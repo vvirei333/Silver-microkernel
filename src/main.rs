@@ -17,6 +17,8 @@ mod interrupts;
 #[cfg(not(feature = "std"))]
 mod memory;
 #[cfg(not(feature = "std"))]
+mod mutex;
+#[cfg(not(feature = "std"))]
 mod pl011;
 #[cfg(not(feature = "std"))]
 mod scheduler;

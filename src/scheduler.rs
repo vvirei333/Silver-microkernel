@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::{
     frame_allocator, interrupts,
     memory::{MemoryRegion, PAGE_SIZE},
-    pl011, timer,
+    mutex, pl011, timer,
 };
 
 const TASK_STACK_PAGES: usize = 4;
@@ -18,6 +18,7 @@ pub enum TaskState {
     Ready,
     Running,
     Sleeping(u64),
+    Blocked,
     Dead,
 }
 
@@ -100,8 +101,9 @@ pub fn init() {
 
     // Idle always exists, so the CPU has somewhere to run when all tasks sleep.
     let _idle_id = spawn_inner(idle_task);
-    let _task_a_id = spawn_inner(task_a);
-    let _task_b_id = spawn_inner(task_b);
+    let _holder_id = spawn_inner(mutex_holder);
+    let _contender_1_id = spawn_inner(mutex_contender);
+    let _contender_2_id = spawn_inner(mutex_contender);
     let _sleeper_id = spawn_inner(sleeping_task);
 
     let manager = scheduler_manager().unwrap();
@@ -148,6 +150,35 @@ pub fn sleep(milliseconds: u64) {
     }
 
     schedule();
+    interrupts::restore_irq(saved_daif);
+}
+
+/// Marks the current task as Blocked and switches away. The task only runs
+/// again after wake_task() moves it back to the ready queue.
+pub fn block_current() {
+    let saved_daif = interrupts::save_and_disable_irq();
+
+    if let Some(task) = current_task_mut() {
+        task.state = TaskState::Blocked;
+    }
+
+    schedule();
+    interrupts::restore_irq(saved_daif);
+}
+
+/// Moves a blocked task back to the ready queue. No-op for tasks that are
+/// not blocked (e.g. a sleeper that was never enqueued).
+pub fn wake_task(id: u64) {
+    let saved_daif = interrupts::save_and_disable_irq();
+
+    if let Some(manager) = scheduler_manager() {
+        if let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) {
+            if task.state == TaskState::Blocked {
+                task.state = TaskState::Ready;
+            }
+        }
+    }
+
     interrupts::restore_irq(saved_daif);
 }
 
@@ -363,18 +394,38 @@ extern "C" fn idle_task() -> ! {
     }
 }
 
-extern "C" fn task_a() -> ! {
+/// Shared counter used by the mutex demo tasks.
+static COUNTER: mutex::Mutex<u64> = mutex::Mutex::new(0);
+
+extern "C" fn mutex_holder() -> ! {
     loop {
-        pl011::write_byte(b'A');
         interrupts::enable_irq();
-        sleep(100);
+        {
+            let _guard = COUNTER.lock();
+            pl011::write_str("MUTEX HOLDER=1 ACQUIRE\r\n");
+            // Hold long enough for both contenders to pile up in the queue.
+            sleep(400);
+            pl011::write_str("MUTEX HOLDER=1 RELEASE\r\n");
+        }
+        sleep(50);
     }
 }
 
-extern "C" fn task_b() -> ! {
+extern "C" fn mutex_contender() -> ! {
     loop {
-        pl011::write_byte(b'B');
         interrupts::enable_irq();
+        pl011::write_str("MUTEX TASK=");
+        pl011::write_hex_u64(current_task_id());
+        pl011::write_str(" TRY\r\n");
+        {
+            let mut counter = COUNTER.lock();
+            *counter += 1;
+            pl011::write_str("MUTEX TASK=");
+            pl011::write_hex_u64(current_task_id());
+            pl011::write_str(" COUNTER=");
+            pl011::write_hex_u64(*counter);
+            pl011::write_str("\r\n");
+        }
         sleep(100);
     }
 }
