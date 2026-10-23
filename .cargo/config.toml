@@ -1,0 +1,10 @@
+[alias]
+kernel = "build --target aarch64-unknown-none --no-default-features --features no_std"
+kernel-release = "build --release --target aarch64-unknown-none --no-default-features --features no_std"
+
+[target.aarch64-unknown-none]
+linker = "rust-lld"
+rustflags = [
+    "-C", "link-arg=-Tlinker.ld",
+    "-C", "link-arg=--gc-sections",
+]

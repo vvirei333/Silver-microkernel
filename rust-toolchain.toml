@@ -1,0 +1,5 @@
+[toolchain]
+channel = "stable"
+profile = "minimal"
+targets = ["aarch64-unknown-none"]
+components = ["clippy", "rustfmt"]
