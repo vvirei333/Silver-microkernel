@@ -18,8 +18,9 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Round-robin scheduler: dynamic `spawn`, `yield`, `sleep`, `exit`
 - [x] Blocking mutex with FIFO wait queue (RAII guard)
 - [x] IPC: mailbox `send()` / blocking `receive()` between tasks
+- [x] System calls via `svc #0` (number in x8, arguments in x0-x5)
+- [ ] Tasks in EL0 (Ring 3) with argument validation
 - [ ] MMU, virtual memory, task isolation
-- [ ] System calls (SVC) instead of direct function calls
 - [ ] Drivers, processes, ELF loader
 
 ## Requirements
@@ -89,6 +90,7 @@ with `--no-default-features --features no_std`.
 | `src/scheduler.rs` | Scheduler: tasks, context switch, demo tasks |
 | `src/mutex.rs` | Blocking mutex with wait queue |
 | `src/ipc.rs` | Mailbox IPC: `send` / `receive` |
+| `src/syscall.rs` | System call table and `svc #0` wrappers |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).

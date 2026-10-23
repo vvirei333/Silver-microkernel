@@ -5,10 +5,13 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## State as of 2026-10-24
 
-Latest verified feature: **IPC mailbox (send / blocking receive)**.
+Latest verified feature: **system calls (SVC)**. The full IPC ping-pong demo
+now goes through `svc #0` — including the blocking `receive`, which is the
+real regression test: a task blocks *inside a syscall*, gets switched away,
+and eret still returns to the right place.
 Verification: `cargo build` (host) + bare-metal build + 5 seconds in QEMU
 with stable output (see README). Running simultaneously: the mutex demo,
-the IPC ping-pong (period ~300 ms) and the sleep task (500 ms).
+the IPC ping-pong over SVC (period ~300 ms) and the sleep task (500 ms).
 
 Always build like this:
 
@@ -55,6 +58,15 @@ Exit code `124` = the kernel lived the whole time = success.
    Blocked / Dead`. The scheduler gives the CPU only to Ready tasks;
    sleeping and blocked tasks are skipped; `find_next_task` prefers
    non-idle tasks.
+8. **SVC trampoline keeps ELR/SPSR on the stack.** The sync exception
+   entry checks ESR EC: `0b010101` (SVC from AArch64) goes to
+   `exception_svc_dispatch`, everything else panics as before. The
+   trampoline saves x0-x30 + ELR_EL1 + SPSR_EL1 in a 272-byte stack frame
+   and restores ELR/SPSR *from the stack* before eret — never trusting the
+   CPU registers, which are global per-CPU and get overwritten when the
+   task is switched away mid-syscall (all syscalls may block).
+   Calling convention: number in x8, args in x0-x5, result in x0.
+   The table lives in `syscall.rs` (`silver_handle_syscall`).
 
 ## Why IPC is not built on mutex::Mutex
 
@@ -77,8 +89,9 @@ task data; IRQ masking is for kernel state.
 - `receive()` has no timeout: a task can wait for a message forever.
 - No MMU: tasks share one address space; stacks are protected only by
   care (`debug_assert` in `schedule` checks SP within stack bounds).
-- No system calls: tasks are linked into the kernel and call its
-  functions directly. SVC is the next big milestone.
+- Tasks run at EL1 and are linked into the kernel image; syscall arguments
+  are trusted (raw pointers are dereferenced without validation). Moving
+  tasks to EL0 + MMU isolation makes this exploitable surface real.
 - UART printing is not atomic: lines from different tasks can interleave
   byte by byte. Add a pl011 spinlock (task context only!).
 - `#[alloc_error_handler]` is unstable on stable Rust — instead a wrapper
@@ -87,15 +100,15 @@ task data; IRQ masking is for kernel state.
 
 ## Next steps (by priority)
 
-1. **System calls (SVC).** Call table, trampoline in `exceptions.rs`,
-   wrapper stubs for tasks instead of calling `ipc::send` etc. directly.
-   Also solves the DAIF rule through a proper mechanism (SPSR/eret).
-2. **Nameserver / task registry.** Right now ping hardcodes pong's ID = 5.
-   Need names or handles handed out at spawn time.
-3. **Condvar / wait queue** on top of the mutex: `wait(cond)` / `notify()`,
+1. **Nameserver / task registry.** Right now ping hardcodes pong's ID = 5.
+   Need names or handles handed out at spawn time (itself a nice IPC
+   exercise: register/lookup via messages to a nameserver task).
+2. **Condvar / wait queue** on top of the mutex: `wait(cond)` / `notify()`,
    per-channel queues instead of the global `receivers`.
-4. **Priority inheritance for the mutex** — or at least decide whether it
-   matters on single-CPU.
+3. **More syscalls behind the SVC boundary:** `spawn`, `exit`, mutex
+   lock/unlock, UART write — so tasks stop calling kernel code directly.
+4. **Tasks at EL0** (AArch64 "Ring 3"): separate SP_EL0, exception-return
+   discipline lower-EL, then MMU isolation becomes meaningful.
 5. **MMU + TTBR0/TTBR1, page tables, stack isolation.** The biggest
    milestone on the road to a "real" microkernel.
 6. **VirtIO-console / virtio-block** — first MMIO device driver, moving

@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::{
     frame_allocator, interrupts, ipc,
     memory::{MemoryRegion, PAGE_SIZE},
-    mutex, pl011, timer,
+    mutex, pl011, syscall, timer,
 };
 
 const TASK_STACK_PAGES: usize = 4;
@@ -432,37 +432,39 @@ extern "C" fn mutex_contender() -> ! {
 const PONG_TASK_ID: u64 = 5;
 
 extern "C" fn ipc_ping() -> ! {
+    let mut reply = ipc::Message::new(0, b"");
     loop {
         interrupts::enable_irq();
-        pl011::write_str("IPC TASK=4 SEND PING\r\n");
-        ipc::send(PONG_TASK_ID, ipc::Message::new(current_task_id(), b"PING"));
+        pl011::write_str("IPC TASK=4 SEND PING (SVC)\r\n");
+        syscall::send(PONG_TASK_ID, &ipc::Message::new(current_task_id(), b"PING"));
 
         // Blocks here until pong answers.
-        let reply = ipc::receive();
+        syscall::receive(&mut reply);
         pl011::write_str("IPC TASK=4 RECV ");
         pl011::write_str(core::str::from_utf8(reply.text()).unwrap_or("?"));
-        pl011::write_str("\r\n");
+        pl011::write_str(" (SVC)\r\n");
 
-        sleep(300);
+        syscall::sleep(300);
     }
 }
 
 extern "C" fn ipc_pong() -> ! {
+    let mut message = ipc::Message::new(0, b"");
     loop {
         interrupts::enable_irq();
         // Do other "work" first; the ping sits in our mailbox meanwhile.
-        sleep(200);
+        syscall::sleep(200);
 
         // Blocks here until ping arrives.
-        let message = ipc::receive();
+        syscall::receive(&mut message);
         pl011::write_str("IPC TASK=5 RECV ");
         pl011::write_str(core::str::from_utf8(message.text()).unwrap_or("?"));
-        pl011::write_str("\r\n");
+        pl011::write_str(" (SVC)\r\n");
 
-        pl011::write_str("IPC TASK=5 SEND PONG\r\n");
-        ipc::send(
+        pl011::write_str("IPC TASK=5 SEND PONG (SVC)\r\n");
+        syscall::send(
             message.sender,
-            ipc::Message::new(current_task_id(), b"PONG"),
+            &ipc::Message::new(current_task_id(), b"PONG"),
         );
     }
 }
