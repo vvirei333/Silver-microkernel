@@ -1,13 +1,13 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
-use crate::pl011;
+pub const TICK_INTERVAL_MS: u64 = 10;
 
 static INTERVAL_TICKS: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
     let frequency = counter_frequency();
-    let interval = frequency / 10;
+    let interval = frequency * TICK_INTERVAL_MS / 1000;
     let interval = if interval == 0 { 1 } else { interval };
 
     INTERVAL_TICKS.store(interval, Ordering::Relaxed);
@@ -16,12 +16,16 @@ pub fn init() {
 }
 
 pub fn handle_irq() {
+    TICKS.fetch_add(1, Ordering::Relaxed);
     rearm();
-    let ticks = TICKS.fetch_add(1, Ordering::Relaxed) + 1;
+}
 
-    if ticks == 1 {
-        pl011::write_str("TIMER IRQ OK\r\n");
-    }
+pub fn ticks() -> u64 {
+    TICKS.load(Ordering::Relaxed)
+}
+
+pub fn milliseconds_to_ticks(milliseconds: u64) -> u64 {
+    milliseconds.div_ceil(TICK_INTERVAL_MS)
 }
 
 fn counter_frequency() -> u64 {

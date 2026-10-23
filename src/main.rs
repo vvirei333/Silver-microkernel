@@ -42,6 +42,20 @@ _start:
     ldr x0, =__stack_top
     mov sp, x0
 
+    mrs x2, CurrentEL
+    lsr x2, x2, #2
+    cmp x2, #2
+    b.ne 4f
+    msr cptr_el2, xzr
+    mov x2, #0x300000
+    msr cpacr_el1, x2
+    b 5f
+4:
+    mov x2, #0x300000
+    msr cpacr_el1, x2
+5:
+    isb
+
     ldr x3, =__bss_start
     ldr x4, =__bss_end
     cmp x3, x4

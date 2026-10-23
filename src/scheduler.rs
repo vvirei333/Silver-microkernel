@@ -1,27 +1,24 @@
 use core::cell::UnsafeCell;
 
+use alloc::vec::Vec;
+
 use crate::{
-    interrupts,
-    memory::MemoryRegion,
-    pl011,
+    frame_allocator, interrupts,
+    memory::{MemoryRegion, PAGE_SIZE},
+    pl011, timer,
 };
 
-const MAX_TASKS: usize = 2;
-const TASK_STACK_SIZE: usize = 16 * 1024;
+const TASK_STACK_PAGES: usize = 4;
+const TASK_STACK_SIZE: usize = TASK_STACK_PAGES * PAGE_SIZE;
 const X30_INDEX: usize = 11;
-const STACK_POINTER_INDEX: usize = 12;
-
-#[derive(Copy, Clone)]
-#[repr(C, align(16))]
-struct TaskStack([u8; TASK_STACK_SIZE]);
-
-const EMPTY_STACK: TaskStack = TaskStack([0; TASK_STACK_SIZE]);
-static mut TASK_STACKS: [TaskStack; MAX_TASKS] = [EMPTY_STACK; MAX_TASKS];
+const IDLE_TASK_ID: u64 = 0;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaskState {
     Ready,
     Running,
+    Sleeping(u64),
+    Dead,
 }
 
 #[repr(C, align(16))]
@@ -46,28 +43,19 @@ pub struct Task {
     pub stack: MemoryRegion,
 }
 
-struct SchedulerState {
-    tasks: [Option<Task>; MAX_TASKS],
-    current: usize,
+pub struct TaskManager {
+    tasks: Vec<Task>,
+    current_index: usize,
+    next_id: u64,
 }
 
-impl SchedulerState {
-    const fn empty() -> Self {
-        Self {
-            tasks: [None, None],
-            current: 0,
-        }
-    }
-}
+struct SharedScheduler(UnsafeCell<Option<TaskManager>>);
 
-struct SharedScheduler(UnsafeCell<SchedulerState>);
-
-// The IRQ handler runs with IRQ masking, so scheduler state cannot be re-entered
-// from a timer interrupt. Add a lock when other interrupt handlers allocate or
-// when SMP support appears.
+// Public scheduler entry points disable IRQs while mutating TaskManager. Timer IRQs
+// enter schedule() already masked. Add a real lock when SMP support appears.
 unsafe impl Sync for SharedScheduler {}
 
-static SCHEDULER: SharedScheduler = SharedScheduler(UnsafeCell::new(SchedulerState::empty()));
+static SCHEDULER: SharedScheduler = SharedScheduler(UnsafeCell::new(None));
 static mut BOOT_CONTEXT: TaskContext = TaskContext::zero();
 
 core::arch::global_asm!(
@@ -103,16 +91,95 @@ extern "C" {
 }
 
 pub fn init() {
-    let state = scheduler_state();
-    state.tasks[0] = Some(Task::new(1, 0, task_a));
-    state.tasks[1] = Some(Task::new(2, 1, task_b));
-    state.current = 0;
+    let slot = scheduler_slot();
+    *slot = Some(TaskManager {
+        tasks: Vec::new(),
+        current_index: 0,
+        next_id: 0,
+    });
+
+    // Idle always exists, so the CPU has somewhere to run when all tasks sleep.
+    let _idle_id = spawn_inner(idle_task);
+    let _task_a_id = spawn_inner(task_a);
+    let _task_b_id = spawn_inner(task_b);
+    let _sleeper_id = spawn_inner(sleeping_task);
+
+    let manager = scheduler_manager().unwrap();
+    manager.current_index = manager
+        .tasks
+        .iter()
+        .position(|task| task.id == 1)
+        .unwrap_or(0);
+}
+
+/// Dynamically adds a task and returns its ID.
+pub fn spawn(entry: extern "C" fn() -> !) -> Option<u64> {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let id = spawn_inner(entry);
+    interrupts::restore_irq(saved_daif);
+    id
+}
+
+/// Voluntarily gives up the remainder of the current time slice.
+pub fn yield_current() {
+    let saved_daif = interrupts::save_and_disable_irq();
+
+    if let Some(task) = current_task_mut() {
+        if task.state == TaskState::Running {
+            task.state = TaskState::Ready;
+        }
+    }
+    schedule();
+    interrupts::restore_irq(saved_daif);
+}
+
+/// Puts the current task to sleep for approximately the requested duration.
+pub fn sleep(milliseconds: u64) {
+    if milliseconds == 0 {
+        yield_current();
+        return;
+    }
+
+    let saved_daif = interrupts::save_and_disable_irq();
+    let wake_at = timer::ticks() + timer::milliseconds_to_ticks(milliseconds);
+
+    if let Some(task) = current_task_mut() {
+        task.state = TaskState::Sleeping(wake_at);
+    }
+
+    schedule();
+    interrupts::restore_irq(saved_daif);
+}
+
+/// Terminates the current task and switches to another runnable task.
+pub fn exit_current() -> ! {
+    let saved_daif = interrupts::save_and_disable_irq();
+
+    if let Some(task) = current_task_mut() {
+        task.state = TaskState::Dead;
+    }
+
+    schedule();
+    interrupts::restore_irq(saved_daif);
+
+    loop {
+        interrupts::wait_for_irq();
+    }
+}
+
+pub fn current_task_id() -> u64 {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(manager.current_index))
+        .map(|task| task.id)
+        .unwrap_or(0)
 }
 
 /// Switches from the boot context into the first task. This function never returns.
 pub fn start() -> ! {
-    let state = scheduler_state();
-    let Some(first_task) = state.tasks[state.current].as_mut() else {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let manager = scheduler_manager().unwrap();
+    let current_index = manager.current_index;
+    let Some(first_task) = manager.tasks.get_mut(current_index) else {
         loop {
             interrupts::wait_for_irq();
         }
@@ -126,73 +193,181 @@ pub fn start() -> ! {
         silver_context_switch(boot_context, first_context);
     }
 
+    interrupts::restore_irq(saved_daif);
     loop {
         interrupts::wait_for_irq();
     }
 }
 
-/// Selects the next ready task and switches to it.
-///
-/// When the current task is selected again later, execution resumes immediately
-/// after the context switch call below.
+/// Wakes expired sleepers, skips sleeping tasks, and switches to the next ready task.
 pub fn schedule() {
-    let state = scheduler_state();
-    let current_index = state.current;
-    let next_index = (current_index + 1) % MAX_TASKS;
-
-    if state.tasks[current_index].is_none() || state.tasks[next_index].is_none() {
+    let Some(manager) = scheduler_manager() else {
+        return;
+    };
+    if manager.tasks.is_empty() {
         return;
     }
 
-    let Some(current_task) = state.tasks[current_index].as_mut() else {
-        return;
-    };
-    let Some(next_task) = state.tasks[next_index].as_mut() else {
-        return;
-    };
+    reap_dead_tasks(manager);
+    wake_expired_tasks(manager, timer::ticks());
 
-    current_task.state = TaskState::Ready;
+    if manager.current_index >= manager.tasks.len() {
+        manager.current_index = 0;
+    }
+
+    let current_index = manager.current_index;
+    if manager.tasks[current_index].state == TaskState::Running {
+        manager.tasks[current_index].state = TaskState::Ready;
+    }
+
+    let Some(next_index) = find_next_task(manager) else {
+        return;
+    };
+    if next_index == current_index {
+        return;
+    }
+
+    let tasks = manager.tasks.as_mut_ptr();
+    // The indices are different, so these are disjoint tasks.
+    let current_task = unsafe { &mut *tasks.add(current_index) };
+    let next_task = unsafe { &mut *tasks.add(next_index) };
+
+    debug_assert_ne!(current_task.id, next_task.id);
+    debug_assert!(next_task
+        .stack
+        .contains(next_task.context.stack_pointer as usize - 1));
+
     next_task.state = TaskState::Running;
-    state.current = next_index;
-
-    let current_context = &mut current_task.context as *mut TaskContext;
-    let next_context = &next_task.context as *const TaskContext;
+    manager.current_index = next_index;
 
     unsafe {
-        silver_context_switch(current_context, next_context);
+        silver_context_switch(
+            &mut current_task.context as *mut TaskContext,
+            &next_task.context as *const TaskContext,
+        );
     }
 }
 
-impl Task {
-    fn new(id: u64, stack_index: usize, entry: extern "C" fn() -> !) -> Self {
-        let stack = task_stack(stack_index);
-        let mut context = TaskContext::zero();
-        context.registers[X30_INDEX] = entry as usize as u64;
-        context.stack_pointer = stack.end as u64;
+fn spawn_inner(entry: extern "C" fn() -> !) -> Option<u64> {
+    let manager = scheduler_manager()?;
+    let id = manager.next_id;
+    let task = Task::new(id, entry)?;
 
-        Self {
-            id,
-            state: TaskState::Ready,
-            context,
-            stack,
+    manager.tasks.push(task);
+    manager.next_id += 1;
+    Some(id)
+}
+
+fn find_next_task(manager: &TaskManager) -> Option<usize> {
+    let task_count = manager.tasks.len();
+
+    for offset in 1..=task_count {
+        let index = (manager.current_index + offset) % task_count;
+        let task = &manager.tasks[index];
+        if task.id != IDLE_TASK_ID && task.state == TaskState::Ready {
+            return Some(index);
+        }
+    }
+
+    for offset in 1..=task_count {
+        let index = (manager.current_index + offset) % task_count;
+        if manager.tasks[index].state == TaskState::Ready {
+            return Some(index);
+        }
+    }
+
+    None
+}
+
+fn wake_expired_tasks(manager: &mut TaskManager, now: u64) {
+    for task in &mut manager.tasks {
+        if let TaskState::Sleeping(wake_at) = task.state {
+            if now >= wake_at {
+                task.state = TaskState::Ready;
+            }
         }
     }
 }
 
-fn scheduler_state() -> &'static mut SchedulerState {
+fn reap_dead_tasks(manager: &mut TaskManager) {
+    if !manager
+        .tasks
+        .iter()
+        .any(|task| task.state == TaskState::Dead)
+    {
+        return;
+    }
+
+    manager.tasks.retain(|task| {
+        if task.state == TaskState::Dead {
+            task.release_stack();
+            false
+        } else {
+            true
+        }
+    });
+
+    manager.current_index = manager
+        .tasks
+        .iter()
+        .position(|task| task.state == TaskState::Running)
+        .unwrap_or(0);
+}
+
+fn current_task_mut() -> Option<&'static mut Task> {
+    let manager = scheduler_manager()?;
+    let index = manager.current_index;
+    let tasks = manager.tasks.as_mut_ptr();
+    unsafe { manager.tasks.get_mut(index).map(|_| &mut *tasks.add(index)) }
+}
+
+impl Task {
+    fn new(id: u64, entry: extern "C" fn() -> !) -> Option<Self> {
+        let stack_start = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES)?;
+        let stack = MemoryRegion::new(stack_start, stack_start + TASK_STACK_SIZE);
+        let mut context = TaskContext::zero();
+        context.registers[X30_INDEX] = entry as usize as u64;
+        context.stack_pointer = stack.end as u64;
+
+        Some(Self {
+            id,
+            state: TaskState::Ready,
+            context,
+            stack,
+        })
+    }
+
+    fn release_stack(&self) {
+        let mut page = self.stack.start;
+        while page < self.stack.end {
+            frame_allocator::free_page(page);
+            page += PAGE_SIZE;
+        }
+    }
+}
+
+fn scheduler_slot() -> &'static mut Option<TaskManager> {
     unsafe { &mut *SCHEDULER.0.get() }
 }
 
-fn task_stack(index: usize) -> MemoryRegion {
-    let start = unsafe { core::ptr::addr_of!(TASK_STACKS[index]) as usize };
-    MemoryRegion::new(start, start + TASK_STACK_SIZE)
+fn scheduler_manager() -> Option<&'static mut TaskManager> {
+    scheduler_slot().as_mut()
+}
+
+extern "C" fn idle_task() -> ! {
+    // Voluntary switches leave IRQ masked, so every task entry point must
+    // unmask interrupts itself before it can be woken by the timer again.
+    interrupts::enable_irq();
+    loop {
+        interrupts::wait_for_irq();
+    }
 }
 
 extern "C" fn task_a() -> ! {
     loop {
         pl011::write_byte(b'A');
         interrupts::enable_irq();
-        interrupts::wait_for_irq();
+        sleep(100);
     }
 }
 
@@ -200,6 +375,16 @@ extern "C" fn task_b() -> ! {
     loop {
         pl011::write_byte(b'B');
         interrupts::enable_irq();
-        interrupts::wait_for_irq();
+        sleep(100);
+    }
+}
+
+extern "C" fn sleeping_task() -> ! {
+    loop {
+        interrupts::enable_irq();
+        sleep(500);
+        pl011::write_str("TASK ID=");
+        pl011::write_hex_u64(current_task_id());
+        pl011::write_str(" AWAKE\r\n");
     }
 }

@@ -80,6 +80,33 @@ pub fn alloc_page() -> Option<usize> {
     None
 }
 
+/// Allocates a contiguous run of physical pages or frees the partial run on failure.
+pub fn alloc_contiguous_pages(page_count: usize) -> Option<usize> {
+    if page_count == 0 {
+        return None;
+    }
+
+    let first = alloc_page()?;
+    let mut last = first;
+
+    for _ in 1..page_count {
+        let Some(page) = alloc_page() else {
+            release_contiguous_pages(first, last);
+            return None;
+        };
+
+        if page != last + PAGE_SIZE {
+            release_contiguous_pages(first, last);
+            free_page(page);
+            return None;
+        }
+
+        last = page;
+    }
+
+    Some(first)
+}
+
 /// Returns a previously allocated page to the allocator.
 ///
 /// Invalid and unaligned addresses are ignored; double-free is checked in debug builds.
@@ -102,6 +129,15 @@ pub fn free_page(address: usize) {
 
     if was_used {
         state.bitmap[word_index] &= !bit_mask;
+    }
+}
+
+/// Releases a contiguous run [first, last] previously built by alloc_contiguous_pages.
+fn release_contiguous_pages(first: usize, last: usize) {
+    let mut page = first;
+    while page <= last {
+        free_page(page);
+        page += PAGE_SIZE;
     }
 }
 

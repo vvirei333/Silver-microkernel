@@ -2,10 +2,10 @@ use core::alloc::{GlobalAlloc, Layout};
 
 use linked_list_allocator::LockedHeap;
 
-use crate::{exceptions, frame_allocator, memory::PAGE_SIZE, pl011};
+use crate::{exceptions, frame_allocator, pl011};
 
 pub const HEAP_PAGES: usize = 256;
-pub const HEAP_SIZE: usize = HEAP_PAGES * PAGE_SIZE;
+pub const HEAP_SIZE: usize = HEAP_PAGES * crate::memory::PAGE_SIZE;
 
 struct KernelAllocator {
     inner: LockedHeap,
@@ -34,43 +34,13 @@ static ALLOCATOR: KernelAllocator = KernelAllocator {
 ///
 /// Returns the physical heap base address on success.
 pub fn init() -> Option<usize> {
-    let heap_base = reserve_contiguous_pages(HEAP_PAGES)?;
+    let heap_base = frame_allocator::alloc_contiguous_pages(HEAP_PAGES)?;
 
     unsafe {
         ALLOCATOR.inner.lock().init(heap_base as *mut u8, HEAP_SIZE);
     }
 
     Some(heap_base)
-}
-
-fn reserve_contiguous_pages(page_count: usize) -> Option<usize> {
-    let first = frame_allocator::alloc_page()?;
-    let mut last = first;
-
-    for _ in 1..page_count {
-        let Some(page) = frame_allocator::alloc_page() else {
-            release_pages(first, last);
-            return None;
-        };
-
-        if page != last + PAGE_SIZE {
-            release_pages(first, last);
-            frame_allocator::free_page(page);
-            return None;
-        }
-
-        last = page;
-    }
-
-    Some(first)
-}
-
-fn release_pages(first: usize, last: usize) {
-    let mut page = first;
-    while page <= last {
-        frame_allocator::free_page(page);
-        page += PAGE_SIZE;
-    }
 }
 
 // `#[alloc_error_handler]` is unstable on Rust 1.99, so GlobalAlloc intercepts
