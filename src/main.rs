@@ -7,6 +7,8 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 mod allocator;
 #[cfg(not(feature = "std"))]
+mod condvar;
+#[cfg(not(feature = "std"))]
 mod exceptions;
 #[cfg(not(feature = "std"))]
 mod frame_allocator;

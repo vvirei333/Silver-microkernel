@@ -73,6 +73,14 @@ pub struct MutexGuard<'a, T> {
     mutex: &'a Mutex<T>,
 }
 
+impl<'a, T> MutexGuard<'a, T> {
+    /// The mutex this guard belongs to. Used by `Condvar::wait` to
+    /// re-acquire the lock after being woken.
+    pub fn mutex(&self) -> &'a Mutex<T> {
+        self.mutex
+    }
+}
+
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
         self.mutex.unlock();

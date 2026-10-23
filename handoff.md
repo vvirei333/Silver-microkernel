@@ -5,14 +5,15 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## State as of 2026-10-24
 
-Latest verified feature: **nameserver**. Tasks discover each other by name
-through two new syscalls (register/lookup) that do request/reply RPC with the
-nameserver task over IPC — no hardcoded peer IDs left in the demo. Lookup
-retries until the peer appears, so startup order does not matter.
-Verification: `cargo build` (host) + bare-metal build + 5 seconds in QEMU
+Latest verified feature: **condition variable + per-mailbox IPC wait queues**.
+IPC moved from IRQ-masked global state to `Mutex<IpcState>` where every
+mailbox owns a `Condvar`; `send()` wakes exactly the waiters of the addressed
+mailbox. Demo proof: alpha and beta both block in `receive()`, probe sends to
+alpha only — log shows `alpha RECV WAKE` and then `beta silent = PASS`.
+Verification: `cargo build` (host) + bare-metal build + 6 seconds in QEMU
 with stable output (see README). Running simultaneously: the nameserver,
-the mutex demo, the IPC ping-pong over SVC (period ~300 ms) and the sleep
-task (500 ms).
+the mutex demo, the IPC ping-pong over SVC (period ~300 ms), the condvar
+test and the sleep task (500 ms).
 
 Always build like this:
 
@@ -74,24 +75,27 @@ Exit code `124` = the kernel lived the whole time = success.
    allowed to stay. Protocol is text over mailbox messages: "R <name>" →
    "OK"/"TAKEN", "L <name>" → "ID <n>"/"MISSING" (see nameserver.rs).
 
-## Why IPC is not built on mutex::Mutex
+## Why IPC uses Mutex + Condvar (and what changed)
 
-The receiver registers itself in the wait list and blocks as one atomic
-operation (under the IRQ mask). If IPC state were protected by the blocking
-mutex, the receiver would fall asleep holding the very lock the sender needs
-to deliver — an instant deadlock. Rule of thumb: the blocking mutex is for
-task data; IRQ masking is for kernel state.
+Early IPC used IRQ-masked global state with a global `receivers` list, because
+blocking on the raw mutex while holding it would deadlock the sender. The
+condition variable removes exactly that restriction: `Condvar::wait` releases
+the mutex *before* blocking, so IPC state now lives behind
+`Mutex<IpcState>` and every mailbox owns a `Condvar`. Senders wake only the
+waiters of the addressed mailbox — targeted wakeups, no spurious scheduling.
+Rule of thumb, updated: IRQ masking guards the tiniest scheduler-critical
+sections; Mutex + Condvar guard everything that can wait on a condition.
+
+Condvar discipline (same as std): check the condition and `wait` under the
+lock; `notify_*` under the lock; re-check the condition after waking.
 
 ## Known tech debt
 
-- `wake_task()` wakes any Blocked task — there is no notion of *why* it
-  blocked. Spurious wakeups are safe (the task just re-checks its
-  condition), but the semantics are coarse. When condvars/waitqueues
-  arrive, replace the global `receivers` list with per-channel queues.
 - A task that dies (`exit_current`) while sitting in someone else's mutex
-  queue or in `IpcState::receivers` leaves a stale entry (waiter leak).
-  No demo task currently does this — none of them ever exit.
-- Mutex queues, mailboxes and `receivers` have no growth limits.
+  or condvar queue leaves a stale waiter entry (leak, and a future
+  wake_task on a dead ID is a harmless no-op). No demo task currently does
+  this — none of them ever exit.
+- Mutex queues, condvar queues and mailboxes have no growth limits.
 - `receive()` has no timeout: a task can wait for a message forever.
 - No MMU: tasks share one address space; stacks are protected only by
   care (`debug_assert` in `schedule` checks SP within stack bounds).
@@ -106,13 +110,13 @@ task data; IRQ masking is for kernel state.
 
 ## Next steps (by priority)
 
-1. **Condvar / wait queue** on top of the mutex: `wait(cond)` / `notify()`,
-   per-channel queues instead of the global `receivers`.
-2. **More syscalls behind the SVC boundary:** `spawn`, `exit`, mutex
+1. **More syscalls behind the SVC boundary:** `spawn`, `exit`, mutex
    lock/unlock, UART write — so tasks stop calling kernel code directly.
-3. **Nameserver extras:** unregister on task exit, duplicate-name policy
+2. **Nameserver extras:** unregister on task exit, duplicate-name policy
    (replace vs TAKEN), watch/notifications for "task appeared" instead of
    lookup polling.
+3. **Semaphore / channel abstraction** on top of mutex+condvar: bounded
+   queues with `send` blocking when full (natural pair for backpressure).
 4. **Tasks at EL0** (AArch64 "Ring 3"): separate SP_EL0, exception-return
    discipline lower-EL, then MMU isolation becomes meaningful.
 5. **MMU + TTBR0/TTBR1, page tables, stack isolation.** The biggest

@@ -1,16 +1,15 @@
 //! Mailbox-based IPC: fixed-size messages between tasks.
 //!
-//! `receive()` blocks the caller until a message arrives. IPC state is
-//! protected by IRQ masking (the same discipline as TaskManager), NOT by the
-//! blocking `mutex::Mutex`: a receiver registers itself and blocks as one
-//! atomic step, and the sender must be able to push + wake without acquiring
-//! any lock the blocked receiver holds.
+//! `receive()` blocks the caller until a message arrives. IPC state lives
+//! behind the blocking kernel mutex, and every mailbox owns a Condvar — a
+//! receiver sleeps on *its own* mailbox's wait queue, and `send()` wakes
+//! exactly the waiters of the addressed mailbox. The old global receiver
+//! list (where any send could spuriously wake an unrelated task) is gone.
 
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
-use core::cell::UnsafeCell;
 
-use crate::{interrupts, scheduler};
+use crate::{condvar::Condvar, mutex::Mutex, scheduler};
 
 pub const PAYLOAD_SIZE: usize = 32;
 
@@ -42,75 +41,67 @@ impl Message {
 struct Mailbox {
     owner: u64,
     queue: VecDeque<Message>,
+    /// Wait queue of tasks blocked in `receive()` on this mailbox.
+    condvar: Condvar,
+}
+
+impl Mailbox {
+    fn new(owner: u64) -> Self {
+        Self {
+            owner,
+            queue: VecDeque::new(),
+            condvar: Condvar::new(),
+        }
+    }
 }
 
 struct IpcState {
     mailboxes: Vec<Mailbox>,
-    /// IDs of tasks currently blocked inside `receive()`, waiting for mail.
-    receivers: Vec<u64>,
 }
 
-struct SharedIpc(UnsafeCell<IpcState>);
-
-// Single-CPU kernel: every mutation happens with IRQs masked.
-unsafe impl Sync for SharedIpc {}
-
-static IPC: SharedIpc = SharedIpc(UnsafeCell::new(IpcState {
+static IPC: Mutex<IpcState> = Mutex::new(IpcState {
     mailboxes: Vec::new(),
-    receivers: Vec::new(),
-}));
+});
 
-fn ipc_state() -> &'static mut IpcState {
-    unsafe { &mut *IPC.0.get() }
-}
-
-fn mailbox_for(state: &mut IpcState, owner: u64) -> &mut Mailbox {
-    if let Some(index) = state.mailboxes.iter().position(|m| m.owner == owner) {
-        return &mut state.mailboxes[index];
-    }
-    state.mailboxes.push(Mailbox {
-        owner,
-        queue: VecDeque::new(),
-    });
-    state.mailboxes.last_mut().unwrap()
-}
-
-/// Delivers a message to the target's mailbox, waking it if it is
-/// blocked inside `receive()`.
+/// Delivers a message to the target's mailbox and wakes at most one task
+/// waiting on that mailbox.
 pub fn send(target: u64, message: Message) {
-    let saved_daif = interrupts::save_and_disable_irq();
-    let state = ipc_state();
-
-    mailbox_for(state, target).queue.push_back(message);
-
-    if let Some(index) = state.receivers.iter().position(|&id| id == target) {
-        state.receivers.remove(index);
-        scheduler::wake_task(target);
-    }
-
-    interrupts::restore_irq(saved_daif);
+    let mut state = IPC.lock();
+    let index = mailbox_index(&mut state, target);
+    let mailbox = &mut state.mailboxes[index];
+    mailbox.queue.push_back(message);
+    mailbox.condvar.notify_one();
 }
 
 /// Blocks until a message for the current task arrives and returns it.
 pub fn receive() -> Message {
     let id = scheduler::current_task_id();
+    let mut guard = IPC.lock();
 
     loop {
-        let saved_daif = interrupts::save_and_disable_irq();
-        let state = ipc_state();
-
-        if let Some(message) = mailbox_for(state, id).queue.pop_front() {
-            interrupts::restore_irq(saved_daif);
+        let index = mailbox_index(&mut guard, id);
+        if let Some(message) = guard.mailboxes[index].queue.pop_front() {
             return message;
         }
 
-        if !state.receivers.contains(&id) {
-            state.receivers.push(id);
+        // Sleep on this mailbox's condvar: releases the lock, blocks, and
+        // re-acquires it. The condvar pointer is re-taken on every iteration
+        // because the mailboxes Vec may relocate while we sleep.
+        let condvar = &guard.mailboxes[index].condvar as *const Condvar;
+        guard = unsafe { (*condvar).wait(guard) };
+    }
+}
+
+fn mailbox_index(state: &mut IpcState, owner: u64) -> usize {
+    match state
+        .mailboxes
+        .iter()
+        .position(|mailbox| mailbox.owner == owner)
+    {
+        Some(index) => index,
+        None => {
+            state.mailboxes.push(Mailbox::new(owner));
+            state.mailboxes.len() - 1
         }
-        // Registration and block_current() are atomic here (IRQs masked), and
-        // the sender consults the same receiver list — no wakeup can be lost.
-        scheduler::block_current();
-        interrupts::restore_irq(saved_daif);
-        // Woken by a send: loop back and pick the message up.
     }
 }

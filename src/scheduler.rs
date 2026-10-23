@@ -109,6 +109,11 @@ pub fn init() {
     let _contender_2_id = spawn_inner(mutex_contender);
     let _ping_id = spawn_inner(ipc_ping);
     let _pong_id = spawn_inner(ipc_pong);
+    // Condvar demo: alpha and beta both block in receive(); the probe sends
+    // to alpha only — beta must stay asleep.
+    let _alpha_id = spawn_inner(condvar_alpha);
+    let _beta_id = spawn_inner(condvar_beta);
+    let _probe_id = spawn_inner(condvar_probe);
     let _sleeper_id = spawn_inner(sleeping_task);
 
     let manager = scheduler_manager().unwrap();
@@ -504,5 +509,66 @@ extern "C" fn sleeping_task() -> ! {
         pl011::write_str("TASK ID=");
         pl011::write_hex_u64(current_task_id());
         pl011::write_str(" AWAKE\r\n");
+    }
+}
+
+/// Condvar demo: two receivers, one message. alpha and beta both block in
+/// `receive()`; the probe sends WAKE to alpha only. If the wakeup were not
+/// targeted, beta would print its line and the test would fail.
+
+extern "C" fn condvar_alpha() -> ! {
+    interrupts::enable_irq();
+    syscall::register("alpha");
+    let mut message = ipc::Message::new(0, b"");
+
+    loop {
+        syscall::receive(&mut message);
+        pl011::write_str("CONDVAR alpha RECV ");
+        pl011::write_str(core::str::from_utf8(message.text()).unwrap_or("?"));
+        pl011::write_str("\r\n");
+        // Back to sleep on the mailbox condvar — silent from here on.
+    }
+}
+
+extern "C" fn condvar_beta() -> ! {
+    interrupts::enable_irq();
+    syscall::register("beta");
+    let mut message = ipc::Message::new(0, b"");
+
+    loop {
+        syscall::receive(&mut message);
+        // Reaching this print means a foreign wakeup hit beta: TEST FAIL.
+        pl011::write_str("CONDVAR beta RECV (TEST FAIL)\r\n");
+    }
+}
+
+extern "C" fn condvar_probe() -> ! {
+    interrupts::enable_irq();
+    syscall::register("probe");
+
+    // Wait until both receivers exist, then give them time to reach receive().
+    let alpha = loop {
+        if let Some(id) = syscall::lookup("alpha") {
+            break id;
+        }
+        syscall::sleep(50);
+    };
+    loop {
+        if syscall::lookup("beta").is_some() {
+            break;
+        }
+        syscall::sleep(50);
+    }
+    syscall::sleep(300);
+
+    pl011::write_str("CONDVAR TEST: send WAKE to alpha only\r\n");
+    syscall::send(alpha, &ipc::Message::new(current_task_id(), b"WAKE"));
+
+    // If beta ever prints, it happens within this window.
+    syscall::sleep(500);
+    pl011::write_str("CONDVAR TEST: beta silent = PASS\r\n");
+
+    loop {
+        syscall::sleep(1000);
     }
 }
