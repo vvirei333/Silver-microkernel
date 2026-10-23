@@ -19,6 +19,7 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Blocking mutex with FIFO wait queue (RAII guard)
 - [x] IPC: mailbox `send()` / blocking `receive()` between tasks
 - [x] System calls via `svc #0` (number in x8, arguments in x0-x5)
+- [x] Nameserver: tasks find each other by name (register/lookup syscalls)
 - [ ] Tasks in EL0 (Ring 3) with argument validation
 - [ ] MMU, virtual memory, task isolation
 - [ ] Drivers, processes, ELF loader
@@ -91,6 +92,7 @@ with `--no-default-features --features no_std`.
 | `src/mutex.rs` | Blocking mutex with wait queue |
 | `src/ipc.rs` | Mailbox IPC: `send` / `receive` |
 | `src/syscall.rs` | System call table and `svc #0` wrappers |
+| `src/nameserver.rs` | Nameserver task: name → task ID registry over IPC |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).

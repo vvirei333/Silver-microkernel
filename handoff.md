@@ -5,13 +5,14 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## State as of 2026-10-24
 
-Latest verified feature: **system calls (SVC)**. The full IPC ping-pong demo
-now goes through `svc #0` — including the blocking `receive`, which is the
-real regression test: a task blocks *inside a syscall*, gets switched away,
-and eret still returns to the right place.
+Latest verified feature: **nameserver**. Tasks discover each other by name
+through two new syscalls (register/lookup) that do request/reply RPC with the
+nameserver task over IPC — no hardcoded peer IDs left in the demo. Lookup
+retries until the peer appears, so startup order does not matter.
 Verification: `cargo build` (host) + bare-metal build + 5 seconds in QEMU
-with stable output (see README). Running simultaneously: the mutex demo,
-the IPC ping-pong over SVC (period ~300 ms) and the sleep task (500 ms).
+with stable output (see README). Running simultaneously: the nameserver,
+the mutex demo, the IPC ping-pong over SVC (period ~300 ms) and the sleep
+task (500 ms).
 
 Always build like this:
 
@@ -67,6 +68,11 @@ Exit code `124` = the kernel lived the whole time = success.
    task is switched away mid-syscall (all syscalls may block).
    Calling convention: number in x8, args in x0-x5, result in x0.
    The table lives in `syscall.rs` (`silver_handle_syscall`).
+9. **Nameserver holds the well-known ID NAMESERVER_ID = 1**, fixed purely by
+   spawn order in `scheduler::init` (first after idle). The syscall clients
+   (register/lookup RPC) hardcode this ID — that is the one hardcode that is
+   allowed to stay. Protocol is text over mailbox messages: "R <name>" →
+   "OK"/"TAKEN", "L <name>" → "ID <n>"/"MISSING" (see nameserver.rs).
 
 ## Why IPC is not built on mutex::Mutex
 
@@ -100,13 +106,13 @@ task data; IRQ masking is for kernel state.
 
 ## Next steps (by priority)
 
-1. **Nameserver / task registry.** Right now ping hardcodes pong's ID = 5.
-   Need names or handles handed out at spawn time (itself a nice IPC
-   exercise: register/lookup via messages to a nameserver task).
-2. **Condvar / wait queue** on top of the mutex: `wait(cond)` / `notify()`,
+1. **Condvar / wait queue** on top of the mutex: `wait(cond)` / `notify()`,
    per-channel queues instead of the global `receivers`.
-3. **More syscalls behind the SVC boundary:** `spawn`, `exit`, mutex
+2. **More syscalls behind the SVC boundary:** `spawn`, `exit`, mutex
    lock/unlock, UART write — so tasks stop calling kernel code directly.
+3. **Nameserver extras:** unregister on task exit, duplicate-name policy
+   (replace vs TAKEN), watch/notifications for "task appeared" instead of
+   lookup polling.
 4. **Tasks at EL0** (AArch64 "Ring 3"): separate SP_EL0, exception-return
    discipline lower-EL, then MMU isolation becomes meaningful.
 5. **MMU + TTBR0/TTBR1, page tables, stack isolation.** The biggest

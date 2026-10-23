@@ -21,6 +21,8 @@ mod memory;
 #[cfg(not(feature = "std"))]
 mod mutex;
 #[cfg(not(feature = "std"))]
+mod nameserver;
+#[cfg(not(feature = "std"))]
 mod pl011;
 #[cfg(not(feature = "std"))]
 mod scheduler;

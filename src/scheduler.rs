@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::{
     frame_allocator, interrupts, ipc,
     memory::{MemoryRegion, PAGE_SIZE},
-    mutex, pl011, syscall, timer,
+    mutex, nameserver, pl011, syscall, timer,
 };
 
 const TASK_STACK_PAGES: usize = 4;
@@ -101,10 +101,12 @@ pub fn init() {
 
     // Idle always exists, so the CPU has somewhere to run when all tasks sleep.
     let _idle_id = spawn_inner(idle_task);
+    // Spawned first after idle, so its ID is NAMESERVER_ID (1) — never
+    // reorder without updating syscall::NAMESERVER_ID.
+    let _nameserver_id = spawn_inner(nameserver::nameserver_task);
     let _holder_id = spawn_inner(mutex_holder);
     let _contender_1_id = spawn_inner(mutex_contender);
     let _contender_2_id = spawn_inner(mutex_contender);
-    // IDs 4 and 5: ipc_ping relies on this spawn order for its peer address.
     let _ping_id = spawn_inner(ipc_ping);
     let _pong_id = spawn_inner(ipc_pong);
     let _sleeper_id = spawn_inner(sleeping_task);
@@ -428,19 +430,42 @@ extern "C" fn mutex_contender() -> ! {
     }
 }
 
-/// Peer ID of ipc_pong, fixed by the spawn order in init().
-const PONG_TASK_ID: u64 = 5;
+/// Registers `name`, then resolves `peer` through the nameserver, retrying
+/// until the peer shows up. Demonstrates the discovery dance both sides do.
+fn resolve_peer(name: &str, peer: &str) -> u64 {
+    pl011::write_str("IPC REGISTER ");
+    pl011::write_str(name);
+    pl011::write_str("\r\n");
+    if !syscall::register(name) {
+        pl011::write_str("IPC REGISTER FAILED\r\n");
+    }
+
+    loop {
+        if let Some(id) = syscall::lookup(peer) {
+            pl011::write_str("IPC FOUND ");
+            pl011::write_str(peer);
+            pl011::write_str("\r\n");
+            return id;
+        }
+        pl011::write_str("IPC LOOKUP ");
+        pl011::write_str(peer);
+        pl011::write_str(" RETRY\r\n");
+        syscall::sleep(100);
+    }
+}
 
 extern "C" fn ipc_ping() -> ! {
+    interrupts::enable_irq();
+    let peer = resolve_peer("ping", "pong");
     let mut reply = ipc::Message::new(0, b"");
+
     loop {
-        interrupts::enable_irq();
-        pl011::write_str("IPC TASK=4 SEND PING (SVC)\r\n");
-        syscall::send(PONG_TASK_ID, &ipc::Message::new(current_task_id(), b"PING"));
+        pl011::write_str("IPC ping SEND PING (SVC)\r\n");
+        syscall::send(peer, &ipc::Message::new(current_task_id(), b"PING"));
 
         // Blocks here until pong answers.
         syscall::receive(&mut reply);
-        pl011::write_str("IPC TASK=4 RECV ");
+        pl011::write_str("IPC ping RECV ");
         pl011::write_str(core::str::from_utf8(reply.text()).unwrap_or("?"));
         pl011::write_str(" (SVC)\r\n");
 
@@ -449,19 +474,22 @@ extern "C" fn ipc_ping() -> ! {
 }
 
 extern "C" fn ipc_pong() -> ! {
+    interrupts::enable_irq();
+    // reply goes to message.sender, so pong only needs to register itself
+    resolve_peer("pong", "ping");
     let mut message = ipc::Message::new(0, b"");
+
     loop {
-        interrupts::enable_irq();
         // Do other "work" first; the ping sits in our mailbox meanwhile.
         syscall::sleep(200);
 
         // Blocks here until ping arrives.
         syscall::receive(&mut message);
-        pl011::write_str("IPC TASK=5 RECV ");
+        pl011::write_str("IPC pong RECV ");
         pl011::write_str(core::str::from_utf8(message.text()).unwrap_or("?"));
         pl011::write_str(" (SVC)\r\n");
 
-        pl011::write_str("IPC TASK=5 SEND PONG (SVC)\r\n");
+        pl011::write_str("IPC pong SEND PONG (SVC)\r\n");
         syscall::send(
             message.sender,
             &ipc::Message::new(current_task_id(), b"PONG"),
