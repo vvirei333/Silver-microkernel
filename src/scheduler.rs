@@ -3,7 +3,7 @@ use core::cell::UnsafeCell;
 use alloc::vec::Vec;
 
 use crate::{
-    frame_allocator, interrupts,
+    frame_allocator, interrupts, ipc,
     memory::{MemoryRegion, PAGE_SIZE},
     mutex, pl011, timer,
 };
@@ -104,6 +104,9 @@ pub fn init() {
     let _holder_id = spawn_inner(mutex_holder);
     let _contender_1_id = spawn_inner(mutex_contender);
     let _contender_2_id = spawn_inner(mutex_contender);
+    // IDs 4 and 5: ipc_ping relies on this spawn order for its peer address.
+    let _ping_id = spawn_inner(ipc_ping);
+    let _pong_id = spawn_inner(ipc_pong);
     let _sleeper_id = spawn_inner(sleeping_task);
 
     let manager = scheduler_manager().unwrap();
@@ -414,19 +417,53 @@ extern "C" fn mutex_holder() -> ! {
 extern "C" fn mutex_contender() -> ! {
     loop {
         interrupts::enable_irq();
-        pl011::write_str("MUTEX TASK=");
-        pl011::write_hex_u64(current_task_id());
-        pl011::write_str(" TRY\r\n");
         {
             let mut counter = COUNTER.lock();
             *counter += 1;
-            pl011::write_str("MUTEX TASK=");
-            pl011::write_hex_u64(current_task_id());
-            pl011::write_str(" COUNTER=");
-            pl011::write_hex_u64(*counter);
-            pl011::write_str("\r\n");
+            // One byte per successful lock keeps the UART log readable
+            // next to the IPC demo lines.
+            pl011::write_byte(b'0' + current_task_id() as u8);
         }
         sleep(100);
+    }
+}
+
+/// Peer ID of ipc_pong, fixed by the spawn order in init().
+const PONG_TASK_ID: u64 = 5;
+
+extern "C" fn ipc_ping() -> ! {
+    loop {
+        interrupts::enable_irq();
+        pl011::write_str("IPC TASK=4 SEND PING\r\n");
+        ipc::send(PONG_TASK_ID, ipc::Message::new(current_task_id(), b"PING"));
+
+        // Blocks here until pong answers.
+        let reply = ipc::receive();
+        pl011::write_str("IPC TASK=4 RECV ");
+        pl011::write_str(core::str::from_utf8(reply.text()).unwrap_or("?"));
+        pl011::write_str("\r\n");
+
+        sleep(300);
+    }
+}
+
+extern "C" fn ipc_pong() -> ! {
+    loop {
+        interrupts::enable_irq();
+        // Do other "work" first; the ping sits in our mailbox meanwhile.
+        sleep(200);
+
+        // Blocks here until ping arrives.
+        let message = ipc::receive();
+        pl011::write_str("IPC TASK=5 RECV ");
+        pl011::write_str(core::str::from_utf8(message.text()).unwrap_or("?"));
+        pl011::write_str("\r\n");
+
+        pl011::write_str("IPC TASK=5 SEND PONG\r\n");
+        ipc::send(
+            message.sender,
+            ipc::Message::new(current_task_id(), b"PONG"),
+        );
     }
 }
 

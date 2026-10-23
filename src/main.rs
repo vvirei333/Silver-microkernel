@@ -15,6 +15,8 @@ mod gic;
 #[cfg(not(feature = "std"))]
 mod interrupts;
 #[cfg(not(feature = "std"))]
+mod ipc;
+#[cfg(not(feature = "std"))]
 mod memory;
 #[cfg(not(feature = "std"))]
 mod mutex;
