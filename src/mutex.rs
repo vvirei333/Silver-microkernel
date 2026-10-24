@@ -1,22 +1,19 @@
-//! Blocking mutex: a contending task sleeps in a FIFO wait queue instead of
-//! spinning. Single-CPU design — all state changes happen with IRQs disabled,
-//! which is our critical-section mechanism until SMP arrives.
+//! Blocking mutex with FIFO waiters and explicit ownership tracking.
+//! Single-CPU design — all state changes happen with IRQs disabled.
 
-use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 
-use crate::{interrupts, scheduler};
+use crate::{interrupts, scheduler, wait_queue::WaitQueue};
 
 pub struct Mutex<T> {
     value: UnsafeCell<T>,
     state: UnsafeCell<MutexState>,
 }
 
-struct MutexState {
-    locked: bool,
-    /// Task IDs currently blocked on this mutex, in FIFO order.
-    waiters: Vec<u64>,
+pub(crate) struct MutexState {
+    owner: Option<u64>,
+    waiters: WaitQueue,
 }
 
 unsafe impl<T> Sync for Mutex<T> {}
@@ -26,56 +23,61 @@ impl<T> Mutex<T> {
         Self {
             value: UnsafeCell::new(value),
             state: UnsafeCell::new(MutexState {
-                locked: false,
-                waiters: Vec::new(),
+                owner: None,
+                waiters: WaitQueue::new(),
             }),
         }
     }
 
-    /// Acquires the mutex, blocking the current task until it is available.
     pub fn lock(&self) -> MutexGuard<'_, T> {
         self.raw_lock();
         MutexGuard { mutex: self }
     }
 
-    /// Acquires the mutex without returning a guard; pair with raw_unlock().
-    /// Used by the syscall layer, where the critical section spans several
-    /// system calls and no guard can live across the SVC boundary.
+    /// Acquires without a guard; ownership is registered with the current
+    /// task so an exit cannot leave this mutex locked forever.
     pub fn raw_lock(&self) {
         loop {
             let saved_daif = interrupts::save_and_disable_irq();
             let state = unsafe { &mut *self.state.get() };
+            let id = scheduler::current_task_id();
 
-            if !state.locked {
-                state.locked = true;
+            if state.owner.is_none() {
+                state.owner = Some(id);
+                scheduler::register_mutex(self.state.get());
                 interrupts::restore_irq(saved_daif);
                 return;
             }
 
-            // Contended: enqueue ourselves once, then block until woken.
-            let id = scheduler::current_task_id();
-            if !state.waiters.contains(&id) {
-                state.waiters.push(id);
-            }
-            scheduler::block_current();
+            scheduler::block_current_on(&state.waiters);
             interrupts::restore_irq(saved_daif);
-            // Woken by an unlock — loop back and try to acquire again.
         }
     }
 
-    /// Releases a mutex acquired with raw_lock(). Debug-asserts it is held.
     pub fn raw_unlock(&self) {
         let saved_daif = interrupts::save_and_disable_irq();
         let state = unsafe { &mut *self.state.get() };
-        debug_assert!(state.locked, "unlocking a mutex that is not locked");
-        state.locked = false;
+        let id = scheduler::current_task_id();
+        debug_assert_eq!(state.owner, Some(id), "unlock by a non-owner");
+        state.owner = None;
+        scheduler::unregister_mutex(self.state.get());
 
-        if !state.waiters.is_empty() {
-            let id = state.waiters.remove(0);
-            scheduler::wake_task(id);
+        if let Some(waiter) = state.waiters.pop() {
+            scheduler::wake_task(waiter);
         }
         interrupts::restore_irq(saved_daif);
     }
+}
+
+/// Releases a mutex during task reaping. The caller removes the pointer from
+/// the dying task itself; only the next waiter needs to be returned here.
+pub(crate) unsafe fn release_owner(state: *mut MutexState, owner: u64) -> Option<u64> {
+    let state = unsafe { &mut *state };
+    if state.owner != Some(owner) {
+        return None;
+    }
+    state.owner = None;
+    state.waiters.pop()
 }
 
 pub struct MutexGuard<'a, T> {
@@ -83,8 +85,6 @@ pub struct MutexGuard<'a, T> {
 }
 
 impl<'a, T> MutexGuard<'a, T> {
-    /// The mutex this guard belongs to. Used by `Condvar::wait` to
-    /// re-acquire the lock after being woken.
     pub fn mutex(&self) -> &'a Mutex<T> {
         self.mutex
     }

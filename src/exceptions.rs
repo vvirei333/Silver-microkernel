@@ -1,4 +1,4 @@
-use crate::{mmu, pl011, scheduler};
+use crate::{pl011, scheduler, user_memory};
 
 #[no_mangle]
 pub extern "C" fn silver_handle_task_fault(esr: u64, elr: u64, far: u64) -> ! {
@@ -23,12 +23,12 @@ pub extern "C" fn silver_handle_task_fault(esr: u64, elr: u64, far: u64) -> ! {
         let Some(address) = sp_el0.checked_add(index * 8) else {
             break;
         };
-        if !mmu::valid_user_slice(address, 8) {
+        let mut bytes = [0_u8; 8];
+        if user_memory::copy_from_user(address, &mut bytes).is_err() {
             pl011::write_str("<unmapped>");
             break;
         }
-        let value = unsafe { core::ptr::read_volatile(address as *const u64) };
-        pl011::write_hex_u64(value);
+        pl011::write_hex_u64(u64::from_le_bytes(bytes));
         pl011::write_str(" ");
     }
     pl011::write_str("\r\n");

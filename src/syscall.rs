@@ -8,9 +8,9 @@
 //! exceptions that overwrite the CPU-global ELR_EL1/SPSR_EL1 registers.
 //! The per-task stack copy is what makes eret land back in the right task.
 
-use alloc::vec::Vec;
+use alloc::{vec, vec::Vec};
 
-use crate::{channel, ipc, mmu, mutex, pl011, scheduler};
+use crate::{channel, ipc, mmu, mutex, pl011, scheduler, user_memory};
 
 pub const SYS_SLEEP: u64 = 1;
 pub const SYS_SEND: u64 = 2;
@@ -25,6 +25,10 @@ pub const SYS_MUTEX_LOCK: u64 = 10;
 pub const SYS_MUTEX_UNLOCK: u64 = 11;
 pub const SYS_CHAN_SEND: u64 = 12;
 pub const SYS_CHAN_RECV: u64 = 13;
+pub const SYS_SPAWN: u64 = 14;
+pub const SYS_EXIT: u64 = 15;
+pub const SYS_UNREGISTER: u64 = 16;
+pub const SYS_TASK_ALIVE: u64 = 17;
 
 /// Well-known task ID of the nameserver. Fixed by spawn order: the scheduler
 /// spawns it first, right after idle (which is always ID 0).
@@ -45,13 +49,6 @@ const FRAME_QUADWORDS: usize = 33;
 /// the lock is raw (no guard can survive the SVC round trips).
 static DEMO_MUTEX: mutex::Mutex<()> = mutex::Mutex::new(());
 static DEMO_CHANNEL: channel::Channel<u64> = channel::Channel::new(2);
-
-/// Accept only pages mapped in the current task's TTBR0: its own ELF image,
-/// fixed-VA stack, or private page. The kernel dereferences the pointer through
-/// that same TTBR0 while TTBR1 keeps privileged state only at high VAs.
-fn valid_task_slice(ptr: u64, len: u64) -> bool {
-    mmu::valid_user_slice(ptr, len)
-}
 
 /// Entry point for the SVC trampoline. `frame` points at the saved register
 /// bank on the kernel stack; the result is written into frame[0] (x0).
@@ -92,6 +89,10 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             0
         }
         SYS_CHAN_RECV => DEMO_CHANNEL.receive(),
+        SYS_SPAWN => scheduler::spawn_user(frame[0], frame[1]).unwrap_or(SYSCALL_ERROR),
+        SYS_EXIT => scheduler::exit_current(),
+        SYS_UNREGISTER => sys_unregister_name(frame[0]),
+        SYS_TASK_ALIVE => u64::from(scheduler::task_alive(frame[0])),
         _ => SYSCALL_ERROR,
     };
 
@@ -102,31 +103,51 @@ fn sys_print(ptr: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    if !valid_task_slice(ptr, len) {
+    if len > 4096 {
         return SYSCALL_ERROR;
     }
-    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
-    pl011::write_bytes(bytes);
+    let mut bytes = vec![0_u8; len as usize];
+    if user_memory::copy_from_user(ptr, &mut bytes).is_err() {
+        return SYSCALL_ERROR;
+    }
+    pl011::write_bytes(&bytes);
     0
 }
 
 fn sys_send(target: u64, message_ptr: u64) -> u64 {
-    let size = core::mem::size_of::<ipc::Message>() as u64;
-    if !valid_task_slice(message_ptr, size) {
+    let mut message = ipc::Message {
+        sender: 0,
+        payload: [0; ipc::PAYLOAD_SIZE],
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts_mut(
+            (&mut message as *mut ipc::Message).cast::<u8>(),
+            core::mem::size_of::<ipc::Message>(),
+        )
+    };
+    if user_memory::copy_from_user(message_ptr, bytes).is_err() {
         return SYSCALL_ERROR;
     }
-    let message = unsafe { core::ptr::read(message_ptr as *const ipc::Message) };
     ipc::send(target, message);
     0
 }
 
 fn sys_receive(buffer_ptr: u64) -> u64 {
     let size = core::mem::size_of::<ipc::Message>() as u64;
-    if !valid_task_slice(buffer_ptr, size) {
+    // Reject before blocking; copy_to_user checks again after the wakeup.
+    if !mmu::valid_user_slice_mut(buffer_ptr, size) {
         return SYSCALL_ERROR;
     }
     let message = ipc::receive();
-    unsafe { core::ptr::write(buffer_ptr as *mut ipc::Message, message) };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&message as *const ipc::Message).cast::<u8>(),
+            core::mem::size_of::<ipc::Message>(),
+        )
+    };
+    if user_memory::copy_to_user(bytes, buffer_ptr).is_err() {
+        return SYSCALL_ERROR;
+    }
     0
 }
 
@@ -135,7 +156,7 @@ fn sys_receive(buffer_ptr: u64) -> u64 {
 // for the reply. The nameserver itself never calls these.
 
 fn sys_register_name(name_ptr: u64) -> u64 {
-    let Some(name) = (unsafe { read_name(name_ptr) }) else {
+    let Some(name) = read_name(name_ptr) else {
         return SYSCALL_ERROR;
     };
     let Some(request) = build_request(b"R ", &name) else {
@@ -143,7 +164,24 @@ fn sys_register_name(name_ptr: u64) -> u64 {
     };
 
     ipc::send(NAMESERVER_ID, request);
-    let reply = ipc::receive();
+    let reply = ipc::receive_from(NAMESERVER_ID);
+    if reply.text() == &b"OK"[..] {
+        0
+    } else {
+        SYSCALL_ERROR
+    }
+}
+
+fn sys_unregister_name(name_ptr: u64) -> u64 {
+    let Some(name) = read_name(name_ptr) else {
+        return SYSCALL_ERROR;
+    };
+    let Some(request) = build_request(b"U ", &name) else {
+        return SYSCALL_ERROR;
+    };
+
+    ipc::send(NAMESERVER_ID, request);
+    let reply = ipc::receive_from(NAMESERVER_ID);
     if reply.text() == &b"OK"[..] {
         0
     } else {
@@ -152,7 +190,7 @@ fn sys_register_name(name_ptr: u64) -> u64 {
 }
 
 fn sys_lookup_name(name_ptr: u64) -> u64 {
-    let Some(name) = (unsafe { read_name(name_ptr) }) else {
+    let Some(name) = read_name(name_ptr) else {
         return 0;
     };
     let Some(request) = build_request(b"L ", &name) else {
@@ -160,37 +198,19 @@ fn sys_lookup_name(name_ptr: u64) -> u64 {
     };
 
     ipc::send(NAMESERVER_ID, request);
-    let reply = ipc::receive();
+    let reply = ipc::receive_from(NAMESERVER_ID);
     match parse_id_reply(&reply) {
         Some(id) => id,
         None => 0,
     }
 }
 
-/// Reads a NUL-terminated name from task memory, capped at NAME_LIMIT bytes.
-///
-/// # Safety
-/// The pointer must be valid for reads up to and including the NUL byte.
-unsafe fn read_name(ptr: u64) -> Option<Vec<u8>> {
-    if !valid_task_slice(ptr, NAME_LIMIT as u64 + 1) {
-        return None;
-    }
-
-    let bytes = ptr as *const u8;
-    let mut name = Vec::new();
-    for offset in 0..NAME_LIMIT {
-        let byte = unsafe { core::ptr::read(bytes.add(offset)) };
-        if byte == 0 {
-            return Some(name);
-        }
-        name.push(byte);
-    }
-    // Exactly NAME_LIMIT bytes long: valid only if the next byte is the NUL.
-    if unsafe { core::ptr::read(bytes.add(NAME_LIMIT)) } == 0 {
-        Some(name)
-    } else {
-        None
-    }
+/// Copies a bounded NUL-terminated name from task memory.
+fn read_name(ptr: u64) -> Option<Vec<u8>> {
+    let mut bytes = [0_u8; NAME_LIMIT + 1];
+    user_memory::copy_from_user(ptr, &mut bytes).ok()?;
+    let end = bytes.iter().position(|byte| *byte == 0)?;
+    Some(bytes[..end].to_vec())
 }
 
 fn build_request(prefix: &[u8], name: &[u8]) -> Option<ipc::Message> {

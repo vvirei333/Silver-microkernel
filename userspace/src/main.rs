@@ -3,18 +3,20 @@
 
 mod demos;
 mod ipc;
-mod nameserver;
 mod syscall;
 
 use core::panic::PanicInfo;
 
-/// One separately linked ELF contains all demo roles. The kernel loads an
-/// independent copy for each task; task_id selects the role at runtime.
+pub const ROLE_LIFECYCLE_SUPERVISOR: u64 = 17;
+pub const ROLE_LIFECYCLE_CHILD: u64 = 18;
+pub const ROLE_COPYOUT_PROBE: u64 = 19;
+
+/// The kernel passes one argument in x0. Demo selection no longer depends on
+/// task ID: dynamically spawned copies can choose any role independently.
 #[no_mangle]
 #[link_section = ".text._start"]
-pub extern "C" fn _start() -> ! {
-    match syscall::task_id() {
-        1 => nameserver::run(),
+pub extern "C" fn _start(argument: u64) -> ! {
+    match argument {
         2 => demos::mutex_holder(),
         3 | 4 => demos::mutex_contender(),
         5 => demos::ipc_ping(),
@@ -29,6 +31,9 @@ pub extern "C" fn _start() -> ! {
         14 => demos::vm_task_b(),
         15 => demos::isolation_probe(),
         16 => demos::kernel_image_probe(),
+        ROLE_LIFECYCLE_SUPERVISOR => demos::lifecycle_supervisor(),
+        ROLE_LIFECYCLE_CHILD => demos::lifecycle_child(),
+        ROLE_COPYOUT_PROBE => demos::copyout_probe(),
         _ => demos::unknown_task(),
     }
 }

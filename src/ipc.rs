@@ -71,23 +71,46 @@ pub fn send(target: u64, message: Message) {
     mailbox.condvar.notify_one();
 }
 
-/// Blocks until a message for the current task arrives and returns it.
+/// Blocks until any message for the current task arrives.
 pub fn receive() -> Message {
+    receive_matching(None)
+}
+
+/// Receives only a message from `sender`, preserving unrelated queued
+/// messages. Nameserver RPC uses this so a concurrent PING cannot be mistaken
+/// for a lookup response and discarded.
+pub fn receive_from(sender: u64) -> Message {
+    receive_matching(Some(sender))
+}
+
+fn receive_matching(sender: Option<u64>) -> Message {
     let id = scheduler::current_task_id();
     let mut guard = IPC.lock();
 
     loop {
         let index = mailbox_index(&mut guard, id);
-        if let Some(message) = guard.mailboxes[index].queue.pop_front() {
+        let mailbox = &mut guard.mailboxes[index];
+        let position = mailbox.queue.iter().position(|message| {
+            sender
+                .map(|expected| message.sender == expected)
+                .unwrap_or(true)
+        });
+        if let Some(message) = position.and_then(|index| mailbox.queue.remove(index)) {
             return message;
         }
 
-        // Sleep on this mailbox's condvar: releases the lock, blocks, and
-        // re-acquires it. The condvar lives in a Box, so this pointer stays
-        // valid even if the mailboxes Vec relocates while we sleep.
+        // Sleep on this mailbox's condvar: unrelated messages may wake us,
+        // but remain queued until the matching reply or normal receive arrives.
         let condvar = &*guard.mailboxes[index].condvar as *const Condvar;
         guard = unsafe { (*condvar).wait(guard) };
     }
+}
+
+/// Drops the exited task's queued messages and mailbox. Only the owner can
+/// block on a mailbox, so a running task cannot be waiting in its own queue.
+pub fn remove_task(owner: u64) {
+    let mut state = IPC.lock();
+    state.mailboxes.retain(|mailbox| mailbox.owner != owner);
 }
 
 fn mailbox_index(state: &mut IpcState, owner: u64) -> usize {

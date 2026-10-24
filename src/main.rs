@@ -39,7 +39,11 @@ mod syscall;
 #[cfg(not(feature = "std"))]
 mod timer;
 #[cfg(not(feature = "std"))]
+mod user_memory;
+#[cfg(not(feature = "std"))]
 mod user_program;
+#[cfg(not(feature = "std"))]
+mod wait_queue;
 
 #[cfg(not(feature = "std"))]
 use core::panic::PanicInfo;
@@ -152,7 +156,7 @@ _start:
     isb
     mrs x0, sctlr_el1
     orr x0, x0, #1
-    bic x0, x0, #(1 << 22)  // PAN off: SVC handlers copy user buffers
+    orr x0, x0, #(1 << 22)  // PAN on: user access requires LDTR/STTR
     msr sctlr_el1, x0
     isb
     tlbi vmalle1

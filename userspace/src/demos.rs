@@ -211,6 +211,83 @@ pub fn kernel_image_probe() -> ! {
     }
 }
 
+pub fn lifecycle_supervisor() -> ! {
+    const NAME: &str = "lifecycle";
+    syscall::sleep(1000);
+    syscall::print("LIFECYCLE SPAWN demo arg=18\r\n");
+    let Some(child) = syscall::spawn(syscall::PROGRAM_DEMO, 18) else {
+        syscall::print("LIFECYCLE SPAWN=FAIL\r\n");
+        loop {
+            syscall::sleep(1000);
+        }
+    };
+    syscall::print("LIFECYCLE CHILD ID=");
+    syscall::print_dec_u64(child);
+    syscall::print("\r\n");
+
+    let mut saw_registration = false;
+    let mut exited = false;
+    for _ in 0..100 {
+        if syscall::lookup(NAME) == Some(child) {
+            saw_registration = true;
+        }
+        if saw_registration && !syscall::task_alive(child) {
+            exited = true;
+            break;
+        }
+        syscall::sleep(50);
+    }
+
+    if !saw_registration || !exited || syscall::lookup(NAME).is_some() {
+        syscall::print("LIFECYCLE EXIT/UNREGISTER=FAIL\r\n");
+    } else {
+        syscall::print("LIFECYCLE EXIT/UNREGISTER=PASS\r\n");
+    }
+
+    // The child intentionally exits while owning the demo mutex. Reaping
+    // must release it and wake a waiter instead of deadlocking the kernel.
+    syscall::mutex_lock();
+    syscall::print("LIFECYCLE MUTEX CLEANUP=PASS\r\n");
+    syscall::mutex_unlock();
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+pub fn lifecycle_child() -> ! {
+    syscall::print("LIFECYCLE CHILD ARG=18\r\n");
+    if !syscall::register("lifecycle") {
+        syscall::print("LIFECYCLE CHILD REGISTER=FAIL\r\n");
+    }
+    syscall::sleep(500);
+    if !syscall::unregister("lifecycle") {
+        syscall::print("LIFECYCLE CHILD UNREGISTER=FAIL\r\n");
+    }
+    syscall::mutex_lock();
+    syscall::print("LIFECYCLE CHILD EXIT HOLDING MUTEX\r\n");
+    syscall::exit()
+}
+
+static READ_ONLY_MESSAGE: ipc::Message = ipc::Message {
+    sender: 0,
+    payload: [0; ipc::PAYLOAD_SIZE],
+};
+
+pub fn copyout_probe() -> ! {
+    let read_only = &READ_ONLY_MESSAGE as *const ipc::Message as *mut ipc::Message;
+    if unsafe { syscall::receive_raw(read_only) } {
+        syscall::print("COPYOUT READONLY REJECT=FAIL\r\n");
+    } else {
+        syscall::print("COPYOUT READONLY REJECT=PASS\r\n");
+    }
+    if unsafe { syscall::receive_raw(0x40 as *mut ipc::Message) } {
+        syscall::print("COPYOUT UNMAPPED REJECT=FAIL\r\n");
+    } else {
+        syscall::print("COPYOUT UNMAPPED REJECT=PASS\r\n");
+    }
+    syscall::exit()
+}
+
 pub fn unknown_task() -> ! {
     syscall::print("UNKNOWN USER TASK\r\n");
     loop {

@@ -26,12 +26,18 @@ fn main() {
         .expect("failed to invoke userspace cargo build");
     assert!(status.success(), "userspace ELF build failed");
 
-    let elf = target_dir
-        .join("aarch64-unknown-none")
-        .join(&profile)
-        .join("silver_userspace");
-    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("silver_userspace.elf");
-    fs::copy(&elf, &out).unwrap_or_else(|error| {
-        panic!("failed to embed {}: {error}", elf.display());
-    });
+    let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    for (binary, embedded) in [
+        ("silver_userspace", "silver_userspace.elf"),
+        ("nameserver", "silver_nameserver.elf"),
+    ] {
+        let elf = target_dir
+            .join("aarch64-unknown-none")
+            .join(&profile)
+            .join(binary);
+        let out = out_dir.join(embedded);
+        fs::copy(&elf, &out).unwrap_or_else(|error| {
+            panic!("failed to embed {}: {error}", elf.display());
+        });
+    }
 }

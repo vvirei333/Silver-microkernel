@@ -1,3 +1,5 @@
+#![allow(dead_code)] // Each executable uses a subset of the shared syscall API.
+
 use crate::ipc;
 
 const SYS_SLEEP: u64 = 1;
@@ -13,7 +15,13 @@ const SYS_MUTEX_LOCK: u64 = 10;
 const SYS_MUTEX_UNLOCK: u64 = 11;
 const SYS_CHAN_SEND: u64 = 12;
 const SYS_CHAN_RECV: u64 = 13;
+const SYS_SPAWN: u64 = 14;
+const SYS_EXIT: u64 = 15;
+const SYS_UNREGISTER: u64 = 16;
+const SYS_TASK_ALIVE: u64 = 17;
 
+pub const PROGRAM_DEMO: u64 = 0;
+pub const PROGRAM_NAMESERVER: u64 = 1;
 const SYSCALL_ERROR: u64 = u64::MAX;
 const NAME_LIMIT: usize = ipc::PAYLOAD_SIZE - 2;
 
@@ -25,8 +33,14 @@ pub fn send(target: u64, message: &ipc::Message) {
     unsafe { syscall2(SYS_SEND, target, message as *const ipc::Message as u64) };
 }
 
-pub fn receive(buffer: &mut ipc::Message) {
-    unsafe { syscall1(SYS_RECEIVE, buffer as *mut ipc::Message as u64) };
+pub fn receive(buffer: &mut ipc::Message) -> bool {
+    unsafe { receive_raw(buffer as *mut ipc::Message) }
+}
+
+/// Raw variant used by permission tests. Returns false without blocking when
+/// the kernel rejects the output buffer.
+pub unsafe fn receive_raw(buffer: *mut ipc::Message) -> bool {
+    unsafe { syscall1(SYS_RECEIVE, buffer as u64) == 0 }
 }
 
 pub fn print(text: &str) {
@@ -61,11 +75,38 @@ pub fn channel_receive() -> u64 {
     unsafe { syscall0(SYS_CHAN_RECV) }
 }
 
+pub fn spawn(program: u64, argument: u64) -> Option<u64> {
+    let id = unsafe { syscall2(SYS_SPAWN, program, argument) };
+    if id == SYSCALL_ERROR {
+        None
+    } else {
+        Some(id)
+    }
+}
+
+pub fn exit() -> ! {
+    unsafe { syscall0(SYS_EXIT) };
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+pub fn task_alive(id: u64) -> bool {
+    unsafe { syscall1(SYS_TASK_ALIVE, id) != 0 }
+}
+
 pub fn register(name: &str) -> bool {
     if name.len() > NAME_LIMIT {
         return false;
     }
     with_nul(name, |ptr| unsafe { syscall1(SYS_REGISTER, ptr) }) == 0
+}
+
+pub fn unregister(name: &str) -> bool {
+    if name.len() > NAME_LIMIT {
+        return false;
+    }
+    with_nul(name, |ptr| unsafe { syscall1(SYS_UNREGISTER, ptr) }) == 0
 }
 
 pub fn lookup(name: &str) -> Option<u64> {

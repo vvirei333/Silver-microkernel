@@ -6,7 +6,8 @@ use crate::{
     elf_loader::{self, UserImage},
     frame_allocator, interrupts,
     memory::{phys_to_virt, virt_to_phys, MemoryRegion, PAGE_SIZE},
-    mmu, pl011, timer, user_program,
+    mmu, mutex, pl011, timer, user_program,
+    wait_queue::WaitQueue,
 };
 
 const TASK_STACK_PAGES: usize = 4;
@@ -71,6 +72,10 @@ pub struct Task {
     pub ttbr0: usize,
     /// Independently loaded ELF pages; released together with the address space.
     user_image: Option<UserImage>,
+    /// Queue containing this task while blocked, used for stale-waiter cleanup.
+    waiting_on: Option<*const WaitQueue>,
+    /// Mutexes owned by this task, released if it exits without unlocking.
+    owned_mutexes: Vec<*mut mutex::MutexState>,
 }
 
 pub struct TaskManager {
@@ -169,13 +174,13 @@ silver_context_switch:
     ret
     .size silver_context_switch, . - silver_context_switch
 
-// First entry for a fresh EL0 task. The context switch rets here at EL1h
-// with x19 = the task entry point (restored from the initial context) and
-// SP_EL0 already loaded. All this stub does is aim eret at the entry with
-// SPSR = EL0t and interrupts unmasked.
+// First entry for a fresh EL0 task. x19 holds the ELF entry and x20 the
+// userspace argument. The bootstrap passes the argument in x0, then erets to
+// EL0t with interrupts unmasked.
     .global silver_user_bootstrap
     .type silver_user_bootstrap, %function
 silver_user_bootstrap:
+    mov x0, x20
     msr elr_el1, x19
     mov x9, xzr
     msr spsr_el1, x9
@@ -198,27 +203,15 @@ pub fn init() {
     });
 
     // Idle always exists, so the CPU has somewhere to run when all tasks sleep.
-    // It stays at EL1: pure wfi loop, never blocks voluntarily, never syscalls.
     let _idle_id = spawn_kernel(idle_task);
-    // Userspace dispatches on task ID. Keep this order in sync with
-    // userspace/src/main.rs; nameserver must remain ID NAMESERVER_ID (1).
-    let _nameserver_id = spawn_user();
-    let _holder_id = spawn_user();
-    let _contender_1_id = spawn_user();
-    let _contender_2_id = spawn_user();
-    let _ping_id = spawn_user();
-    let _pong_id = spawn_user();
-    let _alpha_id = spawn_user();
-    let _beta_id = spawn_user();
-    let _probe_id = spawn_user();
-    let _producer_id = spawn_user();
-    let _consumer_id = spawn_user();
-    let _sleeper_id = spawn_user();
-    let _vm_a_id = spawn_user();
-    let _vm_b_id = spawn_user();
-    // Both probes must die alone; every other task keeps running.
-    let _isolation_probe_id = spawn_user();
-    let _kernel_image_probe_id = spawn_user();
+    // Program IDs select an ELF; arguments select a role inside the demo ELF.
+    // Nameserver remains the first userspace task (ID 1) by protocol contract.
+    let _nameserver_id = spawn_user(user_program::NAMESERVER, 0);
+    for role in 2..=16 {
+        let _ = spawn_user(user_program::DEMO, role);
+    }
+    let _lifecycle_supervisor = spawn_user(user_program::DEMO, 17);
+    let _copyout_probe = spawn_user(user_program::DEMO, 19);
 
     let manager = scheduler_manager().unwrap();
     manager.current_index = manager
@@ -259,21 +252,31 @@ pub fn sleep(milliseconds: u64) {
     interrupts::restore_irq(saved_daif);
 }
 
-/// Marks the current task as Blocked and switches away. The task only runs
-/// again after wake_task() moves it back to the ready queue.
-pub fn block_current() {
-    let saved_daif = interrupts::save_and_disable_irq();
-
+/// Remembers a wait queue before its associated mutex is released.
+pub fn register_waiter(queue: &WaitQueue) {
     if let Some(task) = current_task_mut() {
+        task.waiting_on = Some(queue as *const WaitQueue);
+    }
+}
+
+/// Enqueues and blocks the current task. The queue pointer allows reaping to
+/// remove a dead waiter instead of leaving stale IDs behind.
+pub fn block_current_on(queue: &WaitQueue) {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let id = current_task_id();
+    queue.enqueue(id);
+    if let Some(task) = current_task_mut() {
+        task.waiting_on = Some(queue as *const WaitQueue);
         task.state = TaskState::Blocked;
     }
 
     schedule();
+    if let Some(task) = current_task_mut() {
+        task.waiting_on = None;
+    }
     interrupts::restore_irq(saved_daif);
 }
 
-/// Moves a blocked task back to the ready queue. No-op for tasks that are
-/// not blocked (e.g. a sleeper that was never enqueued).
 pub fn wake_task(id: u64) {
     let saved_daif = interrupts::save_and_disable_irq();
 
@@ -282,14 +285,31 @@ pub fn wake_task(id: u64) {
             if task.state == TaskState::Blocked {
                 task.state = TaskState::Ready;
             }
+            task.waiting_on = None;
         }
     }
 
     interrupts::restore_irq(saved_daif);
 }
 
+pub fn register_mutex(state: *mut mutex::MutexState) {
+    if let Some(task) = current_task_mut() {
+        if !task.owned_mutexes.contains(&state) {
+            task.owned_mutexes.push(state);
+        }
+    }
+}
+
+pub fn unregister_mutex(state: *mut mutex::MutexState) {
+    if let Some(task) = current_task_mut() {
+        task.owned_mutexes.retain(|owned| *owned != state);
+    }
+}
+
 /// Terminates the current task and switches to another runnable task.
 pub fn exit_current() -> ! {
+    let id = current_task_id();
+    crate::ipc::remove_task(id);
     let saved_daif = interrupts::save_and_disable_irq();
 
     if let Some(task) = current_task_mut() {
@@ -309,6 +329,17 @@ pub fn current_task_id() -> u64 {
         .and_then(|manager| manager.tasks.get(manager.current_index))
         .map(|task| task.id)
         .unwrap_or(0)
+}
+
+pub fn task_alive(id: u64) -> bool {
+    scheduler_manager()
+        .map(|manager| {
+            manager
+                .tasks
+                .iter()
+                .any(|task| task.id == id && task.state != TaskState::Dead)
+        })
+        .unwrap_or(false)
 }
 
 /// Switches from the boot context into the first task. This function never returns.
@@ -357,6 +388,11 @@ pub fn schedule() {
     // intend to die? reap may remove it from the Vec and reset
     // current_index to 0, after which tasks[current_index] is some innocent
     // task — checking its state would answer the wrong question.
+    let live_task_id = manager
+        .tasks
+        .get(manager.current_index)
+        .map(|task| task.id)
+        .unwrap_or(IDLE_TASK_ID);
     let live_is_dead = manager
         .tasks
         .get(manager.current_index)
@@ -378,16 +414,12 @@ pub fn schedule() {
     let Some(next_index) = find_next_task(manager) else {
         return;
     };
-    if next_index == current_index {
+    if next_index == current_index && !live_is_dead {
         return;
     }
 
     let tasks = manager.tasks.as_mut_ptr();
-    // The indices are different, so these are disjoint tasks.
-    let current_task = unsafe { &mut *tasks.add(current_index) };
     let next_task = unsafe { &mut *tasks.add(next_index) };
-
-    debug_assert_ne!(current_task.id, next_task.id);
     let saved_stack_pointer = next_task.context.stack_pointer as usize;
     if !next_task
         .stack
@@ -405,49 +437,52 @@ pub fn schedule() {
         panic!("bad saved stack pointer");
     }
 
+    let next_id = next_task.id;
+    let next_ttbr0 = next_task.ttbr0;
     next_task.state = TaskState::Running;
     manager.current_index = next_index;
 
-    // An exiting task's live context is garbage about to be abandoned.
-    // Park the mandatory "save" half of the switch in scratch memory so
-    // we never overwrite an innocent task's saved state with it.
+    // A dead task may have been removed before the only ready task (idle),
+    // making both indices zero. It must still switch, and its live context
+    // must go to scratch rather than overwriting idle's saved context.
     let current_context = if live_is_dead {
         unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CONTEXT) }
     } else {
-        &mut current_task.context
+        unsafe { &mut (*tasks.add(current_index)).context }
     };
+    let from_id = if live_is_dead {
+        live_task_id
+    } else {
+        unsafe { (*tasks.add(current_index)).id }
+    };
+    let current_ttbr0 = unsafe { (*tasks.add(current_index)).ttbr0 };
 
-    if next_task.ttbr0 != current_task.ttbr0 {
-        // TTBR1 keeps this high-half code and its kernel stack valid across
-        // the switch. Only the user half changes; the TLB flush prevents the
-        // next task from observing the previous task's low mappings.
-        mmu::switch_address_space(next_task.ttbr0);
+    if live_is_dead || next_ttbr0 != current_ttbr0 {
+        mmu::switch_address_space(next_ttbr0);
     }
 
     trace_switch(
-        current_task.id,
-        next_task.id,
+        from_id,
+        next_id,
         next_task.context.stack_pointer,
         next_task.context.elr,
     );
 
     unsafe {
-        silver_context_switch(
-            current_context as *mut TaskContext,
-            &next_task.context as *const TaskContext,
-        );
+        silver_context_switch(current_context, &next_task.context);
     }
 }
 
 fn spawn_kernel(entry: extern "C" fn() -> !) -> Option<u64> {
-    spawn_inner(Some(entry), false)
+    spawn_inner(Some(entry), None)
 }
 
-fn spawn_user() -> Option<u64> {
-    spawn_inner(None, true)
+/// Creates a userspace task from a registered ELF and passes `argument` in x0.
+pub fn spawn_user(program: u64, argument: u64) -> Option<u64> {
+    spawn_inner(None, Some((program, argument)))
 }
 
-fn spawn_inner(entry: Option<extern "C" fn() -> !>, user: bool) -> Option<u64> {
+fn spawn_inner(entry: Option<extern "C" fn() -> !>, user: Option<(u64, u64)>) -> Option<u64> {
     let manager = scheduler_manager()?;
     let id = manager.next_id;
     let task = Task::new(id, entry, user)?;
@@ -498,10 +533,32 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     }
 
     // Remember WHO owns the live CPU context before compacting the Vec.
-    // After retain() the old index may be stale or point at a different
-    // task; without this, schedule() would save the live context into an
-    // innocent task and corrupt its stack pointer.
     let live_id = manager.tasks.get(manager.current_index).map(|task| task.id);
+
+    // Remove stale waiters and release locks before freeing any task pages.
+    let mut wake = Vec::new();
+    for task in manager
+        .tasks
+        .iter_mut()
+        .filter(|task| task.state == TaskState::Dead)
+    {
+        if let Some(queue) = task.waiting_on.take() {
+            unsafe { &*queue }.remove(task.id);
+        }
+        wake.extend(task.release_mutexes());
+    }
+    for id in wake {
+        if let Some(task) = manager
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == id && task.state != TaskState::Dead)
+        {
+            if task.state == TaskState::Blocked {
+                task.state = TaskState::Ready;
+            }
+            task.waiting_on = None;
+        }
+    }
 
     manager.tasks.retain(|task| {
         if task.state == TaskState::Dead {
@@ -529,10 +586,10 @@ fn current_task_mut() -> Option<&'static mut Task> {
 }
 
 impl Task {
-    fn new(id: u64, entry: Option<extern "C" fn() -> !>, user: bool) -> Option<Self> {
+    fn new(id: u64, entry: Option<extern "C" fn() -> !>, user: Option<(u64, u64)>) -> Option<Self> {
         let stack_start = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES)?;
 
-        let user_stack = if user {
+        let user_stack = if user.is_some() {
             let Some(user_start) = frame_allocator::alloc_contiguous_pages(TASK_USER_STACK_PAGES)
             else {
                 release_pages(stack_start, TASK_STACK_PAGES);
@@ -551,8 +608,8 @@ impl Task {
             return None;
         };
 
-        let user_image = if user {
-            let Some(image) = elf_loader::load(user_program::DEMO_ELF) else {
+        let user_image = if let Some((program, _)) = user {
+            let Some(image) = user_program::image(program).and_then(elf_loader::load) else {
                 frame_allocator::free_page(private_page);
                 if !user_stack.is_empty() {
                     release_pages(user_stack.start, TASK_USER_STACK_PAGES);
@@ -586,14 +643,14 @@ impl Task {
         } else {
             entry.expect("kernel task entry is required") as usize as u64
         };
-        context.elr = if user {
-            // Return to high EL1 bootstrap, then eret to this task's own ELF.
+        context.registers[1] = user.map_or(0, |(_, argument)| argument); // x20 -> user x0
+        context.elr = if user.is_some() {
             silver_user_bootstrap as *const () as usize as u64
         } else {
             entry.expect("kernel task entry is required") as usize as u64
         };
         context.stack_pointer = phys_to_virt(stack.end) as u64;
-        context.user_stack_pointer = if user {
+        context.user_stack_pointer = if user.is_some() {
             (mmu::USER_STACK_VA + mmu::USER_STACK_SIZE) as u64
         } else {
             0
@@ -607,7 +664,19 @@ impl Task {
             user_stack,
             ttbr0,
             user_image,
+            waiting_on: None,
+            owned_mutexes: Vec::new(),
         })
+    }
+
+    fn release_mutexes(&mut self) -> Vec<u64> {
+        let mut wake = Vec::new();
+        for state in self.owned_mutexes.drain(..) {
+            if let Some(waiter) = unsafe { mutex::release_owner(state, self.id) } {
+                wake.push(waiter);
+            }
+        }
+        wake
     }
 
     fn release_stack(&self) {

@@ -31,8 +31,10 @@ pub fn run() -> ! {
     loop {
         let mut request = ipc::Message::new(0, b"");
         syscall::receive(&mut request);
+        purge_dead(&mut table);
         let reply = match request.text().split_first() {
             Some((&b'R', name)) if !name.is_empty() => register(&mut table, name, request.sender),
+            Some((&b'U', name)) if !name.is_empty() => unregister(&mut table, name, request.sender),
             Some((&b'L', name)) if !name.is_empty() => lookup(&table, name),
             _ => text_reply(b"WHAT?"),
         };
@@ -56,6 +58,28 @@ fn register(table: &mut [Entry], name: &[u8], id: u64) -> ipc::Message {
     syscall::print(core::str::from_utf8(name).unwrap_or("?"));
     syscall::print("\r\n");
     text_reply(b"OK")
+}
+
+fn unregister(table: &mut [Entry], name: &[u8], owner: u64) -> ipc::Message {
+    let Some(entry) = table
+        .iter_mut()
+        .find(|entry| entry.used && entry.name() == name && entry.id == owner)
+    else {
+        return text_reply(b"MISSING");
+    };
+    entry.used = false;
+    syscall::print("NAMESERVER UNREG ");
+    syscall::print(core::str::from_utf8(name).unwrap_or("?"));
+    syscall::print("\r\n");
+    text_reply(b"OK")
+}
+
+fn purge_dead(table: &mut [Entry]) {
+    for entry in table.iter_mut().filter(|entry| entry.used) {
+        if !syscall::task_alive(entry.id) {
+            entry.used = false;
+        }
+    }
 }
 
 fn lookup(table: &[Entry], name: &[u8]) -> ipc::Message {
