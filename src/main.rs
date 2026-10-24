@@ -7,6 +7,8 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 mod allocator;
 #[cfg(not(feature = "std"))]
+mod channel;
+#[cfg(not(feature = "std"))]
 mod condvar;
 #[cfg(not(feature = "std"))]
 mod exceptions;
@@ -28,6 +30,8 @@ mod nameserver;
 mod pl011;
 #[cfg(not(feature = "std"))]
 mod scheduler;
+#[cfg(not(feature = "std"))]
+mod semaphore;
 #[cfg(not(feature = "std"))]
 mod syscall;
 #[cfg(not(feature = "std"))]

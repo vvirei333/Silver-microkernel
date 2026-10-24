@@ -21,6 +21,7 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] System calls via `svc #0` (number in x8, arguments in x0-x5)
 - [x] Nameserver: tasks find each other by name (register/lookup syscalls)
 - [x] Condition variable: per-mailbox wait queues, targeted wakeups
+- [x] Counting semaphore + bounded channel with backpressure
 - [ ] Tasks in EL0 (Ring 3) with argument validation
 - [ ] MMU, virtual memory, task isolation
 - [ ] Drivers, processes, ELF loader
@@ -95,6 +96,8 @@ with `--no-default-features --features no_std`.
 | `src/syscall.rs` | System call table and `svc #0` wrappers |
 | `src/nameserver.rs` | Nameserver task: name → task ID registry over IPC |
 | `src/condvar.rs` | Condition variable: wait / notify_one / notify_all |
+| `src/semaphore.rs` | Counting semaphore on mutex + condvar |
+| `src/channel.rs` | Bounded channel: two semaphores + a mutex (backpressure) |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).

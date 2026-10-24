@@ -3,7 +3,7 @@ use core::cell::UnsafeCell;
 use alloc::vec::Vec;
 
 use crate::{
-    frame_allocator, interrupts, ipc,
+    channel, frame_allocator, interrupts, ipc,
     memory::{MemoryRegion, PAGE_SIZE},
     mutex, nameserver, pl011, syscall, timer,
 };
@@ -114,6 +114,8 @@ pub fn init() {
     let _alpha_id = spawn_inner(condvar_alpha);
     let _beta_id = spawn_inner(condvar_beta);
     let _probe_id = spawn_inner(condvar_probe);
+    let _producer_id = spawn_inner(channel_producer);
+    let _consumer_id = spawn_inner(channel_consumer);
     let _sleeper_id = spawn_inner(sleeping_task);
 
     let manager = scheduler_manager().unwrap();
@@ -570,5 +572,34 @@ extern "C" fn condvar_probe() -> ! {
 
     loop {
         syscall::sleep(1000);
+    }
+}
+
+/// Bounded channel demo: capacity 2, fast producer, slow consumer. The
+/// producer must block in `send` once two items are in flight — watch the
+/// log: TX can never lead RX by more than 2.
+static CHAN: channel::Channel<u64> = channel::Channel::new(2);
+
+extern "C" fn channel_producer() -> ! {
+    interrupts::enable_irq();
+    loop {
+        for item in 1..=5_u64 {
+            CHAN.send(item);
+            pl011::write_str("CHAN TX ");
+            pl011::write_dec_u64(item);
+            pl011::write_str("\r\n");
+        }
+    }
+}
+
+extern "C" fn channel_consumer() -> ! {
+    interrupts::enable_irq();
+    loop {
+        // Deliberately slow: this is what pushes the producer into the cap.
+        sleep(400);
+        let item = CHAN.receive();
+        pl011::write_str("CHAN RX ");
+        pl011::write_dec_u64(item);
+        pl011::write_str("\r\n");
     }
 }

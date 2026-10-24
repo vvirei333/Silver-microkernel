@@ -5,15 +5,17 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## State as of 2026-10-24
 
-Latest verified feature: **condition variable + per-mailbox IPC wait queues**.
-IPC moved from IRQ-masked global state to `Mutex<IpcState>` where every
-mailbox owns a `Condvar`; `send()` wakes exactly the waiters of the addressed
-mailbox. Demo proof: alpha and beta both block in `receive()`, probe sends to
-alpha only — log shows `alpha RECV WAKE` and then `beta silent = PASS`.
+Latest verified feature: **counting semaphore + bounded channel with
+backpressure**. The semaphore is built on mutex + condvar; the channel is
+the textbook composition — two semaphores (free slots / items) plus a short
+mutex critical section for the queue, never held while blocking. The demo
+(capacity 2, fast producer, slow consumer) shows TX never leading RX by more
+than two: `send` genuinely blocks on a full queue. The condvar targeted-
+wakeup test still passes alongside.
 Verification: `cargo build` (host) + bare-metal build + 6 seconds in QEMU
 with stable output (see README). Running simultaneously: the nameserver,
-the mutex demo, the IPC ping-pong over SVC (period ~300 ms), the condvar
-test and the sleep task (500 ms).
+the mutex demo, the IPC ping-pong over SVC, the condvar test, the channel
+demo and the sleep task.
 
 Always build like this:
 
@@ -115,8 +117,8 @@ lock; `notify_*` under the lock; re-check the condition after waking.
 2. **Nameserver extras:** unregister on task exit, duplicate-name policy
    (replace vs TAKEN), watch/notifications for "task appeared" instead of
    lookup polling.
-3. **Semaphore / channel abstraction** on top of mutex+condvar: bounded
-   queues with `send` blocking when full (natural pair for backpressure).
+3. **IPC on top of the channel:** mailbox payloads could ride a bounded
+   channel per task to get backpressure on message floods for free.
 4. **Tasks at EL0** (AArch64 "Ring 3"): separate SP_EL0, exception-return
    discipline lower-EL, then MMU isolation becomes meaningful.
 5. **MMU + TTBR0/TTBR1, page tables, stack isolation.** The biggest

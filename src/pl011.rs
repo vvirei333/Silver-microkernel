@@ -42,3 +42,21 @@ pub fn write_hex_u64(value: u64) {
         write_byte(byte);
     }
 }
+
+pub fn write_dec_u64(value: u64) {
+    let mut digits = [0_u8; 20];
+    let mut count = 0;
+    let mut rest = value;
+    loop {
+        digits[count] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        count += 1;
+        if rest == 0 {
+            break;
+        }
+    }
+    while count > 0 {
+        count -= 1;
+        write_byte(digits[count]);
+    }
+}
