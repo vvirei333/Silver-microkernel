@@ -10,7 +10,7 @@
 
 use alloc::vec::Vec;
 
-use crate::{channel, ipc, memory, mutex, pl011, scheduler};
+use crate::{channel, ipc, mmu, mutex, pl011, scheduler};
 
 pub const SYS_SLEEP: u64 = 1;
 pub const SYS_SEND: u64 = 2;
@@ -46,14 +46,12 @@ const FRAME_QUADWORDS: usize = 33;
 static DEMO_MUTEX: mutex::Mutex<()> = mutex::Mutex::new(());
 static DEMO_CHANNEL: channel::Channel<u64> = channel::Channel::new(2);
 
-/// A task-supplied buffer may live anywhere in DRAM (task stacks, user
-/// memory, statics) but never in the private VA window or MMIO: those VAs
-/// are not mapped in the kernel's own tables, so the kernel cannot touch
-/// them. Reject anything outside the DRAM identity range.
+/// Accept only ranges mapped in the current task's TTBR0: the shared
+/// read-only image, its own fixed-VA stack, or its private page. The kernel
+/// dereferences the pointer through that same TTBR0 while TTBR1 keeps all
+/// privileged state mapped only at high VAs.
 fn valid_task_slice(ptr: u64, len: u64) -> bool {
-    let base = memory::DRAM_BASE as u64;
-    let end = memory::DRAM_END as u64;
-    len <= 4096 && ptr >= base && ptr.checked_add(len).is_some_and(|last| last <= end)
+    mmu::valid_user_slice(ptr, len)
 }
 
 /// Entry point for the SVC trampoline. `frame` points at the saved register

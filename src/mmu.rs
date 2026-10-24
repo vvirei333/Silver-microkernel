@@ -1,29 +1,26 @@
-//! ARMv8-A MMU: identity map of the low MMIO gigabyte and the DRAM gigabyte,
-//! 4 KB granule, four-level translation tables with 2 MB block entries at
-//! level 2. On top of that, per-task address spaces: every task gets its own
-//! L0 — entry[0] chains to a user-accessible identity half of DRAM plus an
-//! EL1-only MMIO gigabyte, entry[1] points at a private gigabyte window
-//! (starting at PRIVATE_WINDOW_VA) backed by pages only that task can see.
+//! ARMv8-A MMU with a high-half kernel and per-task user address spaces.
 //!
-//! Coverage (virtual == physical for the identity windows):
-//!   0x0000_0000..0x4000_0000  device nGnRnE, EL1 only (GIC, UART)
-//!   0x4000_0000..0x8000_0000  normal WB; kernel tables EL1-RW, task
-//!                             tables EL0+EL1 RW (user tasks live here)
+//! TTBR1_EL1 maps physical memory at `KERNEL_VIRT_BASE + PA` for EL1 only:
+//! kernel code/data/stacks, page tables, the kernel heap, UART and GIC all
+//! live there. TTBR0_EL1 belongs to the current task and contains only what
+//! EL0 needs: a read-only low alias of the built-in text/rodata image, the
+//! task's own user stack, and one private data page. There are no kernel
+//! data or MMIO mappings in a task's TTBR0.
 //!
-//! Honest limitation: user tasks can still read/write all of DRAM,
-//! including kernel data, because their code is linked into the kernel
-//! image. What IS already enforced: MMIO is unreachable from EL0 (UART and
-//! GIC are syscall-only) and instruction-stream privilege — EL0 cannot
-//! execute MSR/MRS, touch TTBR/SCTLR, or skip the SVC boundary. Data
-//! confidentiality arrives with the ELF loader (separate user code).
+//! The text/rodata alias is a deliberate compatibility measure until user
+//! programs are separate ELF binaries. It is read-only and contains no
+//! writable kernel state; the ELF loader is the step that removes it.
 
-use crate::{frame_allocator, memory::DRAM_BASE};
+use crate::{
+    frame_allocator,
+    memory::{phys_to_virt, virt_to_phys, MemoryRegion, DRAM_BASE},
+};
 
 extern "C" {
     static __text_start: u8;
     static __text_end: u8;
     static __data_start: u8;
-    static __kernel_end: u8;
+    static __kernel_start: u8;
 }
 
 const ENTRIES: usize = 512;
@@ -35,80 +32,86 @@ const DESC_TABLE: u64 = 0b11;
 const DESC_BLOCK: u64 = 0b01;
 const DESC_PAGE: u64 = 0b11;
 
-/// VA that every task maps privately: L0 index 1, L1/L2/L3 index 0.
-/// Two tasks writing here hit two different physical pages.
+/// Private 4 KB data window: L0 index 1, then L1/L2/L3 index 0.
 pub const PRIVATE_WINDOW_VA: usize = 0x0000_0080_0000_0000;
+/// Every task's own stack appears at this user VA, backed by different PAs.
+pub const USER_STACK_VA: usize = 0x0000_0000_7FE0_0000;
+pub const USER_STACK_PAGES: usize = 2;
+pub const USER_STACK_SIZE: usize = USER_STACK_PAGES * GRANULE;
+const USER_STACK_L2_INDEX: usize = (USER_STACK_VA - DRAM_BASE) / BLOCK_2M;
 
-/// MAIR_EL1 attribute indexes (see MAIR_VALUE below).
-const ATTR_NORMAL: u64 = 0; // MAIR attr0 = 0xFF: Normal, inner+outer WB RW-allocate
-const ATTR_DEVICE: u64 = 1; // MAIR attr1 = 0x00: Device-nGnRnE
+const ATTR_NORMAL: u64 = 0;
+const ATTR_DEVICE: u64 = 1;
 
-const AP_EL1_RW: u64 = 0b00 << 6; // EL1 read/write, EL0 no access
-const AP_EL0_RW: u64 = 0b01 << 6; // EL1 + EL0 read/write
-const AP_BOTH_RO: u64 = 0b11 << 6; // EL1 + EL0 read-only
-const AF: u64 = 1 << 10; // Access Flag: never fault on access
-const SH_NONE: u64 = 0b00 << 8; // non-shareable (device memory)
-const SH_INNER: u64 = 0b11 << 8; // inner-shareable (normal memory)
-const UXN: u64 = 1 << 54; // not executable at EL0 (PXN stays 0: EL1 may execute)
-const PXN: u64 = 1 << 53; // not executable at EL1
+const AP_EL1_RW: u64 = 0b00 << 6;
+const AP_EL0_RW: u64 = 0b01 << 6;
+const AP_BOTH_RO: u64 = 0b11 << 6;
+const AF: u64 = 1 << 10;
+const SH_NONE: u64 = 0b00 << 8;
+const SH_INNER: u64 = 0b11 << 8;
+const UXN: u64 = 1 << 54;
+const PXN: u64 = 1 << 53;
 
 const ADDRESS_MASK: u64 = 0x0000_FFFF_FFFF_F000;
-
-/// MAIR_EL1: attr0 = 0xFF (normal WB), attr1 = 0x00 (device-nGnRnE).
 const MAIR_VALUE: u64 = 0x00FF;
 
-/// TCR_EL1: 48-bit VA (T0SZ=16, full four-level walk), 4 KB granule,
-/// inner-shareable walks, table walk caches WB RW-allocate, 40-bit PA,
-/// TTBR1 walks disabled (we only use TTBR0).
+/// 48-bit VAs on both TTBRs (T0SZ=T1SZ=16), 4 KB granules, 40-bit PAs,
+/// inner-shareable WB table walks. TG0/TG1 are zero: 4 KB on both halves.
 const TCR_VALUE: u64 = 16 // T0SZ
-    | (0b11 << 12) // SH0 = inner shareable
-    | (0b01 << 10) // ORGN0 = WB RW-allocate
-    | (0b01 << 8) // IRGN0 = WB RW-allocate
-    | (1 << 23) // EPD1: TTBR1 disabled
-    | (0b010 << 32); // IPS = 40-bit physical address
-                     // TG0 = 0b00: 4 KB granule (zero bits [15:14])
+    | (16 << 16) // T1SZ
+    | (0b11 << 12) // SH0
+    | (0b01 << 10) // ORGN0
+    | (0b01 << 8) // IRGN0
+    | (0b010 << 32); // IPS
 
-/// One 4 KB translation table (512 × 8-byte descriptors).
-/// The four tables are one array so cache maintenance covers them with a
-/// single contiguous range.
 #[repr(C, align(4096))]
 struct Table {
     entries: [u64; ENTRIES],
 }
 
-const TABLE_COUNT: usize = 4;
-
+const TABLE_COUNT: usize = 6;
 const EMPTY_TABLE: Table = Table {
     entries: [0; ENTRIES],
 };
 
+/// Referenced by the assembly boot stub, which fills the first five tables
+/// before enabling the MMU. Keep the indices in sync with main.rs.
+#[no_mangle]
 static mut TABLES: [Table; TABLE_COUNT] = [EMPTY_TABLE; TABLE_COUNT];
 
-const INDEX_LEVEL0: usize = 0;
-const INDEX_LEVEL1: usize = 1;
-const INDEX_LEVEL2_MMIO: usize = 2;
-const INDEX_LEVEL2_DRAM: usize = 3;
+const INDEX_LOW_LEVEL0: usize = 0;
+const INDEX_HIGH_LEVEL0: usize = 1;
+const INDEX_LEVEL1: usize = 2;
+const INDEX_LEVEL2_MMIO: usize = 3;
+const INDEX_LEVEL2_DRAM: usize = 4;
+const INDEX_USER_IMAGE_L3: usize = 5;
 
-/// Fills the tables and turns on translation. Call once, early in
-/// kernel_main, before anything depends on mapped memory being "normal".
+/// Replaces the temporary boot identity TTBR0 with an empty kernel TTBR0,
+/// retains the high TTBR1 map, and builds the shared read-only user image.
+/// Called from kernel_main while already executing at a high PC.
 pub fn init() {
     unsafe {
-        // Raw pointers: four disjoint tables, borrow checker cannot see that.
         let base = core::ptr::addr_of_mut!(TABLES) as *mut Table;
-        let level0 = &mut *base.add(INDEX_LEVEL0);
+        let low0 = &mut *base.add(INDEX_LOW_LEVEL0);
+        let high0 = &mut *base.add(INDEX_HIGH_LEVEL0);
         let level1 = &mut *base.add(INDEX_LEVEL1);
         let mmio = &mut *base.add(INDEX_LEVEL2_MMIO);
         let dram = &mut *base.add(INDEX_LEVEL2_DRAM);
+        let user_image = &mut *base.add(INDEX_USER_IMAGE_L3);
 
-        level0.entries[0] = table_descriptor(level1);
-        level1.entries[0] = table_descriptor(mmio); // VA 0x0000_0000, 1 GB window
-        level1.entries[1] = table_descriptor(dram); // VA 0x4000_0000, 1 GB window
+        // We execute through TTBR1 now; the low identity alias is no longer
+        // needed by the kernel. User TTBR0s are installed by the scheduler.
+        low0.entries[0] = 0;
+        high0.entries[0] = table_descriptor(level1);
+        level1.entries[0] = table_descriptor(mmio);
+        level1.entries[1] = table_descriptor(dram);
 
         for index in 0..ENTRIES {
             mmio.entries[index] = block_descriptor(index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
             dram.entries[index] =
                 block_descriptor(DRAM_BASE + index * BLOCK_2M, ATTR_NORMAL, SH_INNER);
         }
+        fill_user_image_l3(user_image);
     }
 
     clean_tables_to_point_of_coherency();
@@ -116,7 +119,7 @@ pub fn init() {
 }
 
 fn table_descriptor(table: &Table) -> u64 {
-    ((table as *const Table as u64) & ADDRESS_MASK) | DESC_TABLE
+    (virt_to_phys(table as *const Table as usize) as u64) | DESC_TABLE
 }
 
 fn block_descriptor(output_address: usize, attr_index: u64, shareability: u64) -> u64 {
@@ -129,14 +132,9 @@ fn block_descriptor(output_address: usize, attr_index: u64, shareability: u64) -
         | UXN
 }
 
-/// Pushes the freshly written tables out to the point of coherency. If the
-/// data cache were enabled, the walker could otherwise read stale lines.
-/// (Caches are off at this point in boot; this is the ritual that keeps
-/// working when we turn them on.)
 fn clean_tables_to_point_of_coherency() {
     let start = core::ptr::addr_of!(TABLES) as usize;
     let end = start + TABLE_COUNT * TABLE_BYTES;
-
     unsafe {
         let mut line = start;
         while line < end {
@@ -145,55 +143,49 @@ fn clean_tables_to_point_of_coherency() {
                 line = in(reg) line,
                 options(nostack, preserves_flags),
             );
-            line += 64; // 64-byte cache line on Cortex-A72
+            line += 64;
         }
         core::arch::asm!("dsb sy", options(nostack, preserves_flags));
     }
 }
 
-/// Programs TTBR0_EL1 / MAIR_EL1 / TCR_EL1 and flips SCTLR_EL1.M.
-///
-/// Ordering rules that keep this free of TLB hazards:
-/// - TTBR/TCR/MAIR writes are made visible with ISB *before* M goes on;
-/// - identity mapping means the instruction fetch right after enabling
-///   translates to the very same physical address — no far-jump dance;
-/// - the TLB invalidate afterwards is belt-and-braces: nothing was ever
-///   translated on this CPU, but any *future* table edit must follow the
-///   same "modify tables → clean → tlbi → dsb → isb" ritual.
+/// Installs empty-low/high-kernel TTBRs. The boot stub has already enabled
+/// translation, so this runs entirely through the high alias.
 fn configure_and_enable() {
-    let ttbr0 = (core::ptr::addr_of!(TABLES) as u64) & ADDRESS_MASK;
-    let mut sctlr: u64 = 0;
+    let table_base = core::ptr::addr_of!(TABLES) as usize;
+    let ttbr0 = (virt_to_phys(table_base + INDEX_LOW_LEVEL0 * TABLE_BYTES) as u64) & ADDRESS_MASK;
+    let ttbr1 = (virt_to_phys(table_base + INDEX_HIGH_LEVEL0 * TABLE_BYTES) as u64) & ADDRESS_MASK;
 
     unsafe {
         core::arch::asm!(
-            "msr ttbr0_el1, {ttbr}",
+            "msr ttbr0_el1, {low}",
+            "msr ttbr1_el1, {high}",
             "msr mair_el1, {mair}",
             "msr tcr_el1, {tcr}",
             "isb",
             "mrs {sctlr}, sctlr_el1",
-            "orr {sctlr}, {sctlr}, #1", // SCTLR_EL1.M: enable translation
-            "bic {sctlr}, {sctlr}, #(1 << 22)", // SCTLR_EL1.PAN off: kernel
-            // code legitimately reads/writes EL0-accessible pages (message
-            // copies, task stacks), and we have no use for PAN yet.
+            "orr {sctlr}, {sctlr}, #1",
+            "bic {sctlr}, {sctlr}, #(1 << 22)",
             "msr sctlr_el1, {sctlr}",
             "isb",
             "tlbi vmalle1",
             "dsb ish",
             "isb",
-            ttbr = in(reg) ttbr0,
+            low = in(reg) ttbr0,
+            high = in(reg) ttbr1,
             mair = in(reg) MAIR_VALUE,
             tcr = in(reg) TCR_VALUE,
-            sctlr = inout(reg) sctlr,
+            sctlr = out(reg) _,
             options(nostack),
         );
     }
 }
 
-/// Call after ANY change to translation tables:
-/// clean the edited pages, invalidate affected TLB entries, and serialize.
+/// Clean and invalidate after changing a task's tables. `table_start` is a
+/// physical table address; the CPU accesses it through the high alias.
 pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
-    let start = table_start & !63;
-    let end = (table_start + table_bytes + 63) & !63;
+    let start = phys_to_virt(table_start) & !63;
+    let end = (phys_to_virt(table_start) + table_bytes + 63) & !63;
     unsafe {
         let mut line = start;
         while line < end {
@@ -215,34 +207,16 @@ pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
 }
 
 // ---------------------------------------------------------------------------
-// Per-task address spaces
+// Per-task user address spaces
 // ---------------------------------------------------------------------------
 
-/// Builds a fresh address space for one task. Layout of its private L0:
-///   entry[0] → own L1_user:
-///       [0] → SHARED kernel MMIO level-2 table (device blocks, AP=EL1_RW:
-///             UART and GIC are unreachable from EL0 — syscall-only);
-///       [1] → own L2_dram:
-///             [0] → own L3_kernel: the first 2 MB of DRAM (the whole kernel
-///                   image) at 4 KB granularity, split by section:
-///                   .text   → AP=both-RO, executable at EL0 AND EL1 —
-///                              RO at EL0 sidesteps the architectural rule
-///                              that an EL0-*writable* page is execute-never
-///                              at EL1 (the trampolines must keep executing
-///                              while a task's TTBR0 is loaded);
-///                   .rodata → AP=both-RO, UXN+PXN (data, not code);
-///                   .data/.bss/.stack → AP=EL0_RW, UXN+PXN (plain data;
-///                              EL1 reads/writes it fine, execution never);
-///             [1..] → AP=EL0_RW 2 MB blocks (heap, task stacks: data only).
-///   entry[1] → own L1_priv → L2_priv → L3_priv, mapping PRIVATE_WINDOW_VA
-///              to `private_page` (4 KB, EL0_RW, UXN — data, not code).
+/// Builds a user TTBR0. `user_stack_start == 0` creates no stack mapping
+/// (used for the EL1 idle task); the private page is still allocated/freed
+/// uniformly for every task.
 ///
-/// Table pages come from the frame allocator; they are reachable through
-/// the identity mapping, so filling them by physical address is safe.
-///
-/// Returns the physical base to load into TTBR0_EL1.
-pub fn create_task_space(private_page: usize) -> Option<usize> {
-    // Seven owned table pages; L1_user[0] borrows the shared MMIO L2 instead.
+/// Owned pages: L0, L1_user, L2_user, L3_stack, and three private-window
+/// levels. The read-only image L3 is shared and never freed per task.
+pub fn create_task_space(private_page: usize, user_stack_start: usize) -> Option<usize> {
     let mut pages = [0_usize; 7];
     for (index, slot) in pages.iter_mut().enumerate() {
         let Some(page) = frame_allocator::alloc_page() else {
@@ -253,38 +227,35 @@ pub fn create_task_space(private_page: usize) -> Option<usize> {
         };
         *slot = page;
     }
-    let [l0, l1_user, l2_dram, l3_kernel, l1_priv, l2_priv, l3_priv] = pages;
+    let [l0, l1_user, l2_user, l3_stack, l1_priv, l2_priv, l3_priv] = pages;
 
     unsafe {
         for &page in &pages {
             zero_page(page);
         }
 
-        write_entry(l0, 0, descriptor_address(l1_user as u64) | DESC_TABLE);
-        write_entry(l0, 1, descriptor_address(l1_priv as u64) | DESC_TABLE);
+        write_entry(l0, 0, l1_user as u64 | DESC_TABLE);
+        write_entry(l0, 1, l1_priv as u64 | DESC_TABLE);
+        write_entry(l1_user, 1, l2_user as u64 | DESC_TABLE);
 
-        let shared_mmio_l2 = core::ptr::addr_of!(TABLES) as usize + INDEX_LEVEL2_MMIO * TABLE_BYTES;
-        write_entry(
-            l1_user,
-            0,
-            descriptor_address(shared_mmio_l2 as u64) | DESC_TABLE,
-        );
+        let shared_image =
+            virt_to_phys(core::ptr::addr_of!(TABLES) as usize + INDEX_USER_IMAGE_L3 * TABLE_BYTES);
+        write_entry(l2_user, 0, shared_image as u64 | DESC_TABLE);
 
-        write_entry(l1_user, 1, descriptor_address(l2_dram as u64) | DESC_TABLE);
-        write_entry(
-            l2_dram,
-            0,
-            descriptor_address(l3_kernel as u64) | DESC_TABLE,
-        );
-        for index in 1..ENTRIES {
-            let base = DRAM_BASE + index * BLOCK_2M;
-            write_entry(l2_dram, index, dram_data_block(base));
+        if user_stack_start != 0 {
+            write_entry(l2_user, USER_STACK_L2_INDEX, l3_stack as u64 | DESC_TABLE);
+            for index in 0..USER_STACK_PAGES {
+                write_entry(
+                    l3_stack,
+                    index,
+                    user_data_page(user_stack_start + index * GRANULE),
+                );
+            }
         }
-        fill_kernel_l3(l3_kernel);
 
-        write_entry(l1_priv, 0, descriptor_address(l2_priv as u64) | DESC_TABLE);
-        write_entry(l2_priv, 0, descriptor_address(l3_priv as u64) | DESC_TABLE);
-        write_entry(l3_priv, 0, page_descriptor(private_page));
+        write_entry(l1_priv, 0, l2_priv as u64 | DESC_TABLE);
+        write_entry(l2_priv, 0, l3_priv as u64 | DESC_TABLE);
+        write_entry(l3_priv, 0, user_data_page(private_page));
     }
 
     for page in pages {
@@ -293,41 +264,34 @@ pub fn create_task_space(private_page: usize) -> Option<usize> {
     Some(l0)
 }
 
-/// Fills the 4 KB-granularity view of the kernel image (L2_dram[0] covers
-/// VA 0x4000_0000..0x4020_0000). Pages outside the image are plain RW data.
-unsafe fn fill_kernel_l3(l3_kernel: usize) {
-    let text_start = core::ptr::addr_of!(__text_start) as usize;
-    let text_end = core::ptr::addr_of!(__text_end) as usize;
-    let data_start = core::ptr::addr_of!(__data_start) as usize;
-    let kernel_end = core::ptr::addr_of!(__kernel_end) as usize;
+/// Shared low user alias: only .text and .rodata are present. Kernel data,
+/// stacks, heap, MMIO and every other DRAM page are deliberately unmapped.
+unsafe fn fill_user_image_l3(table: &mut Table) {
+    let text_start = virt_to_phys(core::ptr::addr_of!(__text_start) as usize);
+    let text_end = virt_to_phys(core::ptr::addr_of!(__text_end) as usize);
+    let data_start = virt_to_phys(core::ptr::addr_of!(__data_start) as usize);
 
     for index in 0..ENTRIES {
-        let va = DRAM_BASE + index * GRANULE;
-        let descriptor = if va >= text_start && va < text_end {
-            kernel_text_page(va)
-        } else if va >= text_end && va < data_start {
-            kernel_rodata_page(va)
-        } else if va >= data_start && va < kernel_end {
-            kernel_data_page(va)
-        } else if va >= kernel_end {
-            // RAM past the image: nothing there on QEMU, but keep it data.
-            kernel_data_page(va)
+        let address = DRAM_BASE + index * GRANULE;
+        table.entries[index] = if address >= text_start && address < text_end {
+            kernel_text_page(address)
+        } else if address >= text_end && address < data_start {
+            kernel_rodata_page(address)
         } else {
-            // RAM below the image (0x4000_0000..0x4008_0000): data.
-            kernel_data_page(va)
+            0
         };
-        write_entry(l3_kernel, index, descriptor);
     }
 }
 
-/// Frees every page of a task space created by `create_task_space`,
-/// including the private data page (recovered from the L3 descriptor).
-/// The SHARED kernel MMIO L2 (L1_user[0]) is borrowed, never freed here.
 pub fn destroy_task_space(ttbr0: usize) {
     unsafe {
         let l1_user = follow_table(ttbr0, 0);
-        let l2_dram = follow_table(l1_user, 1);
-        let l3_kernel = follow_table(l2_dram, 0);
+        let l2_user = follow_table(l1_user, 1);
+        let stack_table_entry = read_entry(l2_user, USER_STACK_L2_INDEX);
+        if stack_table_entry & DESC_TABLE == DESC_TABLE {
+            frame_allocator::free_page(descriptor_address(stack_table_entry) as usize);
+        }
+
         let l1_priv = follow_table(ttbr0, 1);
         let l2_priv = follow_table(l1_priv, 0);
         let l3_priv = follow_table(l2_priv, 0);
@@ -336,17 +300,14 @@ pub fn destroy_task_space(ttbr0: usize) {
         frame_allocator::free_page(l3_priv);
         frame_allocator::free_page(l2_priv);
         frame_allocator::free_page(l1_priv);
-        frame_allocator::free_page(l3_kernel);
-        frame_allocator::free_page(l2_dram);
+        frame_allocator::free_page(l2_user);
         frame_allocator::free_page(l1_user);
         frame_allocator::free_page(ttbr0);
     }
 }
 
-/// Loads TTBR0_EL1 and flushes the TLB. Call only on the context-switch
-/// path. Safe mid-switch because everything this code touches until the
-/// register/SP restore lives in the identity half, which is identical in
-/// both address spaces.
+/// Switches only the user half. The executing high-half kernel code and its
+/// stack remain visible through TTBR1_EL1 for every task.
 pub fn switch_address_space(ttbr0: usize) {
     unsafe {
         core::arch::asm!(
@@ -360,29 +321,40 @@ pub fn switch_address_space(ttbr0: usize) {
     }
 }
 
+/// Accepts only memory a user task can legitimately pass to the kernel:
+/// the shared read-only image, its own fixed-VA stack, or its private page.
+pub fn valid_user_slice(pointer: u64, length: u64) -> bool {
+    if length > 4096 {
+        return false;
+    }
+    let Some(last) = pointer.checked_add(length) else {
+        return false;
+    };
+    let pointer = pointer as usize;
+    let last = last as usize;
+    let stack = MemoryRegion::new(USER_STACK_VA, USER_STACK_VA + USER_STACK_SIZE);
+    let private = MemoryRegion::new(PRIVATE_WINDOW_VA, PRIVATE_WINDOW_VA + GRANULE);
+    let image = user_image_range();
+    [image, stack, private]
+        .iter()
+        .any(|region| pointer >= region.start && last <= region.end)
+}
+
+fn user_image_range() -> MemoryRegion {
+    MemoryRegion::new(
+        virt_to_phys(core::ptr::addr_of!(__kernel_start) as usize),
+        virt_to_phys(core::ptr::addr_of!(__data_start) as usize),
+    )
+}
+
 fn descriptor_address(descriptor_or_address: u64) -> u64 {
     descriptor_or_address & ADDRESS_MASK
 }
 
-/// A 2 MB block of DRAM above the kernel image, as mapped inside task
-/// spaces: EL0+EL1 read/write, never executable — heap, task stacks, tables.
-fn dram_data_block(output_address: usize) -> u64 {
-    ((output_address as u64) & !(BLOCK_2M as u64 - 1))
-        | DESC_BLOCK
-        | (ATTR_NORMAL << 2)
-        | AP_EL0_RW
-        | SH_INNER
-        | AF
-        | UXN
-        | PXN
-}
-
-/// Kernel .text page: read-only at both levels, executable at EL0 AND EL1.
-/// RO-at-EL0 is what keeps the page executable at EL1 — an EL0-*writable*
-/// page is architecturally execute-never at EL1 (W^X rule), and the
-/// trampolines must keep fetching while a task's TTBR0 is loaded.
-fn kernel_text_page(identity_address: usize) -> u64 {
-    descriptor_address(identity_address as u64)
+/// Built-in .text, mapped read-only and executable at EL0 and EL1. RO at EL0
+/// also avoids the ARM rule that an EL0-writable page is EL1-execute-never.
+fn kernel_text_page(output_address: usize) -> u64 {
+    descriptor_address(output_address as u64)
         | DESC_PAGE
         | (ATTR_NORMAL << 2)
         | AP_BOTH_RO
@@ -390,15 +362,13 @@ fn kernel_text_page(identity_address: usize) -> u64 {
         | AF
 }
 
-/// Kernel .rodata page: read-only, no execution anywhere.
-fn kernel_rodata_page(identity_address: usize) -> u64 {
-    kernel_text_page(identity_address) | UXN | PXN
+fn kernel_rodata_page(output_address: usize) -> u64 {
+    kernel_text_page(output_address) | UXN | PXN
 }
 
-/// Kernel data page (.data/.bss/.stack, RAM past the image): EL0+EL1 RW,
-/// no execution anywhere.
-fn kernel_data_page(identity_address: usize) -> u64 {
-    descriptor_address(identity_address as u64)
+/// Task-owned writable memory: user stack or private page, never executable.
+fn user_data_page(output_address: usize) -> u64 {
+    descriptor_address(output_address as u64)
         | DESC_PAGE
         | (ATTR_NORMAL << 2)
         | AP_EL0_RW
@@ -408,28 +378,20 @@ fn kernel_data_page(identity_address: usize) -> u64 {
         | PXN
 }
 
-fn page_descriptor(output_address: usize) -> u64 {
-    descriptor_address(output_address as u64)
-        | DESC_PAGE
-        | (ATTR_NORMAL << 2)
-        | AP_EL0_RW
-        | SH_INNER
-        | AF
-        | UXN
+unsafe fn zero_page(physical: usize) {
+    unsafe { core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, GRANULE) };
 }
 
-unsafe fn zero_page(base: usize) {
-    unsafe { core::ptr::write_bytes(base as *mut u8, 0, GRANULE) };
+unsafe fn write_entry(physical: usize, index: usize, descriptor: u64) {
+    unsafe {
+        core::ptr::write_volatile((phys_to_virt(physical) as *mut u64).add(index), descriptor)
+    };
 }
 
-unsafe fn write_entry(base: usize, index: usize, descriptor: u64) {
-    unsafe { core::ptr::write_volatile((base as *mut u64).add(index), descriptor) };
+unsafe fn read_entry(physical: usize, index: usize) -> u64 {
+    unsafe { core::ptr::read_volatile((phys_to_virt(physical) as *const u64).add(index)) }
 }
 
-unsafe fn read_entry(base: usize, index: usize) -> u64 {
-    unsafe { core::ptr::read_volatile((base as *const u64).add(index)) }
-}
-
-unsafe fn follow_table(base: usize, index: usize) -> usize {
-    descriptor_address(read_entry(base, index)) as usize
+unsafe fn follow_table(physical: usize, index: usize) -> usize {
+    descriptor_address(read_entry(physical, index)) as usize
 }

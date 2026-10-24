@@ -55,7 +55,11 @@ core::arch::global_asm!(
     .global _start
     .type _start, %function
 _start:
+    // The ELF is linked at high VAs but loaded at low physical addresses.
+    // Until the MMU is on, convert every linked data address to physical.
     ldr x0, =__stack_top
+    ldr x1, =__kernel_virt_base
+    sub x0, x0, x1
     mov sp, x0
 
     mrs x2, CurrentEL
@@ -63,32 +67,29 @@ _start:
     cmp x2, #2
     b.ne 4f
 
-    // EL2 (QEMU -kernel default): enable FP for EL1, then drop to EL1h —
-    // the MMU is configured through the EL1 registers. HCR_EL2.RW must be 1,
-    // otherwise the ERET into EL1 lands in AArch32.
+    // EL2 (QEMU -kernel default): enable FP for EL1, then drop to EL1h.
     msr cptr_el2, xzr
     mov x2, #0x300000
     msr cpacr_el1, x2
     mov x2, #(1 << 31)
     msr hcr_el2, x2
-    mov x2, #0x3c5             // SPSR_EL2: EL1h, SP_EL1, DAIF masked
+    mov x2, #0x3c5
     msr spsr_el2, x2
     adr x2, 4f
     msr elr_el2, x2
     eret
 4:
-    // EL1 from here on, both for the EL2 drop path and native-EL1 boot.
     mov x2, #0x300000
     msr cpacr_el1, x2
     isb
 
-    ldr x1, =exception_vectors
-    msr vbar_el1, x1
-    isb
-
-    // Zero .bss — the MMU page tables live there and must start empty.
+    // Zero .bss through the low physical alias. The boot/final page tables
+    // live there too; no Rust code may run before the high map is active.
     ldr x3, =__bss_start
     ldr x4, =__bss_end
+    ldr x5, =__kernel_virt_base
+    sub x3, x3, x5
+    sub x4, x4, x5
     cmp x3, x4
     b.hs 3f
 2:
@@ -96,6 +97,76 @@ _start:
     cmp x3, x4
     b.lo 2b
 3:
+    // TABLES layout (see mmu.rs):
+    //   +0     low TTBR0 L0 (identity map during this boot stub only)
+    //   +4096  high TTBR1 L0
+    //   +8192  shared L1: MMIO gigabyte + DRAM gigabyte
+    //   +12288 MMIO L2
+    //   +16384 DRAM L2
+    // Both L0[0] entries share the same L1, producing low and high aliases.
+    ldr x5, =TABLES
+    ldr x6, =__kernel_virt_base
+    sub x5, x5, x6
+    add x6, x5, #4096
+    add x7, x5, #8192
+    add x8, x5, #12288
+    add x9, x5, #16384
+
+    orr x10, x7, #3
+    str x10, [x5]
+    str x10, [x6]
+    orr x10, x8, #3
+    str x10, [x7]
+    orr x10, x9, #3
+    str x10, [x7, #8]
+
+    // 512 x 2 MB blocks per gigabyte. Attr1 device-nGnRnE for MMIO,
+    // attr0 normal WB inner-shareable for DRAM; AP=EL1_RW, AF=1, UXN=1.
+    mov x11, #0
+    mov x12, #512
+    mov x13, #0x405
+    movk x13, #0x40, lsl #48
+    mov x14, #0x701
+    movk x14, #0x40, lsl #48
+    mov x15, #0x40000000
+1:
+    lsl x16, x11, #21
+    orr x17, x16, x13
+    str x17, [x8, x11, lsl #3]
+    add x17, x16, x15
+    orr x17, x17, x14
+    str x17, [x9, x11, lsl #3]
+    add x11, x11, #1
+    cmp x11, x12
+    b.ne 1b
+
+    // 48-bit VAs on both halves, 4 KB granules, 40-bit PAs.
+    mov x0, #0xff
+    msr mair_el1, x0
+    ldr x0, =0x0000000200103510
+    msr tcr_el1, x0
+    msr ttbr0_el1, x5
+    msr ttbr1_el1, x6
+    isb
+    mrs x0, sctlr_el1
+    orr x0, x0, #1
+    bic x0, x0, #(1 << 22)  // PAN off: SVC handlers copy user buffers
+    msr sctlr_el1, x0
+    isb
+    tlbi vmalle1
+    dsb ish
+    isb
+
+    // The identity alias is still live here, so the next fetch is safe.
+    // Jump to the linked high PC and never execute kernel code low again.
+    ldr x0, =5f
+    br x0
+5:
+    ldr x0, =__stack_top
+    mov sp, x0
+    ldr x1, =exception_vectors
+    msr vbar_el1, x1
+    isb
     bl kernel_main
 1:
     wfe

@@ -1,4 +1,4 @@
-ENTRY(_start)
+ENTRY(__boot_entry)
 
 PHDRS
 {
@@ -9,12 +9,14 @@ PHDRS
 
 SECTIONS
 {
-    /* Common AArch64 DRAM load address; replace with the firmware address later. */
-    . = 0x40080000;
+    /* High-half VMA, low physical LMA. QEMU loads the ELF at the physical
+       addresses and starts at __boot_entry with the MMU still disabled. */
+    __kernel_virt_base = 0xFFFF000000000000;
+    . = 0xFFFF000040080000;
     __kernel_start = .;
     __text_start = .;
 
-    .text : ALIGN(4096)
+    .text : AT(ADDR(.text) - __kernel_virt_base) ALIGN(4096)
     {
         KEEP(*(.text.boot))
         KEEP(*(.text.vectors))
@@ -22,12 +24,12 @@ SECTIONS
     } :text
     __text_end = .;
 
-    .rodata : ALIGN(4096)
+    .rodata : AT(ADDR(.rodata) - __kernel_virt_base) ALIGN(4096)
     {
         *(.rodata .rodata.*)
     } :rodata
 
-    .data : ALIGN(4096)
+    .data : AT(ADDR(.data) - __kernel_virt_base) ALIGN(4096)
     {
         __data_start = .;
         *(.data .data.*)
@@ -49,6 +51,9 @@ SECTIONS
 
     . = ALIGN(4096);
     __kernel_end = .;
+
+    /* ELF e_entry must be the physical boot address, not the high VMA. */
+    __boot_entry = _start - __kernel_virt_base;
 
     /DISCARD/ :
     {

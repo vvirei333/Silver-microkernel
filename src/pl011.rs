@@ -1,4 +1,4 @@
-const BASE: usize = 0x0900_0000;
+const BASE: usize = crate::memory::phys_to_virt(0x0900_0000);
 const DR: *mut u32 = BASE as *mut u32;
 const FR: *const u32 = (BASE + 0x18) as *const u32;
 const IBRD: *mut u32 = (BASE + 0x24) as *mut u32;

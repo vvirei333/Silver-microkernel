@@ -2,7 +2,7 @@ use core::alloc::{GlobalAlloc, Layout};
 
 use linked_list_allocator::LockedHeap;
 
-use crate::{exceptions, frame_allocator, pl011};
+use crate::{exceptions, frame_allocator, memory, pl011};
 
 pub const HEAP_PAGES: usize = 256;
 pub const HEAP_SIZE: usize = HEAP_PAGES * crate::memory::PAGE_SIZE;
@@ -37,7 +37,10 @@ pub fn init() -> Option<usize> {
     let heap_base = frame_allocator::alloc_contiguous_pages(HEAP_PAGES)?;
 
     unsafe {
-        ALLOCATOR.inner.lock().init(heap_base as *mut u8, HEAP_SIZE);
+        ALLOCATOR
+            .inner
+            .lock()
+            .init(memory::phys_to_virt(heap_base) as *mut u8, HEAP_SIZE);
     }
 
     Some(heap_base)

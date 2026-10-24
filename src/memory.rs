@@ -28,6 +28,18 @@ pub const DRAM_SIZE: usize = 128 * 1024 * 1024;
 pub const DRAM_END: usize = DRAM_BASE + DRAM_SIZE;
 pub const DRAM: MemoryRegion = MemoryRegion::new(DRAM_BASE, DRAM_END);
 
+/// Link-time base of the kernel's high-half alias. Physical address `p` is
+/// available to EL1 at `KERNEL_VIRT_BASE + p` through TTBR1_EL1.
+pub const KERNEL_VIRT_BASE: usize = 0xFFFF_0000_0000_0000;
+
+pub const fn phys_to_virt(physical: usize) -> usize {
+    KERNEL_VIRT_BASE + physical
+}
+
+pub const fn virt_to_phys(virtual_address: usize) -> usize {
+    virtual_address - KERNEL_VIRT_BASE
+}
+
 extern "C" {
     static __kernel_start: u8;
     static __kernel_end: u8;
@@ -46,10 +58,10 @@ pub struct MemoryMap {
 pub fn current() -> MemoryMap {
     let (kernel_start, kernel_end, stack_bottom, stack_top) = unsafe {
         (
-            &__kernel_start as *const u8 as usize,
-            &__kernel_end as *const u8 as usize,
-            &__stack_bottom as *const u8 as usize,
-            &__stack_top as *const u8 as usize,
+            virt_to_phys(&__kernel_start as *const u8 as usize),
+            virt_to_phys(&__kernel_end as *const u8 as usize),
+            virt_to_phys(&__stack_bottom as *const u8 as usize),
+            virt_to_phys(&__stack_top as *const u8 as usize),
         )
     };
 

@@ -1,12 +1,12 @@
 use core::ptr;
 
-use crate::{exceptions, scheduler, timer};
+use crate::{exceptions, memory, scheduler, timer};
 
 pub const TIMER_IRQ: u32 = 30;
 const SPURIOUS_IRQ: u32 = 1023;
 
-const DISTRIBUTOR_BASE: usize = 0x0800_0000;
-const CPU_INTERFACE_BASE: usize = 0x0801_0000;
+const DISTRIBUTOR_BASE: usize = memory::phys_to_virt(0x0800_0000);
+const CPU_INTERFACE_BASE: usize = memory::phys_to_virt(0x0801_0000);
 
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100;
@@ -22,7 +22,10 @@ const GICC_EOIR: usize = 0x010;
 pub fn init() {
     write32(DISTRIBUTOR_BASE + GICD_CTLR, 0);
 
-    write8(GICD_IPRIORITYR + TIMER_IRQ as usize, 0xA0);
+    write8(
+        DISTRIBUTOR_BASE + GICD_IPRIORITYR + TIMER_IRQ as usize,
+        0xA0,
+    );
 
     let config_offset = GICD_ICFGR + (TIMER_IRQ as usize / 16) * 4;
     let config_shift = (TIMER_IRQ as usize % 16) * 2;

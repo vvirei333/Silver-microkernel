@@ -22,12 +22,14 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Nameserver: tasks find each other by name (register/lookup syscalls)
 - [x] Condition variable: per-mailbox wait queues, targeted wakeups
 - [x] Counting semaphore + bounded channel with backpressure
-- [x] MMU: identity mapping, 4-level tables, SCTLR_EL1.M on (kernel at EL1)
-- [x] Per-task address spaces: private VA window per task, TTBR0 switch on context switch
+- [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
+- [x] Per-task TTBR0 spaces: private page, fixed-VA user stack, TTBR0 switch on context switch
+- [x] Kernel data, heap, kernel stacks and MMIO are absent from user TTBR0
 - [x] Tasks in EL0 (Ring 3): user stacks, SVC-only kernel access, argument validation
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
-- [ ] Full kernel-data isolation (user tasks can still access shared kernel data)
-- [ ] Drivers, processes, ELF loader
+- [x] High-half isolation probe: an EL0 read faults without stopping other tasks
+- [ ] Separate user ELF binaries (removes the temporary read-only text/rodata alias)
+- [ ] Drivers and full process lifecycle
 
 ## Requirements
 
@@ -84,10 +86,10 @@ with `--no-default-features --features no_std`.
 
 | File | Purpose |
 | --- | --- |
-| `src/main.rs` | `_start` entry point, IRQ trampoline, subsystem init |
+| `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
 | `src/exceptions.rs` | ARM64 exception vectors, kernel panic |
-| `src/pl011.rs` | UART driver (MMIO 0x09000000) |
-| `src/memory.rs` | Physical memory map |
+| `src/pl011.rs` | UART driver (physical MMIO 0x09000000) |
+| `src/memory.rs` | Physical memory map and high-half address conversion |
 | `src/frame_allocator.rs` | Physical page frame allocator (bitmap) |
 | `src/allocator.rs` | Kernel heap, `#[global_allocator]` |
 | `src/gic.rs` | GICv2 interrupt controller |
@@ -101,20 +103,37 @@ with `--no-default-features --features no_std`.
 | `src/condvar.rs` | Condition variable: wait / notify_one / notify_all |
 | `src/semaphore.rs` | Counting semaphore on mutex + condvar |
 | `src/channel.rs` | Bounded channel: two semaphores + a mutex (backpressure) |
-| `src/mmu.rs` | MMU: identity map, MAIR/TCR/TTBR, SCTLR_EL1.M, per-task address spaces |
+| `src/mmu.rs` | TTBR1 kernel map, per-task TTBR0 maps, user pointer validation |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
-Per-task spaces: every task gets its own L0 table chained to a shared
-identity-mapped kernel half plus a private 4 KB-mapped window at
-`0x0000_0080_0000_0000`. The scheduler switches TTBR0_EL1 (with
-`tlbi vmalle1`) on every context switch that crosses address spaces.
-The `vm_a` / `vm_b` demo tasks prove isolation: both write to the same
-virtual address and read back only their own values.
+## Memory model
 
-All demo tasks except idle run at EL0t on separate user stacks. They reach
-the kernel only through `svc #0`; UART, GIC and other MMIO are inaccessible
-at EL0. The syscall layer validates task pointers before dereferencing them.
-An EL0 exception that is not an SVC prints a task-fault report and terminates
-only the offending task.
+The kernel is linked at high virtual addresses but loaded at low physical
+addresses. The assembly boot stub builds temporary low/high aliases, enables
+the MMU, branches to the high PC, and removes the kernel's low identity map.
+
+```text
+TTBR1 (EL1 only):  0xFFFF000000000000 + PA -> kernel image, heap, stacks, MMIO
+TTBR0 (per task): read-only image alias + own fixed-VA stack + private page
+```
+
+The scheduler changes only TTBR0_EL1 and flushes stale TLB entries. Its EL1
+code and SP_EL1 stack remain mapped through TTBR1_EL1. Every user task gets
+an 8 KB stack at virtual address `0x7FE00000` and a private 4 KB page at
+`0x0000_0080_0000_0000`; equal VAs in different tasks have different physical
+backing. The `vm_a` / `vm_b` demo proves this by reading back only its own
+value.
+
+The built-in `.text` and `.rodata` still have a **read-only low alias** in
+TTBR0 because the demo tasks are statically linked with the kernel. Writable
+kernel data, heap, kernel and user-task kernel stacks, page tables and MMIO
+are not mapped there. A separate user ELF loader will remove this final
+shared alias.
+
+All demo tasks except idle run at EL0t and enter the kernel only through
+`svc #0`. Syscall pointers must lie in the shared image, the current task's
+stack, or its private page. The intentional isolation probe reads
+`0xFFFF000040000000` from EL0: the expected result is one `TASK FAULT` with
+`EC=0x24`, after which all other tasks continue running.
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).

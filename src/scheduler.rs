@@ -4,14 +4,14 @@ use alloc::vec::Vec;
 
 use crate::{
     frame_allocator, interrupts, ipc,
-    memory::{MemoryRegion, PAGE_SIZE},
+    memory::{phys_to_virt, virt_to_phys, MemoryRegion, PAGE_SIZE},
     mmu, nameserver, pl011, syscall, timer,
 };
 
 const TASK_STACK_PAGES: usize = 4;
 const TASK_STACK_SIZE: usize = TASK_STACK_PAGES * PAGE_SIZE;
-const TASK_USER_STACK_PAGES: usize = 2;
-const TASK_USER_STACK_SIZE: usize = TASK_USER_STACK_PAGES * PAGE_SIZE;
+const TASK_USER_STACK_PAGES: usize = mmu::USER_STACK_PAGES;
+const TASK_USER_STACK_SIZE: usize = mmu::USER_STACK_SIZE;
 const IDLE_TASK_ID: u64 = 0;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -216,6 +216,8 @@ pub fn init() {
     // Per-task address space demo: same VA, different physical pages.
     let _vm_a_id = spawn_inner(vm_task_a, true);
     let _vm_b_id = spawn_inner(vm_task_b, true);
+    // Must die alone on its high-half read; every other task keeps running.
+    let _isolation_probe_id = spawn_inner(isolation_probe, true);
 
     let manager = scheduler_manager().unwrap();
     manager.current_index = manager
@@ -395,9 +397,10 @@ pub fn schedule() {
     let next_task = unsafe { &mut *tasks.add(next_index) };
 
     debug_assert_ne!(current_task.id, next_task.id);
+    let saved_stack_pointer = next_task.context.stack_pointer as usize;
     if !next_task
         .stack
-        .contains(next_task.context.stack_pointer as usize - 1)
+        .contains(virt_to_phys(saved_stack_pointer) - 1)
     {
         pl011::write_str("BAD SP task=");
         pl011::write_dec_u64(next_task.id);
@@ -424,9 +427,9 @@ pub fn schedule() {
     };
 
     if next_task.ttbr0 != current_task.ttbr0 {
-        // Identity half is identical in both spaces, so this code and its
-        // stack stay valid across the switch; the TLB flush covers the
-        // private window so the next task sees only its own mapping.
+        // TTBR1 keeps this high-half code and its kernel stack valid across
+        // the switch. Only the user half changes; the TLB flush prevents the
+        // next task from observing the previous task's low mappings.
         mmu::switch_address_space(next_task.ttbr0);
     }
 
@@ -529,21 +532,12 @@ fn current_task_mut() -> Option<&'static mut Task> {
 impl Task {
     fn new(id: u64, entry: extern "C" fn() -> !, user: bool) -> Option<Self> {
         let stack_start = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES)?;
-        let Some(private_page) = frame_allocator::alloc_page() else {
-            release_pages(stack_start, TASK_STACK_PAGES);
-            return None;
-        };
-        let Some(ttbr0) = mmu::create_task_space(private_page) else {
-            frame_allocator::free_page(private_page);
-            release_pages(stack_start, TASK_STACK_PAGES);
-            return None;
-        };
 
+        // Allocate all user-owned memory before building its TTBR0: the
+        // tables map the stack at USER_STACK_VA regardless of its PA.
         let user_stack = if user {
             let Some(user_start) = frame_allocator::alloc_contiguous_pages(TASK_USER_STACK_PAGES)
             else {
-                mmu::destroy_task_space(ttbr0);
-                frame_allocator::free_page(private_page);
                 release_pages(stack_start, TASK_STACK_PAGES);
                 return None;
             };
@@ -552,18 +546,43 @@ impl Task {
             MemoryRegion::new(0, 0)
         };
 
+        let Some(private_page) = frame_allocator::alloc_page() else {
+            if !user_stack.is_empty() {
+                release_pages(user_stack.start, TASK_USER_STACK_PAGES);
+            }
+            release_pages(stack_start, TASK_STACK_PAGES);
+            return None;
+        };
+        let Some(ttbr0) = mmu::create_task_space(private_page, user_stack.start) else {
+            frame_allocator::free_page(private_page);
+            if !user_stack.is_empty() {
+                release_pages(user_stack.start, TASK_USER_STACK_PAGES);
+            }
+            release_pages(stack_start, TASK_STACK_PAGES);
+            return None;
+        };
+
         let stack = MemoryRegion::new(stack_start, stack_start + TASK_STACK_SIZE);
         let mut context = TaskContext::zero();
-        context.registers[0] = entry as usize as u64; // x19: handed to the bootstrap
+        context.registers[0] = if user {
+            // EL0 executes the low read-only alias of the built-in image.
+            virt_to_phys(entry as usize) as u64
+        } else {
+            entry as usize as u64
+        };
         context.elr = if user {
             // The switch `ret`s here at EL1h; the bootstrap drops to EL0t
-            // at `entry`, passing it in x19 (restored from this context).
+            // at the low entry alias, passed in x19.
             silver_user_bootstrap as *const () as usize as u64
         } else {
             entry as usize as u64
         };
-        context.stack_pointer = stack.end as u64;
-        context.user_stack_pointer = if user { user_stack.end as u64 } else { 0 };
+        context.stack_pointer = phys_to_virt(stack.end) as u64;
+        context.user_stack_pointer = if user {
+            (mmu::USER_STACK_VA + mmu::USER_STACK_SIZE) as u64
+        } else {
+            0
+        };
 
         Some(Self {
             id,
@@ -821,5 +840,22 @@ extern "C" fn vm_task_b() -> ! {
         syscall::print("]=0x");
         syscall::print_hex_u64(observed);
         syscall::print("\r\n");
+    }
+}
+
+/// Negative isolation test: this high address is present in the kernel's
+/// TTBR1 map but deliberately absent from every user TTBR0. The read must
+/// fault at EL0; the exception handler kills only this task.
+extern "C" fn isolation_probe() -> ! {
+    syscall::print("ISOLATION PROBE: reading high-half kernel memory\r\n");
+    let kernel_memory = crate::memory::phys_to_virt(crate::memory::DRAM_BASE) as *const u64;
+    let value = unsafe { core::ptr::read_volatile(kernel_memory) };
+
+    // Reaching this line means isolation is broken.
+    syscall::print("ISOLATION FAIL: kernel read returned 0x");
+    syscall::print_hex_u64(value);
+    syscall::print("\r\n");
+    loop {
+        syscall::sleep(1000);
     }
 }
