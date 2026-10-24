@@ -1,18 +1,30 @@
 //! ARMv8-A MMU: identity map of the low MMIO gigabyte and the DRAM gigabyte,
 //! 4 KB granule, four-level translation tables with 2 MB block entries at
 //! level 2. On top of that, per-task address spaces: every task gets its own
-//! L0 with entry[0] sharing the kernel's identity chain and entry[1] pointing
-//! at a private gigabyte window (starting at PRIVATE_WINDOW_VA) backed by
-//! pages only that task can see through this VA.
+//! L0 — entry[0] chains to a user-accessible identity half of DRAM plus an
+//! EL1-only MMIO gigabyte, entry[1] points at a private gigabyte window
+//! (starting at PRIVATE_WINDOW_VA) backed by pages only that task can see.
 //!
-//! Coverage of the shared identity half (virtual == physical everywhere):
-//!   0x0000_0000..0x4000_0000  device nGnRnE  (GIC @0x0800_0000, UART @0x0900_0000)
-//!   0x4000_0000..0x8000_0000  normal WB      (DRAM starts at 0x4000_0000)
-//! AP=EL1-RW everywhere: EL0 gets nothing yet, and the identity half means
-//! tasks at EL1 can still reach all of kernel memory — real protection
-//! arrives with the move to EL0.
+//! Coverage (virtual == physical for the identity windows):
+//!   0x0000_0000..0x4000_0000  device nGnRnE, EL1 only (GIC, UART)
+//!   0x4000_0000..0x8000_0000  normal WB; kernel tables EL1-RW, task
+//!                             tables EL0+EL1 RW (user tasks live here)
+//!
+//! Honest limitation: user tasks can still read/write all of DRAM,
+//! including kernel data, because their code is linked into the kernel
+//! image. What IS already enforced: MMIO is unreachable from EL0 (UART and
+//! GIC are syscall-only) and instruction-stream privilege — EL0 cannot
+//! execute MSR/MRS, touch TTBR/SCTLR, or skip the SVC boundary. Data
+//! confidentiality arrives with the ELF loader (separate user code).
 
 use crate::{frame_allocator, memory::DRAM_BASE};
+
+extern "C" {
+    static __text_start: u8;
+    static __text_end: u8;
+    static __data_start: u8;
+    static __kernel_end: u8;
+}
 
 const ENTRIES: usize = 512;
 const GRANULE: usize = 4096;
@@ -32,10 +44,13 @@ const ATTR_NORMAL: u64 = 0; // MAIR attr0 = 0xFF: Normal, inner+outer WB RW-allo
 const ATTR_DEVICE: u64 = 1; // MAIR attr1 = 0x00: Device-nGnRnE
 
 const AP_EL1_RW: u64 = 0b00 << 6; // EL1 read/write, EL0 no access
+const AP_EL0_RW: u64 = 0b01 << 6; // EL1 + EL0 read/write
+const AP_BOTH_RO: u64 = 0b11 << 6; // EL1 + EL0 read-only
 const AF: u64 = 1 << 10; // Access Flag: never fault on access
 const SH_NONE: u64 = 0b00 << 8; // non-shareable (device memory)
 const SH_INNER: u64 = 0b11 << 8; // inner-shareable (normal memory)
 const UXN: u64 = 1 << 54; // not executable at EL0 (PXN stays 0: EL1 may execute)
+const PXN: u64 = 1 << 53; // not executable at EL1
 
 const ADDRESS_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 
@@ -157,6 +172,9 @@ fn configure_and_enable() {
             "isb",
             "mrs {sctlr}, sctlr_el1",
             "orr {sctlr}, {sctlr}, #1", // SCTLR_EL1.M: enable translation
+            "bic {sctlr}, {sctlr}, #(1 << 22)", // SCTLR_EL1.PAN off: kernel
+            // code legitimately reads/writes EL0-accessible pages (message
+            // copies, task stacks), and we have no use for PAN yet.
             "msr sctlr_el1, {sctlr}",
             "isb",
             "tlbi vmalle1",
@@ -201,63 +219,126 @@ pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
 // ---------------------------------------------------------------------------
 
 /// Builds a fresh address space for one task. Layout of its private L0:
-///   entry[0] → the SHARED level-1 table of the kernel identity half
-///              (kernel, devices, heap, stacks: identical in every task);
-///   entry[1] → the task's own L1→L2→L3 chain, mapping PRIVATE_WINDOW_VA to
-///              `private_page` (one 4 KB page, EL1-RW, normal WB).
+///   entry[0] → own L1_user:
+///       [0] → SHARED kernel MMIO level-2 table (device blocks, AP=EL1_RW:
+///             UART and GIC are unreachable from EL0 — syscall-only);
+///       [1] → own L2_dram:
+///             [0] → own L3_kernel: the first 2 MB of DRAM (the whole kernel
+///                   image) at 4 KB granularity, split by section:
+///                   .text   → AP=both-RO, executable at EL0 AND EL1 —
+///                              RO at EL0 sidesteps the architectural rule
+///                              that an EL0-*writable* page is execute-never
+///                              at EL1 (the trampolines must keep executing
+///                              while a task's TTBR0 is loaded);
+///                   .rodata → AP=both-RO, UXN+PXN (data, not code);
+///                   .data/.bss/.stack → AP=EL0_RW, UXN+PXN (plain data;
+///                              EL1 reads/writes it fine, execution never);
+///             [1..] → AP=EL0_RW 2 MB blocks (heap, task stacks: data only).
+///   entry[1] → own L1_priv → L2_priv → L3_priv, mapping PRIVATE_WINDOW_VA
+///              to `private_page` (4 KB, EL0_RW, UXN — data, not code).
+///
 /// Table pages come from the frame allocator; they are reachable through
-/// the kernel identity half, so filling them by physical address is safe.
+/// the identity mapping, so filling them by physical address is safe.
 ///
 /// Returns the physical base to load into TTBR0_EL1.
 pub fn create_task_space(private_page: usize) -> Option<usize> {
-    let l0 = frame_allocator::alloc_page()?;
-    let Some(l1) = frame_allocator::alloc_page() else {
-        frame_allocator::free_page(l0);
-        return None;
-    };
-    let Some(l2) = frame_allocator::alloc_page() else {
-        frame_allocator::free_page(l1);
-        frame_allocator::free_page(l0);
-        return None;
-    };
-    let Some(l3) = frame_allocator::alloc_page() else {
-        frame_allocator::free_page(l2);
-        frame_allocator::free_page(l1);
-        frame_allocator::free_page(l0);
-        return None;
-    };
+    // Seven owned table pages; L1_user[0] borrows the shared MMIO L2 instead.
+    let mut pages = [0_usize; 7];
+    for (index, slot) in pages.iter_mut().enumerate() {
+        let Some(page) = frame_allocator::alloc_page() else {
+            for prior in &pages[..index] {
+                frame_allocator::free_page(*prior);
+            }
+            return None;
+        };
+        *slot = page;
+    }
+    let [l0, l1_user, l2_dram, l3_kernel, l1_priv, l2_priv, l3_priv] = pages;
 
     unsafe {
-        zero_page(l0);
-        zero_page(l1);
-        zero_page(l2);
-        zero_page(l3);
+        for &page in &pages {
+            zero_page(page);
+        }
 
-        write_entry(l0, 0, descriptor_address(identity_l1_address() as u64) | DESC_TABLE);
-        write_entry(l0, 1, descriptor_address(l1 as u64) | DESC_TABLE);
-        write_entry(l1, 0, descriptor_address(l2 as u64) | DESC_TABLE);
-        write_entry(l2, 0, descriptor_address(l3 as u64) | DESC_TABLE);
-        write_entry(l3, 0, page_descriptor(private_page));
+        write_entry(l0, 0, descriptor_address(l1_user as u64) | DESC_TABLE);
+        write_entry(l0, 1, descriptor_address(l1_priv as u64) | DESC_TABLE);
+
+        let shared_mmio_l2 = core::ptr::addr_of!(TABLES) as usize + INDEX_LEVEL2_MMIO * TABLE_BYTES;
+        write_entry(
+            l1_user,
+            0,
+            descriptor_address(shared_mmio_l2 as u64) | DESC_TABLE,
+        );
+
+        write_entry(l1_user, 1, descriptor_address(l2_dram as u64) | DESC_TABLE);
+        write_entry(
+            l2_dram,
+            0,
+            descriptor_address(l3_kernel as u64) | DESC_TABLE,
+        );
+        for index in 1..ENTRIES {
+            let base = DRAM_BASE + index * BLOCK_2M;
+            write_entry(l2_dram, index, dram_data_block(base));
+        }
+        fill_kernel_l3(l3_kernel);
+
+        write_entry(l1_priv, 0, descriptor_address(l2_priv as u64) | DESC_TABLE);
+        write_entry(l2_priv, 0, descriptor_address(l3_priv as u64) | DESC_TABLE);
+        write_entry(l3_priv, 0, page_descriptor(private_page));
     }
 
-    for page in [l0, l1, l2, l3] {
+    for page in pages {
         flush_after_table_change(page, GRANULE);
     }
     Some(l0)
 }
 
+/// Fills the 4 KB-granularity view of the kernel image (L2_dram[0] covers
+/// VA 0x4000_0000..0x4020_0000). Pages outside the image are plain RW data.
+unsafe fn fill_kernel_l3(l3_kernel: usize) {
+    let text_start = core::ptr::addr_of!(__text_start) as usize;
+    let text_end = core::ptr::addr_of!(__text_end) as usize;
+    let data_start = core::ptr::addr_of!(__data_start) as usize;
+    let kernel_end = core::ptr::addr_of!(__kernel_end) as usize;
+
+    for index in 0..ENTRIES {
+        let va = DRAM_BASE + index * GRANULE;
+        let descriptor = if va >= text_start && va < text_end {
+            kernel_text_page(va)
+        } else if va >= text_end && va < data_start {
+            kernel_rodata_page(va)
+        } else if va >= data_start && va < kernel_end {
+            kernel_data_page(va)
+        } else if va >= kernel_end {
+            // RAM past the image: nothing there on QEMU, but keep it data.
+            kernel_data_page(va)
+        } else {
+            // RAM below the image (0x4000_0000..0x4008_0000): data.
+            kernel_data_page(va)
+        };
+        write_entry(l3_kernel, index, descriptor);
+    }
+}
+
 /// Frees every page of a task space created by `create_task_space`,
 /// including the private data page (recovered from the L3 descriptor).
+/// The SHARED kernel MMIO L2 (L1_user[0]) is borrowed, never freed here.
 pub fn destroy_task_space(ttbr0: usize) {
     unsafe {
-        let l1 = follow_table(ttbr0, 1);
-        let l2 = follow_table(l1, 0);
-        let l3 = follow_table(l2, 0);
-        let private_page = descriptor_address(read_entry(l3, 0));
+        let l1_user = follow_table(ttbr0, 0);
+        let l2_dram = follow_table(l1_user, 1);
+        let l3_kernel = follow_table(l2_dram, 0);
+        let l1_priv = follow_table(ttbr0, 1);
+        let l2_priv = follow_table(l1_priv, 0);
+        let l3_priv = follow_table(l2_priv, 0);
+        let private_page = descriptor_address(read_entry(l3_priv, 0));
         frame_allocator::free_page(private_page as usize);
-        frame_allocator::free_page(l3);
-        frame_allocator::free_page(l2);
-        frame_allocator::free_page(l1);
+        frame_allocator::free_page(l3_priv);
+        frame_allocator::free_page(l2_priv);
+        frame_allocator::free_page(l1_priv);
+        frame_allocator::free_page(l3_kernel);
+        frame_allocator::free_page(l2_dram);
+        frame_allocator::free_page(l1_user);
         frame_allocator::free_page(ttbr0);
     }
 }
@@ -279,19 +360,59 @@ pub fn switch_address_space(ttbr0: usize) {
     }
 }
 
-fn identity_l1_address() -> usize {
-    core::ptr::addr_of!(TABLES) as usize + INDEX_LEVEL1 * TABLE_BYTES
-}
-
 fn descriptor_address(descriptor_or_address: u64) -> u64 {
     descriptor_or_address & ADDRESS_MASK
+}
+
+/// A 2 MB block of DRAM above the kernel image, as mapped inside task
+/// spaces: EL0+EL1 read/write, never executable — heap, task stacks, tables.
+fn dram_data_block(output_address: usize) -> u64 {
+    ((output_address as u64) & !(BLOCK_2M as u64 - 1))
+        | DESC_BLOCK
+        | (ATTR_NORMAL << 2)
+        | AP_EL0_RW
+        | SH_INNER
+        | AF
+        | UXN
+        | PXN
+}
+
+/// Kernel .text page: read-only at both levels, executable at EL0 AND EL1.
+/// RO-at-EL0 is what keeps the page executable at EL1 — an EL0-*writable*
+/// page is architecturally execute-never at EL1 (W^X rule), and the
+/// trampolines must keep fetching while a task's TTBR0 is loaded.
+fn kernel_text_page(identity_address: usize) -> u64 {
+    descriptor_address(identity_address as u64)
+        | DESC_PAGE
+        | (ATTR_NORMAL << 2)
+        | AP_BOTH_RO
+        | SH_INNER
+        | AF
+}
+
+/// Kernel .rodata page: read-only, no execution anywhere.
+fn kernel_rodata_page(identity_address: usize) -> u64 {
+    kernel_text_page(identity_address) | UXN | PXN
+}
+
+/// Kernel data page (.data/.bss/.stack, RAM past the image): EL0+EL1 RW,
+/// no execution anywhere.
+fn kernel_data_page(identity_address: usize) -> u64 {
+    descriptor_address(identity_address as u64)
+        | DESC_PAGE
+        | (ATTR_NORMAL << 2)
+        | AP_EL0_RW
+        | SH_INNER
+        | AF
+        | UXN
+        | PXN
 }
 
 fn page_descriptor(output_address: usize) -> u64 {
     descriptor_address(output_address as u64)
         | DESC_PAGE
         | (ATTR_NORMAL << 2)
-        | AP_EL1_RW
+        | AP_EL0_RW
         | SH_INNER
         | AF
         | UXN

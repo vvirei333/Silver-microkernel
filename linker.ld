@@ -12,6 +12,7 @@ SECTIONS
     /* Common AArch64 DRAM load address; replace with the firmware address later. */
     . = 0x40080000;
     __kernel_start = .;
+    __text_start = .;
 
     .text : ALIGN(4096)
     {
@@ -19,6 +20,7 @@ SECTIONS
         KEEP(*(.text.vectors))
         *(.text .text.*)
     } :text
+    __text_end = .;
 
     .rodata : ALIGN(4096)
     {
@@ -27,6 +29,7 @@ SECTIONS
 
     .data : ALIGN(4096)
     {
+        __data_start = .;
         *(.data .data.*)
     } :data
 

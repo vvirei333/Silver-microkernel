@@ -11,28 +11,28 @@
 
 use alloc::vec::Vec;
 
-use crate::{interrupts, ipc, pl011, scheduler};
+use crate::{ipc, syscall};
 
 struct Entry {
     name: Vec<u8>,
     id: u64,
 }
 
-/// Entry point spawned by the scheduler. Never returns.
+/// Entry point spawned by the scheduler as an EL0 user task: it reaches the
+/// kernel (IPC, console) only through system calls. Never returns.
 pub extern "C" fn nameserver_task() -> ! {
-    interrupts::enable_irq();
-
     let mut table: Vec<Entry> = Vec::new();
-    pl011::write_str("NAMESERVER READY\r\n");
+    syscall::print("NAMESERVER READY\r\n");
 
     loop {
-        let request = ipc::receive();
+        let mut request = ipc::Message::new(0, b"");
+        syscall::receive(&mut request);
         let reply = match request.text().split_first() {
             Some((&b'R', name)) if !name.is_empty() => register(&mut table, name, request.sender),
             Some((&b'L', name)) if !name.is_empty() => lookup(&mut table, name),
             _ => text_reply("WHAT?"),
         };
-        ipc::send(request.sender, reply);
+        syscall::send(request.sender, &reply);
     }
 }
 
@@ -45,9 +45,9 @@ fn register(table: &mut Vec<Entry>, name: &[u8], id: u64) -> ipc::Message {
         name: name.to_vec(),
         id,
     });
-    pl011::write_str("NAMESERVER REG ");
-    pl011::write_str(core::str::from_utf8(name).unwrap_or("?"));
-    pl011::write_str("\r\n");
+    syscall::print("NAMESERVER REG ");
+    syscall::print(core::str::from_utf8(name).unwrap_or("?"));
+    syscall::print("\r\n");
     text_reply("OK")
 }
 
@@ -59,7 +59,7 @@ fn lookup(table: &[Entry], name: &[u8]) -> ipc::Message {
 }
 
 fn text_reply(text: &str) -> ipc::Message {
-    ipc::Message::new(scheduler::current_task_id(), text.as_bytes())
+    ipc::Message::new(syscall::task_id(), text.as_bytes())
 }
 
 /// Formats an "ID <n>" reply without alloc::format — kernel style.
@@ -82,7 +82,7 @@ fn id_reply(id: u64) -> ipc::Message {
     }
 
     ipc::Message {
-        sender: scheduler::current_task_id(),
+        sender: syscall::task_id(),
         payload,
     }
 }

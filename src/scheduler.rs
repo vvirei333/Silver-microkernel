@@ -3,14 +3,15 @@ use core::cell::UnsafeCell;
 use alloc::vec::Vec;
 
 use crate::{
-    channel, frame_allocator, interrupts, ipc,
+    frame_allocator, interrupts, ipc,
     memory::{MemoryRegion, PAGE_SIZE},
-    mutex, mmu, nameserver, pl011, syscall, timer,
+    mmu, nameserver, pl011, syscall, timer,
 };
 
 const TASK_STACK_PAGES: usize = 4;
 const TASK_STACK_SIZE: usize = TASK_STACK_PAGES * PAGE_SIZE;
-const X30_INDEX: usize = 11;
+const TASK_USER_STACK_PAGES: usize = 2;
+const TASK_USER_STACK_SIZE: usize = TASK_USER_STACK_PAGES * PAGE_SIZE;
 const IDLE_TASK_ID: u64 = 0;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -22,10 +23,28 @@ pub enum TaskState {
     Dead,
 }
 
+/// Saved execution state of a task. The context switch (`silver_context_switch`)
+/// stores/restores this whole block and finishes with `ret`, so every field
+/// maps 1:1 onto CPU state:
+///   registers          x19-x30 (callee-saved; the trampolines own x0-x18)
+///   stack_pointer      SP_EL1 while the task is inside the kernel
+///   user_stack_pointer SP_EL0 (user tasks only; 0 for kernel tasks)
+///   elr                resume PC, loaded into x30: the task entry point for
+///                      a fresh task, or silver_user_bootstrap for a fresh
+///                      EL0 task (entry passed in x19); for a running task it
+///                      is the saved x30, which returns into schedule() and
+///                      unwinds back to the trampoline epilogue (see main.rs)
+///
+/// Note there is deliberately NO spsr field: resume always lands at EL1h
+/// (the `ret` target is EL1 code), and the true return level (EL0t vs EL1h)
+/// lives in the exception frame's SPSR slot, restored by the trampoline
+/// epilogue.
 #[repr(C, align(16))]
 pub struct TaskContext {
     registers: [u64; 12],
     stack_pointer: u64,
+    user_stack_pointer: u64,
+    elr: u64,
 }
 
 impl TaskContext {
@@ -33,6 +52,8 @@ impl TaskContext {
         Self {
             registers: [0; 12],
             stack_pointer: 0,
+            user_stack_pointer: 0,
+            elr: 0,
         }
     }
 }
@@ -41,7 +62,10 @@ pub struct Task {
     pub id: u64,
     pub state: TaskState,
     pub context: TaskContext,
+    /// Kernel stack: used for SVC/IRQ trampolines whenever the task runs.
     pub stack: MemoryRegion,
+    /// User stack (SP_EL0) for EL0 tasks; empty for kernel tasks.
+    pub user_stack: MemoryRegion,
     /// Physical base of this task's translation tables (TTBR0_EL1 value).
     pub ttbr0: usize,
 }
@@ -50,6 +74,47 @@ pub struct TaskManager {
     tasks: Vec<Task>,
     current_index: usize,
     next_id: u64,
+}
+
+// DEBUG: ring buffer of the last context switches (from, to, next sp, next elr).
+const TRACE_LEN: usize = 16;
+static mut SWITCH_TRACE: [(u64, u64, u64, u64); TRACE_LEN] = [(0, 0, 0, 0); TRACE_LEN];
+static mut TRACE_POS: usize = 0;
+
+fn trace_switch(from: u64, to: u64, sp: u64, elr: u64) {
+    unsafe {
+        let pos = core::ptr::addr_of_mut!(TRACE_POS).read();
+        core::ptr::addr_of_mut!(SWITCH_TRACE)
+            .cast::<(u64, u64, u64, u64)>()
+            .add(pos)
+            .write((from, to, sp, elr));
+        core::ptr::addr_of_mut!(TRACE_POS).write((pos + 1) % TRACE_LEN);
+    }
+}
+
+pub fn dump_switch_trace() {
+    pl011::write_str("SWITCH TRACE from,to,sp,elr:\r\n");
+    unsafe {
+        let pos = core::ptr::addr_of!(TRACE_POS).read();
+        for offset in 0..TRACE_LEN {
+            let index = (pos + offset) % TRACE_LEN;
+            let (from, to, sp, elr) = core::ptr::addr_of!(SWITCH_TRACE)
+                .cast::<(u64, u64, u64, u64)>()
+                .add(index)
+                .read();
+            if from == 0 && to == 0 {
+                continue;
+            }
+            pl011::write_dec_u64(from);
+            pl011::write_str("->");
+            pl011::write_dec_u64(to);
+            pl011::write_str(" sp=");
+            pl011::write_hex_u64(sp);
+            pl011::write_str(" elr=");
+            pl011::write_hex_u64(elr);
+            pl011::write_str("\r\n");
+        }
+    }
 }
 
 struct SharedScheduler(UnsafeCell<Option<TaskManager>>);
@@ -66,6 +131,14 @@ core::arch::global_asm!(
     .section .text.scheduler, "ax"
     .global silver_context_switch
     .type silver_context_switch, %function
+// Saves the current task's x19-x30 and SP_EL1/SP_EL0 into the block at x0,
+// loads the same from the block at x1, and resumes the new task with `ret`.
+// x30 holds the resume PC: for a running task it is the return address into
+// schedule() (the call chain trampoline -> handler -> schedule unwinds back
+// to the trampoline epilogue, which still owns the correct SP and the saved
+// ELR/SPSR frame slots); for a fresh task it is the entry point (EL1) or
+// silver_user_bootstrap (EL0). ELR_EL1/SPSR_EL1 are deliberately NOT part of
+// the switch: they live in the trampoline frames.
 silver_context_switch:
     stp x19, x20, [x0, #0]
     stp x21, x22, [x0, #16]
@@ -75,7 +148,12 @@ silver_context_switch:
     stp x29, x30, [x0, #80]
     mov x9, sp
     str x9, [x0, #96]
+    mrs x9, sp_el0
+    str x9, [x0, #104]
+    str x30, [x0, #112]        // resume PC: return into schedule()
 
+    ldr x9, [x1, #104]
+    msr sp_el0, x9
     ldr x9, [x1, #96]
     mov sp, x9
     ldp x19, x20, [x1, #0]
@@ -84,13 +162,28 @@ silver_context_switch:
     ldp x25, x26, [x1, #48]
     ldp x27, x28, [x1, #64]
     ldp x29, x30, [x1, #80]
+    ldr x30, [x1, #112]        // resume PC (elr field) wins over saved x30
     ret
     .size silver_context_switch, . - silver_context_switch
+
+// First entry for a fresh EL0 task. The context switch rets here at EL1h
+// with x19 = the task entry point (restored from the initial context) and
+// SP_EL0 already loaded. All this stub does is aim eret at the entry with
+// SPSR = EL0t and interrupts unmasked.
+    .global silver_user_bootstrap
+    .type silver_user_bootstrap, %function
+silver_user_bootstrap:
+    msr elr_el1, x19
+    mov x9, xzr
+    msr spsr_el1, x9
+    eret
+    .size silver_user_bootstrap, . - silver_user_bootstrap
 "#
 );
 
 extern "C" {
     fn silver_context_switch(current: *mut TaskContext, next: *const TaskContext);
+    fn silver_user_bootstrap();
 }
 
 pub fn init() {
@@ -102,26 +195,27 @@ pub fn init() {
     });
 
     // Idle always exists, so the CPU has somewhere to run when all tasks sleep.
-    let _idle_id = spawn_inner(idle_task);
+    // It stays at EL1: pure wfi loop, never blocks voluntarily, never syscalls.
+    let _idle_id = spawn_inner(idle_task, false);
     // Spawned first after idle, so its ID is NAMESERVER_ID (1) — never
     // reorder without updating syscall::NAMESERVER_ID.
-    let _nameserver_id = spawn_inner(nameserver::nameserver_task);
-    let _holder_id = spawn_inner(mutex_holder);
-    let _contender_1_id = spawn_inner(mutex_contender);
-    let _contender_2_id = spawn_inner(mutex_contender);
-    let _ping_id = spawn_inner(ipc_ping);
-    let _pong_id = spawn_inner(ipc_pong);
+    let _nameserver_id = spawn_inner(nameserver::nameserver_task, true);
+    let _holder_id = spawn_inner(mutex_holder, true);
+    let _contender_1_id = spawn_inner(mutex_contender, true);
+    let _contender_2_id = spawn_inner(mutex_contender, true);
+    let _ping_id = spawn_inner(ipc_ping, true);
+    let _pong_id = spawn_inner(ipc_pong, true);
     // Condvar demo: alpha and beta both block in receive(); the probe sends
     // to alpha only — beta must stay asleep.
-    let _alpha_id = spawn_inner(condvar_alpha);
-    let _beta_id = spawn_inner(condvar_beta);
-    let _probe_id = spawn_inner(condvar_probe);
-    let _producer_id = spawn_inner(channel_producer);
-    let _consumer_id = spawn_inner(channel_consumer);
-    let _sleeper_id = spawn_inner(sleeping_task);
+    let _alpha_id = spawn_inner(condvar_alpha, true);
+    let _beta_id = spawn_inner(condvar_beta, true);
+    let _probe_id = spawn_inner(condvar_probe, true);
+    let _producer_id = spawn_inner(channel_producer, true);
+    let _consumer_id = spawn_inner(channel_consumer, true);
+    let _sleeper_id = spawn_inner(sleeping_task, true);
     // Per-task address space demo: same VA, different physical pages.
-    let _vm_a_id = spawn_inner(vm_task_a);
-    let _vm_b_id = spawn_inner(vm_task_b);
+    let _vm_a_id = spawn_inner(vm_task_a, true);
+    let _vm_b_id = spawn_inner(vm_task_b, true);
 
     let manager = scheduler_manager().unwrap();
     manager.current_index = manager
@@ -131,10 +225,12 @@ pub fn init() {
         .unwrap_or(0);
 }
 
-/// Dynamically adds a task and returns its ID.
-pub fn spawn(entry: extern "C" fn() -> !) -> Option<u64> {
+/// Dynamically adds a task and returns its ID. `user` selects the exception
+/// level: user tasks run at EL0t with their own SP_EL0 stack and reach the
+/// kernel only through SVC; kernel tasks run at EL1h on the kernel stack.
+pub fn spawn(entry: extern "C" fn() -> !, user: bool) -> Option<u64> {
     let saved_daif = interrupts::save_and_disable_irq();
-    let id = spawn_inner(entry);
+    let id = spawn_inner(entry, user);
     interrupts::restore_irq(saved_daif);
     id
 }
@@ -234,6 +330,12 @@ pub fn start() -> ! {
     };
 
     first_task.state = TaskState::Running;
+    trace_switch(
+        0,
+        first_task.id,
+        first_task.context.stack_pointer,
+        first_task.context.elr,
+    );
     let first_context = &first_task.context as *const TaskContext;
     let boot_context = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CONTEXT) };
 
@@ -328,6 +430,13 @@ pub fn schedule() {
         mmu::switch_address_space(next_task.ttbr0);
     }
 
+    trace_switch(
+        current_task.id,
+        next_task.id,
+        next_task.context.stack_pointer,
+        next_task.context.elr,
+    );
+
     unsafe {
         silver_context_switch(
             current_context as *mut TaskContext,
@@ -336,10 +445,10 @@ pub fn schedule() {
     }
 }
 
-fn spawn_inner(entry: extern "C" fn() -> !) -> Option<u64> {
+fn spawn_inner(entry: extern "C" fn() -> !, user: bool) -> Option<u64> {
     let manager = scheduler_manager()?;
     let id = manager.next_id;
-    let task = Task::new(id, entry)?;
+    let task = Task::new(id, entry, user)?;
 
     manager.tasks.push(task);
     manager.next_id += 1;
@@ -418,7 +527,7 @@ fn current_task_mut() -> Option<&'static mut Task> {
 }
 
 impl Task {
-    fn new(id: u64, entry: extern "C" fn() -> !) -> Option<Self> {
+    fn new(id: u64, entry: extern "C" fn() -> !, user: bool) -> Option<Self> {
         let stack_start = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES)?;
         let Some(private_page) = frame_allocator::alloc_page() else {
             release_pages(stack_start, TASK_STACK_PAGES);
@@ -430,22 +539,47 @@ impl Task {
             return None;
         };
 
+        let user_stack = if user {
+            let Some(user_start) = frame_allocator::alloc_contiguous_pages(TASK_USER_STACK_PAGES)
+            else {
+                mmu::destroy_task_space(ttbr0);
+                frame_allocator::free_page(private_page);
+                release_pages(stack_start, TASK_STACK_PAGES);
+                return None;
+            };
+            MemoryRegion::new(user_start, user_start + TASK_USER_STACK_SIZE)
+        } else {
+            MemoryRegion::new(0, 0)
+        };
+
         let stack = MemoryRegion::new(stack_start, stack_start + TASK_STACK_SIZE);
         let mut context = TaskContext::zero();
-        context.registers[X30_INDEX] = entry as usize as u64;
+        context.registers[0] = entry as usize as u64; // x19: handed to the bootstrap
+        context.elr = if user {
+            // The switch `ret`s here at EL1h; the bootstrap drops to EL0t
+            // at `entry`, passing it in x19 (restored from this context).
+            silver_user_bootstrap as *const () as usize as u64
+        } else {
+            entry as usize as u64
+        };
         context.stack_pointer = stack.end as u64;
+        context.user_stack_pointer = if user { user_stack.end as u64 } else { 0 };
 
         Some(Self {
             id,
             state: TaskState::Ready,
             context,
             stack,
+            user_stack,
             ttbr0,
         })
     }
 
     fn release_stack(&self) {
         release_pages(self.stack.start, TASK_STACK_PAGES);
+        if !self.user_stack.is_empty() {
+            release_pages(self.user_stack.start, TASK_USER_STACK_PAGES);
+        }
     }
 
     fn release_space(&self) {
@@ -468,90 +602,81 @@ fn scheduler_manager() -> Option<&'static mut TaskManager> {
 }
 
 extern "C" fn idle_task() -> ! {
-    // Voluntary switches leave IRQ masked, so every task entry point must
-    // unmask interrupts itself before it can be woken by the timer again.
+    // The only kernel (EL1) task. Its initial context resumes with DAIF
+    // masked, so it must unmask IRQ itself; user tasks get unmasked PSTATE
+    // from the bootstrap instead.
     interrupts::enable_irq();
     loop {
         interrupts::wait_for_irq();
     }
 }
 
-/// Shared counter used by the mutex demo tasks.
-static COUNTER: mutex::Mutex<u64> = mutex::Mutex::new(0);
-
 extern "C" fn mutex_holder() -> ! {
     loop {
-        interrupts::enable_irq();
-        {
-            let _guard = COUNTER.lock();
-            pl011::write_str("MUTEX HOLDER=1 ACQUIRE\r\n");
-            // Hold long enough for both contenders to pile up in the queue.
-            sleep(400);
-            pl011::write_str("MUTEX HOLDER=1 RELEASE\r\n");
-        }
-        sleep(50);
+        syscall::mutex_lock();
+        syscall::print("MUTEX HOLDER=1 ACQUIRE\r\n");
+        // Sleep WHILE holding the lock: contenders must pile up in the queue.
+        syscall::sleep(400);
+        syscall::print("MUTEX HOLDER=1 RELEASE\r\n");
+        syscall::mutex_unlock();
+        syscall::sleep(50);
     }
 }
 
 extern "C" fn mutex_contender() -> ! {
     loop {
-        interrupts::enable_irq();
-        {
-            let mut counter = COUNTER.lock();
-            *counter += 1;
-            // One byte per successful lock keeps the UART log readable
-            // next to the IPC demo lines.
-            pl011::write_byte(b'0' + current_task_id() as u8);
-        }
-        sleep(100);
+        syscall::mutex_lock();
+        syscall::print("MUTEX T");
+        syscall::print_dec_u64(syscall::task_id());
+        syscall::print(" LOCK\r\n");
+        syscall::mutex_unlock();
+        syscall::sleep(100);
     }
 }
 
 /// Registers `name`, then resolves `peer` through the nameserver, retrying
 /// until the peer shows up. Demonstrates the discovery dance both sides do.
 fn resolve_peer(name: &str, peer: &str) -> u64 {
-    pl011::write_str("IPC REGISTER ");
-    pl011::write_str(name);
-    pl011::write_str("\r\n");
+    syscall::print("IPC REGISTER ");
+    syscall::print(name);
+    syscall::print("\r\n");
     if !syscall::register(name) {
-        pl011::write_str("IPC REGISTER FAILED\r\n");
+        syscall::print("IPC REGISTER FAILED\r\n");
     }
 
     loop {
         if let Some(id) = syscall::lookup(peer) {
-            pl011::write_str("IPC FOUND ");
-            pl011::write_str(peer);
-            pl011::write_str("\r\n");
+            syscall::print("IPC FOUND ");
+            syscall::print(peer);
+            syscall::print("\r\n");
             return id;
         }
-        pl011::write_str("IPC LOOKUP ");
-        pl011::write_str(peer);
-        pl011::write_str(" RETRY\r\n");
+        syscall::print("IPC LOOKUP ");
+        syscall::print(peer);
+        syscall::print(" RETRY\r\n");
         syscall::sleep(100);
     }
 }
 
 extern "C" fn ipc_ping() -> ! {
-    interrupts::enable_irq();
     let peer = resolve_peer("ping", "pong");
     let mut reply = ipc::Message::new(0, b"");
 
     loop {
-        pl011::write_str("IPC ping SEND PING (SVC)\r\n");
-        syscall::send(peer, &ipc::Message::new(current_task_id(), b"PING"));
+        syscall::print("IPC ping SEND PING (SVC)\r\n");
+        syscall::send(peer, &ipc::Message::new(syscall::task_id(), b"PING"));
 
         // Blocks here until pong answers.
         syscall::receive(&mut reply);
-        pl011::write_str("IPC ping RECV ");
-        pl011::write_str(core::str::from_utf8(reply.text()).unwrap_or("?"));
-        pl011::write_str(" (SVC)\r\n");
+        syscall::print("IPC ping RECV ");
+        syscall::print(core::str::from_utf8(reply.text()).unwrap_or("?"));
+        syscall::print(" (SVC)\r\n");
 
         syscall::sleep(300);
     }
 }
 
 extern "C" fn ipc_pong() -> ! {
-    interrupts::enable_irq();
     // reply goes to message.sender, so pong only needs to register itself
     resolve_peer("pong", "ping");
     let mut message = ipc::Message::new(0, b"");
@@ -562,25 +687,24 @@ extern "C" fn ipc_pong() -> ! {
 
         // Blocks here until ping arrives.
         syscall::receive(&mut message);
-        pl011::write_str("IPC pong RECV ");
-        pl011::write_str(core::str::from_utf8(message.text()).unwrap_or("?"));
-        pl011::write_str(" (SVC)\r\n");
+        syscall::print("IPC pong RECV ");
+        syscall::print(core::str::from_utf8(message.text()).unwrap_or("?"));
+        syscall::print(" (SVC)\r\n");
 
-        pl011::write_str("IPC pong SEND PONG (SVC)\r\n");
+        syscall::print("IPC pong SEND PONG (SVC)\r\n");
         syscall::send(
             message.sender,
-            &ipc::Message::new(current_task_id(), b"PONG"),
+            &ipc::Message::new(syscall::task_id(), b"PONG"),
         );
     }
 }
 
 extern "C" fn sleeping_task() -> ! {
     loop {
-        interrupts::enable_irq();
-        sleep(500);
-        pl011::write_str("TASK ID=");
-        pl011::write_hex_u64(current_task_id());
-        pl011::write_str(" AWAKE\r\n");
+        syscall::sleep(500);
+        syscall::print("TASK ID=");
+        syscall::print_hex_u64(syscall::task_id());
+        syscall::print(" AWAKE\r\n");
     }
 }
 
@@ -589,33 +713,30 @@ extern "C" fn sleeping_task() -> ! {
 /// targeted, beta would print its line and the test would fail.
 
 extern "C" fn condvar_alpha() -> ! {
-    interrupts::enable_irq();
     syscall::register("alpha");
     let mut message = ipc::Message::new(0, b"");
 
     loop {
         syscall::receive(&mut message);
-        pl011::write_str("CONDVAR alpha RECV ");
-        pl011::write_str(core::str::from_utf8(message.text()).unwrap_or("?"));
-        pl011::write_str("\r\n");
+        syscall::print("CONDVAR alpha RECV ");
+        syscall::print(core::str::from_utf8(message.text()).unwrap_or("?"));
+        syscall::print("\r\n");
         // Back to sleep on the mailbox condvar — silent from here on.
     }
 }
 
 extern "C" fn condvar_beta() -> ! {
-    interrupts::enable_irq();
     syscall::register("beta");
     let mut message = ipc::Message::new(0, b"");
 
     loop {
         syscall::receive(&mut message);
         // Reaching this print means a foreign wakeup hit beta: TEST FAIL.
-        pl011::write_str("CONDVAR beta RECV (TEST FAIL)\r\n");
+        syscall::print("CONDVAR beta RECV (TEST FAIL)\r\n");
     }
 }
 
 extern "C" fn condvar_probe() -> ! {
-    interrupts::enable_irq();
     syscall::register("probe");
 
     // Wait until both receivers exist, then give them time to reach receive().
@@ -633,12 +754,12 @@ extern "C" fn condvar_probe() -> ! {
     }
     syscall::sleep(300);
 
-    pl011::write_str("CONDVAR TEST: send WAKE to alpha only\r\n");
-    syscall::send(alpha, &ipc::Message::new(current_task_id(), b"WAKE"));
+    syscall::print("CONDVAR TEST: send WAKE to alpha only\r\n");
+    syscall::send(alpha, &ipc::Message::new(syscall::task_id(), b"WAKE"));
 
     // If beta ever prints, it happens within this window.
     syscall::sleep(500);
-    pl011::write_str("CONDVAR TEST: beta silent = PASS\r\n");
+    syscall::print("CONDVAR TEST: beta silent = PASS\r\n");
 
     loop {
         syscall::sleep(1000);
@@ -648,29 +769,25 @@ extern "C" fn condvar_probe() -> ! {
 /// Bounded channel demo: capacity 2, fast producer, slow consumer. The
 /// producer must block in `send` once two items are in flight — watch the
 /// log: TX can never lead RX by more than 2.
-static CHAN: channel::Channel<u64> = channel::Channel::new(2);
-
 extern "C" fn channel_producer() -> ! {
-    interrupts::enable_irq();
     loop {
         for item in 1..=5_u64 {
-            CHAN.send(item);
-            pl011::write_str("CHAN TX ");
-            pl011::write_dec_u64(item);
-            pl011::write_str("\r\n");
+            syscall::channel_send(item);
+            syscall::print("CHAN TX ");
+            syscall::print_dec_u64(item);
+            syscall::print("\r\n");
         }
     }
 }
 
 extern "C" fn channel_consumer() -> ! {
-    interrupts::enable_irq();
     loop {
         // Deliberately slow: this is what pushes the producer into the cap.
-        sleep(400);
-        let item = CHAN.receive();
-        pl011::write_str("CHAN RX ");
-        pl011::write_dec_u64(item);
-        pl011::write_str("\r\n");
+        syscall::sleep(400);
+        let item = syscall::channel_receive();
+        syscall::print("CHAN RX ");
+        syscall::print_dec_u64(item);
+        syscall::print("\r\n");
     }
 }
 
@@ -680,31 +797,29 @@ extern "C" fn channel_consumer() -> ! {
 // per-task translation, task B would overwrite the cell while A sleeps and A
 // would read back 0xBBBB instead of its own 0xAAAA.
 extern "C" fn vm_task_a() -> ! {
-    interrupts::enable_irq();
     let cell = mmu::PRIVATE_WINDOW_VA as *mut u64;
     loop {
         unsafe { core::ptr::write_volatile(cell, 0xAAAA) };
-        sleep(500);
+        syscall::sleep(500);
         let observed = unsafe { core::ptr::read_volatile(cell) };
-        pl011::write_str("VM A [0x");
-        pl011::write_hex_u64(mmu::PRIVATE_WINDOW_VA as u64);
-        pl011::write_str("]=0x");
-        pl011::write_hex_u64(observed);
-        pl011::write_str("\r\n");
+        syscall::print("VM A [0x");
+        syscall::print_hex_u64(mmu::PRIVATE_WINDOW_VA as u64);
+        syscall::print("]=0x");
+        syscall::print_hex_u64(observed);
+        syscall::print("\r\n");
     }
 }
 
 extern "C" fn vm_task_b() -> ! {
-    interrupts::enable_irq();
     let cell = mmu::PRIVATE_WINDOW_VA as *mut u64;
     loop {
         unsafe { core::ptr::write_volatile(cell, 0xBBBB) };
-        sleep(500);
+        syscall::sleep(500);
         let observed = unsafe { core::ptr::read_volatile(cell) };
-        pl011::write_str("VM B [0x");
-        pl011::write_hex_u64(mmu::PRIVATE_WINDOW_VA as u64);
-        pl011::write_str("]=0x");
-        pl011::write_hex_u64(observed);
-        pl011::write_str("\r\n");
+        syscall::print("VM B [0x");
+        syscall::print_hex_u64(mmu::PRIVATE_WINDOW_VA as u64);
+        syscall::print("]=0x");
+        syscall::print_hex_u64(observed);
+        syscall::print("\r\n");
     }
 }

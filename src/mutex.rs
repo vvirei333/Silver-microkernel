@@ -34,6 +34,14 @@ impl<T> Mutex<T> {
 
     /// Acquires the mutex, blocking the current task until it is available.
     pub fn lock(&self) -> MutexGuard<'_, T> {
+        self.raw_lock();
+        MutexGuard { mutex: self }
+    }
+
+    /// Acquires the mutex without returning a guard; pair with raw_unlock().
+    /// Used by the syscall layer, where the critical section spans several
+    /// system calls and no guard can live across the SVC boundary.
+    pub fn raw_lock(&self) {
         loop {
             let saved_daif = interrupts::save_and_disable_irq();
             let state = unsafe { &mut *self.state.get() };
@@ -41,7 +49,7 @@ impl<T> Mutex<T> {
             if !state.locked {
                 state.locked = true;
                 interrupts::restore_irq(saved_daif);
-                return MutexGuard { mutex: self };
+                return;
             }
 
             // Contended: enqueue ourselves once, then block until woken.
@@ -55,7 +63,8 @@ impl<T> Mutex<T> {
         }
     }
 
-    fn unlock(&self) {
+    /// Releases a mutex acquired with raw_lock(). Debug-asserts it is held.
+    pub fn raw_unlock(&self) {
         let saved_daif = interrupts::save_and_disable_irq();
         let state = unsafe { &mut *self.state.get() };
         debug_assert!(state.locked, "unlocking a mutex that is not locked");
@@ -83,7 +92,7 @@ impl<'a, T> MutexGuard<'a, T> {
 
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        self.mutex.unlock();
+        self.mutex.raw_unlock();
     }
 }
 

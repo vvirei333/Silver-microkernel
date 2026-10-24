@@ -152,8 +152,19 @@ exception_sync_entry:
     lsr x10, x9, #26
     cmp x10, #21             // EC == 0b010101: SVC from AArch64
     b.eq exception_svc_dispatch
+    // Anything else: if it came from EL0 it is a task fault (bad pointer,
+    // bad instruction, trapped MSR...) — kill the task, keep the kernel.
+    // If it came from EL1 it is a kernel bug — panic as before.
+    mrs x11, spsr_el1
+    and x11, x11, #0xC       // SPSR.M[3:2]: 0b00 = EL0t
+    cbz x11, exception_user_fault
     mov x0, #0
     b exception_dispatch
+exception_user_fault:
+    mrs x0, esr_el1
+    mrs x1, elr_el1
+    mrs x2, far_el1
+    b silver_handle_task_fault
 exception_irq_entry:
     b exception_irq_dispatch
 exception_fiq_entry:
@@ -170,12 +181,14 @@ exception_serror_entry:
 // ELR/SPSR are saved on the STACK (not trusted to stay in the CPU registers):
 // a syscall may block and switch to another task whose exceptions would
 // otherwise overwrite the CPU-global ELR_EL1/SPSR_EL1 mid-syscall.
+//
+// A context switch resumes this task via `ret`: it restores x19-x30/SP and
+// returns into schedule(), which returns here with SP still pointing at this
+// frame — so the epilogue below always finds its ELR/SPSR slots intact.
 exception_svc_dispatch:
     // Mask IRQs for the whole syscall: the handlers manipulate scheduler
-    // state (block, wake, schedule). A timer IRQ landing in the window
-    // between SVC entry and the first save_and_disable_irq would re-enter
-    // the scheduler mid-mutation and corrupt task contexts. eret restores
-    // the caller's unmasked PSTATE from SPSR.
+    // state (block, wake, schedule). eret restores the caller's PSTATE
+    // from the frame.
     msr daifset, #2
     sub sp, sp, #272
     stp x0, x1, [sp, #0]
@@ -200,6 +213,10 @@ exception_svc_dispatch:
     str x9, [sp, #256]
     mov x0, sp
     bl silver_handle_syscall
+    // Fall through to the epilogue: the handler may have switched this task
+    // away and back (the switch resumes via `ret`, unwinding the call chain
+    // to this exact point), so the frame and SP are exactly as we left them.
+exception_svc_epilogue:
     // Restore ELR/SPSR first, while x9 is still trampoline scratch.
     ldr x9, [sp, #248]
     msr elr_el1, x9
@@ -227,13 +244,14 @@ exception_svc_dispatch:
 exception_irq_dispatch:
     // Mask IRQs before touching anything: the handler calls schedule(),
     // and a nested timer IRQ here would re-enter the scheduler mid-switch
-    // and corrupt task contexts. eret restores the pre-interrupt PSTATE.
+    // and corrupt task contexts. eret restores the pre-interrupt PSTATE
+    // from the frame.
     msr daifset, #2
     // Frame is 272 bytes like the SVC trampoline: x0-x30, then ELR, SPSR.
     // ELR_EL1/SPSR_EL1 MUST be saved and restored here — schedule() may
-    // switch to another task whose SVC trampoline overwrites these
-    // CPU-global registers; without the stack copy, our eret would return
-    // into the wrong task at the wrong place.
+    // switch to another task whose exceptions overwrite these CPU-global
+    // registers; without the stack copy, our eret would return into the
+    // wrong task at the wrong place.
     sub sp, sp, #272
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
@@ -256,6 +274,8 @@ exception_irq_dispatch:
     mrs x9, spsr_el1
     str x9, [sp, #256]
     bl silver_handle_irq
+    // Fall through to the epilogue (see the SVC trampoline above).
+exception_irq_epilogue:
     ldr x9, [sp, #248]
     msr elr_el1, x9
     ldr x9, [sp, #256]

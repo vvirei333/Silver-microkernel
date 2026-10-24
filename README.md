@@ -24,7 +24,9 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: identity mapping, 4-level tables, SCTLR_EL1.M on (kernel at EL1)
 - [x] Per-task address spaces: private VA window per task, TTBR0 switch on context switch
-- [ ] Tasks in EL0 (Ring 3) with argument validation
+- [x] Tasks in EL0 (Ring 3): user stacks, SVC-only kernel access, argument validation
+- [x] EL0 fault containment: bad user accesses kill the task, not the kernel
+- [ ] Full kernel-data isolation (user tasks can still access shared kernel data)
 - [ ] Drivers, processes, ELF loader
 
 ## Requirements
@@ -108,5 +110,11 @@ identity-mapped kernel half plus a private 4 KB-mapped window at
 `tlbi vmalle1`) on every context switch that crosses address spaces.
 The `vm_a` / `vm_b` demo tasks prove isolation: both write to the same
 virtual address and read back only their own values.
+
+All demo tasks except idle run at EL0t on separate user stacks. They reach
+the kernel only through `svc #0`; UART, GIC and other MMIO are inaccessible
+at EL0. The syscall layer validates task pointers before dereferencing them.
+An EL0 exception that is not an SVC prints a task-fault report and terminates
+only the offending task.
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).

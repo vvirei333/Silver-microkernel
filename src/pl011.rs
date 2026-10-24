@@ -17,8 +17,21 @@ pub fn init() {
 }
 
 pub fn write_byte(byte: u8) {
-    while unsafe { core::ptr::read_volatile(FR) } & (1 << 5) != 0 {
-        core::hint::spin_loop();
+    // Wait for TX FIFO space with IRQs unmasked — but restore the caller's
+    // DAIF afterwards so this stays transparent in any context (syscall
+    // handlers, the scheduler's BAD SP guard, panic dumps). Spinning on TXFF
+    // with the interrupt flag set would freeze the whole system: the guest
+    // prints in bursts far faster than the host drains the UART, and a
+    // masked timer can never preempt a spinning syscall handler. The
+    // trampolines keep ELR/SPSR in their stack frames, so taking an IRQ
+    // mid-print is safe — the handler returns exactly here.
+    if unsafe { core::ptr::read_volatile(FR) } & (1 << 5) != 0 {
+        let saved_daif = crate::interrupts::save_and_disable_irq();
+        while unsafe { core::ptr::read_volatile(FR) } & (1 << 5) != 0 {
+            crate::interrupts::enable_irq();
+            core::hint::spin_loop();
+        }
+        crate::interrupts::restore_irq(saved_daif);
     }
 
     unsafe {
@@ -27,7 +40,11 @@ pub fn write_byte(byte: u8) {
 }
 
 pub fn write_str(message: &str) {
-    for &byte in message.as_bytes() {
+    write_bytes(message.as_bytes());
+}
+
+pub fn write_bytes(bytes: &[u8]) {
+    for &byte in bytes {
         write_byte(byte);
     }
 }

@@ -10,13 +10,21 @@
 
 use alloc::vec::Vec;
 
-use crate::{ipc, scheduler};
+use crate::{channel, ipc, memory, mutex, pl011, scheduler};
 
 pub const SYS_SLEEP: u64 = 1;
 pub const SYS_SEND: u64 = 2;
 pub const SYS_RECEIVE: u64 = 3;
 pub const SYS_REGISTER: u64 = 4;
 pub const SYS_LOOKUP: u64 = 5;
+pub const SYS_PRINT: u64 = 6;
+pub const SYS_WHOAMI: u64 = 7;
+pub const SYS_PRINT_HEX: u64 = 8;
+pub const SYS_PRINT_DEC: u64 = 9;
+pub const SYS_MUTEX_LOCK: u64 = 10;
+pub const SYS_MUTEX_UNLOCK: u64 = 11;
+pub const SYS_CHAN_SEND: u64 = 12;
+pub const SYS_CHAN_RECV: u64 = 13;
 
 /// Well-known task ID of the nameserver. Fixed by spawn order: the scheduler
 /// spawns it first, right after idle (which is always ID 0).
@@ -31,6 +39,22 @@ pub const SYSCALL_ERROR: u64 = u64::MAX;
 
 /// Frame layout built by the SVC trampoline: x0-x30, then ELR, then SPSR.
 const FRAME_QUADWORDS: usize = 33;
+
+/// Kernel objects the demo tasks share. They live behind the syscall
+/// boundary: user tasks hold the demo mutex across several syscalls, so
+/// the lock is raw (no guard can survive the SVC round trips).
+static DEMO_MUTEX: mutex::Mutex<()> = mutex::Mutex::new(());
+static DEMO_CHANNEL: channel::Channel<u64> = channel::Channel::new(2);
+
+/// A task-supplied buffer may live anywhere in DRAM (task stacks, user
+/// memory, statics) but never in the private VA window or MMIO: those VAs
+/// are not mapped in the kernel's own tables, so the kernel cannot touch
+/// them. Reject anything outside the DRAM identity range.
+fn valid_task_slice(ptr: u64, len: u64) -> bool {
+    let base = memory::DRAM_BASE as u64;
+    let end = memory::DRAM_END as u64;
+    len <= 4096 && ptr >= base && ptr.checked_add(len).is_some_and(|last| last <= end)
+}
 
 /// Entry point for the SVC trampoline. `frame` points at the saved register
 /// bank on the kernel stack; the result is written into frame[0] (x0).
@@ -48,24 +72,60 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_RECEIVE => sys_receive(frame[0]),
         SYS_REGISTER => sys_register_name(frame[0]),
         SYS_LOOKUP => sys_lookup_name(frame[0]),
+        SYS_PRINT => sys_print(frame[0], frame[1]),
+        SYS_WHOAMI => scheduler::current_task_id(),
+        SYS_PRINT_HEX => {
+            pl011::write_hex_u64(frame[0]);
+            0
+        }
+        SYS_PRINT_DEC => {
+            pl011::write_dec_u64(frame[0]);
+            0
+        }
+        SYS_MUTEX_LOCK => {
+            DEMO_MUTEX.raw_lock();
+            0
+        }
+        SYS_MUTEX_UNLOCK => {
+            DEMO_MUTEX.raw_unlock();
+            0
+        }
+        SYS_CHAN_SEND => {
+            DEMO_CHANNEL.send(frame[0]);
+            0
+        }
+        SYS_CHAN_RECV => DEMO_CHANNEL.receive(),
         _ => SYSCALL_ERROR,
     };
 
     frame[0] = result;
 }
 
-fn sys_send(target: u64, message_ptr: u64) -> u64 {
-    if message_ptr == 0 {
+fn sys_print(ptr: u64, len: u64) -> u64 {
+    if len == 0 {
+        return 0;
+    }
+    if !valid_task_slice(ptr, len) {
         return SYSCALL_ERROR;
     }
-    // Tasks share one address space for now, so the pointer is a plain copy.
+    let bytes = unsafe { core::slice::from_raw_parts(ptr as *const u8, len as usize) };
+    pl011::write_bytes(bytes);
+    0
+}
+
+fn sys_send(target: u64, message_ptr: u64) -> u64 {
+    let size = core::mem::size_of::<ipc::Message>() as u64;
+    if !valid_task_slice(message_ptr, size) {
+        return SYSCALL_ERROR;
+    }
     let message = unsafe { core::ptr::read(message_ptr as *const ipc::Message) };
     ipc::send(target, message);
     0
 }
 
 fn sys_receive(buffer_ptr: u64) -> u64 {
-    if buffer_ptr == 0 {
+    let size = core::mem::size_of::<ipc::Message>() as u64;
+    if !valid_task_slice(buffer_ptr, size) {
         return SYSCALL_ERROR;
     }
     let message = ipc::receive();
@@ -115,7 +175,7 @@ fn sys_lookup_name(name_ptr: u64) -> u64 {
 /// # Safety
 /// The pointer must be valid for reads up to and including the NUL byte.
 unsafe fn read_name(ptr: u64) -> Option<Vec<u8>> {
-    if ptr == 0 {
+    if !valid_task_slice(ptr, NAME_LIMIT as u64 + 1) {
         return None;
     }
 
@@ -176,6 +236,48 @@ pub fn receive(buffer: &mut ipc::Message) {
     unsafe { syscall1(SYS_RECEIVE, buffer as *mut ipc::Message as u64) };
 }
 
+/// Writes `text` to the kernel console. The only legal way for an EL0 task
+/// to reach the UART: MMIO is unmapped at EL0.
+pub fn print(text: &str) {
+    unsafe { syscall2(SYS_PRINT, text.as_ptr() as u64, text.len() as u64) };
+}
+
+/// ID of the current task.
+pub fn task_id() -> u64 {
+    unsafe { syscall0(SYS_WHOAMI) }
+}
+
+/// Prints `value` as 16 hex digits through the kernel console.
+pub fn print_hex_u64(value: u64) {
+    unsafe { syscall1(SYS_PRINT_HEX, value) };
+}
+
+/// Prints `value` in decimal through the kernel console.
+pub fn print_dec_u64(value: u64) {
+    unsafe { syscall1(SYS_PRINT_DEC, value) };
+}
+
+/// Acquires the demo mutex, blocking until it is free. Pair with
+/// `mutex_unlock` — the lock is held across syscalls, so there is no guard.
+pub fn mutex_lock() {
+    unsafe { syscall0(SYS_MUTEX_LOCK) };
+}
+
+/// Releases the demo mutex.
+pub fn mutex_unlock() {
+    unsafe { syscall0(SYS_MUTEX_UNLOCK) };
+}
+
+/// Sends a value into the demo channel, blocking when it is full.
+pub fn channel_send(value: u64) {
+    unsafe { syscall1(SYS_CHAN_SEND, value) };
+}
+
+/// Receives a value from the demo channel, blocking while it is empty.
+pub fn channel_receive() -> u64 {
+    unsafe { syscall0(SYS_CHAN_RECV) }
+}
+
 /// Registers the current task under `name` at the nameserver.
 /// Returns false if the name is taken or too long.
 pub fn register(name: &str) -> bool {
@@ -205,6 +307,17 @@ fn with_nul<R>(name: &str, call: impl FnOnce(u64) -> R) -> R {
     let mut buffer = [0_u8; NAME_LIMIT + 1];
     buffer[..name.len()].copy_from_slice(name.as_bytes());
     call(buffer.as_ptr() as u64)
+}
+
+unsafe fn syscall0(number: u64) -> u64 {
+    let result: u64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") number,
+        lateout("x0") result,
+        options(nostack),
+    );
+    result
 }
 
 unsafe fn syscall1(number: u64, arg0: u64) -> u64 {
