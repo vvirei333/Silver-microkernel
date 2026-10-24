@@ -6,6 +6,7 @@
 //! exactly the waiters of the addressed mailbox. The old global receiver
 //! list (where any send could spuriously wake an unrelated task) is gone.
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
@@ -41,8 +42,11 @@ impl Message {
 struct Mailbox {
     owner: u64,
     queue: VecDeque<Message>,
-    /// Wait queue of tasks blocked in `receive()` on this mailbox.
-    condvar: Condvar,
+    /// Boxed so the condvar's address survives `mailboxes.push()`:
+    /// a Vec growth relocates every Mailbox, and a raw pointer taken
+    /// before blocking in `receive()` would dangle straight into the
+    /// allocator's free list.
+    condvar: Box<Condvar>,
 }
 
 impl Mailbox {
@@ -50,7 +54,7 @@ impl Mailbox {
         Self {
             owner,
             queue: VecDeque::new(),
-            condvar: Condvar::new(),
+            condvar: Box::new(Condvar::new()),
         }
     }
 }
@@ -85,9 +89,9 @@ pub fn receive() -> Message {
         }
 
         // Sleep on this mailbox's condvar: releases the lock, blocks, and
-        // re-acquires it. The condvar pointer is re-taken on every iteration
-        // because the mailboxes Vec may relocate while we sleep.
-        let condvar = &guard.mailboxes[index].condvar as *const Condvar;
+        // re-acquires it. The condvar lives in a Box, so this pointer stays
+        // valid even if the mailboxes Vec relocates while we sleep.
+        let condvar = &*guard.mailboxes[index].condvar as *const Condvar;
         guard = unsafe { (*condvar).wait(guard) };
     }
 }

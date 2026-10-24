@@ -171,6 +171,12 @@ exception_serror_entry:
 // a syscall may block and switch to another task whose exceptions would
 // otherwise overwrite the CPU-global ELR_EL1/SPSR_EL1 mid-syscall.
 exception_svc_dispatch:
+    // Mask IRQs for the whole syscall: the handlers manipulate scheduler
+    // state (block, wake, schedule). A timer IRQ landing in the window
+    // between SVC entry and the first save_and_disable_irq would re-enter
+    // the scheduler mid-mutation and corrupt task contexts. eret restores
+    // the caller's unmasked PSTATE from SPSR.
+    msr daifset, #2
     sub sp, sp, #272
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
@@ -219,7 +225,16 @@ exception_svc_dispatch:
     eret
 
 exception_irq_dispatch:
-    sub sp, sp, #256
+    // Mask IRQs before touching anything: the handler calls schedule(),
+    // and a nested timer IRQ here would re-enter the scheduler mid-switch
+    // and corrupt task contexts. eret restores the pre-interrupt PSTATE.
+    msr daifset, #2
+    // Frame is 272 bytes like the SVC trampoline: x0-x30, then ELR, SPSR.
+    // ELR_EL1/SPSR_EL1 MUST be saved and restored here — schedule() may
+    // switch to another task whose SVC trampoline overwrites these
+    // CPU-global registers; without the stack copy, our eret would return
+    // into the wrong task at the wrong place.
+    sub sp, sp, #272
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
@@ -236,7 +251,15 @@ exception_irq_dispatch:
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
     str x30, [sp, #240]
+    mrs x9, elr_el1
+    str x9, [sp, #248]
+    mrs x9, spsr_el1
+    str x9, [sp, #256]
     bl silver_handle_irq
+    ldr x9, [sp, #248]
+    msr elr_el1, x9
+    ldr x9, [sp, #256]
+    msr spsr_el1, x9
     ldr x30, [sp, #240]
     ldp x28, x29, [sp, #224]
     ldp x26, x27, [sp, #208]
@@ -253,7 +276,7 @@ exception_irq_dispatch:
     ldp x4, x5, [sp, #32]
     ldp x2, x3, [sp, #16]
     ldp x0, x1, [sp, #0]
-    add sp, sp, #256
+    add sp, sp, #272
     eret
 
 exception_dispatch:
@@ -321,7 +344,19 @@ pub extern "C" fn kernel_main() -> ! {
 
 #[cfg(not(feature = "std"))]
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
+fn panic(info: &PanicInfo) -> ! {
+    if let Some(location) = info.location() {
+        pl011::write_str("PANIC AT ");
+        pl011::write_str(location.file());
+        pl011::write_str(":");
+        pl011::write_dec_u64(location.line() as u64);
+        pl011::write_str("\r\n");
+    }
+    if let Some(message) = info.message().as_str() {
+        pl011::write_str("PANIC MSG ");
+        pl011::write_str(message);
+        pl011::write_str("\r\n");
+    }
     exceptions::silver_handle_exception(4, 0, 0, 0)
 }
 

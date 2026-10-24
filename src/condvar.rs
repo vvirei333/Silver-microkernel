@@ -19,11 +19,7 @@
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-use crate::{
-    interrupts,
-    mutex::{Mutex, MutexGuard},
-    scheduler,
-};
+use crate::{interrupts, mutex::MutexGuard, scheduler};
 
 pub struct Condvar {
     /// Task IDs blocked in `wait`, in FIFO order. Only touched while the

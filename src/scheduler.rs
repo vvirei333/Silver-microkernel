@@ -251,6 +251,16 @@ pub fn schedule() {
         return;
     }
 
+    // Capture BEFORE reap: does the task that owns the live CPU context
+    // intend to die? reap may remove it from the Vec and reset
+    // current_index to 0, after which tasks[current_index] is some innocent
+    // task — checking its state would answer the wrong question.
+    let live_is_dead = manager
+        .tasks
+        .get(manager.current_index)
+        .map(|task| task.state == TaskState::Dead)
+        .unwrap_or(false);
+
     reap_dead_tasks(manager);
     wake_expired_tasks(manager, timer::ticks());
 
@@ -276,16 +286,37 @@ pub fn schedule() {
     let next_task = unsafe { &mut *tasks.add(next_index) };
 
     debug_assert_ne!(current_task.id, next_task.id);
-    debug_assert!(next_task
+    if !next_task
         .stack
-        .contains(next_task.context.stack_pointer as usize - 1));
+        .contains(next_task.context.stack_pointer as usize - 1)
+    {
+        pl011::write_str("BAD SP task=");
+        pl011::write_dec_u64(next_task.id);
+        pl011::write_str(" sp=");
+        pl011::write_hex_u64(next_task.context.stack_pointer);
+        pl011::write_str(" stack=[");
+        pl011::write_hex_u64(next_task.stack.start as u64);
+        pl011::write_str(",");
+        pl011::write_hex_u64(next_task.stack.end as u64);
+        pl011::write_str("]\r\n");
+        panic!("bad saved stack pointer");
+    }
 
     next_task.state = TaskState::Running;
     manager.current_index = next_index;
 
+    // An exiting task's live context is garbage about to be abandoned.
+    // Park the mandatory "save" half of the switch in scratch memory so
+    // we never overwrite an innocent task's saved state with it.
+    let current_context = if live_is_dead {
+        unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CONTEXT) }
+    } else {
+        &mut current_task.context
+    };
+
     unsafe {
         silver_context_switch(
-            &mut current_task.context as *mut TaskContext,
+            current_context as *mut TaskContext,
             &next_task.context as *const TaskContext,
         );
     }
@@ -341,6 +372,12 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         return;
     }
 
+    // Remember WHO owns the live CPU context before compacting the Vec.
+    // After retain() the old index may be stale or point at a different
+    // task; without this, schedule() would save the live context into an
+    // innocent task and corrupt its stack pointer.
+    let live_id = manager.tasks.get(manager.current_index).map(|task| task.id);
+
     manager.tasks.retain(|task| {
         if task.state == TaskState::Dead {
             task.release_stack();
@@ -350,10 +387,11 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         }
     });
 
-    manager.current_index = manager
-        .tasks
-        .iter()
-        .position(|task| task.state == TaskState::Running)
+    // If the live task itself was Dead (exit path), it is gone from the
+    // list; index 0 is fine because the switch below parks the doomed
+    // context in scratch instead of overwriting task 0.
+    manager.current_index = live_id
+        .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
         .unwrap_or(0);
 }
 
