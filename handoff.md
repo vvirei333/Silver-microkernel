@@ -5,17 +5,15 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## State as of 2026-10-24
 
-Latest verified feature: **counting semaphore + bounded channel with
-backpressure**. The semaphore is built on mutex + condvar; the channel is
-the textbook composition — two semaphores (free slots / items) plus a short
-mutex critical section for the queue, never held while blocking. The demo
-(capacity 2, fast producer, slow consumer) shows TX never leading RX by more
-than two: `send` genuinely blocks on a full queue. The condvar targeted-
-wakeup test still passes alongside.
+Latest verified feature: **MMU bring-up**. The kernel now runs at EL1
+(QEMU's `-kernel` starts at EL2 — `_start` drops to EL1h via ERET, with
+HCR_EL2.RW=1) with translation enabled: identity map of the low MMIO
+gigabyte (device nGnRnE) and the DRAM gigabyte (normal WB), 4 KB granule,
+four-level tables with 2 MB blocks at level 2, AP=EL1-RW. Log prints
+`MMU=OK`; every demo (nameserver, ping-pong over SVC, condvar test, channel
+backpressure, mutex, sleeper) works unchanged on top.
 Verification: `cargo build` (host) + bare-metal build + 6 seconds in QEMU
-with stable output (see README). Running simultaneously: the nameserver,
-the mutex demo, the IPC ping-pong over SVC, the condvar test, the channel
-demo and the sleep task.
+with stable output (see README).
 
 Always build like this:
 
@@ -35,6 +33,14 @@ Exit code `124` = the kernel lived the whole time = success.
 - Timer: ARM Generic Timer, IRQ 30, 100 Hz tick (`timer::TICK_INTERVAL_MS = 10`)
 - FP/SIMD enabled in `_start` (CPACR_EL1 = 0x300000, CPTR_EL2 = 0) —
   without this the first use of a float register traps with EC=7
+- Runtime is always EL1h: QEMU `-kernel` starts at EL2, `_start` drops to
+  EL1 via ERET (HCR_EL2.RW=1, SPSR_EL2=0x3C5). All system registers are the
+  EL1 variants; VBAR_EL1, TTBR0_EL1, TCR_EL1, MAIR_EL1, SCTLR_EL1
+- MMU on from the first line of kernel_main: identity map, 4 KB granule,
+  4-level tables in `.bss` (`mmu::TABLES`), 2 MB blocks at L2. MMIO gigabyte
+  = device nGnRnE, DRAM gigabyte = normal WB inner-shareable, AP=EL1-RW
+- Data/instruction caches stay OFF for now (SCTLR.C/I = 0) — only
+  translation is on
 
 ## Architectural invariants (do not break!)
 
@@ -76,6 +82,11 @@ Exit code `124` = the kernel lived the whole time = success.
    (register/lookup RPC) hardcode this ID — that is the one hardcode that is
    allowed to stay. Protocol is text over mailbox messages: "R <name>" →
    "OK"/"TAKEN", "L <name>" → "ID <n>"/"MISSING" (see nameserver.rs).
+10. **TLB/cache ritual for any future table edit.** Translation tables are
+    CPU-read memory: after modifying them you must clean the lines to the
+    point of coherency (`dc cvac` + `dsb`), invalidate stale TLB entries
+    (`tlbi` + `dsb` + `isb`). Template: `mmu::flush_after_table_change`.
+    First enable is exempt (cold TLB, caches off) but follows the same code.
 
 ## Why IPC uses Mutex + Condvar (and what changed)
 
@@ -119,12 +130,15 @@ lock; `notify_*` under the lock; re-check the condition after waking.
    lookup polling.
 3. **IPC on top of the channel:** mailbox payloads could ride a bounded
    channel per task to get backpressure on message floods for free.
-4. **Tasks at EL0** (AArch64 "Ring 3"): separate SP_EL0, exception-return
-   discipline lower-EL, then MMU isolation becomes meaningful.
-5. **MMU + TTBR0/TTBR1, page tables, stack isolation.** The biggest
-   milestone on the road to a "real" microkernel.
-6. **VirtIO-console / virtio-block** — first MMIO device driver, moving
+4. **Per-task address spaces:** dedicated L3 tables per task (stacks and
+   heap already come from the frame allocator), TTBR0 switch on context
+   switch, kernel mapped into every task at a high VA, then move tasks to
+   **EL0** (separate SP_EL0, SVC from lower EL). The two together are the
+   real isolation milestone.
+5. **VirtIO-console / virtio-block** — first MMIO device driver, moving
    UART output behind a driver interface.
+6. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
+   `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
 
 ## Workflow for a new feature
 

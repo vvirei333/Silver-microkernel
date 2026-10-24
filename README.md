@@ -22,6 +22,8 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Nameserver: tasks find each other by name (register/lookup syscalls)
 - [x] Condition variable: per-mailbox wait queues, targeted wakeups
 - [x] Counting semaphore + bounded channel with backpressure
+- [x] MMU: identity mapping, 4-level tables, SCTLR_EL1.M on (kernel at EL1)
+- [ ] Per-task address spaces and stacks isolation
 - [ ] Tasks in EL0 (Ring 3) with argument validation
 - [ ] MMU, virtual memory, task isolation
 - [ ] Drivers, processes, ELF loader
@@ -98,6 +100,7 @@ with `--no-default-features --features no_std`.
 | `src/condvar.rs` | Condition variable: wait / notify_one / notify_all |
 | `src/semaphore.rs` | Counting semaphore on mutex + condvar |
 | `src/channel.rs` | Bounded channel: two semaphores + a mutex (backpressure) |
+| `src/mmu.rs` | MMU bring-up: identity map, MAIR/TCR/TTBR, SCTLR_EL1.M |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).

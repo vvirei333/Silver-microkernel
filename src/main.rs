@@ -23,6 +23,8 @@ mod ipc;
 #[cfg(not(feature = "std"))]
 mod memory;
 #[cfg(not(feature = "std"))]
+mod mmu;
+#[cfg(not(feature = "std"))]
 mod mutex;
 #[cfg(not(feature = "std"))]
 mod nameserver;
@@ -60,16 +62,31 @@ _start:
     lsr x2, x2, #2
     cmp x2, #2
     b.ne 4f
+
+    // EL2 (QEMU -kernel default): enable FP for EL1, then drop to EL1h —
+    // the MMU is configured through the EL1 registers. HCR_EL2.RW must be 1,
+    // otherwise the ERET into EL1 lands in AArch32.
     msr cptr_el2, xzr
     mov x2, #0x300000
     msr cpacr_el1, x2
-    b 5f
+    mov x2, #(1 << 31)
+    msr hcr_el2, x2
+    mov x2, #0x3c5             // SPSR_EL2: EL1h, SP_EL1, DAIF masked
+    msr spsr_el2, x2
+    adr x2, 4f
+    msr elr_el2, x2
+    eret
 4:
+    // EL1 from here on, both for the EL2 drop path and native-EL1 boot.
     mov x2, #0x300000
     msr cpacr_el1, x2
-5:
     isb
 
+    ldr x1, =exception_vectors
+    msr vbar_el1, x1
+    isb
+
+    // Zero .bss — the MMU page tables live there and must start empty.
     ldr x3, =__bss_start
     ldr x4, =__bss_end
     cmp x3, x4
@@ -79,18 +96,6 @@ _start:
     cmp x3, x4
     b.lo 2b
 3:
-    ldr x1, =exception_vectors
-    mrs x2, CurrentEL
-    lsr x2, x2, #2
-    cmp x2, #2
-    b.ne 1f
-    msr vbar_el2, x1
-    isb
-    b 2f
-1:
-    msr vbar_el1, x1
-    isb
-2:
     bl kernel_main
 1:
     wfe
@@ -271,10 +276,13 @@ exception_dispatch:
 #[cfg(not(feature = "std"))]
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
+    mmu::init();
+
     let memory_map = memory::current();
     let available_pages = frame_allocator::init(memory_map.available);
 
     pl011::init();
+    pl011::write_str("MMU=OK\r\n");
 
     if !memory_map.is_valid() || available_pages == 0 || !frame_allocator::run_self_test() {
         exceptions::silver_handle_exception(6, 0, 0, 0);
