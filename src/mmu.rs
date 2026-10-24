@@ -1,14 +1,18 @@
-//! ARMv8-A MMU bring-up: identity map of the low MMIO gigabyte and the DRAM
-//! gigabyte, 4 KB granule, four-level translation tables with 2 MB block
-//! entries at level 2 (level 3 page tables can hang off these later for
-//! per-task isolation).
+//! ARMv8-A MMU: identity map of the low MMIO gigabyte and the DRAM gigabyte,
+//! 4 KB granule, four-level translation tables with 2 MB block entries at
+//! level 2. On top of that, per-task address spaces: every task gets its own
+//! L0 with entry[0] sharing the kernel's identity chain and entry[1] pointing
+//! at a private gigabyte window (starting at PRIVATE_WINDOW_VA) backed by
+//! pages only that task can see through this VA.
 //!
-//! Coverage (virtual == physical everywhere):
+//! Coverage of the shared identity half (virtual == physical everywhere):
 //!   0x0000_0000..0x4000_0000  device nGnRnE  (GIC @0x0800_0000, UART @0x0900_0000)
 //!   0x4000_0000..0x8000_0000  normal WB      (DRAM starts at 0x4000_0000)
-//! Everything else translation-faults. AP=EL1-RW so EL0 gets nothing yet.
+//! AP=EL1-RW everywhere: EL0 gets nothing yet, and the identity half means
+//! tasks at EL1 can still reach all of kernel memory — real protection
+//! arrives with the move to EL0.
 
-use crate::memory::DRAM_BASE;
+use crate::{frame_allocator, memory::DRAM_BASE};
 
 const ENTRIES: usize = 512;
 const GRANULE: usize = 4096;
@@ -17,6 +21,11 @@ const BLOCK_2M: usize = 0x20_0000;
 
 const DESC_TABLE: u64 = 0b11;
 const DESC_BLOCK: u64 = 0b01;
+const DESC_PAGE: u64 = 0b11;
+
+/// VA that every task maps privately: L0 index 1, L1/L2/L3 index 0.
+/// Two tasks writing here hit two different physical pages.
+pub const PRIVATE_WINDOW_VA: usize = 0x0000_0080_0000_0000;
 
 /// MAIR_EL1 attribute indexes (see MAIR_VALUE below).
 const ATTR_NORMAL: u64 = 0; // MAIR attr0 = 0xFF: Normal, inner+outer WB RW-allocate
@@ -34,11 +43,13 @@ const ADDRESS_MASK: u64 = 0x0000_FFFF_FFFF_F000;
 const MAIR_VALUE: u64 = 0x00FF;
 
 /// TCR_EL1: 48-bit VA (T0SZ=16, full four-level walk), 4 KB granule,
-/// inner-shareable walks, table walk caches WB RW-allocate, 40-bit PA.
+/// inner-shareable walks, table walk caches WB RW-allocate, 40-bit PA,
+/// TTBR1 walks disabled (we only use TTBR0).
 const TCR_VALUE: u64 = 16 // T0SZ
     | (0b11 << 12) // SH0 = inner shareable
     | (0b01 << 10) // ORGN0 = WB RW-allocate
     | (0b01 << 8) // IRGN0 = WB RW-allocate
+    | (1 << 23) // EPD1: TTBR1 disabled
     | (0b010 << 32); // IPS = 40-bit physical address
                      // TG0 = 0b00: 4 KB granule (zero bits [15:14])
 
@@ -160,11 +171,8 @@ fn configure_and_enable() {
     }
 }
 
-/// Call after ANY future change to the translation tables:
+/// Call after ANY change to translation tables:
 /// clean the edited pages, invalidate affected TLB entries, and serialize.
-/// Not needed today (tables are built once, before M=1) — this is the
-/// template for the per-task mappings to come.
-#[allow(dead_code)]
 pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
     let start = table_start & !63;
     let end = (table_start + table_bytes + 63) & !63;
@@ -186,4 +194,121 @@ pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
             options(nostack),
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Per-task address spaces
+// ---------------------------------------------------------------------------
+
+/// Builds a fresh address space for one task. Layout of its private L0:
+///   entry[0] → the SHARED level-1 table of the kernel identity half
+///              (kernel, devices, heap, stacks: identical in every task);
+///   entry[1] → the task's own L1→L2→L3 chain, mapping PRIVATE_WINDOW_VA to
+///              `private_page` (one 4 KB page, EL1-RW, normal WB).
+/// Table pages come from the frame allocator; they are reachable through
+/// the kernel identity half, so filling them by physical address is safe.
+///
+/// Returns the physical base to load into TTBR0_EL1.
+pub fn create_task_space(private_page: usize) -> Option<usize> {
+    let l0 = frame_allocator::alloc_page()?;
+    let Some(l1) = frame_allocator::alloc_page() else {
+        frame_allocator::free_page(l0);
+        return None;
+    };
+    let Some(l2) = frame_allocator::alloc_page() else {
+        frame_allocator::free_page(l1);
+        frame_allocator::free_page(l0);
+        return None;
+    };
+    let Some(l3) = frame_allocator::alloc_page() else {
+        frame_allocator::free_page(l2);
+        frame_allocator::free_page(l1);
+        frame_allocator::free_page(l0);
+        return None;
+    };
+
+    unsafe {
+        zero_page(l0);
+        zero_page(l1);
+        zero_page(l2);
+        zero_page(l3);
+
+        write_entry(l0, 0, descriptor_address(identity_l1_address() as u64) | DESC_TABLE);
+        write_entry(l0, 1, descriptor_address(l1 as u64) | DESC_TABLE);
+        write_entry(l1, 0, descriptor_address(l2 as u64) | DESC_TABLE);
+        write_entry(l2, 0, descriptor_address(l3 as u64) | DESC_TABLE);
+        write_entry(l3, 0, page_descriptor(private_page));
+    }
+
+    for page in [l0, l1, l2, l3] {
+        flush_after_table_change(page, GRANULE);
+    }
+    Some(l0)
+}
+
+/// Frees every page of a task space created by `create_task_space`,
+/// including the private data page (recovered from the L3 descriptor).
+pub fn destroy_task_space(ttbr0: usize) {
+    unsafe {
+        let l1 = follow_table(ttbr0, 1);
+        let l2 = follow_table(l1, 0);
+        let l3 = follow_table(l2, 0);
+        let private_page = descriptor_address(read_entry(l3, 0));
+        frame_allocator::free_page(private_page as usize);
+        frame_allocator::free_page(l3);
+        frame_allocator::free_page(l2);
+        frame_allocator::free_page(l1);
+        frame_allocator::free_page(ttbr0);
+    }
+}
+
+/// Loads TTBR0_EL1 and flushes the TLB. Call only on the context-switch
+/// path. Safe mid-switch because everything this code touches until the
+/// register/SP restore lives in the identity half, which is identical in
+/// both address spaces.
+pub fn switch_address_space(ttbr0: usize) {
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {ttbr}",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            ttbr = in(reg) ttbr0 as u64,
+            options(nostack),
+        );
+    }
+}
+
+fn identity_l1_address() -> usize {
+    core::ptr::addr_of!(TABLES) as usize + INDEX_LEVEL1 * TABLE_BYTES
+}
+
+fn descriptor_address(descriptor_or_address: u64) -> u64 {
+    descriptor_or_address & ADDRESS_MASK
+}
+
+fn page_descriptor(output_address: usize) -> u64 {
+    descriptor_address(output_address as u64)
+        | DESC_PAGE
+        | (ATTR_NORMAL << 2)
+        | AP_EL1_RW
+        | SH_INNER
+        | AF
+        | UXN
+}
+
+unsafe fn zero_page(base: usize) {
+    unsafe { core::ptr::write_bytes(base as *mut u8, 0, GRANULE) };
+}
+
+unsafe fn write_entry(base: usize, index: usize, descriptor: u64) {
+    unsafe { core::ptr::write_volatile((base as *mut u64).add(index), descriptor) };
+}
+
+unsafe fn read_entry(base: usize, index: usize) -> u64 {
+    unsafe { core::ptr::read_volatile((base as *const u64).add(index)) }
+}
+
+unsafe fn follow_table(base: usize, index: usize) -> usize {
+    descriptor_address(read_entry(base, index)) as usize
 }

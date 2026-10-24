@@ -23,9 +23,8 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Condition variable: per-mailbox wait queues, targeted wakeups
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: identity mapping, 4-level tables, SCTLR_EL1.M on (kernel at EL1)
-- [ ] Per-task address spaces and stacks isolation
+- [x] Per-task address spaces: private VA window per task, TTBR0 switch on context switch
 - [ ] Tasks in EL0 (Ring 3) with argument validation
-- [ ] MMU, virtual memory, task isolation
 - [ ] Drivers, processes, ELF loader
 
 ## Requirements
@@ -100,7 +99,14 @@ with `--no-default-features --features no_std`.
 | `src/condvar.rs` | Condition variable: wait / notify_one / notify_all |
 | `src/semaphore.rs` | Counting semaphore on mutex + condvar |
 | `src/channel.rs` | Bounded channel: two semaphores + a mutex (backpressure) |
-| `src/mmu.rs` | MMU bring-up: identity map, MAIR/TCR/TTBR, SCTLR_EL1.M |
+| `src/mmu.rs` | MMU: identity map, MAIR/TCR/TTBR, SCTLR_EL1.M, per-task address spaces |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
+
+Per-task spaces: every task gets its own L0 table chained to a shared
+identity-mapped kernel half plus a private 4 KB-mapped window at
+`0x0000_0080_0000_0000`. The scheduler switches TTBR0_EL1 (with
+`tlbi vmalle1`) on every context switch that crosses address spaces.
+The `vm_a` / `vm_b` demo tasks prove isolation: both write to the same
+virtual address and read back only their own values.
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).

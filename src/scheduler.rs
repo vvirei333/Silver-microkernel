@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::{
     channel, frame_allocator, interrupts, ipc,
     memory::{MemoryRegion, PAGE_SIZE},
-    mutex, nameserver, pl011, syscall, timer,
+    mutex, mmu, nameserver, pl011, syscall, timer,
 };
 
 const TASK_STACK_PAGES: usize = 4;
@@ -42,6 +42,8 @@ pub struct Task {
     pub state: TaskState,
     pub context: TaskContext,
     pub stack: MemoryRegion,
+    /// Physical base of this task's translation tables (TTBR0_EL1 value).
+    pub ttbr0: usize,
 }
 
 pub struct TaskManager {
@@ -117,6 +119,9 @@ pub fn init() {
     let _producer_id = spawn_inner(channel_producer);
     let _consumer_id = spawn_inner(channel_consumer);
     let _sleeper_id = spawn_inner(sleeping_task);
+    // Per-task address space demo: same VA, different physical pages.
+    let _vm_a_id = spawn_inner(vm_task_a);
+    let _vm_b_id = spawn_inner(vm_task_b);
 
     let manager = scheduler_manager().unwrap();
     manager.current_index = manager
@@ -232,6 +237,8 @@ pub fn start() -> ! {
     let first_context = &first_task.context as *const TaskContext;
     let boot_context = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CONTEXT) };
 
+    mmu::switch_address_space(first_task.ttbr0);
+
     unsafe {
         silver_context_switch(boot_context, first_context);
     }
@@ -314,6 +321,13 @@ pub fn schedule() {
         &mut current_task.context
     };
 
+    if next_task.ttbr0 != current_task.ttbr0 {
+        // Identity half is identical in both spaces, so this code and its
+        // stack stay valid across the switch; the TLB flush covers the
+        // private window so the next task sees only its own mapping.
+        mmu::switch_address_space(next_task.ttbr0);
+    }
+
     unsafe {
         silver_context_switch(
             current_context as *mut TaskContext,
@@ -381,6 +395,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     manager.tasks.retain(|task| {
         if task.state == TaskState::Dead {
             task.release_stack();
+            task.release_space();
             false
         } else {
             true
@@ -405,6 +420,16 @@ fn current_task_mut() -> Option<&'static mut Task> {
 impl Task {
     fn new(id: u64, entry: extern "C" fn() -> !) -> Option<Self> {
         let stack_start = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES)?;
+        let Some(private_page) = frame_allocator::alloc_page() else {
+            release_pages(stack_start, TASK_STACK_PAGES);
+            return None;
+        };
+        let Some(ttbr0) = mmu::create_task_space(private_page) else {
+            frame_allocator::free_page(private_page);
+            release_pages(stack_start, TASK_STACK_PAGES);
+            return None;
+        };
+
         let stack = MemoryRegion::new(stack_start, stack_start + TASK_STACK_SIZE);
         let mut context = TaskContext::zero();
         context.registers[X30_INDEX] = entry as usize as u64;
@@ -415,15 +440,22 @@ impl Task {
             state: TaskState::Ready,
             context,
             stack,
+            ttbr0,
         })
     }
 
     fn release_stack(&self) {
-        let mut page = self.stack.start;
-        while page < self.stack.end {
-            frame_allocator::free_page(page);
-            page += PAGE_SIZE;
-        }
+        release_pages(self.stack.start, TASK_STACK_PAGES);
+    }
+
+    fn release_space(&self) {
+        mmu::destroy_task_space(self.ttbr0);
+    }
+}
+
+fn release_pages(start: usize, page_count: usize) {
+    for index in 0..page_count {
+        frame_allocator::free_page(start + index * PAGE_SIZE);
     }
 }
 
@@ -638,6 +670,41 @@ extern "C" fn channel_consumer() -> ! {
         let item = CHAN.receive();
         pl011::write_str("CHAN RX ");
         pl011::write_dec_u64(item);
+        pl011::write_str("\r\n");
+    }
+}
+
+// Per-task address spaces demo: both tasks write to the SAME virtual address
+// (PRIVATE_WINDOW_VA), but each task's L0 maps it to its own private physical
+// page. The write -> sleep -> read pattern is the isolation proof: without
+// per-task translation, task B would overwrite the cell while A sleeps and A
+// would read back 0xBBBB instead of its own 0xAAAA.
+extern "C" fn vm_task_a() -> ! {
+    interrupts::enable_irq();
+    let cell = mmu::PRIVATE_WINDOW_VA as *mut u64;
+    loop {
+        unsafe { core::ptr::write_volatile(cell, 0xAAAA) };
+        sleep(500);
+        let observed = unsafe { core::ptr::read_volatile(cell) };
+        pl011::write_str("VM A [0x");
+        pl011::write_hex_u64(mmu::PRIVATE_WINDOW_VA as u64);
+        pl011::write_str("]=0x");
+        pl011::write_hex_u64(observed);
+        pl011::write_str("\r\n");
+    }
+}
+
+extern "C" fn vm_task_b() -> ! {
+    interrupts::enable_irq();
+    let cell = mmu::PRIVATE_WINDOW_VA as *mut u64;
+    loop {
+        unsafe { core::ptr::write_volatile(cell, 0xBBBB) };
+        sleep(500);
+        let observed = unsafe { core::ptr::read_volatile(cell) };
+        pl011::write_str("VM B [0x");
+        pl011::write_hex_u64(mmu::PRIVATE_WINDOW_VA as u64);
+        pl011::write_str("]=0x");
+        pl011::write_hex_u64(observed);
         pl011::write_str("\r\n");
     }
 }

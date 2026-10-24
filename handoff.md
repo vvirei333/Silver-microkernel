@@ -3,17 +3,33 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-24
+## State as of 2026-10-24 (evening)
 
-Latest verified feature: **MMU bring-up**. The kernel now runs at EL1
-(QEMU's `-kernel` starts at EL2 — `_start` drops to EL1h via ERET, with
-HCR_EL2.RW=1) with translation enabled: identity map of the low MMIO
-gigabyte (device nGnRnE) and the DRAM gigabyte (normal WB), 4 KB granule,
-four-level tables with 2 MB blocks at level 2, AP=EL1-RW. Log prints
-`MMU=OK`; every demo (nameserver, ping-pong over SVC, condvar test, channel
-backpressure, mutex, sleeper) works unchanged on top.
-Verification: `cargo build` (host) + bare-metal build + 6 seconds in QEMU
-with stable output (see README).
+Latest verified feature: **per-task address spaces**. Every task owns a
+dedicated L0 table (4 pages: L0–L3, plus one private data page), allocated
+through the frame allocator at spawn and freed on reap. Each L0[0] points at
+the shared identity-mapped kernel half (`identity_l1_address()`), and each
+L0[1] chains to the task's own L1→L2→L3 tables mapping a private 4 KB window
+at `PRIVATE_WINDOW_VA = 0x0000_0080_0000_0000`. The scheduler compares
+TTBR0_EL1 values and, on change, loads the next task's table and issues
+`tlbi vmalle1; dsb ish; isb` *in Rust code before* `silver_context_switch` —
+safe because all kernel code and stacks live in the identity half, which is
+byte-identical in every address space.
+
+Proof: the `vm_a` / `vm_b` demo tasks both write to VA `0x0000008000000000`
+(vm_a = 0xAAAA, vm_b = 0xBBBB) and read back only their own value on every
+iteration; verified stable across repeated QEMU runs with zero panics.
+
+Verification: `cargo build` (host) + bare-metal build + QEMU runs with
+stable alternating `VM A`/`VM B` output (see README).
+
+Hard-won lesson this milestone (commit c05d3b9): **ELR_EL1/SPSR_EL1 are
+CPU-global.** The IRQ trampoline originally left them untouched, so an SVC
+trampoline running for another task overwrote them while the interrupted
+task still sat inside the IRQ trampoline — `eret` then returned into the
+wrong task (BAD SP, growing idle SP, panics with garbage ELR). Fix: the IRQ
+trampoline now saves/restores ELR/SPSR in its 272-byte frame exactly like
+the SVC trampoline, and both trampolines mask IRQs on entry.
 
 Always build like this:
 
@@ -68,13 +84,16 @@ Exit code `124` = the kernel lived the whole time = success.
    Blocked / Dead`. The scheduler gives the CPU only to Ready tasks;
    sleeping and blocked tasks are skipped; `find_next_task` prefers
    non-idle tasks.
-8. **SVC trampoline keeps ELR/SPSR on the stack.** The sync exception
-   entry checks ESR EC: `0b010101` (SVC from AArch64) goes to
-   `exception_svc_dispatch`, everything else panics as before. The
+8. **Trampolines keep ELR/SPSR on the stack — both of them.** The sync
+   exception entry checks ESR EC: `0b010101` (SVC from AArch64) goes to
+   `exception_svc_dispatch`, everything else panics as before. The SVC
    trampoline saves x0-x30 + ELR_EL1 + SPSR_EL1 in a 272-byte stack frame
-   and restores ELR/SPSR *from the stack* before eret — never trusting the
-   CPU registers, which are global per-CPU and get overwritten when the
-   task is switched away mid-syscall (all syscalls may block).
+   and restores ELR/SPSR *from the stack* before eret. The IRQ trampoline
+   does the same (same frame size): while a task interrupted by IRQ waits
+   inside the trampoline, an SVC for another task runs and clobbers the
+   CPU-global ELR/SPSR — trusting the registers there returns into the
+   wrong task (heisenbug, commit c05d3b9). Both trampolines also mask IRQs
+   on entry (`msr daifset,#2`).
    Calling convention: number in x8, args in x0-x5, result in x0.
    The table lives in `syscall.rs` (`silver_handle_syscall`).
 9. **Nameserver holds the well-known ID NAMESERVER_ID = 1**, fixed purely by
@@ -110,8 +129,12 @@ lock; `notify_*` under the lock; re-check the condition after waking.
   this — none of them ever exit.
 - Mutex queues, condvar queues and mailboxes have no growth limits.
 - `receive()` has no timeout: a task can wait for a message forever.
-- No MMU: tasks share one address space; stacks are protected only by
-  care (`debug_assert` in `schedule` checks SP within stack bounds).
+- Tasks still run at EL1 and share the identity-mapped kernel half of every
+  address space, so they can still read/write all of kernel memory. The
+  private window is isolated; real protection only arrives with EL0 +
+  removing the identity half from task tables.
+- Task address spaces hold exactly one private page; there is no per-task
+  heap or growable user mapping yet.
 - Tasks run at EL1 and are linked into the kernel image; syscall arguments
   are trusted (raw pointers are dereferenced without validation). Moving
   tasks to EL0 + MMU isolation makes this exploitable surface real.
@@ -123,21 +146,24 @@ lock; `notify_*` under the lock; re-check the condition after waking.
 
 ## Next steps (by priority)
 
-1. **More syscalls behind the SVC boundary:** `spawn`, `exit`, mutex
+1. **Move tasks to EL0 (Ring 3):** separate SP_EL0, SVC from lower EL
+   (`ESR EC=0b010101` already handles both, but EL0 needs its own stack
+   switch and page-table AP bits — kernel RW only at EL1, user pages
+   EL0-RW). Drop the identity half from task tables; keep the kernel
+   mapped at a high VA shared by all tasks. This is the real isolation
+   milestone.
+2. **More syscalls behind the SVC boundary:** `spawn`, `exit`, mutex
    lock/unlock, UART write — so tasks stop calling kernel code directly.
-2. **Nameserver extras:** unregister on task exit, duplicate-name policy
+3. **Nameserver extras:** unregister on task exit, duplicate-name policy
    (replace vs TAKEN), watch/notifications for "task appeared" instead of
    lookup polling.
-3. **IPC on top of the channel:** mailbox payloads could ride a bounded
+4. **IPC on top of the channel:** mailbox payloads could ride a bounded
    channel per task to get backpressure on message floods for free.
-4. **Per-task address spaces:** dedicated L3 tables per task (stacks and
-   heap already come from the frame allocator), TTBR0 switch on context
-   switch, kernel mapped into every task at a high VA, then move tasks to
-   **EL0** (separate SP_EL0, SVC from lower EL). The two together are the
-   real isolation milestone.
-5. **VirtIO-console / virtio-block** — first MMIO device driver, moving
+5. **Grow per-task spaces:** multiple private pages, per-task heap region,
+   copy-on-write later.
+6. **VirtIO-console / virtio-block** — first MMIO device driver, moving
    UART output behind a driver interface.
-6. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
+7. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
    `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
 
 ## Workflow for a new feature
