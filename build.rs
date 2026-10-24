@@ -1,0 +1,37 @@
+use std::{env, fs, path::PathBuf, process::Command};
+
+fn main() {
+    println!("cargo:rerun-if-changed=userspace");
+    if env::var_os("CARGO_FEATURE_NO_STD").is_none() {
+        return;
+    }
+
+    let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+    let profile = env::var("PROFILE").unwrap();
+    let target_dir = root.join("target").join("userspace");
+    let cargo = env::var_os("CARGO").unwrap();
+    let mut command = Command::new(cargo);
+    command
+        .current_dir(root.join("userspace"))
+        .arg("build")
+        .arg("--target")
+        .arg("aarch64-unknown-none")
+        .arg("--target-dir")
+        .arg(&target_dir);
+    if profile == "release" {
+        command.arg("--release");
+    }
+    let status = command
+        .status()
+        .expect("failed to invoke userspace cargo build");
+    assert!(status.success(), "userspace ELF build failed");
+
+    let elf = target_dir
+        .join("aarch64-unknown-none")
+        .join(&profile)
+        .join("silver_userspace");
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("silver_userspace.elf");
+    fs::copy(&elf, &out).unwrap_or_else(|error| {
+        panic!("failed to embed {}: {error}", elf.display());
+    });
+}

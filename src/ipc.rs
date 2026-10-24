@@ -15,19 +15,13 @@ use crate::{condvar::Condvar, mutex::Mutex, scheduler};
 pub const PAYLOAD_SIZE: usize = 32;
 
 #[derive(Copy, Clone)]
+#[repr(C)]
 pub struct Message {
     pub sender: u64,
     pub payload: [u8; PAYLOAD_SIZE],
 }
 
 impl Message {
-    pub fn new(sender: u64, bytes: &[u8]) -> Self {
-        let mut payload = [0_u8; PAYLOAD_SIZE];
-        let len = bytes.len().min(PAYLOAD_SIZE);
-        payload[..len].copy_from_slice(&bytes[..len]);
-        Self { sender, payload }
-    }
-
     /// Payload viewed as text, truncated at the first NUL byte.
     pub fn text(&self) -> &[u8] {
         let end = self

@@ -1,16 +1,3 @@
-//! Nameserver task: maps printable names to task IDs so tasks can find each
-//! other without hardcoded IDs. It holds the well-known ID NAMESERVER_ID (1),
-//! guaranteed by spawn order in scheduler::init.
-//!
-//! Protocol (mailbox messages, text payloads, request/reply over IPC):
-//!   request "R <name>" — register the sender under <name>;
-//!                        replies "OK" or "TAKEN" (no re-registration)
-//!   request "L <name>" — look up <name>;
-//!                        replies "ID <n>" or "MISSING"
-//!
-//! The table is fixed-capacity stack storage, not a Vec: user tasks have no
-//! kernel heap mapping in the high-half design.
-
 use crate::{ipc, syscall};
 
 const MAX_ENTRIES: usize = 16;
@@ -37,9 +24,7 @@ impl Entry {
     }
 }
 
-/// Entry point spawned by the scheduler as an EL0 user task: it reaches the
-/// kernel (IPC, console) only through system calls. Never returns.
-pub extern "C" fn nameserver_task() -> ! {
+pub fn run() -> ! {
     let mut table = [Entry::EMPTY; MAX_ENTRIES];
     syscall::print("NAMESERVER READY\r\n");
 
@@ -49,22 +34,18 @@ pub extern "C" fn nameserver_task() -> ! {
         let reply = match request.text().split_first() {
             Some((&b'R', name)) if !name.is_empty() => register(&mut table, name, request.sender),
             Some((&b'L', name)) if !name.is_empty() => lookup(&table, name),
-            _ => text_reply("WHAT?"),
+            _ => text_reply(b"WHAT?"),
         };
         syscall::send(request.sender, &reply);
     }
 }
 
 fn register(table: &mut [Entry], name: &[u8], id: u64) -> ipc::Message {
-    if name.len() > NAME_CAPACITY {
-        return text_reply("TAKEN");
+    if name.len() > NAME_CAPACITY || table.iter().any(|entry| entry.used && entry.name() == name) {
+        return text_reply(b"TAKEN");
     }
-    if table.iter().any(|entry| entry.used && entry.name() == name) {
-        return text_reply("TAKEN");
-    }
-
     let Some(entry) = table.iter_mut().find(|entry| !entry.used) else {
-        return text_reply("FULL");
+        return text_reply(b"FULL");
     };
     entry.name[..name.len()].copy_from_slice(name);
     entry.name_len = name.len() as u8;
@@ -74,7 +55,7 @@ fn register(table: &mut [Entry], name: &[u8], id: u64) -> ipc::Message {
     syscall::print("NAMESERVER REG ");
     syscall::print(core::str::from_utf8(name).unwrap_or("?"));
     syscall::print("\r\n");
-    text_reply("OK")
+    text_reply(b"OK")
 }
 
 fn lookup(table: &[Entry], name: &[u8]) -> ipc::Message {
@@ -83,21 +64,17 @@ fn lookup(table: &[Entry], name: &[u8]) -> ipc::Message {
         .find(|entry| entry.used && entry.name() == name)
     {
         Some(entry) => id_reply(entry.id),
-        None => text_reply("MISSING"),
+        None => text_reply(b"MISSING"),
     }
 }
 
-fn text_reply(text: &str) -> ipc::Message {
-    ipc::Message::new(syscall::task_id(), text.as_bytes())
+fn text_reply(text: &[u8]) -> ipc::Message {
+    ipc::Message::new(syscall::task_id(), text)
 }
 
-/// Formats an "ID <n>" reply without alloc::format — kernel style.
 fn id_reply(id: u64) -> ipc::Message {
     let mut payload = [0_u8; ipc::PAYLOAD_SIZE];
-    payload[0] = b'I';
-    payload[1] = b'D';
-    payload[2] = b' ';
-
+    payload[..3].copy_from_slice(b"ID ");
     let mut digits = [0_u8; 20];
     let mut count = 0;
     let mut rest = id;
@@ -109,7 +86,6 @@ fn id_reply(id: u64) -> ipc::Message {
     for index in 0..count {
         payload[3 + index] = digits[count - 1 - index];
     }
-
     ipc::Message {
         sender: syscall::task_id(),
         payload,

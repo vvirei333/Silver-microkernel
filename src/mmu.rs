@@ -2,26 +2,14 @@
 //!
 //! TTBR1_EL1 maps physical memory at `KERNEL_VIRT_BASE + PA` for EL1 only:
 //! kernel code/data/stacks, page tables, the kernel heap, UART and GIC all
-//! live there. TTBR0_EL1 belongs to the current task and contains only what
-//! EL0 needs: a read-only low alias of the built-in text/rodata image, the
-//! task's own user stack, and one private data page. There are no kernel
-//! data or MMIO mappings in a task's TTBR0.
-//!
-//! The text/rodata alias is a deliberate compatibility measure until user
-//! programs are separate ELF binaries. It is read-only and contains no
-//! writable kernel state; the ELF loader is the step that removes it.
+//! live there. TTBR0_EL1 belongs to the current task and contains only its
+//! independently loaded ELF image, its own user stack and one private page.
+//! No kernel image, kernel data or MMIO pages are shared with EL0.
 
 use crate::{
     frame_allocator,
-    memory::{phys_to_virt, virt_to_phys, MemoryRegion, DRAM_BASE},
+    memory::{phys_to_virt, virt_to_phys, DRAM_BASE},
 };
-
-extern "C" {
-    static __text_start: u8;
-    static __text_end: u8;
-    static __data_start: u8;
-    static __kernel_start: u8;
-}
 
 const ENTRIES: usize = 512;
 const GRANULE: usize = 4096;
@@ -34,6 +22,7 @@ const DESC_PAGE: u64 = 0b11;
 
 /// Private 4 KB data window: L0 index 1, then L1/L2/L3 index 0.
 pub const PRIVATE_WINDOW_VA: usize = 0x0000_0080_0000_0000;
+const PRIVATE_WINDOW_L0_INDEX: usize = (PRIVATE_WINDOW_VA >> 39) & 0x1FF;
 /// Every task's own stack appears at this user VA, backed by different PAs.
 pub const USER_STACK_VA: usize = 0x0000_0000_7FE0_0000;
 pub const USER_STACK_PAGES: usize = 2;
@@ -69,13 +58,13 @@ struct Table {
     entries: [u64; ENTRIES],
 }
 
-const TABLE_COUNT: usize = 6;
+const TABLE_COUNT: usize = 5;
 const EMPTY_TABLE: Table = Table {
     entries: [0; ENTRIES],
 };
 
-/// Referenced by the assembly boot stub, which fills the first five tables
-/// before enabling the MMU. Keep the indices in sync with main.rs.
+/// Referenced by the assembly boot stub, which fills these five tables before
+/// enabling the MMU. Keep the indices in sync with main.rs.
 #[no_mangle]
 static mut TABLES: [Table; TABLE_COUNT] = [EMPTY_TABLE; TABLE_COUNT];
 
@@ -84,11 +73,9 @@ const INDEX_HIGH_LEVEL0: usize = 1;
 const INDEX_LEVEL1: usize = 2;
 const INDEX_LEVEL2_MMIO: usize = 3;
 const INDEX_LEVEL2_DRAM: usize = 4;
-const INDEX_USER_IMAGE_L3: usize = 5;
 
-/// Replaces the temporary boot identity TTBR0 with an empty kernel TTBR0,
-/// retains the high TTBR1 map, and builds the shared read-only user image.
-/// Called from kernel_main while already executing at a high PC.
+/// Replaces the temporary boot identity TTBR0 with an empty kernel TTBR0 and
+/// retains the high TTBR1 map. User TTBR0s are installed by the scheduler.
 pub fn init() {
     unsafe {
         let base = core::ptr::addr_of_mut!(TABLES) as *mut Table;
@@ -97,7 +84,6 @@ pub fn init() {
         let level1 = &mut *base.add(INDEX_LEVEL1);
         let mmio = &mut *base.add(INDEX_LEVEL2_MMIO);
         let dram = &mut *base.add(INDEX_LEVEL2_DRAM);
-        let user_image = &mut *base.add(INDEX_USER_IMAGE_L3);
 
         // We execute through TTBR1 now; the low identity alias is no longer
         // needed by the kernel. User TTBR0s are installed by the scheduler.
@@ -111,7 +97,6 @@ pub fn init() {
             dram.entries[index] =
                 block_descriptor(DRAM_BASE + index * BLOCK_2M, ATTR_NORMAL, SH_INNER);
         }
-        fill_user_image_l3(user_image);
     }
 
     clean_tables_to_point_of_coherency();
@@ -211,13 +196,14 @@ pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
 // ---------------------------------------------------------------------------
 
 /// Builds a user TTBR0. `user_stack_start == 0` creates no stack mapping
-/// (used for the EL1 idle task); the private page is still allocated/freed
-/// uniformly for every task.
-///
-/// Owned pages: L0, L1_user, L2_user, L3_stack, and three private-window
-/// levels. The read-only image L3 is shared and never freed per task.
-pub fn create_task_space(private_page: usize, user_stack_start: usize) -> Option<usize> {
-    let mut pages = [0_usize; 7];
+/// (used for the EL1 idle task). A loaded ELF supplies independently owned
+/// image pages instead of the old shared kernel text/rodata alias.
+pub fn create_task_space(
+    private_page: usize,
+    user_stack_start: usize,
+    image: Option<&crate::elf_loader::UserImage>,
+) -> Option<usize> {
+    let mut pages = [0_usize; 8];
     for (index, slot) in pages.iter_mut().enumerate() {
         let Some(page) = frame_allocator::alloc_page() else {
             for prior in &pages[..index] {
@@ -227,7 +213,7 @@ pub fn create_task_space(private_page: usize, user_stack_start: usize) -> Option
         };
         *slot = page;
     }
-    let [l0, l1_user, l2_user, l3_stack, l1_priv, l2_priv, l3_priv] = pages;
+    let [l0, l1_user, l2_user, l3_image, l3_stack, l1_priv, l2_priv, l3_priv] = pages;
 
     unsafe {
         for &page in &pages {
@@ -235,12 +221,21 @@ pub fn create_task_space(private_page: usize, user_stack_start: usize) -> Option
         }
 
         write_entry(l0, 0, l1_user as u64 | DESC_TABLE);
-        write_entry(l0, 1, l1_priv as u64 | DESC_TABLE);
+        write_entry(l0, PRIVATE_WINDOW_L0_INDEX, l1_priv as u64 | DESC_TABLE);
         write_entry(l1_user, 1, l2_user as u64 | DESC_TABLE);
+        write_entry(l2_user, 0, l3_image as u64 | DESC_TABLE);
 
-        let shared_image =
-            virt_to_phys(core::ptr::addr_of!(TABLES) as usize + INDEX_USER_IMAGE_L3 * TABLE_BYTES);
-        write_entry(l2_user, 0, shared_image as u64 | DESC_TABLE);
+        if let Some(image) = image {
+            for index in 0..image.page_count {
+                let physical = image.physical_start + index * GRANULE;
+                let descriptor = match image.kinds[index] {
+                    crate::elf_loader::PageKind::Text => user_text_page(physical),
+                    crate::elf_loader::PageKind::ReadOnly => user_rodata_page(physical),
+                    crate::elf_loader::PageKind::Data => user_data_page(physical),
+                };
+                write_entry(l3_image, index, descriptor);
+            }
+        }
 
         if user_stack_start != 0 {
             write_entry(l2_user, USER_STACK_L2_INDEX, l3_stack as u64 | DESC_TABLE);
@@ -264,29 +259,14 @@ pub fn create_task_space(private_page: usize, user_stack_start: usize) -> Option
     Some(l0)
 }
 
-/// Shared low user alias: only .text and .rodata are present. Kernel data,
-/// stacks, heap, MMIO and every other DRAM page are deliberately unmapped.
-unsafe fn fill_user_image_l3(table: &mut Table) {
-    let text_start = virt_to_phys(core::ptr::addr_of!(__text_start) as usize);
-    let text_end = virt_to_phys(core::ptr::addr_of!(__text_end) as usize);
-    let data_start = virt_to_phys(core::ptr::addr_of!(__data_start) as usize);
-
-    for index in 0..ENTRIES {
-        let address = DRAM_BASE + index * GRANULE;
-        table.entries[index] = if address >= text_start && address < text_end {
-            kernel_text_page(address)
-        } else if address >= text_end && address < data_start {
-            kernel_rodata_page(address)
-        } else {
-            0
-        };
-    }
-}
-
 pub fn destroy_task_space(ttbr0: usize) {
     unsafe {
         let l1_user = follow_table(ttbr0, 0);
         let l2_user = follow_table(l1_user, 1);
+        let image_table_entry = read_entry(l2_user, 0);
+        if image_table_entry & DESC_TABLE == DESC_TABLE {
+            frame_allocator::free_page(descriptor_address(image_table_entry) as usize);
+        }
         let stack_table_entry = read_entry(l2_user, USER_STACK_L2_INDEX);
         if stack_table_entry & DESC_TABLE == DESC_TABLE {
             frame_allocator::free_page(descriptor_address(stack_table_entry) as usize);
@@ -321,49 +301,72 @@ pub fn switch_address_space(ttbr0: usize) {
     }
 }
 
-/// Accepts only memory a user task can legitimately pass to the kernel:
-/// the shared read-only image, its own fixed-VA stack, or its private page.
+/// Accepts only pages actually mapped in the current task's TTBR0. This
+/// covers its own ELF image, fixed-VA stack and private page without baking
+/// linker addresses or image sizes into the syscall layer.
 pub fn valid_user_slice(pointer: u64, length: u64) -> bool {
-    if length > 4096 {
+    if length > 4096 || pointer >= (1_u64 << 48) {
         return false;
     }
-    let Some(last) = pointer.checked_add(length) else {
+    if length == 0 {
+        return true;
+    }
+    let Some(last) = pointer.checked_add(length - 1) else {
         return false;
     };
-    let pointer = pointer as usize;
-    let last = last as usize;
-    let stack = MemoryRegion::new(USER_STACK_VA, USER_STACK_VA + USER_STACK_SIZE);
-    let private = MemoryRegion::new(PRIVATE_WINDOW_VA, PRIVATE_WINDOW_VA + GRANULE);
-    let image = user_image_range();
-    [image, stack, private]
-        .iter()
-        .any(|region| pointer >= region.start && last <= region.end)
+    if last >= (1_u64 << 48) {
+        return false;
+    }
+
+    let mut page = pointer & !(GRANULE as u64 - 1);
+    let last_page = last & !(GRANULE as u64 - 1);
+    loop {
+        if !current_user_page_present(page) {
+            return false;
+        }
+        if page == last_page {
+            return true;
+        }
+        page += GRANULE as u64;
+    }
 }
 
-fn user_image_range() -> MemoryRegion {
-    MemoryRegion::new(
-        virt_to_phys(core::ptr::addr_of!(__kernel_start) as usize),
-        virt_to_phys(core::ptr::addr_of!(__data_start) as usize),
-    )
+fn current_user_page_present(virtual_address: u64) -> bool {
+    let ttbr0: u64;
+    unsafe {
+        core::arch::asm!("mrs {value}, ttbr0_el1", value = out(reg) ttbr0, options(nostack));
+        let mut table = descriptor_address(ttbr0) as usize;
+        for shift in [39, 30, 21] {
+            let index = ((virtual_address >> shift) & 0x1FF) as usize;
+            let descriptor = read_entry(table, index);
+            if descriptor & DESC_TABLE != DESC_TABLE {
+                return false;
+            }
+            table = descriptor_address(descriptor) as usize;
+        }
+        let index = ((virtual_address >> 12) & 0x1FF) as usize;
+        read_entry(table, index) & DESC_PAGE == DESC_PAGE
+    }
 }
 
 fn descriptor_address(descriptor_or_address: u64) -> u64 {
     descriptor_or_address & ADDRESS_MASK
 }
 
-/// Built-in .text, mapped read-only and executable at EL0 and EL1. RO at EL0
-/// also avoids the ARM rule that an EL0-writable page is EL1-execute-never.
-fn kernel_text_page(output_address: usize) -> u64 {
+/// User ELF text: readable/executable at EL0, never executable at EL1.
+fn user_text_page(output_address: usize) -> u64 {
     descriptor_address(output_address as u64)
         | DESC_PAGE
         | (ATTR_NORMAL << 2)
         | AP_BOTH_RO
         | SH_INNER
         | AF
+        | PXN
 }
 
-fn kernel_rodata_page(output_address: usize) -> u64 {
-    kernel_text_page(output_address) | UXN | PXN
+/// User ELF rodata: read-only and never executable at either level.
+fn user_rodata_page(output_address: usize) -> u64 {
+    user_text_page(output_address) | UXN
 }
 
 /// Task-owned writable memory: user stack or private page, never executable.

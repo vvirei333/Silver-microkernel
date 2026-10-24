@@ -3,9 +3,10 @@ use core::cell::UnsafeCell;
 use alloc::vec::Vec;
 
 use crate::{
-    frame_allocator, interrupts, ipc,
+    elf_loader::{self, UserImage},
+    frame_allocator, interrupts,
     memory::{phys_to_virt, virt_to_phys, MemoryRegion, PAGE_SIZE},
-    mmu, nameserver, pl011, syscall, timer,
+    mmu, pl011, timer, user_program,
 };
 
 const TASK_STACK_PAGES: usize = 4;
@@ -68,6 +69,8 @@ pub struct Task {
     pub user_stack: MemoryRegion,
     /// Physical base of this task's translation tables (TTBR0_EL1 value).
     pub ttbr0: usize,
+    /// Independently loaded ELF pages; released together with the address space.
+    user_image: Option<UserImage>,
 }
 
 pub struct TaskManager {
@@ -196,28 +199,26 @@ pub fn init() {
 
     // Idle always exists, so the CPU has somewhere to run when all tasks sleep.
     // It stays at EL1: pure wfi loop, never blocks voluntarily, never syscalls.
-    let _idle_id = spawn_inner(idle_task, false);
-    // Spawned first after idle, so its ID is NAMESERVER_ID (1) — never
-    // reorder without updating syscall::NAMESERVER_ID.
-    let _nameserver_id = spawn_inner(nameserver::nameserver_task, true);
-    let _holder_id = spawn_inner(mutex_holder, true);
-    let _contender_1_id = spawn_inner(mutex_contender, true);
-    let _contender_2_id = spawn_inner(mutex_contender, true);
-    let _ping_id = spawn_inner(ipc_ping, true);
-    let _pong_id = spawn_inner(ipc_pong, true);
-    // Condvar demo: alpha and beta both block in receive(); the probe sends
-    // to alpha only — beta must stay asleep.
-    let _alpha_id = spawn_inner(condvar_alpha, true);
-    let _beta_id = spawn_inner(condvar_beta, true);
-    let _probe_id = spawn_inner(condvar_probe, true);
-    let _producer_id = spawn_inner(channel_producer, true);
-    let _consumer_id = spawn_inner(channel_consumer, true);
-    let _sleeper_id = spawn_inner(sleeping_task, true);
-    // Per-task address space demo: same VA, different physical pages.
-    let _vm_a_id = spawn_inner(vm_task_a, true);
-    let _vm_b_id = spawn_inner(vm_task_b, true);
-    // Must die alone on its high-half read; every other task keeps running.
-    let _isolation_probe_id = spawn_inner(isolation_probe, true);
+    let _idle_id = spawn_kernel(idle_task);
+    // Userspace dispatches on task ID. Keep this order in sync with
+    // userspace/src/main.rs; nameserver must remain ID NAMESERVER_ID (1).
+    let _nameserver_id = spawn_user();
+    let _holder_id = spawn_user();
+    let _contender_1_id = spawn_user();
+    let _contender_2_id = spawn_user();
+    let _ping_id = spawn_user();
+    let _pong_id = spawn_user();
+    let _alpha_id = spawn_user();
+    let _beta_id = spawn_user();
+    let _probe_id = spawn_user();
+    let _producer_id = spawn_user();
+    let _consumer_id = spawn_user();
+    let _sleeper_id = spawn_user();
+    let _vm_a_id = spawn_user();
+    let _vm_b_id = spawn_user();
+    // Both probes must die alone; every other task keeps running.
+    let _isolation_probe_id = spawn_user();
+    let _kernel_image_probe_id = spawn_user();
 
     let manager = scheduler_manager().unwrap();
     manager.current_index = manager
@@ -225,16 +226,6 @@ pub fn init() {
         .iter()
         .position(|task| task.id == 1)
         .unwrap_or(0);
-}
-
-/// Dynamically adds a task and returns its ID. `user` selects the exception
-/// level: user tasks run at EL0t with their own SP_EL0 stack and reach the
-/// kernel only through SVC; kernel tasks run at EL1h on the kernel stack.
-pub fn spawn(entry: extern "C" fn() -> !, user: bool) -> Option<u64> {
-    let saved_daif = interrupts::save_and_disable_irq();
-    let id = spawn_inner(entry, user);
-    interrupts::restore_irq(saved_daif);
-    id
 }
 
 /// Voluntarily gives up the remainder of the current time slice.
@@ -448,7 +439,15 @@ pub fn schedule() {
     }
 }
 
-fn spawn_inner(entry: extern "C" fn() -> !, user: bool) -> Option<u64> {
+fn spawn_kernel(entry: extern "C" fn() -> !) -> Option<u64> {
+    spawn_inner(Some(entry), false)
+}
+
+fn spawn_user() -> Option<u64> {
+    spawn_inner(None, true)
+}
+
+fn spawn_inner(entry: Option<extern "C" fn() -> !>, user: bool) -> Option<u64> {
     let manager = scheduler_manager()?;
     let id = manager.next_id;
     let task = Task::new(id, entry, user)?;
@@ -530,11 +529,9 @@ fn current_task_mut() -> Option<&'static mut Task> {
 }
 
 impl Task {
-    fn new(id: u64, entry: extern "C" fn() -> !, user: bool) -> Option<Self> {
+    fn new(id: u64, entry: Option<extern "C" fn() -> !>, user: bool) -> Option<Self> {
         let stack_start = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES)?;
 
-        // Allocate all user-owned memory before building its TTBR0: the
-        // tables map the stack at USER_STACK_VA regardless of its PA.
         let user_stack = if user {
             let Some(user_start) = frame_allocator::alloc_contiguous_pages(TASK_USER_STACK_PAGES)
             else {
@@ -553,7 +550,27 @@ impl Task {
             release_pages(stack_start, TASK_STACK_PAGES);
             return None;
         };
-        let Some(ttbr0) = mmu::create_task_space(private_page, user_stack.start) else {
+
+        let user_image = if user {
+            let Some(image) = elf_loader::load(user_program::DEMO_ELF) else {
+                frame_allocator::free_page(private_page);
+                if !user_stack.is_empty() {
+                    release_pages(user_stack.start, TASK_USER_STACK_PAGES);
+                }
+                release_pages(stack_start, TASK_STACK_PAGES);
+                return None;
+            };
+            Some(image)
+        } else {
+            None
+        };
+
+        let Some(ttbr0) =
+            mmu::create_task_space(private_page, user_stack.start, user_image.as_ref())
+        else {
+            if let Some(image) = &user_image {
+                image.release();
+            }
             frame_allocator::free_page(private_page);
             if !user_stack.is_empty() {
                 release_pages(user_stack.start, TASK_USER_STACK_PAGES);
@@ -564,18 +581,16 @@ impl Task {
 
         let stack = MemoryRegion::new(stack_start, stack_start + TASK_STACK_SIZE);
         let mut context = TaskContext::zero();
-        context.registers[0] = if user {
-            // EL0 executes the low read-only alias of the built-in image.
-            virt_to_phys(entry as usize) as u64
+        context.registers[0] = if let Some(image) = &user_image {
+            image.entry as u64
         } else {
-            entry as usize as u64
+            entry.expect("kernel task entry is required") as usize as u64
         };
         context.elr = if user {
-            // The switch `ret`s here at EL1h; the bootstrap drops to EL0t
-            // at the low entry alias, passed in x19.
+            // Return to high EL1 bootstrap, then eret to this task's own ELF.
             silver_user_bootstrap as *const () as usize as u64
         } else {
-            entry as usize as u64
+            entry.expect("kernel task entry is required") as usize as u64
         };
         context.stack_pointer = phys_to_virt(stack.end) as u64;
         context.user_stack_pointer = if user {
@@ -591,6 +606,7 @@ impl Task {
             stack,
             user_stack,
             ttbr0,
+            user_image,
         })
     }
 
@@ -603,6 +619,9 @@ impl Task {
 
     fn release_space(&self) {
         mmu::destroy_task_space(self.ttbr0);
+        if let Some(image) = &self.user_image {
+            image.release();
+        }
     }
 }
 
@@ -627,235 +646,5 @@ extern "C" fn idle_task() -> ! {
     interrupts::enable_irq();
     loop {
         interrupts::wait_for_irq();
-    }
-}
-
-extern "C" fn mutex_holder() -> ! {
-    loop {
-        syscall::mutex_lock();
-        syscall::print("MUTEX HOLDER=1 ACQUIRE\r\n");
-        // Sleep WHILE holding the lock: contenders must pile up in the queue.
-        syscall::sleep(400);
-        syscall::print("MUTEX HOLDER=1 RELEASE\r\n");
-        syscall::mutex_unlock();
-        syscall::sleep(50);
-    }
-}
-
-extern "C" fn mutex_contender() -> ! {
-    loop {
-        syscall::mutex_lock();
-        syscall::print("MUTEX T");
-        syscall::print_dec_u64(syscall::task_id());
-        syscall::print(" LOCK\r\n");
-        syscall::mutex_unlock();
-        syscall::sleep(100);
-    }
-}
-
-/// Registers `name`, then resolves `peer` through the nameserver, retrying
-/// until the peer shows up. Demonstrates the discovery dance both sides do.
-fn resolve_peer(name: &str, peer: &str) -> u64 {
-    syscall::print("IPC REGISTER ");
-    syscall::print(name);
-    syscall::print("\r\n");
-    if !syscall::register(name) {
-        syscall::print("IPC REGISTER FAILED\r\n");
-    }
-
-    loop {
-        if let Some(id) = syscall::lookup(peer) {
-            syscall::print("IPC FOUND ");
-            syscall::print(peer);
-            syscall::print("\r\n");
-            return id;
-        }
-        syscall::print("IPC LOOKUP ");
-        syscall::print(peer);
-        syscall::print(" RETRY\r\n");
-        syscall::sleep(100);
-    }
-}
-
-extern "C" fn ipc_ping() -> ! {
-    let peer = resolve_peer("ping", "pong");
-    let mut reply = ipc::Message::new(0, b"");
-
-    loop {
-        syscall::print("IPC ping SEND PING (SVC)\r\n");
-        syscall::send(peer, &ipc::Message::new(syscall::task_id(), b"PING"));
-
-        // Blocks here until pong answers.
-        syscall::receive(&mut reply);
-        syscall::print("IPC ping RECV ");
-        syscall::print(core::str::from_utf8(reply.text()).unwrap_or("?"));
-        syscall::print(" (SVC)\r\n");
-
-        syscall::sleep(300);
-    }
-}
-
-extern "C" fn ipc_pong() -> ! {
-    // reply goes to message.sender, so pong only needs to register itself
-    resolve_peer("pong", "ping");
-    let mut message = ipc::Message::new(0, b"");
-
-    loop {
-        // Do other "work" first; the ping sits in our mailbox meanwhile.
-        syscall::sleep(200);
-
-        // Blocks here until ping arrives.
-        syscall::receive(&mut message);
-        syscall::print("IPC pong RECV ");
-        syscall::print(core::str::from_utf8(message.text()).unwrap_or("?"));
-        syscall::print(" (SVC)\r\n");
-
-        syscall::print("IPC pong SEND PONG (SVC)\r\n");
-        syscall::send(
-            message.sender,
-            &ipc::Message::new(syscall::task_id(), b"PONG"),
-        );
-    }
-}
-
-extern "C" fn sleeping_task() -> ! {
-    loop {
-        syscall::sleep(500);
-        syscall::print("TASK ID=");
-        syscall::print_hex_u64(syscall::task_id());
-        syscall::print(" AWAKE\r\n");
-    }
-}
-
-/// Condvar demo: two receivers, one message. alpha and beta both block in
-/// `receive()`; the probe sends WAKE to alpha only. If the wakeup were not
-/// targeted, beta would print its line and the test would fail.
-
-extern "C" fn condvar_alpha() -> ! {
-    syscall::register("alpha");
-    let mut message = ipc::Message::new(0, b"");
-
-    loop {
-        syscall::receive(&mut message);
-        syscall::print("CONDVAR alpha RECV ");
-        syscall::print(core::str::from_utf8(message.text()).unwrap_or("?"));
-        syscall::print("\r\n");
-        // Back to sleep on the mailbox condvar — silent from here on.
-    }
-}
-
-extern "C" fn condvar_beta() -> ! {
-    syscall::register("beta");
-    let mut message = ipc::Message::new(0, b"");
-
-    loop {
-        syscall::receive(&mut message);
-        // Reaching this print means a foreign wakeup hit beta: TEST FAIL.
-        syscall::print("CONDVAR beta RECV (TEST FAIL)\r\n");
-    }
-}
-
-extern "C" fn condvar_probe() -> ! {
-    syscall::register("probe");
-
-    // Wait until both receivers exist, then give them time to reach receive().
-    let alpha = loop {
-        if let Some(id) = syscall::lookup("alpha") {
-            break id;
-        }
-        syscall::sleep(50);
-    };
-    loop {
-        if syscall::lookup("beta").is_some() {
-            break;
-        }
-        syscall::sleep(50);
-    }
-    syscall::sleep(300);
-
-    syscall::print("CONDVAR TEST: send WAKE to alpha only\r\n");
-    syscall::send(alpha, &ipc::Message::new(syscall::task_id(), b"WAKE"));
-
-    // If beta ever prints, it happens within this window.
-    syscall::sleep(500);
-    syscall::print("CONDVAR TEST: beta silent = PASS\r\n");
-
-    loop {
-        syscall::sleep(1000);
-    }
-}
-
-/// Bounded channel demo: capacity 2, fast producer, slow consumer. The
-/// producer must block in `send` once two items are in flight — watch the
-/// log: TX can never lead RX by more than 2.
-extern "C" fn channel_producer() -> ! {
-    loop {
-        for item in 1..=5_u64 {
-            syscall::channel_send(item);
-            syscall::print("CHAN TX ");
-            syscall::print_dec_u64(item);
-            syscall::print("\r\n");
-        }
-    }
-}
-
-extern "C" fn channel_consumer() -> ! {
-    loop {
-        // Deliberately slow: this is what pushes the producer into the cap.
-        syscall::sleep(400);
-        let item = syscall::channel_receive();
-        syscall::print("CHAN RX ");
-        syscall::print_dec_u64(item);
-        syscall::print("\r\n");
-    }
-}
-
-// Per-task address spaces demo: both tasks write to the SAME virtual address
-// (PRIVATE_WINDOW_VA), but each task's L0 maps it to its own private physical
-// page. The write -> sleep -> read pattern is the isolation proof: without
-// per-task translation, task B would overwrite the cell while A sleeps and A
-// would read back 0xBBBB instead of its own 0xAAAA.
-extern "C" fn vm_task_a() -> ! {
-    let cell = mmu::PRIVATE_WINDOW_VA as *mut u64;
-    loop {
-        unsafe { core::ptr::write_volatile(cell, 0xAAAA) };
-        syscall::sleep(500);
-        let observed = unsafe { core::ptr::read_volatile(cell) };
-        syscall::print("VM A [0x");
-        syscall::print_hex_u64(mmu::PRIVATE_WINDOW_VA as u64);
-        syscall::print("]=0x");
-        syscall::print_hex_u64(observed);
-        syscall::print("\r\n");
-    }
-}
-
-extern "C" fn vm_task_b() -> ! {
-    let cell = mmu::PRIVATE_WINDOW_VA as *mut u64;
-    loop {
-        unsafe { core::ptr::write_volatile(cell, 0xBBBB) };
-        syscall::sleep(500);
-        let observed = unsafe { core::ptr::read_volatile(cell) };
-        syscall::print("VM B [0x");
-        syscall::print_hex_u64(mmu::PRIVATE_WINDOW_VA as u64);
-        syscall::print("]=0x");
-        syscall::print_hex_u64(observed);
-        syscall::print("\r\n");
-    }
-}
-
-/// Negative isolation test: this high address is present in the kernel's
-/// TTBR1 map but deliberately absent from every user TTBR0. The read must
-/// fault at EL0; the exception handler kills only this task.
-extern "C" fn isolation_probe() -> ! {
-    syscall::print("ISOLATION PROBE: reading high-half kernel memory\r\n");
-    let kernel_memory = crate::memory::phys_to_virt(crate::memory::DRAM_BASE) as *const u64;
-    let value = unsafe { core::ptr::read_volatile(kernel_memory) };
-
-    // Reaching this line means isolation is broken.
-    syscall::print("ISOLATION FAIL: kernel read returned 0x");
-    syscall::print_hex_u64(value);
-    syscall::print("\r\n");
-    loop {
-        syscall::sleep(1000);
     }
 }

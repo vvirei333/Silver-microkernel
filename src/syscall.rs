@@ -46,10 +46,9 @@ const FRAME_QUADWORDS: usize = 33;
 static DEMO_MUTEX: mutex::Mutex<()> = mutex::Mutex::new(());
 static DEMO_CHANNEL: channel::Channel<u64> = channel::Channel::new(2);
 
-/// Accept only ranges mapped in the current task's TTBR0: the shared
-/// read-only image, its own fixed-VA stack, or its private page. The kernel
-/// dereferences the pointer through that same TTBR0 while TTBR1 keeps all
-/// privileged state mapped only at high VAs.
+/// Accept only pages mapped in the current task's TTBR0: its own ELF image,
+/// fixed-VA stack, or private page. The kernel dereferences the pointer through
+/// that same TTBR0 while TTBR1 keeps privileged state only at high VAs.
 fn valid_task_slice(ptr: u64, len: u64) -> bool {
     mmu::valid_user_slice(ptr, len)
 }
@@ -217,126 +216,4 @@ fn parse_id_reply(reply: &ipc::Message) -> Option<u64> {
         id = id * 10 + u64::from(byte - b'0');
     }
     Some(id)
-}
-
-/// Blocks the current task for approximately `milliseconds`.
-pub fn sleep(milliseconds: u64) {
-    unsafe { syscall1(SYS_SLEEP, milliseconds) };
-}
-
-/// Sends a message to task `target`.
-pub fn send(target: u64, message: &ipc::Message) {
-    unsafe { syscall2(SYS_SEND, target, message as *const ipc::Message as u64) };
-}
-
-/// Blocks until a message arrives and writes it into `buffer`.
-pub fn receive(buffer: &mut ipc::Message) {
-    unsafe { syscall1(SYS_RECEIVE, buffer as *mut ipc::Message as u64) };
-}
-
-/// Writes `text` to the kernel console. The only legal way for an EL0 task
-/// to reach the UART: MMIO is unmapped at EL0.
-pub fn print(text: &str) {
-    unsafe { syscall2(SYS_PRINT, text.as_ptr() as u64, text.len() as u64) };
-}
-
-/// ID of the current task.
-pub fn task_id() -> u64 {
-    unsafe { syscall0(SYS_WHOAMI) }
-}
-
-/// Prints `value` as 16 hex digits through the kernel console.
-pub fn print_hex_u64(value: u64) {
-    unsafe { syscall1(SYS_PRINT_HEX, value) };
-}
-
-/// Prints `value` in decimal through the kernel console.
-pub fn print_dec_u64(value: u64) {
-    unsafe { syscall1(SYS_PRINT_DEC, value) };
-}
-
-/// Acquires the demo mutex, blocking until it is free. Pair with
-/// `mutex_unlock` — the lock is held across syscalls, so there is no guard.
-pub fn mutex_lock() {
-    unsafe { syscall0(SYS_MUTEX_LOCK) };
-}
-
-/// Releases the demo mutex.
-pub fn mutex_unlock() {
-    unsafe { syscall0(SYS_MUTEX_UNLOCK) };
-}
-
-/// Sends a value into the demo channel, blocking when it is full.
-pub fn channel_send(value: u64) {
-    unsafe { syscall1(SYS_CHAN_SEND, value) };
-}
-
-/// Receives a value from the demo channel, blocking while it is empty.
-pub fn channel_receive() -> u64 {
-    unsafe { syscall0(SYS_CHAN_RECV) }
-}
-
-/// Registers the current task under `name` at the nameserver.
-/// Returns false if the name is taken or too long.
-pub fn register(name: &str) -> bool {
-    if name.len() > NAME_LIMIT {
-        return false;
-    }
-    with_nul(name, |ptr| unsafe { syscall1(SYS_REGISTER, ptr) }) == 0
-}
-
-/// Looks up the task ID registered under `name`. None = not registered.
-pub fn lookup(name: &str) -> Option<u64> {
-    if name.len() > NAME_LIMIT {
-        return None;
-    }
-    let id = with_nul(name, |ptr| unsafe { syscall1(SYS_LOOKUP, ptr) });
-    if id == 0 || id == SYSCALL_ERROR {
-        None
-    } else {
-        Some(id)
-    }
-}
-
-/// Copies `name` into a NUL-terminated stack buffer and passes its address
-/// to `call`. The buffer outlives the syscall (the kernel copies the name
-/// into the request message before returning).
-fn with_nul<R>(name: &str, call: impl FnOnce(u64) -> R) -> R {
-    let mut buffer = [0_u8; NAME_LIMIT + 1];
-    buffer[..name.len()].copy_from_slice(name.as_bytes());
-    call(buffer.as_ptr() as u64)
-}
-
-unsafe fn syscall0(number: u64) -> u64 {
-    let result: u64;
-    core::arch::asm!(
-        "svc #0",
-        in("x8") number,
-        lateout("x0") result,
-        options(nostack),
-    );
-    result
-}
-
-unsafe fn syscall1(number: u64, arg0: u64) -> u64 {
-    let result: u64;
-    core::arch::asm!(
-        "svc #0",
-        in("x8") number,
-        inlateout("x0") arg0 => result,
-        options(nostack),
-    );
-    result
-}
-
-unsafe fn syscall2(number: u64, arg0: u64, arg1: u64) -> u64 {
-    let result: u64;
-    core::arch::asm!(
-        "svc #0",
-        in("x8") number,
-        inlateout("x0") arg0 => result,
-        in("x1") arg1,
-        options(nostack),
-    );
-    result
 }

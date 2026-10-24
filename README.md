@@ -15,7 +15,7 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Physical memory map + page frame allocator (bitmap)
 - [x] Kernel heap + Rust global allocator (`alloc`: `Box`, `Vec`)
 - [x] GICv2 + ARM Generic Timer (IRQ 30, 100 Hz tick)
-- [x] Round-robin scheduler: dynamic `spawn`, `yield`, `sleep`, `exit`
+- [x] Round-robin scheduler: task creation, `yield`, `sleep`, `exit`
 - [x] Blocking mutex with FIFO wait queue (RAII guard)
 - [x] IPC: mailbox `send()` / blocking `receive()` between tasks
 - [x] System calls via `svc #0` (number in x8, arguments in x0-x5)
@@ -23,12 +23,13 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Condition variable: per-mailbox wait queues, targeted wakeups
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
-- [x] Per-task TTBR0 spaces: private page, fixed-VA user stack, TTBR0 switch on context switch
-- [x] Kernel data, heap, kernel stacks and MMIO are absent from user TTBR0
-- [x] Tasks in EL0 (Ring 3): user stacks, SVC-only kernel access, argument validation
+- [x] Separate userspace ELF with checked `PT_LOAD` segment loading and BSS zeroing
+- [x] Per-task TTBR0 spaces: independent ELF image, fixed-VA stack and private page
+- [x] W^X user mappings: R-X text, R-- rodata, RW-NX data/stack/private memory
+- [x] No kernel image, kernel data, heap, kernel stacks or MMIO in user TTBR0
+- [x] Tasks in EL0 (Ring 3): user stacks, SVC-only kernel access, page-table-based pointer validation
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
-- [x] High-half isolation probe: an EL0 read faults without stopping other tasks
-- [ ] Separate user ELF binaries (removes the temporary read-only text/rodata alias)
+- [x] High-half and removed-alias probes: both fault without stopping other tasks
 - [ ] Drivers and full process lifecycle
 
 ## Requirements
@@ -80,14 +81,17 @@ means "the kernel kept running the whole time" — that is success.
 
 `Cargo.toml` has two features: `std` (default, a stub to keep the host
 toolchain happy) and `no_std` (the real kernel build). The kernel only builds
-with `--no-default-features --features no_std`.
+with `--no-default-features --features no_std`. For a bare-metal build,
+`build.rs` automatically builds `userspace/` for AArch64 and embeds the
+resulting ELF; no separate userspace command is needed.
 
 ## Project layout
 
 | File | Purpose |
 | --- | --- |
+| `build.rs` | Builds and embeds the userspace ELF for bare-metal profiles |
 | `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
-| `src/exceptions.rs` | ARM64 exception vectors, kernel panic |
+| `src/exceptions.rs` | Task fault diagnostics and kernel panic |
 | `src/pl011.rs` | UART driver (physical MMIO 0x09000000) |
 | `src/memory.rs` | Physical memory map and high-half address conversion |
 | `src/frame_allocator.rs` | Physical page frame allocator (bitmap) |
@@ -95,15 +99,17 @@ with `--no-default-features --features no_std`.
 | `src/gic.rs` | GICv2 interrupt controller |
 | `src/timer.rs` | ARM Generic Timer, tick counter |
 | `src/interrupts.rs` | IRQ control: masking/restoring DAIF |
-| `src/scheduler.rs` | Scheduler: tasks, context switch, demo tasks |
+| `src/scheduler.rs` | Tasks, ELF-backed creation, context switch and resource reaping |
 | `src/mutex.rs` | Blocking mutex with wait queue |
 | `src/ipc.rs` | Mailbox IPC: `send` / `receive` |
-| `src/syscall.rs` | System call table and `svc #0` wrappers |
-| `src/nameserver.rs` | Nameserver task: name → task ID registry over IPC |
+| `src/syscall.rs` | Kernel system call table and user buffer validation |
 | `src/condvar.rs` | Condition variable: wait / notify_one / notify_all |
 | `src/semaphore.rs` | Counting semaphore on mutex + condvar |
 | `src/channel.rs` | Bounded channel: two semaphores + a mutex (backpressure) |
-| `src/mmu.rs` | TTBR1 kernel map, per-task TTBR0 maps, user pointer validation |
+| `src/mmu.rs` | TTBR1 kernel map, per-task TTBR0 maps, page-table-based pointer validation |
+| `src/elf_loader.rs` | Static ELF64/AArch64 `PT_LOAD` loader and image ownership |
+| `src/user_program.rs` | Embedded userspace ELF bytes |
+| `userspace/` | Separately linked `no_std` EL0 demos, nameserver and syscall wrappers |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
 ## Memory model
@@ -114,26 +120,31 @@ the MMU, branches to the high PC, and removes the kernel's low identity map.
 
 ```text
 TTBR1 (EL1 only):  0xFFFF000000000000 + PA -> kernel image, heap, stacks, MMIO
-TTBR0 (per task): read-only image alias + own fixed-VA stack + private page
+TTBR0 (per task): own ELF image + own fixed-VA stack + own private page
 ```
 
 The scheduler changes only TTBR0_EL1 and flushes stale TLB entries. Its EL1
 code and SP_EL1 stack remain mapped through TTBR1_EL1. Every user task gets
-an 8 KB stack at virtual address `0x7FE00000` and a private 4 KB page at
-`0x0000_0080_0000_0000`; equal VAs in different tasks have different physical
-backing. The `vm_a` / `vm_b` demo proves this by reading back only its own
-value.
+an independently loaded ELF image at `0x40000000`, an 8 KB stack at
+`0x7FE00000`, and a private 4 KB page at `0x0000_0080_0000_0000`. Equal VAs
+in different tasks have different physical backing. VM A/B verify both the
+private page and an ELF BSS variable by reading back only their own values.
 
-The built-in `.text` and `.rodata` still have a **read-only low alias** in
-TTBR0 because the demo tasks are statically linked with the kernel. Writable
-kernel data, heap, kernel and user-task kernel stacks, page tables and MMIO
-are not mapped there. A separate user ELF loader will remove this final
-shared alias.
+The userspace linker emits separate R-X, R-- and RW `PT_LOAD` segments. The
+loader accepts static ELF64/AArch64 `ET_EXEC` files inside a 2 MB image window,
+rejects W+X or incompatible page permissions, copies file bytes into fresh
+frames and zero-fills BSS. There is no shared kernel `.text` / `.rodata` alias
+left in TTBR0.
 
 All demo tasks except idle run at EL0t and enter the kernel only through
-`svc #0`. Syscall pointers must lie in the shared image, the current task's
-stack, or its private page. The intentional isolation probe reads
-`0xFFFF000040000000` from EL0: the expected result is one `TASK FAULT` with
-`EC=0x24`, after which all other tasks continue running.
+`svc #0`. Syscall validation walks the current TTBR0 and accepts only buffers
+whose pages are actually mapped. Two intentional probes prove isolation:
+task 15 reads `0xFFFF000040000000` (high-half kernel) and task 16 reads
+`0x0000000040080000` (the old kernel text alias). Each must produce one
+`TASK FAULT` with `EC=0x24`; all other tasks continue running.
+
+The current demo uses one embedded ELF and selects a role by fixed task ID.
+This is not yet a general process API: user-facing spawn arguments, exit and
+full lifecycle management remain future work.
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).

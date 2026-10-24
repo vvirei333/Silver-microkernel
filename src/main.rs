@@ -11,6 +11,8 @@ mod channel;
 #[cfg(not(feature = "std"))]
 mod condvar;
 #[cfg(not(feature = "std"))]
+mod elf_loader;
+#[cfg(not(feature = "std"))]
 mod exceptions;
 #[cfg(not(feature = "std"))]
 mod frame_allocator;
@@ -27,8 +29,6 @@ mod mmu;
 #[cfg(not(feature = "std"))]
 mod mutex;
 #[cfg(not(feature = "std"))]
-mod nameserver;
-#[cfg(not(feature = "std"))]
 mod pl011;
 #[cfg(not(feature = "std"))]
 mod scheduler;
@@ -38,6 +38,8 @@ mod semaphore;
 mod syscall;
 #[cfg(not(feature = "std"))]
 mod timer;
+#[cfg(not(feature = "std"))]
+mod user_program;
 
 #[cfg(not(feature = "std"))]
 use core::panic::PanicInfo;
@@ -219,10 +221,18 @@ exception_vectors:
     b exception_serror_entry
 
 exception_sync_entry:
+    msr daifset, #2
+    // ESR decoding needs scratch registers, but x9/x10 still belong to the
+    // user. Preserve them before the SVC check so optimized userspace can
+    // safely keep live values in any register across svc #0.
+    sub sp, sp, #16
+    stp x9, x10, [sp]
     mrs x9, esr_el1
     lsr x10, x9, #26
     cmp x10, #21             // EC == 0b010101: SVC from AArch64
-    b.eq exception_svc_dispatch
+    b.eq exception_sync_svc
+    ldp x9, x10, [sp]
+    add sp, sp, #16
     // Anything else: if it came from EL0 it is a task fault (bad pointer,
     // bad instruction, trapped MSR...) — kill the task, keep the kernel.
     // If it came from EL1 it is a kernel bug — panic as before.
@@ -231,6 +241,10 @@ exception_sync_entry:
     cbz x11, exception_user_fault
     mov x0, #0
     b exception_dispatch
+exception_sync_svc:
+    ldp x9, x10, [sp]
+    add sp, sp, #16
+    b exception_svc_dispatch
 exception_user_fault:
     mrs x0, esr_el1
     mrs x1, elr_el1

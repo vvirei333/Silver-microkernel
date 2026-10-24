@@ -3,34 +3,31 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-24 (night)
+## State as of 2026-10-24 (ELF userspace update)
 
-Latest verified feature: **the kernel runs in the TTBR1 high half while EL0
-tasks receive minimal per-task TTBR0 mappings**. Kernel data, heap, kernel
-stacks, page tables and MMIO are absent from user TTBR0. All demo tasks except
-idle still run at EL0t and enter the kernel only through `svc #0`.
+Latest verified feature: **a separately linked static AArch64 userspace ELF is
+loaded into an independent set of pages for every EL0 task**. The old shared
+kernel `.text` / `.rodata` alias is gone. User TTBR0 now contains only the
+current task's own ELF image, user stack and private page. Kernel image/data,
+heap, kernel stacks, page tables and MMIO exist only in the TTBR1 high half.
 
-Verified with host and bare-metal builds, a 20-second QEMU run, five
-consecutive 12-second runs, and a final 12-second smoke run. Every run had
-exactly one intentional `TASK FAULT` from the isolation probe and no
-`KERNEL PANIC`, `BAD SP`, or `ISOLATION FAIL`. IPC, nameserver, mutex/channel,
-condvar and the VM A/B private-page demo continued after that task died.
+Verified with host, debug bare-metal and release bare-metal builds, a release
+QEMU smoke run and five consecutive 8-second debug QEMU runs. Every run had
+exactly two intentional `TASK FAULT` reports and no `KERNEL PANIC`, `BAD SP`,
+`ISOLATION FAIL`, `ALIAS FAIL` or `VM ISOLATION FAIL`. IPC, nameserver,
+mutex/channel, condvar, sleep and both VM isolation checks continued after the
+probe tasks died.
 
-The probe reads `0xFFFF000040000000` from EL0 and reports:
+| Probe | Current ID | Address read from EL0 | Expected FAR |
+| --- | ---: | --- | --- |
+| High-half kernel | 15 | `0xFFFF000040000000` | `FFFF000040000000` |
+| Removed low kernel text alias | 16 | `0x0000000040080000` | `0000000040080000` |
 
-```text
-TASK FAULT
-ID=15
-EC=0000000000000024
-FAR=FFFF000040000000
-SP_EL0=000000007FE01FC0
-```
+Both report `EC=0x24`, a data abort from a lower exception level. These are
+expected translation/permission failures, not kernel regressions. IDs depend
+on spawn order and are part of the current demo contract, not a stable API.
 
-EC `0x24` is a data abort from a lower exception level: the expected
-permission/translation failure, not a kernel regression. Task IDs depend on
-spawn order; the current order makes the isolation probe ID 15.
-
-Three important fixes from the EL0/high-half work must be preserved:
+Important fixes from the EL0/high-half and ELF work must be preserved:
 
 1. **The context switch resumes with `ret`, not `eret`.** The saved x30
    returns into `schedule()`, the original call chain unwinds back to the
@@ -44,12 +41,26 @@ Three important fixes from the EL0/high-half work must be preserved:
    exposed a latent timer-priority write to bare offset `0x41E`, causing
    `KERNEL PANIC EC=0x25 FAR=0x41E`. The write now uses
    `DISTRIBUTOR_BASE + GICD_IPRIORITYR + TIMER_IRQ`.
+4. **The syscall message ABI is `#[repr(C)]` on both sides.** Kernel and
+   userspace `Message` layouts must match. `repr(Rust)` let the compiler
+   reorder fields, so userspace could interpret payload bytes as the sender.
+5. **SVC decoding preserves live user registers.** `exception_sync_entry`
+   saves x9/x10 before reading ESR and restores them before dispatch.
+   Optimized userspace may keep live values in any register across `svc #0`.
+6. **Fault stack dumps are bounds checked.** Each 8-byte word is accepted by
+   `mmu::valid_user_slice()` before it is read; an unmapped word prints
+   `<unmapped>` instead of causing a secondary EL1 data abort.
 
 Always build like this:
 
 ```bash
 cargo build --target aarch64-unknown-none --no-default-features --features no_std
 ```
+
+For bare-metal profiles, `build.rs` invokes Cargo in `userspace/`, uses
+`target/userspace` as its target directory, matches debug/release profile and
+copies the resulting ELF into `OUT_DIR`. `src/user_program.rs` embeds those
+bytes with `include_bytes!`. Host builds skip userspace.
 
 QEMU run: `timeout 5s qemu-system-aarch64 -machine virt -cpu cortex-a72
 -m 128M -nographic -kernel target/aarch64-unknown-none/debug/silver_microkernel`.
@@ -85,7 +96,7 @@ MAIR/TCR and SCTLR.M, then branches to the linked high PC. Only after that
 branch does it install the high SP and VBAR and call `kernel_main`.
 `mmu::init()` removes the temporary low identity alias from kernel TTBR0.
 
-The six statically allocated boot tables have fixed 4 KB slots:
+The five statically allocated boot tables have fixed 4 KB slots:
 
 | Index | Table | Role |
 | --- | --- | --- |
@@ -94,7 +105,6 @@ The six statically allocated boot tables have fixed 4 KB slots:
 | 2 | shared L1 | MMIO gigabyte at index 0, DRAM gigabyte at index 1 |
 | 3 | MMIO L2 | 512 × 2 MB EL1-only device blocks |
 | 4 | DRAM L2 | 512 × 2 MB EL1-only normal-memory blocks |
-| 5 | user image L3 | Shared read-only low `.text` / `.rodata` alias |
 
 For privileged code, physical address `p` is `0xFFFF000000000000 + p` via
 TTBR1. `memory::current()` converts high linker symbols back to PAs so the
@@ -102,62 +112,84 @@ frame allocator remains physical-address based. Kernel heap and kernel-stack
 virtual addresses, including SP_EL1, are high; allocator logs may separately
 show the physical heap base.
 
-Each task owns seven pages of TTBR0 tables plus its data pages:
+Each task owns eight pages of TTBR0 tables plus its image and data pages:
 
-- L0[0] → user L1; L1[1] → user L2; L2[0] → the shared read-only image L3.
+- L0[0] → user L1; L1[1] → user L2; L2[0] → a task-owned image L3.
+  The image L3 maps the freshly loaded ELF pages at `0x40000000`.
 - L2[511] → a task-owned L3 mapping two stack pages at fixed VA
   `0x7FE00000` (8 KB total). Equal stack VAs have different physical backing.
 - L0[1] → a private L1/L2/L3 chain mapping one writable 4 KB page at
   `0x0000008000000000`.
-- There are no user mappings for MMIO, `.data`, `.bss`, kernel heap, kernel
-  stacks, other DRAM, or page-table pages. The shared image L3 is never
-  freed by `destroy_task_space()`; task-owned tables and pages are freed.
+- There are no user mappings for kernel text/rodata, MMIO, kernel `.data` or
+  `.bss`, kernel heap, kernel stacks, unrelated DRAM or page-table pages.
+- `destroy_task_space()` frees all task-owned tables and the private page;
+  `Task::release_space()` then releases the independently owned ELF frames.
 
-**Remaining compatibility alias:** built-in user functions are still linked
-into the kernel ELF, so `.text` and `.rodata` remain visible read-only at low
-addresses in every user TTBR0. This is not writable kernel-state exposure,
-but it is still shared kernel image visibility. Separate user ELF binaries
-are required to remove it; do not claim TTBR0 is completely empty of kernel
-image pages yet.
+## ELF loading and W^X
+
+`userspace/linker.ld` links a static `ET_EXEC` image at `0x40000000` with
+separate R-X text, R-- rodata and RW data `PT_LOAD` segments. `.bss` is
+`NOLOAD` and belongs to the RW segment, so its memory size can exceed its
+file size.
+
+`elf_loader::load()` currently accepts ELF64 little-endian AArch64 `ET_EXEC`
+files only. It checks program-header and file bounds, requires every loadable
+segment to fit within the 2 MB image window, rejects W+X segments and rejects
+different permissions sharing one 4 KB page. The entry must lie in an
+executable segment. It allocates fresh contiguous frames, zeroes the whole
+image, copies `PT_LOAD` file bytes and records a `PageKind` for every page.
+
+The resulting mappings enforce W^X: text is R-X at EL0 and PXN; rodata is R--
+and UXN/PXN; data, stack and private memory are RW at EL0 and UXN/PXN. Each
+spawn loads another copy, so even writable ELF data/BSS is private. VM A/B
+write `0xAAAA` / `0xBBBB` to both their private page and `ELF_BSS_CELL` and
+read back only their own values.
 
 ## EL0 execution model
 
 - `scheduler::spawn_inner(entry, user)` creates a kernel stack and, for user
-  tasks, a separate 8 KB user stack before constructing TTBR0. Only idle
-  remains an EL1 task.
-- A fresh user context has high SP_EL1, low user entry
-  `virt_to_phys(entry)`, and SP_EL0 = `0x7FE00000 + 0x2000`. It resumes at
-  high `silver_user_bootstrap` with x19 = low entry; the bootstrap sets
-  ELR_EL1 = x19, SPSR_EL1 = 0 (EL0t, IRQs unmasked), and executes `eret`.
+  tasks, an 8 KB user stack, a private page and an independently loaded ELF
+  image before constructing TTBR0. Only idle remains an EL1 task.
+- A fresh user context has high SP_EL1, the ELF entry in x19, and SP_EL0 =
+  `0x7FE00000 + 0x2000`. It resumes at high `silver_user_bootstrap`; the
+  bootstrap sets ELR_EL1 = x19, SPSR_EL1 = 0 (EL0t, IRQs unmasked), and
+  executes `eret`.
 - The scheduler switches only TTBR0_EL1, then performs
   `tlbi vmalle1; dsb ish; isb`. High kernel text and SP_EL1 remain valid
   through TTBR1 throughout the switch.
 - The sync exception entry recognizes SVC by EC=0b010101. Other exceptions
   inspect SPSR.M[3:2]: EL0 goes to `silver_handle_task_fault`; EL1 is a
   kernel panic.
-- User tasks use wrappers in `syscall.rs`; nameserver itself is an EL0 task
-  using IPC and print syscalls. Syscalls include sleep, send, receive,
-  register, lookup, print, whoami, hex/dec print, mutex lock/unlock, and
-  channel send/receive.
+- User tasks use wrappers in `userspace/src/syscall.rs`; nameserver itself is
+  an EL0 task using IPC and print syscalls. Syscalls include sleep, send,
+  receive, register, lookup, print, whoami, hex/dec print, mutex lock/unlock,
+  and channel send/receive.
 - User tasks cannot use the high-only kernel heap. The nameserver therefore
   stores 16 fixed-capacity entries on its user stack instead of in a `Vec`.
 - `valid_task_slice()` delegates to `mmu::valid_user_slice()`: buffers are
-  limited to 4096 bytes and must fit inside the shared image, current fixed-VA
-  stack, or private page. This is range validation, not a full copyin API.
+  limited to 4096 bytes and every covered page must be present in the current
+  TTBR0. Validation walks actual tables rather than assuming linker ranges.
+  It does not yet check read/write permissions or provide a full copyin API.
+
+**Temporary demo dispatch:** all roles share one `silver_userspace.elf`.
+`userspace/src/main.rs` calls `sys_whoami` and selects nameserver, demos or
+probes by fixed task ID. Keep this table synchronized with `scheduler::init`.
+This is deliberately not presented as a general spawn-with-arguments API.
 
 ## Page-table rules learned the hard way
 
-- Shared low `.text` is AP=0b11 (read-only at EL1 and EL0), executable at
-  both levels. Shared `.rodata` is read-only and UXN/PXN.
-- User stacks and private pages are AP=0b01 and UXN/PXN. TTBR1 MMIO and DRAM
-  mappings are AP=0b00 and absent from TTBR0.
+- User ELF text is AP=0b11 (read-only at EL1 and EL0), executable at EL0 and
+  PXN. User rodata is read-only and UXN/PXN.
+- User data, stacks and private pages are AP=0b01 and UXN/PXN. TTBR1 MMIO and
+  DRAM mappings are AP=0b00 and absent from TTBR0.
+- AP=0b10 is not user read-only: with the two-range EL1/EL0 regime it means
+  read-only at EL1 and no EL0 access. Use AP=0b11 for user-readable rodata.
 
 **Critical ARM64 rule:** when the translation regime has two address ranges,
 a page writable at EL0 (AP=0b01) is execute-never at EL1, regardless of PXN.
 QEMU implements this rule in its page-table walk. Therefore executing kernel
-trampolines from an EL0-RW `.text` mapping produces an instruction abort.
-Making `.text` read-only avoids that EL0-writable condition and preserves
-EL1 execution. Do not mark user-writable pages as kernel-executable.
+trampolines from an EL0-RW mapping produces an instruction abort. Kernel
+execution remains in TTBR1; user text is read-only and PXN.
 
 PAN is currently disabled in the boot stub and `configure_and_enable`: SVC
 handlers directly read and write current-task buffers through TTBR0. Revisit
@@ -197,19 +229,28 @@ this when proper copyin/copyout accessors are implemented.
    and do not need to re-arm ELR/SPSR for scheduling: the ret-based switch
    unwinds back to the epilogue with the original SP. CPU-global ELR/SPSR
    may be clobbered by other tasks in between; the frame copy is authoritative.
-9. **Nameserver holds the well-known ID NAMESERVER_ID = 1**, fixed by spawn
-   order in `scheduler::init` (first after idle). Protocol: text over mailbox
-   messages, "R <name>" → "OK"/"TAKEN", "L <name>" → "ID <n>"/"MISSING".
-10. **TLB/cache ritual for any future table edit.** After modifying tables,
+9. **SVC register preservation starts before ESR decoding.** x9/x10 are user
+   registers, not free scratch. The sync entry saves/restores them around its
+   dispatch check; the full 272-byte frame is built afterwards.
+10. **Nameserver holds the well-known ID NAMESERVER_ID = 1**, fixed by spawn
+    order in `scheduler::init` (first after idle). Protocol: text over mailbox
+    messages, "R <name>" → "OK"/"TAKEN", "L <name>" → "ID <n>"/"MISSING".
+11. **Cross-crate syscall structures have a stable layout.** `Message` is
+    `#[repr(C)]` in kernel and userspace. Apply the same rule to future
+    structs passed by pointer across the SVC boundary.
+12. **TLB/cache ritual for any future table edit.** After modifying tables,
     clean lines to the point of coherency (`dc cvac` + `dsb`), invalidate
     stale TLB entries (`tlbi` + `dsb` + `isb`). Template:
     `mmu::flush_after_table_change`. Address-space switches load TTBR0_EL1
     and issue `tlbi vmalle1; dsb ish; isb` before the context switch.
-11. **UART FIFO waits preserve DAIF.** `pl011::write_byte()` may unmask IRQs
+13. **UART FIFO waits preserve DAIF.** `pl011::write_byte()` may unmask IRQs
     while waiting for TXFF, but restores the caller's saved DAIF before
     returning. Never replace this with an indefinitely masked spin. Taking
     a timer IRQ mid-print is intentional and safe with the frame-based
     trampolines.
+14. **Fault diagnostics must not create a second fault.** Validate every
+    userspace stack word before printing it; print `<unmapped>` at the first
+    invalid word.
 
 ## Why IPC uses Mutex + Condvar
 
@@ -226,7 +267,8 @@ guard everything that can wait on a condition.
 `scheduler.rs` keeps a 16-entry ring of recent context switches
 (`from`, `to`, next SP, next resume PC). `silver_handle_task_fault` dumps it
 before killing the task. It costs no output during normal operation; keep it
-until task lifecycle and isolation are more battle-tested.
+until task lifecycle and isolation are more battle-tested. Fault stack dumps
+stop at the first unmapped word.
 
 QEMU exception tracing is invaluable for resume/fault bugs:
 
@@ -238,15 +280,17 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 ## Known tech debt
 
-- **The built-in read-only image alias remains.** Writable privileged state
-  and MMIO are isolated through TTBR1, but every user TTBR0 can still read
-  the statically linked `.text` / `.rodata`. Separate user ELF binaries are
-  needed before each task can receive only its own executable image.
-- Pointer validation checks the current task's fixed user ranges and a
-  4096-byte length cap. There are no general copyin/copyout APIs.
+- One embedded ELF supplies all demos through fixed-ID role dispatch. There
+  is no user-facing spawn/exit, argument passing, executable selection or
+  general process lifecycle API.
+- The loader supports only static `ET_EXEC`, a contiguous 2 MB image window
+  and page-uniform permissions; there is no PIE, dynamic linking, demand
+  loading or sparse multi-window image layout.
+- Pointer validation checks mapped pages and a 4096-byte length cap, but not
+  access permissions. There are no general copyin/copyout APIs.
 - PAN is off because kernel code directly accesses user pages through TTBR0.
 - A task that dies while sitting in a mutex or condvar queue leaves a stale
-  waiter entry. There are no user-facing spawn/exit syscalls yet.
+  waiter entry. Nameserver unregister and ownership cleanup are missing.
 - Mutex queues, condvar queues and mailboxes have no growth limits.
 - `receive()` has no timeout.
 - Task address spaces hold one private page and one fixed-size 8 KB stack;
@@ -255,29 +299,33 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   another task during a FIFO wait.
 - `#[alloc_error_handler]` is unstable on stable Rust — instead a wrapper
   in `allocator.rs` catches the null from `GlobalAlloc` and raises a panic.
+- `Condvar::notify_all` is currently unused and produces a dead-code warning.
 
 ## Next steps (by priority)
 
-1. **ELF loader and real user programs:** load separate binaries, construct
-   per-task executable mappings, and remove the shared low image alias.
-2. **Task lifecycle syscalls:** user `spawn`/`exit`, waiter cleanup on exit,
-   nameserver unregister, and reliable resource reaping.
-3. **Checked copyin/copyout and PAN:** stop dereferencing user pointers
-   directly in arbitrary kernel code, then re-evaluate SCTLR.PAN.
-4. **Grow per-task spaces:** multiple private pages, per-task heap region,
-   demand paging later.
-5. **IPC hardening:** bounded mailboxes/backpressure, receive timeouts,
+1. **Task lifecycle syscalls:** user `spawn`/`exit`, spawn arguments and
+   executable selection, waiter cleanup on exit, nameserver unregister and
+   reliable resource reaping. Replace fixed-ID demo role dispatch.
+2. **Checked copyin/copyout and PAN:** stop dereferencing user pointers
+   directly in arbitrary kernel code, validate permissions, then re-evaluate
+   SCTLR.PAN.
+3. **Grow per-task spaces:** multiple private pages, per-task heap region,
+   sparse image mappings and demand paging later.
+4. **IPC hardening:** bounded mailboxes/backpressure, receive timeouts,
    nameserver watch notifications instead of lookup polling.
-6. **VirtIO-console / virtio-block** — first MMIO device driver, moving
+5. **VirtIO-console / virtio-block** — first MMIO device driver, moving
    UART output behind a driver interface.
-7. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
+6. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
    `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
 
 ## Workflow for a new feature
 
-1. Code → `cargo fmt --all`
+1. Code → `cargo fmt --all` and `cargo fmt --manifest-path userspace/Cargo.toml`
 2. `cargo build` (host — catches silly mistakes faster)
 3. `cargo build --target aarch64-unknown-none --no-default-features --features no_std`
-4. QEMU run for 5–30 s, compare output against expectations; repeat several
-   times for scheduler/interrupt changes because races are timing-sensitive
-5. Update the README checklist and this file
+4. Also check `--release`: optimized userspace exposes register-preservation
+   bugs that debug builds can hide.
+5. QEMU run for 5–30 s, compare output against expectations; repeat several
+   times for scheduler/interrupt changes because races are timing-sensitive.
+   Expect exactly the two intentional faults from tasks 15 and 16.
+6. Update the README checklist and this file.
