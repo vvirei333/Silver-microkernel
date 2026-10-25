@@ -98,7 +98,10 @@ pub extern "C" fn silver_handle_irq() {
             }
         }
         SPURIOUS_IRQ => {}
-        _ => exceptions::silver_handle_exception(8, u64::from(irq), 0, 0),
+        _ => {
+            end_interrupt(acknowledge_register);
+            exceptions::silver_handle_exception(8, u64::from(irq), 0, 0);
+        }
     }
 }
 

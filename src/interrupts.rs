@@ -9,8 +9,8 @@ pub fn enable_irq() {
 pub fn save_and_disable_irq() -> u64 {
     let daif: u64;
     unsafe {
-        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nomem, nostack));
-        core::arch::asm!("msr daifset, #2", options(nomem, nostack));
+        core::arch::asm!("mrs {}, daif", out(reg) daif, options(nostack));
+        core::arch::asm!("msr daifset, #2", options(nostack));
     }
     daif
 }

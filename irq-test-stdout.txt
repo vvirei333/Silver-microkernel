@@ -1,0 +1,55 @@
+MMU=OK
+HEAP=OK BASE=000000004062D000 VALUE=000000000000002A ADDR=FFFF00004062D000
+IRQ READY
+HELLO, WORLD!
+SCHEDULER START
+[2J[H                                       .==.       .:+:.
+                                      .-=-.       .+-:
+                                     .:-:-.      .+.-:
+                                    ..=.:-.:.   .=:.--...
+                                    .=. :=:.   .-: .-=..
+                                    .....    ...
+                                    .-==:. ..-=-..
+                                 ....
+                                .---.                 .:. ....
+                                .:::                .:=:..:=:.
+                                 ...               .::...-...
+                                 .-.       .::... .-:
+                                 .=.       ...... .:+..
+                                 .=.               .--.
+                                 .=.                :=:.
+                                 .=.....            .--..
+                                 .=..:+-.            .=:.
+                                 .:. ...             .... ..:::::::..
+                                 .+:.-=:. =-           .=:....    ...:-..
+                                 .+: ...  =-            .=..         ..-==:..
+                                 .+:      =-             ::.           -:.-*-..
+                                 .+:  .:-.==. .:=.      .+.          ..==::..
+                                 ..=++=:...-++=:..  .:::=....      ..:....
+                                    ..      ...  .::..... ...-++++-:::.
+
+silver@silvershell
+---------------
+OS: Silver Microkernel
+Kernel: AArch64
+Shell: silvershell
+Uptime: 0.01 s
+Memory: 126.5 MiB / 128.0 MiB
+Free RAM: 1.4 MiB
+
+silvershell ready. Type 'help' for commands.
+[1;36msilvershell>[0m spawn demo 12
+Spawned task ID=3
+[1;36msilvershell>[0m fg 3
+TASK ID=0000000000000003 AWAKE
+TASK ID=0000000000000003 AWAKE
+TASK ID=0000000000000003 AWAKE
+TASK ID=0000000000000003 AWAKE
+Stopped task ID=3
+[1;36msilvershell>[0m ps
+ID  PROGRAM      ARG  STATE
+0   kernel        0    ready
+1   nameserver    0    blocked
+2   silvershell   0    running
+3   demo          12    stopped
+[1;36msilvershell>[0m 
