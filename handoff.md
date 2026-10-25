@@ -3,15 +3,15 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (growable user heap update)
+## State as of 2026-10-25 (userspace malloc/free update)
 
-Latest verified feature: **sparse per-task user heaps managed by `SYS_BRK`**.
-Growth maps zeroed RW-NX pages on demand, shrinking releases whole pages,
-failed growth rolls back partial mappings, and task reaping frees the remaining
-heap frames. Lifecycle cleanup, checked copyin/copyout and PAN remain intact.
+Latest verified feature: **explicit userspace `malloc/free` over `SYS_BRK`**.
+The per-task allocator uses 16-byte alignment, first-fit, block splitting,
+address-sorted free blocks, neighbor coalescing and tail trimming through
+`brk`. Sparse heap growth, rollback and exit cleanup remain intact.
 
-Verified with host, debug bare-metal and release bare-metal builds, five debug
-QEMU runs (5–8 seconds each) and an 8-second release run. Every run had exactly
+Verified with host, debug bare-metal and release bare-metal builds, three debug
+QEMU runs (5–6 seconds each) and a 6-second release run. Every run had exactly
 two intentional `TASK FAULT` reports and no `KERNEL PANIC`, `BAD SP`, isolation
 failures or stale debug output. All runs passed these checks:
 
@@ -21,10 +21,14 @@ COPYOUT UNMAPPED REJECT=PASS
 LIFECYCLE EXIT/UNREGISTER=PASS
 LIFECYCLE MUTEX CLEANUP=PASS
 HEAP GROW/SHRINK=PASS
+MALLOC FREE/REUSE=PASS
+MALLOC BRK TRIM=PASS
 ```
 
-VM A/B additionally write different values to the same heap VA and read back
-only their own values, proving that dynamic mappings remain task-private.
+The malloc test frees a middle allocation, reuses its exact address for a
+smaller allocation, verifies both neighbors' contents, then frees every block
+and confirms that the original program break is restored. VM A/B still prove
+that identical heap VAs have independent physical backing.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
 | --- | ---: | --- | --- |
@@ -65,6 +69,9 @@ Important fixes and invariants from the recent work must be preserved:
     roll back every page added by the failed request and preserve the old break.
     New mappings are zeroed before becoming visible; unmap and flush before
     freeing a shrunken page.
+11. **The userspace free list stays address-sorted.** Coalesce both neighbors
+    before trimming. Only the final free block may shrink `brk`, and the shrink
+    must succeed before unlinking it. Block sizes include the 16-byte header.
 
 Always build like this:
 
@@ -195,6 +202,21 @@ read back only their own values.
 - User tasks cannot use the high-only kernel heap. The nameserver therefore
   stores 16 fixed-capacity entries on its user stack instead of in a `Vec`.
 
+## Userspace malloc/free
+
+- `userspace/src/allocator.rs` stores a 16-byte header before every payload;
+  header `size` is the total block size and `next` is used only while free.
+- `malloc` aligns payloads to 16 bytes, returns null for zero/overflow/OOM,
+  uses first-fit and splits when at least 32 bytes remain. If no block fits,
+  it extends `brk` and creates a new block there.
+- `free` inserts by address and coalesces with both neighbors. If the final
+  free block ends at the current break, `trim_program_break` first shrinks
+  `brk`, then unlinks that block. Thus tail memory returns to the kernel.
+- Allocator state lives in each task's private ELF data. It currently assumes
+  one execution thread per address space and has no double-free validation.
+- This is an explicit C-style API, not Rust `GlobalAlloc`; `Box`/`Vec` are not
+  available in userspace yet.
+
 ## Page-table, copyin/copyout and PAN rules
 
 - User ELF text is AP=0b11 (read-only at EL1 and EL0), executable at EL0 and
@@ -311,9 +333,10 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   external program storage, `kill`, `wait` or credential model yet.
 - Mutex queues, condvar queues and mailboxes have no growth limits.
 - `receive()` has no timeout.
-- The user heap is limited to one 2 MB L3 window and has no userspace allocator
-  above `brk`; there is no general `mmap`/`munmap` or growable stack. The user
-  stack remains fixed at 8 KB and the demo private window at one page.
+- The user heap is limited to one 2 MB L3 window. The allocator is explicit
+  `malloc/free` only: no `GlobalAlloc`, `realloc`, `calloc`, thread safety or
+  double-free detection. There is no general `mmap`/`munmap` or growable stack;
+  the user stack remains fixed at 8 KB and the private window at one page.
 - UART lines from different tasks can interleave; an IRQ may even schedule
   another task during a FIFO wait.
 - `#[alloc_error_handler]` is unstable on stable Rust — instead a wrapper
@@ -322,7 +345,8 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 ## Next steps (by priority)
 
 1. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
-   a userspace allocator over `brk`, growable stacks and demand paging later.
+   growable stacks and demand paging later. Optionally connect the userspace
+   allocator to `GlobalAlloc` and add `realloc`/`calloc`.
 2. **IPC hardening:** bounded mailboxes/backpressure, receive timeouts,
    nameserver watch notifications instead of lookup polling.
 3. **VirtIO-console / virtio-block** — first MMIO device driver, moving
@@ -341,6 +365,7 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
    times for scheduler/interrupt changes because races are timing-sensitive.
    Expect exactly the two intentional faults from tasks 15 and 16, plus
    `COPYOUT READONLY REJECT=PASS`, `COPYOUT UNMAPPED REJECT=PASS`,
-   `LIFECYCLE EXIT/UNREGISTER=PASS`, `LIFECYCLE MUTEX CLEANUP=PASS` and
-   `HEAP GROW/SHRINK=PASS`.
+   `LIFECYCLE EXIT/UNREGISTER=PASS`, `LIFECYCLE MUTEX CLEANUP=PASS`,
+   `HEAP GROW/SHRINK=PASS`, `MALLOC FREE/REUSE=PASS` and
+   `MALLOC BRK TRIM=PASS`.
 6. Update the README checklist and this file.

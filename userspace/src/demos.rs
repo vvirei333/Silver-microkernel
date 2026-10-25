@@ -1,4 +1,4 @@
-use crate::{ipc, syscall};
+use crate::{allocator, ipc, syscall};
 
 const PRIVATE_WINDOW_VA: usize = 0x0000_0080_0000_0000;
 const HIGH_HALF_DRAM: usize = 0xFFFF_0000_4000_0000;
@@ -344,6 +344,68 @@ pub fn heap_probe() -> ! {
     }
 
     syscall::print("HEAP GROW/SHRINK=PASS\r\n");
+    syscall::exit()
+}
+
+pub fn malloc_probe() -> ! {
+    let Some(initial_break) = syscall::program_break() else {
+        syscall::print("MALLOC BRK QUERY=FAIL\r\n");
+        syscall::exit();
+    };
+    let a = allocator::malloc(24);
+    let b = allocator::malloc(64);
+    let c = allocator::malloc(128);
+    if a.is_null()
+        || b.is_null()
+        || c.is_null()
+        || a as usize & 15 != 0
+        || b as usize & 15 != 0
+        || c as usize & 15 != 0
+        || !allocator::malloc(0).is_null()
+    {
+        syscall::print("MALLOC ALLOCATION=FAIL\r\n");
+        syscall::exit();
+    }
+
+    unsafe {
+        for index in 0..24 {
+            core::ptr::write_volatile(a.add(index), 0xA0 + (index % 16) as u8);
+        }
+        for index in 0..64 {
+            core::ptr::write_volatile(b.add(index), 0xB0 + (index % 16) as u8);
+        }
+        for index in 0..128 {
+            core::ptr::write_volatile(c.add(index), 0xC0 + (index % 8) as u8);
+        }
+        allocator::free(b);
+    }
+
+    // The freed 64-byte payload block is large enough to split. First-fit must
+    // return its original address while leaving a new free remainder.
+    let recycled = allocator::malloc(32);
+    let neighbors_intact = unsafe {
+        (0..24).all(|index| core::ptr::read_volatile(a.add(index)) == 0xA0 + (index % 16) as u8)
+            && (0..128)
+                .all(|index| core::ptr::read_volatile(c.add(index)) == 0xC0 + (index % 8) as u8)
+    };
+    if recycled != b || !neighbors_intact {
+        syscall::print("MALLOC FREE/REUSE=FAIL\r\n");
+        syscall::exit();
+    }
+    syscall::print("MALLOC FREE/REUSE=PASS\r\n");
+
+    // Sorted insertion plus coalescing merges A, the recycled/split B area and
+    // C into one tail block, which trim_program_break returns through SYS_BRK.
+    unsafe {
+        allocator::free(recycled);
+        allocator::free(a);
+        allocator::free(c);
+    }
+    if syscall::program_break() != Some(initial_break) {
+        syscall::print("MALLOC BRK TRIM=FAIL\r\n");
+        syscall::exit();
+    }
+    syscall::print("MALLOC BRK TRIM=PASS\r\n");
     syscall::exit()
 }
 

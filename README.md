@@ -27,6 +27,7 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Two userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
 - [x] Per-task TTBR0 spaces: independent ELF image, fixed-VA stack and private page
 - [x] Growable per-task heap: sparse 2 MB window, `brk`, zero-fill and cleanup on exit
+- [x] Userspace `malloc/free`: first-fit free list, split, coalesce and `brk` trim
 - [x] W^X user mappings: R-X text, R-- rodata, RW-NX data/heap/stack/private memory
 - [x] No kernel image, kernel data, heap, kernel stacks or MMIO in user TTBR0
 - [x] Tasks in EL0 (Ring 3): user stacks and SVC-only kernel access
@@ -114,6 +115,7 @@ demo and nameserver ELFs; no separate userspace command is needed.
 | `src/mmu.rs` | TTBR1 kernel map, per-task TTBR0 maps, permission validation |
 | `src/elf_loader.rs` | Static ELF64/AArch64 `PT_LOAD` loader and image ownership |
 | `src/user_program.rs` | Program IDs and embedded userspace ELF selection |
+| `userspace/src/allocator.rs` | Per-task first-fit `malloc/free` over `SYS_BRK` |
 | `userspace/` | Separate demo and nameserver EL0 programs plus syscall wrappers |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
@@ -138,8 +140,13 @@ page, ELF BSS and heap by reading back only their own values.
 `SYS_BRK` manages a byte-granular program break in a reserved 2 MB heap window
 at `0x40200000`. Growth maps zeroed RW-NX pages on demand; shrinking unmaps and
 frees whole pages; failed growth rolls back partial mappings. Reaping frees
-all remaining heap frames. This is a kernel VM API, not a userspace `malloc`
-yet, and the current heap limit is 2 MB per task.
+all remaining heap frames.
+
+`userspace/src/allocator.rs` provides explicit 16-byte-aligned `malloc/free`.
+It uses first-fit, splits large free blocks, keeps the list address-sorted and
+coalesces adjacent blocks. Freeing a tail block also shrinks `brk`, returning
+whole pages to the kernel. Tests verify same-address reuse, neighbor integrity
+and restoration of the initial program break. This is not `GlobalAlloc` yet.
 
 The userspace linker emits separate R-X, R-- and RW `PT_LOAD` segments. The
 loader accepts static ELF64/AArch64 `ET_EXEC` files inside a 2 MB image window,

@@ -217,6 +217,7 @@ pub fn init() {
     let _lifecycle_supervisor = spawn_user(user_program::DEMO, 17);
     let _copyout_probe = spawn_user(user_program::DEMO, 19);
     let _heap_probe = spawn_user(user_program::DEMO, 20);
+    let _malloc_probe = spawn_user(user_program::DEMO, 21);
 
     let manager = scheduler_manager().unwrap();
     manager.current_index = manager
