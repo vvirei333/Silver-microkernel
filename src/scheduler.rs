@@ -23,6 +23,7 @@ pub enum TaskState {
     Sleeping(u64),
     Blocked,
     BlockedUntil(u64),
+    Stopped,
     Dead,
 }
 
@@ -73,12 +74,16 @@ pub struct TaskInfo {
 pub struct Task {
     pub id: u64,
     pub state: TaskState,
+    /// State to restore after fg; notifications may replace it while stopped.
+    resume_state: Option<TaskState>,
     pub program: u64,
     pub argument: u64,
     /// Immutable byte string passed to SYS_ARGS in the new task.
     arguments: Vec<u8>,
     /// Absolute working directory, inherited by child tasks.
     cwd: String,
+    /// UART access is granted only to the foreground owner in shell mode.
+    owns_console: bool,
     pub context: TaskContext,
     /// Kernel stack: used for SVC/IRQ trampolines whenever the task runs.
     pub stack: MemoryRegion,
@@ -102,6 +107,8 @@ pub struct TaskManager {
     tasks: Vec<Task>,
     current_index: usize,
     next_id: u64,
+    /// Shell waiting for the current foreground task; None at a shell prompt.
+    console_parent: Option<u64>,
     /// Bounded completion records let wait() succeed even after reaping.
     exit_statuses: Vec<(u64, u64)>,
 }
@@ -223,6 +230,7 @@ pub fn init() {
         tasks: Vec::new(),
         current_index: 0,
         next_id: 0,
+        console_parent: None,
         exit_statuses: Vec::new(),
     });
 
@@ -235,7 +243,11 @@ pub fn init() {
     // The default boot is a clean interactive MVP. Regression demos are opt-in
     // so their intentional faults and periodic output cannot bury the shell.
     #[cfg(not(feature = "demo-tasks"))]
-    let _shell_id = spawn_user(user_program::SILVERSHELL, 0);
+    {
+        let shell_id =
+            spawn_user(user_program::SILVERSHELL, 0).expect("silvershell must be created at boot");
+        let _ = set_console_owner(shell_id);
+    }
 
     #[cfg(feature = "demo-tasks")]
     {
@@ -342,10 +354,7 @@ pub fn wake_task(id: u64) {
 
     if let Some(manager) = scheduler_manager() {
         if let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) {
-            if matches!(task.state, TaskState::Blocked | TaskState::BlockedUntil(_)) {
-                task.state = TaskState::Ready;
-            }
-            task.waiting_on = None;
+            wake_blocked_task(task);
         }
     }
 
@@ -383,6 +392,7 @@ pub fn exit_current_with_status(status: u64) -> ! {
         task.state = TaskState::Dead;
     }
     if let Some(manager) = scheduler_manager() {
+        recover_console(manager, id);
         record_exit(manager, id, status);
     }
 
@@ -416,14 +426,58 @@ pub fn kill_task(id: u64) -> bool {
         return false;
     }
     task.state = TaskState::Dead;
+    recover_console(manager, id);
     record_exit(manager, id, 1);
     schedule();
     interrupts::restore_irq(saved_daif);
     true
 }
 
-/// Waits for a task ID and consumes its completion record.
+fn recover_console(manager: &mut TaskManager, exited: u64) {
+    let Some(exited_task) = manager.tasks.iter_mut().find(|task| task.id == exited) else {
+        return;
+    };
+    if !exited_task.owns_console {
+        return;
+    }
+    exited_task.owns_console = false;
+    manager.console_parent = None;
+
+    // The regression profile intentionally lets all demo tasks print. Only
+    // remove the dead task's access; interactive mode returns to a live shell.
+    if cfg!(feature = "demo-tasks") {
+        return;
+    }
+    let fallback = manager
+        .tasks
+        .iter()
+        .find(|task| task.state != TaskState::Dead && task.program == user_program::SILVERSHELL)
+        .map(|task| task.id);
+    for task in &mut manager.tasks {
+        task.owns_console = Some(task.id) == fallback;
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WaitEvent {
+    Exited(u64),
+    Stopped,
+}
+
+/// Waits only for termination and consumes its completion record.
 pub fn wait_for_task(id: u64) -> Option<u64> {
+    match wait_inner(id, false) {
+        Some(WaitEvent::Exited(status)) => Some(status),
+        _ => None,
+    }
+}
+
+/// Foreground wait also returns when Ctrl-Z stops the child.
+pub fn wait_for_task_event(id: u64) -> Option<WaitEvent> {
+    wait_inner(id, true)
+}
+
+fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
     if id == IDLE_TASK_ID || id == current_task_id() {
         return None;
     }
@@ -440,11 +494,15 @@ pub fn wait_for_task(id: u64) -> Option<u64> {
         {
             let (_, status) = manager.exit_statuses.remove(index);
             interrupts::restore_irq(saved_daif);
-            return Some(status);
+            return Some(WaitEvent::Exited(status));
         }
-        if !manager.tasks.iter().any(|task| task.id == id) {
+        let Some(task) = manager.tasks.iter().find(|task| task.id == id) else {
             interrupts::restore_irq(saved_daif);
             return None;
+        };
+        if report_stopped && task.state == TaskState::Stopped {
+            interrupts::restore_irq(saved_daif);
+            return Some(WaitEvent::Stopped);
         }
 
         let waiter = current_task_id();
@@ -474,18 +532,37 @@ fn record_exit(manager: &mut TaskManager, id: u64, status: u64) {
         }
         manager.exit_statuses.push((id, status));
     }
+    wake_process_waiters(manager);
+}
 
+fn wake_process_waiters(manager: &mut TaskManager) {
     while let Some(waiter) = PROCESS_WAIT_QUEUE.pop() {
         if let Some(task) = manager
             .tasks
             .iter_mut()
             .find(|task| task.id == waiter && task.state != TaskState::Dead)
         {
-            if matches!(task.state, TaskState::Blocked | TaskState::BlockedUntil(_)) {
-                task.state = TaskState::Ready;
-            }
+            wake_blocked_task(task);
+        }
+    }
+}
+
+fn wake_blocked_task(task: &mut Task) {
+    match task.state {
+        TaskState::Blocked | TaskState::BlockedUntil(_) => {
+            task.state = TaskState::Ready;
             task.waiting_on = None;
         }
+        TaskState::Stopped
+            if matches!(
+                task.resume_state,
+                Some(TaskState::Blocked | TaskState::BlockedUntil(_))
+            ) =>
+        {
+            task.resume_state = Some(TaskState::Ready);
+            task.waiting_on = None;
+        }
+        _ => {}
     }
 }
 
@@ -494,6 +571,100 @@ pub fn current_task_id() -> u64 {
         .and_then(|manager| manager.tasks.get(manager.current_index))
         .map(|task| task.id)
         .unwrap_or(0)
+}
+
+pub fn current_task_owns_console() -> bool {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(manager.current_index))
+        .map(|task| task.owns_console)
+        .unwrap_or(false)
+}
+
+/// Called by the timer after PL011 consumes Ctrl-Z. A shell prompt has no
+/// console parent and is therefore immune to its own stop key.
+pub fn stop_console_owner() -> bool {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let mut stopped = false;
+    if let Some(manager) = scheduler_manager() {
+        if manager.console_parent.is_some() {
+            if let Some(task) = manager
+                .tasks
+                .iter_mut()
+                .find(|task| task.owns_console && task.state != TaskState::Dead)
+            {
+                let id = task.id;
+                let previous = if task.state == TaskState::Running {
+                    TaskState::Ready
+                } else {
+                    task.state
+                };
+                task.resume_state = Some(previous);
+                task.state = TaskState::Stopped;
+                recover_console(manager, id);
+                wake_process_waiters(manager);
+                stopped = true;
+            }
+        }
+    }
+    interrupts::restore_irq(saved_daif);
+    stopped
+}
+
+/// Resumes a stopped task in its saved state; a live running task is a no-op.
+pub fn resume_task(id: u64) -> bool {
+    if id == IDLE_TASK_ID {
+        return false;
+    }
+    let saved_daif = interrupts::save_and_disable_irq();
+    let result = scheduler_manager()
+        .map(|manager| {
+            let Some(task) = manager
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == id && task.state != TaskState::Dead)
+            else {
+                return false;
+            };
+            if task.state == TaskState::Stopped {
+                task.state = task.resume_state.take().unwrap_or(TaskState::Ready);
+                if task.state == TaskState::Running {
+                    task.state = TaskState::Ready;
+                }
+            }
+            true
+        })
+        .unwrap_or(false);
+    interrupts::restore_irq(saved_daif);
+    result
+}
+
+/// Assigns the single interactive UART owner. Background tasks keep running,
+/// but their print/read syscalls have no effect until they own the console.
+pub fn set_console_owner(id: u64) -> bool {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let caller = current_task_id();
+    let result = scheduler_manager()
+        .map(|manager| {
+            let valid = id != IDLE_TASK_ID
+                && manager
+                    .tasks
+                    .iter()
+                    .any(|task| task.id == id && task.state != TaskState::Dead);
+            if valid {
+                for task in &mut manager.tasks {
+                    task.owns_console = task.id == id;
+                }
+                manager.console_parent = if id == caller || caller == IDLE_TASK_ID {
+                    None
+                } else {
+                    Some(caller)
+                };
+            }
+            valid
+        })
+        .unwrap_or(false);
+    interrupts::restore_irq(saved_daif);
+    result
 }
 
 pub fn task_alive(id: u64) -> bool {
@@ -573,6 +744,7 @@ fn state_code(state: TaskState) -> u64 {
         TaskState::Blocked => 4,
         TaskState::BlockedUntil(_) => 5,
         TaskState::Dead => 6,
+        TaskState::Stopped => 7,
     }
 }
 
@@ -769,6 +941,18 @@ fn find_next_task(manager: &TaskManager) -> Option<usize> {
 
 fn wake_expired_tasks(manager: &mut TaskManager, now: u64) {
     for task in &mut manager.tasks {
+        if task.state == TaskState::Stopped {
+            let expired = match task.resume_state {
+                Some(TaskState::Sleeping(deadline) | TaskState::BlockedUntil(deadline)) => {
+                    now >= deadline
+                }
+                _ => false,
+            };
+            if expired {
+                task.resume_state = Some(TaskState::Ready);
+            }
+            continue;
+        }
         let wake_at = match task.state {
             TaskState::Sleeping(deadline) | TaskState::BlockedUntil(deadline) => deadline,
             _ => continue,
@@ -809,10 +993,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
             .iter_mut()
             .find(|task| task.id == id && task.state != TaskState::Dead)
         {
-            if matches!(task.state, TaskState::Blocked | TaskState::BlockedUntil(_)) {
-                task.state = TaskState::Ready;
-            }
-            task.waiting_on = None;
+            wake_blocked_task(task);
         }
     }
 
@@ -920,10 +1101,14 @@ impl Task {
         Some(Self {
             id,
             state: TaskState::Ready,
+            resume_state: None,
             program: user.map_or(u64::MAX, |(program, _)| program),
             argument: user.map_or(0, |(_, argument)| argument),
             arguments,
             cwd: String::from("/"),
+            // Legacy regression tasks share UART; interactive children start
+            // without console access until the shell explicitly foregrounds them.
+            owns_console: cfg!(feature = "demo-tasks"),
             context,
             stack,
             user_stack,

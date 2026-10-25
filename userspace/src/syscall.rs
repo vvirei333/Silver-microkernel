@@ -40,6 +40,9 @@ const SYS_GETCWD: u64 = 35;
 const SYS_FS_UNLINK: u64 = 36;
 const SYS_FS_RMDIR: u64 = 37;
 const SYS_FS_RENAME: u64 = 38;
+const SYS_CONSOLE_SET: u64 = 39;
+const SYS_TASK_RESUME: u64 = 40;
+const SYS_WAIT_EVENT: u64 = 41;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -56,6 +59,7 @@ pub const DIR_NAME_CAPACITY: usize = 32;
 pub const PATH_LIMIT: usize = 191;
 const SYSCALL_ERROR: u64 = u64::MAX;
 const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
+const SYSCALL_STOPPED: u64 = u64::MAX - 2;
 const NAME_LIMIT: usize = ipc::PAYLOAD_SIZE - 2;
 
 #[derive(Copy, Clone)]
@@ -98,6 +102,12 @@ impl DirEntry {
 pub enum ReceiveError {
     Timeout,
     Failed,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum WaitEvent {
+    Exited(u64),
+    Stopped,
 }
 
 pub fn sleep(milliseconds: u64) {
@@ -243,8 +253,24 @@ pub fn wait(id: u64) -> Option<u64> {
     }
 }
 
+pub fn wait_event(id: u64) -> Option<WaitEvent> {
+    match unsafe { syscall1(SYS_WAIT_EVENT, id) } {
+        SYSCALL_ERROR => None,
+        SYSCALL_STOPPED => Some(WaitEvent::Stopped),
+        status => Some(WaitEvent::Exited(status)),
+    }
+}
+
 pub fn kill(id: u64) -> bool {
     unsafe { syscall1(SYS_KILL, id) == 0 }
+}
+
+pub fn console_set(id: u64) -> bool {
+    unsafe { syscall1(SYS_CONSOLE_SET, id) == 0 }
+}
+
+pub fn resume(id: u64) -> bool {
+    unsafe { syscall1(SYS_TASK_RESUME, id) == 0 }
 }
 
 pub fn exit() -> ! {

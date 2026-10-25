@@ -139,8 +139,9 @@ fn receive_matching(sender: Option<u64>, timeout_ticks: u64) -> Result<Message, 
     }
 }
 
-/// Clears queued messages and wakes every sender blocked by backpressure.
-/// Only the owner can wait on `not_empty`, and it is currently exiting.
+/// Clears queued messages and wakes every waiter before freeing their queues.
+/// A killed receiver may still be blocked (or stopped) on `not_empty`, so both
+/// sides must detach from the mailbox before it is removed.
 pub fn remove_task(owner: u64) {
     let mut state = IPC.lock();
     for mailbox in state
@@ -149,6 +150,7 @@ pub fn remove_task(owner: u64) {
         .filter(|mailbox| mailbox.owner == owner)
     {
         mailbox.queue.clear();
+        mailbox.not_empty.notify_all();
         mailbox.not_full.notify_all();
     }
     state.mailboxes.retain(|mailbox| mailbox.owner != owner);

@@ -3,22 +3,36 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (shell convenience update)
+## State as of 2026-10-25 (Ctrl-Z and job control update)
 
-Latest verified features: **append redirection and terminal conveniences**.
-`echo text >> file` preserves existing data and creates a missing file, while
-`>` still truncates. The VFS OPEN_APPEND flag applies current-EOF semantics to
-every write, including multiple append handles. `clear` emits ANSI clear/home,
-`uname` prints `Silver Microkernel v0.1.0 aarch64`, and the prompt is bold cyan.
+Latest verified features: **Ctrl-Z stop/resume and stopped-aware foreground wait**.
+PL011 now captures RX into a bounded 256-byte kernel FIFO during timer ticks and
+turns Ctrl-Z (`0x1A`) into a stop request. This works even when the foreground
+program never reads UART. Ordinary input remains available to the console owner;
+Ctrl-Z at a shell prompt is ignored.
 
-Earlier rename/unlink/rmdir and per-task cwd behavior remain intact. The shell
-runs ls/cat/echo as utilities and waits for them, while redirection, `mkdir`,
-`rm`, `rmdir`, `mv`, `cd` and `pwd` call VFS directly.
+The interactive profile still has one UART owner. `spawn` and `bg` create children
+without it; `fg <id>` resumes a stopped task or foregrounds a live one, then waits
+for either exit or stop. Ctrl-Z changes the child to `Stopped`, returns the console
+to the shell and wakes the foreground waiter. `ps` reports state code 7 as
+`stopped`. `SYS_TASK_RESUME = 40` and `SYS_WAIT_EVENT = 41` implement resume and
+the `Exited`/`Stopped` event split; old `SYS_WAIT` still waits only for exit.
 
-The default bare-metal boot includes only idle, nameserver and the shell, so
-periodic demo output cannot bury the prompt. Build with `no_std,demo-tasks` for
-the old regression suite. Verified with host, debug/release builds, scripted
-QEMU UART input in both shell profiles, and a 10-second demo-tasks run. The
+A stopped task keeps `resume_state`: `Running` becomes `Ready`, while sleep and
+blocked waits retain their deadlines/queue membership. Expiry or notification
+while stopped updates the saved state instead of accidentally scheduling the task.
+Killing stopped/blocked IPC receivers now wakes `not_empty` before mailbox
+destruction as well as `not_full`, preventing a dangling WaitQueue during reaping.
+
+Earlier console ownership, append redirection, terminal conveniences, VFS and cwd
+behavior remain intact. Background output is still discarded rather than buffered;
+kernel diagnostics bypass ownership. Fastfetch prints `Kernel: AArch64`.
+
+Debug QEMU verified sleeping `demo 12`: `fg` → Ctrl-Z → `ps` = stopped → no AWAKE
+while stopped → `fg` resume → Ctrl-Z → kill/wait. Release repeated the cycle with
+blocked `demo 7`, verified Ctrl-Z is ignored at the prompt, and delivered WAKE to
+a stopped condvar receiver only after resume (`CONDVAR alpha RECV WAKE`). Final
+kill/wait and subsequent shell commands succeeded without panic. A 12-second
 regression run had exactly two intentional `TASK FAULT` reports and passed:
 
 ```text
@@ -101,6 +115,13 @@ Important fixes and invariants from the recent work must be preserved:
     ID immediately; timeout removal happens in `block_current_on_until` after
     the task resumes. IPC checks for a matching message before checking the
     deadline, so a notify/timeout race cannot discard an available message.
+13. **Stopped tasks are woken only through `resume_state`.** `wake_blocked_task`
+    and timer expiry update the saved state while leaving `Task.state = Stopped`.
+    Only `resume_task` restores it. Never set a stopped task directly to Ready
+    from a mutex/condvar/process notification.
+14. **IPC queues must outlive their registered waiters.** `remove_task` notifies
+    both `not_empty` and `not_full` before dropping a mailbox. This is mandatory
+    for kill, including a receiver stopped while blocked on `not_empty`.
 
 Always build like this:
 
@@ -222,20 +243,28 @@ read back only their own values.
   inspect SPSR.M[3:2]: EL0 goes to `silver_handle_task_fault`; EL1 is a
   kernel panic.
 - Syscalls include sleep, IPC, nameserver, print, task control, spawn/args,
-  wait/kill, `brk`, UART read, uptime, meminfo and the RAM-VFS file operations.
-- `SYS_READ` polls PL011 RX and returns a byte or SYSCALL_ERROR when RXFE says
-  no input is available. `SYS_UPTIME` returns raw 100 Hz ticks. `SYS_MEMINFO`
-  copies three u64 byte counts (total, used, free) through checked copyout;
-  used includes kernel/reserved RAM as well as allocated frames.
+  wait/kill, stop/resume, `brk`, UART read, console ownership and RAM-VFS.
+- `SYS_CONSOLE_SET(id)` rejects idle, missing and dead IDs. On success it makes
+  the selected task the sole interactive UART owner under one IRQ-critical
+  section and records the calling shell as `console_parent` for Ctrl-Z. Print
+  syscalls from non-owners succeed but discard their bytes; non-owner `SYS_READ`
+  returns SYSCALL_ERROR without touching PL011.
+- Timer IRQs poll PL011 into a 256-byte RX FIFO and consume Ctrl-Z as a stop
+  request before scheduling. The owner's `SYS_READ` drains buffered input first,
+  then polls hardware; no byte/no input returns SYSCALL_ERROR. `SYS_UPTIME`
+  returns raw 100 Hz ticks. `SYS_MEMINFO` copies three u64 byte counts through
+  checked copyout; used includes kernel/reserved RAM and allocated frames.
 - `SYS_TASK_LIST(buffer, capacity)` copies up to 64 `#[repr(C)]` TaskInfo entries
-  (ID, numeric state, program, argument) and returns the number written. Task
-  metadata lives in the Task itself, so ps can distinguish identical ELF roles.
+  (ID, numeric state, program, argument). State 7 is Stopped. Task metadata lives
+  in the Task itself, so ps can distinguish identical ELF roles.
 - `SYS_SPAWN_ARGS(program, numeric, ptr, len)` copies at most 192 argument bytes
   before allocating the task. `SYS_ARGS(buffer, capacity)` returns those bytes
   to the current program and fails rather than truncating them.
-- `SYS_WAIT(id)` blocks on the process wait queue and consumes one of 64 bounded
-  completion records. `SYS_KILL` rejects idle/self, marks another task Dead and
-  records status 1. Normal `SYS_EXIT(status)` records the supplied status.
+- `SYS_WAIT(id)` blocks only for termination and consumes one of 64 bounded
+  completion records. `SYS_WAIT_EVENT(id)` instead returns Stopped as
+  `SYSCALL_STOPPED = u64::MAX - 2` when the target is stopped. `SYS_TASK_RESUME`
+  restores its saved state and is a no-op for a live non-stopped task.
+  `SYS_KILL` rejects idle/self and records status 1; SYS_EXIT records its status.
 - `SYS_SEND(target, message)` blocks while the target has 16 queued messages and
   returns `SYSCALL_ERROR` if the target is dead. Nameserver RPC paths propagate
   this failure too.
@@ -245,9 +274,12 @@ read back only their own values.
 - `SYS_BRK(0)` queries the program break. Other values set an absolute break in
   `0x40200000..0x40400000`; invalid requests and allocation failures return
   `SYSCALL_ERROR` without changing the previous break or mappings.
-- Exit and kill clear the task mailbox, wake blocked senders and close every VFS
-  descriptor owned by that task. Reaping removes stale waiters, releases owned
-  mutexes, wakes the next waiter, then frees the ELF pages, heap frames, page
+- Exit and kill clear the task mailbox, wake both receiver and sender waiters
+  before freeing its condvars, and close every VFS descriptor owned by that task.
+  If the dead task owned the interactive console, `recover_console` gives it to
+  the first live silvershell before scheduling; `demo-tasks` instead only clears
+  the dead task's shared-console flag. Reaping removes stale waiters, releases
+  owned mutexes, wakes the next waiter, then frees ELF pages, heap frames, page
   tables, private page and both stacks. A woken sender rechecks liveness and
   cannot recreate the dead task's mailbox.
 - Nameserver unregister is owner-checked. Its table is also purged through
@@ -291,29 +323,35 @@ read back only their own values.
 - `silvershell.rs` is an independent no_std/no_main ELF with no allocator. It
   uses a 96-byte line buffer, accepts printable ASCII and CR/LF, echoes input,
   and implements Backspace/DEL by removing the last byte and erasing it onscreen.
-- UART input is deliberately a nonblocking syscall in this MVP. The shell sleeps
-  for 1 ms when RX is empty, so polling does not monopolize the scheduler. A
-  future UART RX interrupt can replace polling without changing command parsing.
+- UART input remains a nonblocking syscall. The shell sleeps for 1 ms when RX
+  is empty, while timer-side capture guarantees Ctrl-Z works without task reads.
+  A future UART RX interrupt can replace both polling paths without changing the
+  command parser or job-control event.
 - Startup emits ANSI clear/home, runs fastfetch once and shows a bold cyan
   `silvershell>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`,
   `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`,
-  `kill` and `wait`; empty lines only reprompt. Echo parsing preserves quoted
-  spaces, strips outer quotes and recognizes `>`/`>>` only outside quotes.
+  `bg`, `fg`, `kill` and `wait`; empty lines only reprompt. Echo parsing preserves
+  quoted spaces, strips outer quotes and recognizes `>`/`>>` only outside quotes.
   `mv old new` takes a full destination path, not just a directory.
 - `ls`, `cat` and ordinary `echo` spawn separate EL0 utilities with string args
-  and inherited cwd, then immediately wait for them. `echo text > path`
+  and inherited cwd. `run_utility` gives the child the console and uses wait_event,
+  so either exit or Ctrl-Z returns control to the shell. `echo text > path`
   truncates/creates; `echo text >> path` appends/creates directly through VFS.
-  `mkdir`, `rm`, `rmdir`, `mv`, `cd` and `pwd` are also direct syscalls.
-  `clear` emits clear/home and `uname` prints the fixed OS/version/arch string.
-  Utility failures return status 1.
-- `ps` uses a fixed 32-entry userspace array and prints ID/program/argument/state.
-  `spawn` parses an optional checked decimal u64 and reports the new task ID.
-  `kill` terminates a non-current task; `wait` prints and consumes its status.
-  Spawned programs share the console, so output can interleave with the prompt.
+  `mkdir`, `rm`, `rmdir`, `mv`, `cd` and `pwd` are direct syscalls.
+- `ps` uses a fixed 32-entry userspace array and prints ID/program/argument/state,
+  including `stopped`. `spawn` and `bg` parse an optional checked decimal u64 and
+  create a task without console ownership. `fg <id>` calls resume, transfers the
+  console and waits for an Exited/Stopped event. Ctrl-Z prints `Stopped task ID=N`
+  and returns the prompt; another fg continues the same task. `kill` works on
+  stopped tasks, and plain `wait` still reports only termination status.
+- Background task output is dropped rather than buffered, so early output cannot
+  be replayed by `fg`. Only output produced after the transfer becomes visible.
 - Fastfetch converts ticks to seconds with hundredths and bytes to tenths of a
   MiB. Its three memory counters come from SYS_MEMINFO, not hardcoded free RAM.
-- The default clean boot selects task ID 2 (shell) after nameserver ID 1.
-  `demo-tasks` selects task ID 1 and preserves the earlier regression IDs.
+  The architecture row is `Kernel: AArch64`.
+- The default clean boot selects task ID 2 (shell) after nameserver ID 1 and
+  explicitly makes it console owner. `demo-tasks` selects task ID 1, preserves
+  the earlier regression IDs and opts every demo into shared UART output.
 
 ## Userspace allocation
 
@@ -370,8 +408,9 @@ read back only their own values.
    User tasks get unmasked PSTATE from `silver_user_bootstrap` and from the
    SPSR saved in their exception frames.
 4. **IRQ handler order** (`gic::silver_handle_irq`):
-   `timer::handle_irq()` → `end_interrupt()` (EOI) → `scheduler::schedule()`.
-   EOI strictly before the switch.
+   `timer::handle_irq()` → `pl011::poll_rx()` → optional `stop_console_owner()` →
+   `end_interrupt()` (EOI) → `scheduler::schedule()`. Stop only marks state and
+   returns the console; the normal end-of-IRQ schedule performs the switch.
 5. **The heap is initialized after the frame allocator** and only through
    `alloc_contiguous_pages`. No `alloc` before `allocator::init()`.
 6. **Context switch layout:** x19-x30 at offsets 0-95, SP_EL1 at 96,
@@ -381,10 +420,10 @@ read back only their own values.
    resume-PC slot wins over the saved x30. Fresh tasks put their entry or
    `silver_user_bootstrap` there.
 7. **Task states:** `Ready / Running / Sleeping(deadline_ticks) /
-   Blocked / BlockedUntil(deadline_ticks) / Dead`. The scheduler gives the CPU
-   only to Ready tasks; sleeping and blocked tasks are skipped. One timer scan
-   wakes expired sleepers and timed waiters; `find_next_task` prefers non-idle
-   tasks.
+   Blocked / BlockedUntil(deadline_ticks) / Stopped / Dead`. The scheduler gives
+   the CPU only to Ready tasks. Stopped tasks keep a separate resume_state;
+   timer expiry and wakeups update that saved state without scheduling them.
+   `find_next_task` prefers non-idle tasks.
 8. **Both trampolines keep ELR/SPSR on the stack.** Each builds a 272-byte
    frame: x0-x30, ELR at offset 248, SPSR at offset 256. The epilogue
    restores ELR/SPSR from the frame before `eret`. They mask IRQs on entry
@@ -454,7 +493,7 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   and page-uniform permissions; there is no PIE, dynamic linking, demand
   loading or sparse multi-window image layout.
 - Programs are selected from ELFs embedded at kernel build time. There is no
-  external program storage, console ownership/job control or credential model yet.
+  external program storage or credential model yet.
 - Mutex and condvar wait queues still have no growth limits. Mailboxes are
   bounded at 16 messages, but nameserver/control replies also obey backpressure;
   a full client mailbox can therefore block the nameserver. Selective receive
@@ -464,25 +503,29 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   thread safety or double-free detection. There is no general `mmap`/`munmap`
   or growable stack; the user stack remains fixed at 8 KB and the private
   window at one page.
-- UART lines from different tasks can interleave; an IRQ may even schedule
-  another task during a FIFO wait. Shell RX is polled rather than interrupt
-  driven, has no escape-sequence parser and currently has one intended reader.
+- Interactive mode prevents ordinary background/foreground output interleaving,
+  but `demo-tasks` intentionally shares UART. Kernel diagnostics bypass ownership,
+  and an IRQ may schedule another task during a FIFO wait. UART RX is still polled
+  rather than interrupt-driven, has no escape-sequence parser and drops new bytes
+  when its 256-byte buffer is full. Background output is discarded. Console
+  arbitration is cooperative, with no owner-switch permission check, process
+  groups, `jobs` command or general signal API.
 - `#[alloc_error_handler]` is unstable on stable Rust. The kernel converts a
   null from its `GlobalAlloc` into a panic; the demo userspace wrapper instead
   prints the layout and exits only the current EL0 task.
 
 ## Next steps (by priority)
 
-1. **Console ownership and job control:** spawned programs currently share UART
-   output with the shell; add foreground/background ownership before RX IRQs.
+1. **Interrupt-driven UART RX:** replace timer/shell polling with PL011 RX IRQs
+   while preserving the bounded input queue and Ctrl-Z dispatch. Consider
+   per-task output buffers only if replay is actually needed.
 2. **Grow VFS semantics:** file-size quotas and overwrite/rename options if
    needed. Persistent storage still needs a block driver.
 3. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.
 4. **VirtIO-console / virtio-block** — first MMIO device driver, moving
-   UART output behind a driver interface. UART RX interrupts can remove shell
-   polling when console ownership is defined.
+   UART output behind a driver interface.
 5. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
    `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
 
@@ -500,8 +543,12 @@ and the full-mailbox selective-receive limitation recorded above.
    `--features no_std,demo-tasks`; this replaces the interactive boot.
 5. For the default profile, verify `ls`, `echo 'hello' > test.txt`,
    `cat test.txt`, `mkdir docs`, quoted echo, `cd /bin`, `pwd`, relative paths,
-   `cd ..`, `ps`, and `spawn`/`kill`/`wait`. Also check fastfetch and the logo. For
-   demo-tasks, run 5–30 seconds,
+   `cd ..`, `ps`, and `spawn`/`kill`/`wait`. Also check fastfetch and the logo.
+   Run `bg demo 12`, confirm shell output stays free of `AWAKE`, then `fg 3`.
+   Send Ctrl-Z, verify `ps` = stopped and silence while stopped, resume with
+   `fg 3`, stop again and verify kill/wait. Repeat with blocked `demo 7` and
+   verify a notification received while stopped is delivered after resume.
+   For demo-tasks, run 5–30 seconds,
    repeat timing-sensitive runs and expect exactly two intentional faults from
    tasks 15 and 16, plus
    `COPYOUT READONLY REJECT=PASS`, `COPYOUT UNMAPPED REJECT=PASS`,

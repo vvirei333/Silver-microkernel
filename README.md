@@ -16,6 +16,7 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Kernel heap + Rust global allocator (`alloc`: `Box`, `Vec`)
 - [x] GICv2 + ARM Generic Timer (IRQ 30, 100 Hz tick)
 - [x] Round-robin scheduler: spawn with numeric/string arguments, `yield`, `sleep`, `kill`, `wait`
+- [x] Console ownership + job control: `bg`/`fg`, Ctrl-Z, `Stopped`, resume and shell recovery
 - [x] Lifecycle cleanup: address spaces, mailboxes, file handles, wait queues and owned mutexes
 - [x] Blocking mutex with FIFO wait queue, ownership tracking and RAII guard
 - [x] Bounded IPC: 16-message mailboxes, blocking send/backpressure and receive timeouts
@@ -26,13 +27,13 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
 - [x] Six userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
-- [x] silvershell: `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `kill`, `wait`
+- [x] silvershell: `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`
 - [x] Shell output redirection: `>` truncates, `>>` appends, quoted operators stay literal
 - [x] ANSI clear/home and a bold cyan `silvershell>` prompt
 - [x] RAM-VFS: `/bin`, `/etc`, `/tmp`, files/directories and per-task descriptors
 - [x] Per-task cwd inherited on spawn, absolute handles and `chdir`/`getcwd` syscalls
 - [x] File syscalls: `open`, `read`, `write`, `create`, `close`, `read_dir`, `mkdir`, `unlink`, `rmdir`, `rename`
-- [x] Shell syscalls: `SYS_READ`, `SYS_UPTIME`, `SYS_MEMINFO` and `SYS_TASK_LIST`
+- [x] Shell syscalls: console ownership, resume, stopped-aware wait, uptime, memory and task info
 - [x] Per-task TTBR0 spaces: independent ELF image, fixed-VA stack and private page
 - [x] Growable per-task heap: sparse 2 MB window, `brk`, zero-fill and cleanup on exit
 - [x] Userspace `malloc/free`: first-fit free list, split, coalesce and `brk` trim
@@ -43,7 +44,7 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
-- [ ] Drivers, console ownership/job control, credentials and persistent storage
+- [ ] Drivers, credentials, persistent storage and interrupt-driven UART RX
 
 ## Requirements
 
@@ -117,9 +118,23 @@ silvershell> ls
 ```
 
 `ls`, `cat` and ordinary `echo` run as separate EL0 programs; they inherit the
-shell's cwd and the shell waits for their exit status. Redirection, `mkdir`,
-`rm`, `rmdir`, `mv`, `cd` and `pwd` use syscalls directly.
-`spawn demo 12`, `kill <id>` and `wait <id>` provide explicit task control.
+shell's cwd, temporarily receive the console and return it when the shell has
+consumed their exit status. Redirection, `mkdir`, `rm`, `rmdir`, `mv`, `cd` and
+`pwd` use syscalls directly.
+
+`spawn demo 12` and `bg demo 12` start a background task without UART access.
+Its output is discarded, not buffered, and its input calls report no data. `fg 3`
+transfers the console and waits. Ctrl-Z stops the foreground task, returns the
+shell prompt and makes `ps` show `stopped`; another `fg 3` resumes it. Sleeping
+and blocked state is preserved, and notifications arriving while stopped are
+not lost. Ctrl-Z at a shell prompt is ignored. `kill <id>` and `wait <id>` still
+provide explicit lifecycle control, including for stopped tasks.
+
+Console ownership returns to the first live silvershell when its owner exits or
+is killed. This is cooperative arbitration, not a security boundary. Ordinary
+UART bytes use a bounded kernel buffer, so Ctrl-Z works even when the foreground
+program never reads input.
+
 Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
@@ -137,14 +152,14 @@ ls, cat and echo ELFs; no separate userspace command is needed.
 | `build.rs` | Builds and embeds all six userspace ELFs for bare-metal profiles |
 | `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
 | `src/exceptions.rs` | Task fault diagnostics and kernel panic |
-| `src/pl011.rs` | UART TX/RX driver (physical MMIO 0x09000000) |
+| `src/pl011.rs` | UART TX/RX, bounded input buffer and Ctrl-Z capture |
 | `src/memory.rs` | Physical memory map and high-half address conversion |
 | `src/frame_allocator.rs` | Physical page frame allocator (bitmap) |
 | `src/allocator.rs` | Kernel heap, `#[global_allocator]` |
-| `src/gic.rs` | GICv2 interrupt controller |
+| `src/gic.rs` | GICv2 interrupts, timer-driven input polling and stop dispatch |
 | `src/timer.rs` | ARM Generic Timer, tick counter |
 | `src/interrupts.rs` | IRQ control: masking/restoring DAIF |
-| `src/scheduler.rs` | Tasks, program/argument spawn, context switch and resource reaping |
+| `src/scheduler.rs` | Tasks, stop/resume, console ownership, context switch and reaping |
 | `src/mutex.rs` | Blocking mutex with FIFO waiters and ownership tracking |
 | `src/wait_queue.rs` | Shared FIFO queue with dead-waiter removal |
 | `src/ipc.rs` | Bounded mailboxes, backpressure, timed/selective receive and cleanup |

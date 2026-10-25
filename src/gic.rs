@@ -1,6 +1,6 @@
 use core::ptr;
 
-use crate::{exceptions, memory, scheduler, timer};
+use crate::{exceptions, memory, pl011, scheduler, timer};
 
 pub const TIMER_IRQ: u32 = 30;
 const SPURIOUS_IRQ: u32 = 1023;
@@ -62,6 +62,10 @@ pub extern "C" fn silver_handle_irq() {
     match irq {
         TIMER_IRQ => {
             timer::handle_irq();
+            pl011::poll_rx();
+            if pl011::take_stop_request() {
+                scheduler::stop_console_owner();
+            }
             end_interrupt(acknowledge_register);
             scheduler::schedule();
         }

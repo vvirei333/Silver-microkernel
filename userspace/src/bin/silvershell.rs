@@ -90,6 +90,10 @@ fn execute(command: &str) {
             syscall::print("  uname      Print kernel name, version and architecture\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
             syscall::print("  spawn <demo|nameserver|silvershell|ls|cat|echo> [arg]\r\n");
+            syscall::print("  bg <program> [arg]\r\n");
+            syscall::print("             Spawn without console ownership\r\n");
+            syscall::print("  fg <id>    Resume a task in the foreground\r\n");
+            syscall::print("  Ctrl-Z     Stop the foreground task and return to shell\r\n");
             syscall::print("  kill <id>  Kill a task\r\n");
             syscall::print("  wait <id>  Wait for a task and print its exit status\r\n");
         }
@@ -105,7 +109,8 @@ fn execute(command: &str) {
         Some("clear") => clear_screen(),
         Some("uname") => syscall::print("Silver Microkernel v0.1.0 aarch64\r\n"),
         Some("ps") => show_tasks(),
-        Some("spawn") => spawn_program(words.next(), words.next()),
+        Some("spawn") | Some("bg") => spawn_program(words.next(), words.next()),
+        Some("fg") => foreground_task(words.next()),
         Some("kill") => kill_task(words.next()),
         Some("wait") => wait_task(words.next()),
         Some(_) => syscall::print("Unknown command. Type 'help'.\r\n"),
@@ -117,12 +122,26 @@ fn run_utility(program: u64, arguments: &str) {
         syscall::print("Could not start program.\r\n");
         return;
     };
-    match syscall::wait(id) {
-        Some(0) => {}
-        Some(status) => {
+    let shell_id = syscall::task_id();
+    if !syscall::console_set(id) {
+        syscall::print("Could not assign the foreground console.\r\n");
+        let _ = syscall::kill(id);
+        let _ = syscall::wait(id);
+        return;
+    }
+    let event = syscall::wait_event(id);
+    let _ = syscall::console_set(shell_id);
+    match event {
+        Some(syscall::WaitEvent::Exited(0)) => {}
+        Some(syscall::WaitEvent::Exited(status)) => {
             syscall::print("Program exited with status ");
             syscall::print_dec_u64(status);
             syscall::print("\r\n");
+        }
+        Some(syscall::WaitEvent::Stopped) => {
+            syscall::print("Program ID=");
+            syscall::print_dec_u64(id);
+            syscall::print(" stopped\r\n");
         }
         None => syscall::print("Could not wait for program.\r\n"),
     }
@@ -301,6 +320,35 @@ fn print_working_directory() {
     }
 }
 
+fn foreground_task(id: Option<&str>) {
+    let Some(id) = id.and_then(parse_number) else {
+        syscall::print("Usage: fg <id>\r\n");
+        return;
+    };
+    let shell_id = syscall::task_id();
+    if id == shell_id || !syscall::resume(id) || !syscall::console_set(id) {
+        syscall::print("fg: invalid or exited task\r\n");
+        return;
+    }
+    let event = syscall::wait_event(id);
+    let _ = syscall::console_set(shell_id);
+    match event {
+        Some(syscall::WaitEvent::Exited(status)) => {
+            syscall::print("Foreground task ID=");
+            syscall::print_dec_u64(id);
+            syscall::print(" exited with status ");
+            syscall::print_dec_u64(status);
+            syscall::print("\r\n");
+        }
+        Some(syscall::WaitEvent::Stopped) => {
+            syscall::print("Stopped task ID=");
+            syscall::print_dec_u64(id);
+            syscall::print("\r\n");
+        }
+        None => syscall::print("fg: could not wait for task\r\n"),
+    }
+}
+
 fn kill_task(id: Option<&str>) {
     let Some(id) = id.and_then(parse_number) else {
         syscall::print("Usage: kill <id>\r\n");
@@ -377,6 +425,7 @@ fn state_name(state: u64) -> &'static str {
         4 => "blocked",
         5 => "blocked-timeout",
         6 => "dead",
+        7 => "stopped",
         _ => "unknown",
     }
 }
@@ -441,7 +490,7 @@ fn fastfetch() {
     field("silver@silvershell");
     field("---------------");
     field("OS: Silver Microkernel");
-    field("Kernel: Rust / AArch64");
+    field("Kernel: AArch64");
     field("Shell: silvershell");
 
     syscall::print("Uptime: ");

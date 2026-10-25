@@ -52,6 +52,9 @@ pub const SYS_GETCWD: u64 = 35;
 pub const SYS_FS_UNLINK: u64 = 36;
 pub const SYS_FS_RMDIR: u64 = 37;
 pub const SYS_FS_RENAME: u64 = 38;
+pub const SYS_CONSOLE_SET: u64 = 39;
+pub const SYS_TASK_RESUME: u64 = 40;
+pub const SYS_WAIT_EVENT: u64 = 41;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -68,6 +71,7 @@ const NAME_LIMIT: usize = ipc::PAYLOAD_SIZE - 2;
 /// Written into x0 when the call number is not in the table.
 pub const SYSCALL_ERROR: u64 = u64::MAX;
 pub const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
+pub const SYSCALL_STOPPED: u64 = u64::MAX - 2;
 
 /// Frame layout built by the SVC trampoline: x0-x30, then ELR, then SPSR.
 const FRAME_QUADWORDS: usize = 33;
@@ -105,11 +109,15 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_PRINT => sys_print(frame[0], frame[1]),
         SYS_WHOAMI => scheduler::current_task_id(),
         SYS_PRINT_HEX => {
-            pl011::write_hex_u64(frame[0]);
+            if scheduler::current_task_owns_console() {
+                pl011::write_hex_u64(frame[0]);
+            }
             0
         }
         SYS_PRINT_DEC => {
-            pl011::write_dec_u64(frame[0]);
+            if scheduler::current_task_owns_console() {
+                pl011::write_dec_u64(frame[0]);
+            }
             0
         }
         SYS_MUTEX_LOCK => {
@@ -132,13 +140,38 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_BRK => scheduler::change_program_break(frame[0] as usize)
             .map(|address| address as u64)
             .unwrap_or(SYSCALL_ERROR),
-        SYS_READ => pl011::read_byte().map(u64::from).unwrap_or(SYSCALL_ERROR),
+        SYS_READ => {
+            if scheduler::current_task_owns_console() {
+                pl011::read_byte().map(u64::from).unwrap_or(SYSCALL_ERROR)
+            } else {
+                SYSCALL_ERROR
+            }
+        }
         SYS_UPTIME => timer::ticks(),
         SYS_MEMINFO => sys_meminfo(frame[0]),
         SYS_TASK_LIST => sys_task_list(frame[0], frame[1]),
         SYS_SPAWN_ARGS => sys_spawn_with_args(frame[0], frame[1], frame[2], frame[3]),
         SYS_ARGS => sys_arguments(frame[0], frame[1]),
         SYS_WAIT => scheduler::wait_for_task(frame[0]).unwrap_or(SYSCALL_ERROR),
+        SYS_CONSOLE_SET => {
+            if scheduler::set_console_owner(frame[0]) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
+        SYS_TASK_RESUME => {
+            if scheduler::resume_task(frame[0]) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
+        SYS_WAIT_EVENT => match scheduler::wait_for_task_event(frame[0]) {
+            Some(scheduler::WaitEvent::Exited(status)) => status,
+            Some(scheduler::WaitEvent::Stopped) => SYSCALL_STOPPED,
+            None => SYSCALL_ERROR,
+        },
         SYS_KILL => {
             if scheduler::kill_task(frame[0]) {
                 0
@@ -395,6 +428,11 @@ fn sys_meminfo(info_ptr: u64) -> u64 {
 }
 
 fn sys_print(ptr: u64, len: u64) -> u64 {
+    // Background output is deliberately discarded in the interactive MVP.
+    // Kernel diagnostics use pl011 directly and remain visible for all tasks.
+    if !scheduler::current_task_owns_console() {
+        return 0;
+    }
     if len == 0 {
         return 0;
     }
