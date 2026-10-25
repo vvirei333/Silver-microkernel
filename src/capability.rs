@@ -6,7 +6,9 @@ pub const CAP_KILL: u32 = 1 << 0;
 pub const CAP_WAIT: u32 = 1 << 1;
 pub const CAP_CONSOLE_GRANT: u32 = 1 << 2;
 pub const CAP_RESUME: u32 = 1 << 3;
-pub const CAP_ALL: u32 = CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME;
+pub const CAP_MMIO: u32 = 1 << 4;
+pub const CAP_IRQ: u32 = 1 << 5;
+pub const CAP_ALL: u32 = CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME | CAP_MMIO | CAP_IRQ;
 
 pub struct Cap {
     pub id: CapId,
@@ -48,6 +50,12 @@ impl CapTable {
             return None;
         }
         Some((cap.target_task, rights_mask))
+    }
+
+    pub fn has_rights(&self, rights_mask: u32) -> bool {
+        self.caps
+            .iter()
+            .any(|cap| cap.rights & rights_mask == rights_mask)
     }
 
     pub fn get_mut(&mut self, id: CapId) -> Option<&mut Cap> {

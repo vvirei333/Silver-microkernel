@@ -3,18 +3,20 @@
 //! TTBR1_EL1 maps physical memory at `KERNEL_VIRT_BASE + PA` for EL1 only:
 //! kernel code/data/stacks, page tables, the kernel heap, UART and GIC all
 //! live there. TTBR0_EL1 belongs to the current task and contains only its
-//! independently loaded ELF image, sparse heap, user stack and private page.
-//! No kernel image, kernel data or MMIO pages are shared with EL0.
+//! independently loaded ELF image, sparse heap, user stack, private page and
+//! explicitly authorized Device-nGnRnE MMIO mappings. No kernel image or kernel
+//! data is shared with EL0.
 
 use crate::{
     frame_allocator,
-    memory::{phys_to_virt, virt_to_phys, DRAM_BASE},
+    memory::{phys_to_virt, virt_to_phys, DRAM_BASE, DRAM_END},
 };
 
 const ENTRIES: usize = 512;
 const GRANULE: usize = 4096;
 const TABLE_BYTES: usize = ENTRIES * 8;
 const BLOCK_2M: usize = 0x20_0000;
+const PHYSICAL_ADDRESS_LIMIT: usize = 1 << 40;
 
 const DESC_TABLE: u64 = 0b11;
 const DESC_BLOCK: u64 = 0b01;
@@ -35,6 +37,11 @@ pub const USER_STACK_VA: usize = 0x0000_0000_7FE0_0000;
 pub const USER_STACK_PAGES: usize = 2;
 pub const USER_STACK_SIZE: usize = USER_STACK_PAGES * GRANULE;
 const USER_STACK_L2_INDEX: usize = (USER_STACK_VA - DRAM_BASE) / BLOCK_2M;
+
+/// A 2 MB first-fit window for explicitly authorized user MMIO mappings.
+pub const USER_MMIO_VA: usize = 0x0000_0000_8000_0000;
+const USER_MMIO_L1_INDEX: usize = (USER_MMIO_VA >> 30) & 0x1FF;
+const USER_MMIO_L2_INDEX: usize = 0;
 
 const ATTR_NORMAL: u64 = 0;
 const ATTR_DEVICE: u64 = 1;
@@ -189,7 +196,7 @@ pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
             line += 64;
         }
         core::arch::asm!(
-            "dsb ish",
+            "dsb ishst",
             "tlbi vmalle1",
             "dsb ish",
             "isb",
@@ -307,6 +314,94 @@ pub fn unmap_user_heap_page(ttbr0: usize, index: usize) -> Option<usize> {
     }
 }
 
+/// Maps an MMIO range into a free run in the task's 2 MB device window.
+/// Physical DRAM is rejected so this interface cannot expose kernel memory.
+pub fn map_phys_to_user(
+    task: &crate::scheduler::Task,
+    phys_addr: usize,
+    size: usize,
+) -> Option<usize> {
+    if size == 0 {
+        return None;
+    }
+    let physical_end = phys_addr.checked_add(size)?;
+    if physical_end > PHYSICAL_ADDRESS_LIMIT || (phys_addr < DRAM_END && physical_end > DRAM_BASE) {
+        return None;
+    }
+
+    let physical_start = phys_addr & !(GRANULE - 1);
+    let physical_offset = phys_addr - physical_start;
+    let mapped_size = physical_offset.checked_add(size)?;
+    let page_count = mapped_size.div_ceil(GRANULE);
+    if page_count == 0 || page_count > ENTRIES {
+        return None;
+    }
+
+    unsafe {
+        let l3_mmio = user_mmio_table(task.ttbr0)?;
+        let mut first = ENTRIES;
+        let mut run_length = 0;
+        for index in 0..ENTRIES {
+            if read_entry(l3_mmio, index) == 0 {
+                if run_length == 0 {
+                    first = index;
+                }
+                run_length += 1;
+                if run_length == page_count {
+                    break;
+                }
+            } else {
+                run_length = 0;
+            }
+        }
+        if run_length != page_count {
+            return None;
+        }
+
+        for page_index in 0..page_count {
+            write_entry(
+                l3_mmio,
+                first + page_index,
+                user_device_page(physical_start + page_index * GRANULE),
+            );
+        }
+        flush_after_table_change(l3_mmio, GRANULE);
+        Some(USER_MMIO_VA + first * GRANULE + physical_offset)
+    }
+}
+
+fn user_mmio_table(ttbr0: usize) -> Option<usize> {
+    unsafe {
+        let l1_user = follow_table(ttbr0, 0);
+        let existing = read_entry(l1_user, USER_MMIO_L1_INDEX);
+        if existing & DESC_TABLE == DESC_TABLE {
+            let l2_mmio = descriptor_address(existing) as usize;
+            let l3_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
+            if l3_entry & DESC_TABLE != DESC_TABLE {
+                return None;
+            }
+            return Some(descriptor_address(l3_entry) as usize);
+        }
+        if existing != 0 {
+            return None;
+        }
+
+        let l2_mmio = frame_allocator::alloc_page()?;
+        zero_page(l2_mmio);
+        let Some(l3_mmio) = frame_allocator::alloc_page() else {
+            frame_allocator::free_page(l2_mmio);
+            return None;
+        };
+        zero_page(l3_mmio);
+        write_entry(l2_mmio, USER_MMIO_L2_INDEX, l3_mmio as u64 | DESC_TABLE);
+        write_entry(l1_user, USER_MMIO_L1_INDEX, l2_mmio as u64 | DESC_TABLE);
+        flush_after_table_change(l3_mmio, GRANULE);
+        flush_after_table_change(l2_mmio, GRANULE);
+        flush_after_table_change(l1_user, GRANULE);
+        Some(l3_mmio)
+    }
+}
+
 pub fn destroy_task_space(ttbr0: usize) {
     unsafe {
         let l1_user = follow_table(ttbr0, 0);
@@ -329,6 +424,15 @@ pub fn destroy_task_space(ttbr0: usize) {
         let stack_table_entry = read_entry(l2_user, USER_STACK_L2_INDEX);
         if stack_table_entry & DESC_TABLE == DESC_TABLE {
             frame_allocator::free_page(descriptor_address(stack_table_entry) as usize);
+        }
+        let mmio_table_entry = read_entry(l1_user, USER_MMIO_L1_INDEX);
+        if mmio_table_entry & DESC_TABLE == DESC_TABLE {
+            let l2_mmio = descriptor_address(mmio_table_entry) as usize;
+            let l3_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
+            if l3_entry & DESC_TABLE == DESC_TABLE {
+                frame_allocator::free_page(descriptor_address(l3_entry) as usize);
+            }
+            frame_allocator::free_page(l2_mmio);
         }
 
         let l1_priv = follow_table(ttbr0, 1);
@@ -452,6 +556,18 @@ fn user_data_page(output_address: usize) -> u64 {
         | (ATTR_NORMAL << 2)
         | AP_EL0_RW
         | SH_INNER
+        | AF
+        | UXN
+        | PXN
+}
+
+/// User MMIO: MAIR index 1 is 0x00, Device-nGnRnE, never executable.
+fn user_device_page(output_address: usize) -> u64 {
+    descriptor_address(output_address as u64)
+        | DESC_PAGE
+        | (ATTR_DEVICE << 2)
+        | AP_EL0_RW
+        | SH_NONE
         | AF
         | UXN
         | PXN

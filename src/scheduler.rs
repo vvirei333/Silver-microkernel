@@ -939,6 +939,22 @@ pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, right
     granted
 }
 
+pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let result = scheduler_manager().and_then(|manager| {
+        let task = manager.tasks.get_mut(manager.current_index)?;
+        if !task.cap_table.has_rights(capability::CAP_MMIO) {
+            return None;
+        }
+        let virtual_address = mmu::map_phys_to_user(task, phys_addr, size)?;
+        task.cap_table
+            .insert(virtual_address as u64, capability::CAP_MMIO);
+        Some(virtual_address)
+    });
+    interrupts::restore_irq(saved_daif);
+    result
+}
+
 pub fn spawn_user_with_args_and_cap(
     program: u64,
     argument: u64,

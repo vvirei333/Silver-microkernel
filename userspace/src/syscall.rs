@@ -45,6 +45,7 @@ const SYS_TASK_RESUME: u64 = 40;
 const SYS_WAIT_EVENT: u64 = 41;
 const SYS_CAP_GET_TASK_ID: u64 = 60;
 const SYS_CAP_GRANT: u64 = 61;
+const SYS_MAP_PHYS: u64 = 62;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -232,6 +233,10 @@ pub fn cap_get_task_id(cap_id: u64) -> Option<u64> {
 
 pub fn cap_grant(cap_id: u64, recipient_task_id: u64, rights: u32) -> bool {
     unsafe { syscall3(SYS_CAP_GRANT, cap_id, recipient_task_id, rights as u64) == 0 }
+}
+
+pub fn map_phys(phys_addr: u64, size: u64) -> Option<u64> {
+    optional_id(unsafe { syscall2(SYS_MAP_PHYS, phys_addr, size) })
 }
 
 pub fn spawn_with_args(program: u64, argument: u64, arguments: &str) -> Option<u64> {

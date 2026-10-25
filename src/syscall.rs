@@ -58,6 +58,7 @@ pub const SYS_TASK_RESUME: u64 = 40;
 pub const SYS_WAIT_EVENT: u64 = 41;
 pub const SYS_CAP_GET_TASK_ID: u64 = 60;
 pub const SYS_CAP_GRANT: u64 = 61;
+pub const SYS_MAP_PHYS: u64 = 62;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -220,10 +221,17 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
                 SYSCALL_ERROR
             }
         }
+        SYS_MAP_PHYS => sys_map_phys(frame[0], frame[1]),
         _ => SYSCALL_ERROR,
     };
 
     frame[0] = result;
+}
+
+fn sys_map_phys(phys_addr: u64, size: u64) -> u64 {
+    scheduler::map_phys_to_current(phys_addr as usize, size as usize)
+        .map(|address| address as u64)
+        .unwrap_or(SYSCALL_ERROR)
 }
 
 fn sys_spawn_with_args(program: u64, argument: u64, ptr: u64, len: u64) -> u64 {

@@ -43,6 +43,9 @@ Capability model implemented. Raw Task IDs are no longer sufficient for kill/wai
 another live task; recipients cannot receive rights the caller does not hold.
 When a target dies, its capabilities lose every right except `CAP_WAIT`; that
 wait-only capability is revoked when the completion record is consumed.
+`SYS_MAP_PHYS = 62` requires `CAP_MMIO` and maps non-DRAM physical pages as
+Device-nGnRnE into a first-fit 2 MB user window at `0x80000000`. `CAP_IRQ` is
+reserved for future interrupt delegation.
 
 Debug and release QEMU both passed IRQ-only `uname`, `echo` and `pwd`; sleeping
 `demo 12` stop/resume/kill/wait; and blocked `demo 7` with IPC delivered while
@@ -305,6 +308,10 @@ read back only their own values.
 - `SYS_BRK(0)` queries the program break. Other values set an absolute break in
   `0x40200000..0x40400000`; invalid requests and allocation failures return
   `SYSCALL_ERROR` without changing the previous break or mappings.
+- `SYS_MAP_PHYS(phys, size)` rejects empty, overflowing and DRAM ranges. Its
+  lazily allocated L2/L3 tables are freed with the task address space, while the
+  referenced device frames are never freed. Each mapping records a `CAP_MMIO`
+  region token and returns the user VA including the original page offset.
 - Exit and kill clear the task mailbox, wake both receiver and sender waiters
   before freeing its condvars, and close every VFS descriptor owned by that task.
   If the dead task owned the interactive console, `recover_console` gives it to
