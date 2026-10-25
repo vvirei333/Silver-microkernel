@@ -157,6 +157,70 @@ impl Vfs {
         Ok(())
     }
 
+    fn rename(
+        &mut self,
+        cwd: &str,
+        source: &str,
+        destination: &str,
+        in_use: impl FnOnce(&str) -> bool,
+    ) -> Result<(), ()> {
+        let source = resolve_path(cwd, source)?;
+        let destination = resolve_path(cwd, destination)?;
+        if source == destination {
+            return Err(());
+        }
+        let source_components = components(&source).ok_or(())?;
+        let (&source_name, source_parent) = source_components.split_last().ok_or(())?;
+        let destination_components = components(&destination).ok_or(())?;
+        let (&destination_name, destination_parent) =
+            destination_components.split_last().ok_or(())?;
+
+        let is_directory = match find_node(&self.root, &source).ok_or(())?.kind {
+            NodeKind::File(_) => false,
+            NodeKind::Directory(_) => true,
+        };
+        if is_directory
+            && destination.starts_with(&source)
+            && destination.as_bytes().get(source.len()) == Some(&b'/')
+        {
+            return Err(());
+        }
+        // Handles contain absolute paths. Reject renaming an open file or any
+        // directory containing one instead of leaving a stale handle behind.
+        if self.open_files.iter().any(|file| {
+            file.path == source
+                || (file.path.starts_with(&source)
+                    && file.path.as_bytes().get(source.len()) == Some(&b'/'))
+        }) {
+            return Err(());
+        }
+        if is_directory && in_use(&source) {
+            return Err(());
+        }
+
+        // Validate the complete destination before detaching the source, so
+        // every expected error leaves the tree unchanged.
+        {
+            let children = directory_mut(&mut self.root, destination_parent)?;
+            if children.iter().any(|node| node.name == destination_name) {
+                return Err(());
+            }
+        }
+        let mut node = {
+            let children = directory_mut(&mut self.root, source_parent)?;
+            let index = children
+                .iter()
+                .position(|node| node.name == source_name)
+                .ok_or(())?;
+            children.remove(index)
+        };
+        node.name = String::from(destination_name);
+        directory_mut(&mut self.root, destination_parent)
+            .expect("validated rename destination disappeared")
+            .push(node);
+        Ok(())
+    }
+
     fn open(&mut self, owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {
         if flags & !OPEN_WRITE != 0 {
             return Err(());
@@ -301,6 +365,17 @@ pub fn unlink(cwd: &str, path: &str) -> Result<(), ()> {
 /// Removes an empty directory only if no live task uses it as cwd or below it.
 pub fn rmdir(cwd: &str, path: &str, in_use: impl FnOnce(&str) -> bool) -> Result<(), ()> {
     with_vfs(|vfs| vfs.remove_directory(cwd, path, in_use))
+}
+
+/// Renames without replacing an existing node. Open files and directories
+/// used as a live task's cwd stay pinned while handles/cwds are path-based.
+pub fn rename(
+    cwd: &str,
+    source: &str,
+    destination: &str,
+    in_use: impl FnOnce(&str) -> bool,
+) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.rename(cwd, source, destination, in_use))
 }
 
 pub fn open(owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {

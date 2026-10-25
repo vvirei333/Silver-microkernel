@@ -82,6 +82,8 @@ fn execute(command: &str) {
             syscall::print("  rm <file>  Remove a closed file\r\n");
             syscall::print("  rmdir <path>\r\n");
             syscall::print("             Remove an empty, unused directory\r\n");
+            syscall::print("  mv <old> <new>\r\n");
+            syscall::print("             Rename or move a closed file/unused directory\r\n");
             syscall::print("  cd <path>  Change current working directory\r\n");
             syscall::print("  pwd        Print current working directory\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
@@ -95,6 +97,7 @@ fn execute(command: &str) {
         Some("mkdir") => make_directory(words.next()),
         Some("rm") => remove_file(words.next()),
         Some("rmdir") => remove_directory(words.next()),
+        Some("mv") => rename_node(words.next(), words.next()),
         Some("cd") => change_directory(words.next()),
         Some("pwd") => print_working_directory(),
         Some("ps") => show_tasks(),
@@ -229,6 +232,16 @@ fn remove_directory(path: Option<&str>) {
     };
     if !syscall::fs_rmdir(path) {
         syscall::print("rmdir: directory is missing, not empty, in use, or invalid\r\n");
+    }
+}
+
+fn rename_node(source: Option<&str>, destination: Option<&str>) {
+    let (Some(source), Some(destination)) = (source, destination) else {
+        syscall::print("Usage: mv <old> <new>\r\n");
+        return;
+    };
+    if !syscall::fs_rename(source, destination) {
+        syscall::print("mv: cannot rename (missing, same, open, busy, or bad destination)\r\n");
     }
 }
 

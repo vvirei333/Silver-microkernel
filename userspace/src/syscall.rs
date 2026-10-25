@@ -39,6 +39,7 @@ const SYS_CHDIR: u64 = 34;
 const SYS_GETCWD: u64 = 35;
 const SYS_FS_UNLINK: u64 = 36;
 const SYS_FS_RMDIR: u64 = 37;
+const SYS_FS_RENAME: u64 = 38;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -302,6 +303,14 @@ pub fn fs_unlink(path: &str) -> bool {
 
 pub fn fs_rmdir(path: &str) -> bool {
     with_path(path, |ptr| unsafe { syscall1(SYS_FS_RMDIR, ptr) }) == 0
+}
+
+pub fn fs_rename(source: &str, destination: &str) -> bool {
+    with_path(source, |source_ptr| {
+        with_path(destination, |destination_ptr| unsafe {
+            syscall2(SYS_FS_RENAME, source_ptr, destination_ptr)
+        })
+    }) == 0
 }
 
 pub fn fs_close(fd: u64) -> bool {
