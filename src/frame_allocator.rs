@@ -11,6 +11,7 @@ struct FrameAllocatorState {
     bitmap: [u64; BITMAP_WORDS],
     available: MemoryRegion,
     total_pages: usize,
+    free_pages: usize,
 }
 
 struct SharedState(UnsafeCell<FrameAllocatorState>);
@@ -23,6 +24,7 @@ static STATE: SharedState = SharedState(UnsafeCell::new(FrameAllocatorState {
     bitmap: [0; BITMAP_WORDS],
     available: MemoryRegion::new(0, 0),
     total_pages: 0,
+    free_pages: 0,
 }));
 
 fn state() -> &'static mut FrameAllocatorState {
@@ -48,6 +50,7 @@ pub fn init(available: MemoryRegion) -> usize {
     state.bitmap.fill(ALL_PAGES_USED);
     state.available = MemoryRegion::new(start, usable_end);
     state.total_pages = total_pages;
+    state.free_pages = total_pages;
 
     for page_index in 0..total_pages {
         mark_free(state, page_index);
@@ -56,15 +59,17 @@ pub fn init(available: MemoryRegion) -> usize {
     total_pages
 }
 
-/// Number of currently free bytes in the managed physical-page pool.
-pub fn free_bytes() -> usize {
+pub fn total_pages() -> usize {
+    state().total_pages
+}
+
+pub fn free_pages() -> usize {
+    state().free_pages
+}
+
+pub fn used_pages() -> usize {
     let state = state();
-    let word_count = state.total_pages.div_ceil(BITS_PER_WORD);
-    let free_pages: usize = state.bitmap[..word_count]
-        .iter()
-        .map(|word| word.count_ones() as usize)
-        .sum();
-    free_pages * PAGE_SIZE
+    state.total_pages - state.free_pages
 }
 
 /// Allocates one physical page using first-fit search.
@@ -85,6 +90,7 @@ pub fn alloc_page() -> Option<usize> {
         }
 
         mark_used(state, page_index);
+        state.free_pages -= 1;
         return Some(state.available.start + page_index * PAGE_SIZE);
     }
 
@@ -140,6 +146,7 @@ pub fn free_page(address: usize) {
 
     if was_used {
         state.bitmap[word_index] &= !bit_mask;
+        state.free_pages += 1;
     }
 }
 

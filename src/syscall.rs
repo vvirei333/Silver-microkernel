@@ -412,10 +412,12 @@ fn sys_task_list(buffer_ptr: u64, capacity: u64) -> u64 {
 
 fn sys_meminfo(info_ptr: u64) -> u64 {
     let total_bytes = memory::DRAM_SIZE as u64;
-    let free_bytes = (frame_allocator::free_bytes() as u64).min(total_bytes);
+    let managed_total_bytes = (frame_allocator::total_pages() * memory::PAGE_SIZE) as u64;
+    let managed_used_bytes = (frame_allocator::used_pages() * memory::PAGE_SIZE) as u64;
+    let free_bytes = (frame_allocator::free_pages() * memory::PAGE_SIZE) as u64;
     let info = MemoryInfo {
         total_bytes,
-        used_bytes: total_bytes - free_bytes,
+        used_bytes: total_bytes - managed_total_bytes + managed_used_bytes,
         free_bytes,
     };
     let bytes = unsafe {
