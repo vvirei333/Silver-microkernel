@@ -125,8 +125,11 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             0
         }
         SYS_MUTEX_UNLOCK => {
-            DEMO_MUTEX.raw_unlock();
-            0
+            if DEMO_MUTEX.raw_unlock() {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
         }
         SYS_CHAN_SEND => {
             DEMO_CHANNEL.send(frame[0]);
@@ -461,6 +464,9 @@ fn sys_send(target: u64, message_ptr: u64) -> u64 {
     if user_memory::copy_from_user(message_ptr, bytes).is_err() {
         return SYSCALL_ERROR;
     }
+    // Identity is a kernel fact, not user-provided message payload. This also
+    // protects nameserver replies and receive_from() from sender spoofing.
+    message.sender = scheduler::current_task_id();
     if ipc::send(target, message).is_err() {
         return SYSCALL_ERROR;
     }
@@ -572,12 +578,15 @@ fn build_request(prefix: &[u8], name: &[u8]) -> Option<ipc::Message> {
 
 fn parse_id_reply(reply: &ipc::Message) -> Option<u64> {
     let digits = reply.text().strip_prefix(b"ID ")?;
+    if digits.is_empty() {
+        return None;
+    }
     let mut id = 0_u64;
     for &byte in digits {
         if !byte.is_ascii_digit() {
             return None;
         }
-        id = id * 10 + u64::from(byte - b'0');
+        id = id.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
     }
     Some(id)
 }

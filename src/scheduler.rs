@@ -262,6 +262,7 @@ pub fn init() {
         for role in 23..=26 {
             let _ = spawn_user(user_program::DEMO, role);
         }
+        let _security_probe = spawn_user(user_program::DEMO, 27);
     }
 
     let first_id = if cfg!(feature = "demo-tasks") { 1 } else { 2 };
@@ -294,7 +295,7 @@ pub fn sleep(milliseconds: u64) {
     }
 
     let saved_daif = interrupts::save_and_disable_irq();
-    let wake_at = timer::ticks() + timer::milliseconds_to_ticks(milliseconds);
+    let wake_at = timer::ticks().saturating_add(timer::milliseconds_to_ticks(milliseconds));
 
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Sleeping(wake_at);

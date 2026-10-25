@@ -206,8 +206,8 @@ pub fn mutex_lock() {
     unsafe { syscall0(SYS_MUTEX_LOCK) };
 }
 
-pub fn mutex_unlock() {
-    unsafe { syscall0(SYS_MUTEX_UNLOCK) };
+pub fn mutex_unlock() -> bool {
+    unsafe { syscall0(SYS_MUTEX_UNLOCK) == 0 }
 }
 
 pub fn channel_send(value: u64) {

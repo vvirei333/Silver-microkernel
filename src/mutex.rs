@@ -54,11 +54,16 @@ impl<T> Mutex<T> {
         }
     }
 
-    pub fn raw_unlock(&self) {
+    /// Releases only a mutex owned by the calling task. Non-owner unlock is
+    /// an ordinary error in every profile, never a debug-only assertion.
+    pub fn raw_unlock(&self) -> bool {
         let saved_daif = interrupts::save_and_disable_irq();
         let state = unsafe { &mut *self.state.get() };
         let id = scheduler::current_task_id();
-        debug_assert_eq!(state.owner, Some(id), "unlock by a non-owner");
+        if state.owner != Some(id) {
+            interrupts::restore_irq(saved_daif);
+            return false;
+        }
         state.owner = None;
         scheduler::unregister_mutex(self.state.get());
 
@@ -66,6 +71,7 @@ impl<T> Mutex<T> {
             scheduler::wake_task(waiter);
         }
         interrupts::restore_irq(saved_daif);
+        true
     }
 }
 
@@ -92,7 +98,8 @@ impl<'a, T> MutexGuard<'a, T> {
 
 impl<T> Drop for MutexGuard<'_, T> {
     fn drop(&mut self) {
-        self.mutex.raw_unlock();
+        let released = self.mutex.raw_unlock();
+        debug_assert!(released, "mutex guard lost ownership");
     }
 }
 

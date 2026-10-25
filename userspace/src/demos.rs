@@ -555,6 +555,49 @@ pub fn ipc_exit_receiver() -> ! {
     syscall::exit()
 }
 
+pub fn security_probe() -> ! {
+    let id = syscall::task_id();
+    let spoofed = ipc::Message::new(1, b"SPOOF");
+    syscall::send(id, &spoofed);
+    let mut received = ipc::Message::new(0, b"");
+    syscall::receive(&mut received);
+    if received.sender == id && received.text() == b"SPOOF" {
+        syscall::print("SECURITY IPC SENDER=PASS\r\n");
+    } else {
+        syscall::print("SECURITY IPC SENDER=FAIL\r\n");
+    }
+
+    if !syscall::mutex_unlock() {
+        syscall::print("SECURITY MUTEX NONOWNER=PASS\r\n");
+    } else {
+        syscall::print("SECURITY MUTEX NONOWNER=FAIL\r\n");
+    }
+    syscall::mutex_lock();
+    if syscall::mutex_unlock() {
+        syscall::print("SECURITY MUTEX OWNER=PASS\r\n");
+    } else {
+        syscall::print("SECURITY MUTEX OWNER=FAIL\r\n");
+    }
+
+    if let Some(child) = syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_SLEEP_OVERFLOW) {
+        syscall::sleep(100);
+        if syscall::task_alive(child) && syscall::kill(child) && syscall::wait(child) == Some(1) {
+            syscall::print("SECURITY SLEEP OVERFLOW=PASS\r\n");
+        } else {
+            syscall::print("SECURITY SLEEP OVERFLOW=FAIL\r\n");
+        }
+    } else {
+        syscall::print("SECURITY SLEEP OVERFLOW=FAIL\r\n");
+    }
+    syscall::exit();
+}
+
+pub fn sleep_overflow() -> ! {
+    syscall::sleep(u64::MAX);
+    syscall::print("SECURITY SLEEP OVERFLOW=FAIL\r\n");
+    syscall::exit();
+}
+
 pub fn unknown_task() -> ! {
     syscall::print("UNKNOWN USER TASK\r\n");
     loop {

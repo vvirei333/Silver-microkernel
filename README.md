@@ -10,11 +10,11 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 ## What already works
 
 - [x] Bare-metal boot: `_start`, custom linker script, `.bss` zeroing
-- [x] PL011 UART console input/output with echo and line editing
+- [x] PL011 UART console input/output with IRQ-driven RX, echo and line editing
 - [x] ARM64 exception handler: kernel panic with error code and address
 - [x] Physical memory map + page frame allocator (bitmap)
 - [x] Kernel heap + Rust global allocator (`alloc`: `Box`, `Vec`)
-- [x] GICv2 + ARM Generic Timer (IRQ 30, 100 Hz tick)
+- [x] GICv2 + ARM Generic Timer (IRQ 30, 100 Hz tick) + PL011 RX (INTID 33)
 - [x] Round-robin scheduler: spawn with numeric/string arguments, `yield`, `sleep`, `kill`, `wait`
 - [x] Console ownership + job control: `bg`/`fg`, Ctrl-Z, `Stopped`, resume and shell recovery
 - [x] Lifecycle cleanup: address spaces, mailboxes, file handles, wait queues and owned mutexes
@@ -44,7 +44,8 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
-- [ ] Drivers, credentials, persistent storage and interrupt-driven UART RX
+- [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
+- [ ] More drivers, credentials/capabilities, resource quotas and persistent storage
 
 ## Requirements
 
@@ -131,9 +132,10 @@ not lost. Ctrl-Z at a shell prompt is ignored. `kill <id>` and `wait <id>` still
 provide explicit lifecycle control, including for stopped tasks.
 
 Console ownership returns to the first live silvershell when its owner exits or
-is killed. This is cooperative arbitration, not a security boundary. Ordinary
-UART bytes use a bounded kernel buffer, so Ctrl-Z works even when the foreground
-program never reads input.
+is killed. This is cooperative arbitration, not a security boundary. PL011 RX
+uses GIC INTID 33: its IRQ handler fills a bounded 256-byte kernel buffer, so
+Ctrl-Z works even when the foreground program never reads input. `SYS_READ`
+consumes only this buffer; the timer no longer polls UART.
 
 Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
@@ -152,11 +154,11 @@ ls, cat and echo ELFs; no separate userspace command is needed.
 | `build.rs` | Builds and embeds all six userspace ELFs for bare-metal profiles |
 | `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
 | `src/exceptions.rs` | Task fault diagnostics and kernel panic |
-| `src/pl011.rs` | UART TX/RX, bounded input buffer and Ctrl-Z capture |
+| `src/pl011.rs` | UART TX, IRQ-driven RX, bounded input buffer and Ctrl-Z capture |
 | `src/memory.rs` | Physical memory map and high-half address conversion |
 | `src/frame_allocator.rs` | Physical page frame allocator (bitmap) |
 | `src/allocator.rs` | Kernel heap, `#[global_allocator]` |
-| `src/gic.rs` | GICv2 interrupts, timer-driven input polling and stop dispatch |
+| `src/gic.rs` | GICv2 timer/UART IRQ setup, EOI and stop-aware dispatch |
 | `src/timer.rs` | ARM Generic Timer, tick counter |
 | `src/interrupts.rs` | IRQ control: masking/restoring DAIF |
 | `src/scheduler.rs` | Tasks, stop/resume, console ownership, context switch and reaping |
@@ -261,6 +263,18 @@ relative timer-tick timeout. It returns `SYSCALL_TIMEOUT` (`u64::MAX - 1`) on
 expiry. Receiver exit clears queued messages, wakes all blocked senders and makes
 their sends fail instead of recreating the dead mailbox. Demos verify timeout,
 backpressure on the seventeenth send, FIFO delivery and exit wakeup.
+
+## Security notes
+
+The kernel stamps every IPC sender after checked copyin, rejects non-owner mutex
+unlock in all build profiles, parses nameserver IDs with checked arithmetic and
+uses saturating sleep deadlines. Debug and release regression probes cover these
+paths alongside the existing MMU, copyout, lifecycle and IPC checks.
+
+This is not yet a complete security model. Any EL0 task can currently request
+console/task control operations for arbitrary IDs; credentials and capabilities
+are still needed. Spawn, heap, VFS and wait-queue resource quotas are also not
+implemented, so denial-of-service resistance remains limited.
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).
 

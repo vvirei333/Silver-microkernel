@@ -23,6 +23,8 @@ pub const ROLE_IPC_BACKPRESSURE_SENDER: u64 = 23;
 pub const ROLE_IPC_BACKPRESSURE_RECEIVER: u64 = 24;
 pub const ROLE_IPC_EXIT_SENDER: u64 = 25;
 pub const ROLE_IPC_EXIT_RECEIVER: u64 = 26;
+pub const ROLE_SECURITY_PROBE: u64 = 27;
+pub const ROLE_SLEEP_OVERFLOW: u64 = 28;
 
 /// The kernel passes one argument in x0. Demo selection no longer depends on
 /// task ID: dynamically spawned copies can choose any role independently.
@@ -54,6 +56,8 @@ pub extern "C" fn _start(argument: u64) -> ! {
         ROLE_IPC_BACKPRESSURE_RECEIVER => demos::ipc_backpressure_receiver(),
         ROLE_IPC_EXIT_SENDER => demos::ipc_exit_sender(),
         ROLE_IPC_EXIT_RECEIVER => demos::ipc_exit_receiver(),
+        ROLE_SECURITY_PROBE => demos::security_probe(),
+        ROLE_SLEEP_OVERFLOW => demos::sleep_overflow(),
         _ => demos::unknown_task(),
     }
 }

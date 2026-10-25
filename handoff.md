@@ -3,13 +3,19 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (Ctrl-Z and job control update)
+## State as of 2026-10-25 (UART RX IRQ and security hardening)
 
-Latest verified features: **Ctrl-Z stop/resume and stopped-aware foreground wait**.
-PL011 now captures RX into a bounded 256-byte kernel FIFO during timer ticks and
-turns Ctrl-Z (`0x1A`) into a stop request. This works even when the foreground
-program never reads UART. Ordinary input remains available to the console owner;
-Ctrl-Z at a shell prompt is ignored.
+Latest verified features: **hardware PL011 RX interrupts and focused syscall
+hardening**. The QEMU virt DTB describes the PL011 interrupt as SPI 1,
+level-high, which is GIC INTID 33. PL011 RXIM and RTIM feed a bounded 256-byte
+kernel FIFO; the IRQ handler drains the hardware FIFO completely. `SYS_READ`
+now reads only that software queue and never polls hardware. The timer no longer
+polls UART. Ctrl-Z (`0x1A`) still becomes a stop request, but the UART IRQ calls
+`schedule()` only when a foreground task was actually stopped.
+
+Keep `GICD_ICFGR = 0b00` for this level-sensitive interrupt. `0b10` means
+edge-triggered and left input stuck during development. RX timeout (RTIM) is
+required so a single keypress does not wait for the RX FIFO threshold.
 
 The interactive profile still has one UART owner. `spawn` and `bg` create children
 without it; `fg <id>` resumes a stopped task or foregrounds a live one, then waits
@@ -21,34 +27,42 @@ the `Exited`/`Stopped` event split; old `SYS_WAIT` still waits only for exit.
 A stopped task keeps `resume_state`: `Running` becomes `Ready`, while sleep and
 blocked waits retain their deadlines/queue membership. Expiry or notification
 while stopped updates the saved state instead of accidentally scheduling the task.
-Killing stopped/blocked IPC receivers now wakes `not_empty` before mailbox
-destruction as well as `not_full`, preventing a dangling WaitQueue during reaping.
+Killing stopped/blocked IPC receivers wakes both `not_empty` and `not_full` before
+mailbox destruction, preventing a dangling WaitQueue during reaping.
 
-Earlier console ownership, append redirection, terminal conveniences, VFS and cwd
-behavior remain intact. Background output is still discarded rather than buffered;
-kernel diagnostics bypass ownership. Fastfetch prints `Kernel: AArch64`.
+Focused security review found and fixed four concrete issues: `SYS_SEND` now
+overwrites the user-provided `Message.sender` with the current task ID; mutex
+unlock rejects non-owners in release as well as debug; nameserver decimal ID
+parsing uses checked arithmetic; and sleep deadlines use saturating addition.
+Regression role 27 verifies sender stamping, non-owner/owner unlock and survival
+of a child sleeping for `u64::MAX` milliseconds. This was a focused review, not a
+complete security audit. Arbitrary task/console control still lacks a capability
+model, and task/memory/wait-queue/file resource quotas remain open.
 
-Debug QEMU verified sleeping `demo 12`: `fg` → Ctrl-Z → `ps` = stopped → no AWAKE
-while stopped → `fg` resume → Ctrl-Z → kill/wait. Release repeated the cycle with
-blocked `demo 7`, verified Ctrl-Z is ignored at the prompt, and delivered WAKE to
-a stopped condvar receiver only after resume (`CONDVAR alpha RECV WAKE`). Final
-kill/wait and subsequent shell commands succeeded without panic. A 12-second
-regression run had exactly two intentional `TASK FAULT` reports and passed:
+Debug and release QEMU both passed IRQ-only `uname`, `echo` and `pwd`; sleeping
+`demo 12` stop/resume/kill/wait; and blocked `demo 7` with IPC delivered while
+stopped and consumed after resume. Twelve-second `demo-tasks` runs in both
+profiles passed 18 markers with exactly two intentional `TASK FAULT` reports:
 
 ```text
-COPYOUT READONLY REJECT=PASS
-COPYOUT UNMAPPED REJECT=PASS
+CONDVAR TEST: beta silent = PASS
 LIFECYCLE EXIT/UNREGISTER=PASS
 LIFECYCLE MUTEX CLEANUP=PASS
+COPYOUT READONLY REJECT=PASS
+COPYOUT UNMAPPED REJECT=PASS
 HEAP GROW/SHRINK=PASS
 MALLOC FREE/REUSE=PASS
 MALLOC BRK TRIM=PASS
 GLOBAL ALLOC BOX=42 VEC_LEN=32 PASS
 GLOBAL ALLOC TRIM=PASS
-IPC TIMEOUT=PASS
 IPC BP SENDER RESUMED=PASS
+IPC TIMEOUT=PASS
 IPC BP BACKPRESSURE=PASS
 IPC EXIT WAKE=PASS
+SECURITY IPC SENDER=PASS
+SECURITY MUTEX NONOWNER=PASS
+SECURITY MUTEX OWNER=PASS
+SECURITY SLEEP OVERFLOW=PASS
 ```
 
 Debug and release QEMU checks observed `/bin`, `/etc` and `/tmp` in `ls`,
@@ -148,7 +162,10 @@ handles both CR and LF from UART.
 - RAM: physical `0x40000000`, 128 MB (defined in `memory.rs` and `-m 128M`)
 - UART PL011: physical `0x09000000`; GICv2 Distributor `0x08000000`,
   CPU Interface `0x08010000`. Drivers access them through the high alias.
-- Timer: ARM Generic Timer, IRQ 30, 100 Hz tick (`timer::TICK_INTERVAL_MS = 10`)
+  The virt DTB describes UART as SPI 1 / level-high: GIC INTID 33, ICFGR `0b00`.
+  RXIM + RTIM are unmasked; the RX threshold is 1/8 and the IRQ drains the FIFO.
+- Timer: ARM Generic Timer, IRQ 30, 100 Hz tick (`timer::TICK_INTERVAL_MS = 10`).
+  UART priority is 0x80 and timer priority 0xA0; ordinary RX does not schedule.
 - FP/SIMD enabled in `_start` (CPACR_EL1 = 0x300000, CPTR_EL2 = 0) —
   without this the first use of a float register traps with EC=7
 - Runtime is EL1h for the kernel and EL0t for user tasks: QEMU `-kernel`
@@ -249,11 +266,12 @@ read back only their own values.
   section and records the calling shell as `console_parent` for Ctrl-Z. Print
   syscalls from non-owners succeed but discard their bytes; non-owner `SYS_READ`
   returns SYSCALL_ERROR without touching PL011.
-- Timer IRQs poll PL011 into a 256-byte RX FIFO and consume Ctrl-Z as a stop
-  request before scheduling. The owner's `SYS_READ` drains buffered input first,
-  then polls hardware; no byte/no input returns SYSCALL_ERROR. `SYS_UPTIME`
-  returns raw 100 Hz ticks. `SYS_MEMINFO` copies three u64 byte counts through
-  checked copyout; used includes kernel/reserved RAM and allocated frames.
+- PL011 INTID 33 drains hardware RX into a 256-byte software FIFO and consumes
+  Ctrl-Z as a stop request. The owner's `SYS_READ` reads only the software FIFO;
+  no byte/no input returns SYSCALL_ERROR. Timer IRQs handle only ticks and normal
+  scheduling; UART IRQs schedule only after stopping a foreground task.
+  `SYS_UPTIME` returns raw 100 Hz ticks. `SYS_MEMINFO` copies three u64 byte counts
+  through checked copyout; used includes kernel/reserved RAM and allocated frames.
 - `SYS_TASK_LIST(buffer, capacity)` copies up to 64 `#[repr(C)]` TaskInfo entries
   (ID, numeric state, program, argument). State 7 is Stopped. Task metadata lives
   in the Task itself, so ps can distinguish identical ELF roles.
@@ -266,8 +284,14 @@ read back only their own values.
   restores its saved state and is a no-op for a live non-stopped task.
   `SYS_KILL` rejects idle/self and records status 1; SYS_EXIT records its status.
 - `SYS_SEND(target, message)` blocks while the target has 16 queued messages and
-  returns `SYSCALL_ERROR` if the target is dead. Nameserver RPC paths propagate
-  this failure too.
+  returns `SYSCALL_ERROR` if the target is dead. After copyin the kernel always
+  replaces `message.sender` with `current_task_id()`, making selective receive
+  and nameserver replies resistant to sender spoofing. Nameserver RPC paths
+  propagate send failure and parse returned IDs with checked arithmetic.
+- `SYS_SLEEP(ms)` uses a saturating absolute deadline, so an extreme userspace
+  argument cannot panic a debug kernel or wrap to an immediate wakeup.
+- `SYS_MUTEX_UNLOCK` succeeds only for the recorded owner in every build profile;
+  non-owner attempts return `SYSCALL_ERROR` without waking a waiter.
 - `SYS_RECEIVE(buffer, timeout_ticks)` uses zero for a poll and `u64::MAX` for an
   infinite wait. Other values are relative 100 Hz ticks; expiry returns
   `SYSCALL_TIMEOUT = u64::MAX - 1`. Invalid buffers still return SYSCALL_ERROR.
@@ -323,10 +347,9 @@ read back only their own values.
 - `silvershell.rs` is an independent no_std/no_main ELF with no allocator. It
   uses a 96-byte line buffer, accepts printable ASCII and CR/LF, echoes input,
   and implements Backspace/DEL by removing the last byte and erasing it onscreen.
-- UART input remains a nonblocking syscall. The shell sleeps for 1 ms when RX
-  is empty, while timer-side capture guarantees Ctrl-Z works without task reads.
-  A future UART RX interrupt can replace both polling paths without changing the
-  command parser or job-control event.
+- UART input remains a nonblocking syscall. The shell sleeps for 1 ms when the
+  software queue is empty, while PL011 INTID 33 captures bytes and Ctrl-Z without
+  task reads. The command parser and job-control event are unchanged.
 - Startup emits ANSI clear/home, runs fastfetch once and shows a bold cyan
   `silvershell>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`,
   `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`,
@@ -407,10 +430,11 @@ read back only their own values.
    must call `interrupts::enable_irq()` before waiting; idle does this.
    User tasks get unmasked PSTATE from `silver_user_bootstrap` and from the
    SPSR saved in their exception frames.
-4. **IRQ handler order** (`gic::silver_handle_irq`):
-   `timer::handle_irq()` → `pl011::poll_rx()` → optional `stop_console_owner()` →
-   `end_interrupt()` (EOI) → `scheduler::schedule()`. Stop only marks state and
-   returns the console; the normal end-of-IRQ schedule performs the switch.
+4. **Timer and UART IRQs have separate paths** (`gic::silver_handle_irq`).
+   Timer: `timer::handle_irq()` → EOI → `schedule()`. UART: `pl011::handle_irq()`
+   drains RX → consume stop request → optional `stop_console_owner()` → EOI →
+   `schedule()` only if a task stopped. Ordinary UART bytes never cause a context
+   switch. PL011 is level-sensitive: its ICFGR field must remain `0b00`.
 5. **The heap is initialized after the frame allocator** and only through
    `alloc_contiguous_pages`. No `alloc` before `allocator::init()`.
 6. **Context switch layout:** x19-x30 at offsets 0-95, SP_EL1 at 96,
@@ -493,11 +517,15 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   and page-uniform permissions; there is no PIE, dynamic linking, demand
   loading or sparse multi-window image layout.
 - Programs are selected from ELFs embedded at kernel build time. There is no
-  external program storage or credential model yet.
+  external program storage, credential or capability model yet. In particular,
+  arbitrary task IDs can be passed to console/resume/kill/wait syscalls; console
+  arbitration and process control are cooperative, not security boundaries.
 - Mutex and condvar wait queues still have no growth limits. Mailboxes are
   bounded at 16 messages, but nameserver/control replies also obey backpressure;
   a full client mailbox can therefore block the nameserver. Selective receive
-  on a full mailbox can likewise deadlock with its expected sender.
+  on a full mailbox can likewise deadlock with its expected sender. Spawn counts,
+  kernel heap/VFS growth and per-task memory consumption need quotas for DoS
+  resistance.
 - The user heap is limited to one 2 MB L3 window. The allocator supports only
   alignments up to 16 bytes and has no explicit C-style `realloc`/`calloc`,
   thread safety or double-free detection. There is no general `mmap`/`munmap`
@@ -505,28 +533,29 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   window at one page.
 - Interactive mode prevents ordinary background/foreground output interleaving,
   but `demo-tasks` intentionally shares UART. Kernel diagnostics bypass ownership,
-  and an IRQ may schedule another task during a FIFO wait. UART RX is still polled
-  rather than interrupt-driven, has no escape-sequence parser and drops new bytes
-  when its 256-byte buffer is full. Background output is discarded. Console
-  arbitration is cooperative, with no owner-switch permission check, process
-  groups, `jobs` command or general signal API.
+  and an IRQ may schedule another task during a FIFO wait. UART RX is interrupt-
+  driven but has no escape-sequence parser and drops new bytes when its 256-byte
+  buffer is full. Background output is discarded. There are no process groups,
+  `jobs` command or general signal API.
 - `#[alloc_error_handler]` is unstable on stable Rust. The kernel converts a
   null from its `GlobalAlloc` into a panic; the demo userspace wrapper instead
   prints the layout and exits only the current EL0 task.
 
 ## Next steps (by priority)
 
-1. **Interrupt-driven UART RX:** replace timer/shell polling with PL011 RX IRQs
-   while preserving the bounded input queue and Ctrl-Z dispatch. Consider
-   per-task output buffers only if replay is actually needed.
-2. **Grow VFS semantics:** file-size quotas and overwrite/rename options if
+1. **Credentials and capabilities:** define parent/owner relationships and
+   unforgeable rights for console transfer, resume, kill and wait. Do not treat a
+   program-name check as authorization: any task can request an embedded shell ELF.
+2. **Resource quotas:** bound task count, per-task/kernel memory, wait queues and
+   VFS file growth; define behavior under exhaustion before adding more services.
+3. **Grow VFS semantics:** file-size quotas and overwrite/rename options if
    needed. Persistent storage still needs a block driver.
-3. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
+4. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.
-4. **VirtIO-console / virtio-block** — first MMIO device driver, moving
+5. **VirtIO-console / virtio-block** — first MMIO device driver, moving
    UART output behind a driver interface.
-5. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
+6. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
    `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
 
 Nameserver watch notifications are explicitly deferred. Later IPC control-plane
@@ -556,6 +585,8 @@ and the full-mailbox selective-receive limitation recorded above.
    `HEAP GROW/SHRINK=PASS`, `MALLOC FREE/REUSE=PASS`,
    `MALLOC BRK TRIM=PASS`, `GLOBAL ALLOC BOX=42 VEC_LEN=32 PASS`,
    `GLOBAL ALLOC TRIM=PASS`, `IPC TIMEOUT=PASS`,
-   `IPC BP SENDER RESUMED=PASS`, `IPC BP BACKPRESSURE=PASS` and
-   `IPC EXIT WAKE=PASS`.
+   `IPC BP SENDER RESUMED=PASS`, `IPC BP BACKPRESSURE=PASS`,
+   `IPC EXIT WAKE=PASS`, `SECURITY IPC SENDER=PASS`,
+   `SECURITY MUTEX NONOWNER=PASS`, `SECURITY MUTEX OWNER=PASS` and
+   `SECURITY SLEEP OVERFLOW=PASS`.
 6. Update the README checklist and this file.
