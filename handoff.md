@@ -34,7 +34,7 @@ IPC BP BACKPRESSURE=PASS
 IPC EXIT WAKE=PASS
 ```
 
-Shell QEMU checks observed the wolf screen, `silver@silvershell`, changing uptime,
+Shell QEMU checks observed the `logo.txt` screen, `silver@silvershell`, changing uptime,
 RAM and fastfetch. `ps` showed kernel/nameserver/shell states; `spawn demo 12`
 created a sleeping task with argument 12, and release `spawn demo 20` ran the heap
 probe and reaped it before the next `ps`. Invalid decimal arguments were rejected.
@@ -436,7 +436,7 @@ and the full-mailbox selective-receive limitation recorded above.
    bugs that debug builds can hide. For regressions, separately build with
    `--features no_std,demo-tasks`; this replaces the interactive boot.
 5. For the default profile, type `help`, `fastfetch`, `ps` and a `spawn` command;
-   verify the wolf screen, live uptime/RAM, task metadata and spawned task ID.
+   verify the `logo.txt` screen, live uptime/RAM, task metadata and spawned task ID.
    For demo-tasks, run 5–30 seconds,
    repeat timing-sensitive runs and expect exactly two intentional faults from
    tasks 15 and 16, plus

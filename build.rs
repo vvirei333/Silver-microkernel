@@ -2,6 +2,7 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=userspace");
+    println!("cargo:rerun-if-changed=logo.txt");
     if env::var_os("CARGO_FEATURE_NO_STD").is_none() {
         return;
     }

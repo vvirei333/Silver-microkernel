@@ -12,16 +12,7 @@ const LINE_CAPACITY: usize = 96;
 const TICKS_PER_SECOND: u64 = 100;
 const MIB: u64 = 1024 * 1024;
 
-const WOLF: [&str; 8] = [
-    "   /\\_/\\              ",
-    "  ( o.o )             ",
-    "   > ^ <              ",
-    "  /|   |\\             ",
-    " / |   | \\            ",
-    "   |___|              ",
-    "  /     \\             ",
-    "                      ",
-];
+const LOGO: &str = include_str!("../../../logo.txt");
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -183,18 +174,18 @@ fn fastfetch() {
     let uptime = syscall::uptime_ticks();
     let memory = syscall::memory_info();
 
-    field(WOLF[0], "silver@silvershell");
-    field(WOLF[1], "---------------");
-    field(WOLF[2], "OS: Silver Microkernel");
-    field(WOLF[3], "Kernel: Rust / AArch64");
-    field(WOLF[4], "Shell: silvershell");
+    print_logo();
+    syscall::print("\r\n");
+    field("silver@silvershell");
+    field("---------------");
+    field("OS: Silver Microkernel");
+    field("Kernel: Rust / AArch64");
+    field("Shell: silvershell");
 
-    syscall::print(WOLF[5]);
     syscall::print("Uptime: ");
     print_uptime(uptime);
     syscall::print("\r\n");
 
-    syscall::print(WOLF[6]);
     syscall::print("Memory: ");
     if let Some(info) = memory {
         print_mib(info.used_bytes);
@@ -205,7 +196,6 @@ fn fastfetch() {
     }
     syscall::print("\r\n");
 
-    syscall::print(WOLF[7]);
     syscall::print("Free RAM: ");
     if let Some(info) = memory {
         print_mib(info.free_bytes);
@@ -215,8 +205,26 @@ fn fastfetch() {
     syscall::print("\r\n");
 }
 
-fn field(logo: &str, text: &str) {
-    syscall::print(logo);
+fn print_logo() {
+    let start = LOGO
+        .lines()
+        .position(|line| !line.trim().is_empty())
+        .unwrap_or(0);
+    let end = LOGO
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| !line.trim().is_empty())
+        .map(|(index, _)| index + 1)
+        .last()
+        .unwrap_or(start);
+
+    for line in LOGO.lines().skip(start).take(end - start) {
+        syscall::print(line.trim_end());
+        syscall::print("\r\n");
+    }
+}
+
+fn field(text: &str) {
     syscall::print(text);
     syscall::print("\r\n");
 }

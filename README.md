@@ -26,7 +26,7 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
 - [x] Three userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
-- [x] silvershell: `help`, `fastfetch`, `ps`, `spawn`, wolf ASCII art and clean MVP boot
+- [x] silvershell: `help`, `fastfetch`, `ps`, `spawn`, `logo.txt` ASCII art and clean MVP boot
 - [x] Shell syscalls: `SYS_READ`, `SYS_UPTIME`, `SYS_MEMINFO` and `SYS_TASK_LIST`
 - [x] Per-task TTBR0 spaces: independent ELF image, fixed-VA stack and private page
 - [x] Growable per-task heap: sparse 2 MB window, `brk`, zero-fill and cleanup on exit
@@ -123,7 +123,7 @@ ELFs; no separate userspace command is needed.
 | `src/elf_loader.rs` | Static ELF64/AArch64 `PT_LOAD` loader and image ownership |
 | `src/user_program.rs` | Program IDs and embedded userspace ELF selection |
 | `userspace/src/allocator.rs` | Per-task first-fit `malloc/free` over `SYS_BRK` |
-| `userspace/src/bin/silvershell.rs` | Interactive shell and wolf fastfetch screen |
+| `userspace/src/bin/silvershell.rs` | Interactive shell and `logo.txt` fastfetch screen |
 | `userspace/` | Separate demo, nameserver and shell EL0 programs plus syscall wrappers |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
@@ -194,3 +194,7 @@ their sends fail instead of recreating the dead mailbox. Demos verify timeout,
 backpressure on the seventeenth send, FIFO delivery and exit wakeup.
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).

@@ -3,6 +3,7 @@ name = "silver_microkernel"
 version = "0.1.0"
 edition = "2021"
 description = "AArch64 mobile microkernel with a Rust foundation"
+license = "MIT"
 
 [features]
 default = ["std"]
