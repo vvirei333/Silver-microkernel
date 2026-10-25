@@ -12,7 +12,11 @@ use core::panic::PanicInfo;
 
 #[no_mangle]
 #[link_section = ".text._start"]
-pub extern "C" fn _start(_argument: u64) -> ! {
+pub extern "C" fn _start(silverd_id: u64) -> ! {
+    if silverd_id != 0 {
+        let ready = ipc::Message::new(0, b"SCOUT READY");
+        let _ = syscall::send(silverd_id, &ready);
+    }
     nameserver::run()
 }
 

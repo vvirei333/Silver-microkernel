@@ -30,7 +30,8 @@ fn main() {
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     for (binary, embedded) in [
         ("silver_userspace", "silver_userspace.elf"),
-        ("nameserver", "silver_nameserver.elf"),
+        ("silverd", "silverd.elf"),
+        ("scout", "scout.elf"),
         ("silvershell", "silvershell.elf"),
         ("ls", "ls.elf"),
         ("cat", "cat.elf"),

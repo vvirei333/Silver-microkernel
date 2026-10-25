@@ -67,9 +67,12 @@ const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
 const IO_LIMIT: usize = 4096;
 
-/// Well-known task ID of the nameserver. Fixed by spawn order: the scheduler
-/// spawns it first, right after idle (which is always ID 0).
-pub const NAMESERVER_ID: u64 = 1;
+/// Well-known Scout task ID. Demo boot starts Scout directly after idle;
+/// normal boot starts silverd first and lets silverd create Scout second.
+#[cfg(feature = "demo-tasks")]
+pub const SCOUT_ID: u64 = 1;
+#[cfg(not(feature = "demo-tasks"))]
+pub const SCOUT_ID: u64 = 2;
 
 /// Longest name the nameserver protocol carries: payload is 32 bytes, two go
 /// to the "R "/"L " prefix.
@@ -563,7 +566,7 @@ fn sys_receive(buffer_ptr: u64, timeout_ticks: u64) -> u64 {
 }
 
 // Nameserver RPC. These syscalls do a full request/reply round trip over
-// IPC: build a text request, send it to NAMESERVER_ID, block in receive()
+// IPC: build a text request, send it to SCOUT_ID, block in receive()
 // for the reply. The nameserver itself never calls these.
 
 fn sys_register_name(name_ptr: u64) -> u64 {
@@ -574,10 +577,10 @@ fn sys_register_name(name_ptr: u64) -> u64 {
         return SYSCALL_ERROR;
     };
 
-    if ipc::send(NAMESERVER_ID, request).is_err() {
+    if ipc::send(SCOUT_ID, request).is_err() {
         return SYSCALL_ERROR;
     }
-    let reply = ipc::receive_from(NAMESERVER_ID);
+    let reply = ipc::receive_from(SCOUT_ID);
     if reply.text() == &b"OK"[..] {
         0
     } else {
@@ -593,10 +596,10 @@ fn sys_unregister_name(name_ptr: u64) -> u64 {
         return SYSCALL_ERROR;
     };
 
-    if ipc::send(NAMESERVER_ID, request).is_err() {
+    if ipc::send(SCOUT_ID, request).is_err() {
         return SYSCALL_ERROR;
     }
-    let reply = ipc::receive_from(NAMESERVER_ID);
+    let reply = ipc::receive_from(SCOUT_ID);
     if reply.text() == &b"OK"[..] {
         0
     } else {
@@ -612,10 +615,10 @@ fn sys_lookup_name(name_ptr: u64) -> u64 {
         return 0;
     };
 
-    if ipc::send(NAMESERVER_ID, request).is_err() {
+    if ipc::send(SCOUT_ID, request).is_err() {
         return SYSCALL_ERROR;
     }
-    let reply = ipc::receive_from(NAMESERVER_ID);
+    let reply = ipc::receive_from(SCOUT_ID);
     match parse_id_reply(&reply) {
         Some(id) => id,
         None => 0,

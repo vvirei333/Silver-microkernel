@@ -240,21 +240,19 @@ pub fn init() {
 
     // Idle always exists, so the CPU has somewhere to run when all tasks sleep.
     let _idle_id = spawn_kernel(idle_task);
-    // Program IDs select an ELF; arguments select a role inside the demo ELF.
-    // Nameserver remains the first userspace task (ID 1) by protocol contract.
-    let _nameserver_id = spawn_user(user_program::NAMESERVER, 0);
 
-    // The default boot is a clean interactive MVP. Regression demos are opt-in
-    // so their intentional faults and periodic output cannot bury the shell.
+    // Normal boot enters userspace only through silverd. The regression profile
+    // keeps Scout at task ID 1 because the demo IPC protocol depends on it.
     #[cfg(not(feature = "demo-tasks"))]
     {
-        let shell_id =
-            spawn_user(user_program::SILVERSHELL, 0).expect("silvershell must be created at boot");
-        let _ = set_console_owner(shell_id);
+        let silverd_id =
+            spawn_user(user_program::SILVERD, 0).expect("silverd must be created at boot");
+        let _ = set_console_owner(silverd_id);
     }
 
     #[cfg(feature = "demo-tasks")]
     {
+        let _scout_id = spawn_user(user_program::SCOUT, 0);
         for role in 2..=16 {
             let _ = spawn_user(user_program::DEMO, role);
         }
@@ -269,7 +267,7 @@ pub fn init() {
         let _security_probe = spawn_user(user_program::DEMO, 27);
     }
 
-    let first_id = if cfg!(feature = "demo-tasks") { 1 } else { 2 };
+    let first_id = 1;
     let manager = scheduler_manager().unwrap();
     manager.current_index = manager
         .tasks
@@ -516,7 +514,7 @@ fn recover_console(manager: &mut TaskManager, exited: u64) {
     let fallback = manager
         .tasks
         .iter()
-        .find(|task| task.state != TaskState::Dead && task.program == user_program::SILVERSHELL)
+        .find(|task| task.state != TaskState::Dead && task.program == user_program::HOWL)
         .map(|task| task.id);
     for task in &mut manager.tasks {
         task.owns_console = Some(task.id) == fallback;
@@ -1286,7 +1284,7 @@ impl Task {
         };
 
         let mut cap_table = capability::CapTable::new();
-        if user.map(|(program, _)| program) == Some(user_program::UART_DRIVER) {
+        if user.map(|(program, _)| program) == Some(user_program::HOWLER) {
             cap_table.insert(id, capability::CAP_MMIO | capability::CAP_IRQ);
         }
 

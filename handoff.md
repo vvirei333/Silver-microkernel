@@ -3,15 +3,21 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (UART RX IRQ and security hardening)
+## State as of 2026-10-26 (silverd init and Ring 3 UART IPC)
 
-Latest verified features: **hardware PL011 RX interrupts and focused syscall
-hardening**. The QEMU virt DTB describes the PL011 interrupt as SPI 1,
-level-high, which is GIC INTID 33. PL011 RXIM and RTIM feed a bounded 256-byte
-kernel FIFO; the IRQ handler drains the hardware FIFO completely. `SYS_READ`
-now reads only that software queue and never polls hardware. The timer no longer
-polls UART. Ctrl-Z (`0x1A`) still becomes a stop request, but the UART IRQ calls
-`schedule()` only when a foreground task was actually stopped.
+Latest verified architecture: **silverd -> Scout, Howl, Howler**. Normal boot
+creates only silverd (task 1). Silverd spawns Scout (task 2), waits for its
+`SCOUT READY` IPC handshake, spawns Howl (task 3) with Howler's ID as its
+argument, transfers the console, then spawns Howler (task 4) with Howl's ID.
+Howler maps PL011 and binds INTID 33; Howl receives only Howler's one-byte IPC
+messages. Kernel UART RX remains a demo/fallback path, not the normal Howl input
+path. `demo-tasks` does not start silverd and keeps Scout at task ID 1.
+
+The QEMU virt DTB describes the PL011 interrupt as SPI 1, level-high, which is
+GIC INTID 33. The kernel fallback uses PL011 RXIM and RTIM with a bounded
+256-byte FIFO; its IRQ handler drains the hardware FIFO completely. `SYS_READ`
+reads only that software queue and never polls hardware. The timer no longer
+polls UART. In the unbound fallback, Ctrl-Z (`0x1A`) still becomes a stop request.
 
 Keep `GICD_ICFGR = 0b00` for this level-sensitive interrupt. `0b10` means
 edge-triggered and left input stuck during development. RX timeout (RTIM) is
@@ -19,10 +25,12 @@ required so a single keypress does not wait for the RX FIFO threshold.
 
 The interactive profile still has one UART owner. `spawn` and `bg` create children
 without it; `fg <cap>` resumes a stopped task or foregrounds a live one, then waits
-for either exit or stop. Ctrl-Z changes the child to `Stopped`, returns the console
-to the shell and wakes the foreground waiter. `ps` reports state code 7 as
-`stopped`. `SYS_TASK_RESUME = 40` and `SYS_WAIT_EVENT = 41` implement resume and
-the `Exited`/`Stopped` event split; old `SYS_WAIT` still waits only for exit.
+for either exit or stop. In the unbound kernel UART fallback, Ctrl-Z changes the
+child to `Stopped`, returns the console to the shell and wakes the foreground
+waiter. The normal Howler IPC path does not yet implement that Ctrl-Z line
+discipline. `ps` reports state code 7 as `stopped`. `SYS_TASK_RESUME = 40` and
+`SYS_WAIT_EVENT = 41` implement resume and the `Exited`/`Stopped` event split;
+old `SYS_WAIT` still waits only for exit.
 
 A stopped task keeps `resume_state`: `Running` becomes `Ready`, while sleep and
 blocked waits retain their deadlines/queue membership. Expiry or notification
@@ -50,9 +58,10 @@ Device-nGnRnE into a first-fit 2 MB user window at `0x80000000`.
 `SYS_TRY_SEND = 65` rejects a full or dead mailbox without blocking.
 Bound level-triggered IRQs are masked before GIC EOI, then unmasked by
 `bind_irq` and every `wait_irq` call to prevent an IRQ storm while EL0 handles
-the device. Program 8 (`uart_driver`) receives self capabilities with CAP_MMIO
-and CAP_IRQ at spawn; it maps PL011, binds INTID 33 and sends received bytes
-to the shell through nonblocking IPC without entering the kernel PL011 handler.
+the device. Program 4 (Howler) receives self capabilities with CAP_MMIO and
+CAP_IRQ at spawn, plus an explicit CAP_GRANT from silverd. It maps PL011, binds
+INTID 33 and sends received bytes to Howl through nonblocking IPC without
+entering the kernel PL011 handler.
 
 Debug and release QEMU both passed IRQ-only `uname`, `echo` and `pwd`; sleeping
 `demo 12` stop/resume/kill/wait; and blocked `demo 7` with IPC delivered while
@@ -127,9 +136,9 @@ Important fixes and invariants from the recent work must be preserved:
 7. **Exit must switch even when only idle is ready.** Reaping can reset the
    current index to zero. `next_index == current_index` is skippable only for
    a live task; a dead task still switches to idle and saves into BOOT_CONTEXT.
-8. **Nameserver RPC uses selective receive.** `receive_from(NAMESERVER_ID)`
-   leaves unrelated messages queued. Plain receive could consume a PING as a
-   lookup reply, lose the real reply and create a persistent WHAT? loop.
+8. **Scout RPC uses selective receive.** `receive_from(SCOUT_ID)` leaves
+   unrelated messages queued. Plain receive could consume a PING as a lookup
+   reply, lose the real reply and create a persistent WHAT? loop.
 9. **Mutex ownership and wait membership belong to the task.** Reaping removes
    dead waiters, releases owned mutexes and wakes the next FIFO waiter before
    freeing stacks or address spaces.
@@ -161,10 +170,9 @@ cargo build --target aarch64-unknown-none --no-default-features --features no_st
 For bare-metal profiles, `build.rs` invokes Cargo in `userspace/`, uses
 `target/userspace` as its target directory, matches debug/release profile and
 copies every userspace ELF into `OUT_DIR`. `src/user_program.rs` assigns IDs
-0 (demo), 1 (nameserver), 2 (shell), 3 (ls), 4 (cat), 5 (echo), 6 (say),
-7 (sl) and 8 (uart_driver). Host builds skip userspace. The default scheduler
-starts shell ID 2 after the nameserver; `demo-tasks` replaces the shell boot
-with the regression task set.
+0 (demo), 1 (silverd), 2 (Scout), 3 (Howl), 4 (Howler), 5 (ls), 6 (cat),
+7 (echo), 8 (say) and 9 (sl). Host builds skip userspace. Normal boot starts
+only silverd; `demo-tasks` starts Scout and the regression task set instead.
 
 Interactive QEMU: `qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M
 -nographic -kernel target/aarch64-unknown-none/debug/silver_microkernel`.
@@ -259,16 +267,16 @@ read back only their own values.
 
 ## EL0 execution and lifecycle model
 
-- `SYS_SPAWN(program, argument)` selects program 0 (demo), 1 (nameserver) or 2
-  (silvershell). `scheduler::spawn_user` creates a kernel stack, an 8 KB user
-  stack, a private page and an independent ELF copy before constructing TTBR0.
-  Only idle remains an EL1 task.
+- `SYS_SPAWN(program, argument)` selects any embedded program ID from the table
+  above. `scheduler::spawn_user` creates a kernel stack, an 8 KB user stack, a
+  private page and an independent ELF copy before constructing TTBR0. Only idle
+  remains an EL1 task.
 - A fresh user context has high SP_EL1, the ELF entry in x19, the argument in
   x20 and SP_EL0 = `0x7FE00000 + 0x2000`. `silver_user_bootstrap` moves x20 to
   x0, sets ELR_EL1 = x19 and SPSR_EL1 = 0, then executes `eret`.
 - Demo roles are selected by the argument in `userspace/src/main.rs`, not by
-  task ID. Nameserver, shell and utilities have separate executables in
-  `userspace/src/bin/`.
+  task ID. Silverd, Scout, Howl, Howler and utilities have separate executables
+  in `userspace/src/bin/`.
 - The scheduler switches only TTBR0_EL1, then performs
   `tlbi vmalle1; dsb ish; isb`. High kernel text and SP_EL1 remain valid
   through TTBR1 throughout the switch.
@@ -332,7 +340,7 @@ read back only their own values.
 - Exit and kill clear the task mailbox, wake both receiver and sender waiters
   before freeing its condvars, and close every VFS descriptor owned by that task.
   If the dead task owned the interactive console, `recover_console` gives it to
-  the first live silvershell before scheduling; `demo-tasks` instead only clears
+  the first live Howl before scheduling; `demo-tasks` instead only clears
   the dead task's shared-console flag. Reaping removes stale waiters, releases
   owned mutexes, wakes the next waiter, then frees ELF pages, heap frames, page
   tables, private page and both stacks. A woken sender rechecks liveness and
@@ -373,46 +381,50 @@ read back only their own values.
 - There is no persistence or file-size quota yet. Repeated writes extend the
   in-memory file through the kernel heap.
 
-## silvershell
+## Howl (silvershell.rs)
 
-- `silvershell.rs` is an independent no_std/no_main ELF with no allocator. It
-  uses a 96-byte line buffer, accepts printable ASCII and CR/LF, echoes input,
-  and implements Backspace/DEL by removing the last byte and erasing it onscreen.
-- Before the EL0 driver is started, UART input uses the nonblocking kernel
-  syscall and PL011 INTID 33 fills the kernel FIFO. `start_uart_driver` spawns
-  program 8 in the background with the shell's real Task ID as its argument.
-  The driver then sends one-byte IPC messages directly to that mailbox; the
-  shell polls with a zero timeout, accepts only the spawned driver's sender ID,
-  and sleeps 1 ms when empty. The kernel transfers mailbox data but no longer
-  reads UART bytes or forwards them to the shell. Output still uses SYS_PRINT.
+- Howl is an independent no_std/no_main ELF with no allocator. It uses a
+  96-byte line buffer, accepts printable ASCII and CR/LF, echoes input, and
+  implements Backspace/DEL by removing the last byte and erasing it onscreen.
+- Normal boot is automatic: silverd starts Scout and waits for its `SCOUT READY`
+  IPC, then starts Howl (task 3) with Howler's future ID 4 as its argument, gives
+  Howl the console, and starts Howler (task 4) with Howl's real ID 3. There is no
+  manual `start_uart_driver` command. Howler maps PL011, binds INTID 33 and sends
+  one-byte IPC messages directly to Howl's mailbox. Howl polls with a zero
+  timeout, accepts only sender ID 4 and sleeps 1 ms when empty. The kernel
+  transfers mailbox data but does not read UART bytes or forward them to Howl.
+  Output still uses SYS_PRINT.
 - Startup emits ANSI clear/home, runs fastfetch once and shows a bold cyan
-  `silvershell>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`,
-  `say`, `sl`, `start_uart_driver`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`,
-  `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill` and `wait`; empty lines
-  only reprompt. Echo parsing preserves quoted spaces, strips outer quotes and
-  recognizes `>`/`>>` only outside quotes. `mv old new` takes a full destination
-  path, not just a directory.
+  `howl>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`,
+  `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`,
+  `spawn`, `bg`, `fg`, `kill` and `wait`; empty lines only reprompt. Echo parsing
+  preserves quoted spaces, strips outer quotes and recognizes `>`/`>>` only
+  outside quotes. `mv old new` takes a full destination path, not just a directory.
 - `ls`, `cat`, ordinary `echo` and `say` spawn separate EL0 utilities with
   string args and inherited cwd. `say` preserves spaces and strips paired outer
   quotes. `sl` runs a 60-frame ANSI steam-locomotive animation. `run_utility`
-  gives the child the console and uses wait_event, so either exit or Ctrl-Z
-  returns control to the shell. `echo text > path` truncates/creates;
-  `echo text >> path` appends/creates directly through VFS. `mkdir`, `rm`,
-  `rmdir`, `mv`, `cd` and `pwd` are direct syscalls.
+  gives the child the console and uses wait_event for Exited/Stopped events.
+  `echo text > path` truncates/creates; `echo text >> path` appends/creates
+  directly through VFS. `mkdir`, `rm`, `rmdir`, `mv`, `cd` and `pwd` are direct
+  syscalls.
 - `ps` uses a fixed 32-entry userspace array and prints ID/program/argument/state,
   including `stopped`. `spawn` and `bg` parse an optional checked decimal u64 and
-  create a task without console ownership. `fg <id>` calls resume, transfers the
-  console and waits for an Exited/Stopped event. Ctrl-Z prints `Stopped task ID=N`
-  and returns the prompt; another fg continues the same task. `kill` works on
-  stopped tasks, and plain `wait` still reports only termination status.
+  create a task without console ownership. `fg <cap>` calls resume, transfers the
+  console and waits for an Exited/Stopped event. `kill` works on stopped tasks,
+  and plain `wait` still reports only termination status.
+- Current limitation: the unbound kernel UART fallback consumes Ctrl-Z (`0x1A`)
+  as a stop request, but the normal Howler IPC path forwards it as an ordinary
+  byte and Howl ignores it. Ctrl-Z line discipline must be added to the EL0 path
+  before interactive stop/resume works there.
 - Background task output is dropped rather than buffered, so early output cannot
   be replayed by `fg`. Only output produced after the transfer becomes visible.
 - Fastfetch converts ticks to seconds with hundredths and bytes to tenths of a
   MiB. Its three memory counters come from SYS_MEMINFO, not hardcoded free RAM.
   The architecture row is `Kernel: AArch64`.
-- The default clean boot selects task ID 2 (shell) after nameserver ID 1 and
-  explicitly makes it console owner. `demo-tasks` selects task ID 1, preserves
-  the earlier regression IDs and opts every demo into shared UART output.
+- Normal boot starts only silverd (task 1) in the kernel; silverd creates Scout
+  (task 2), Howl (task 3) and Howler (task 4). `demo-tasks` does not start
+  silverd: Scout remains task 1, the earlier regression IDs are preserved and
+  every demo opts into shared UART output.
 
 ## Userspace allocation
 
@@ -498,11 +510,11 @@ read back only their own values.
 9. **SVC register preservation starts before ESR decoding.** x9/x10 are user
    registers, not free scratch. The sync entry saves/restores them around its
    dispatch check; the full 272-byte frame is built afterwards.
-10. **Nameserver holds the well-known ID NAMESERVER_ID = 1**, fixed by spawn
-    order in `scheduler::init` (first after idle). Protocol: text over mailbox
-    messages, "R <name>" → "OK"/"TAKEN", "L <name>" → "ID <n>"/"MISSING",
-    and "U <name>" → "OK"/"MISSING"/"NOT OWNER". Kernel RPC uses
-    `receive_from(NAMESERVER_ID)`, so unrelated queued messages are preserved.
+10. **Scout holds the well-known SCOUT_ID**, fixed by spawn order: 2 in normal
+    boot and 1 in `demo-tasks`. Protocol: text over mailbox messages,
+    "R <name>" → "OK"/"TAKEN", "L <name>" → "ID <n>"/"MISSING", and
+    "U <name>" → "OK"/"MISSING"/"NOT OWNER". Kernel RPC uses
+    `receive_from(SCOUT_ID)`, so unrelated queued messages are preserved.
 11. **Cross-crate syscall structures have a stable layout.** `Message` is
     `#[repr(C)]` in kernel and userspace. Apply the same rule to future
     structs passed by pointer across the SVC boundary.

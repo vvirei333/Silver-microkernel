@@ -26,7 +26,7 @@ impl Entry {
 
 pub fn run() -> ! {
     let mut table = [Entry::EMPTY; MAX_ENTRIES];
-    syscall::print("NAMESERVER READY\r\n");
+    syscall::print("SCOUT READY\r\n");
 
     loop {
         let mut request = ipc::Message::new(0, b"");
@@ -54,7 +54,7 @@ fn register(table: &mut [Entry], name: &[u8], id: u64) -> ipc::Message {
     entry.id = id;
     entry.used = true;
 
-    syscall::print("NAMESERVER REG ");
+    syscall::print("SCOUT REG ");
     syscall::print(core::str::from_utf8(name).unwrap_or("?"));
     syscall::print("\r\n");
     text_reply(b"OK")
@@ -68,7 +68,7 @@ fn unregister(table: &mut [Entry], name: &[u8], owner: u64) -> ipc::Message {
         return text_reply(b"MISSING");
     };
     entry.used = false;
-    syscall::print("NAMESERVER UNREG ");
+    syscall::print("SCOUT UNREG ");
     syscall::print(core::str::from_utf8(name).unwrap_or("?"));
     syscall::print("\r\n");
     text_reply(b"OK")

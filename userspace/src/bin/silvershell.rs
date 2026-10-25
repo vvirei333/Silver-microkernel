@@ -14,20 +14,18 @@ const MIB: u64 = 1024 * 1024;
 
 const LOGO: &str = include_str!("../../../logo.txt");
 
-static mut UART_DRIVER_ID: u64 = 0;
-
 #[no_mangle]
 #[link_section = ".text._start"]
-pub extern "C" fn _start(_argument: u64) -> ! {
+pub extern "C" fn _start(howler_id: u64) -> ! {
     syscall::print("\x1b[2J\x1b[H");
     fastfetch();
-    syscall::print("\r\nsilvershell ready. Type 'help' for commands.\r\n");
+    syscall::print("\r\nhowl ready. Type 'help' for commands.\r\n");
     prompt();
 
     let mut line = [0_u8; LINE_CAPACITY];
     let mut length = 0_usize;
     loop {
-        let Some(byte) = read_input() else {
+        let Some(byte) = read_input(howler_id) else {
             syscall::sleep(1);
             continue;
         };
@@ -58,19 +56,14 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     }
 }
 
-fn read_input() -> Option<u8> {
-    let driver_id = unsafe { UART_DRIVER_ID };
-    if driver_id == 0 {
-        return syscall::read();
-    }
-    if !syscall::task_alive(driver_id) {
-        unsafe { UART_DRIVER_ID = 0 };
-        return syscall::read();
+fn read_input(howler_id: u64) -> Option<u8> {
+    if howler_id == 0 || !syscall::task_alive(howler_id) {
+        return None;
     }
 
     let mut message = ipc::Message::new(0, &[]);
     match syscall::receive_timeout(&mut message, 0) {
-        Ok(()) if message.sender == driver_id => Some(message.payload[0]),
+        Ok(()) if message.sender == howler_id => Some(message.payload[0]),
         _ => None,
     }
 }
@@ -98,7 +91,7 @@ fn execute(command: &str) {
     match words.next() {
         None => {}
         Some("help") => {
-            syscall::print("silvershell commands:\r\n");
+            syscall::print("howl commands:\r\n");
             syscall::print("  help       Show this command list\r\n");
             syscall::print("  fastfetch  Show OS, uptime and memory information\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
@@ -107,8 +100,6 @@ fn execute(command: &str) {
             syscall::print("             Print, truncate/write, or append to a file\r\n");
             syscall::print("  say <text> Print text\r\n");
             syscall::print("  sl         Run an animated steam locomotive\r\n");
-            syscall::print("  start_uart_driver\r\n");
-            syscall::print("             Route UART input through the EL0 driver and IPC\r\n");
             syscall::print("  mkdir <path>\r\n");
             syscall::print("  rm <file>  Remove a closed file\r\n");
             syscall::print("  rmdir <path>\r\n");
@@ -120,9 +111,7 @@ fn execute(command: &str) {
             syscall::print("  clear      Clear the terminal screen\r\n");
             syscall::print("  uname      Print kernel name, version and architecture\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
-            syscall::print(
-                "  spawn <demo|nameserver|silvershell|ls|cat|echo|say|sl|uart_driver> [arg]\r\n",
-            );
+            syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl> [arg]\r\n");
             syscall::print("  bg <program> [arg]\r\n");
             syscall::print("             Spawn without console ownership\r\n");
             syscall::print("  fg <cap>   Resume a task in the foreground\r\n");
@@ -134,7 +123,6 @@ fn execute(command: &str) {
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
-        Some("start_uart_driver") => start_uart_driver(),
         Some("mkdir") => make_directory(words.next()),
         Some("rm") => remove_file(words.next()),
         Some("rmdir") => remove_directory(words.next()),
@@ -150,31 +138,6 @@ fn execute(command: &str) {
         Some("wait") => wait_task(words.next()),
         Some(_) => syscall::print("Unknown command. Type 'help'.\r\n"),
     }
-}
-
-fn start_uart_driver() {
-    let previous = unsafe { UART_DRIVER_ID };
-    if previous != 0 && syscall::task_alive(previous) {
-        syscall::print("UART driver is already running.\r\n");
-        return;
-    }
-
-    let shell_id = syscall::task_id();
-    let Some(cap_id) = syscall::spawn(syscall::PROGRAM_UART_DRIVER, shell_id) else {
-        syscall::print("Could not start UART driver.\r\n");
-        return;
-    };
-    let Some(driver_id) = syscall::cap_get_task_id(cap_id) else {
-        syscall::print("Could not resolve UART driver Task ID.\r\n");
-        let _ = syscall::kill(cap_id);
-        let _ = syscall::wait(cap_id);
-        return;
-    };
-
-    unsafe { UART_DRIVER_ID = driver_id };
-    syscall::print("UART DRIVER STARTED: IPC input from Task ID=");
-    syscall::print_dec_u64(driver_id);
-    syscall::print("\r\n");
 }
 
 fn run_utility(program: u64, arguments: &str) {
@@ -464,14 +427,15 @@ fn show_tasks() {
 fn program_name(program: u64) -> &'static str {
     match program {
         syscall::PROGRAM_DEMO => "demo        ",
-        syscall::PROGRAM_NAMESERVER => "nameserver  ",
-        syscall::PROGRAM_SILVERSHELL => "silvershell ",
+        syscall::PROGRAM_SILVERD => "silverd     ",
+        syscall::PROGRAM_SCOUT => "scout       ",
+        syscall::PROGRAM_HOWL => "howl        ",
+        syscall::PROGRAM_HOWLER => "howler      ",
         syscall::PROGRAM_LS => "ls          ",
         syscall::PROGRAM_CAT => "cat         ",
         syscall::PROGRAM_ECHO => "echo        ",
         syscall::PROGRAM_SAY => "say         ",
         syscall::PROGRAM_SL => "sl          ",
-        syscall::PROGRAM_UART_DRIVER => "uart_driver ",
         _ => "kernel      ",
     }
 }
@@ -492,20 +456,21 @@ fn state_name(state: u64) -> &'static str {
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
         syscall::print(
-            "Usage: spawn <demo|nameserver|silvershell|ls|cat|echo|say|sl|uart_driver> [arg]\r\n",
+            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl> [arg]\r\n",
         );
         return;
     };
     let program = match program {
         "demo" => syscall::PROGRAM_DEMO,
-        "nameserver" => syscall::PROGRAM_NAMESERVER,
-        "silvershell" => syscall::PROGRAM_SILVERSHELL,
+        "silverd" => syscall::PROGRAM_SILVERD,
+        "scout" => syscall::PROGRAM_SCOUT,
+        "howl" => syscall::PROGRAM_HOWL,
+        "howler" => syscall::PROGRAM_HOWLER,
         "ls" => syscall::PROGRAM_LS,
         "cat" => syscall::PROGRAM_CAT,
         "echo" => syscall::PROGRAM_ECHO,
         "say" => syscall::PROGRAM_SAY,
         "sl" => syscall::PROGRAM_SL,
-        "uart_driver" => syscall::PROGRAM_UART_DRIVER,
         _ => {
             syscall::print("Unknown program. See 'help' for the program list.\r\n");
             return;
@@ -557,11 +522,11 @@ fn fastfetch() {
 
     print_logo();
     syscall::print("\r\n");
-    field("silver@silvershell");
+    field("silver@howl");
     field("---------------");
     field("OS: Silver Microkernel");
     field("Kernel: AArch64");
-    field("Shell: silvershell");
+    field("Shell: howl");
 
     syscall::print("Uptime: ");
     print_uptime(uptime);
@@ -635,7 +600,7 @@ fn clear_screen() {
 }
 
 fn prompt() {
-    syscall::print("\x1b[1;36msilvershell>\x1b[0m ");
+    syscall::print("\x1b[1;36mhowl>\x1b[0m ");
 }
 
 fn echo(byte: u8) {
