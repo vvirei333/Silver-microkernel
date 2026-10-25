@@ -11,7 +11,7 @@
 use alloc::{vec, vec::Vec};
 
 use crate::{
-    channel, frame_allocator, ipc, memory, mmu, mutex, pl011, scheduler, timer, user_memory,
+    channel, frame_allocator, ipc, memory, mmu, mutex, pl011, scheduler, timer, user_memory, vfs,
 };
 
 pub const SYS_SLEEP: u64 = 1;
@@ -36,6 +36,21 @@ pub const SYS_READ: u64 = 19;
 pub const SYS_UPTIME: u64 = 20;
 pub const SYS_MEMINFO: u64 = 21;
 pub const SYS_TASK_LIST: u64 = 22;
+pub const SYS_SPAWN_ARGS: u64 = 23;
+pub const SYS_ARGS: u64 = 24;
+pub const SYS_WAIT: u64 = 25;
+pub const SYS_KILL: u64 = 26;
+pub const SYS_FS_OPEN: u64 = 27;
+pub const SYS_FS_READ: u64 = 28;
+pub const SYS_FS_WRITE: u64 = 29;
+pub const SYS_FS_CREATE: u64 = 30;
+pub const SYS_FS_CLOSE: u64 = 31;
+pub const SYS_FS_READ_DIR: u64 = 32;
+pub const SYS_FS_MKDIR: u64 = 33;
+
+const ARGUMENT_LIMIT: usize = 192;
+const PATH_LIMIT: usize = 191;
+const IO_LIMIT: usize = 4096;
 
 /// Well-known task ID of the nameserver. Fixed by spawn order: the scheduler
 /// spawns it first, right after idle (which is always ID 0).
@@ -106,7 +121,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         }
         SYS_CHAN_RECV => DEMO_CHANNEL.receive(),
         SYS_SPAWN => scheduler::spawn_user(frame[0], frame[1]).unwrap_or(SYSCALL_ERROR),
-        SYS_EXIT => scheduler::exit_current(),
+        SYS_EXIT => scheduler::exit_current_with_status(frame[0]),
         SYS_UNREGISTER => sys_unregister_name(frame[0]),
         SYS_TASK_ALIVE => u64::from(scheduler::task_alive(frame[0])),
         SYS_BRK => scheduler::change_program_break(frame[0] as usize)
@@ -116,10 +131,154 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_UPTIME => timer::ticks(),
         SYS_MEMINFO => sys_meminfo(frame[0]),
         SYS_TASK_LIST => sys_task_list(frame[0], frame[1]),
+        SYS_SPAWN_ARGS => sys_spawn_with_args(frame[0], frame[1], frame[2], frame[3]),
+        SYS_ARGS => sys_arguments(frame[0], frame[1]),
+        SYS_WAIT => scheduler::wait_for_task(frame[0]).unwrap_or(SYSCALL_ERROR),
+        SYS_KILL => {
+            if scheduler::kill_task(frame[0]) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
+        SYS_FS_OPEN => sys_fs_open(frame[0], frame[1]),
+        SYS_FS_READ => sys_fs_read(frame[0], frame[1], frame[2]),
+        SYS_FS_WRITE => sys_fs_write(frame[0], frame[1], frame[2]),
+        SYS_FS_CREATE => sys_fs_create(frame[0]),
+        SYS_FS_CLOSE => sys_fs_close(frame[0]),
+        SYS_FS_READ_DIR => sys_fs_read_dir(frame[0], frame[1], frame[2]),
+        SYS_FS_MKDIR => sys_fs_mkdir(frame[0]),
         _ => SYSCALL_ERROR,
     };
 
     frame[0] = result;
+}
+
+fn sys_spawn_with_args(program: u64, argument: u64, ptr: u64, len: u64) -> u64 {
+    if len > ARGUMENT_LIMIT as u64 {
+        return SYSCALL_ERROR;
+    }
+    let mut arguments = vec![0_u8; len as usize];
+    if user_memory::copy_from_user(ptr, &mut arguments).is_err() {
+        return SYSCALL_ERROR;
+    }
+    scheduler::spawn_user_with_args(program, argument, arguments).unwrap_or(SYSCALL_ERROR)
+}
+
+fn sys_arguments(buffer_ptr: u64, capacity: u64) -> u64 {
+    let arguments = scheduler::current_task_arguments();
+    if arguments.len() > capacity as usize {
+        return SYSCALL_ERROR;
+    }
+    if arguments.is_empty() {
+        return 0;
+    }
+    if user_memory::copy_to_user(&arguments, buffer_ptr).is_err() {
+        return SYSCALL_ERROR;
+    }
+    arguments.len() as u64
+}
+
+fn sys_fs_open(path_ptr: u64, flags: u64) -> u64 {
+    with_path(path_ptr, |path| {
+        vfs::open(scheduler::current_task_id(), path, flags).unwrap_or(SYSCALL_ERROR)
+    })
+}
+
+fn sys_fs_create(path_ptr: u64) -> u64 {
+    with_path(path_ptr, |path| {
+        if vfs::create(path).is_ok() {
+            0
+        } else {
+            SYSCALL_ERROR
+        }
+    })
+}
+
+fn sys_fs_mkdir(path_ptr: u64) -> u64 {
+    with_path(path_ptr, |path| {
+        if vfs::mkdir(path).is_ok() {
+            0
+        } else {
+            SYSCALL_ERROR
+        }
+    })
+}
+
+fn sys_fs_close(fd: u64) -> u64 {
+    if vfs::close(scheduler::current_task_id(), fd).is_ok() {
+        0
+    } else {
+        SYSCALL_ERROR
+    }
+}
+
+fn sys_fs_read(fd: u64, buffer_ptr: u64, len: u64) -> u64 {
+    if len > IO_LIMIT as u64 {
+        return SYSCALL_ERROR;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let Ok(bytes) = vfs::read(scheduler::current_task_id(), fd, len as usize) else {
+        return SYSCALL_ERROR;
+    };
+    if !bytes.is_empty() && user_memory::copy_to_user(&bytes, buffer_ptr).is_err() {
+        return SYSCALL_ERROR;
+    }
+    bytes.len() as u64
+}
+
+fn sys_fs_write(fd: u64, buffer_ptr: u64, len: u64) -> u64 {
+    if len > IO_LIMIT as u64 {
+        return SYSCALL_ERROR;
+    }
+    if len == 0 {
+        return 0;
+    }
+    let mut bytes = vec![0_u8; len as usize];
+    if user_memory::copy_from_user(buffer_ptr, &mut bytes).is_err() {
+        return SYSCALL_ERROR;
+    }
+    vfs::write(scheduler::current_task_id(), fd, &bytes)
+        .map(|count| count as u64)
+        .unwrap_or(SYSCALL_ERROR)
+}
+
+fn sys_fs_read_dir(path_ptr: u64, buffer_ptr: u64, capacity: u64) -> u64 {
+    with_path(path_ptr, |path| {
+        let Ok(entries) = vfs::read_dir(path) else {
+            return SYSCALL_ERROR;
+        };
+        let count = entries.len().min(capacity as usize).min(64);
+        if count == 0 {
+            return 0;
+        }
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                entries.as_ptr().cast::<u8>(),
+                count * core::mem::size_of::<vfs::DirEntry>(),
+            )
+        };
+        if user_memory::copy_to_user(bytes, buffer_ptr).is_err() {
+            return SYSCALL_ERROR;
+        }
+        count as u64
+    })
+}
+
+fn with_path(path_ptr: u64, call: impl FnOnce(&str) -> u64) -> u64 {
+    let mut bytes = [0_u8; PATH_LIMIT + 1];
+    if user_memory::copy_from_user(path_ptr, &mut bytes).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Some(end) = bytes.iter().position(|byte| *byte == 0) else {
+        return SYSCALL_ERROR;
+    };
+    let Ok(path) = core::str::from_utf8(&bytes[..end]) else {
+        return SYSCALL_ERROR;
+    };
+    call(path)
 }
 
 fn sys_task_list(buffer_ptr: u64, capacity: u64) -> u64 {

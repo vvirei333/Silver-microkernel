@@ -6,7 +6,7 @@ use crate::{
     elf_loader::{self, UserImage},
     frame_allocator, interrupts,
     memory::{phys_to_virt, virt_to_phys, MemoryRegion, PAGE_SIZE},
-    mmu, mutex, pl011, timer, user_program,
+    mmu, mutex, pl011, timer, user_program, vfs,
     wait_queue::WaitQueue,
 };
 
@@ -75,6 +75,8 @@ pub struct Task {
     pub state: TaskState,
     pub program: u64,
     pub argument: u64,
+    /// Immutable byte string passed to SYS_ARGS in the new task.
+    arguments: Vec<u8>,
     pub context: TaskContext,
     /// Kernel stack: used for SVC/IRQ trampolines whenever the task runs.
     pub stack: MemoryRegion,
@@ -98,6 +100,8 @@ pub struct TaskManager {
     tasks: Vec<Task>,
     current_index: usize,
     next_id: u64,
+    /// Bounded completion records let wait() succeed even after reaping.
+    exit_statuses: Vec<(u64, u64)>,
 }
 
 // DEBUG: ring buffer of the last context switches (from, to, next sp, next elr).
@@ -148,6 +152,7 @@ struct SharedScheduler(UnsafeCell<Option<TaskManager>>);
 unsafe impl Sync for SharedScheduler {}
 
 static SCHEDULER: SharedScheduler = SharedScheduler(UnsafeCell::new(None));
+static PROCESS_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 static mut BOOT_CONTEXT: TaskContext = TaskContext::zero();
 
 core::arch::global_asm!(
@@ -216,6 +221,7 @@ pub fn init() {
         tasks: Vec::new(),
         current_index: 0,
         next_id: 0,
+        exit_statuses: Vec::new(),
     });
 
     // Idle always exists, so the CPU has somewhere to run when all tasks sleep.
@@ -358,14 +364,24 @@ pub fn unregister_mutex(state: *mut mutex::MutexState) {
     }
 }
 
-/// Terminates the current task and switches to another runnable task.
+const EXIT_STATUS_LIMIT: usize = 64;
+
+/// Terminates the current task successfully and switches to another task.
 pub fn exit_current() -> ! {
+    exit_current_with_status(0)
+}
+
+pub fn exit_current_with_status(status: u64) -> ! {
     let id = current_task_id();
     crate::ipc::remove_task(id);
+    vfs::close_task(id);
     let saved_daif = interrupts::save_and_disable_irq();
 
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Dead;
+    }
+    if let Some(manager) = scheduler_manager() {
+        record_exit(manager, id, status);
     }
 
     schedule();
@@ -373,6 +389,101 @@ pub fn exit_current() -> ! {
 
     loop {
         interrupts::wait_for_irq();
+    }
+}
+
+/// Kills a non-current userspace task. Reaping releases its VM, stacks and locks.
+pub fn kill_task(id: u64) -> bool {
+    if id == IDLE_TASK_ID || id == current_task_id() {
+        return false;
+    }
+    crate::ipc::remove_task(id);
+    vfs::close_task(id);
+
+    let saved_daif = interrupts::save_and_disable_irq();
+    let Some(manager) = scheduler_manager() else {
+        interrupts::restore_irq(saved_daif);
+        return false;
+    };
+    let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) else {
+        interrupts::restore_irq(saved_daif);
+        return false;
+    };
+    if task.state == TaskState::Dead {
+        interrupts::restore_irq(saved_daif);
+        return false;
+    }
+    task.state = TaskState::Dead;
+    record_exit(manager, id, 1);
+    schedule();
+    interrupts::restore_irq(saved_daif);
+    true
+}
+
+/// Waits for a task ID and consumes its completion record.
+pub fn wait_for_task(id: u64) -> Option<u64> {
+    if id == IDLE_TASK_ID || id == current_task_id() {
+        return None;
+    }
+    let saved_daif = interrupts::save_and_disable_irq();
+    loop {
+        let Some(manager) = scheduler_manager() else {
+            interrupts::restore_irq(saved_daif);
+            return None;
+        };
+        if let Some(index) = manager
+            .exit_statuses
+            .iter()
+            .position(|(task_id, _)| *task_id == id)
+        {
+            let (_, status) = manager.exit_statuses.remove(index);
+            interrupts::restore_irq(saved_daif);
+            return Some(status);
+        }
+        if !manager.tasks.iter().any(|task| task.id == id) {
+            interrupts::restore_irq(saved_daif);
+            return None;
+        }
+
+        let waiter = current_task_id();
+        PROCESS_WAIT_QUEUE.enqueue(waiter);
+        if let Some(task) = current_task_mut() {
+            task.waiting_on = Some(&PROCESS_WAIT_QUEUE);
+            task.state = TaskState::Blocked;
+        }
+        schedule();
+        PROCESS_WAIT_QUEUE.remove(waiter);
+        if let Some(task) = current_task_mut() {
+            task.waiting_on = None;
+        }
+    }
+}
+
+fn record_exit(manager: &mut TaskManager, id: u64, status: u64) {
+    if let Some(record) = manager
+        .exit_statuses
+        .iter_mut()
+        .find(|(task_id, _)| *task_id == id)
+    {
+        *record = (id, status);
+    } else {
+        if manager.exit_statuses.len() == EXIT_STATUS_LIMIT {
+            manager.exit_statuses.remove(0);
+        }
+        manager.exit_statuses.push((id, status));
+    }
+
+    while let Some(waiter) = PROCESS_WAIT_QUEUE.pop() {
+        if let Some(task) = manager
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == waiter && task.state != TaskState::Dead)
+        {
+            if matches!(task.state, TaskState::Blocked | TaskState::BlockedUntil(_)) {
+                task.state = TaskState::Ready;
+            }
+            task.waiting_on = None;
+        }
     }
 }
 
@@ -392,6 +503,13 @@ pub fn task_alive(id: u64) -> bool {
                 .any(|task| task.id == id && task.state != TaskState::Dead)
         })
         .unwrap_or(false)
+}
+
+pub fn current_task_arguments() -> Vec<u8> {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(manager.current_index))
+        .map(|task| task.arguments.clone())
+        .unwrap_or_default()
 }
 
 /// Snapshot for SYS_TASK_LIST. Numeric states are part of the userspace ABI.
@@ -561,18 +679,26 @@ pub fn schedule() {
 }
 
 fn spawn_kernel(entry: extern "C" fn() -> !) -> Option<u64> {
-    spawn_inner(Some(entry), None)
+    spawn_inner(Some(entry), None, Vec::new())
 }
 
 /// Creates a userspace task from a registered ELF and passes `argument` in x0.
 pub fn spawn_user(program: u64, argument: u64) -> Option<u64> {
-    spawn_inner(None, Some((program, argument)))
+    spawn_inner(None, Some((program, argument)), Vec::new())
 }
 
-fn spawn_inner(entry: Option<extern "C" fn() -> !>, user: Option<(u64, u64)>) -> Option<u64> {
+pub fn spawn_user_with_args(program: u64, argument: u64, arguments: Vec<u8>) -> Option<u64> {
+    spawn_inner(None, Some((program, argument)), arguments)
+}
+
+fn spawn_inner(
+    entry: Option<extern "C" fn() -> !>,
+    user: Option<(u64, u64)>,
+    arguments: Vec<u8>,
+) -> Option<u64> {
     let manager = scheduler_manager()?;
     let id = manager.next_id;
-    let task = Task::new(id, entry, user)?;
+    let task = Task::new(id, entry, user, arguments)?;
 
     manager.tasks.push(task);
     manager.next_id += 1;
@@ -675,7 +801,12 @@ fn current_task_mut() -> Option<&'static mut Task> {
 }
 
 impl Task {
-    fn new(id: u64, entry: Option<extern "C" fn() -> !>, user: Option<(u64, u64)>) -> Option<Self> {
+    fn new(
+        id: u64,
+        entry: Option<extern "C" fn() -> !>,
+        user: Option<(u64, u64)>,
+        arguments: Vec<u8>,
+    ) -> Option<Self> {
         let stack_start = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES)?;
 
         let user_stack = if user.is_some() {
@@ -750,6 +881,7 @@ impl Task {
             state: TaskState::Ready,
             program: user.map_or(u64::MAX, |(program, _)| program),
             argument: user.map_or(0, |(_, argument)| argument),
+            arguments,
             context,
             stack,
             user_stack,

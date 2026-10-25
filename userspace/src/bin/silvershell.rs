@@ -57,6 +57,16 @@ pub extern "C" fn _start(_argument: u64) -> ! {
 }
 
 fn execute(command: &str) {
+    let command = command.trim();
+    if command == "echo" {
+        run_utility(syscall::PROGRAM_ECHO, "");
+        return;
+    }
+    if let Some(arguments) = command.strip_prefix("echo ") {
+        execute_echo(arguments);
+        return;
+    }
+
     let mut words = command.split_whitespace();
     match words.next() {
         None => {}
@@ -64,14 +74,162 @@ fn execute(command: &str) {
             syscall::print("silvershell commands:\r\n");
             syscall::print("  help       Show this command list\r\n");
             syscall::print("  fastfetch  Show OS, uptime and memory information\r\n");
+            syscall::print("  ls [path]  List a directory (root by default)\r\n");
+            syscall::print("  cat <file> Print a file\r\n");
+            syscall::print("  echo <text> [> file]\r\n");
+            syscall::print("             Print text or truncate and write a file\r\n");
+            syscall::print("  mkdir <path>\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
-            syscall::print("  spawn <demo|nameserver|silvershell> [arg]\r\n");
-            syscall::print("             Start an embedded program with an optional argument\r\n");
+            syscall::print("  spawn <demo|nameserver|silvershell|ls|cat|echo> [arg]\r\n");
+            syscall::print("  kill <id>  Kill a task\r\n");
+            syscall::print("  wait <id>  Wait for a task and print its exit status\r\n");
         }
         Some("fastfetch") => fastfetch(),
+        Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
+        Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
+        Some("mkdir") => make_directory(words.next()),
         Some("ps") => show_tasks(),
         Some("spawn") => spawn_program(words.next(), words.next()),
+        Some("kill") => kill_task(words.next()),
+        Some("wait") => wait_task(words.next()),
         Some(_) => syscall::print("Unknown command. Type 'help'.\r\n"),
+    }
+}
+
+fn run_utility(program: u64, arguments: &str) {
+    let Some(id) = syscall::spawn_with_args(program, 0, arguments) else {
+        syscall::print("Could not start program.\r\n");
+        return;
+    };
+    match syscall::wait(id) {
+        Some(0) => {}
+        Some(status) => {
+            syscall::print("Program exited with status ");
+            syscall::print_dec_u64(status);
+            syscall::print("\r\n");
+        }
+        None => syscall::print("Could not wait for program.\r\n"),
+    }
+}
+
+fn execute_echo(arguments: &str) {
+    let Ok((text, destination)) = split_redirection(arguments) else {
+        syscall::print("echo: invalid quotes or redirection\r\n");
+        return;
+    };
+    let text = unquote(text.trim());
+    if let Some(path) = destination {
+        write_file(unquote(path.trim()), text);
+    } else {
+        run_utility(syscall::PROGRAM_ECHO, text);
+    }
+}
+
+fn split_redirection(input: &str) -> Result<(&str, Option<&str>), ()> {
+    let mut quote = None;
+    let mut redirect = None;
+    for (index, byte) in input.bytes().enumerate() {
+        match byte {
+            b'\'' | b'"' if quote == Some(byte) => quote = None,
+            b'\'' | b'"' if quote.is_none() => quote = Some(byte),
+            b'>' if quote.is_none() => {
+                if redirect.replace(index).is_some() {
+                    return Err(());
+                }
+            }
+            _ => {}
+        }
+    }
+    if quote.is_some() {
+        return Err(());
+    }
+    if let Some(index) = redirect {
+        let path = input[index + 1..].trim();
+        if path.is_empty() {
+            return Err(());
+        }
+        Ok((&input[..index], Some(path)))
+    } else {
+        Ok((input, None))
+    }
+}
+
+fn unquote(text: &str) -> &str {
+    let bytes = text.as_bytes();
+    if bytes.len() >= 2
+        && (bytes[0] == b'\'' || bytes[0] == b'"')
+        && bytes[bytes.len() - 1] == bytes[0]
+    {
+        &text[1..text.len() - 1]
+    } else {
+        text
+    }
+}
+
+fn write_file(path: &str, text: &str) {
+    if path.is_empty() || !syscall::fs_create(path) {
+        syscall::print("echo: cannot create file\r\n");
+        return;
+    }
+    let Some(fd) = syscall::fs_open(path, syscall::OPEN_WRITE) else {
+        syscall::print("echo: cannot open file\r\n");
+        return;
+    };
+    let ok = write_all(fd, text.as_bytes()) && write_all(fd, b"\r\n");
+    syscall::fs_close(fd);
+    if !ok {
+        syscall::print("echo: write failed\r\n");
+    }
+}
+
+fn write_all(fd: u64, bytes: &[u8]) -> bool {
+    let mut written = 0;
+    while written < bytes.len() {
+        match syscall::fs_write(fd, &bytes[written..]) {
+            Some(0) | None => return false,
+            Some(count) => written += count,
+        }
+    }
+    true
+}
+
+fn make_directory(path: Option<&str>) {
+    let Some(path) = path else {
+        syscall::print("Usage: mkdir <path>\r\n");
+        return;
+    };
+    if !syscall::fs_mkdir(path) {
+        syscall::print("mkdir: cannot create directory\r\n");
+    }
+}
+
+fn kill_task(id: Option<&str>) {
+    let Some(id) = id.and_then(parse_number) else {
+        syscall::print("Usage: kill <id>\r\n");
+        return;
+    };
+    if syscall::kill(id) {
+        syscall::print("Killed task ID=");
+        syscall::print_dec_u64(id);
+        syscall::print("\r\n");
+    } else {
+        syscall::print("kill: invalid task or task already exited\r\n");
+    }
+}
+
+fn wait_task(id: Option<&str>) {
+    let Some(id) = id.and_then(parse_number) else {
+        syscall::print("Usage: wait <id>\r\n");
+        return;
+    };
+    if let Some(status) = syscall::wait(id) {
+        syscall::print("Task ID=");
+        syscall::print_dec_u64(id);
+        syscall::print(" exited with status ");
+        syscall::print_dec_u64(status);
+        syscall::print("\r\n");
+    } else {
+        syscall::print("wait: unknown task or status already consumed\r\n");
     }
 }
 
@@ -106,6 +264,9 @@ fn program_name(program: u64) -> &'static str {
         syscall::PROGRAM_DEMO => "demo        ",
         syscall::PROGRAM_NAMESERVER => "nameserver  ",
         syscall::PROGRAM_SILVERSHELL => "silvershell ",
+        syscall::PROGRAM_LS => "ls          ",
+        syscall::PROGRAM_CAT => "cat         ",
+        syscall::PROGRAM_ECHO => "echo        ",
         _ => "kernel      ",
     }
 }
@@ -124,15 +285,18 @@ fn state_name(state: u64) -> &'static str {
 
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
-        syscall::print("Usage: spawn <demo|nameserver|silvershell> [arg]\r\n");
+        syscall::print("Usage: spawn <demo|nameserver|silvershell|ls|cat|echo> [arg]\r\n");
         return;
     };
     let program = match program {
         "demo" => syscall::PROGRAM_DEMO,
         "nameserver" => syscall::PROGRAM_NAMESERVER,
         "silvershell" => syscall::PROGRAM_SILVERSHELL,
+        "ls" => syscall::PROGRAM_LS,
+        "cat" => syscall::PROGRAM_CAT,
+        "echo" => syscall::PROGRAM_ECHO,
         _ => {
-            syscall::print("Unknown program. Use demo, nameserver or silvershell.\r\n");
+            syscall::print("Unknown program. See 'help' for the program list.\r\n");
             return;
         }
     };

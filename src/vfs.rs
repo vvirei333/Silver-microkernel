@@ -1,0 +1,335 @@
+//! Single-CPU in-memory file tree and per-task file descriptors.
+//!
+//! Paths are rooted at `/`; relative paths currently resolve from that same
+//! root. Handles store normalized lookups by path, so directory Vec growth
+//! never leaves a dangling pointer to a Node.
+
+use alloc::{string::String, vec::Vec};
+use core::cell::UnsafeCell;
+
+use crate::interrupts;
+
+pub const MAX_NAME_LEN: usize = 32;
+pub const OPEN_WRITE: u64 = 1;
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct DirEntry {
+    pub name: [u8; MAX_NAME_LEN],
+    pub name_len: u64,
+    pub kind: u64,
+}
+
+pub struct Node {
+    name: String,
+    kind: NodeKind,
+}
+
+enum NodeKind {
+    File(Vec<u8>),
+    Directory(Vec<Node>),
+}
+
+struct OpenFile {
+    owner: u64,
+    fd: u64,
+    path: String,
+    offset: usize,
+    writable: bool,
+}
+
+struct Vfs {
+    root: Node,
+    open_files: Vec<OpenFile>,
+}
+
+struct SharedVfs(UnsafeCell<Option<Vfs>>);
+
+unsafe impl Sync for SharedVfs {}
+
+static VFS: SharedVfs = SharedVfs(UnsafeCell::new(None));
+
+impl Node {
+    fn file(name: &str) -> Self {
+        Self {
+            name: String::from(name),
+            kind: NodeKind::File(Vec::new()),
+        }
+    }
+
+    fn directory(name: &str) -> Self {
+        Self {
+            name: String::from(name),
+            kind: NodeKind::Directory(Vec::new()),
+        }
+    }
+}
+
+impl Vfs {
+    fn new() -> Self {
+        let mut root = Node::directory("/");
+        if let NodeKind::Directory(children) = &mut root.kind {
+            children.push(Node::directory("bin"));
+            children.push(Node::directory("etc"));
+            children.push(Node::directory("tmp"));
+        }
+        Self {
+            root,
+            open_files: Vec::new(),
+        }
+    }
+
+    fn create_file(&mut self, path: &str) -> Result<(), ()> {
+        let components = components(path).ok_or(())?;
+        let (&name, parent) = components.split_last().ok_or(())?;
+        let children = directory_mut(&mut self.root, parent)?;
+
+        if let Some(existing) = children.iter_mut().find(|node| node.name == name) {
+            return match &mut existing.kind {
+                NodeKind::File(data) => {
+                    data.clear();
+                    Ok(())
+                }
+                NodeKind::Directory(_) => Err(()),
+            };
+        }
+
+        children.push(Node::file(name));
+        Ok(())
+    }
+
+    fn make_directory(&mut self, path: &str) -> Result<(), ()> {
+        let components = components(path).ok_or(())?;
+        let (&name, parent) = components.split_last().ok_or(())?;
+        let children = directory_mut(&mut self.root, parent)?;
+        if children.iter().any(|node| node.name == name) {
+            return Err(());
+        }
+        children.push(Node::directory(name));
+        Ok(())
+    }
+
+    fn open(&mut self, owner: u64, path: &str, flags: u64) -> Result<u64, ()> {
+        if flags & !OPEN_WRITE != 0 {
+            return Err(());
+        }
+        match &find_node(&self.root, path).ok_or(())?.kind {
+            NodeKind::File(_) => {}
+            NodeKind::Directory(_) => return Err(()),
+        }
+
+        let mut fd = 3_u64;
+        while self
+            .open_files
+            .iter()
+            .any(|file| file.owner == owner && file.fd == fd)
+        {
+            fd = fd.checked_add(1).ok_or(())?;
+        }
+        self.open_files.push(OpenFile {
+            owner,
+            fd,
+            path: String::from(path),
+            offset: 0,
+            writable: flags & OPEN_WRITE != 0,
+        });
+        Ok(fd)
+    }
+
+    fn close(&mut self, owner: u64, fd: u64) -> Result<(), ()> {
+        let index = self
+            .open_files
+            .iter()
+            .position(|file| file.owner == owner && file.fd == fd)
+            .ok_or(())?;
+        self.open_files.remove(index);
+        Ok(())
+    }
+
+    fn close_task(&mut self, owner: u64) {
+        self.open_files.retain(|file| file.owner != owner);
+    }
+
+    fn read(&mut self, owner: u64, fd: u64, limit: usize) -> Result<Vec<u8>, ()> {
+        let handle = self
+            .open_files
+            .iter_mut()
+            .find(|file| file.owner == owner && file.fd == fd)
+            .ok_or(())?;
+        let node = find_node(&self.root, &handle.path).ok_or(())?;
+        let data = match &node.kind {
+            NodeKind::File(data) => data,
+            NodeKind::Directory(_) => return Err(()),
+        };
+        let start = handle.offset.min(data.len());
+        let count = limit.min(data.len() - start);
+        let result = data[start..start + count].to_vec();
+        handle.offset = start + count;
+        Ok(result)
+    }
+
+    fn write(&mut self, owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
+        let handle = self
+            .open_files
+            .iter_mut()
+            .find(|file| file.owner == owner && file.fd == fd)
+            .ok_or(())?;
+        if !handle.writable {
+            return Err(());
+        }
+        let node = find_node_mut(&mut self.root, &handle.path).ok_or(())?;
+        let data = match &mut node.kind {
+            NodeKind::File(data) => data,
+            NodeKind::Directory(_) => return Err(()),
+        };
+        if handle.offset > data.len() {
+            return Err(());
+        }
+        let remaining = data.len() - handle.offset;
+        if bytes.len() <= remaining {
+            data[handle.offset..handle.offset + bytes.len()].copy_from_slice(bytes);
+        } else {
+            if remaining != 0 {
+                data[handle.offset..].copy_from_slice(&bytes[..remaining]);
+            }
+            data.extend_from_slice(&bytes[remaining..]);
+        }
+        handle.offset += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, ()> {
+        let node = find_node(&self.root, path).ok_or(())?;
+        let children = match &node.kind {
+            NodeKind::Directory(children) => children,
+            NodeKind::File(_) => return Err(()),
+        };
+        Ok(children
+            .iter()
+            .map(|node| {
+                let mut entry = DirEntry {
+                    name: [0; MAX_NAME_LEN],
+                    name_len: node.name.len() as u64,
+                    kind: match node.kind {
+                        NodeKind::File(_) => 1,
+                        NodeKind::Directory(_) => 2,
+                    },
+                };
+                entry.name[..node.name.len()].copy_from_slice(node.name.as_bytes());
+                entry
+            })
+            .collect())
+    }
+}
+
+pub fn init() {
+    unsafe { *VFS.0.get() = Some(Vfs::new()) };
+}
+
+pub fn create(path: &str) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.create_file(path))
+}
+
+pub fn mkdir(path: &str) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.make_directory(path))
+}
+
+pub fn open(owner: u64, path: &str, flags: u64) -> Result<u64, ()> {
+    with_vfs(|vfs| vfs.open(owner, path, flags))
+}
+
+pub fn close(owner: u64, fd: u64) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.close(owner, fd))
+}
+
+pub fn close_task(owner: u64) {
+    let saved = interrupts::save_and_disable_irq();
+    if let Some(vfs) = vfs_slot() {
+        vfs.close_task(owner);
+    }
+    interrupts::restore_irq(saved);
+}
+
+pub fn read(owner: u64, fd: u64, limit: usize) -> Result<Vec<u8>, ()> {
+    with_vfs(|vfs| vfs.read(owner, fd, limit))
+}
+
+pub fn write(owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
+    with_vfs(|vfs| vfs.write(owner, fd, bytes))
+}
+
+pub fn read_dir(path: &str) -> Result<Vec<DirEntry>, ()> {
+    with_vfs(|vfs| vfs.read_dir(path))
+}
+
+fn with_vfs<T>(call: impl FnOnce(&mut Vfs) -> T) -> T {
+    let saved = interrupts::save_and_disable_irq();
+    let result = call(vfs_slot().expect("VFS is not initialized"));
+    interrupts::restore_irq(saved);
+    result
+}
+
+fn vfs_slot() -> Option<&'static mut Vfs> {
+    unsafe { &mut *VFS.0.get() }.as_mut()
+}
+
+fn components(path: &str) -> Option<Vec<&str>> {
+    if path.is_empty() {
+        return None;
+    }
+    let mut result = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                result.pop();
+            }
+            name if name.len() <= MAX_NAME_LEN => result.push(name),
+            _ => return None,
+        }
+    }
+    Some(result)
+}
+
+fn directory_mut<'a>(mut node: &'a mut Node, path: &[&str]) -> Result<&'a mut Vec<Node>, ()> {
+    for &component in path {
+        let children = match &mut node.kind {
+            NodeKind::Directory(children) => children,
+            NodeKind::File(_) => return Err(()),
+        };
+        node = children
+            .iter_mut()
+            .find(|child| child.name == component)
+            .ok_or(())?;
+    }
+    match &mut node.kind {
+        NodeKind::Directory(children) => Ok(children),
+        NodeKind::File(_) => Err(()),
+    }
+}
+
+fn find_node<'a>(root: &'a Node, path: &str) -> Option<&'a Node> {
+    let components = components(path)?;
+    let mut node = root;
+    for component in components {
+        let children = match &node.kind {
+            NodeKind::Directory(children) => children,
+            NodeKind::File(_) => return None,
+        };
+        node = children.iter().find(|child| child.name == component)?;
+    }
+    Some(node)
+}
+
+fn find_node_mut<'a>(root: &'a mut Node, path: &str) -> Option<&'a mut Node> {
+    let components = components(path)?;
+    let mut node = root;
+    for component in components {
+        let children = match &mut node.kind {
+            NodeKind::Directory(children) => children,
+            NodeKind::File(_) => return None,
+        };
+        node = children.iter_mut().find(|child| child.name == component)?;
+    }
+    Some(node)
+}

@@ -32,6 +32,9 @@ fn main() {
         ("silver_userspace", "silver_userspace.elf"),
         ("nameserver", "silver_nameserver.elf"),
         ("silvershell", "silvershell.elf"),
+        ("ls", "ls.elf"),
+        ("cat", "cat.elf"),
+        ("echo", "echo.elf"),
     ] {
         let elf = target_dir
             .join("aarch64-unknown-none")

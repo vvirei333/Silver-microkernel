@@ -3,19 +3,20 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (silvershell MVP update)
+## State as of 2026-10-25 (RAM-VFS and MVP utilities)
 
-Latest verified feature: **interactive silvershell with fastfetch, ps and spawn**.
-The third userspace ELF starts as the first interactive task, clears the terminal,
-prints OS/kernel/shell details, uptime and RAM, then accepts commands through
-UART. `help`, `fastfetch`, `ps`, `spawn`, Backspace editing and argument error
-handling work. New syscalls are nonblocking `SYS_READ`, `SYS_UPTIME`,
-checked-copyout `SYS_MEMINFO` and `SYS_TASK_LIST` task snapshots.
+Latest verified feature: **RAM-VFS, separate ls/cat/echo EL0 programs, shell
+redirection, and kill/wait with exit status**. Six userspace ELFs are embedded:
+demo, nameserver, silvershell, ls, cat and echo. String arguments are copied
+into task metadata and fetched through `SYS_ARGS`; numeric ELF arguments remain
+available for demo roles. File syscalls use checked user buffers and per-task
+descriptors. The shell runs utilities and waits for them, while `echo > file`
+and `mkdir` call VFS directly.
 
 The default bare-metal boot includes only idle, nameserver and the shell, so
 periodic demo output cannot bury the prompt. Build with `no_std,demo-tasks` for
-the old regression suite. Verified with host, debug/release shell builds,
-scripted QEMU UART input in both profiles, and an 8-second demo-tasks run. The
+the old regression suite. Verified with host, debug/release builds, scripted
+QEMU UART input in both shell profiles, and a 10-second demo-tasks run. The
 regression run had exactly two intentional `TASK FAULT` reports and passed:
 
 ```text
@@ -34,11 +35,12 @@ IPC BP BACKPRESSURE=PASS
 IPC EXIT WAKE=PASS
 ```
 
-Shell QEMU checks observed the `logo.txt` screen, `silver@silvershell`, changing uptime,
-RAM and fastfetch. `ps` showed kernel/nameserver/shell states; `spawn demo 12`
-created a sleeping task with argument 12, and release `spawn demo 20` ran the heap
-probe and reaped it before the next `ps`. Invalid decimal arguments were rejected.
-No `KERNEL PANIC`, `BAD SP` or unexpected `FAIL` occurred.
+Debug and release QEMU checks observed `/bin`, `/etc` and `/tmp` in `ls`,
+`echo 'hello' > test.txt`, `cat test.txt` printing `hello`, quoted multiword
+echo, and `mkdir docs` appearing in the next listing. `kill 3` terminated a
+sleeping demo and `wait 3` returned status 1; a naturally exiting echo returned
+status 0 through `wait`. No `KERNEL PANIC`, `BAD SP` or unexpected `FAIL`
+occurred.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
 | --- | ---: | --- | --- |
@@ -198,16 +200,16 @@ read back only their own values.
   x20 and SP_EL0 = `0x7FE00000 + 0x2000`. `silver_user_bootstrap` moves x20 to
   x0, sets ELR_EL1 = x19 and SPSR_EL1 = 0, then executes `eret`.
 - Demo roles are selected by the argument in `userspace/src/main.rs`, not by
-  task ID. Nameserver and shell have separate executables in `userspace/src/bin/`.
+  task ID. Nameserver, shell and utilities have separate executables in
+  `userspace/src/bin/`.
 - The scheduler switches only TTBR0_EL1, then performs
   `tlbi vmalle1; dsb ish; isb`. High kernel text and SP_EL1 remain valid
   through TTBR1 throughout the switch.
 - The sync exception entry recognizes SVC by EC=0b010101. Other exceptions
   inspect SPSR.M[3:2]: EL0 goes to `silver_handle_task_fault`; EL1 is a
   kernel panic.
-- Syscalls include sleep, send, receive, register, lookup, unregister, print,
-  whoami, task_alive, task_list, spawn, exit, `brk`, UART read, uptime, meminfo,
-  hex/dec print, mutex lock/unlock and channel send/receive.
+- Syscalls include sleep, IPC, nameserver, print, task control, spawn/args,
+  wait/kill, `brk`, UART read, uptime, meminfo and the RAM-VFS file operations.
 - `SYS_READ` polls PL011 RX and returns a byte or SYSCALL_ERROR when RXFE says
   no input is available. `SYS_UPTIME` returns raw 100 Hz ticks. `SYS_MEMINFO`
   copies three u64 byte counts (total, used, free) through checked copyout;
@@ -215,6 +217,12 @@ read back only their own values.
 - `SYS_TASK_LIST(buffer, capacity)` copies up to 64 `#[repr(C)]` TaskInfo entries
   (ID, numeric state, program, argument) and returns the number written. Task
   metadata lives in the Task itself, so ps can distinguish identical ELF roles.
+- `SYS_SPAWN_ARGS(program, numeric, ptr, len)` copies at most 192 argument bytes
+  before allocating the task. `SYS_ARGS(buffer, capacity)` returns those bytes
+  to the current program and fails rather than truncating them.
+- `SYS_WAIT(id)` blocks on the process wait queue and consumes one of 64 bounded
+  completion records. `SYS_KILL` rejects idle/self, marks another task Dead and
+  records status 1. Normal `SYS_EXIT(status)` records the supplied status.
 - `SYS_SEND(target, message)` blocks while the target has 16 queued messages and
   returns `SYSCALL_ERROR` if the target is dead. Nameserver RPC paths propagate
   this failure too.
@@ -224,16 +232,31 @@ read back only their own values.
 - `SYS_BRK(0)` queries the program break. Other values set an absolute break in
   `0x40200000..0x40400000`; invalid requests and allocation failures return
   `SYSCALL_ERROR` without changing the previous break or mappings.
-- `SYS_EXIT` clears the current mailbox, wakes all its blocked senders and marks
-  the task Dead. Reaping removes stale waiters, releases owned mutexes, wakes
-  the next waiter, then frees the ELF pages, heap frames, page tables, private
-  page and both stacks. A woken sender rechecks liveness and cannot recreate the
-  dead task's mailbox.
+- Exit and kill clear the task mailbox, wake blocked senders and close every VFS
+  descriptor owned by that task. Reaping removes stale waiters, releases owned
+  mutexes, wakes the next waiter, then frees the ELF pages, heap frames, page
+  tables, private page and both stacks. A woken sender rechecks liveness and
+  cannot recreate the dead task's mailbox.
 - Nameserver unregister is owner-checked. Its table is also purged through
   `task_alive` when later requests arrive, so names left by dead tasks do not
   remain permanently valid.
 - User tasks cannot use the high-only kernel heap. The nameserver therefore
   stores 16 fixed-capacity entries on its user stack instead of in a `Vec`.
+
+## RAM-VFS
+
+- `Node` is either `File(Vec<u8>)` or `Directory(Vec<Node>)`. The volatile root
+  starts with `/bin`, `/etc` and `/tmp`. Absolute and relative paths both resolve
+  from `/`; `.` and `..` are normalized and `..` cannot escape the root.
+- Open handles store the path rather than a Node pointer, so Vec reallocation
+  cannot invalidate them. Each handle has owner, per-owner fd (starting at 3),
+  offset and writable flag. Exit/kill removes all handles for that owner.
+- `SYS_FS_OPEN/READ/WRITE/CREATE/CLOSE/READ_DIR/MKDIR` use checked copyin/copyout.
+  Paths are limited to 191 bytes, names to 32 bytes and one I/O call to 4096
+  bytes. `create` truncates files, `open` supports read-only or write mode and
+  `read_dir` copies 48-byte `#[repr(C)]` entries with name bytes/length and kind.
+- There is no cwd/chdir, persistence, unlink/rename, file-size quota or append
+  flag yet. Repeated writes extend the in-memory file through the kernel heap.
 
 ## silvershell
 
@@ -244,10 +267,16 @@ read back only their own values.
   for 1 ms when RX is empty, so polling does not monopolize the scheduler. A
   future UART RX interrupt can replace polling without changing command parsing.
 - Startup emits ANSI clear/home, runs fastfetch once and shows `silvershell> `.
-  Commands use whitespace tokenization: `help`, `fastfetch`, `ps`, and
-  `spawn <demo|nameserver|silvershell> [arg]`; empty lines only reprompt.
+  Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `ps`, `spawn`,
+  `kill` and `wait`; empty lines only reprompt. Echo parsing preserves quoted
+  spaces, strips matching outer quotes and recognizes `>` only outside quotes.
+- `ls`, `cat` and ordinary `echo` spawn separate EL0 utilities with string args
+  and immediately wait for them. `echo text > path` truncates/creates and writes
+  directly through VFS. `mkdir` is also a direct syscall. Utility failures print
+  a diagnostic and return status 1 to the shell.
 - `ps` uses a fixed 32-entry userspace array and prints ID/program/argument/state.
   `spawn` parses an optional checked decimal u64 and reports the new task ID.
+  `kill` terminates a non-current task; `wait` prints and consumes its status.
   Spawned programs share the console, so output can interleave with the prompt.
 - Fastfetch converts ticks to seconds with hundredths and bytes to tenths of a
   MiB. Its three memory counters come from SYS_MEMINFO, not hardcoded free RAM.
@@ -393,7 +422,7 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   and page-uniform permissions; there is no PIE, dynamic linking, demand
   loading or sparse multi-window image layout.
 - Programs are selected from ELFs embedded at kernel build time. There is no
-  external program storage, `kill`, `wait` or credential model yet.
+  external program storage, console ownership/job control or credential model yet.
 - Mutex and condvar wait queues still have no growth limits. Mailboxes are
   bounded at 16 messages, but nameserver/control replies also obey backpressure;
   a full client mailbox can therefore block the nameserver. Selective receive
@@ -412,15 +441,17 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 ## Next steps (by priority)
 
-1. **Grow task control:** `kill`, `wait`/exit status and console ownership or
-   job control; spawned programs currently share UART output with the shell.
-2. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
+1. **Console ownership and job control:** spawned programs currently share UART
+   output with the shell; add foreground/background ownership before RX IRQs.
+2. **Grow VFS semantics:** per-task cwd plus `chdir`/`pwd`, unlink/rename, append
+   mode and file-size quotas. Persistent storage still needs a block driver.
+3. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.
-3. **VirtIO-console / virtio-block** — first MMIO device driver, moving
+4. **VirtIO-console / virtio-block** — first MMIO device driver, moving
    UART output behind a driver interface. UART RX interrupts can remove shell
    polling when console ownership is defined.
-4. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
+5. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
    `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
 
 Nameserver watch notifications are explicitly deferred. Later IPC control-plane
@@ -435,9 +466,10 @@ and the full-mailbox selective-receive limitation recorded above.
 4. Also check `--release`: optimized userspace exposes register-preservation
    bugs that debug builds can hide. For regressions, separately build with
    `--features no_std,demo-tasks`; this replaces the interactive boot.
-5. For the default profile, type `help`, `fastfetch`, `ps` and a `spawn` command;
-   verify the `logo.txt` screen, live uptime/RAM, task metadata and spawned task ID.
-   For demo-tasks, run 5–30 seconds,
+5. For the default profile, verify `ls`, `echo 'hello' > test.txt`,
+   `cat test.txt`, `mkdir docs`, quoted echo, `ps`, and `spawn`/`kill`/`wait`.
+   Also check `fastfetch`, live uptime/RAM and the `logo.txt` screen. For
+   demo-tasks, run 5–30 seconds,
    repeat timing-sensitive runs and expect exactly two intentional faults from
    tasks 15 and 16, plus
    `COPYOUT READONLY REJECT=PASS`, `COPYOUT UNMAPPED REJECT=PASS`,

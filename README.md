@@ -15,8 +15,8 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Physical memory map + page frame allocator (bitmap)
 - [x] Kernel heap + Rust global allocator (`alloc`: `Box`, `Vec`)
 - [x] GICv2 + ARM Generic Timer (IRQ 30, 100 Hz tick)
-- [x] Round-robin scheduler: dynamic `spawn(program, argument)`, `yield`, `sleep`, `exit`
-- [x] Lifecycle cleanup: address spaces, mailboxes, wait queues and owned mutexes
+- [x] Round-robin scheduler: spawn with numeric/string arguments, `yield`, `sleep`, `kill`, `wait`
+- [x] Lifecycle cleanup: address spaces, mailboxes, file handles, wait queues and owned mutexes
 - [x] Blocking mutex with FIFO wait queue, ownership tracking and RAII guard
 - [x] Bounded IPC: 16-message mailboxes, blocking send/backpressure and receive timeouts
 - [x] IPC cleanup: queued-message disposal and blocked-sender wakeups on receiver exit
@@ -25,8 +25,11 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Condition variable: per-mailbox wait queues, targeted wakeups and timed waits
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
-- [x] Three userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
-- [x] silvershell: `help`, `fastfetch`, `ps`, `spawn`, `logo.txt` ASCII art and clean MVP boot
+- [x] Six userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
+- [x] silvershell: `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `ps`, `spawn`, `kill`, `wait`
+- [x] Shell output redirection: `echo 'hello' > test.txt`, including quoted text
+- [x] RAM-VFS: `/bin`, `/etc`, `/tmp`, files/directories and per-task descriptors
+- [x] File syscalls: `open`, `read`, `write`, `create`, `close`, `read_dir`, `mkdir`
 - [x] Shell syscalls: `SYS_READ`, `SYS_UPTIME`, `SYS_MEMINFO` and `SYS_TASK_LIST`
 - [x] Per-task TTBR0 spaces: independent ELF image, fixed-VA stack and private page
 - [x] Growable per-task heap: sparse 2 MB window, `brk`, zero-fill and cleanup on exit
@@ -38,7 +41,7 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
-- [ ] Drivers and richer process management (kill, wait, credentials)
+- [ ] Drivers, console ownership/job control, credentials and persistent storage
 
 ## Requirements
 
@@ -84,8 +87,23 @@ qemu-system-aarch64 \
   -kernel target/aarch64-unknown-none/debug/silver_microkernel
 ```
 
-At the `silvershell>` prompt, use `help`, `fastfetch`, `ps`, or
-`spawn <demo|nameserver|silvershell> [arg]`. Backspace edits the current line.
+At the `silvershell>` prompt, `help` lists all commands. Backspace edits the
+current line. A minimal file workflow looks like this:
+
+```text
+silvershell> ls
+bin/
+etc/
+tmp/
+silvershell> echo 'hello' > test.txt
+silvershell> cat test.txt
+hello
+silvershell> mkdir docs
+```
+
+`ls`, `cat` and ordinary `echo` run as separate EL0 programs; the shell waits
+for their exit status. Redirection and `mkdir` use file syscalls directly.
+`spawn demo 12`, `kill <id>` and `wait <id>` provide explicit task control.
 Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
@@ -93,14 +111,14 @@ prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 `demo-tasks` (opt-in regression programs). The default bare-metal build starts
 only idle, nameserver and silvershell for a clean console. To run the older
 fault/VM/allocator/IPC demos instead, use `--features no_std,demo-tasks`.
-`build.rs` automatically builds and embeds the demo, nameserver and silvershell
-ELFs; no separate userspace command is needed.
+`build.rs` automatically builds and embeds the demo, nameserver, silvershell,
+ls, cat and echo ELFs; no separate userspace command is needed.
 
 ## Project layout
 
 | File | Purpose |
 | --- | --- |
-| `build.rs` | Builds and embeds all three userspace ELFs for bare-metal profiles |
+| `build.rs` | Builds and embeds all six userspace ELFs for bare-metal profiles |
 | `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
 | `src/exceptions.rs` | Task fault diagnostics and kernel panic |
 | `src/pl011.rs` | UART TX/RX driver (physical MMIO 0x09000000) |
@@ -122,9 +140,11 @@ ELFs; no separate userspace command is needed.
 | `src/mmu.rs` | TTBR1 kernel map, per-task TTBR0 maps, permission validation |
 | `src/elf_loader.rs` | Static ELF64/AArch64 `PT_LOAD` loader and image ownership |
 | `src/user_program.rs` | Program IDs and embedded userspace ELF selection |
+| `src/vfs.rs` | RAM file tree, normalized paths and per-task file descriptors |
 | `userspace/src/allocator.rs` | Per-task first-fit `malloc/free` over `SYS_BRK` |
 | `userspace/src/bin/silvershell.rs` | Interactive shell and `logo.txt` fastfetch screen |
-| `userspace/` | Separate demo, nameserver and shell EL0 programs plus syscall wrappers |
+| `userspace/src/bin/{ls,cat,echo}.rs` | Separate EL0 file/console utilities |
+| `userspace/` | Separate demo, nameserver, shell and utility EL0 programs |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
 ## Memory model
@@ -179,11 +199,20 @@ Two intentional probes prove isolation: task 15 reads
 `0x0000000040080000` (the old kernel text alias). Each must produce one
 `TASK FAULT` with `EC=0x24`; all other tasks continue running.
 
-`spawn(program, argument)` selects a registered ELF and passes an argument to
-its entry point. The lifecycle demo dynamically spawns a child, checks the
-argument, registers/unregisters a name, exits while holding a mutex and proves
-that reaping releases it. Nameserver RPC uses selective receive so unrelated
-messages cannot be consumed as lookup responses.
+`spawn(program, argument)` selects a registered ELF and passes a numeric argument
+to its entry point. `spawn_with_args` additionally copies a bounded byte string
+for `SYS_ARGS`. `kill` rejects idle/self and terminates another task with status
+1. `wait(id)` blocks until termination and consumes a bounded completion record,
+so it also works after the task's memory has been reaped. The lifecycle demo
+proves that reaping releases resources. Nameserver RPC uses selective receive
+so unrelated messages cannot be consumed as lookup responses.
+
+The RAM-VFS starts with `/bin`, `/etc` and `/tmp`. Absolute and relative paths
+currently resolve from `/`; there is no per-task current directory yet. Files
+are volatile and live in kernel heap memory. Descriptors start at 3, belong to
+one task, track their offset and close automatically on exit or kill. Path and
+I/O buffers are bounded and all user pointers pass the checked copyin/copyout
+layer. `create` truncates an existing file; `mkdir` rejects duplicates.
 
 Each mailbox holds at most 16 messages. A sender blocks on `not_full` while the
 queue is full; removing any message wakes one sender. `SYS_RECEIVE(buffer, ticks)`

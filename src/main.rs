@@ -43,6 +43,8 @@ mod user_memory;
 #[cfg(not(feature = "std"))]
 mod user_program;
 #[cfg(not(feature = "std"))]
+mod vfs;
+#[cfg(not(feature = "std"))]
 mod wait_queue;
 
 #[cfg(not(feature = "std"))]
@@ -439,6 +441,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     gic::init();
     timer::init();
+    vfs::init();
     scheduler::init();
 
     pl011::write_str("IRQ READY\r\n");
