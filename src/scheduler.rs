@@ -212,23 +212,33 @@ pub fn init() {
     // Program IDs select an ELF; arguments select a role inside the demo ELF.
     // Nameserver remains the first userspace task (ID 1) by protocol contract.
     let _nameserver_id = spawn_user(user_program::NAMESERVER, 0);
-    for role in 2..=16 {
-        let _ = spawn_user(user_program::DEMO, role);
-    }
-    let _lifecycle_supervisor = spawn_user(user_program::DEMO, 17);
-    let _copyout_probe = spawn_user(user_program::DEMO, 19);
-    let _heap_probe = spawn_user(user_program::DEMO, 20);
-    let _malloc_probe = spawn_user(user_program::DEMO, 21);
-    let _global_alloc_probe = spawn_user(user_program::DEMO, 22);
-    for role in 23..=26 {
-        let _ = spawn_user(user_program::DEMO, role);
+
+    // The default boot is a clean interactive MVP. Regression demos are opt-in
+    // so their intentional faults and periodic output cannot bury the shell.
+    #[cfg(not(feature = "demo-tasks"))]
+    let _shell_id = spawn_user(user_program::SILVERSHELL, 0);
+
+    #[cfg(feature = "demo-tasks")]
+    {
+        for role in 2..=16 {
+            let _ = spawn_user(user_program::DEMO, role);
+        }
+        let _lifecycle_supervisor = spawn_user(user_program::DEMO, 17);
+        let _copyout_probe = spawn_user(user_program::DEMO, 19);
+        let _heap_probe = spawn_user(user_program::DEMO, 20);
+        let _malloc_probe = spawn_user(user_program::DEMO, 21);
+        let _global_alloc_probe = spawn_user(user_program::DEMO, 22);
+        for role in 23..=26 {
+            let _ = spawn_user(user_program::DEMO, role);
+        }
     }
 
+    let first_id = if cfg!(feature = "demo-tasks") { 1 } else { 2 };
     let manager = scheduler_manager().unwrap();
     manager.current_index = manager
         .tasks
         .iter()
-        .position(|task| task.id == 1)
+        .position(|task| task.id == first_id)
         .unwrap_or(0);
 }
 

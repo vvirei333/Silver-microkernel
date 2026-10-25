@@ -16,6 +16,14 @@ pub fn init() {
     }
 }
 
+/// Returns one received byte without waiting. Bit 4 of FR is RXFE (RX FIFO empty).
+pub fn read_byte() -> Option<u8> {
+    if unsafe { core::ptr::read_volatile(FR) } & (1 << 4) != 0 {
+        return None;
+    }
+    Some(unsafe { core::ptr::read_volatile(DR) } as u8)
+}
+
 pub fn write_byte(byte: u8) {
     // Wait for TX FIFO space with IRQs unmasked — but restore the caller's
     // DAIF afterwards so this stays transparent in any context (syscall

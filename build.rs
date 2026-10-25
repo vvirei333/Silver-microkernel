@@ -30,6 +30,7 @@ fn main() {
     for (binary, embedded) in [
         ("silver_userspace", "silver_userspace.elf"),
         ("nameserver", "silver_nameserver.elf"),
+        ("silvershell", "silvershell.elf"),
     ] {
         let elf = target_dir
             .join("aarch64-unknown-none")

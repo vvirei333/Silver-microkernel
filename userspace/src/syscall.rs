@@ -20,14 +20,26 @@ const SYS_EXIT: u64 = 15;
 const SYS_UNREGISTER: u64 = 16;
 const SYS_TASK_ALIVE: u64 = 17;
 const SYS_BRK: u64 = 18;
+const SYS_READ: u64 = 19;
+const SYS_UPTIME: u64 = 20;
+const SYS_MEMINFO: u64 = 21;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
 pub const PROGRAM_DEMO: u64 = 0;
 pub const PROGRAM_NAMESERVER: u64 = 1;
+pub const PROGRAM_SILVERSHELL: u64 = 2;
 const SYSCALL_ERROR: u64 = u64::MAX;
 const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
 const NAME_LIMIT: usize = ipc::PAYLOAD_SIZE - 2;
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct MemoryInfo {
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ReceiveError {
@@ -37,6 +49,31 @@ pub enum ReceiveError {
 
 pub fn sleep(milliseconds: u64) {
     unsafe { syscall1(SYS_SLEEP, milliseconds) };
+}
+
+/// Non-blocking UART input. The shell sleeps briefly when no byte is available.
+pub fn read() -> Option<u8> {
+    match unsafe { syscall0(SYS_READ) } {
+        SYSCALL_ERROR => None,
+        byte => Some(byte as u8),
+    }
+}
+
+pub fn uptime_ticks() -> u64 {
+    unsafe { syscall0(SYS_UPTIME) }
+}
+
+pub fn memory_info() -> Option<MemoryInfo> {
+    let mut info = MemoryInfo {
+        total_bytes: 0,
+        used_bytes: 0,
+        free_bytes: 0,
+    };
+    if unsafe { syscall1(SYS_MEMINFO, &mut info as *mut MemoryInfo as u64) } == 0 {
+        Some(info)
+    } else {
+        None
+    }
 }
 
 pub fn send(target: u64, message: &ipc::Message) -> bool {

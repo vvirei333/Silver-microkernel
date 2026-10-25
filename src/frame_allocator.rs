@@ -56,6 +56,17 @@ pub fn init(available: MemoryRegion) -> usize {
     total_pages
 }
 
+/// Number of currently free bytes in the managed physical-page pool.
+pub fn free_bytes() -> usize {
+    let state = state();
+    let word_count = state.total_pages.div_ceil(BITS_PER_WORD);
+    let free_pages: usize = state.bitmap[..word_count]
+        .iter()
+        .map(|word| word.count_ones() as usize)
+        .sum();
+    free_pages * PAGE_SIZE
+}
+
 /// Allocates one physical page using first-fit search.
 pub fn alloc_page() -> Option<usize> {
     let state = state();

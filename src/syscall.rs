@@ -10,7 +10,9 @@
 
 use alloc::{vec, vec::Vec};
 
-use crate::{channel, ipc, mmu, mutex, pl011, scheduler, user_memory};
+use crate::{
+    channel, frame_allocator, ipc, memory, mmu, mutex, pl011, scheduler, timer, user_memory,
+};
 
 pub const SYS_SLEEP: u64 = 1;
 pub const SYS_SEND: u64 = 2;
@@ -30,6 +32,9 @@ pub const SYS_EXIT: u64 = 15;
 pub const SYS_UNREGISTER: u64 = 16;
 pub const SYS_TASK_ALIVE: u64 = 17;
 pub const SYS_BRK: u64 = 18;
+pub const SYS_READ: u64 = 19;
+pub const SYS_UPTIME: u64 = 20;
+pub const SYS_MEMINFO: u64 = 21;
 
 /// Well-known task ID of the nameserver. Fixed by spawn order: the scheduler
 /// spawns it first, right after idle (which is always ID 0).
@@ -45,6 +50,14 @@ pub const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
 
 /// Frame layout built by the SVC trampoline: x0-x30, then ELR, then SPSR.
 const FRAME_QUADWORDS: usize = 33;
+
+/// Stable userspace ABI for SYS_MEMINFO. All values are byte counts.
+#[repr(C)]
+struct MemoryInfo {
+    total_bytes: u64,
+    used_bytes: u64,
+    free_bytes: u64,
+}
 
 /// Kernel objects the demo tasks share. They live behind the syscall
 /// boundary: user tasks hold the demo mutex across several syscalls, so
@@ -98,10 +111,33 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_BRK => scheduler::change_program_break(frame[0] as usize)
             .map(|address| address as u64)
             .unwrap_or(SYSCALL_ERROR),
+        SYS_READ => pl011::read_byte().map(u64::from).unwrap_or(SYSCALL_ERROR),
+        SYS_UPTIME => timer::ticks(),
+        SYS_MEMINFO => sys_meminfo(frame[0]),
         _ => SYSCALL_ERROR,
     };
 
     frame[0] = result;
+}
+
+fn sys_meminfo(info_ptr: u64) -> u64 {
+    let total_bytes = memory::DRAM_SIZE as u64;
+    let free_bytes = (frame_allocator::free_bytes() as u64).min(total_bytes);
+    let info = MemoryInfo {
+        total_bytes,
+        used_bytes: total_bytes - free_bytes,
+        free_bytes,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&info as *const MemoryInfo).cast::<u8>(),
+            core::mem::size_of::<MemoryInfo>(),
+        )
+    };
+    if user_memory::copy_to_user(bytes, info_ptr).is_err() {
+        return SYSCALL_ERROR;
+    }
+    0
 }
 
 fn sys_print(ptr: u64, len: u64) -> u64 {

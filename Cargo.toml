@@ -8,6 +8,7 @@ description = "AArch64 mobile microkernel with a Rust foundation"
 default = ["std"]
 std = []
 no_std = []
+demo-tasks = []
 
 [dependencies]
 linked_list_allocator = "0.10.6"

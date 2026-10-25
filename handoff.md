@@ -3,18 +3,20 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (IPC hardening update)
+## State as of 2026-10-25 (Silver2Shell MVP update)
 
-Latest verified feature: **bounded mailboxes with backpressure, timed receive
-and blocked-sender cleanup on exit**. Each mailbox has 16 slots and independent
-`not_empty` / `not_full` condition queues. `SYS_RECEIVE` accepts a relative tick
-timeout; sender and receiver lifecycle errors cross the syscall boundary as
-explicit results instead of hanging forever.
+Latest verified feature: **interactive Silver2Shell with wolf fastfetch**. The
+third userspace ELF starts as the first interactive task, clears the terminal,
+prints OS/kernel/shell details, uptime and RAM, then accepts commands through
+UART. `help`, `fastfetch`, Backspace editing and unknown-command diagnostics all
+work. New syscalls are nonblocking `SYS_READ`, `SYS_UPTIME` and checked-copyout
+`SYS_MEMINFO`.
 
-Verified with host, debug bare-metal and release bare-metal builds, three debug
-QEMU runs (8 seconds each) and an 8-second release run. Every run had exactly
-two intentional `TASK FAULT` reports and no `KERNEL PANIC`, `BAD SP`, isolation
-failures or stale debug output. All runs passed these checks:
+The default bare-metal boot includes only idle, nameserver and the shell, so
+periodic demo output cannot bury the prompt. Build with `no_std,demo-tasks` for
+the old regression suite. Verified with host, debug/release shell builds,
+scripted QEMU UART input in both profiles, and an 8-second demo-tasks run. The
+regression run had exactly two intentional `TASK FAULT` reports and passed:
 
 ```text
 COPYOUT READONLY REJECT=PASS
@@ -32,10 +34,9 @@ IPC BP BACKPRESSURE=PASS
 IPC EXIT WAKE=PASS
 ```
 
-The backpressure demo fills all 16 slots, blocks A on send 17, then drains the
-messages in FIFO order after B wakes it. The exit demo destroys a full mailbox
-without reading it and verifies that the blocked sender resumes with an error.
-Earlier userspace allocation and VM A/B isolation checks still pass.
+Shell QEMU checks observed the wolf screen, `silver@silver2`, changing uptime,
+`Memory: ... / 128.0 MiB`, free RAM, both help entries and a fresh fastfetch
+after typed input. No `KERNEL PANIC`, `BAD SP` or unexpected `FAIL` occurred.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
 | --- | ---: | --- | --- |
@@ -92,13 +93,17 @@ cargo build --target aarch64-unknown-none --no-default-features --features no_st
 
 For bare-metal profiles, `build.rs` invokes Cargo in `userspace/`, uses
 `target/userspace` as its target directory, matches debug/release profile and
-copies `silver_userspace` plus `nameserver` into `OUT_DIR` as the two embedded
-ELFs. `src/user_program.rs` assigns program IDs 0 (demo) and 1 (nameserver).
-Host builds skip userspace.
+copies `silver_userspace`, `nameserver` and `silvershell` into `OUT_DIR`.
+`src/user_program.rs` assigns program IDs 0 (demo), 1 (nameserver) and 2 (shell).
+Host builds skip userspace. The default scheduler starts shell ID 2 after the
+nameserver; `demo-tasks` replaces the shell boot with the regression task set.
 
-QEMU run: `timeout 5s qemu-system-aarch64 -machine virt -cpu cortex-a72
--m 128M -nographic -kernel target/aarch64-unknown-none/debug/silver_microkernel`.
-Exit code `124` = the kernel lived the whole time = success.
+Interactive QEMU: `qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M
+-nographic -kernel target/aarch64-unknown-none/debug/silver_microkernel`.
+Use Ctrl-A then X to quit. For automation, prefix `timeout 5s`; exit code 124
+means the kernel lived the whole time. Scripted serial input uses LF (`help\n`);
+QEMU's multiplexed stdio may consume a piped bare CR even though the shell
+handles both CR and LF from UART.
 
 ## Hardware contract (QEMU virt)
 
@@ -183,15 +188,15 @@ read back only their own values.
 
 ## EL0 execution and lifecycle model
 
-- `SYS_SPAWN(program, argument)` selects program 0 (demo ELF) or 1
-  (nameserver ELF). `scheduler::spawn_user` creates a kernel stack, an 8 KB
-  user stack, a private page and an independent ELF copy before constructing
-  TTBR0. Only idle remains an EL1 task.
+- `SYS_SPAWN(program, argument)` selects program 0 (demo), 1 (nameserver) or 2
+  (silvershell). `scheduler::spawn_user` creates a kernel stack, an 8 KB user
+  stack, a private page and an independent ELF copy before constructing TTBR0.
+  Only idle remains an EL1 task.
 - A fresh user context has high SP_EL1, the ELF entry in x19, the argument in
   x20 and SP_EL0 = `0x7FE00000 + 0x2000`. `silver_user_bootstrap` moves x20 to
   x0, sets ELR_EL1 = x19 and SPSR_EL1 = 0, then executes `eret`.
 - Demo roles are selected by the argument in `userspace/src/main.rs`, not by
-  task ID. The nameserver has its own executable in `userspace/src/bin/`.
+  task ID. Nameserver and shell have separate executables in `userspace/src/bin/`.
 - The scheduler switches only TTBR0_EL1, then performs
   `tlbi vmalle1; dsb ish; isb`. High kernel text and SP_EL1 remain valid
   through TTBR1 throughout the switch.
@@ -199,8 +204,12 @@ read back only their own values.
   inspect SPSR.M[3:2]: EL0 goes to `silver_handle_task_fault`; EL1 is a
   kernel panic.
 - Syscalls include sleep, send, receive, register, lookup, unregister, print,
-  whoami, task_alive, spawn, exit, `brk`, hex/dec print, mutex lock/unlock and
-  channel send/receive.
+  whoami, task_alive, spawn, exit, `brk`, UART read, uptime, meminfo, hex/dec
+  print, mutex lock/unlock and channel send/receive.
+- `SYS_READ` polls PL011 RX and returns a byte or SYSCALL_ERROR when RXFE says
+  no input is available. `SYS_UPTIME` returns raw 100 Hz ticks. `SYS_MEMINFO`
+  copies three u64 byte counts (total, used, free) through checked copyout;
+  used includes kernel/reserved RAM as well as allocated frames.
 - `SYS_SEND(target, message)` blocks while the target has 16 queued messages and
   returns `SYSCALL_ERROR` if the target is dead. Nameserver RPC paths propagate
   this failure too.
@@ -220,6 +229,21 @@ read back only their own values.
   remain permanently valid.
 - User tasks cannot use the high-only kernel heap. The nameserver therefore
   stores 16 fixed-capacity entries on its user stack instead of in a `Vec`.
+
+## Silver2Shell
+
+- `silvershell.rs` is an independent no_std/no_main ELF with no allocator. It
+  uses a 96-byte line buffer, accepts printable ASCII and CR/LF, echoes input,
+  and implements Backspace/DEL by removing the last byte and erasing it onscreen.
+- UART input is deliberately a nonblocking syscall in this MVP. The shell sleeps
+  for 1 ms when RX is empty, so polling does not monopolize the scheduler. A
+  future UART RX interrupt can replace polling without changing command parsing.
+- Startup emits ANSI clear/home, runs fastfetch once and shows `silver2> `.
+  Commands are exact-match `help` and `fastfetch`; empty lines only reprompt.
+- Fastfetch converts ticks to seconds with hundredths and bytes to tenths of a
+  MiB. Its three memory counters come from SYS_MEMINFO, not hardcoded free RAM.
+- The default clean boot selects task ID 2 (shell) after nameserver ID 1.
+  `demo-tasks` selects task ID 1 and preserves the earlier regression IDs.
 
 ## Userspace allocation
 
@@ -371,23 +395,28 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   or growable stack; the user stack remains fixed at 8 KB and the private
   window at one page.
 - UART lines from different tasks can interleave; an IRQ may even schedule
-  another task during a FIFO wait.
+  another task during a FIFO wait. Shell RX is polled rather than interrupt
+  driven, has no escape-sequence parser and currently has one intended reader.
 - `#[alloc_error_handler]` is unstable on stable Rust. The kernel converts a
   null from its `GlobalAlloc` into a panic; the demo userspace wrapper instead
   prints the layout and exits only the current EL0 task.
 
 ## Next steps (by priority)
 
-1. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
+1. **Grow the shell MVP:** argument parsing, `ps`/task control and launching
+   embedded programs from commands; keep the default console free of demo spam.
+2. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.
-2. **IPC control plane:** nameserver watch notifications instead of lookup
-   polling, plus nonblocking/priority control replies so full data mailboxes
-   cannot block service RPC. Send timeouts and cancellation are still open.
 3. **VirtIO-console / virtio-block** — first MMIO device driver, moving
-   UART output behind a driver interface.
+   UART output behind a driver interface. UART RX interrupts can remove shell
+   polling when console ownership is defined.
 4. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
    `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
+
+Nameserver watch notifications are explicitly deferred. Later IPC control-plane
+work should also address nonblocking/priority replies, send timeouts/cancellation
+and the full-mailbox selective-receive limitation recorded above.
 
 ## Workflow for a new feature
 
@@ -395,10 +424,12 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 2. `cargo build` (host — catches silly mistakes faster)
 3. `cargo build --target aarch64-unknown-none --no-default-features --features no_std`
 4. Also check `--release`: optimized userspace exposes register-preservation
-   bugs that debug builds can hide.
-5. QEMU run for 5–30 s, compare output against expectations; repeat several
-   times for scheduler/interrupt changes because races are timing-sensitive.
-   Expect exactly the two intentional faults from tasks 15 and 16, plus
+   bugs that debug builds can hide. For regressions, separately build with
+   `--features no_std,demo-tasks`; this replaces the interactive boot.
+5. For the default profile, type `help` and `fastfetch` in QEMU and verify the
+   wolf screen, live uptime/RAM and prompt. For demo-tasks, run 5–30 seconds,
+   repeat timing-sensitive runs and expect exactly two intentional faults from
+   tasks 15 and 16, plus
    `COPYOUT READONLY REJECT=PASS`, `COPYOUT UNMAPPED REJECT=PASS`,
    `LIFECYCLE EXIT/UNREGISTER=PASS`, `LIFECYCLE MUTEX CLEANUP=PASS`,
    `HEAP GROW/SHRINK=PASS`, `MALLOC FREE/REUSE=PASS`,
