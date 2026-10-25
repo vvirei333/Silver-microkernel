@@ -23,6 +23,7 @@ const SYS_BRK: u64 = 18;
 const SYS_READ: u64 = 19;
 const SYS_UPTIME: u64 = 20;
 const SYS_MEMINFO: u64 = 21;
+const SYS_TASK_LIST: u64 = 22;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -39,6 +40,15 @@ pub struct MemoryInfo {
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub free_bytes: u64,
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct TaskInfo {
+    pub id: u64,
+    pub state: u64,
+    pub program: u64,
+    pub argument: u64,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -73,6 +83,19 @@ pub fn memory_info() -> Option<MemoryInfo> {
         Some(info)
     } else {
         None
+    }
+}
+
+pub fn task_list(buffer: &mut [TaskInfo]) -> Option<usize> {
+    match unsafe {
+        syscall2(
+            SYS_TASK_LIST,
+            buffer.as_mut_ptr() as u64,
+            buffer.len() as u64,
+        )
+    } {
+        SYSCALL_ERROR => None,
+        count => Some(count as usize),
     }
 }
 

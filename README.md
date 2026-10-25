@@ -26,8 +26,8 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
 - [x] Three userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
-- [x] Silver2Shell: interactive `help` / `fastfetch`, wolf ASCII art and clean MVP boot
-- [x] Shell syscalls: nonblocking `SYS_READ`, `SYS_UPTIME` and checked `SYS_MEMINFO`
+- [x] silvershell: `help`, `fastfetch`, `ps`, `spawn`, wolf ASCII art and clean MVP boot
+- [x] Shell syscalls: `SYS_READ`, `SYS_UPTIME`, `SYS_MEMINFO` and `SYS_TASK_LIST`
 - [x] Per-task TTBR0 spaces: independent ELF image, fixed-VA stack and private page
 - [x] Growable per-task heap: sparse 2 MB window, `brk`, zero-fill and cleanup on exit
 - [x] Userspace `malloc/free`: first-fit free list, split, coalesce and `brk` trim
@@ -84,13 +84,14 @@ qemu-system-aarch64 \
   -kernel target/aarch64-unknown-none/debug/silver_microkernel
 ```
 
-Type `help` or `fastfetch` at the `silver2>` prompt. Backspace edits the current
-line. Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
+At the `silvershell>` prompt, use `help`, `fastfetch`, `ps`, or
+`spawn <demo|nameserver|silvershell> [arg]`. Backspace edits the current line.
+Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
 `Cargo.toml` has `std` (default host stub), `no_std` (bare metal) and
 `demo-tasks` (opt-in regression programs). The default bare-metal build starts
-only idle, nameserver and Silver2Shell for a clean console. To run the older
+only idle, nameserver and silvershell for a clean console. To run the older
 fault/VM/allocator/IPC demos instead, use `--features no_std,demo-tasks`.
 `build.rs` automatically builds and embeds the demo, nameserver and silvershell
 ELFs; no separate userspace command is needed.

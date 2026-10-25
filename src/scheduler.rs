@@ -61,9 +61,20 @@ impl TaskContext {
     }
 }
 
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct TaskInfo {
+    pub id: u64,
+    pub state: u64,
+    pub program: u64,
+    pub argument: u64,
+}
+
 pub struct Task {
     pub id: u64,
     pub state: TaskState,
+    pub program: u64,
+    pub argument: u64,
     pub context: TaskContext,
     /// Kernel stack: used for SVC/IRQ trampolines whenever the task runs.
     pub stack: MemoryRegion,
@@ -381,6 +392,35 @@ pub fn task_alive(id: u64) -> bool {
                 .any(|task| task.id == id && task.state != TaskState::Dead)
         })
         .unwrap_or(false)
+}
+
+/// Snapshot for SYS_TASK_LIST. Numeric states are part of the userspace ABI.
+pub fn task_infos() -> Vec<TaskInfo> {
+    scheduler_manager()
+        .map(|manager| {
+            manager
+                .tasks
+                .iter()
+                .map(|task| TaskInfo {
+                    id: task.id,
+                    state: state_code(task.state),
+                    program: task.program,
+                    argument: task.argument,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn state_code(state: TaskState) -> u64 {
+    match state {
+        TaskState::Ready => 1,
+        TaskState::Running => 2,
+        TaskState::Sleeping(_) => 3,
+        TaskState::Blocked => 4,
+        TaskState::BlockedUntil(_) => 5,
+        TaskState::Dead => 6,
+    }
 }
 
 /// Queries or moves the current EL0 task's program break. Zero is the query
@@ -708,6 +748,8 @@ impl Task {
         Some(Self {
             id,
             state: TaskState::Ready,
+            program: user.map_or(u64::MAX, |(program, _)| program),
+            argument: user.map_or(0, |(_, argument)| argument),
             context,
             stack,
             user_stack,

@@ -28,7 +28,7 @@ const WOLF: [&str; 8] = [
 pub extern "C" fn _start(_argument: u64) -> ! {
     syscall::print("\x1b[2J\x1b[H");
     fastfetch();
-    syscall::print("\r\nSilver2Shell ready. Type 'help' for commands.\r\n");
+    syscall::print("\r\nsilvershell ready. Type 'help' for commands.\r\n");
     prompt();
 
     let mut line = [0_u8; LINE_CAPACITY];
@@ -66,27 +66,128 @@ pub extern "C" fn _start(_argument: u64) -> ! {
 }
 
 fn execute(command: &str) {
-    match command {
-        "" => {}
-        "help" => {
-            syscall::print("Silver2Shell commands:\r\n");
+    let mut words = command.split_whitespace();
+    match words.next() {
+        None => {}
+        Some("help") => {
+            syscall::print("silvershell commands:\r\n");
             syscall::print("  help       Show this command list\r\n");
             syscall::print("  fastfetch  Show OS, uptime and memory information\r\n");
+            syscall::print("  ps         List tasks and their states\r\n");
+            syscall::print("  spawn <demo|nameserver|silvershell> [arg]\r\n");
+            syscall::print("             Start an embedded program with an optional argument\r\n");
         }
-        "fastfetch" => fastfetch(),
-        _ => syscall::print("Unknown command. Type 'help'.\r\n"),
+        Some("fastfetch") => fastfetch(),
+        Some("ps") => show_tasks(),
+        Some("spawn") => spawn_program(words.next(), words.next()),
+        Some(_) => syscall::print("Unknown command. Type 'help'.\r\n"),
     }
+}
+
+fn show_tasks() {
+    const EMPTY: syscall::TaskInfo = syscall::TaskInfo {
+        id: 0,
+        state: 0,
+        program: 0,
+        argument: 0,
+    };
+    let mut tasks = [EMPTY; 32];
+    let Some(count) = syscall::task_list(&mut tasks) else {
+        syscall::print("Could not read the task list.\r\n");
+        return;
+    };
+
+    syscall::print("ID  PROGRAM      ARG  STATE\r\n");
+    for task in &tasks[..count] {
+        syscall::print_dec_u64(task.id);
+        syscall::print("   ");
+        syscall::print(program_name(task.program));
+        syscall::print("  ");
+        syscall::print_dec_u64(task.argument);
+        syscall::print("    ");
+        syscall::print(state_name(task.state));
+        syscall::print("\r\n");
+    }
+}
+
+fn program_name(program: u64) -> &'static str {
+    match program {
+        syscall::PROGRAM_DEMO => "demo        ",
+        syscall::PROGRAM_NAMESERVER => "nameserver  ",
+        syscall::PROGRAM_SILVERSHELL => "silvershell ",
+        _ => "kernel      ",
+    }
+}
+
+fn state_name(state: u64) -> &'static str {
+    match state {
+        1 => "ready",
+        2 => "running",
+        3 => "sleeping",
+        4 => "blocked",
+        5 => "blocked-timeout",
+        6 => "dead",
+        _ => "unknown",
+    }
+}
+
+fn spawn_program(program: Option<&str>, argument: Option<&str>) {
+    let Some(program) = program else {
+        syscall::print("Usage: spawn <demo|nameserver|silvershell> [arg]\r\n");
+        return;
+    };
+    let program = match program {
+        "demo" => syscall::PROGRAM_DEMO,
+        "nameserver" => syscall::PROGRAM_NAMESERVER,
+        "silvershell" => syscall::PROGRAM_SILVERSHELL,
+        _ => {
+            syscall::print("Unknown program. Use demo, nameserver or silvershell.\r\n");
+            return;
+        }
+    };
+    let argument = match argument {
+        Some(text) => match parse_number(text) {
+            Some(value) => value,
+            None => {
+                syscall::print("Argument must be a non-negative decimal integer.\r\n");
+                return;
+            }
+        },
+        None => 0,
+    };
+
+    if let Some(id) = syscall::spawn(program, argument) {
+        syscall::print("Spawned task ID=");
+        syscall::print_dec_u64(id);
+        syscall::print("\r\n");
+    } else {
+        syscall::print("Spawn failed.\r\n");
+    }
+}
+
+fn parse_number(text: &str) -> Option<u64> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut value = 0_u64;
+    for byte in text.bytes() {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?.checked_add(u64::from(byte - b'0'))?;
+    }
+    Some(value)
 }
 
 fn fastfetch() {
     let uptime = syscall::uptime_ticks();
     let memory = syscall::memory_info();
 
-    field(WOLF[0], "silver@silver2");
+    field(WOLF[0], "silver@silvershell");
     field(WOLF[1], "---------------");
     field(WOLF[2], "OS: Silver Microkernel");
     field(WOLF[3], "Kernel: Rust / AArch64");
-    field(WOLF[4], "Shell: Silver2Shell");
+    field(WOLF[4], "Shell: silvershell");
 
     syscall::print(WOLF[5]);
     syscall::print("Uptime: ");
@@ -141,7 +242,7 @@ fn print_mib(bytes: u64) {
 }
 
 fn prompt() {
-    syscall::print("silver2> ");
+    syscall::print("silvershell> ");
 }
 
 fn echo(byte: u8) {

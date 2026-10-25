@@ -35,6 +35,7 @@ pub const SYS_BRK: u64 = 18;
 pub const SYS_READ: u64 = 19;
 pub const SYS_UPTIME: u64 = 20;
 pub const SYS_MEMINFO: u64 = 21;
+pub const SYS_TASK_LIST: u64 = 22;
 
 /// Well-known task ID of the nameserver. Fixed by spawn order: the scheduler
 /// spawns it first, right after idle (which is always ID 0).
@@ -114,10 +115,29 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_READ => pl011::read_byte().map(u64::from).unwrap_or(SYSCALL_ERROR),
         SYS_UPTIME => timer::ticks(),
         SYS_MEMINFO => sys_meminfo(frame[0]),
+        SYS_TASK_LIST => sys_task_list(frame[0], frame[1]),
         _ => SYSCALL_ERROR,
     };
 
     frame[0] = result;
+}
+
+fn sys_task_list(buffer_ptr: u64, capacity: u64) -> u64 {
+    let tasks = scheduler::task_infos();
+    let count = tasks.len().min(capacity as usize).min(64);
+    if count == 0 {
+        return 0;
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            tasks.as_ptr().cast::<u8>(),
+            count * core::mem::size_of::<scheduler::TaskInfo>(),
+        )
+    };
+    if user_memory::copy_to_user(bytes, buffer_ptr).is_err() {
+        return SYSCALL_ERROR;
+    }
+    count as u64
 }
 
 fn sys_meminfo(info_ptr: u64) -> u64 {

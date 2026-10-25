@@ -3,14 +3,14 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (Silver2Shell MVP update)
+## State as of 2026-10-25 (silvershell MVP update)
 
-Latest verified feature: **interactive Silver2Shell with wolf fastfetch**. The
-third userspace ELF starts as the first interactive task, clears the terminal,
+Latest verified feature: **interactive silvershell with fastfetch, ps and spawn**.
+The third userspace ELF starts as the first interactive task, clears the terminal,
 prints OS/kernel/shell details, uptime and RAM, then accepts commands through
-UART. `help`, `fastfetch`, Backspace editing and unknown-command diagnostics all
-work. New syscalls are nonblocking `SYS_READ`, `SYS_UPTIME` and checked-copyout
-`SYS_MEMINFO`.
+UART. `help`, `fastfetch`, `ps`, `spawn`, Backspace editing and argument error
+handling work. New syscalls are nonblocking `SYS_READ`, `SYS_UPTIME`,
+checked-copyout `SYS_MEMINFO` and `SYS_TASK_LIST` task snapshots.
 
 The default bare-metal boot includes only idle, nameserver and the shell, so
 periodic demo output cannot bury the prompt. Build with `no_std,demo-tasks` for
@@ -34,9 +34,11 @@ IPC BP BACKPRESSURE=PASS
 IPC EXIT WAKE=PASS
 ```
 
-Shell QEMU checks observed the wolf screen, `silver@silver2`, changing uptime,
-`Memory: ... / 128.0 MiB`, free RAM, both help entries and a fresh fastfetch
-after typed input. No `KERNEL PANIC`, `BAD SP` or unexpected `FAIL` occurred.
+Shell QEMU checks observed the wolf screen, `silver@silvershell`, changing uptime,
+RAM and fastfetch. `ps` showed kernel/nameserver/shell states; `spawn demo 12`
+created a sleeping task with argument 12, and release `spawn demo 20` ran the heap
+probe and reaped it before the next `ps`. Invalid decimal arguments were rejected.
+No `KERNEL PANIC`, `BAD SP` or unexpected `FAIL` occurred.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
 | --- | ---: | --- | --- |
@@ -204,12 +206,15 @@ read back only their own values.
   inspect SPSR.M[3:2]: EL0 goes to `silver_handle_task_fault`; EL1 is a
   kernel panic.
 - Syscalls include sleep, send, receive, register, lookup, unregister, print,
-  whoami, task_alive, spawn, exit, `brk`, UART read, uptime, meminfo, hex/dec
-  print, mutex lock/unlock and channel send/receive.
+  whoami, task_alive, task_list, spawn, exit, `brk`, UART read, uptime, meminfo,
+  hex/dec print, mutex lock/unlock and channel send/receive.
 - `SYS_READ` polls PL011 RX and returns a byte or SYSCALL_ERROR when RXFE says
   no input is available. `SYS_UPTIME` returns raw 100 Hz ticks. `SYS_MEMINFO`
   copies three u64 byte counts (total, used, free) through checked copyout;
   used includes kernel/reserved RAM as well as allocated frames.
+- `SYS_TASK_LIST(buffer, capacity)` copies up to 64 `#[repr(C)]` TaskInfo entries
+  (ID, numeric state, program, argument) and returns the number written. Task
+  metadata lives in the Task itself, so ps can distinguish identical ELF roles.
 - `SYS_SEND(target, message)` blocks while the target has 16 queued messages and
   returns `SYSCALL_ERROR` if the target is dead. Nameserver RPC paths propagate
   this failure too.
@@ -230,7 +235,7 @@ read back only their own values.
 - User tasks cannot use the high-only kernel heap. The nameserver therefore
   stores 16 fixed-capacity entries on its user stack instead of in a `Vec`.
 
-## Silver2Shell
+## silvershell
 
 - `silvershell.rs` is an independent no_std/no_main ELF with no allocator. It
   uses a 96-byte line buffer, accepts printable ASCII and CR/LF, echoes input,
@@ -238,8 +243,12 @@ read back only their own values.
 - UART input is deliberately a nonblocking syscall in this MVP. The shell sleeps
   for 1 ms when RX is empty, so polling does not monopolize the scheduler. A
   future UART RX interrupt can replace polling without changing command parsing.
-- Startup emits ANSI clear/home, runs fastfetch once and shows `silver2> `.
-  Commands are exact-match `help` and `fastfetch`; empty lines only reprompt.
+- Startup emits ANSI clear/home, runs fastfetch once and shows `silvershell> `.
+  Commands use whitespace tokenization: `help`, `fastfetch`, `ps`, and
+  `spawn <demo|nameserver|silvershell> [arg]`; empty lines only reprompt.
+- `ps` uses a fixed 32-entry userspace array and prints ID/program/argument/state.
+  `spawn` parses an optional checked decimal u64 and reports the new task ID.
+  Spawned programs share the console, so output can interleave with the prompt.
 - Fastfetch converts ticks to seconds with hundredths and bytes to tenths of a
   MiB. Its three memory counters come from SYS_MEMINFO, not hardcoded free RAM.
 - The default clean boot selects task ID 2 (shell) after nameserver ID 1.
@@ -403,8 +412,8 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 ## Next steps (by priority)
 
-1. **Grow the shell MVP:** argument parsing, `ps`/task control and launching
-   embedded programs from commands; keep the default console free of demo spam.
+1. **Grow task control:** `kill`, `wait`/exit status and console ownership or
+   job control; spawned programs currently share UART output with the shell.
 2. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.
@@ -426,8 +435,9 @@ and the full-mailbox selective-receive limitation recorded above.
 4. Also check `--release`: optimized userspace exposes register-preservation
    bugs that debug builds can hide. For regressions, separately build with
    `--features no_std,demo-tasks`; this replaces the interactive boot.
-5. For the default profile, type `help` and `fastfetch` in QEMU and verify the
-   wolf screen, live uptime/RAM and prompt. For demo-tasks, run 5–30 seconds,
+5. For the default profile, type `help`, `fastfetch`, `ps` and a `spawn` command;
+   verify the wolf screen, live uptime/RAM, task metadata and spawned task ID.
+   For demo-tasks, run 5–30 seconds,
    repeat timing-sensitive runs and expect exactly two intentional faults from
    tasks 15 and 16, plus
    `COPYOUT READONLY REJECT=PASS`, `COPYOUT UNMAPPED REJECT=PASS`,
