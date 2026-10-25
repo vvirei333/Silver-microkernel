@@ -3,21 +3,26 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-26 (silverd init and Ring 3 UART IPC)
+## State as of 2026-10-26 (Ring 3 UART TX/RX and Ctrl-Z)
 
 Latest verified architecture: **silverd -> Scout, Howl, Howler**. Normal boot
 creates only silverd (task 1). Silverd spawns Scout (task 2), waits for its
 `SCOUT READY` IPC handshake, spawns Howl (task 3) with Howler's ID as its
 argument, transfers the console, then spawns Howler (task 4) with Howl's ID.
-Howler maps PL011 and binds INTID 33; Howl receives only Howler's one-byte IPC
-messages. Kernel UART RX remains a demo/fallback path, not the normal Howl input
-path. `demo-tasks` does not start silverd and keeps Scout at task ID 1.
+Howler maps PL011 and binds INTID 33. Normal user RX and TX both pass through
+Howler in Ring 3: input messages are `[0, byte]`, while output messages are
+`[1, length, up to 30 bytes]`. `SYS_PRINT`, `SYS_PRINT_HEX` and `SYS_PRINT_DEC`
+chunk console output into nonblocking IPC messages to task 4. The kernel wakes
+Howler's event wait for TX as well as hardware RX and yields after each chunk.
+Early diagnostics, `demo-tasks` and a dead-Howler fallback still use kernel PL011;
+a full TX mailbox drops the remaining output instead of blocking.
 
 The QEMU virt DTB describes the PL011 interrupt as SPI 1, level-high, which is
 GIC INTID 33. The kernel fallback uses PL011 RXIM and RTIM with a bounded
 256-byte FIFO; its IRQ handler drains the hardware FIFO completely. `SYS_READ`
 reads only that software queue and never polls hardware. The timer no longer
-polls UART. In the unbound fallback, Ctrl-Z (`0x1A`) still becomes a stop request.
+polls UART. Both the unbound fallback and Howler consume Ctrl-Z (`0x1A`) as a
+stop request rather than forwarding it to Howl.
 
 Keep `GICD_ICFGR = 0b00` for this level-sensitive interrupt. `0b10` means
 edge-triggered and left input stuck during development. RX timeout (RTIM) is
@@ -25,10 +30,10 @@ required so a single keypress does not wait for the RX FIFO threshold.
 
 The interactive profile still has one UART owner. `spawn` and `bg` create children
 without it; `fg <cap>` resumes a stopped task or foregrounds a live one, then waits
-for either exit or stop. In the unbound kernel UART fallback, Ctrl-Z changes the
-child to `Stopped`, returns the console to the shell and wakes the foreground
-waiter. The normal Howler IPC path does not yet implement that Ctrl-Z line
-discipline. `ps` reports state code 7 as `stopped`. `SYS_TASK_RESUME = 40` and
+for either exit or stop. Ctrl-Z changes the child to `Stopped`, returns the console
+to the shell and wakes the foreground waiter. Howler invokes `SYS_STOP_CONSOLE =
+66`; the kernel stops the current console owner and schedules if one was stopped.
+`ps` reports state code 7 as `stopped`. `SYS_TASK_RESUME = 40` and
 `SYS_WAIT_EVENT = 41` implement resume and the `Exited`/`Stopped` event split;
 old `SYS_WAIT` still waits only for exit.
 
@@ -56,17 +61,18 @@ Device-nGnRnE into a first-fit 2 MB user window at `0x80000000`.
 `SYS_BIND_IRQ = 63` requires `CAP_IRQ` and exclusively binds a non-timer INTID.
 `SYS_WAIT_IRQ = 64` consumes a pending notification or blocks until one arrives.
 `SYS_TRY_SEND = 65` rejects a full or dead mailbox without blocking.
+`SYS_STOP_CONSOLE = 66` lets Howler deliver Ctrl-Z without forwarding the byte.
 Bound level-triggered IRQs are masked before GIC EOI, then unmasked by
 `bind_irq` and every `wait_irq` call to prevent an IRQ storm while EL0 handles
 the device. Program 4 (Howler) receives self capabilities with CAP_MMIO and
 CAP_IRQ at spawn, plus an explicit CAP_GRANT from silverd. It maps PL011, binds
-INTID 33 and sends received bytes to Howl through nonblocking IPC without
-entering the kernel PL011 handler.
+INTID 33, sends input to Howl and writes output IPC to DR without entering the
+kernel PL011 handler on the normal path.
 
-Debug and release QEMU both passed IRQ-only `uname`, `echo` and `pwd`; sleeping
-`demo 12` stop/resume/kill/wait; and blocked `demo 7` with IPC delivered while
-stopped and consumed after resume. Twelve-second `demo-tasks` runs in both
-profiles passed 18 markers with exactly two intentional `TASK FAULT` reports:
+Debug and release QEMU passed Howler-backed TX/RX and sleeping `demo 12`
+stop/kill/wait; debug also passed `fg` resume and `uname`. A twelve-second debug
+`demo-tasks` run passed 18 markers with exactly two intentional `TASK FAULT`
+reports:
 
 ```text
 CONDVAR TEST: beta silent = PASS
@@ -291,10 +297,16 @@ read back only their own values.
   section and records the calling shell as `console_parent` for Ctrl-Z. Print
   syscalls from non-owners succeed but discard their bytes; non-owner `SYS_READ`
   returns SYSCALL_ERROR without touching PL011.
-- PL011 INTID 33 drains hardware RX into a 256-byte software FIFO and consumes
-  Ctrl-Z as a stop request. The owner's `SYS_READ` reads only the software FIFO;
-  no byte/no input returns SYSCALL_ERROR. Timer IRQs handle only ticks and normal
-  scheduling; UART IRQs schedule only after stopping a foreground task.
+- On the normal path, console print syscalls copy and validate user bytes, then
+  send `[1, len, data]` chunks to Howler with `ipc::try_send`. Successful sends
+  set Howler's pending event, wake its `wait_irq` and yield the CPU. Howler polls
+  output IPC with zero timeout and waits for TXFF before writing DR. A dead
+  Howler selects the kernel PL011 fallback; a full mailbox drops remaining bytes.
+- The unbound PL011 fallback drains INTID 33 into a 256-byte software FIFO and
+  consumes Ctrl-Z as a stop request. The owner's `SYS_READ` reads only that FIFO;
+  no byte/no input returns SYSCALL_ERROR. On the normal path Howler reads DR,
+  clears RX/RT interrupt sources and either sends `[0, byte]` to Howl or invokes
+  `SYS_STOP_CONSOLE` for Ctrl-Z. Timer IRQs handle ticks and normal scheduling.
   `SYS_UPTIME` returns raw 100 Hz ticks. `SYS_MEMINFO` copies three u64 byte counts
   through checked copyout; used includes kernel/reserved RAM and allocated frames.
 - `SYS_TASK_LIST(buffer, capacity)` copies up to 64 `#[repr(C)]` TaskInfo entries
@@ -390,10 +402,10 @@ read back only their own values.
   IPC, then starts Howl (task 3) with Howler's future ID 4 as its argument, gives
   Howl the console, and starts Howler (task 4) with Howl's real ID 3. There is no
   manual `start_uart_driver` command. Howler maps PL011, binds INTID 33 and sends
-  one-byte IPC messages directly to Howl's mailbox. Howl polls with a zero
-  timeout, accepts only sender ID 4 and sleeps 1 ms when empty. The kernel
-  transfers mailbox data but does not read UART bytes or forward them to Howl.
-  Output still uses SYS_PRINT.
+  `[0, byte]` input messages directly to Howl's mailbox. Howl polls with a zero
+  timeout, accepts only type-0 messages from sender ID 4 and sleeps 1 ms when
+  empty. Normal output uses SYS_PRINT/SYS_PRINT_HEX/SYS_PRINT_DEC, whose typed
+  chunks return through IPC to Howler for the actual PL011 writes.
 - Startup emits ANSI clear/home, runs fastfetch once and shows a bold cyan
   `howl>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`,
   `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`,
@@ -410,12 +422,9 @@ read back only their own values.
 - `ps` uses a fixed 32-entry userspace array and prints ID/program/argument/state,
   including `stopped`. `spawn` and `bg` parse an optional checked decimal u64 and
   create a task without console ownership. `fg <cap>` calls resume, transfers the
-  console and waits for an Exited/Stopped event. `kill` works on stopped tasks,
-  and plain `wait` still reports only termination status.
-- Current limitation: the unbound kernel UART fallback consumes Ctrl-Z (`0x1A`)
-  as a stop request, but the normal Howler IPC path forwards it as an ordinary
-  byte and Howl ignores it. Ctrl-Z line discipline must be added to the EL0 path
-  before interactive stop/resume works there.
+  console and waits for an Exited/Stopped event. Howler consumes Ctrl-Z and calls
+  `SYS_STOP_CONSOLE`, so the foreground task stops without receiving byte 0x1A.
+  `kill` works on stopped tasks, and plain `wait` still reports only exit status.
 - Background task output is dropped rather than buffered, so early output cannot
   be replayed by `fg`. Only output produced after the transfer becomes visible.
 - Fastfetch converts ticks to seconds with hundredths and bytes to tenths of a

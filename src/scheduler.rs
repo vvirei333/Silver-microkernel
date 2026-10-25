@@ -365,6 +365,29 @@ pub fn wake_bound_irq(intid: u32) -> bool {
     true
 }
 
+/// Wakes a driver waiting in `wait_irq` when a non-IRQ event is queued for it.
+/// Howler uses the same event wait for hardware RX and IPC-based TX.
+#[cfg(not(feature = "demo-tasks"))]
+pub fn notify_bound_task(id: u64) -> bool {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let notified = scheduler_manager()
+        .and_then(|manager| {
+            manager
+                .tasks
+                .iter_mut()
+                .find(|task| {
+                    task.id == id && task.state != TaskState::Dead && task.bound_irq.is_some()
+                })
+                .map(|task| {
+                    task.irq_pending = true;
+                    wake_blocked_task(task);
+                })
+        })
+        .is_some();
+    interrupts::restore_irq(saved_daif);
+    notified
+}
+
 /// Remembers a wait queue before its associated mutex is released.
 pub fn register_waiter(queue: &WaitQueue) {
     if let Some(task) = current_task_mut() {
@@ -646,7 +669,7 @@ pub fn current_task_owns_console() -> bool {
         .unwrap_or(false)
 }
 
-/// Called by the timer after PL011 consumes Ctrl-Z. A shell prompt has no
+/// Called after kernel PL011 or Howler consumes Ctrl-Z. A shell prompt has no
 /// console parent and is therefore immune to its own stop key.
 pub fn stop_console_owner() -> bool {
     let saved_daif = interrupts::save_and_disable_irq();

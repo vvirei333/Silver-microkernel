@@ -63,7 +63,9 @@ fn read_input(howler_id: u64) -> Option<u8> {
 
     let mut message = ipc::Message::new(0, &[]);
     match syscall::receive_timeout(&mut message, 0) {
-        Ok(()) if message.sender == howler_id => Some(message.payload[0]),
+        Ok(()) if message.sender == howler_id && message.payload[0] == 0 => {
+            Some(message.payload[1])
+        }
         _ => None,
     }
 }

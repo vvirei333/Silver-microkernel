@@ -14,7 +14,11 @@ const UART_DR: usize = 0x00;
 const UART_FR: usize = 0x18;
 const UART_ICR: usize = 0x44;
 const UART_FR_RXFE: u32 = 1 << 4;
+const UART_FR_TXFF: u32 = 1 << 5;
 const UART_RX_RT_CLEAR: u32 = 0x30;
+const IPC_INPUT: u8 = 0;
+const IPC_OUTPUT: u8 = 1;
+const CTRL_Z: u8 = 0x1A;
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -32,14 +36,42 @@ pub extern "C" fn _start(target_task_id: u64) -> ! {
     syscall::print("UART DRIVER STARTED\r\n");
     let base = base as usize;
     loop {
+        drain_output(base);
         syscall::wait_irq();
         if read32(base + UART_FR) & UART_FR_RXFE == 0 {
             let byte = read32(base + UART_DR) as u8;
             write32(base + UART_ICR, UART_RX_RT_CLEAR);
-            let message = ipc::Message::new(0, &[byte]);
-            let _ = syscall::try_send(target_task_id, &message);
+            if byte == CTRL_Z {
+                syscall::stop_console();
+            } else {
+                let message = ipc::Message::new(0, &[IPC_INPUT, byte]);
+                let _ = syscall::try_send(target_task_id, &message);
+            }
         }
     }
+}
+
+fn drain_output(base: usize) {
+    loop {
+        let mut message = ipc::Message::new(0, &[]);
+        if syscall::receive_timeout(&mut message, 0).is_err() {
+            return;
+        }
+        if message.payload[0] != IPC_OUTPUT {
+            continue;
+        }
+        let len = usize::from(message.payload[1]).min(ipc::PAYLOAD_SIZE - 2);
+        for &byte in &message.payload[2..2 + len] {
+            write_byte(base, byte);
+        }
+    }
+}
+
+fn write_byte(base: usize, byte: u8) {
+    while read32(base + UART_FR) & UART_FR_TXFF != 0 {
+        core::hint::spin_loop();
+    }
+    write32(base + UART_DR, u32::from(byte));
 }
 
 fn read32(address: usize) -> u32 {

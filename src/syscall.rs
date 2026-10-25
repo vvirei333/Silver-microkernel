@@ -62,6 +62,7 @@ pub const SYS_MAP_PHYS: u64 = 62;
 pub const SYS_BIND_IRQ: u64 = 63;
 pub const SYS_WAIT_IRQ: u64 = 64;
 pub const SYS_TRY_SEND: u64 = 65;
+pub const SYS_STOP_CONSOLE: u64 = 66;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -119,18 +120,8 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_LOOKUP => sys_lookup_name(frame[0]),
         SYS_PRINT => sys_print(frame[0], frame[1]),
         SYS_WHOAMI => scheduler::current_task_id(),
-        SYS_PRINT_HEX => {
-            if scheduler::current_task_owns_console() {
-                pl011::write_hex_u64(frame[0]);
-            }
-            0
-        }
-        SYS_PRINT_DEC => {
-            if scheduler::current_task_owns_console() {
-                pl011::write_dec_u64(frame[0]);
-            }
-            0
-        }
+        SYS_PRINT_HEX => sys_print_hex(frame[0]),
+        SYS_PRINT_DEC => sys_print_dec(frame[0]),
         SYS_MUTEX_LOCK => {
             DEMO_MUTEX.raw_lock();
             0
@@ -242,6 +233,12 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             } else {
                 SYSCALL_ERROR
             }
+        }
+        SYS_STOP_CONSOLE => {
+            if scheduler::stop_console_owner() {
+                scheduler::schedule();
+            }
+            0
         }
         _ => SYSCALL_ERROR,
     };
@@ -503,8 +500,75 @@ fn sys_print(ptr: u64, len: u64) -> u64 {
     if user_memory::copy_from_user(ptr, &mut bytes).is_err() {
         return SYSCALL_ERROR;
     }
-    pl011::write_bytes(&bytes);
+    write_console_bytes(&bytes);
     0
+}
+
+fn sys_print_hex(value: u64) -> u64 {
+    if !scheduler::current_task_owns_console() {
+        return 0;
+    }
+    let mut bytes = [0_u8; 16];
+    for (index, byte) in bytes.iter_mut().enumerate() {
+        let digit = ((value >> (60 - index * 4)) & 0xF) as u8;
+        *byte = match digit {
+            0x0..=0x9 => b'0' + digit,
+            _ => b'A' + digit - 0xA,
+        };
+    }
+    write_console_bytes(&bytes);
+    0
+}
+
+fn sys_print_dec(value: u64) -> u64 {
+    if !scheduler::current_task_owns_console() {
+        return 0;
+    }
+    let mut digits = [0_u8; 20];
+    let mut start = digits.len();
+    let mut rest = value;
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    write_console_bytes(&digits[start..]);
+    0
+}
+
+#[cfg(feature = "demo-tasks")]
+fn write_console_bytes(bytes: &[u8]) {
+    pl011::write_bytes(bytes);
+}
+
+#[cfg(not(feature = "demo-tasks"))]
+fn write_console_bytes(bytes: &[u8]) {
+    const HOWLER_TASK_ID: u64 = 4;
+    const IPC_OUTPUT: u8 = 1;
+    const DATA_CAPACITY: usize = ipc::PAYLOAD_SIZE - 2;
+
+    for chunk in bytes.chunks(DATA_CAPACITY) {
+        let mut message = ipc::Message {
+            sender: scheduler::current_task_id(),
+            payload: [0; ipc::PAYLOAD_SIZE],
+        };
+        message.payload[0] = IPC_OUTPUT;
+        message.payload[1] = chunk.len() as u8;
+        message.payload[2..2 + chunk.len()].copy_from_slice(chunk);
+        match ipc::try_send(HOWLER_TASK_ID, message) {
+            Ok(()) => {
+                // TX IPC and hardware RX share Howler's event wait. Yield so a
+                // burst of small print calls cannot fill the bounded mailbox.
+                scheduler::notify_bound_task(HOWLER_TASK_ID);
+                scheduler::yield_current();
+            }
+            Err(ipc::SendError::TargetDead) => pl011::write_bytes(chunk),
+            Err(ipc::SendError::QueueFull) => return,
+        }
+    }
 }
 
 fn sys_send(target: u64, message_ptr: u64) -> u64 {

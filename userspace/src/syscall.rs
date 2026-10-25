@@ -49,6 +49,7 @@ const SYS_MAP_PHYS: u64 = 62;
 const SYS_BIND_IRQ: u64 = 63;
 const SYS_WAIT_IRQ: u64 = 64;
 const SYS_TRY_SEND: u64 = 65;
+const SYS_STOP_CONSOLE: u64 = 66;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -258,6 +259,10 @@ pub fn bind_irq(intid: u64) -> bool {
 
 pub fn wait_irq() {
     unsafe { syscall0(SYS_WAIT_IRQ) };
+}
+
+pub fn stop_console() {
+    unsafe { syscall0(SYS_STOP_CONSOLE) };
 }
 
 pub fn spawn_with_args(program: u64, argument: u64, arguments: &str) -> Option<u64> {
