@@ -61,6 +61,7 @@ pub const SYS_CAP_GRANT: u64 = 61;
 pub const SYS_MAP_PHYS: u64 = 62;
 pub const SYS_BIND_IRQ: u64 = 63;
 pub const SYS_WAIT_IRQ: u64 = 64;
+pub const SYS_TRY_SEND: u64 = 65;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -109,6 +110,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             0
         }
         SYS_SEND => sys_send(frame[0], frame[1]),
+        SYS_TRY_SEND => sys_try_send(frame[0], frame[1]),
         SYS_RECEIVE => sys_receive(frame[0], frame[1]),
         SYS_REGISTER => sys_register_name(frame[0]),
         SYS_LOOKUP => sys_lookup_name(frame[0]),
@@ -503,6 +505,14 @@ fn sys_print(ptr: u64, len: u64) -> u64 {
 }
 
 fn sys_send(target: u64, message_ptr: u64) -> u64 {
+    sys_send_impl(target, message_ptr, false)
+}
+
+fn sys_try_send(target: u64, message_ptr: u64) -> u64 {
+    sys_send_impl(target, message_ptr, true)
+}
+
+fn sys_send_impl(target: u64, message_ptr: u64, nonblocking: bool) -> u64 {
     let mut message = ipc::Message {
         sender: 0,
         payload: [0; ipc::PAYLOAD_SIZE],
@@ -519,7 +529,12 @@ fn sys_send(target: u64, message_ptr: u64) -> u64 {
     // Identity is a kernel fact, not user-provided message payload. This also
     // protects nameserver replies and receive_from() from sender spoofing.
     message.sender = scheduler::current_task_id();
-    if ipc::send(target, message).is_err() {
+    let result = if nonblocking {
+        ipc::try_send(target, message)
+    } else {
+        ipc::send(target, message)
+    };
+    if result.is_err() {
         return SYSCALL_ERROR;
     }
     0

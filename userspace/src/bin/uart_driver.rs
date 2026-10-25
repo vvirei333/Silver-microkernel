@@ -18,7 +18,10 @@ const UART_RX_RT_CLEAR: u32 = 0x30;
 
 #[no_mangle]
 #[link_section = ".text._start"]
-pub extern "C" fn _start(_argument: u64) -> ! {
+pub extern "C" fn _start(target_task_id: u64) -> ! {
+    if target_task_id == 0 {
+        fail("UART DRIVER INVALID TARGET\r\n");
+    }
     let Some(base) = syscall::map_phys(UART_PHYS, 4096) else {
         fail("UART DRIVER MAP FAILED\r\n");
     };
@@ -31,9 +34,10 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     loop {
         syscall::wait_irq();
         if read32(base + UART_FR) & UART_FR_RXFE == 0 {
-            let byte = read32(base + UART_DR);
+            let byte = read32(base + UART_DR) as u8;
             write32(base + UART_ICR, UART_RX_RT_CLEAR);
-            write32(base + UART_DR, byte);
+            let message = ipc::Message::new(0, &[byte]);
+            let _ = syscall::try_send(target_task_id, &message);
         }
     }
 }

@@ -47,11 +47,12 @@ wait-only capability is revoked when the completion record is consumed.
 Device-nGnRnE into a first-fit 2 MB user window at `0x80000000`.
 `SYS_BIND_IRQ = 63` requires `CAP_IRQ` and exclusively binds a non-timer INTID.
 `SYS_WAIT_IRQ = 64` consumes a pending notification or blocks until one arrives.
+`SYS_TRY_SEND = 65` rejects a full or dead mailbox without blocking.
 Bound level-triggered IRQs are masked before GIC EOI, then unmasked by
 `bind_irq` and every `wait_irq` call to prevent an IRQ storm while EL0 handles
 the device. Program 8 (`uart_driver`) receives self capabilities with CAP_MMIO
-and CAP_IRQ at spawn; it maps PL011, binds INTID 33 and echoes received bytes
-from EL0 without entering the kernel PL011 handler.
+and CAP_IRQ at spawn; it maps PL011, binds INTID 33 and sends received bytes
+to the shell through nonblocking IPC without entering the kernel PL011 handler.
 
 Debug and release QEMU both passed IRQ-only `uname`, `echo` and `pwd`; sleeping
 `demo 12` stop/resume/kill/wait; and blocked `demo 7` with IPC delivered while
@@ -301,10 +302,13 @@ read back only their own values.
   a no-op for a live non-stopped task. `SYS_KILL(cap_id)` requires `CAP_KILL`,
   rejects idle/self and records status 1; SYS_EXIT records its status.
 - `SYS_SEND(target, message)` blocks while the target has 16 queued messages and
-  returns `SYSCALL_ERROR` if the target is dead. After copyin the kernel always
-  replaces `message.sender` with `current_task_id()`, making selective receive
-  and nameserver replies resistant to sender spoofing. Nameserver RPC paths
-  propagate send failure and parse returned IDs with checked arithmetic.
+  returns `SYSCALL_ERROR` if the target is dead. `SYS_TRY_SEND` has the same
+  checked-copyin and sender-stamping path but returns immediately on a full or
+  dead mailbox; the UART driver drops that byte and continues its IRQ loop.
+  After copyin the kernel always replaces `message.sender` with
+  `current_task_id()`, making selective receive and nameserver replies resistant
+  to sender spoofing. Nameserver RPC paths propagate send failure and parse
+  returned IDs with checked arithmetic.
 - `SYS_SLEEP(ms)` uses a saturating absolute deadline, so an extreme userspace
   argument cannot panic a debug kernel or wrap to an immediate wakeup.
 - `SYS_MUTEX_UNLOCK` succeeds only for the recorded owner in every build profile;
@@ -374,11 +378,13 @@ read back only their own values.
 - `silvershell.rs` is an independent no_std/no_main ELF with no allocator. It
   uses a 96-byte line buffer, accepts printable ASCII and CR/LF, echoes input,
   and implements Backspace/DEL by removing the last byte and erasing it onscreen.
-- UART input remains a nonblocking syscall. Before the EL0 driver is started,
-  the shell sleeps for 1 ms when the software queue is empty, while PL011 INTID
-  33 captures bytes and Ctrl-Z without task reads. `start_uart_driver` instead
-  gives the foreground console to program 8; its raw RX echo does not feed the
-  kernel FIFO or the shell command parser.
+- Before the EL0 driver is started, UART input uses the nonblocking kernel
+  syscall and PL011 INTID 33 fills the kernel FIFO. `start_uart_driver` spawns
+  program 8 in the background with the shell's real Task ID as its argument.
+  The driver then sends one-byte IPC messages directly to that mailbox; the
+  shell polls with a zero timeout, accepts only the spawned driver's sender ID,
+  and sleeps 1 ms when empty. The kernel transfers mailbox data but no longer
+  reads UART bytes or forwards them to the shell. Output still uses SYS_PRINT.
 - Startup emits ANSI clear/home, runs fastfetch once and shows a bold cyan
   `silvershell>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`,
   `say`, `sl`, `start_uart_driver`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`,

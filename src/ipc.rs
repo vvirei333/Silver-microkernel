@@ -36,6 +36,7 @@ impl Message {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum SendError {
     TargetDead,
+    QueueFull,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -89,6 +90,23 @@ pub fn send(target: u64, message: Message) -> Result<(), SendError> {
         let not_full = &*mailbox.not_full as *const Condvar;
         guard = unsafe { (*not_full).wait(guard) };
     }
+}
+
+/// Sends without waiting for queue space. Full and dead mailboxes reject the
+/// message, allowing drivers to drop input rather than block their IRQ loop.
+pub fn try_send(target: u64, message: Message) -> Result<(), SendError> {
+    let mut guard = IPC.lock();
+    if !scheduler::task_alive(target) {
+        return Err(SendError::TargetDead);
+    }
+    let index = mailbox_index(&mut guard, target);
+    let mailbox = &mut guard.mailboxes[index];
+    if mailbox.queue.len() >= MAILBOX_CAPACITY {
+        return Err(SendError::QueueFull);
+    }
+    mailbox.queue.push_back(message);
+    mailbox.not_empty.notify_one();
+    Ok(())
 }
 
 /// Receives with a tick timeout. Zero polls; `INFINITE_TIMEOUT` waits forever.

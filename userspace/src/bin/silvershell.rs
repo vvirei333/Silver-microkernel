@@ -14,6 +14,8 @@ const MIB: u64 = 1024 * 1024;
 
 const LOGO: &str = include_str!("../../../logo.txt");
 
+static mut UART_DRIVER_ID: u64 = 0;
+
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(_argument: u64) -> ! {
@@ -25,7 +27,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     let mut line = [0_u8; LINE_CAPACITY];
     let mut length = 0_usize;
     loop {
-        let Some(byte) = syscall::read() else {
+        let Some(byte) = read_input() else {
             syscall::sleep(1);
             continue;
         };
@@ -53,6 +55,23 @@ pub extern "C" fn _start(_argument: u64) -> ! {
             }
             _ => {}
         }
+    }
+}
+
+fn read_input() -> Option<u8> {
+    let driver_id = unsafe { UART_DRIVER_ID };
+    if driver_id == 0 {
+        return syscall::read();
+    }
+    if !syscall::task_alive(driver_id) {
+        unsafe { UART_DRIVER_ID = 0 };
+        return syscall::read();
+    }
+
+    let mut message = ipc::Message::new(0, &[]);
+    match syscall::receive_timeout(&mut message, 0) {
+        Ok(()) if message.sender == driver_id => Some(message.payload[0]),
+        _ => None,
     }
 }
 
@@ -89,7 +108,7 @@ fn execute(command: &str) {
             syscall::print("  say <text> Print text\r\n");
             syscall::print("  sl         Run an animated steam locomotive\r\n");
             syscall::print("  start_uart_driver\r\n");
-            syscall::print("             Start the EL0 UART driver in the foreground\r\n");
+            syscall::print("             Route UART input through the EL0 driver and IPC\r\n");
             syscall::print("  mkdir <path>\r\n");
             syscall::print("  rm <file>  Remove a closed file\r\n");
             syscall::print("  rmdir <path>\r\n");
@@ -115,7 +134,7 @@ fn execute(command: &str) {
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
-        Some("start_uart_driver") => run_utility(syscall::PROGRAM_UART_DRIVER, ""),
+        Some("start_uart_driver") => start_uart_driver(),
         Some("mkdir") => make_directory(words.next()),
         Some("rm") => remove_file(words.next()),
         Some("rmdir") => remove_directory(words.next()),
@@ -131,6 +150,31 @@ fn execute(command: &str) {
         Some("wait") => wait_task(words.next()),
         Some(_) => syscall::print("Unknown command. Type 'help'.\r\n"),
     }
+}
+
+fn start_uart_driver() {
+    let previous = unsafe { UART_DRIVER_ID };
+    if previous != 0 && syscall::task_alive(previous) {
+        syscall::print("UART driver is already running.\r\n");
+        return;
+    }
+
+    let shell_id = syscall::task_id();
+    let Some(cap_id) = syscall::spawn(syscall::PROGRAM_UART_DRIVER, shell_id) else {
+        syscall::print("Could not start UART driver.\r\n");
+        return;
+    };
+    let Some(driver_id) = syscall::cap_get_task_id(cap_id) else {
+        syscall::print("Could not resolve UART driver Task ID.\r\n");
+        let _ = syscall::kill(cap_id);
+        let _ = syscall::wait(cap_id);
+        return;
+    };
+
+    unsafe { UART_DRIVER_ID = driver_id };
+    syscall::print("UART DRIVER STARTED: IPC input from Task ID=");
+    syscall::print_dec_u64(driver_id);
+    syscall::print("\r\n");
 }
 
 fn run_utility(program: u64, arguments: &str) {

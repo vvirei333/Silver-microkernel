@@ -48,6 +48,7 @@ const SYS_CAP_GRANT: u64 = 61;
 const SYS_MAP_PHYS: u64 = 62;
 const SYS_BIND_IRQ: u64 = 63;
 const SYS_WAIT_IRQ: u64 = 64;
+const SYS_TRY_SEND: u64 = 65;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -162,6 +163,10 @@ pub fn task_list(buffer: &mut [TaskInfo]) -> Option<usize> {
 
 pub fn send(target: u64, message: &ipc::Message) -> bool {
     unsafe { syscall2(SYS_SEND, target, message as *const ipc::Message as u64) == 0 }
+}
+
+pub fn try_send(target: u64, message: &ipc::Message) -> bool {
+    unsafe { syscall2(SYS_TRY_SEND, target, message as *const ipc::Message as u64) == 0 }
 }
 
 pub fn receive(buffer: &mut ipc::Message) -> bool {
