@@ -8,7 +8,9 @@ pub const CAP_CONSOLE_GRANT: u32 = 1 << 2;
 pub const CAP_RESUME: u32 = 1 << 3;
 pub const CAP_MMIO: u32 = 1 << 4;
 pub const CAP_IRQ: u32 = 1 << 5;
-pub const CAP_ALL: u32 = CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME | CAP_MMIO | CAP_IRQ;
+pub const CAP_PCI: u32 = 1 << 6;
+pub const CAP_ALL: u32 =
+    CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME | CAP_MMIO | CAP_IRQ | CAP_PCI;
 
 pub struct Cap {
     pub id: CapId,

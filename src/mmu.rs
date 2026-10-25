@@ -3,9 +3,9 @@
 //! TTBR1_EL1 maps physical memory at `KERNEL_VIRT_BASE + PA` for EL1 only:
 //! kernel code/data/stacks, page tables, the kernel heap, UART and GIC all
 //! live there. TTBR0_EL1 belongs to the current task and contains only its
-//! independently loaded ELF image, sparse heap, user stack, private page and
-//! explicitly authorized Device-nGnRnE MMIO mappings. No kernel image or kernel
-//! data is shared with EL0.
+//! independently loaded ELF image, sparse heap, user stack, private page,
+//! explicitly authorized Device-nGnRnE MMIO and Normal Non-Cacheable DMA.
+//! No kernel image or kernel data is shared with EL0.
 
 use crate::{
     frame_allocator,
@@ -38,13 +38,21 @@ pub const USER_STACK_PAGES: usize = 2;
 pub const USER_STACK_SIZE: usize = USER_STACK_PAGES * GRANULE;
 const USER_STACK_L2_INDEX: usize = (USER_STACK_VA - DRAM_BASE) / BLOCK_2M;
 
-/// A 2 MB first-fit window for explicitly authorized user MMIO mappings.
+/// A 2 MB first-fit window for explicitly authorized user MMIO and DMA mappings.
 pub const USER_MMIO_VA: usize = 0x0000_0000_8000_0000;
+pub const USER_DMA_MAX_SIZE: usize = ENTRIES * GRANULE;
 const USER_MMIO_L1_INDEX: usize = (USER_MMIO_VA >> 30) & 0x1FF;
 const USER_MMIO_L2_INDEX: usize = 0;
 
+pub const PCI_ECAM_BASE: usize = 0x0000_0040_1000_0000;
+pub const PCI_ECAM_SIZE: usize = 0x1000_0000;
+const PCI_ECAM_L1_INDEX: usize = (PCI_ECAM_BASE >> 30) & 0x1FF;
+const PCI_ECAM_L2_INDEX: usize = ((PCI_ECAM_BASE >> 21) & 0x1FF) as usize;
+const PCI_ECAM_L2_BLOCKS: usize = PCI_ECAM_SIZE / BLOCK_2M;
+
 const ATTR_NORMAL: u64 = 0;
 const ATTR_DEVICE: u64 = 1;
+const ATTR_NORMAL_NC: u64 = 2;
 
 const AP_EL1_RW: u64 = 0b00 << 6;
 const AP_EL0_RW: u64 = 0b01 << 6;
@@ -56,7 +64,7 @@ const UXN: u64 = 1 << 54;
 const PXN: u64 = 1 << 53;
 
 const ADDRESS_MASK: u64 = 0x0000_FFFF_FFFF_F000;
-const MAIR_VALUE: u64 = 0x00FF;
+const MAIR_VALUE: u64 = 0x00_44_FF;
 
 /// 48-bit VAs on both TTBRs (T0SZ=T1SZ=16), 4 KB granules, 40-bit PAs,
 /// inner-shareable WB table walks. TG0/TG1 are zero: 4 KB on both halves.
@@ -72,13 +80,13 @@ struct Table {
     entries: [u64; ENTRIES],
 }
 
-const TABLE_COUNT: usize = 5;
+const TABLE_COUNT: usize = 6;
 const EMPTY_TABLE: Table = Table {
     entries: [0; ENTRIES],
 };
 
-/// Referenced by the assembly boot stub, which fills these five tables before
-/// enabling the MMU. Keep the indices in sync with main.rs.
+/// The assembly boot stub fills the first five tables before enabling the MMU.
+/// The sixth is zeroed with .bss and populated for PCI ECAM in `init`.
 #[no_mangle]
 static mut TABLES: [Table; TABLE_COUNT] = [EMPTY_TABLE; TABLE_COUNT];
 
@@ -87,6 +95,7 @@ const INDEX_HIGH_LEVEL0: usize = 1;
 const INDEX_LEVEL1: usize = 2;
 const INDEX_LEVEL2_MMIO: usize = 3;
 const INDEX_LEVEL2_DRAM: usize = 4;
+const INDEX_LEVEL2_PCI: usize = 5;
 
 /// Replaces the temporary boot identity TTBR0 with an empty kernel TTBR0 and
 /// retains the high TTBR1 map. User TTBR0s are installed by the scheduler.
@@ -98,6 +107,7 @@ pub fn init() {
         let level1 = &mut *base.add(INDEX_LEVEL1);
         let mmio = &mut *base.add(INDEX_LEVEL2_MMIO);
         let dram = &mut *base.add(INDEX_LEVEL2_DRAM);
+        let pci = &mut *base.add(INDEX_LEVEL2_PCI);
 
         // We execute through TTBR1 now; the low identity alias is no longer
         // needed by the kernel. User TTBR0s are installed by the scheduler.
@@ -105,11 +115,16 @@ pub fn init() {
         high0.entries[0] = table_descriptor(level1);
         level1.entries[0] = table_descriptor(mmio);
         level1.entries[1] = table_descriptor(dram);
+        level1.entries[PCI_ECAM_L1_INDEX] = table_descriptor(pci);
 
         for index in 0..ENTRIES {
             mmio.entries[index] = block_descriptor(index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
             dram.entries[index] =
                 block_descriptor(DRAM_BASE + index * BLOCK_2M, ATTR_NORMAL, SH_INNER);
+        }
+        for index in 0..PCI_ECAM_L2_BLOCKS {
+            pci.entries[PCI_ECAM_L2_INDEX + index] =
+                block_descriptor(PCI_ECAM_BASE + index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
         }
     }
 
@@ -336,7 +351,47 @@ pub fn map_phys_to_user(
     if page_count == 0 || page_count > ENTRIES {
         return None;
     }
+    map_user_pages(
+        task,
+        physical_start,
+        page_count,
+        physical_offset,
+        user_device_page,
+    )
+}
 
+/// Maps newly allocated DMA frames as Normal Non-Cacheable, never as Device or
+/// cacheable RAM. The range must be page-aligned and wholly inside known DRAM.
+pub fn map_dma_to_user(
+    task: &crate::scheduler::Task,
+    phys_addr: usize,
+    size: usize,
+) -> Option<usize> {
+    if size == 0 || phys_addr % GRANULE != 0 || size % GRANULE != 0 {
+        return None;
+    }
+    let physical_end = phys_addr.checked_add(size)?;
+    if phys_addr < DRAM_BASE || physical_end > DRAM_END {
+        return None;
+    }
+    let page_count = size / GRANULE;
+    if page_count > ENTRIES {
+        return None;
+    }
+
+    // The allocator and zeroing path use the cacheable kernel alias. Push those
+    // lines to the point of coherency before the device can observe the buffer.
+    clean_dma_range(phys_addr, size);
+    map_user_pages(task, phys_addr, page_count, 0, user_dma_page)
+}
+
+fn map_user_pages(
+    task: &crate::scheduler::Task,
+    physical_start: usize,
+    page_count: usize,
+    physical_offset: usize,
+    descriptor: fn(usize) -> u64,
+) -> Option<usize> {
     unsafe {
         let l3_mmio = user_mmio_table(task.ttbr0)?;
         let mut first = ENTRIES;
@@ -362,11 +417,24 @@ pub fn map_phys_to_user(
             write_entry(
                 l3_mmio,
                 first + page_index,
-                user_device_page(physical_start + page_index * GRANULE),
+                descriptor(physical_start + page_index * GRANULE),
             );
         }
         flush_after_table_change(l3_mmio, GRANULE);
         Some(USER_MMIO_VA + first * GRANULE + physical_offset)
+    }
+}
+
+fn clean_dma_range(physical: usize, size: usize) {
+    let start = phys_to_virt(physical) & !63;
+    let end = (phys_to_virt(physical) + size + 63) & !63;
+    unsafe {
+        let mut line = start;
+        while line < end {
+            core::arch::asm!("dc cvac, {}", in(reg) line, options(nostack));
+            line += 64;
+        }
+        core::arch::asm!("dsb ishst", options(nostack));
     }
 }
 
@@ -568,6 +636,18 @@ fn user_device_page(output_address: usize) -> u64 {
         | (ATTR_DEVICE << 2)
         | AP_EL0_RW
         | SH_NONE
+        | AF
+        | UXN
+        | PXN
+}
+
+/// User DMA: MAIR index 2 is 0x44, Normal Non-Cacheable, never executable.
+fn user_dma_page(output_address: usize) -> u64 {
+    descriptor_address(output_address as u64)
+        | DESC_PAGE
+        | (ATTR_NORMAL_NC << 2)
+        | AP_EL0_RW
+        | SH_INNER
         | AF
         | UXN
         | PXN

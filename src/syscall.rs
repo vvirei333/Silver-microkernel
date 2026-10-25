@@ -1,6 +1,7 @@
 //! System call interface: tasks request kernel services through `svc #0`.
 //!
 //! Calling convention: call number in x8, arguments in x0-x5, result in x0.
+//! SYS_ALLOC_DMA additionally returns the buffer's physical address in x1.
 //! The SVC trampoline (exception_svc_dispatch in main.rs) saves the full
 //! register bank plus ELR_EL1/SPSR_EL1 on the kernel stack before dispatch.
 //! Keeping ELR/SPSR in the *stack frame* is essential: syscalls like
@@ -63,6 +64,9 @@ pub const SYS_BIND_IRQ: u64 = 63;
 pub const SYS_WAIT_IRQ: u64 = 64;
 pub const SYS_TRY_SEND: u64 = 65;
 pub const SYS_STOP_CONSOLE: u64 = 66;
+pub const SYS_ALLOC_DMA: u64 = 67;
+pub const SYS_PCI_READ: u64 = 68;
+pub const SYS_PCI_WRITE: u64 = 69;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -240,6 +244,15 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             }
             0
         }
+        SYS_ALLOC_DMA => match scheduler::alloc_dma_for_current(frame[0] as usize) {
+            Some((virtual_address, physical_address)) => {
+                frame[1] = physical_address as u64;
+                virtual_address as u64
+            }
+            None => SYSCALL_ERROR,
+        },
+        SYS_PCI_READ => sys_pci_read(frame[0]),
+        SYS_PCI_WRITE => sys_pci_write(frame[0], frame[1]),
         _ => SYSCALL_ERROR,
     };
 
@@ -250,6 +263,34 @@ fn sys_map_phys(phys_addr: u64, size: u64) -> u64 {
     scheduler::map_phys_to_current(phys_addr as usize, size as usize)
         .map(|address| address as u64)
         .unwrap_or(SYSCALL_ERROR)
+}
+
+fn sys_pci_read(offset: u64) -> u64 {
+    if !scheduler::current_task_has_rights(capability::CAP_PCI) {
+        return SYSCALL_ERROR;
+    }
+    let Some(address) = pci_config_address(offset) else {
+        return SYSCALL_ERROR;
+    };
+    u64::from(unsafe { core::ptr::read_volatile(address as *const u32) })
+}
+
+fn sys_pci_write(offset: u64, value: u64) -> u64 {
+    if !scheduler::current_task_has_rights(capability::CAP_PCI) {
+        return SYSCALL_ERROR;
+    }
+    let Some(address) = pci_config_address(offset) else {
+        return SYSCALL_ERROR;
+    };
+    unsafe { core::ptr::write_volatile(address as *mut u32, value as u32) };
+    0
+}
+
+fn pci_config_address(offset: u64) -> Option<usize> {
+    if offset % 4 != 0 || offset >= mmu::PCI_ECAM_SIZE as u64 {
+        return None;
+    }
+    Some(memory::phys_to_virt(mmu::PCI_ECAM_BASE + offset as usize))
 }
 
 fn sys_spawn_with_args(program: u64, argument: u64, ptr: u64, len: u64) -> u64 {

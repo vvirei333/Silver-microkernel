@@ -113,7 +113,7 @@ fn execute(command: &str) {
             syscall::print("  clear      Clear the terminal screen\r\n");
             syscall::print("  uname      Print kernel name, version and architecture\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
-            syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl> [arg]\r\n");
+            syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver> [arg]\r\n");
             syscall::print("  bg <program> [arg]\r\n");
             syscall::print("             Spawn without console ownership\r\n");
             syscall::print("  fg <cap>   Resume a task in the foreground\r\n");
@@ -438,6 +438,7 @@ fn program_name(program: u64) -> &'static str {
         syscall::PROGRAM_ECHO => "echo        ",
         syscall::PROGRAM_SAY => "say         ",
         syscall::PROGRAM_SL => "sl          ",
+        syscall::PROGRAM_BLOCK_DRIVER => "block_driver",
         _ => "kernel      ",
     }
 }
@@ -458,7 +459,7 @@ fn state_name(state: u64) -> &'static str {
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
         syscall::print(
-            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl> [arg]\r\n",
+            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver> [arg]\r\n",
         );
         return;
     };
@@ -473,6 +474,7 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
         "echo" => syscall::PROGRAM_ECHO,
         "say" => syscall::PROGRAM_SAY,
         "sl" => syscall::PROGRAM_SL,
+        "block_driver" => syscall::PROGRAM_BLOCK_DRIVER,
         _ => {
             syscall::print("Unknown program. See 'help' for the program list.\r\n");
             return;

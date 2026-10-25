@@ -10,6 +10,7 @@ use core::panic::PanicInfo;
 
 const HOWL_TASK_ID: u64 = 3;
 const HOWLER_TASK_ID: u64 = 4;
+const BLOCK_TASK_ID: u64 = 5;
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -35,6 +36,14 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     }
     if !syscall::cap_grant(howler_cap, howler_id, syscall::CAP_MMIO | syscall::CAP_IRQ) {
         fail("SILVERD: HOWLER CAP GRANT FAILED\r\n");
+    }
+
+    let (block_cap, block_id) = spawn(syscall::PROGRAM_BLOCK_DRIVER, 0);
+    if block_id != BLOCK_TASK_ID {
+        fail("SILVERD: UNEXPECTED BLOCK DRIVER ID\r\n");
+    }
+    if !syscall::cap_grant(block_cap, block_id, syscall::CAP_PCI | syscall::CAP_MMIO) {
+        fail("SILVERD: BLOCK DRIVER CAP GRANT FAILED\r\n");
     }
 
     loop {

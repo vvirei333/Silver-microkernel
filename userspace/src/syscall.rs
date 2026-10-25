@@ -50,6 +50,9 @@ const SYS_BIND_IRQ: u64 = 63;
 const SYS_WAIT_IRQ: u64 = 64;
 const SYS_TRY_SEND: u64 = 65;
 const SYS_STOP_CONSOLE: u64 = 66;
+const SYS_ALLOC_DMA: u64 = 67;
+const SYS_PCI_READ: u64 = 68;
+const SYS_PCI_WRITE: u64 = 69;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -63,8 +66,10 @@ pub const PROGRAM_CAT: u64 = 6;
 pub const PROGRAM_ECHO: u64 = 7;
 pub const PROGRAM_SAY: u64 = 8;
 pub const PROGRAM_SL: u64 = 9;
+pub const PROGRAM_BLOCK_DRIVER: u64 = 10;
 pub const CAP_MMIO: u32 = 1 << 4;
 pub const CAP_IRQ: u32 = 1 << 5;
+pub const CAP_PCI: u32 = 1 << 6;
 pub const OPEN_READ: u64 = 0;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_APPEND: u64 = 2;
@@ -251,6 +256,27 @@ pub fn cap_grant(cap_id: u64, recipient_task_id: u64, rights: u32) -> bool {
 
 pub fn map_phys(phys_addr: u64, size: u64) -> Option<u64> {
     optional_id(unsafe { syscall2(SYS_MAP_PHYS, phys_addr, size) })
+}
+
+/// Returns the non-cacheable user virtual address and DMA physical address.
+pub fn alloc_dma(size: u64) -> Option<(u64, u64)> {
+    let (virtual_address, physical_address) = unsafe { syscall1_pair(SYS_ALLOC_DMA, size) };
+    if virtual_address == SYSCALL_ERROR {
+        None
+    } else {
+        Some((virtual_address, physical_address))
+    }
+}
+
+pub fn pci_read32(offset: u64) -> Option<u32> {
+    match unsafe { syscall1(SYS_PCI_READ, offset) } {
+        SYSCALL_ERROR => None,
+        value => Some(value as u32),
+    }
+}
+
+pub fn pci_write32(offset: u64, value: u32) -> bool {
+    unsafe { syscall2(SYS_PCI_WRITE, offset, u64::from(value)) == 0 }
 }
 
 pub fn bind_irq(intid: u64) -> bool {
@@ -496,6 +522,20 @@ unsafe fn syscall1(number: u64, arg0: u64) -> u64 {
     );
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     result
+}
+
+unsafe fn syscall1_pair(number: u64, arg0: u64) -> (u64, u64) {
+    let result0: u64;
+    let result1: u64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") number,
+        inlateout("x0") arg0 => result0,
+        lateout("x1") result1,
+        options(nostack),
+    );
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    (result0, result1)
 }
 
 unsafe fn syscall2(number: u64, arg0: u64, arg1: u64) -> u64 {

@@ -99,6 +99,8 @@ pub struct Task {
     user_image: Option<UserImage>,
     /// Physical heap frames in virtual-page order. The MMU frees them on reap.
     heap_pages: Vec<usize>,
+    /// Contiguous DMA allocations: physical base and page count.
+    dma_pages: Vec<(usize, usize)>,
     /// Current byte-granular program break within the reserved heap window.
     program_break: usize,
     /// Queue containing this task while blocked, used for stale-waiter cleanup.
@@ -1022,6 +1024,12 @@ pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, right
     granted
 }
 
+pub fn current_task_has_rights(rights: u32) -> bool {
+    current_task_mut()
+        .map(|task| task.cap_table.has_rights(rights))
+        .unwrap_or(false)
+}
+
 pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
     let saved_daif = interrupts::save_and_disable_irq();
     let result = scheduler_manager().and_then(|manager| {
@@ -1033,6 +1041,32 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
         task.cap_table
             .insert(virtual_address as u64, capability::CAP_MMIO);
         Some(virtual_address)
+    });
+    interrupts::restore_irq(saved_daif);
+    result
+}
+
+/// Allocates, zeroes and maps contiguous DMA frames. Returns user VA and PA.
+pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
+    if size == 0 || size > mmu::USER_DMA_MAX_SIZE {
+        return None;
+    }
+    let page_count = size.div_ceil(PAGE_SIZE);
+    let mapped_size = page_count * PAGE_SIZE;
+    let saved_daif = interrupts::save_and_disable_irq();
+    let result = scheduler_manager().and_then(|manager| {
+        let task = manager.tasks.get_mut(manager.current_index)?;
+        if !task.cap_table.has_rights(capability::CAP_MMIO) {
+            return None;
+        }
+        let physical = frame_allocator::alloc_contiguous_pages(page_count)?;
+        unsafe { core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, mapped_size) };
+        let Some(virtual_address) = mmu::map_dma_to_user(task, physical, mapped_size) else {
+            release_pages(physical, page_count);
+            return None;
+        };
+        task.dma_pages.push((physical, page_count));
+        Some((virtual_address, physical))
     });
     interrupts::restore_irq(saved_daif);
     result
@@ -1307,8 +1341,14 @@ impl Task {
         };
 
         let mut cap_table = capability::CapTable::new();
-        if user.map(|(program, _)| program) == Some(user_program::HOWLER) {
-            cap_table.insert(id, capability::CAP_MMIO | capability::CAP_IRQ);
+        match user.map(|(program, _)| program) {
+            Some(user_program::HOWLER) => {
+                cap_table.insert(id, capability::CAP_MMIO | capability::CAP_IRQ);
+            }
+            Some(user_program::BLOCK_DRIVER) => {
+                cap_table.insert(id, capability::CAP_MMIO | capability::CAP_PCI);
+            }
+            _ => {}
         }
 
         Some(Self {
@@ -1331,6 +1371,7 @@ impl Task {
             ttbr0,
             user_image,
             heap_pages: Vec::new(),
+            dma_pages: Vec::new(),
             program_break: mmu::USER_HEAP_VA,
             waiting_on: None,
             owned_mutexes: Vec::new(),
@@ -1399,6 +1440,9 @@ impl Task {
 
     fn release_space(&self) {
         mmu::destroy_task_space(self.ttbr0);
+        for &(physical, page_count) in &self.dma_pages {
+            release_pages(physical, page_count);
+        }
         if let Some(image) = &self.user_image {
             image.release();
         }

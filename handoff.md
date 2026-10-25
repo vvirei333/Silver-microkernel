@@ -3,12 +3,14 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-26 (Ring 3 UART TX/RX and Ctrl-Z)
+## State as of 2026-10-26 (DMA/PCI infrastructure and Ring 3 UART)
 
-Latest verified architecture: **silverd -> Scout, Howl, Howler**. Normal boot
-creates only silverd (task 1). Silverd spawns Scout (task 2), waits for its
-`SCOUT READY` IPC handshake, spawns Howl (task 3) with Howler's ID as its
-argument, transfers the console, then spawns Howler (task 4) with Howl's ID.
+Latest verified architecture: **silverd -> Scout, Howl, Howler, block_driver**.
+Normal boot creates only silverd (task 1). Silverd spawns Scout (task 2), waits
+for its `SCOUT READY` IPC handshake, spawns Howl (task 3) with Howler's ID as its
+argument, transfers the console, then spawns Howler (task 4) with Howl's ID and
+block_driver (task 5). The block driver is only an infrastructure smoke-test
+stub: no Virtio device protocol or block I/O is implemented yet.
 Howler maps PL011 and binds INTID 33. Normal user RX and TX both pass through
 Howler in Ring 3: input messages are `[0, byte]`, while output messages are
 `[1, length, up to 30 bytes]`. `SYS_PRINT`, `SYS_PRINT_HEX` and `SYS_PRINT_DEC`
@@ -69,6 +71,23 @@ CAP_IRQ at spawn, plus an explicit CAP_GRANT from silverd. It maps PL011, binds
 INTID 33, sends input to Howl and writes output IPC to DR without entering the
 kernel PL011 handler on the normal path.
 
+`SYS_ALLOC_DMA = 67` requires CAP_MMIO, accepts a byte size in x0 and returns a
+page-aligned user VA in x0 plus its physical DMA address in x1. Allocations are
+zeroed contiguous frames, rounded to whole pages and limited to 2 MB total per
+call. They share the first-fit mapping window at `0x80000000` with MMIO, never
+the heap, and are mapped Normal Non-Cacheable (MAIR index 2, value `0x44`) rather
+than Device memory. The kernel cleans the cacheable aliases before exposing the
+buffer and releases tracked frames during task reaping. No DMA-free syscall or
+per-allocation quota exists yet.
+
+`SYS_PCI_READ = 68` and `SYS_PCI_WRITE = 69` require CAP_PCI. Their offset is a
+4-byte-aligned byte offset within QEMU virt's 256 MB ECAM at physical
+`0x4010000000`; reads/writes are volatile 32-bit accesses through a kernel
+Device-nGnRnE mapping. Program 10 (block_driver) receives self capabilities with
+CAP_MMIO and CAP_PCI at spawn, plus an explicit CAP_GRANT from silverd. Its stub
+checks a four-page DMA allocation and ECAM read, then sleeps. The Virtio ring,
+queue setup, interrupts and request protocol remain unimplemented.
+
 Debug and release QEMU passed Howler-backed TX/RX and sleeping `demo 12`
 stop/kill/wait; debug also passed `fg` resume and `uname`. A twelve-second debug
 `demo-tasks` run passed 18 markers with exactly two intentional `TASK FAULT`
@@ -111,7 +130,10 @@ same-path/missing-parent/self-subtree/active-cwd moves were rejected. Append
 tests passed in both profiles with spaced/unspaced `>>`, existing and new files,
 quoted literal operators and a `>` truncation regression check. ANSI prompt and
 clear sequences were observed, and uname printed the exact version string. No
-`KERNEL PANIC`, `BAD SP` or unexpected `FAIL` occurred.
+`KERNEL PANIC`, `BAD SP` or unexpected `FAIL` occurred. For the DMA/PCI change,
+both debug and release `ps` showed live sleeping block_driver task 5 after its
+DMA read/write and ECAM-read smoke checks; the 18-marker regression run still
+had exactly the two intentional isolation faults.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
 | --- | ---: | --- | --- |
@@ -177,7 +199,7 @@ For bare-metal profiles, `build.rs` invokes Cargo in `userspace/`, uses
 `target/userspace` as its target directory, matches debug/release profile and
 copies every userspace ELF into `OUT_DIR`. `src/user_program.rs` assigns IDs
 0 (demo), 1 (silverd), 2 (Scout), 3 (Howl), 4 (Howler), 5 (ls), 6 (cat),
-7 (echo), 8 (say) and 9 (sl). Host builds skip userspace. Normal boot starts
+7 (echo), 8 (say), 9 (sl) and 10 (block_driver). Host builds skip userspace. Normal boot starts
 only silverd; `demo-tasks` starts Scout and the regression task set instead.
 
 Interactive QEMU: `qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M
@@ -196,6 +218,7 @@ handles both CR and LF from UART.
   RXIM + RTIM are unmasked; the RX threshold is 1/8 and the IRQ drains the FIFO.
 - Timer: ARM Generic Timer, IRQ 30, 100 Hz tick (`timer::TICK_INTERVAL_MS = 10`).
   UART priority is 0x80 and timer priority 0xA0; ordinary RX does not schedule.
+- PCI ECAM: physical `0x4010000000`, 256 MB, kernel-only Device-nGnRnE mapping.
 - FP/SIMD enabled in `_start` (CPACR_EL1 = 0x300000, CPTR_EL2 = 0) —
   without this the first use of a float register traps with EC=7
 - Runtime is EL1h for the kernel and EL0t for user tasks: QEMU `-kernel`
@@ -203,8 +226,10 @@ handles both CR and LF from UART.
   SPSR_EL2=0x3C5). VBAR_EL1, both TTBRs, TCR_EL1, MAIR_EL1 and SCTLR_EL1
   are programmed before normal Rust subsystem initialization.
 - Translation uses 48-bit VAs on both halves (T0SZ=T1SZ=16), 4 KB granules,
-  40-bit PAs and four table levels. MMIO is device-nGnRnE; DRAM is normal
-  WB inner-shareable. Data/instruction caches remain off (SCTLR.C/I = 0).
+  40-bit PAs and four table levels. MMIO is device-nGnRnE; ordinary DRAM is
+  normal WB inner-shareable; user DMA is Normal Non-Cacheable. MAIR entries
+  are `0xFF`, `0x00`, `0x44` at indices 0, 1, 2. Data/instruction caches remain
+  off (SCTLR.C/I = 0).
 
 ## Boot and high-half memory model
 
@@ -220,15 +245,17 @@ MAIR/TCR and SCTLR.M, then branches to the linked high PC. Only after that
 branch does it install the high SP and VBAR and call `kernel_main`.
 `mmu::init()` removes the temporary low identity alias from kernel TTBR0.
 
-The five statically allocated boot tables have fixed 4 KB slots:
+Six statically allocated boot tables have fixed 4 KB slots. The assembly fills
+the first five; the PCI table is zeroed with `.bss` and populated by `mmu::init()`:
 
 | Index | Table | Role |
 | --- | --- | --- |
 | 0 | low L0 | Temporary boot TTBR0; emptied after the high-PC transition |
 | 1 | high L0 | TTBR1 root |
-| 2 | shared L1 | MMIO gigabyte at index 0, DRAM gigabyte at index 1 |
+| 2 | shared L1 | MMIO gigabyte at index 0, DRAM gigabyte at index 1, PCI at index 64 |
 | 3 | MMIO L2 | 512 × 2 MB EL1-only device blocks |
 | 4 | DRAM L2 | 512 × 2 MB EL1-only normal-memory blocks |
+| 5 | PCI L2 | 128 × 2 MB EL1-only device blocks starting at L2 index 128 |
 
 For privileged code, physical address `p` is `0xFFFF000000000000 + p` via
 TTBR1. `memory::current()` converts high linker symbols back to PAs so the
@@ -246,10 +273,13 @@ Each task owns nine pages of TTBR0 tables plus its image and data pages:
   `0x7FE00000` (8 KB total). Equal stack VAs have different physical backing.
 - L0[1] → a private L1/L2/L3 chain mapping one writable 4 KB page at
   `0x0000008000000000`.
-- There are no user mappings for kernel text/rodata, MMIO, kernel `.data` or
-  `.bss`, kernel heap, kernel stacks, unrelated DRAM or page-table pages.
+- L1[2] → an on-demand L2/L3 chain for authorized MMIO and DMA mappings at
+  `0x80000000`. These two table pages are allocated only on first use.
+- There are no user mappings for kernel text/rodata, kernel `.data` or `.bss`,
+  kernel heap, kernel stacks, unrelated DRAM, page-table pages or unauthorized
+  MMIO.
 - `destroy_task_space()` frees all task-owned tables, heap frames and the
-  private page; `Task::release_space()` then releases the ELF frames.
+  private page; `Task::release_space()` then releases ELF and tracked DMA frames.
 
 ## ELF loading and W^X
 
