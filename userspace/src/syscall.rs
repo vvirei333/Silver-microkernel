@@ -26,24 +26,47 @@ pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
 pub const PROGRAM_DEMO: u64 = 0;
 pub const PROGRAM_NAMESERVER: u64 = 1;
 const SYSCALL_ERROR: u64 = u64::MAX;
+const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
 const NAME_LIMIT: usize = ipc::PAYLOAD_SIZE - 2;
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ReceiveError {
+    Timeout,
+    Failed,
+}
 
 pub fn sleep(milliseconds: u64) {
     unsafe { syscall1(SYS_SLEEP, milliseconds) };
 }
 
-pub fn send(target: u64, message: &ipc::Message) {
-    unsafe { syscall2(SYS_SEND, target, message as *const ipc::Message as u64) };
+pub fn send(target: u64, message: &ipc::Message) -> bool {
+    unsafe { syscall2(SYS_SEND, target, message as *const ipc::Message as u64) == 0 }
 }
 
 pub fn receive(buffer: &mut ipc::Message) -> bool {
     unsafe { receive_raw(buffer as *mut ipc::Message) }
 }
 
+/// Waits up to `timeout_ticks` timer ticks. Zero performs a non-blocking poll;
+/// `u64::MAX` waits indefinitely. A deadline never discards an available message.
+pub fn receive_timeout(buffer: &mut ipc::Message, timeout_ticks: u64) -> Result<(), ReceiveError> {
+    match unsafe {
+        syscall2(
+            SYS_RECEIVE,
+            buffer as *mut ipc::Message as u64,
+            timeout_ticks,
+        )
+    } {
+        0 => Ok(()),
+        SYSCALL_TIMEOUT => Err(ReceiveError::Timeout),
+        _ => Err(ReceiveError::Failed),
+    }
+}
+
 /// Raw variant used by permission tests. Returns false without blocking when
 /// the kernel rejects the output buffer.
 pub unsafe fn receive_raw(buffer: *mut ipc::Message) -> bool {
-    unsafe { syscall1(SYS_RECEIVE, buffer as u64) == 0 }
+    unsafe { syscall2(SYS_RECEIVE, buffer as u64, u64::MAX) == 0 }
 }
 
 pub fn print(text: &str) {

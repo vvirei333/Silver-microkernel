@@ -18,10 +18,11 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Round-robin scheduler: dynamic `spawn(program, argument)`, `yield`, `sleep`, `exit`
 - [x] Lifecycle cleanup: address spaces, mailboxes, wait queues and owned mutexes
 - [x] Blocking mutex with FIFO wait queue, ownership tracking and RAII guard
-- [x] IPC: mailbox `send()` / blocking `receive()`, selective nameserver RPC receive
+- [x] Bounded IPC: 16-message mailboxes, blocking send/backpressure and receive timeouts
+- [x] IPC cleanup: queued-message disposal and blocked-sender wakeups on receiver exit
 - [x] System calls via `svc #0` (number in x8, arguments in x0-x5)
 - [x] Nameserver: register/lookup/unregister plus stale-owner cleanup
-- [x] Condition variable: per-mailbox wait queues, targeted wakeups
+- [x] Condition variable: per-mailbox wait queues, targeted wakeups and timed waits
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
 - [x] Two userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
@@ -107,10 +108,10 @@ demo and nameserver ELFs; no separate userspace command is needed.
 | `src/scheduler.rs` | Tasks, program/argument spawn, context switch and resource reaping |
 | `src/mutex.rs` | Blocking mutex with FIFO waiters and ownership tracking |
 | `src/wait_queue.rs` | Shared FIFO queue with dead-waiter removal |
-| `src/ipc.rs` | Mailbox IPC, selective receive and mailbox cleanup |
+| `src/ipc.rs` | Bounded mailboxes, backpressure, timed/selective receive and cleanup |
 | `src/syscall.rs` | System call table and checked user-buffer operations |
 | `src/user_memory.rs` | PAN-compatible `LDTR/STTR` copyin/copyout |
-| `src/condvar.rs` | Condition variable: wait / notify_one / notify_all |
+| `src/condvar.rs` | Condition variable: timed/infinite wait and targeted wakeups |
 | `src/semaphore.rs` | Counting semaphore on mutex + condvar |
 | `src/channel.rs` | Bounded channel: two semaphores + a mutex (backpressure) |
 | `src/mmu.rs` | TTBR1 kernel map, per-task TTBR0 maps, permission validation |
@@ -177,5 +178,13 @@ its entry point. The lifecycle demo dynamically spawns a child, checks the
 argument, registers/unregisters a name, exits while holding a mutex and proves
 that reaping releases it. Nameserver RPC uses selective receive so unrelated
 messages cannot be consumed as lookup responses.
+
+Each mailbox holds at most 16 messages. A sender blocks on `not_full` while the
+queue is full; removing any message wakes one sender. `SYS_RECEIVE(buffer, ticks)`
+uses `0` for polling, `u64::MAX` for infinite waiting and any other value as a
+relative timer-tick timeout. It returns `SYSCALL_TIMEOUT` (`u64::MAX - 1`) on
+expiry. Receiver exit clears queued messages, wakes all blocked senders and makes
+their sends fail instead of recreating the dead mailbox. Demos verify timeout,
+backpressure on the seventeenth send, FIFO delivery and exit wakeup.
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).

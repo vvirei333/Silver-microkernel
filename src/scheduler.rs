@@ -22,6 +22,7 @@ pub enum TaskState {
     Running,
     Sleeping(u64),
     Blocked,
+    BlockedUntil(u64),
     Dead,
 }
 
@@ -219,6 +220,9 @@ pub fn init() {
     let _heap_probe = spawn_user(user_program::DEMO, 20);
     let _malloc_probe = spawn_user(user_program::DEMO, 21);
     let _global_alloc_probe = spawn_user(user_program::DEMO, 22);
+    for role in 23..=26 {
+        let _ = spawn_user(user_program::DEMO, role);
+    }
 
     let manager = scheduler_manager().unwrap();
     manager.current_index = manager
@@ -284,12 +288,32 @@ pub fn block_current_on(queue: &WaitQueue) {
     interrupts::restore_irq(saved_daif);
 }
 
+/// Blocks on a condition queue until notified or an absolute timer deadline.
+/// Notification removes the ID from the queue; a timeout does not, so removal
+/// on resume is required to prevent a stale waiter from a later wakeup.
+pub fn block_current_on_until(queue: &WaitQueue, deadline: u64) {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let id = current_task_id();
+    queue.enqueue(id);
+    if let Some(task) = current_task_mut() {
+        task.waiting_on = Some(queue as *const WaitQueue);
+        task.state = TaskState::BlockedUntil(deadline);
+    }
+
+    schedule();
+    queue.remove(id);
+    if let Some(task) = current_task_mut() {
+        task.waiting_on = None;
+    }
+    interrupts::restore_irq(saved_daif);
+}
+
 pub fn wake_task(id: u64) {
     let saved_daif = interrupts::save_and_disable_irq();
 
     if let Some(manager) = scheduler_manager() {
         if let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) {
-            if task.state == TaskState::Blocked {
+            if matches!(task.state, TaskState::Blocked | TaskState::BlockedUntil(_)) {
                 task.state = TaskState::Ready;
             }
             task.waiting_on = None;
@@ -528,10 +552,12 @@ fn find_next_task(manager: &TaskManager) -> Option<usize> {
 
 fn wake_expired_tasks(manager: &mut TaskManager, now: u64) {
     for task in &mut manager.tasks {
-        if let TaskState::Sleeping(wake_at) = task.state {
-            if now >= wake_at {
-                task.state = TaskState::Ready;
-            }
+        let wake_at = match task.state {
+            TaskState::Sleeping(deadline) | TaskState::BlockedUntil(deadline) => deadline,
+            _ => continue,
+        };
+        if now >= wake_at {
+            task.state = TaskState::Ready;
         }
     }
 }
@@ -566,7 +592,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
             .iter_mut()
             .find(|task| task.id == id && task.state != TaskState::Dead)
         {
-            if task.state == TaskState::Blocked {
+            if matches!(task.state, TaskState::Blocked | TaskState::BlockedUntil(_)) {
                 task.state = TaskState::Ready;
             }
             task.waiting_on = None;

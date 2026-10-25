@@ -442,6 +442,119 @@ pub fn global_alloc_probe() -> ! {
     syscall::exit()
 }
 
+fn wait_for_name(name: &str) -> u64 {
+    loop {
+        if let Some(id) = syscall::lookup(name) {
+            return id;
+        }
+        syscall::sleep(20);
+    }
+}
+
+pub fn ipc_backpressure_sender() -> ! {
+    if !syscall::register("bp-a") {
+        syscall::print("IPC BP SENDER REGISTER=FAIL\r\n");
+        syscall::exit();
+    }
+    let receiver = wait_for_name("bp-b");
+    wait_for_name("bp-ready");
+    let id = syscall::task_id();
+    for sequence in 0..16_u8 {
+        let mut message = ipc::Message::new(id, b"");
+        message.payload[0] = sequence;
+        if !syscall::send(receiver, &message) {
+            syscall::print("IPC BP FILL=FAIL\r\n");
+            syscall::exit();
+        }
+    }
+    syscall::print("IPC BP QUEUE FULL\r\n");
+
+    let mut seventeenth = ipc::Message::new(id, b"");
+    seventeenth.payload[0] = 16;
+    if syscall::send(receiver, &seventeenth) {
+        syscall::print("IPC BP SENDER RESUMED=PASS\r\n");
+    } else {
+        syscall::print("IPC BP SENDER RESUMED=FAIL\r\n");
+    }
+    syscall::exit()
+}
+
+pub fn ipc_backpressure_receiver() -> ! {
+    if !syscall::register("bp-b") {
+        syscall::print("IPC BP REGISTER=FAIL\r\n");
+        syscall::exit();
+    }
+
+    let mut message = ipc::Message::new(0, b"");
+    match syscall::receive_timeout(&mut message, 5) {
+        Err(syscall::ReceiveError::Timeout) => syscall::print("IPC TIMEOUT=PASS\r\n"),
+        _ => syscall::print("IPC TIMEOUT=FAIL\r\n"),
+    }
+    if !syscall::register("bp-ready") {
+        syscall::print("IPC BP READY=FAIL\r\n");
+        syscall::exit();
+    }
+
+    // Let A fill all 16 slots and block on the seventeenth send. The first
+    // receive below frees one slot and must wake exactly that sender.
+    syscall::sleep(500);
+    let mut sender = None;
+    let mut valid = true;
+    for sequence in 0..17_u8 {
+        match syscall::receive_timeout(&mut message, 1000) {
+            Ok(()) => {
+                let expected_sender = *sender.get_or_insert(message.sender);
+                valid &= message.sender == expected_sender && message.payload[0] == sequence;
+            }
+            Err(_) => {
+                valid = false;
+                break;
+            }
+        }
+    }
+    if valid {
+        syscall::print("IPC BP BACKPRESSURE=PASS\r\n");
+    } else {
+        syscall::print("IPC BP BACKPRESSURE=FAIL\r\n");
+    }
+    syscall::exit()
+}
+
+pub fn ipc_exit_sender() -> ! {
+    let receiver = wait_for_name("ipc-gone");
+    let id = syscall::task_id();
+    for sequence in 0..17_u8 {
+        let mut message = ipc::Message::new(id, b"");
+        message.payload[0] = sequence;
+        let sent = syscall::send(receiver, &message);
+        if sequence < 16 && !sent {
+            syscall::print("IPC EXIT FILL=FAIL\r\n");
+            syscall::exit();
+        }
+        if sequence == 16 {
+            if sent {
+                syscall::print("IPC EXIT WAKE=FAIL\r\n");
+            } else {
+                syscall::print("IPC EXIT WAKE=PASS\r\n");
+            }
+            syscall::exit();
+        }
+    }
+    syscall::exit()
+}
+
+pub fn ipc_exit_receiver() -> ! {
+    if !syscall::register("ipc-gone") {
+        syscall::print("IPC EXIT RECEIVER REGISTER=FAIL\r\n");
+        syscall::exit();
+    }
+    // Do not issue another RPC here: once the queue is full, even a nameserver
+    // reply could not fit. Give the sender time to block on message 17, then exit
+    // without draining; cleanup must discard the queue and wake it with an error.
+    syscall::sleep(1000);
+    syscall::exit()
+}
+
 pub fn unknown_task() -> ! {
     syscall::print("UNKNOWN USER TASK\r\n");
     loop {

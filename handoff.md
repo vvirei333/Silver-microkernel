@@ -3,15 +3,16 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (userspace GlobalAlloc update)
+## State as of 2026-10-25 (IPC hardening update)
 
-Latest verified feature: **`Box` and growable `Vec` in EL0 through
-`#[global_allocator]`**. `UserAllocator` adapts the existing first-fit
-`malloc/free` implementation to `GlobalAlloc`; default reallocation therefore
-allocates, copies and frees through the same per-task free list and `SYS_BRK`.
+Latest verified feature: **bounded mailboxes with backpressure, timed receive
+and blocked-sender cleanup on exit**. Each mailbox has 16 slots and independent
+`not_empty` / `not_full` condition queues. `SYS_RECEIVE` accepts a relative tick
+timeout; sender and receiver lifecycle errors cross the syscall boundary as
+explicit results instead of hanging forever.
 
 Verified with host, debug bare-metal and release bare-metal builds, three debug
-QEMU runs (5–6 seconds each) and a 6-second release run. Every run had exactly
+QEMU runs (8 seconds each) and an 8-second release run. Every run had exactly
 two intentional `TASK FAULT` reports and no `KERNEL PANIC`, `BAD SP`, isolation
 failures or stale debug output. All runs passed these checks:
 
@@ -25,11 +26,16 @@ MALLOC FREE/REUSE=PASS
 MALLOC BRK TRIM=PASS
 GLOBAL ALLOC BOX=42 VEC_LEN=32 PASS
 GLOBAL ALLOC TRIM=PASS
+IPC TIMEOUT=PASS
+IPC BP SENDER RESUMED=PASS
+IPC BP BACKPRESSURE=PASS
+IPC EXIT WAKE=PASS
 ```
 
-The EL0 test checks `Box::new(42)`, grows a `Vec` to 32 elements, verifies every
-value, drops both objects and confirms restoration of the original program
-break. Earlier same-address malloc reuse and VM A/B isolation checks still pass.
+The backpressure demo fills all 16 slots, blocks A on send 17, then drains the
+messages in FIFO order after B wakes it. The exit demo destroys a full mailbox
+without reading it and verifies that the blocked sender resumes with an error.
+Earlier userspace allocation and VM A/B isolation checks still pass.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
 | --- | ---: | --- | --- |
@@ -73,6 +79,10 @@ Important fixes and invariants from the recent work must be preserved:
 11. **The userspace free list stays address-sorted.** Coalesce both neighbors
     before trimming. Only the final free block may shrink `brk`, and the shrink
     must succeed before unlinking it. Block sizes include the 16-byte header.
+12. **A timed waiter always leaves its condition queue.** Notification pops the
+    ID immediately; timeout removal happens in `block_current_on_until` after
+    the task resumes. IPC checks for a matching message before checking the
+    deadline, so a notify/timeout race cannot discard an available message.
 
 Always build like this:
 
@@ -191,12 +201,20 @@ read back only their own values.
 - Syscalls include sleep, send, receive, register, lookup, unregister, print,
   whoami, task_alive, spawn, exit, `brk`, hex/dec print, mutex lock/unlock and
   channel send/receive.
+- `SYS_SEND(target, message)` blocks while the target has 16 queued messages and
+  returns `SYSCALL_ERROR` if the target is dead. Nameserver RPC paths propagate
+  this failure too.
+- `SYS_RECEIVE(buffer, timeout_ticks)` uses zero for a poll and `u64::MAX` for an
+  infinite wait. Other values are relative 100 Hz ticks; expiry returns
+  `SYSCALL_TIMEOUT = u64::MAX - 1`. Invalid buffers still return SYSCALL_ERROR.
 - `SYS_BRK(0)` queries the program break. Other values set an absolute break in
   `0x40200000..0x40400000`; invalid requests and allocation failures return
   `SYSCALL_ERROR` without changing the previous break or mappings.
-- `SYS_EXIT` removes the current mailbox and marks the task Dead. Reaping
-  removes stale waiters, releases owned mutexes, wakes the next waiter, then
-  frees the ELF pages, heap frames, page tables, private page and both stacks.
+- `SYS_EXIT` clears the current mailbox, wakes all its blocked senders and marks
+  the task Dead. Reaping removes stale waiters, releases owned mutexes, wakes
+  the next waiter, then frees the ELF pages, heap frames, page tables, private
+  page and both stacks. A woken sender rechecks liveness and cannot recreate the
+  dead task's mailbox.
 - Nameserver unregister is owner-checked. Its table is also purged through
   `task_alive` when later requests arrive, so names left by dead tasks do not
   remain permanently valid.
@@ -269,9 +287,10 @@ read back only their own values.
    resume-PC slot wins over the saved x30. Fresh tasks put their entry or
    `silver_user_bootstrap` there.
 7. **Task states:** `Ready / Running / Sleeping(deadline_ticks) /
-   Blocked / Dead`. The scheduler gives the CPU only to Ready tasks;
-   sleeping and blocked tasks are skipped; `find_next_task` prefers
-   non-idle tasks.
+   Blocked / BlockedUntil(deadline_ticks) / Dead`. The scheduler gives the CPU
+   only to Ready tasks; sleeping and blocked tasks are skipped. One timer scan
+   wakes expired sleepers and timed waiters; `find_next_task` prefers non-idle
+   tasks.
 8. **Both trampolines keep ELR/SPSR on the stack.** Each builds a 272-byte
    frame: x0-x30, ELR at offset 248, SPSR at offset 256. The epilogue
    restores ELR/SPSR from the frame before `eret`. They mask IRQs on entry
@@ -305,13 +324,19 @@ read back only their own values.
 
 ## Why IPC uses Mutex + Condvar
 
-IPC state lives behind `Mutex<IpcState>` and every mailbox owns a `Condvar`.
-`Condvar::wait` releases the mutex before blocking, and senders wake only the
-waiters of the addressed mailbox. Check the condition and `wait` under the
-lock; `notify_*` under the lock; re-check after waking.
+IPC state lives behind `Mutex<IpcState>`. Every mailbox owns boxed `not_empty`
+and `not_full` Condvars; boxing keeps their addresses stable when the mailbox
+Vec reallocates. `Condvar::wait`/`wait_until` releases the mutex before blocking.
+Send wakes one receiver, receive wakes one sender, and mailbox destruction wakes
+all senders. Check the condition and wait under the lock, notify under the lock,
+and re-check after waking. Timed waits share the scheduler's absolute tick
+deadlines and remove themselves from the queue on every return path.
 
 IRQ masking guards the tiniest scheduler-critical sections; Mutex + Condvar
-guard everything that can wait on a condition.
+guard everything that can wait on a condition. With a bounded queue, a task that
+selectively waits for one sender can leave its mailbox full and block the very
+sender it needs. Likewise, nameserver replies obey backpressure and can block if
+a client's mailbox is full; demos must not issue RPC to an already-full mailbox.
 
 ## Debugging aids
 
@@ -336,8 +361,10 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   loading or sparse multi-window image layout.
 - Programs are selected from ELFs embedded at kernel build time. There is no
   external program storage, `kill`, `wait` or credential model yet.
-- Mutex queues, condvar queues and mailboxes have no growth limits.
-- `receive()` has no timeout.
+- Mutex and condvar wait queues still have no growth limits. Mailboxes are
+  bounded at 16 messages, but nameserver/control replies also obey backpressure;
+  a full client mailbox can therefore block the nameserver. Selective receive
+  on a full mailbox can likewise deadlock with its expected sender.
 - The user heap is limited to one 2 MB L3 window. The allocator supports only
   alignments up to 16 bytes and has no explicit C-style `realloc`/`calloc`,
   thread safety or double-free detection. There is no general `mmap`/`munmap`
@@ -354,8 +381,9 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 1. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.
-2. **IPC hardening:** bounded mailboxes/backpressure, receive timeouts,
-   nameserver watch notifications instead of lookup polling.
+2. **IPC control plane:** nameserver watch notifications instead of lookup
+   polling, plus nonblocking/priority control replies so full data mailboxes
+   cannot block service RPC. Send timeouts and cancellation are still open.
 3. **VirtIO-console / virtio-block** — first MMIO device driver, moving
    UART output behind a driver interface.
 4. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
@@ -374,6 +402,8 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
    `COPYOUT READONLY REJECT=PASS`, `COPYOUT UNMAPPED REJECT=PASS`,
    `LIFECYCLE EXIT/UNREGISTER=PASS`, `LIFECYCLE MUTEX CLEANUP=PASS`,
    `HEAP GROW/SHRINK=PASS`, `MALLOC FREE/REUSE=PASS`,
-   `MALLOC BRK TRIM=PASS`, `GLOBAL ALLOC BOX=42 VEC_LEN=32 PASS` and
-   `GLOBAL ALLOC TRIM=PASS`.
+   `MALLOC BRK TRIM=PASS`, `GLOBAL ALLOC BOX=42 VEC_LEN=32 PASS`,
+   `GLOBAL ALLOC TRIM=PASS`, `IPC TIMEOUT=PASS`,
+   `IPC BP SENDER RESUMED=PASS`, `IPC BP BACKPRESSURE=PASS` and
+   `IPC EXIT WAKE=PASS`.
 6. Update the README checklist and this file.

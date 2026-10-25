@@ -1,18 +1,18 @@
-//! Mailbox-based IPC: fixed-size messages between tasks.
+//! Bounded mailbox IPC with backpressure and timed receive.
 //!
-//! `receive()` blocks the caller until a message arrives. IPC state lives
-//! behind the blocking kernel mutex, and every mailbox owns a Condvar — a
-//! receiver sleeps on *its own* mailbox's wait queue, and `send()` wakes
-//! exactly the waiters of the addressed mailbox. The old global receiver
-//! list (where any send could spuriously wake an unrelated task) is gone.
+//! Every mailbox has independent `not_empty` and `not_full` condition queues.
+//! Senders block while 16 messages are queued; removing any message wakes one.
+//! Receivers can wait forever, poll, or sleep until an absolute timer deadline.
 
 use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
-use crate::{condvar::Condvar, mutex::Mutex, scheduler};
+use crate::{condvar::Condvar, mutex::Mutex, scheduler, timer};
 
 pub const PAYLOAD_SIZE: usize = 32;
+pub const MAILBOX_CAPACITY: usize = 16;
+pub const INFINITE_TIMEOUT: u64 = u64::MAX;
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -33,14 +33,22 @@ impl Message {
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum SendError {
+    TargetDead,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ReceiveError {
+    Timeout,
+}
+
 struct Mailbox {
     owner: u64,
     queue: VecDeque<Message>,
-    /// Boxed so the condvar's address survives `mailboxes.push()`:
-    /// a Vec growth relocates every Mailbox, and a raw pointer taken
-    /// before blocking in `receive()` would dangle straight into the
-    /// allocator's free list.
-    condvar: Box<Condvar>,
+    /// Boxed so their addresses survive `mailboxes.push()` and Vec relocation.
+    not_empty: Box<Condvar>,
+    not_full: Box<Condvar>,
 }
 
 impl Mailbox {
@@ -48,7 +56,8 @@ impl Mailbox {
         Self {
             owner,
             queue: VecDeque::new(),
-            condvar: Box::new(Condvar::new()),
+            not_empty: Box::new(Condvar::new()),
+            not_full: Box::new(Condvar::new()),
         }
     }
 }
@@ -61,30 +70,47 @@ static IPC: Mutex<IpcState> = Mutex::new(IpcState {
     mailboxes: Vec::new(),
 });
 
-/// Delivers a message to the target's mailbox and wakes at most one task
-/// waiting on that mailbox.
-pub fn send(target: u64, message: Message) {
-    let mut state = IPC.lock();
-    let index = mailbox_index(&mut state, target);
-    let mailbox = &mut state.mailboxes[index];
-    mailbox.queue.push_back(message);
-    mailbox.condvar.notify_one();
+/// Blocks while the target queue is full. Mailbox destruction wakes all such
+/// senders; the liveness check then prevents recreating a dead task's mailbox.
+pub fn send(target: u64, message: Message) -> Result<(), SendError> {
+    let mut guard = IPC.lock();
+    loop {
+        if !scheduler::task_alive(target) {
+            return Err(SendError::TargetDead);
+        }
+        let index = mailbox_index(&mut guard, target);
+        let mailbox = &mut guard.mailboxes[index];
+        if mailbox.queue.len() < MAILBOX_CAPACITY {
+            mailbox.queue.push_back(message);
+            mailbox.not_empty.notify_one();
+            return Ok(());
+        }
+
+        let not_full = &*mailbox.not_full as *const Condvar;
+        guard = unsafe { (*not_full).wait(guard) };
+    }
 }
 
-/// Blocks until any message for the current task arrives.
-pub fn receive() -> Message {
-    receive_matching(None)
+/// Receives with a tick timeout. Zero polls; `INFINITE_TIMEOUT` waits forever.
+pub fn receive_timeout(timeout_ticks: u64) -> Result<Message, ReceiveError> {
+    receive_matching(None, timeout_ticks)
 }
 
-/// Receives only a message from `sender`, preserving unrelated queued
-/// messages. Nameserver RPC uses this so a concurrent PING cannot be mistaken
-/// for a lookup response and discarded.
+/// Receives only a message from `sender`, preserving unrelated queued messages.
 pub fn receive_from(sender: u64) -> Message {
-    receive_matching(Some(sender))
+    match receive_matching(Some(sender), INFINITE_TIMEOUT) {
+        Ok(message) => message,
+        Err(_) => unreachable!(),
+    }
 }
 
-fn receive_matching(sender: Option<u64>) -> Message {
+fn receive_matching(sender: Option<u64>, timeout_ticks: u64) -> Result<Message, ReceiveError> {
     let id = scheduler::current_task_id();
+    let deadline = if timeout_ticks == INFINITE_TIMEOUT {
+        None
+    } else {
+        Some(timer::ticks().saturating_add(timeout_ticks))
+    };
     let mut guard = IPC.lock();
 
     loop {
@@ -96,20 +122,35 @@ fn receive_matching(sender: Option<u64>) -> Message {
                 .unwrap_or(true)
         });
         if let Some(message) = position.and_then(|index| mailbox.queue.remove(index)) {
-            return message;
+            mailbox.not_full.notify_one();
+            return Ok(message);
         }
 
-        // Sleep on this mailbox's condvar: unrelated messages may wake us,
-        // but remain queued until the matching reply or normal receive arrives.
-        let condvar = &*guard.mailboxes[index].condvar as *const Condvar;
-        guard = unsafe { (*condvar).wait(guard) };
+        if deadline.map(|deadline| timer::ticks() >= deadline) == Some(true) {
+            return Err(ReceiveError::Timeout);
+        }
+
+        let not_empty = &*mailbox.not_empty as *const Condvar;
+        guard = if let Some(deadline) = deadline {
+            unsafe { (*not_empty).wait_until(guard, deadline) }
+        } else {
+            unsafe { (*not_empty).wait(guard) }
+        };
     }
 }
 
-/// Drops the exited task's queued messages and mailbox. Only the owner can
-/// block on a mailbox, so a running task cannot be waiting in its own queue.
+/// Clears queued messages and wakes every sender blocked by backpressure.
+/// Only the owner can wait on `not_empty`, and it is currently exiting.
 pub fn remove_task(owner: u64) {
     let mut state = IPC.lock();
+    for mailbox in state
+        .mailboxes
+        .iter_mut()
+        .filter(|mailbox| mailbox.owner == owner)
+    {
+        mailbox.queue.clear();
+        mailbox.not_full.notify_all();
+    }
     state.mailboxes.retain(|mailbox| mailbox.owner != owner);
 }
 

@@ -19,6 +19,10 @@ pub const ROLE_COPYOUT_PROBE: u64 = 19;
 pub const ROLE_HEAP_PROBE: u64 = 20;
 pub const ROLE_MALLOC_PROBE: u64 = 21;
 pub const ROLE_GLOBAL_ALLOC_PROBE: u64 = 22;
+pub const ROLE_IPC_BACKPRESSURE_SENDER: u64 = 23;
+pub const ROLE_IPC_BACKPRESSURE_RECEIVER: u64 = 24;
+pub const ROLE_IPC_EXIT_SENDER: u64 = 25;
+pub const ROLE_IPC_EXIT_RECEIVER: u64 = 26;
 
 /// The kernel passes one argument in x0. Demo selection no longer depends on
 /// task ID: dynamically spawned copies can choose any role independently.
@@ -46,6 +50,10 @@ pub extern "C" fn _start(argument: u64) -> ! {
         ROLE_HEAP_PROBE => demos::heap_probe(),
         ROLE_MALLOC_PROBE => demos::malloc_probe(),
         ROLE_GLOBAL_ALLOC_PROBE => demos::global_alloc_probe(),
+        ROLE_IPC_BACKPRESSURE_SENDER => demos::ipc_backpressure_sender(),
+        ROLE_IPC_BACKPRESSURE_RECEIVER => demos::ipc_backpressure_receiver(),
+        ROLE_IPC_EXIT_SENDER => demos::ipc_exit_sender(),
+        ROLE_IPC_EXIT_RECEIVER => demos::ipc_exit_receiver(),
         _ => demos::unknown_task(),
     }
 }

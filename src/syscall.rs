@@ -41,6 +41,7 @@ const NAME_LIMIT: usize = ipc::PAYLOAD_SIZE - 2;
 
 /// Written into x0 when the call number is not in the table.
 pub const SYSCALL_ERROR: u64 = u64::MAX;
+pub const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
 
 /// Frame layout built by the SVC trampoline: x0-x30, then ELR, then SPSR.
 const FRAME_QUADWORDS: usize = 33;
@@ -64,7 +65,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             0
         }
         SYS_SEND => sys_send(frame[0], frame[1]),
-        SYS_RECEIVE => sys_receive(frame[0]),
+        SYS_RECEIVE => sys_receive(frame[0], frame[1]),
         SYS_REGISTER => sys_register_name(frame[0]),
         SYS_LOOKUP => sys_lookup_name(frame[0]),
         SYS_PRINT => sys_print(frame[0], frame[1]),
@@ -132,17 +133,22 @@ fn sys_send(target: u64, message_ptr: u64) -> u64 {
     if user_memory::copy_from_user(message_ptr, bytes).is_err() {
         return SYSCALL_ERROR;
     }
-    ipc::send(target, message);
+    if ipc::send(target, message).is_err() {
+        return SYSCALL_ERROR;
+    }
     0
 }
 
-fn sys_receive(buffer_ptr: u64) -> u64 {
+fn sys_receive(buffer_ptr: u64, timeout_ticks: u64) -> u64 {
     let size = core::mem::size_of::<ipc::Message>() as u64;
     // Reject before blocking; copy_to_user checks again after the wakeup.
     if !mmu::valid_user_slice_mut(buffer_ptr, size) {
         return SYSCALL_ERROR;
     }
-    let message = ipc::receive();
+    let message = match ipc::receive_timeout(timeout_ticks) {
+        Ok(message) => message,
+        Err(ipc::ReceiveError::Timeout) => return SYSCALL_TIMEOUT,
+    };
     let bytes = unsafe {
         core::slice::from_raw_parts(
             (&message as *const ipc::Message).cast::<u8>(),
@@ -167,7 +173,9 @@ fn sys_register_name(name_ptr: u64) -> u64 {
         return SYSCALL_ERROR;
     };
 
-    ipc::send(NAMESERVER_ID, request);
+    if ipc::send(NAMESERVER_ID, request).is_err() {
+        return SYSCALL_ERROR;
+    }
     let reply = ipc::receive_from(NAMESERVER_ID);
     if reply.text() == &b"OK"[..] {
         0
@@ -184,7 +192,9 @@ fn sys_unregister_name(name_ptr: u64) -> u64 {
         return SYSCALL_ERROR;
     };
 
-    ipc::send(NAMESERVER_ID, request);
+    if ipc::send(NAMESERVER_ID, request).is_err() {
+        return SYSCALL_ERROR;
+    }
     let reply = ipc::receive_from(NAMESERVER_ID);
     if reply.text() == &b"OK"[..] {
         0
@@ -201,7 +211,9 @@ fn sys_lookup_name(name_ptr: u64) -> u64 {
         return 0;
     };
 
-    ipc::send(NAMESERVER_ID, request);
+    if ipc::send(NAMESERVER_ID, request).is_err() {
+        return SYSCALL_ERROR;
+    }
     let reply = ipc::receive_from(NAMESERVER_ID);
     match parse_id_reply(&reply) {
         Some(id) => id,
