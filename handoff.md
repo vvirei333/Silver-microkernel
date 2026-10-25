@@ -49,7 +49,9 @@ Device-nGnRnE into a first-fit 2 MB user window at `0x80000000`.
 `SYS_WAIT_IRQ = 64` consumes a pending notification or blocks until one arrives.
 Bound level-triggered IRQs are masked before GIC EOI, then unmasked by
 `bind_irq` and every `wait_irq` call to prevent an IRQ storm while EL0 handles
-the device.
+the device. Program 8 (`uart_driver`) receives self capabilities with CAP_MMIO
+and CAP_IRQ at spawn; it maps PL011, binds INTID 33 and echoes received bytes
+from EL0 without entering the kernel PL011 handler.
 
 Debug and release QEMU both passed IRQ-only `uname`, `echo` and `pwd`; sleeping
 `demo 12` stop/resume/kill/wait; and blocked `demo 7` with IPC delivered while
@@ -157,10 +159,11 @@ cargo build --target aarch64-unknown-none --no-default-features --features no_st
 
 For bare-metal profiles, `build.rs` invokes Cargo in `userspace/`, uses
 `target/userspace` as its target directory, matches debug/release profile and
-copies `silver_userspace`, `nameserver` and `silvershell` into `OUT_DIR`.
-`src/user_program.rs` assigns program IDs 0 (demo), 1 (nameserver) and 2 (shell).
-Host builds skip userspace. The default scheduler starts shell ID 2 after the
-nameserver; `demo-tasks` replaces the shell boot with the regression task set.
+copies every userspace ELF into `OUT_DIR`. `src/user_program.rs` assigns IDs
+0 (demo), 1 (nameserver), 2 (shell), 3 (ls), 4 (cat), 5 (echo), 6 (say),
+7 (sl) and 8 (uart_driver). Host builds skip userspace. The default scheduler
+starts shell ID 2 after the nameserver; `demo-tasks` replaces the shell boot
+with the regression task set.
 
 Interactive QEMU: `qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M
 -nographic -kernel target/aarch64-unknown-none/debug/silver_microkernel`.
@@ -371,19 +374,21 @@ read back only their own values.
 - `silvershell.rs` is an independent no_std/no_main ELF with no allocator. It
   uses a 96-byte line buffer, accepts printable ASCII and CR/LF, echoes input,
   and implements Backspace/DEL by removing the last byte and erasing it onscreen.
-- UART input remains a nonblocking syscall. The shell sleeps for 1 ms when the
-  software queue is empty, while PL011 INTID 33 captures bytes and Ctrl-Z without
-  task reads. The command parser and job-control event are unchanged.
+- UART input remains a nonblocking syscall. Before the EL0 driver is started,
+  the shell sleeps for 1 ms when the software queue is empty, while PL011 INTID
+  33 captures bytes and Ctrl-Z without task reads. `start_uart_driver` instead
+  gives the foreground console to program 8; its raw RX echo does not feed the
+  kernel FIFO or the shell command parser.
 - Startup emits ANSI clear/home, runs fastfetch once and shows a bold cyan
   `silvershell>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`,
-  `say`, `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`,
-  `ps`, `spawn`, `bg`, `fg`, `kill` and `wait`; empty lines only reprompt. Echo
-  parsing preserves quoted spaces, strips outer quotes and recognizes `>`/`>>`
-  only outside quotes. `mv old new` takes a full destination path, not just a
-  directory.
+  `say`, `sl`, `start_uart_driver`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`,
+  `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill` and `wait`; empty lines
+  only reprompt. Echo parsing preserves quoted spaces, strips outer quotes and
+  recognizes `>`/`>>` only outside quotes. `mv old new` takes a full destination
+  path, not just a directory.
 - `ls`, `cat`, ordinary `echo` and `say` spawn separate EL0 utilities with
   string args and inherited cwd. `say` preserves spaces and strips paired outer
-  quotes. `sl` runs a 24-frame ANSI steam-locomotive animation. `run_utility`
+  quotes. `sl` runs a 60-frame ANSI steam-locomotive animation. `run_utility`
   gives the child the console and uses wait_event, so either exit or Ctrl-Z
   returns control to the shell. `echo text > path` truncates/creates;
   `echo text >> path` appends/creates directly through VFS. `mkdir`, `rm`,

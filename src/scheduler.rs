@@ -1285,13 +1285,18 @@ impl Task {
             0
         };
 
+        let mut cap_table = capability::CapTable::new();
+        if user.map(|(program, _)| program) == Some(user_program::UART_DRIVER) {
+            cap_table.insert(id, capability::CAP_MMIO | capability::CAP_IRQ);
+        }
+
         Some(Self {
             id,
             state: TaskState::Ready,
             resume_state: None,
             program: user.map_or(u64::MAX, |(program, _)| program),
             argument: user.map_or(0, |(_, argument)| argument),
-            cap_table: capability::CapTable::new(),
+            cap_table,
             bound_irq: None,
             irq_pending: false,
             arguments,

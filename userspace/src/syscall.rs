@@ -59,6 +59,7 @@ pub const PROGRAM_CAT: u64 = 4;
 pub const PROGRAM_ECHO: u64 = 5;
 pub const PROGRAM_SAY: u64 = 6;
 pub const PROGRAM_SL: u64 = 7;
+pub const PROGRAM_UART_DRIVER: u64 = 8;
 pub const OPEN_READ: u64 = 0;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_APPEND: u64 = 2;

@@ -1,0 +1,59 @@
+#![no_std]
+#![no_main]
+
+#[path = "../ipc.rs"]
+mod ipc;
+#[path = "../syscall.rs"]
+mod syscall;
+
+use core::panic::PanicInfo;
+
+const UART_PHYS: u64 = 0x0900_0000;
+const UART_IRQ: u64 = 33;
+const UART_DR: usize = 0x00;
+const UART_FR: usize = 0x18;
+const UART_ICR: usize = 0x44;
+const UART_FR_RXFE: u32 = 1 << 4;
+const UART_RX_RT_CLEAR: u32 = 0x30;
+
+#[no_mangle]
+#[link_section = ".text._start"]
+pub extern "C" fn _start(_argument: u64) -> ! {
+    let Some(base) = syscall::map_phys(UART_PHYS, 4096) else {
+        fail("UART DRIVER MAP FAILED\r\n");
+    };
+    if !syscall::bind_irq(UART_IRQ) {
+        fail("UART DRIVER IRQ BIND FAILED\r\n");
+    }
+
+    syscall::print("UART DRIVER STARTED\r\n");
+    let base = base as usize;
+    loop {
+        syscall::wait_irq();
+        if read32(base + UART_FR) & UART_FR_RXFE == 0 {
+            let byte = read32(base + UART_DR);
+            write32(base + UART_ICR, UART_RX_RT_CLEAR);
+            write32(base + UART_DR, byte);
+        }
+    }
+}
+
+fn read32(address: usize) -> u32 {
+    unsafe { core::ptr::read_volatile(address as *const u32) }
+}
+
+fn write32(address: usize, value: u32) {
+    unsafe { core::ptr::write_volatile(address as *mut u32, value) }
+}
+
+fn fail(message: &str) -> ! {
+    syscall::print(message);
+    syscall::exit_with_status(1)
+}
+
+#[panic_handler]
+fn panic(_info: &PanicInfo) -> ! {
+    loop {
+        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
+    }
+}

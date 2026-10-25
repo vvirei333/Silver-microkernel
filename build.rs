@@ -37,6 +37,7 @@ fn main() {
         ("echo", "echo.elf"),
         ("say", "say.elf"),
         ("sl", "sl.elf"),
+        ("uart_driver", "uart_driver.elf"),
     ] {
         let elf = target_dir
             .join("aarch64-unknown-none")

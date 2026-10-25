@@ -8,6 +8,7 @@ pub const CAT: u64 = 4;
 pub const ECHO: u64 = 5;
 pub const SAY: u64 = 6;
 pub const SL: u64 = 7;
+pub const UART_DRIVER: u64 = 8;
 
 static DEMO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silver_userspace.elf"));
 static NAMESERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silver_nameserver.elf"));
@@ -17,6 +18,7 @@ static CAT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cat.elf"));
 static ECHO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo.elf"));
 static SAY_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/say.elf"));
 static SL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sl.elf"));
+static UART_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/uart_driver.elf"));
 
 /// Selects an executable for spawn. Unknown program IDs are rejected.
 pub fn image(program: u64) -> Option<&'static [u8]> {
@@ -29,6 +31,7 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         ECHO => Some(ECHO_ELF),
         SAY => Some(SAY_ELF),
         SL => Some(SL_ELF),
+        UART_DRIVER => Some(UART_DRIVER_ELF),
         _ => None,
     }
 }

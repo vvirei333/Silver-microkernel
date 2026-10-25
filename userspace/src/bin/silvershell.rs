@@ -88,6 +88,8 @@ fn execute(command: &str) {
             syscall::print("             Print, truncate/write, or append to a file\r\n");
             syscall::print("  say <text> Print text\r\n");
             syscall::print("  sl         Run an animated steam locomotive\r\n");
+            syscall::print("  start_uart_driver\r\n");
+            syscall::print("             Start the EL0 UART driver in the foreground\r\n");
             syscall::print("  mkdir <path>\r\n");
             syscall::print("  rm <file>  Remove a closed file\r\n");
             syscall::print("  rmdir <path>\r\n");
@@ -99,7 +101,9 @@ fn execute(command: &str) {
             syscall::print("  clear      Clear the terminal screen\r\n");
             syscall::print("  uname      Print kernel name, version and architecture\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
-            syscall::print("  spawn <demo|nameserver|silvershell|ls|cat|echo|say|sl> [arg]\r\n");
+            syscall::print(
+                "  spawn <demo|nameserver|silvershell|ls|cat|echo|say|sl|uart_driver> [arg]\r\n",
+            );
             syscall::print("  bg <program> [arg]\r\n");
             syscall::print("             Spawn without console ownership\r\n");
             syscall::print("  fg <cap>   Resume a task in the foreground\r\n");
@@ -111,6 +115,7 @@ fn execute(command: &str) {
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
+        Some("start_uart_driver") => run_utility(syscall::PROGRAM_UART_DRIVER, ""),
         Some("mkdir") => make_directory(words.next()),
         Some("rm") => remove_file(words.next()),
         Some("rmdir") => remove_directory(words.next()),
@@ -422,6 +427,7 @@ fn program_name(program: u64) -> &'static str {
         syscall::PROGRAM_ECHO => "echo        ",
         syscall::PROGRAM_SAY => "say         ",
         syscall::PROGRAM_SL => "sl          ",
+        syscall::PROGRAM_UART_DRIVER => "uart_driver ",
         _ => "kernel      ",
     }
 }
@@ -441,7 +447,9 @@ fn state_name(state: u64) -> &'static str {
 
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
-        syscall::print("Usage: spawn <demo|nameserver|silvershell|ls|cat|echo|say|sl> [arg]\r\n");
+        syscall::print(
+            "Usage: spawn <demo|nameserver|silvershell|ls|cat|echo|say|sl|uart_driver> [arg]\r\n",
+        );
         return;
     };
     let program = match program {
@@ -453,6 +461,7 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
         "echo" => syscall::PROGRAM_ECHO,
         "say" => syscall::PROGRAM_SAY,
         "sl" => syscall::PROGRAM_SL,
+        "uart_driver" => syscall::PROGRAM_UART_DRIVER,
         _ => {
             syscall::print("Unknown program. See 'help' for the program list.\r\n");
             return;

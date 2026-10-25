@@ -22,7 +22,7 @@ const TRAIN: [&str; 8] = [
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(_argument: u64) -> ! {
-    for offset in 0..24 {
+    for offset in 0..60 {
         syscall::print("\x1b[2J\x1b[H");
         for line in TRAIN {
             print_spaces(offset);
