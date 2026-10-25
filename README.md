@@ -7,6 +7,13 @@ code — only the build commands and toolchain setup differ.
 
 Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 
+## Screenshot
+
+![Silver Microkernel fastfetch](assets/silver-fastfetch.png)
+
+The `fastfetch` screen above is real output from Silver Microkernel running in
+QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace.
+
 ## What already works
 
 - [x] Bare-metal boot: `_start`, custom linker script, `.bss` zeroing
@@ -26,10 +33,11 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Condition variable: per-mailbox wait queues, targeted wakeups and timed waits
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
-- [x] Six userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
-- [x] silvershell: `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`
+- [x] Eleven userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
+- [x] Init architecture: `silverd` starts Scout, Howl, Howler and the block-driver stub
+- [x] howl: `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`, `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`
 - [x] Shell output redirection: `>` truncates, `>>` appends, quoted operators stay literal
-- [x] ANSI clear/home and a bold cyan `silvershell>` prompt
+- [x] ANSI clear/home and a bold cyan `howl>` prompt
 - [x] RAM-VFS: `/bin`, `/etc`, `/tmp`, files/directories and per-task descriptors
 - [x] Per-task cwd inherited on spawn, absolute handles and `chdir`/`getcwd` syscalls
 - [x] File syscalls: `open`, `read`, `write`, `create`, `close`, `read_dir`, `mkdir`, `unlink`, `rmdir`, `rename`
@@ -39,13 +47,17 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Userspace `malloc/free`: first-fit free list, split, coalesce and `brk` trim
 - [x] Userspace `GlobalAlloc`: `Box`, growable `Vec` and deallocation in EL0
 - [x] W^X user mappings: R-X text, R-- rodata, RW-NX data/heap/stack/private memory
-- [x] No kernel image, kernel data, heap, kernel stacks or MMIO in user TTBR0
+- [x] No kernel image, kernel data, heap, kernel stacks or unauthorized MMIO in user TTBR0
 - [x] Tasks in EL0 (Ring 3): user stacks and SVC-only kernel access
+- [x] Capability-protected kill/wait/console/IRQ/MMIO operations and capability delegation
+- [x] Userspace UART driver: IRQ-bound RX plus IPC-routed input and output
+- [x] DMA infrastructure: contiguous frames and Normal Non-Cacheable user mappings
+- [x] PCI ECAM read/write syscalls protected by `CAP_PCI`; no Virtio protocol yet
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
 - [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
-- [ ] More drivers, credentials/capabilities, resource quotas and persistent storage
+- [ ] Virtio-block protocol, more drivers, resource quotas and persistent storage
 
 ## Requirements
 
@@ -91,31 +103,31 @@ qemu-system-aarch64 \
   -kernel target/aarch64-unknown-none/debug/silver_microkernel
 ```
 
-At the `silvershell>` prompt, `help` lists all commands. Backspace edits the
+At the `howl>` prompt, `help` lists all commands. Backspace edits the
 current line. A minimal file workflow looks like this:
 
 ```text
-silvershell> ls
+howl> ls
 bin/
 etc/
 tmp/
-silvershell> echo 'hello' > test.txt
-silvershell> cat test.txt
+howl> echo 'hello' > test.txt
+howl> cat test.txt
 hello
-silvershell> echo 'again' >> test.txt
-silvershell> cat test.txt
+howl> echo 'again' >> test.txt
+howl> cat test.txt
 hello
 again
-silvershell> mkdir docs
-silvershell> mv test.txt docs/readme.txt
-silvershell> cat docs/readme.txt
+howl> mkdir docs
+howl> mv test.txt docs/readme.txt
+howl> cat docs/readme.txt
 hello
-silvershell> rm docs/readme.txt
-silvershell> rmdir docs
-silvershell> cd /bin
-silvershell> pwd
+howl> rm docs/readme.txt
+howl> rmdir docs
+howl> cd /bin
+howl> pwd
 /bin
-silvershell> ls
+howl> ls
 ```
 
 `ls`, `cat` and ordinary `echo` run as separate EL0 programs; they inherit the
@@ -123,45 +135,42 @@ shell's cwd, temporarily receive the console and return it when the shell has
 consumed their exit status. Redirection, `mkdir`, `rm`, `rmdir`, `mv`, `cd` and
 `pwd` use syscalls directly.
 
-`spawn demo 12` and `bg demo 12` start a background task without UART access.
-Its output is discarded, not buffered, and its input calls report no data. `fg 3`
-transfers the console and waits. Ctrl-Z stops the foreground task, returns the
-shell prompt and makes `ps` show `stopped`; another `fg 3` resumes it. Sleeping
-and blocked state is preserved, and notifications arriving while stopped are
-not lost. Ctrl-Z at a shell prompt is ignored. `kill <id>` and `wait <id>` still
-provide explicit lifecycle control, including for stopped tasks.
+`spawn demo 12` and `bg demo 12` start a background task without console access.
+`spawn` prints the child's Task ID and CapId. `fg <cap>` transfers the console
+and waits; Ctrl-Z stops the foreground task and returns the shell prompt;
+another `fg <cap>` resumes it. `kill <cap>` and `wait <cap>` require the
+corresponding capability rights.
 
-Console ownership returns to the first live silvershell when its owner exits or
-is killed. This is cooperative arbitration, not a security boundary. PL011 RX
-uses GIC INTID 33: its IRQ handler fills a bounded 256-byte kernel buffer, so
-Ctrl-Z works even when the foreground program never reads input. `SYS_READ`
-consumes only this buffer; the timer no longer polls UART.
+During normal boot, Howler owns PL011 in EL0: hardware IRQ 33 wakes the driver,
+and input/output travel through IPC. The kernel retains a bounded RX fallback
+for early diagnostics, demo tasks and recovery if Howler dies.
 
 Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
 `Cargo.toml` has `std` (default host stub), `no_std` (bare metal) and
-`demo-tasks` (opt-in regression programs). The default bare-metal build starts
-only idle, nameserver and silvershell for a clean console. To run the older
-fault/VM/allocator/IPC demos instead, use `--features no_std,demo-tasks`.
-`build.rs` automatically builds and embeds the demo, nameserver, silvershell,
-ls, cat and echo ELFs; no separate userspace command is needed.
+`demo-tasks` (opt-in regression programs). Normal bare-metal boot starts only
+silverd, which then starts Scout, Howl, Howler and the block-driver stub. To run
+the fault/VM/allocator/IPC regression programs instead, use
+`--features no_std,demo-tasks`. `build.rs` automatically builds and embeds every
+userspace ELF; no separate userspace command is needed.
 
 ## Project layout
 
 | File | Purpose |
 | --- | --- |
-| `build.rs` | Builds and embeds all six userspace ELFs for bare-metal profiles |
+| `build.rs` | Builds and embeds all eleven userspace ELFs for bare-metal profiles |
 | `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
 | `src/exceptions.rs` | Task fault diagnostics and kernel panic |
-| `src/pl011.rs` | UART TX, IRQ-driven RX, bounded input buffer and Ctrl-Z capture |
+| `src/pl011.rs` | Kernel UART diagnostics and bounded RX fallback |
 | `src/memory.rs` | Physical memory map and high-half address conversion |
 | `src/frame_allocator.rs` | Physical page frame allocator (bitmap) |
 | `src/allocator.rs` | Kernel heap, `#[global_allocator]` |
-| `src/gic.rs` | GICv2 timer/UART IRQ setup, EOI and stop-aware dispatch |
+| `src/gic.rs` | GICv2 timer/UART IRQ setup, EOI and userspace IRQ dispatch |
 | `src/timer.rs` | ARM Generic Timer, tick counter |
 | `src/interrupts.rs` | IRQ control: masking/restoring DAIF |
-| `src/scheduler.rs` | Tasks, stop/resume, console ownership, context switch and reaping |
+| `src/capability.rs` | Capability tables, rights, delegation and revocation |
+| `src/scheduler.rs` | Tasks, capabilities, DMA ownership, console control and reaping |
 | `src/mutex.rs` | Blocking mutex with FIFO waiters and ownership tracking |
 | `src/wait_queue.rs` | Shared FIFO queue with dead-waiter removal |
 | `src/ipc.rs` | Bounded mailboxes, backpressure, timed/selective receive and cleanup |
@@ -271,10 +280,11 @@ unlock in all build profiles, parses nameserver IDs with checked arithmetic and
 uses saturating sleep deadlines. Debug and release regression probes cover these
 paths alongside the existing MMU, copyout, lifecycle and IPC checks.
 
-This is not yet a complete security model. Any EL0 task can currently request
-console/task control operations for arbitrary IDs; credentials and capabilities
-are still needed. Spawn, heap, VFS and wait-queue resource quotas are also not
-implemented, so denial-of-service resistance remains limited.
+This is not yet a complete security model. Kill, wait, console, resume, MMIO,
+IRQ and PCI operations check capability rights; `SYS_CAP_GRANT` delegates only a
+subset of the caller's rights, and task death revokes or downgrades affected
+capabilities. Spawn, heap, DMA, VFS and wait-queue resource quotas are still
+limited or absent, so denial-of-service resistance remains incomplete.
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).
 
