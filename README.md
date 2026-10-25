@@ -28,6 +28,7 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Per-task TTBR0 spaces: independent ELF image, fixed-VA stack and private page
 - [x] Growable per-task heap: sparse 2 MB window, `brk`, zero-fill and cleanup on exit
 - [x] Userspace `malloc/free`: first-fit free list, split, coalesce and `brk` trim
+- [x] Userspace `GlobalAlloc`: `Box`, growable `Vec` and deallocation in EL0
 - [x] W^X user mappings: R-X text, R-- rodata, RW-NX data/heap/stack/private memory
 - [x] No kernel image, kernel data, heap, kernel stacks or MMIO in user TTBR0
 - [x] Tasks in EL0 (Ring 3): user stacks and SVC-only kernel access
@@ -146,7 +147,13 @@ all remaining heap frames.
 It uses first-fit, splits large free blocks, keeps the list address-sorted and
 coalesces adjacent blocks. Freeing a tail block also shrinks `brk`, returning
 whole pages to the kernel. Tests verify same-address reuse, neighbor integrity
-and restoration of the initial program break. This is not `GlobalAlloc` yet.
+and restoration of the initial program break.
+
+The demo ELF registers this allocator as `#[global_allocator]`, so `Box`, `Vec`
+and default `GlobalAlloc` reallocation work in EL0. Layouts requiring alignment
+above 16 bytes and OOM terminate only the current task with diagnostics. The
+EL0 test grows a 32-element `Vec`, checks `Box::new(42)` and verifies `brk` trim
+after both values are dropped.
 
 The userspace linker emits separate R-X, R-- and RW `PT_LOAD` segments. The
 loader accepts static ELF64/AArch64 `ET_EXEC` files inside a 2 MB image window,

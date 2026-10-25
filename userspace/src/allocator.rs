@@ -4,6 +4,8 @@
 //! are sorted by address, split on allocation and coalesced on free. A free
 //! block at the program break is returned to the kernel by shrinking `brk`.
 
+use core::alloc::{GlobalAlloc, Layout};
+
 use crate::syscall;
 
 const ALIGNMENT: usize = 16;
@@ -25,6 +27,40 @@ struct Allocator {
 static mut ALLOCATOR: Allocator = Allocator {
     free_head: core::ptr::null_mut(),
 };
+
+/// `GlobalAlloc` adapter used by `Box`, `Vec` and other `alloc` collections.
+/// The current backing malloc guarantees 16-byte alignment; stricter layouts
+/// take the allocation-error path instead of returning a misaligned pointer.
+pub struct UserAllocator;
+
+unsafe impl GlobalAlloc for UserAllocator {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let pointer = if layout.align() <= ALIGNMENT {
+            malloc(layout.size())
+        } else {
+            core::ptr::null_mut()
+        };
+        if pointer.is_null() {
+            allocation_error(layout);
+        }
+        pointer
+    }
+
+    unsafe fn dealloc(&self, pointer: *mut u8, _layout: Layout) {
+        unsafe { free(pointer) };
+    }
+}
+
+// `#[alloc_error_handler]` is still unstable. Intercepting null here gives a
+// deterministic EL0 task exit and satisfies alloc's error path without it.
+fn allocation_error(layout: Layout) -> ! {
+    syscall::print("USER ALLOCATION ERROR\r\nSIZE=");
+    syscall::print_dec_u64(layout.size() as u64);
+    syscall::print("\r\nALIGN=");
+    syscall::print_dec_u64(layout.align() as u64);
+    syscall::print("\r\n");
+    syscall::exit()
+}
 
 /// Allocates `size` bytes aligned to 16 bytes, or returns null on exhaustion.
 /// A zero-sized allocation also returns null.

@@ -409,6 +409,39 @@ pub fn malloc_probe() -> ! {
     syscall::exit()
 }
 
+pub fn global_alloc_probe() -> ! {
+    let Some(initial_break) = syscall::program_break() else {
+        syscall::print("GLOBAL ALLOC BRK QUERY=FAIL\r\n");
+        syscall::exit();
+    };
+
+    let boxed = alloc::boxed::Box::new(42_u64);
+    let mut values = alloc::vec::Vec::new();
+    // Vec grows through several capacities, exercising GlobalAlloc's default
+    // realloc path (allocate, copy, deallocate) as well as fresh allocations.
+    for value in 0..32_u64 {
+        values.push(value * 3);
+    }
+    let contents_ok = values
+        .iter()
+        .copied()
+        .eq((0..32_u64).map(|value| value * 3));
+    if *boxed != 42 || values.len() != 32 || !contents_ok {
+        syscall::print("GLOBAL ALLOC BOX/VEC=FAIL\r\n");
+        syscall::exit();
+    }
+    syscall::print("GLOBAL ALLOC BOX=42 VEC_LEN=32 PASS\r\n");
+
+    drop(values);
+    drop(boxed);
+    if syscall::program_break() != Some(initial_break) {
+        syscall::print("GLOBAL ALLOC TRIM=FAIL\r\n");
+        syscall::exit();
+    }
+    syscall::print("GLOBAL ALLOC TRIM=PASS\r\n");
+    syscall::exit()
+}
+
 pub fn unknown_task() -> ! {
     syscall::print("UNKNOWN USER TASK\r\n");
     loop {

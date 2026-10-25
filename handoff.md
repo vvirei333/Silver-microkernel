@@ -3,12 +3,12 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (userspace malloc/free update)
+## State as of 2026-10-25 (userspace GlobalAlloc update)
 
-Latest verified feature: **explicit userspace `malloc/free` over `SYS_BRK`**.
-The per-task allocator uses 16-byte alignment, first-fit, block splitting,
-address-sorted free blocks, neighbor coalescing and tail trimming through
-`brk`. Sparse heap growth, rollback and exit cleanup remain intact.
+Latest verified feature: **`Box` and growable `Vec` in EL0 through
+`#[global_allocator]`**. `UserAllocator` adapts the existing first-fit
+`malloc/free` implementation to `GlobalAlloc`; default reallocation therefore
+allocates, copies and frees through the same per-task free list and `SYS_BRK`.
 
 Verified with host, debug bare-metal and release bare-metal builds, three debug
 QEMU runs (5–6 seconds each) and a 6-second release run. Every run had exactly
@@ -23,12 +23,13 @@ LIFECYCLE MUTEX CLEANUP=PASS
 HEAP GROW/SHRINK=PASS
 MALLOC FREE/REUSE=PASS
 MALLOC BRK TRIM=PASS
+GLOBAL ALLOC BOX=42 VEC_LEN=32 PASS
+GLOBAL ALLOC TRIM=PASS
 ```
 
-The malloc test frees a middle allocation, reuses its exact address for a
-smaller allocation, verifies both neighbors' contents, then frees every block
-and confirms that the original program break is restored. VM A/B still prove
-that identical heap VAs have independent physical backing.
+The EL0 test checks `Box::new(42)`, grows a `Vec` to 32 elements, verifies every
+value, drops both objects and confirms restoration of the original program
+break. Earlier same-address malloc reuse and VM A/B isolation checks still pass.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
 | --- | ---: | --- | --- |
@@ -202,7 +203,7 @@ read back only their own values.
 - User tasks cannot use the high-only kernel heap. The nameserver therefore
   stores 16 fixed-capacity entries on its user stack instead of in a `Vec`.
 
-## Userspace malloc/free
+## Userspace allocation
 
 - `userspace/src/allocator.rs` stores a 16-byte header before every payload;
   header `size` is the total block size and `next` is used only while free.
@@ -214,8 +215,12 @@ read back only their own values.
   `brk`, then unlinks that block. Thus tail memory returns to the kernel.
 - Allocator state lives in each task's private ELF data. It currently assumes
   one execution thread per address space and has no double-free validation.
-- This is an explicit C-style API, not Rust `GlobalAlloc`; `Box`/`Vec` are not
-  available in userspace yet.
+- The demo ELF registers `UserAllocator` as `#[global_allocator]` and imports
+  `extern crate alloc`. `alloc` forwards `alloc`/`dealloc` to `malloc/free`;
+  default `realloc` uses those operations plus a copy.
+- Layout alignment above 16 bytes is not supported yet. It and OOM print the
+  layout and exit the current EL0 task. This explicit error path avoids the
+  still-unstable `#[alloc_error_handler]`; do not return null into `alloc`.
 
 ## Page-table, copyin/copyout and PAN rules
 
@@ -333,20 +338,22 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   external program storage, `kill`, `wait` or credential model yet.
 - Mutex queues, condvar queues and mailboxes have no growth limits.
 - `receive()` has no timeout.
-- The user heap is limited to one 2 MB L3 window. The allocator is explicit
-  `malloc/free` only: no `GlobalAlloc`, `realloc`, `calloc`, thread safety or
-  double-free detection. There is no general `mmap`/`munmap` or growable stack;
-  the user stack remains fixed at 8 KB and the private window at one page.
+- The user heap is limited to one 2 MB L3 window. The allocator supports only
+  alignments up to 16 bytes and has no explicit C-style `realloc`/`calloc`,
+  thread safety or double-free detection. There is no general `mmap`/`munmap`
+  or growable stack; the user stack remains fixed at 8 KB and the private
+  window at one page.
 - UART lines from different tasks can interleave; an IRQ may even schedule
   another task during a FIFO wait.
-- `#[alloc_error_handler]` is unstable on stable Rust — instead a wrapper
-  in `allocator.rs` catches the null from `GlobalAlloc` and raises a panic.
+- `#[alloc_error_handler]` is unstable on stable Rust. The kernel converts a
+  null from its `GlobalAlloc` into a panic; the demo userspace wrapper instead
+  prints the layout and exits only the current EL0 task.
 
 ## Next steps (by priority)
 
 1. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
-   growable stacks and demand paging later. Optionally connect the userspace
-   allocator to `GlobalAlloc` and add `realloc`/`calloc`.
+   growable stacks and demand paging later. Add over-aligned user allocations
+   and explicit `realloc`/`calloc` when their use cases appear.
 2. **IPC hardening:** bounded mailboxes/backpressure, receive timeouts,
    nameserver watch notifications instead of lookup polling.
 3. **VirtIO-console / virtio-block** — first MMIO device driver, moving
@@ -366,6 +373,7 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
    Expect exactly the two intentional faults from tasks 15 and 16, plus
    `COPYOUT READONLY REJECT=PASS`, `COPYOUT UNMAPPED REJECT=PASS`,
    `LIFECYCLE EXIT/UNREGISTER=PASS`, `LIFECYCLE MUTEX CLEANUP=PASS`,
-   `HEAP GROW/SHRINK=PASS`, `MALLOC FREE/REUSE=PASS` and
-   `MALLOC BRK TRIM=PASS`.
+   `HEAP GROW/SHRINK=PASS`, `MALLOC FREE/REUSE=PASS`,
+   `MALLOC BRK TRIM=PASS`, `GLOBAL ALLOC BOX=42 VEC_LEN=32 PASS` and
+   `GLOBAL ALLOC TRIM=PASS`.
 6. Update the README checklist and this file.
