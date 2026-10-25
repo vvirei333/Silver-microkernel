@@ -74,11 +74,13 @@ fn execute(command: &str) {
             syscall::print("silvershell commands:\r\n");
             syscall::print("  help       Show this command list\r\n");
             syscall::print("  fastfetch  Show OS, uptime and memory information\r\n");
-            syscall::print("  ls [path]  List a directory (root by default)\r\n");
+            syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  echo <text> [> file]\r\n");
             syscall::print("             Print text or truncate and write a file\r\n");
             syscall::print("  mkdir <path>\r\n");
+            syscall::print("  cd <path>  Change current working directory\r\n");
+            syscall::print("  pwd        Print current working directory\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
             syscall::print("  spawn <demo|nameserver|silvershell|ls|cat|echo> [arg]\r\n");
             syscall::print("  kill <id>  Kill a task\r\n");
@@ -88,6 +90,8 @@ fn execute(command: &str) {
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("mkdir") => make_directory(words.next()),
+        Some("cd") => change_directory(words.next()),
+        Some("pwd") => print_working_directory(),
         Some("ps") => show_tasks(),
         Some("spawn") => spawn_program(words.next(), words.next()),
         Some("kill") => kill_task(words.next()),
@@ -200,6 +204,28 @@ fn make_directory(path: Option<&str>) {
     };
     if !syscall::fs_mkdir(path) {
         syscall::print("mkdir: cannot create directory\r\n");
+    }
+}
+
+fn change_directory(path: Option<&str>) {
+    let Some(path) = path else {
+        syscall::print("Usage: cd <path>\r\n");
+        return;
+    };
+    if !syscall::fs_chdir(path) {
+        syscall::print("cd: no such directory\r\n");
+    }
+}
+
+fn print_working_directory() {
+    let mut cwd = [0_u8; 192];
+    let Some(len) = syscall::fs_getcwd(&mut cwd) else {
+        syscall::print("pwd: cannot read current directory\r\n");
+        return;
+    };
+    if let Ok(path) = core::str::from_utf8(&cwd[..len]) {
+        syscall::print(path);
+        syscall::print("\r\n");
     }
 }
 

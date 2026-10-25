@@ -1,8 +1,7 @@
 //! Single-CPU in-memory file tree and per-task file descriptors.
 //!
-//! Paths are rooted at `/`; relative paths currently resolve from that same
-//! root. Handles store normalized lookups by path, so directory Vec growth
-//! never leaves a dangling pointer to a Node.
+//! Relative paths resolve from the calling task's cwd. Handles store absolute
+//! normalized paths, so later chdir calls and directory Vec growth are safe.
 
 use alloc::{string::String, vec::Vec};
 use core::cell::UnsafeCell;
@@ -10,6 +9,7 @@ use core::cell::UnsafeCell;
 use crate::interrupts;
 
 pub const MAX_NAME_LEN: usize = 32;
+pub const MAX_PATH_LEN: usize = 191;
 pub const OPEN_WRITE: u64 = 1;
 
 #[derive(Copy, Clone)]
@@ -79,8 +79,9 @@ impl Vfs {
         }
     }
 
-    fn create_file(&mut self, path: &str) -> Result<(), ()> {
-        let components = components(path).ok_or(())?;
+    fn create_file(&mut self, cwd: &str, path: &str) -> Result<(), ()> {
+        let resolved = resolve_path(cwd, path)?;
+        let components = components(&resolved).ok_or(())?;
         let (&name, parent) = components.split_last().ok_or(())?;
         let children = directory_mut(&mut self.root, parent)?;
 
@@ -98,8 +99,9 @@ impl Vfs {
         Ok(())
     }
 
-    fn make_directory(&mut self, path: &str) -> Result<(), ()> {
-        let components = components(path).ok_or(())?;
+    fn make_directory(&mut self, cwd: &str, path: &str) -> Result<(), ()> {
+        let resolved = resolve_path(cwd, path)?;
+        let components = components(&resolved).ok_or(())?;
         let (&name, parent) = components.split_last().ok_or(())?;
         let children = directory_mut(&mut self.root, parent)?;
         if children.iter().any(|node| node.name == name) {
@@ -109,11 +111,12 @@ impl Vfs {
         Ok(())
     }
 
-    fn open(&mut self, owner: u64, path: &str, flags: u64) -> Result<u64, ()> {
+    fn open(&mut self, owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {
         if flags & !OPEN_WRITE != 0 {
             return Err(());
         }
-        match &find_node(&self.root, path).ok_or(())?.kind {
+        let resolved = resolve_path(cwd, path)?;
+        match &find_node(&self.root, &resolved).ok_or(())?.kind {
             NodeKind::File(_) => {}
             NodeKind::Directory(_) => return Err(()),
         }
@@ -129,7 +132,7 @@ impl Vfs {
         self.open_files.push(OpenFile {
             owner,
             fd,
-            path: String::from(path),
+            path: resolved,
             offset: 0,
             writable: flags & OPEN_WRITE != 0,
         });
@@ -198,8 +201,17 @@ impl Vfs {
         Ok(bytes.len())
     }
 
-    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, ()> {
-        let node = find_node(&self.root, path).ok_or(())?;
+    fn resolve_directory(&self, cwd: &str, path: &str) -> Result<String, ()> {
+        let resolved = resolve_path(cwd, path)?;
+        match find_node(&self.root, &resolved).ok_or(())?.kind {
+            NodeKind::Directory(_) => Ok(resolved),
+            NodeKind::File(_) => Err(()),
+        }
+    }
+
+    fn read_dir(&self, cwd: &str, path: &str) -> Result<Vec<DirEntry>, ()> {
+        let resolved = resolve_path(cwd, path)?;
+        let node = find_node(&self.root, &resolved).ok_or(())?;
         let children = match &node.kind {
             NodeKind::Directory(children) => children,
             NodeKind::File(_) => return Err(()),
@@ -226,16 +238,16 @@ pub fn init() {
     unsafe { *VFS.0.get() = Some(Vfs::new()) };
 }
 
-pub fn create(path: &str) -> Result<(), ()> {
-    with_vfs(|vfs| vfs.create_file(path))
+pub fn create(cwd: &str, path: &str) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.create_file(cwd, path))
 }
 
-pub fn mkdir(path: &str) -> Result<(), ()> {
-    with_vfs(|vfs| vfs.make_directory(path))
+pub fn mkdir(cwd: &str, path: &str) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.make_directory(cwd, path))
 }
 
-pub fn open(owner: u64, path: &str, flags: u64) -> Result<u64, ()> {
-    with_vfs(|vfs| vfs.open(owner, path, flags))
+pub fn open(owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {
+    with_vfs(|vfs| vfs.open(owner, cwd, path, flags))
 }
 
 pub fn close(owner: u64, fd: u64) -> Result<(), ()> {
@@ -258,8 +270,12 @@ pub fn write(owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
     with_vfs(|vfs| vfs.write(owner, fd, bytes))
 }
 
-pub fn read_dir(path: &str) -> Result<Vec<DirEntry>, ()> {
-    with_vfs(|vfs| vfs.read_dir(path))
+pub fn read_dir(cwd: &str, path: &str) -> Result<Vec<DirEntry>, ()> {
+    with_vfs(|vfs| vfs.read_dir(cwd, path))
+}
+
+pub fn resolve_directory(cwd: &str, path: &str) -> Result<String, ()> {
+    with_vfs(|vfs| vfs.resolve_directory(cwd, path))
 }
 
 fn with_vfs<T>(call: impl FnOnce(&mut Vfs) -> T) -> T {
@@ -271,6 +287,39 @@ fn with_vfs<T>(call: impl FnOnce(&mut Vfs) -> T) -> T {
 
 fn vfs_slot() -> Option<&'static mut Vfs> {
     unsafe { &mut *VFS.0.get() }.as_mut()
+}
+
+fn resolve_path(cwd: &str, path: &str) -> Result<String, ()> {
+    if path.is_empty() {
+        return Err(());
+    }
+    let mut parts = if path.starts_with('/') {
+        Vec::new()
+    } else {
+        components(cwd).ok_or(())?
+    };
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            name if name.len() <= MAX_NAME_LEN => parts.push(name),
+            _ => return Err(()),
+        }
+    }
+
+    let mut resolved = String::from("/");
+    for (index, component) in parts.iter().enumerate() {
+        if index != 0 {
+            resolved.push('/');
+        }
+        resolved.push_str(component);
+    }
+    if resolved.len() > MAX_PATH_LEN {
+        return Err(());
+    }
+    Ok(resolved)
 }
 
 fn components(path: &str) -> Option<Vec<&str>> {

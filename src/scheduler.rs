@@ -1,6 +1,6 @@
 use core::cell::UnsafeCell;
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use crate::{
     elf_loader::{self, UserImage},
@@ -77,6 +77,8 @@ pub struct Task {
     pub argument: u64,
     /// Immutable byte string passed to SYS_ARGS in the new task.
     arguments: Vec<u8>,
+    /// Absolute working directory, inherited by child tasks.
+    cwd: String,
     pub context: TaskContext,
     /// Kernel stack: used for SVC/IRQ trampolines whenever the task runs.
     pub stack: MemoryRegion,
@@ -512,6 +514,24 @@ pub fn current_task_arguments() -> Vec<u8> {
         .unwrap_or_default()
 }
 
+pub fn current_task_cwd() -> String {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(manager.current_index))
+        .map(|task| task.cwd.clone())
+        .unwrap_or_else(|| String::from("/"))
+}
+
+pub fn set_current_task_cwd(cwd: String) -> bool {
+    if !cwd.starts_with('/') {
+        return false;
+    }
+    if let Some(task) = current_task_mut() {
+        task.cwd = cwd;
+        return true;
+    }
+    false
+}
+
 /// Snapshot for SYS_TASK_LIST. Numeric states are part of the userspace ABI.
 pub fn task_infos() -> Vec<TaskInfo> {
     scheduler_manager()
@@ -698,7 +718,13 @@ fn spawn_inner(
 ) -> Option<u64> {
     let manager = scheduler_manager()?;
     let id = manager.next_id;
-    let task = Task::new(id, entry, user, arguments)?;
+    let cwd = manager
+        .tasks
+        .get(manager.current_index)
+        .map(|task| task.cwd.clone())
+        .unwrap_or_else(|| String::from("/"));
+    let mut task = Task::new(id, entry, user, arguments)?;
+    task.cwd = cwd;
 
     manager.tasks.push(task);
     manager.next_id += 1;
@@ -882,6 +908,7 @@ impl Task {
             program: user.map_or(u64::MAX, |(program, _)| program),
             argument: user.map_or(0, |(_, argument)| argument),
             arguments,
+            cwd: String::from("/"),
             context,
             stack,
             user_stack,

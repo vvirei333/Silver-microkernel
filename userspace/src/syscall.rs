@@ -35,6 +35,8 @@ const SYS_FS_CREATE: u64 = 30;
 const SYS_FS_CLOSE: u64 = 31;
 const SYS_FS_READ_DIR: u64 = 32;
 const SYS_FS_MKDIR: u64 = 33;
+const SYS_CHDIR: u64 = 34;
+const SYS_GETCWD: u64 = 35;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -329,6 +331,17 @@ pub fn fs_read_dir(path: &str, entries: &mut [DirEntry]) -> Option<usize> {
     match result {
         SYSCALL_ERROR => None,
         count => Some(count as usize),
+    }
+}
+
+pub fn fs_chdir(path: &str) -> bool {
+    with_path(path, |ptr| unsafe { syscall1(SYS_CHDIR, ptr) }) == 0
+}
+
+pub fn fs_getcwd(buffer: &mut [u8]) -> Option<usize> {
+    match unsafe { syscall2(SYS_GETCWD, buffer.as_mut_ptr() as u64, buffer.len() as u64) } {
+        SYSCALL_ERROR => None,
+        len => Some(len as usize),
     }
 }
 

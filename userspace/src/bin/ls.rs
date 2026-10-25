@@ -20,7 +20,16 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     let mut arguments = [0_u8; 192];
     let len = syscall::arguments(&mut arguments).unwrap_or(0);
     let path = core::str::from_utf8(&arguments[..len]).unwrap_or("").trim();
-    let path = if path.is_empty() { "/" } else { path };
+    let mut cwd = [0_u8; 192];
+    let path = if path.is_empty() {
+        let Some(len) = syscall::fs_getcwd(&mut cwd) else {
+            syscall::print("ls: cannot read current directory\r\n");
+            syscall::exit_with_status(1);
+        };
+        core::str::from_utf8(&cwd[..len]).unwrap_or("/")
+    } else {
+        path
+    };
 
     let mut entries = [EMPTY; 32];
     let Some(count) = syscall::fs_read_dir(path, &mut entries) else {

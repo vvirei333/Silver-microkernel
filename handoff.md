@@ -3,15 +3,19 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (RAM-VFS and MVP utilities)
+## State as of 2026-10-25 (per-task cwd update)
 
-Latest verified feature: **RAM-VFS, separate ls/cat/echo EL0 programs, shell
-redirection, and kill/wait with exit status**. Six userspace ELFs are embedded:
-demo, nameserver, silvershell, ls, cat and echo. String arguments are copied
-into task metadata and fetched through `SYS_ARGS`; numeric ELF arguments remain
-available for demo roles. File syscalls use checked user buffers and per-task
-descriptors. The shell runs utilities and waits for them, while `echo > file`
-and `mkdir` call VFS directly.
+Latest verified feature: **per-task cwd, cd/pwd and cwd-aware VFS paths**. Every
+Task stores an absolute cwd inherited by children. `SYS_CHDIR` validates and
+normalizes the target; `SYS_GETCWD` uses checked copyout. All relative file
+operations resolve from the caller's cwd, while open handles keep absolute
+paths. Separate ls/cat/echo EL0 programs therefore operate in the shell's
+current directory even though they run as new tasks.
+
+The existing six ELFs, shell redirection and kill/wait remain intact. String
+arguments are copied into task metadata and fetched through `SYS_ARGS`; numeric
+ELF arguments remain available for demo roles. The shell runs utilities and
+waits for them, while `echo > file`, `mkdir`, `cd` and `pwd` call VFS directly.
 
 The default bare-metal boot includes only idle, nameserver and the shell, so
 periodic demo output cannot bury the prompt. Build with `no_std,demo-tasks` for
@@ -39,8 +43,10 @@ Debug and release QEMU checks observed `/bin`, `/etc` and `/tmp` in `ls`,
 `echo 'hello' > test.txt`, `cat test.txt` printing `hello`, quoted multiword
 echo, and `mkdir docs` appearing in the next listing. `kill 3` terminated a
 sleeping demo and `wait 3` returned status 1; a naturally exiting echo returned
-status 0 through `wait`. No `KERNEL PANIC`, `BAD SP` or unexpected `FAIL`
-occurred.
+status 0 through `wait`. The cwd scenario verified `cd /bin` → `pwd` = `/bin`,
+empty `/bin` in the inherited `ls`, relative file creation/cat, `cd ..`, nested
+`/tmp/docs`, and `cd ../..` back to `/`. No `KERNEL PANIC`, `BAD SP` or
+unexpected `FAIL` occurred.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
 | --- | ---: | --- | --- |
@@ -246,17 +252,21 @@ read back only their own values.
 ## RAM-VFS
 
 - `Node` is either `File(Vec<u8>)` or `Directory(Vec<Node>)`. The volatile root
-  starts with `/bin`, `/etc` and `/tmp`. Absolute and relative paths both resolve
-  from `/`; `.` and `..` are normalized and `..` cannot escape the root.
-- Open handles store the path rather than a Node pointer, so Vec reallocation
-  cannot invalidate them. Each handle has owner, per-owner fd (starting at 3),
-  offset and writable flag. Exit/kill removes all handles for that owner.
+  starts with `/bin`, `/etc` and `/tmp`. Each Task stores an absolute cwd, and
+  `spawn_inner` clones it into the child. Relative paths resolve from that cwd;
+  `.` and `..` are normalized and `..` cannot escape root.
+- Open handles store an absolute normalized path rather than a Node pointer or
+  relative path, so Vec reallocation and later chdir calls cannot retarget them.
+  Each handle has owner, per-owner fd (starting at 3), offset and writable flag.
+  Exit/kill removes all handles for that owner.
 - `SYS_FS_OPEN/READ/WRITE/CREATE/CLOSE/READ_DIR/MKDIR` use checked copyin/copyout.
-  Paths are limited to 191 bytes, names to 32 bytes and one I/O call to 4096
-  bytes. `create` truncates files, `open` supports read-only or write mode and
-  `read_dir` copies 48-byte `#[repr(C)]` entries with name bytes/length and kind.
-- There is no cwd/chdir, persistence, unlink/rename, file-size quota or append
-  flag yet. Repeated writes extend the in-memory file through the kernel heap.
+  `SYS_CHDIR` resolves and validates a directory before replacing the Task cwd;
+  `SYS_GETCWD` copies its absolute bytes. Paths are limited to 191 bytes, names
+  to 32 bytes and one I/O call to 4096 bytes. `create` truncates files, `open`
+  supports read-only or write mode and `read_dir` copies 48-byte `#[repr(C)]`
+  entries with name bytes/length and kind.
+- There is no persistence, unlink/rename, file-size quota or append flag yet.
+  Repeated writes extend the in-memory file through the kernel heap.
 
 ## silvershell
 
@@ -267,13 +277,13 @@ read back only their own values.
   for 1 ms when RX is empty, so polling does not monopolize the scheduler. A
   future UART RX interrupt can replace polling without changing command parsing.
 - Startup emits ANSI clear/home, runs fastfetch once and shows `silvershell> `.
-  Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `ps`, `spawn`,
-  `kill` and `wait`; empty lines only reprompt. Echo parsing preserves quoted
-  spaces, strips matching outer quotes and recognizes `>` only outside quotes.
+  Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `cd`, `pwd`,
+  `ps`, `spawn`, `kill` and `wait`; empty lines only reprompt. Echo parsing
+  preserves quoted spaces, strips outer quotes and finds `>` outside quotes.
 - `ls`, `cat` and ordinary `echo` spawn separate EL0 utilities with string args
-  and immediately wait for them. `echo text > path` truncates/creates and writes
-  directly through VFS. `mkdir` is also a direct syscall. Utility failures print
-  a diagnostic and return status 1 to the shell.
+  and inherited cwd, then immediately wait for them. `echo text > path`
+  truncates/creates and writes directly through VFS. `mkdir`, `cd` and `pwd`
+  are also direct syscalls. Utility failures return status 1 to the shell.
 - `ps` uses a fixed 32-entry userspace array and prints ID/program/argument/state.
   `spawn` parses an optional checked decimal u64 and reports the new task ID.
   `kill` terminates a non-current task; `wait` prints and consumes its status.
@@ -443,8 +453,8 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 1. **Console ownership and job control:** spawned programs currently share UART
    output with the shell; add foreground/background ownership before RX IRQs.
-2. **Grow VFS semantics:** per-task cwd plus `chdir`/`pwd`, unlink/rename, append
-   mode and file-size quotas. Persistent storage still needs a block driver.
+2. **Grow VFS semantics:** unlink/rename, append mode and file-size quotas.
+   Persistent storage still needs a block driver.
 3. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.
@@ -467,8 +477,8 @@ and the full-mailbox selective-receive limitation recorded above.
    bugs that debug builds can hide. For regressions, separately build with
    `--features no_std,demo-tasks`; this replaces the interactive boot.
 5. For the default profile, verify `ls`, `echo 'hello' > test.txt`,
-   `cat test.txt`, `mkdir docs`, quoted echo, `ps`, and `spawn`/`kill`/`wait`.
-   Also check `fastfetch`, live uptime/RAM and the `logo.txt` screen. For
+   `cat test.txt`, `mkdir docs`, quoted echo, `cd /bin`, `pwd`, relative paths,
+   `cd ..`, `ps`, and `spawn`/`kill`/`wait`. Also check fastfetch and the logo. For
    demo-tasks, run 5–30 seconds,
    repeat timing-sensitive runs and expect exactly two intentional faults from
    tasks 15 and 16, plus

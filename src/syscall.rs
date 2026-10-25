@@ -47,6 +47,8 @@ pub const SYS_FS_CREATE: u64 = 30;
 pub const SYS_FS_CLOSE: u64 = 31;
 pub const SYS_FS_READ_DIR: u64 = 32;
 pub const SYS_FS_MKDIR: u64 = 33;
+pub const SYS_CHDIR: u64 = 34;
+pub const SYS_GETCWD: u64 = 35;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -148,6 +150,8 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_FS_CLOSE => sys_fs_close(frame[0]),
         SYS_FS_READ_DIR => sys_fs_read_dir(frame[0], frame[1], frame[2]),
         SYS_FS_MKDIR => sys_fs_mkdir(frame[0]),
+        SYS_CHDIR => sys_chdir(frame[0]),
+        SYS_GETCWD => sys_getcwd(frame[0], frame[1]),
         _ => SYSCALL_ERROR,
     };
 
@@ -180,14 +184,16 @@ fn sys_arguments(buffer_ptr: u64, capacity: u64) -> u64 {
 }
 
 fn sys_fs_open(path_ptr: u64, flags: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
-        vfs::open(scheduler::current_task_id(), path, flags).unwrap_or(SYSCALL_ERROR)
+        vfs::open(scheduler::current_task_id(), &cwd, path, flags).unwrap_or(SYSCALL_ERROR)
     })
 }
 
 fn sys_fs_create(path_ptr: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
-        if vfs::create(path).is_ok() {
+        if vfs::create(&cwd, path).is_ok() {
             0
         } else {
             SYSCALL_ERROR
@@ -196,13 +202,40 @@ fn sys_fs_create(path_ptr: u64) -> u64 {
 }
 
 fn sys_fs_mkdir(path_ptr: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
-        if vfs::mkdir(path).is_ok() {
+        if vfs::mkdir(&cwd, path).is_ok() {
             0
         } else {
             SYSCALL_ERROR
         }
     })
+}
+
+fn sys_chdir(path_ptr: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
+    with_path(path_ptr, |path| {
+        let Ok(resolved) = vfs::resolve_directory(&cwd, path) else {
+            return SYSCALL_ERROR;
+        };
+        if scheduler::set_current_task_cwd(resolved) {
+            0
+        } else {
+            SYSCALL_ERROR
+        }
+    })
+}
+
+fn sys_getcwd(buffer_ptr: u64, capacity: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
+    let bytes = cwd.as_bytes();
+    if bytes.len() > capacity as usize {
+        return SYSCALL_ERROR;
+    }
+    if user_memory::copy_to_user(bytes, buffer_ptr).is_err() {
+        return SYSCALL_ERROR;
+    }
+    bytes.len() as u64
 }
 
 fn sys_fs_close(fd: u64) -> u64 {
@@ -246,8 +279,9 @@ fn sys_fs_write(fd: u64, buffer_ptr: u64, len: u64) -> u64 {
 }
 
 fn sys_fs_read_dir(path_ptr: u64, buffer_ptr: u64, capacity: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
-        let Ok(entries) = vfs::read_dir(path) else {
+        let Ok(entries) = vfs::read_dir(&cwd, path) else {
             return SYSCALL_ERROR;
         };
         let count = entries.len().min(capacity as usize).min(64);
