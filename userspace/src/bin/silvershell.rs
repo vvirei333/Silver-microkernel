@@ -66,6 +66,14 @@ fn execute(command: &str) {
         execute_echo(arguments);
         return;
     }
+    if command == "say" {
+        run_utility(syscall::PROGRAM_SAY, "");
+        return;
+    }
+    if let Some(arguments) = command.strip_prefix("say ") {
+        run_utility(syscall::PROGRAM_SAY, unquote(arguments.trim()));
+        return;
+    }
 
     let mut words = command.split_whitespace();
     match words.next() {
@@ -78,6 +86,8 @@ fn execute(command: &str) {
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
             syscall::print("             Print, truncate/write, or append to a file\r\n");
+            syscall::print("  say <text> Print text\r\n");
+            syscall::print("  sl         Run an animated steam locomotive\r\n");
             syscall::print("  mkdir <path>\r\n");
             syscall::print("  rm <file>  Remove a closed file\r\n");
             syscall::print("  rmdir <path>\r\n");
@@ -89,7 +99,7 @@ fn execute(command: &str) {
             syscall::print("  clear      Clear the terminal screen\r\n");
             syscall::print("  uname      Print kernel name, version and architecture\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
-            syscall::print("  spawn <demo|nameserver|silvershell|ls|cat|echo> [arg]\r\n");
+            syscall::print("  spawn <demo|nameserver|silvershell|ls|cat|echo|say|sl> [arg]\r\n");
             syscall::print("  bg <program> [arg]\r\n");
             syscall::print("             Spawn without console ownership\r\n");
             syscall::print("  fg <cap>   Resume a task in the foreground\r\n");
@@ -100,6 +110,7 @@ fn execute(command: &str) {
         Some("fastfetch") => fastfetch(),
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
+        Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
         Some("mkdir") => make_directory(words.next()),
         Some("rm") => remove_file(words.next()),
         Some("rmdir") => remove_directory(words.next()),
@@ -409,6 +420,8 @@ fn program_name(program: u64) -> &'static str {
         syscall::PROGRAM_LS => "ls          ",
         syscall::PROGRAM_CAT => "cat         ",
         syscall::PROGRAM_ECHO => "echo        ",
+        syscall::PROGRAM_SAY => "say         ",
+        syscall::PROGRAM_SL => "sl          ",
         _ => "kernel      ",
     }
 }
@@ -428,7 +441,7 @@ fn state_name(state: u64) -> &'static str {
 
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
-        syscall::print("Usage: spawn <demo|nameserver|silvershell|ls|cat|echo> [arg]\r\n");
+        syscall::print("Usage: spawn <demo|nameserver|silvershell|ls|cat|echo|say|sl> [arg]\r\n");
         return;
     };
     let program = match program {
@@ -438,6 +451,8 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
         "ls" => syscall::PROGRAM_LS,
         "cat" => syscall::PROGRAM_CAT,
         "echo" => syscall::PROGRAM_ECHO,
+        "say" => syscall::PROGRAM_SAY,
+        "sl" => syscall::PROGRAM_SL,
         _ => {
             syscall::print("Unknown program. See 'help' for the program list.\r\n");
             return;

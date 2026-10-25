@@ -46,6 +46,8 @@ const SYS_WAIT_EVENT: u64 = 41;
 const SYS_CAP_GET_TASK_ID: u64 = 60;
 const SYS_CAP_GRANT: u64 = 61;
 const SYS_MAP_PHYS: u64 = 62;
+const SYS_BIND_IRQ: u64 = 63;
+const SYS_WAIT_IRQ: u64 = 64;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -55,6 +57,8 @@ pub const PROGRAM_SILVERSHELL: u64 = 2;
 pub const PROGRAM_LS: u64 = 3;
 pub const PROGRAM_CAT: u64 = 4;
 pub const PROGRAM_ECHO: u64 = 5;
+pub const PROGRAM_SAY: u64 = 6;
+pub const PROGRAM_SL: u64 = 7;
 pub const OPEN_READ: u64 = 0;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_APPEND: u64 = 2;
@@ -237,6 +241,14 @@ pub fn cap_grant(cap_id: u64, recipient_task_id: u64, rights: u32) -> bool {
 
 pub fn map_phys(phys_addr: u64, size: u64) -> Option<u64> {
     optional_id(unsafe { syscall2(SYS_MAP_PHYS, phys_addr, size) })
+}
+
+pub fn bind_irq(intid: u64) -> bool {
+    unsafe { syscall1(SYS_BIND_IRQ, intid) == 0 }
+}
+
+pub fn wait_irq() {
+    unsafe { syscall0(SYS_WAIT_IRQ) };
 }
 
 pub fn spawn_with_args(program: u64, argument: u64, arguments: &str) -> Option<u64> {

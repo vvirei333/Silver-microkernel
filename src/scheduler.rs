@@ -80,6 +80,8 @@ pub struct Task {
     pub program: u64,
     pub argument: u64,
     pub cap_table: capability::CapTable,
+    pub bound_irq: Option<u32>,
+    irq_pending: bool,
     /// Immutable byte string passed to SYS_ARGS in the new task.
     arguments: Vec<u8>,
     /// Absolute working directory, inherited by child tasks.
@@ -307,6 +309,64 @@ pub fn sleep(milliseconds: u64) {
     interrupts::restore_irq(saved_daif);
 }
 
+/// Blocks until the bound interrupt arrives. A pending flag closes the race
+/// between hardware delivery and entry into this syscall.
+pub fn wait_irq() -> bool {
+    let saved_daif = interrupts::save_and_disable_irq();
+    if current_task_mut().and_then(|task| task.bound_irq).is_none() {
+        interrupts::restore_irq(saved_daif);
+        return false;
+    }
+
+    loop {
+        let Some(task) = current_task_mut() else {
+            interrupts::restore_irq(saved_daif);
+            return false;
+        };
+        if task.irq_pending {
+            task.irq_pending = false;
+            if let Some(intid) = task.bound_irq {
+                crate::gic::enable_irq(intid);
+            }
+            interrupts::restore_irq(saved_daif);
+            return true;
+        }
+        if let Some(intid) = task.bound_irq {
+            crate::gic::enable_irq(intid);
+        }
+        task.state = TaskState::Blocked;
+        schedule();
+    }
+}
+
+pub fn irq_is_bound(intid: u32) -> bool {
+    scheduler_manager()
+        .map(|manager| {
+            manager
+                .tasks
+                .iter()
+                .any(|task| task.state != TaskState::Dead && task.bound_irq == Some(intid))
+        })
+        .unwrap_or(false)
+}
+
+/// Called from the IRQ handler with interrupts already masked.
+pub fn wake_bound_irq(intid: u32) -> bool {
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    let Some(task) = manager
+        .tasks
+        .iter_mut()
+        .find(|task| task.state != TaskState::Dead && task.bound_irq == Some(intid))
+    else {
+        return false;
+    };
+    task.irq_pending = true;
+    wake_blocked_task(task);
+    true
+}
+
 /// Remembers a wait queue before its associated mutex is released.
 pub fn register_waiter(queue: &WaitQueue) {
     if let Some(task) = current_task_mut() {
@@ -393,6 +453,7 @@ pub fn exit_current_with_status(status: u64) -> ! {
 
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Dead;
+        task.bound_irq = None;
     }
     if let Some(manager) = scheduler_manager() {
         recover_console(manager, id);
@@ -429,6 +490,7 @@ pub fn kill_task(id: u64) -> bool {
         return false;
     }
     task.state = TaskState::Dead;
+    task.bound_irq = None;
     recover_console(manager, id);
     record_exit(manager, id, 1);
     schedule();
@@ -955,6 +1017,40 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
     result
 }
 
+pub fn bind_irq(intid: u32) -> bool {
+    if intid >= 1020 || intid == crate::gic::TIMER_IRQ {
+        return false;
+    }
+    let saved_daif = interrupts::save_and_disable_irq();
+    let result = scheduler_manager()
+        .map(|manager| {
+            let current_index = manager.current_index;
+            let Some(current) = manager.tasks.get(current_index) else {
+                return false;
+            };
+            if !current.cap_table.has_rights(capability::CAP_IRQ) {
+                return false;
+            }
+            if manager.tasks.iter().enumerate().any(|(index, task)| {
+                index != current_index
+                    && task.state != TaskState::Dead
+                    && task.bound_irq == Some(intid)
+            }) {
+                return false;
+            }
+            let Some(task) = manager.tasks.get_mut(current_index) else {
+                return false;
+            };
+            task.bound_irq = Some(intid);
+            task.irq_pending = false;
+            crate::gic::enable_irq(intid);
+            true
+        })
+        .unwrap_or(false);
+    interrupts::restore_irq(saved_daif);
+    result
+}
+
 pub fn spawn_user_with_args_and_cap(
     program: u64,
     argument: u64,
@@ -1065,6 +1161,8 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         }
         wake.extend(task.release_mutexes());
         task.cap_table.remove_all();
+        task.bound_irq = None;
+        task.irq_pending = false;
     }
     for id in wake {
         if let Some(task) = manager
@@ -1194,6 +1292,8 @@ impl Task {
             program: user.map_or(u64::MAX, |(program, _)| program),
             argument: user.map_or(0, |(_, argument)| argument),
             cap_table: capability::CapTable::new(),
+            bound_irq: None,
+            irq_pending: false,
             arguments,
             cwd: String::from("/"),
             // Legacy regression tasks share UART; interactive children start

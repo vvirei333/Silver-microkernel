@@ -44,8 +44,12 @@ another live task; recipients cannot receive rights the caller does not hold.
 When a target dies, its capabilities lose every right except `CAP_WAIT`; that
 wait-only capability is revoked when the completion record is consumed.
 `SYS_MAP_PHYS = 62` requires `CAP_MMIO` and maps non-DRAM physical pages as
-Device-nGnRnE into a first-fit 2 MB user window at `0x80000000`. `CAP_IRQ` is
-reserved for future interrupt delegation.
+Device-nGnRnE into a first-fit 2 MB user window at `0x80000000`.
+`SYS_BIND_IRQ = 63` requires `CAP_IRQ` and exclusively binds a non-timer INTID.
+`SYS_WAIT_IRQ = 64` consumes a pending notification or blocks until one arrives.
+Bound level-triggered IRQs are masked before GIC EOI, then unmasked by
+`bind_irq` and every `wait_irq` call to prevent an IRQ storm while EL0 handles
+the device.
 
 Debug and release QEMU both passed IRQ-only `uname`, `echo` and `pwd`; sleeping
 `demo 12` stop/resume/kill/wait; and blocked `demo 7` with IPC delivered while
@@ -312,6 +316,12 @@ read back only their own values.
   lazily allocated L2/L3 tables are freed with the task address space, while the
   referenced device frames are never freed. Each mapping records a `CAP_MMIO`
   region token and returns the user VA including the original page offset.
+- A bound IRQ bypasses the kernel device handler: the GIC distributor masks it
+  before EOI, then a pending flag and wakeup go to its live owner. `bind_irq`
+  and `SYS_WAIT_IRQ` unmask it only when EL0 is ready for another event.
+  `SYS_WAIT_IRQ` preserves events delivered before the wait. Exit, kill and
+  reaping clear the binding, restoring the kernel fallback; timer and spurious
+  INTIDs cannot be bound.
 - Exit and kill clear the task mailbox, wake both receiver and sender waiters
   before freeing its condvars, and close every VFS descriptor owned by that task.
   If the dead task owned the interactive console, `recover_console` gives it to
@@ -366,15 +376,18 @@ read back only their own values.
   task reads. The command parser and job-control event are unchanged.
 - Startup emits ANSI clear/home, runs fastfetch once and shows a bold cyan
   `silvershell>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`,
-  `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`,
-  `bg`, `fg`, `kill` and `wait`; empty lines only reprompt. Echo parsing preserves
-  quoted spaces, strips outer quotes and recognizes `>`/`>>` only outside quotes.
-  `mv old new` takes a full destination path, not just a directory.
-- `ls`, `cat` and ordinary `echo` spawn separate EL0 utilities with string args
-  and inherited cwd. `run_utility` gives the child the console and uses wait_event,
-  so either exit or Ctrl-Z returns control to the shell. `echo text > path`
-  truncates/creates; `echo text >> path` appends/creates directly through VFS.
-  `mkdir`, `rm`, `rmdir`, `mv`, `cd` and `pwd` are direct syscalls.
+  `say`, `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`,
+  `ps`, `spawn`, `bg`, `fg`, `kill` and `wait`; empty lines only reprompt. Echo
+  parsing preserves quoted spaces, strips outer quotes and recognizes `>`/`>>`
+  only outside quotes. `mv old new` takes a full destination path, not just a
+  directory.
+- `ls`, `cat`, ordinary `echo` and `say` spawn separate EL0 utilities with
+  string args and inherited cwd. `say` preserves spaces and strips paired outer
+  quotes. `sl` runs a 24-frame ANSI steam-locomotive animation. `run_utility`
+  gives the child the console and uses wait_event, so either exit or Ctrl-Z
+  returns control to the shell. `echo text > path` truncates/creates;
+  `echo text >> path` appends/creates directly through VFS. `mkdir`, `rm`,
+  `rmdir`, `mv`, `cd` and `pwd` are direct syscalls.
 - `ps` uses a fixed 32-entry userspace array and prints ID/program/argument/state,
   including `stopped`. `spawn` and `bg` parse an optional checked decimal u64 and
   create a task without console ownership. `fg <id>` calls resume, transfers the
@@ -445,10 +458,13 @@ read back only their own values.
    User tasks get unmasked PSTATE from `silver_user_bootstrap` and from the
    SPSR saved in their exception frames.
 4. **Timer and UART IRQs have separate paths** (`gic::silver_handle_irq`).
-   Timer: `timer::handle_irq()` → EOI → `schedule()`. UART: `pl011::handle_irq()`
-   drains RX → consume stop request → optional `stop_console_owner()` → EOI →
-   `schedule()` only if a task stopped. Ordinary UART bytes never cause a context
-   switch. PL011 is level-sensitive: its ICFGR field must remain `0b00`.
+   Timer: `timer::handle_irq()` → EOI → `schedule()`. A bound non-timer IRQ takes
+   distributor mask → EOI → set pending/wake its user owner without entering
+   the kernel driver; `bind_irq`/`SYS_WAIT_IRQ` unmask it for the next event.
+   Unbound UART: `pl011::handle_irq()` drains RX → consume stop request →
+   optional `stop_console_owner()` → EOI → `schedule()` only if a task stopped.
+   Ordinary unbound UART bytes never cause a context switch. PL011 is
+   level-sensitive: its ICFGR field must remain `0b00`.
 5. **The heap is initialized after the frame allocator** and only through
    `alloc_contiguous_pages`. No `alloc` before `allocator::init()`.
 6. **Context switch layout:** x19-x30 at offsets 0-95, SP_EL1 at 96,

@@ -59,6 +59,8 @@ pub const SYS_WAIT_EVENT: u64 = 41;
 pub const SYS_CAP_GET_TASK_ID: u64 = 60;
 pub const SYS_CAP_GRANT: u64 = 61;
 pub const SYS_MAP_PHYS: u64 = 62;
+pub const SYS_BIND_IRQ: u64 = 63;
+pub const SYS_WAIT_IRQ: u64 = 64;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -222,6 +224,20 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             }
         }
         SYS_MAP_PHYS => sys_map_phys(frame[0], frame[1]),
+        SYS_BIND_IRQ => {
+            if frame[0] <= u64::from(u32::MAX) && scheduler::bind_irq(frame[0] as u32) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
+        SYS_WAIT_IRQ => {
+            if scheduler::wait_irq() {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
         _ => SYSCALL_ERROR,
     };
 

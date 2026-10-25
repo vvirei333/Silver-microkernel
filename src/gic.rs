@@ -12,6 +12,7 @@ const CPU_INTERFACE_BASE: usize = memory::phys_to_virt(0x0801_0000);
 
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100;
+const GICD_ICENABLER: usize = 0x180;
 const GICD_IPRIORITYR: usize = 0x400;
 const GICD_ITARGETSR: usize = 0x800;
 const GICD_ICFGR: usize = 0xC00;
@@ -63,8 +64,13 @@ pub fn init() {
     write32(CPU_INTERFACE_BASE + GICC_CTLR, 1);
 }
 
-fn enable_irq(irq: u32) {
+pub fn enable_irq(irq: u32) {
     let offset = GICD_ISENABLER + (irq as usize / 32) * 4;
+    write32(DISTRIBUTOR_BASE + offset, 1_u32 << (irq % 32));
+}
+
+pub fn disable_irq(irq: u32) {
+    let offset = GICD_ICENABLER + (irq as usize / 32) * 4;
     write32(DISTRIBUTOR_BASE + offset, 1_u32 << (irq % 32));
 }
 
@@ -80,6 +86,13 @@ pub fn end_interrupt(acknowledge_register: u32) {
 pub extern "C" fn silver_handle_irq() {
     let acknowledge_register = acknowledge();
     let irq = acknowledge_register & 0x3FF;
+
+    if irq != TIMER_IRQ && irq != SPURIOUS_IRQ && scheduler::irq_is_bound(irq) {
+        disable_irq(irq);
+        end_interrupt(acknowledge_register);
+        scheduler::wake_bound_irq(irq);
+        return;
+    }
 
     match irq {
         TIMER_IRQ => {

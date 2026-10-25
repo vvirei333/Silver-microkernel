@@ -35,6 +35,8 @@ fn main() {
         ("ls", "ls.elf"),
         ("cat", "cat.elf"),
         ("echo", "echo.elf"),
+        ("say", "say.elf"),
+        ("sl", "sl.elf"),
     ] {
         let elf = target_dir
             .join("aarch64-unknown-none")
