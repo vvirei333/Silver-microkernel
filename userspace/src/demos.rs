@@ -224,7 +224,8 @@ pub fn lifecycle_supervisor() -> ! {
     const NAME: &str = "lifecycle";
     syscall::sleep(1000);
     syscall::print("LIFECYCLE SPAWN demo arg=18\r\n");
-    let Some(child) = syscall::spawn(syscall::PROGRAM_DEMO, 18) else {
+    let Some(child) = syscall::spawn(syscall::PROGRAM_DEMO, 18).and_then(syscall::cap_get_task_id)
+    else {
         syscall::print("LIFECYCLE SPAWN=FAIL\r\n");
         loop {
             syscall::sleep(1000);
@@ -579,10 +580,17 @@ pub fn security_probe() -> ! {
         syscall::print("SECURITY MUTEX OWNER=FAIL\r\n");
     }
 
-    if let Some(child) = syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_SLEEP_OVERFLOW) {
-        syscall::sleep(100);
-        if syscall::task_alive(child) && syscall::kill(child) && syscall::wait(child) == Some(1) {
-            syscall::print("SECURITY SLEEP OVERFLOW=PASS\r\n");
+    if let Some(child_cap) = syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_SLEEP_OVERFLOW) {
+        if let Some(child) = syscall::cap_get_task_id(child_cap) {
+            syscall::sleep(100);
+            if syscall::task_alive(child)
+                && syscall::kill(child_cap)
+                && syscall::wait(child_cap) == Some(1)
+            {
+                syscall::print("SECURITY SLEEP OVERFLOW=PASS\r\n");
+            } else {
+                syscall::print("SECURITY SLEEP OVERFLOW=FAIL\r\n");
+            }
         } else {
             syscall::print("SECURITY SLEEP OVERFLOW=FAIL\r\n");
         }

@@ -11,7 +11,8 @@
 use alloc::{vec, vec::Vec};
 
 use crate::{
-    channel, frame_allocator, ipc, memory, mmu, mutex, pl011, scheduler, timer, user_memory, vfs,
+    capability, channel, frame_allocator, ipc, memory, mmu, mutex, pl011, scheduler, timer,
+    user_memory, vfs,
 };
 
 pub const SYS_SLEEP: u64 = 1;
@@ -55,6 +56,8 @@ pub const SYS_FS_RENAME: u64 = 38;
 pub const SYS_CONSOLE_SET: u64 = 39;
 pub const SYS_TASK_RESUME: u64 = 40;
 pub const SYS_WAIT_EVENT: u64 = 41;
+pub const SYS_CAP_GET_TASK_ID: u64 = 60;
+pub const SYS_CAP_GRANT: u64 = 61;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -136,7 +139,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             0
         }
         SYS_CHAN_RECV => DEMO_CHANNEL.receive(),
-        SYS_SPAWN => scheduler::spawn_user(frame[0], frame[1]).unwrap_or(SYSCALL_ERROR),
+        SYS_SPAWN => scheduler::spawn_user_with_cap(frame[0], frame[1]).unwrap_or(SYSCALL_ERROR),
         SYS_EXIT => scheduler::exit_current_with_status(frame[0]),
         SYS_UNREGISTER => sys_unregister_name(frame[0]),
         SYS_TASK_ALIVE => u64::from(scheduler::task_alive(frame[0])),
@@ -155,28 +158,43 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_TASK_LIST => sys_task_list(frame[0], frame[1]),
         SYS_SPAWN_ARGS => sys_spawn_with_args(frame[0], frame[1], frame[2], frame[3]),
         SYS_ARGS => sys_arguments(frame[0], frame[1]),
-        SYS_WAIT => scheduler::wait_for_task(frame[0]).unwrap_or(SYSCALL_ERROR),
+        SYS_WAIT => scheduler::capability_task_id_with_rights(frame[0], capability::CAP_WAIT)
+            .and_then(scheduler::wait_for_task)
+            .unwrap_or(SYSCALL_ERROR),
         SYS_CONSOLE_SET => {
-            if scheduler::set_console_owner(frame[0]) {
+            if scheduler::capability_task_id_with_rights(frame[0], capability::CAP_CONSOLE_GRANT)
+                .map(scheduler::set_console_owner)
+                .unwrap_or(false)
+            {
                 0
             } else {
                 SYSCALL_ERROR
             }
         }
         SYS_TASK_RESUME => {
-            if scheduler::resume_task(frame[0]) {
+            if scheduler::capability_task_id_with_rights(frame[0], capability::CAP_RESUME)
+                .map(scheduler::resume_task)
+                .unwrap_or(false)
+            {
                 0
             } else {
                 SYSCALL_ERROR
             }
         }
-        SYS_WAIT_EVENT => match scheduler::wait_for_task_event(frame[0]) {
-            Some(scheduler::WaitEvent::Exited(status)) => status,
-            Some(scheduler::WaitEvent::Stopped) => SYSCALL_STOPPED,
-            None => SYSCALL_ERROR,
-        },
+        SYS_WAIT_EVENT => {
+            match scheduler::capability_task_id_with_rights(frame[0], capability::CAP_WAIT)
+                .and_then(scheduler::wait_for_task_event)
+            {
+                Some(scheduler::WaitEvent::Exited(status)) => status,
+                Some(scheduler::WaitEvent::Stopped) => SYSCALL_STOPPED,
+                None => SYSCALL_ERROR,
+            }
+        }
         SYS_KILL => {
-            if scheduler::kill_task(frame[0]) {
+            if scheduler::capability_task_id_with_rights(frame[0], capability::CAP_KILL)
+                .map(scheduler::kill_task)
+                .unwrap_or(false)
+            {
                 0
             } else {
                 SYSCALL_ERROR
@@ -194,6 +212,14 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_FS_UNLINK => sys_fs_unlink(frame[0]),
         SYS_FS_RMDIR => sys_fs_rmdir(frame[0]),
         SYS_FS_RENAME => sys_fs_rename(frame[0], frame[1]),
+        SYS_CAP_GET_TASK_ID => scheduler::capability_task_id(frame[0]).unwrap_or(SYSCALL_ERROR),
+        SYS_CAP_GRANT => {
+            if scheduler::grant_capability(frame[0], frame[1], frame[2] as u32) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
         _ => SYSCALL_ERROR,
     };
 
@@ -208,7 +234,7 @@ fn sys_spawn_with_args(program: u64, argument: u64, ptr: u64, len: u64) -> u64 {
     if user_memory::copy_from_user(ptr, &mut arguments).is_err() {
         return SYSCALL_ERROR;
     }
-    scheduler::spawn_user_with_args(program, argument, arguments).unwrap_or(SYSCALL_ERROR)
+    scheduler::spawn_user_with_args_and_cap(program, argument, arguments).unwrap_or(SYSCALL_ERROR)
 }
 
 fn sys_arguments(buffer_ptr: u64, capacity: u64) -> u64 {

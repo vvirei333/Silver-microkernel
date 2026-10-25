@@ -3,6 +3,7 @@ use core::cell::UnsafeCell;
 use alloc::{string::String, vec::Vec};
 
 use crate::{
+    capability,
     elf_loader::{self, UserImage},
     frame_allocator, interrupts,
     memory::{phys_to_virt, virt_to_phys, MemoryRegion, PAGE_SIZE},
@@ -78,6 +79,7 @@ pub struct Task {
     resume_state: Option<TaskState>,
     pub program: u64,
     pub argument: u64,
+    pub cap_table: capability::CapTable,
     /// Immutable byte string passed to SYS_ARGS in the new task.
     arguments: Vec<u8>,
     /// Absolute working directory, inherited by child tasks.
@@ -494,6 +496,9 @@ fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
             .position(|(task_id, _)| *task_id == id)
         {
             let (_, status) = manager.exit_statuses.remove(index);
+            if let Some(waiter) = manager.tasks.get_mut(manager.current_index) {
+                waiter.cap_table.remove_for_target(id);
+            }
             interrupts::restore_irq(saved_daif);
             return Some(WaitEvent::Exited(status));
         }
@@ -895,6 +900,55 @@ pub fn spawn_user(program: u64, argument: u64) -> Option<u64> {
     spawn_inner(None, Some((program, argument)), Vec::new())
 }
 
+pub fn spawn_user_with_cap(program: u64, argument: u64) -> Option<capability::CapId> {
+    let task_id = spawn_user(program, argument)?;
+    let parent = current_task_mut()?;
+    Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
+}
+
+pub fn capability_task_id(cap_id: capability::CapId) -> Option<u64> {
+    capability_task_id_with_rights(cap_id, 0)
+}
+
+pub fn capability_task_id_with_rights(cap_id: capability::CapId, rights: u32) -> Option<u64> {
+    let cap = current_task_mut()?.cap_table.get(cap_id)?;
+    if cap.rights & rights != rights {
+        return None;
+    }
+    Some(cap.target_task)
+}
+
+pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, rights: u32) -> bool {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let mut granted = false;
+    if let Some((target_task, rights)) =
+        current_task_mut().and_then(|task| task.cap_table.grant(cap_id, rights))
+    {
+        if let Some(manager) = scheduler_manager() {
+            if let Some(recipient) = manager
+                .tasks
+                .iter_mut()
+                .find(|task| task.id == recipient_task_id && task.state != TaskState::Dead)
+            {
+                recipient.cap_table.insert(target_task, rights);
+                granted = true;
+            }
+        }
+    }
+    interrupts::restore_irq(saved_daif);
+    granted
+}
+
+pub fn spawn_user_with_args_and_cap(
+    program: u64,
+    argument: u64,
+    arguments: Vec<u8>,
+) -> Option<capability::CapId> {
+    let task_id = spawn_user_with_args(program, argument, arguments)?;
+    let parent = current_task_mut()?;
+    Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
+}
+
 pub fn spawn_user_with_args(program: u64, argument: u64, arguments: Vec<u8>) -> Option<u64> {
     spawn_inner(None, Some((program, argument)), arguments)
 }
@@ -973,6 +1027,13 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         return;
     }
 
+    let dead_ids: Vec<u64> = manager
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Dead)
+        .map(|task| task.id)
+        .collect();
+
     // Remember WHO owns the live CPU context before compacting the Vec.
     let live_id = manager.tasks.get(manager.current_index).map(|task| task.id);
 
@@ -987,6 +1048,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
             unsafe { &*queue }.remove(task.id);
         }
         wake.extend(task.release_mutexes());
+        task.cap_table.remove_all();
     }
     for id in wake {
         if let Some(task) = manager
@@ -995,6 +1057,16 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
             .find(|task| task.id == id && task.state != TaskState::Dead)
         {
             wake_blocked_task(task);
+        }
+    }
+
+    for task in manager
+        .tasks
+        .iter_mut()
+        .filter(|task| task.state != TaskState::Dead)
+    {
+        for dead_id in &dead_ids {
+            task.cap_table.retire_for_target(*dead_id);
         }
     }
 
@@ -1105,6 +1177,7 @@ impl Task {
             resume_state: None,
             program: user.map_or(u64::MAX, |(program, _)| program),
             argument: user.map_or(0, |(_, argument)| argument),
+            cap_table: capability::CapTable::new(),
             arguments,
             cwd: String::from("/"),
             // Legacy regression tasks share UART; interactive children start

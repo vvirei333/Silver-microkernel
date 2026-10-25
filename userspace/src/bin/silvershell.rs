@@ -92,10 +92,10 @@ fn execute(command: &str) {
             syscall::print("  spawn <demo|nameserver|silvershell|ls|cat|echo> [arg]\r\n");
             syscall::print("  bg <program> [arg]\r\n");
             syscall::print("             Spawn without console ownership\r\n");
-            syscall::print("  fg <id>    Resume a task in the foreground\r\n");
+            syscall::print("  fg <cap>   Resume a task in the foreground\r\n");
             syscall::print("  Ctrl-Z     Stop the foreground task and return to shell\r\n");
-            syscall::print("  kill <id>  Kill a task\r\n");
-            syscall::print("  wait <id>  Wait for a task and print its exit status\r\n");
+            syscall::print("  kill <cap> Kill a task\r\n");
+            syscall::print("  wait <cap> Wait for a task and print its exit status\r\n");
         }
         Some("fastfetch") => fastfetch(),
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
@@ -118,19 +118,17 @@ fn execute(command: &str) {
 }
 
 fn run_utility(program: u64, arguments: &str) {
-    let Some(id) = syscall::spawn_with_args(program, 0, arguments) else {
+    let Some(cap_id) = syscall::spawn_with_args(program, 0, arguments) else {
         syscall::print("Could not start program.\r\n");
         return;
     };
-    let shell_id = syscall::task_id();
-    if !syscall::console_set(id) {
+    if !syscall::console_set(cap_id) {
         syscall::print("Could not assign the foreground console.\r\n");
-        let _ = syscall::kill(id);
-        let _ = syscall::wait(id);
+        let _ = syscall::kill(cap_id);
+        let _ = syscall::wait(cap_id);
         return;
     }
-    let event = syscall::wait_event(id);
-    let _ = syscall::console_set(shell_id);
+    let event = syscall::wait_event(cap_id);
     match event {
         Some(syscall::WaitEvent::Exited(0)) => {}
         Some(syscall::WaitEvent::Exited(status)) => {
@@ -139,8 +137,8 @@ fn run_utility(program: u64, arguments: &str) {
             syscall::print("\r\n");
         }
         Some(syscall::WaitEvent::Stopped) => {
-            syscall::print("Program ID=");
-            syscall::print_dec_u64(id);
+            syscall::print("Program CapId=");
+            syscall::print_dec_u64(cap_id);
             syscall::print(" stopped\r\n");
         }
         None => syscall::print("Could not wait for program.\r\n"),
@@ -320,62 +318,60 @@ fn print_working_directory() {
     }
 }
 
-fn foreground_task(id: Option<&str>) {
-    let Some(id) = id.and_then(parse_number) else {
-        syscall::print("Usage: fg <id>\r\n");
+fn foreground_task(cap_id: Option<&str>) {
+    let Some(cap_id) = cap_id.and_then(parse_number) else {
+        syscall::print("Usage: fg <cap>\r\n");
         return;
     };
-    let shell_id = syscall::task_id();
-    if id == shell_id || !syscall::resume(id) || !syscall::console_set(id) {
+    if !syscall::resume(cap_id) || !syscall::console_set(cap_id) {
         syscall::print("fg: invalid or exited task\r\n");
         return;
     }
-    let event = syscall::wait_event(id);
-    let _ = syscall::console_set(shell_id);
+    let event = syscall::wait_event(cap_id);
     match event {
         Some(syscall::WaitEvent::Exited(status)) => {
-            syscall::print("Foreground task ID=");
-            syscall::print_dec_u64(id);
+            syscall::print("Foreground CapId=");
+            syscall::print_dec_u64(cap_id);
             syscall::print(" exited with status ");
             syscall::print_dec_u64(status);
             syscall::print("\r\n");
         }
         Some(syscall::WaitEvent::Stopped) => {
-            syscall::print("Stopped task ID=");
-            syscall::print_dec_u64(id);
+            syscall::print("Stopped CapId=");
+            syscall::print_dec_u64(cap_id);
             syscall::print("\r\n");
         }
         None => syscall::print("fg: could not wait for task\r\n"),
     }
 }
 
-fn kill_task(id: Option<&str>) {
-    let Some(id) = id.and_then(parse_number) else {
-        syscall::print("Usage: kill <id>\r\n");
+fn kill_task(cap_id: Option<&str>) {
+    let Some(cap_id) = cap_id.and_then(parse_number) else {
+        syscall::print("Usage: kill <cap>\r\n");
         return;
     };
-    if syscall::kill(id) {
-        syscall::print("Killed task ID=");
-        syscall::print_dec_u64(id);
+    if syscall::kill(cap_id) {
+        syscall::print("Killed CapId=");
+        syscall::print_dec_u64(cap_id);
         syscall::print("\r\n");
     } else {
-        syscall::print("kill: invalid task or task already exited\r\n");
+        syscall::print("kill: invalid capability or task already exited\r\n");
     }
 }
 
-fn wait_task(id: Option<&str>) {
-    let Some(id) = id.and_then(parse_number) else {
-        syscall::print("Usage: wait <id>\r\n");
+fn wait_task(cap_id: Option<&str>) {
+    let Some(cap_id) = cap_id.and_then(parse_number) else {
+        syscall::print("Usage: wait <cap>\r\n");
         return;
     };
-    if let Some(status) = syscall::wait(id) {
-        syscall::print("Task ID=");
-        syscall::print_dec_u64(id);
+    if let Some(status) = syscall::wait(cap_id) {
+        syscall::print("CapId=");
+        syscall::print_dec_u64(cap_id);
         syscall::print(" exited with status ");
         syscall::print_dec_u64(status);
         syscall::print("\r\n");
     } else {
-        syscall::print("wait: unknown task or status already consumed\r\n");
+        syscall::print("wait: unknown capability or status already consumed\r\n");
     }
 }
 
@@ -458,10 +454,16 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
         None => 0,
     };
 
-    if let Some(id) = syscall::spawn(program, argument) {
-        syscall::print("Spawned task ID=");
-        syscall::print_dec_u64(id);
-        syscall::print("\r\n");
+    if let Some(cap_id) = syscall::spawn(program, argument) {
+        if let Some(id) = syscall::cap_get_task_id(cap_id) {
+            syscall::print("Spawned task ID=");
+            syscall::print_dec_u64(id);
+            syscall::print(" CapId=");
+            syscall::print_dec_u64(cap_id);
+            syscall::print("\r\n");
+        } else {
+            syscall::print("Spawned, but could not resolve CapId.\r\n");
+        }
     } else {
         syscall::print("Spawn failed.\r\n");
     }

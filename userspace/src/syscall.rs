@@ -43,6 +43,8 @@ const SYS_FS_RENAME: u64 = 38;
 const SYS_CONSOLE_SET: u64 = 39;
 const SYS_TASK_RESUME: u64 = 40;
 const SYS_WAIT_EVENT: u64 = 41;
+const SYS_CAP_GET_TASK_ID: u64 = 60;
+const SYS_CAP_GRANT: u64 = 61;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -219,15 +221,24 @@ pub fn channel_receive() -> u64 {
 }
 
 pub fn spawn(program: u64, argument: u64) -> Option<u64> {
-    let id = unsafe { syscall2(SYS_SPAWN, program, argument) };
-    optional_id(id)
+    let cap_id = unsafe { syscall2(SYS_SPAWN, program, argument) };
+    optional_id(cap_id)
+}
+
+pub fn cap_get_task_id(cap_id: u64) -> Option<u64> {
+    let task_id = unsafe { syscall1(SYS_CAP_GET_TASK_ID, cap_id) };
+    optional_id(task_id)
+}
+
+pub fn cap_grant(cap_id: u64, recipient_task_id: u64, rights: u32) -> bool {
+    unsafe { syscall3(SYS_CAP_GRANT, cap_id, recipient_task_id, rights as u64) == 0 }
 }
 
 pub fn spawn_with_args(program: u64, argument: u64, arguments: &str) -> Option<u64> {
     if arguments.len() > 192 {
         return None;
     }
-    let id = unsafe {
+    let cap_id = unsafe {
         syscall4(
             SYS_SPAWN_ARGS,
             program,
@@ -236,7 +247,7 @@ pub fn spawn_with_args(program: u64, argument: u64, arguments: &str) -> Option<u
             arguments.len() as u64,
         )
     };
-    optional_id(id)
+    optional_id(cap_id)
 }
 
 pub fn arguments(buffer: &mut [u8]) -> Option<usize> {
@@ -246,31 +257,31 @@ pub fn arguments(buffer: &mut [u8]) -> Option<usize> {
     }
 }
 
-pub fn wait(id: u64) -> Option<u64> {
-    match unsafe { syscall1(SYS_WAIT, id) } {
+pub fn wait(cap_id: u64) -> Option<u64> {
+    match unsafe { syscall1(SYS_WAIT, cap_id) } {
         SYSCALL_ERROR => None,
         status => Some(status),
     }
 }
 
-pub fn wait_event(id: u64) -> Option<WaitEvent> {
-    match unsafe { syscall1(SYS_WAIT_EVENT, id) } {
+pub fn wait_event(cap_id: u64) -> Option<WaitEvent> {
+    match unsafe { syscall1(SYS_WAIT_EVENT, cap_id) } {
         SYSCALL_ERROR => None,
         SYSCALL_STOPPED => Some(WaitEvent::Stopped),
         status => Some(WaitEvent::Exited(status)),
     }
 }
 
-pub fn kill(id: u64) -> bool {
-    unsafe { syscall1(SYS_KILL, id) == 0 }
+pub fn kill(cap_id: u64) -> bool {
+    unsafe { syscall1(SYS_KILL, cap_id) == 0 }
 }
 
-pub fn console_set(id: u64) -> bool {
-    unsafe { syscall1(SYS_CONSOLE_SET, id) == 0 }
+pub fn console_set(cap_id: u64) -> bool {
+    unsafe { syscall1(SYS_CONSOLE_SET, cap_id) == 0 }
 }
 
-pub fn resume(id: u64) -> bool {
-    unsafe { syscall1(SYS_TASK_RESUME, id) == 0 }
+pub fn resume(cap_id: u64) -> bool {
+    unsafe { syscall1(SYS_TASK_RESUME, cap_id) == 0 }
 }
 
 pub fn exit() -> ! {

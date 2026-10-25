@@ -7,6 +7,8 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 mod allocator;
 #[cfg(not(feature = "std"))]
+mod capability;
+#[cfg(not(feature = "std"))]
 mod channel;
 #[cfg(not(feature = "std"))]
 mod condvar;

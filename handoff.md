@@ -18,7 +18,7 @@ edge-triggered and left input stuck during development. RX timeout (RTIM) is
 required so a single keypress does not wait for the RX FIFO threshold.
 
 The interactive profile still has one UART owner. `spawn` and `bg` create children
-without it; `fg <id>` resumes a stopped task or foregrounds a live one, then waits
+without it; `fg <cap>` resumes a stopped task or foregrounds a live one, then waits
 for either exit or stop. Ctrl-Z changes the child to `Stopped`, returns the console
 to the shell and wakes the foreground waiter. `ps` reports state code 7 as
 `stopped`. `SYS_TASK_RESUME = 40` and `SYS_WAIT_EVENT = 41` implement resume and
@@ -36,8 +36,13 @@ unlock rejects non-owners in release as well as debug; nameserver decimal ID
 parsing uses checked arithmetic; and sleep deadlines use saturating addition.
 Regression role 27 verifies sender stamping, non-owner/owner unlock and survival
 of a child sleeping for `u64::MAX` milliseconds. This was a focused review, not a
-complete security audit. Arbitrary task/console control still lacks a capability
-model, and task/memory/wait-queue/file resource quotas remain open.
+complete security audit. Task/memory/wait-queue/file resource quotas remain open.
+
+Capability model implemented. Raw Task IDs are no longer sufficient for kill/wait/console.
+`SYS_CAP_GRANT = 61` delegates a subset of an existing capability's rights to
+another live task; recipients cannot receive rights the caller does not hold.
+When a target dies, its capabilities lose every right except `CAP_WAIT`; that
+wait-only capability is revoked when the completion record is consumed.
 
 Debug and release QEMU both passed IRQ-only `uname`, `echo` and `pwd`; sleeping
 `demo 12` stop/resume/kill/wait; and blocked `demo 7` with IPC delivered while
@@ -261,8 +266,9 @@ read back only their own values.
   kernel panic.
 - Syscalls include sleep, IPC, nameserver, print, task control, spawn/args,
   wait/kill, stop/resume, `brk`, UART read, console ownership and RAM-VFS.
-- `SYS_CONSOLE_SET(id)` rejects idle, missing and dead IDs. On success it makes
-  the selected task the sole interactive UART owner under one IRQ-critical
+- `SYS_CONSOLE_SET(cap_id)` requires `CAP_CONSOLE_GRANT`, then rejects idle,
+  missing and dead target IDs. On success it makes the selected task the sole
+  interactive UART owner under one IRQ-critical
   section and records the calling shell as `console_parent` for Ctrl-Z. Print
   syscalls from non-owners succeed but discard their bytes; non-owner `SYS_READ`
   returns SYSCALL_ERROR without touching PL011.
@@ -278,11 +284,12 @@ read back only their own values.
 - `SYS_SPAWN_ARGS(program, numeric, ptr, len)` copies at most 192 argument bytes
   before allocating the task. `SYS_ARGS(buffer, capacity)` returns those bytes
   to the current program and fails rather than truncating them.
-- `SYS_WAIT(id)` blocks only for termination and consumes one of 64 bounded
-  completion records. `SYS_WAIT_EVENT(id)` instead returns Stopped as
-  `SYSCALL_STOPPED = u64::MAX - 2` when the target is stopped. `SYS_TASK_RESUME`
-  restores its saved state and is a no-op for a live non-stopped task.
-  `SYS_KILL` rejects idle/self and records status 1; SYS_EXIT records its status.
+- `SYS_WAIT(cap_id)` requires `CAP_WAIT`, blocks only for termination and consumes
+  one of 64 bounded completion records. `SYS_WAIT_EVENT(cap_id)` instead returns
+  Stopped as `SYSCALL_STOPPED = u64::MAX - 2` when the target is stopped.
+  `SYS_TASK_RESUME(cap_id)` requires `CAP_RESUME`, restores the saved state and is
+  a no-op for a live non-stopped task. `SYS_KILL(cap_id)` requires `CAP_KILL`,
+  rejects idle/self and records status 1; SYS_EXIT records its status.
 - `SYS_SEND(target, message)` blocks while the target has 16 queued messages and
   returns `SYSCALL_ERROR` if the target is dead. After copyin the kernel always
   replaces `message.sender` with `current_task_id()`, making selective receive
@@ -516,10 +523,10 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 - The loader supports only static `ET_EXEC`, a contiguous 2 MB image window
   and page-uniform permissions; there is no PIE, dynamic linking, demand
   loading or sparse multi-window image layout.
-- Programs are selected from ELFs embedded at kernel build time. There is no
-  external program storage, credential or capability model yet. In particular,
-  arbitrary task IDs can be passed to console/resume/kill/wait syscalls; console
-  arbitration and process control are cooperative, not security boundaries.
+- Programs are selected from ELFs embedded at kernel build time; there is no
+  external program storage or program credential model. Task control and rights
+  delegation use per-task capabilities, but any task can still request an
+  embedded shell ELF.
 - Mutex and condvar wait queues still have no growth limits. Mailboxes are
   bounded at 16 messages, but nameserver/control replies also obey backpressure;
   a full client mailbox can therefore block the nameserver. Selective receive
@@ -543,9 +550,9 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 ## Next steps (by priority)
 
-1. **Credentials and capabilities:** define parent/owner relationships and
-   unforgeable rights for console transfer, resume, kill and wait. Do not treat a
-   program-name check as authorization: any task can request an embedded shell ELF.
+1. **Program credentials:** define which embedded programs a task may request;
+   currently any task can still spawn the shell ELF. Capability delegation is
+   available through `SYS_CAP_GRANT`.
 2. **Resource quotas:** bound task count, per-task/kernel memory, wait queues and
    VFS file growth; define behavior under exhaustion before adding more services.
 3. **Grow VFS semantics:** file-size quotas and overwrite/rename options if
