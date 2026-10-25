@@ -26,11 +26,11 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
 - [x] Six userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
-- [x] silvershell: `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `cd`, `pwd`, `ps`, `spawn`, `kill`, `wait`
+- [x] silvershell: `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `rm`, `rmdir`, `cd`, `pwd`, `ps`, `spawn`, `kill`, `wait`
 - [x] Shell output redirection: `echo 'hello' > test.txt`, including quoted text
 - [x] RAM-VFS: `/bin`, `/etc`, `/tmp`, files/directories and per-task descriptors
 - [x] Per-task cwd inherited on spawn, absolute handles and `chdir`/`getcwd` syscalls
-- [x] File syscalls: `open`, `read`, `write`, `create`, `close`, `read_dir`, `mkdir`
+- [x] File syscalls: `open`, `read`, `write`, `create`, `close`, `read_dir`, `mkdir`, `unlink`, `rmdir`
 - [x] Shell syscalls: `SYS_READ`, `SYS_UPTIME`, `SYS_MEMINFO` and `SYS_TASK_LIST`
 - [x] Per-task TTBR0 spaces: independent ELF image, fixed-VA stack and private page
 - [x] Growable per-task heap: sparse 2 MB window, `brk`, zero-fill and cleanup on exit
@@ -100,6 +100,8 @@ silvershell> echo 'hello' > test.txt
 silvershell> cat test.txt
 hello
 silvershell> mkdir docs
+silvershell> rm test.txt
+silvershell> rmdir docs
 silvershell> cd /bin
 silvershell> pwd
 /bin
@@ -108,7 +110,7 @@ silvershell> ls
 
 `ls`, `cat` and ordinary `echo` run as separate EL0 programs; they inherit the
 shell's cwd and the shell waits for their exit status. Redirection, `mkdir`,
-`cd` and `pwd` use syscalls directly.
+`rm`, `rmdir`, `cd` and `pwd` use syscalls directly.
 `spawn demo 12`, `kill <id>` and `wait <id>` provide explicit task control.
 Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
@@ -221,7 +223,10 @@ handles retain absolute paths, so later `cd` calls do not change their target.
 Files are volatile and live in kernel heap memory. Descriptors start at 3,
 belong to one task, track their offset and close automatically on exit or kill.
 Path and I/O buffers are bounded and all user pointers pass checked copying.
-`create` truncates an existing file; `mkdir` rejects duplicates.
+`create` truncates an existing file; `mkdir` rejects duplicates. `unlink`
+refuses files that still have open descriptors (there is no Unix-style
+unlink-while-open yet). `rmdir` accepts only empty directories and rejects root
+or any directory that contains a live task's cwd.
 
 Each mailbox holds at most 16 messages. A sender blocks on `not_full` while the
 queue is full; removing any message wakes one sender. `SYS_RECEIVE(buffer, ticks)`

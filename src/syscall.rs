@@ -49,6 +49,8 @@ pub const SYS_FS_READ_DIR: u64 = 32;
 pub const SYS_FS_MKDIR: u64 = 33;
 pub const SYS_CHDIR: u64 = 34;
 pub const SYS_GETCWD: u64 = 35;
+pub const SYS_FS_UNLINK: u64 = 36;
+pub const SYS_FS_RMDIR: u64 = 37;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -152,6 +154,8 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_FS_MKDIR => sys_fs_mkdir(frame[0]),
         SYS_CHDIR => sys_chdir(frame[0]),
         SYS_GETCWD => sys_getcwd(frame[0], frame[1]),
+        SYS_FS_UNLINK => sys_fs_unlink(frame[0]),
+        SYS_FS_RMDIR => sys_fs_rmdir(frame[0]),
         _ => SYSCALL_ERROR,
     };
 
@@ -205,6 +209,28 @@ fn sys_fs_mkdir(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         if vfs::mkdir(&cwd, path).is_ok() {
+            0
+        } else {
+            SYSCALL_ERROR
+        }
+    })
+}
+
+fn sys_fs_unlink(path_ptr: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
+    with_path(path_ptr, |path| {
+        if vfs::unlink(&cwd, path).is_ok() {
+            0
+        } else {
+            SYSCALL_ERROR
+        }
+    })
+}
+
+fn sys_fs_rmdir(path_ptr: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
+    with_path(path_ptr, |path| {
+        if vfs::rmdir(&cwd, path, scheduler::cwd_in_use).is_ok() {
             0
         } else {
             SYSCALL_ERROR

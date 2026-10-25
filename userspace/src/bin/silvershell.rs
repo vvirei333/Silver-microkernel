@@ -79,6 +79,9 @@ fn execute(command: &str) {
             syscall::print("  echo <text> [> file]\r\n");
             syscall::print("             Print text or truncate and write a file\r\n");
             syscall::print("  mkdir <path>\r\n");
+            syscall::print("  rm <file>  Remove a closed file\r\n");
+            syscall::print("  rmdir <path>\r\n");
+            syscall::print("             Remove an empty, unused directory\r\n");
             syscall::print("  cd <path>  Change current working directory\r\n");
             syscall::print("  pwd        Print current working directory\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
@@ -90,6 +93,8 @@ fn execute(command: &str) {
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("mkdir") => make_directory(words.next()),
+        Some("rm") => remove_file(words.next()),
+        Some("rmdir") => remove_directory(words.next()),
         Some("cd") => change_directory(words.next()),
         Some("pwd") => print_working_directory(),
         Some("ps") => show_tasks(),
@@ -204,6 +209,26 @@ fn make_directory(path: Option<&str>) {
     };
     if !syscall::fs_mkdir(path) {
         syscall::print("mkdir: cannot create directory\r\n");
+    }
+}
+
+fn remove_file(path: Option<&str>) {
+    let Some(path) = path else {
+        syscall::print("Usage: rm <file>\r\n");
+        return;
+    };
+    if !syscall::fs_unlink(path) {
+        syscall::print("rm: cannot remove file (missing, open, or a directory)\r\n");
+    }
+}
+
+fn remove_directory(path: Option<&str>) {
+    let Some(path) = path else {
+        syscall::print("Usage: rmdir <path>\r\n");
+        return;
+    };
+    if !syscall::fs_rmdir(path) {
+        syscall::print("rmdir: directory is missing, not empty, in use, or invalid\r\n");
     }
 }
 

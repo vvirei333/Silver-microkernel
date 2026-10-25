@@ -111,6 +111,52 @@ impl Vfs {
         Ok(())
     }
 
+    fn remove_file(&mut self, cwd: &str, path: &str) -> Result<(), ()> {
+        let resolved = resolve_path(cwd, path)?;
+        if self.open_files.iter().any(|file| file.path == resolved) {
+            return Err(());
+        }
+        let components = components(&resolved).ok_or(())?;
+        let (&name, parent) = components.split_last().ok_or(())?;
+        let children = directory_mut(&mut self.root, parent)?;
+        let index = children
+            .iter()
+            .position(|node| node.name == name)
+            .ok_or(())?;
+        if !matches!(children[index].kind, NodeKind::File(_)) {
+            return Err(());
+        }
+        children.remove(index);
+        Ok(())
+    }
+
+    fn remove_directory(
+        &mut self,
+        cwd: &str,
+        path: &str,
+        in_use: impl FnOnce(&str) -> bool,
+    ) -> Result<(), ()> {
+        let resolved = resolve_path(cwd, path)?;
+        let components = components(&resolved).ok_or(())?;
+        let (&name, parent) = components.split_last().ok_or(())?;
+        let children = directory_mut(&mut self.root, parent)?;
+        let index = children
+            .iter()
+            .position(|node| node.name == name)
+            .ok_or(())?;
+        match &children[index].kind {
+            NodeKind::Directory(entries) if entries.is_empty() => {}
+            _ => return Err(()),
+        }
+        // Check every task while VFS IRQ masking also excludes chdir. This
+        // prevents removing a directory out from under any task's cwd.
+        if in_use(&resolved) {
+            return Err(());
+        }
+        children.remove(index);
+        Ok(())
+    }
+
     fn open(&mut self, owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {
         if flags & !OPEN_WRITE != 0 {
             return Err(());
@@ -244,6 +290,17 @@ pub fn create(cwd: &str, path: &str) -> Result<(), ()> {
 
 pub fn mkdir(cwd: &str, path: &str) -> Result<(), ()> {
     with_vfs(|vfs| vfs.make_directory(cwd, path))
+}
+
+/// Removes a closed file. Open handles keep path-based files alive until
+/// closed; Unix-style unlink-while-open is intentionally not implemented.
+pub fn unlink(cwd: &str, path: &str) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.remove_file(cwd, path))
+}
+
+/// Removes an empty directory only if no live task uses it as cwd or below it.
+pub fn rmdir(cwd: &str, path: &str, in_use: impl FnOnce(&str) -> bool) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.remove_directory(cwd, path, in_use))
 }
 
 pub fn open(owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {

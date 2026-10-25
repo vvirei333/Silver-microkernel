@@ -37,6 +37,8 @@ const SYS_FS_READ_DIR: u64 = 32;
 const SYS_FS_MKDIR: u64 = 33;
 const SYS_CHDIR: u64 = 34;
 const SYS_GETCWD: u64 = 35;
+const SYS_FS_UNLINK: u64 = 36;
+const SYS_FS_RMDIR: u64 = 37;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -292,6 +294,14 @@ pub fn fs_create(path: &str) -> bool {
 
 pub fn fs_mkdir(path: &str) -> bool {
     with_path(path, |ptr| unsafe { syscall1(SYS_FS_MKDIR, ptr) }) == 0
+}
+
+pub fn fs_unlink(path: &str) -> bool {
+    with_path(path, |ptr| unsafe { syscall1(SYS_FS_UNLINK, ptr) }) == 0
+}
+
+pub fn fs_rmdir(path: &str) -> bool {
+    with_path(path, |ptr| unsafe { syscall1(SYS_FS_RMDIR, ptr) }) == 0
 }
 
 pub fn fs_close(fd: u64) -> bool {

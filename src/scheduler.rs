@@ -521,6 +521,21 @@ pub fn current_task_cwd() -> String {
         .unwrap_or_else(|| String::from("/"))
 }
 
+/// True if a live task has its cwd at this directory or below it. Callers
+/// must hold the VFS IRQ critical section so chdir cannot race the check.
+pub fn cwd_in_use(path: &str) -> bool {
+    scheduler_manager()
+        .map(|manager| {
+            manager.tasks.iter().any(|task| {
+                task.state != TaskState::Dead
+                    && (task.cwd == path
+                        || (task.cwd.starts_with(path)
+                            && task.cwd.as_bytes().get(path.len()) == Some(&b'/')))
+            })
+        })
+        .unwrap_or(false)
+}
+
 pub fn set_current_task_cwd(cwd: String) -> bool {
     if !cwd.starts_with('/') {
         return false;
