@@ -26,8 +26,9 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
 - [x] Six userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
-- [x] silvershell: `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `ps`, `spawn`, `kill`, `wait`
-- [x] Shell output redirection: `echo 'hello' > test.txt`, including quoted text
+- [x] silvershell: `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `kill`, `wait`
+- [x] Shell output redirection: `>` truncates, `>>` appends, quoted operators stay literal
+- [x] ANSI clear/home and a bold cyan `silvershell>` prompt
 - [x] RAM-VFS: `/bin`, `/etc`, `/tmp`, files/directories and per-task descriptors
 - [x] Per-task cwd inherited on spawn, absolute handles and `chdir`/`getcwd` syscalls
 - [x] File syscalls: `open`, `read`, `write`, `create`, `close`, `read_dir`, `mkdir`, `unlink`, `rmdir`, `rename`
@@ -99,6 +100,10 @@ tmp/
 silvershell> echo 'hello' > test.txt
 silvershell> cat test.txt
 hello
+silvershell> echo 'again' >> test.txt
+silvershell> cat test.txt
+hello
+again
 silvershell> mkdir docs
 silvershell> mv test.txt docs/readme.txt
 silvershell> cat docs/readme.txt
@@ -226,12 +231,13 @@ handles retain absolute paths, so later `cd` calls do not change their target.
 Files are volatile and live in kernel heap memory. Descriptors start at 3,
 belong to one task, track their offset and close automatically on exit or kill.
 Path and I/O buffers are bounded and all user pointers pass checked copying.
-`create` truncates an existing file; `mkdir` rejects duplicates. `unlink`
-refuses files that still have open descriptors (there is no Unix-style
-unlink-while-open yet). `rmdir` accepts only empty directories and rejects root
-or any directory that contains a live task's cwd. `rename`/`mv` never replaces
-an existing node, rejects self/subtree moves and pins sources with open files
-or active directory cwds.
+`create` truncates an existing file; `mkdir` rejects duplicates. `OPEN_APPEND`
+requires write mode and moves every write to the current EOF. `unlink` refuses
+files that still have open descriptors (there is no Unix-style unlink-while-open
+yet). `rmdir` accepts only empty directories and rejects root or any directory
+that contains a live task's cwd. `rename`/`mv` never replaces an existing node,
+rejects self/subtree moves and pins sources with open files or active directory
+cwds.
 
 Each mailbox holds at most 16 messages. A sender blocks on `not_full` while the
 queue is full; removing any message wakes one sender. `SYS_RECEIVE(buffer, ticks)`

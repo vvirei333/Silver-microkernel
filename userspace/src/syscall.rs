@@ -51,6 +51,7 @@ pub const PROGRAM_CAT: u64 = 4;
 pub const PROGRAM_ECHO: u64 = 5;
 pub const OPEN_READ: u64 = 0;
 pub const OPEN_WRITE: u64 = 1;
+pub const OPEN_APPEND: u64 = 2;
 pub const DIR_NAME_CAPACITY: usize = 32;
 pub const PATH_LIMIT: usize = 191;
 const SYSCALL_ERROR: u64 = u64::MAX;

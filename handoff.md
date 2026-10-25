@@ -3,19 +3,17 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-25 (safe VFS rename update)
+## State as of 2026-10-25 (shell convenience update)
 
-Latest verified feature: **file and directory rename/move**. `SYS_FS_RENAME`
-backs the shell's `mv old new` command for absolute and cwd-relative paths. It
-rejects identical source/destination paths, missing destination parents and
-replacement of any existing destination. Directories cannot move inside their
-own subtree, and those at or above a live task's cwd stay pinned. Open files,
-including files below a moved directory, also pin the source while handles are
-absolute-path based.
+Latest verified features: **append redirection and terminal conveniences**.
+`echo text >> file` preserves existing data and creates a missing file, while
+`>` still truncates. The VFS OPEN_APPEND flag applies current-EOF semantics to
+every write, including multiple append handles. `clear` emits ANSI clear/home,
+`uname` prints `Silver Microkernel v0.1.0 aarch64`, and the prompt is bold cyan.
 
-Earlier unlink/rmdir and per-task cwd behavior remain intact. The shell runs
-ls/cat/echo as utilities and waits for them, while `echo > file`, `mkdir`, `rm`,
-`rmdir`, `mv`, `cd` and `pwd` call VFS directly.
+Earlier rename/unlink/rmdir and per-task cwd behavior remain intact. The shell
+runs ls/cat/echo as utilities and waits for them, while redirection, `mkdir`,
+`rm`, `rmdir`, `mv`, `cd` and `pwd` call VFS directly.
 
 The default bare-metal boot includes only idle, nameserver and the shell, so
 periodic demo output cannot bury the prompt. Build with `no_std,demo-tasks` for
@@ -51,7 +49,10 @@ rejected, and rmdir refused both the current directory and an ancestor of a
 nested cwd before succeeding after chdir. Rename tests passed in both profiles
 with absolute and relative paths: file contents survived same/cross-directory
 moves, old names disappeared, existing destinations remained unchanged, and
-same-path/missing-parent/self-subtree/active-cwd moves were rejected. No
+same-path/missing-parent/self-subtree/active-cwd moves were rejected. Append
+tests passed in both profiles with spaced/unspaced `>>`, existing and new files,
+quoted literal operators and a `>` truncation regression check. ANSI prompt and
+clear sequences were observed, and uname printed the exact version string. No
 `KERNEL PANIC`, `BAD SP` or unexpected `FAIL` occurred.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
@@ -263,13 +264,14 @@ read back only their own values.
   `.` and `..` are normalized and `..` cannot escape root.
 - Open handles store an absolute normalized path rather than a Node pointer or
   relative path, so Vec reallocation and later chdir calls cannot retarget them.
-  Each handle has owner, per-owner fd (starting at 3), offset and writable flag.
-  Exit/kill removes all handles for that owner.
+  Each handle has owner, per-owner fd (starting at 3), offset, writable and
+  append flags. Exit/kill removes all handles for that owner.
 - `SYS_FS_OPEN/READ/WRITE/CREATE/CLOSE/READ_DIR/MKDIR/UNLINK/RMDIR/RENAME` use
   checked copyin/copyout. `SYS_CHDIR` resolves and validates a directory before
   replacing the Task cwd; `SYS_GETCWD` copies its absolute bytes. Paths are
   limited to 191 bytes, names to 32 bytes and one I/O call to 4096 bytes.
-  `create` truncates files, `open` supports read-only or write mode and
+  `create` truncates files, `open` supports read-only, write and write+append
+  modes. Append starts at the current EOF on every write, not merely at open.
   `read_dir` copies 48-byte `#[repr(C)]` entries with name bytes/length and kind.
 - `unlink` removes only files with no open handles; there is deliberately no
   Unix-style unlink-while-open while handles are path-based. `rmdir` removes
@@ -281,8 +283,8 @@ read back only their own values.
   cycles. Sources with open files below them or live cwds below directories are
   rejected instead of rewriting path-based handles/cwds. The same IRQ-critical
   section covers checks and the move, so expected failures preserve the tree.
-- There is no persistence, file-size quota or append flag yet. Repeated writes
-  extend the in-memory file through the kernel heap.
+- There is no persistence or file-size quota yet. Repeated writes extend the
+  in-memory file through the kernel heap.
 
 ## silvershell
 
@@ -292,15 +294,18 @@ read back only their own values.
 - UART input is deliberately a nonblocking syscall in this MVP. The shell sleeps
   for 1 ms when RX is empty, so polling does not monopolize the scheduler. A
   future UART RX interrupt can replace polling without changing command parsing.
-- Startup emits ANSI clear/home, runs fastfetch once and shows `silvershell> `.
-  Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`, `mkdir`, `rm`, `rmdir`,
-  `mv`, `cd`, `pwd`, `ps`, `spawn`, `kill` and `wait`; empty lines only reprompt.
-  Echo parsing preserves quoted spaces, strips outer quotes and finds `>` outside
-  quotes. `mv old new` takes a full destination path, not just a directory.
+- Startup emits ANSI clear/home, runs fastfetch once and shows a bold cyan
+  `silvershell>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`,
+  `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`,
+  `kill` and `wait`; empty lines only reprompt. Echo parsing preserves quoted
+  spaces, strips outer quotes and recognizes `>`/`>>` only outside quotes.
+  `mv old new` takes a full destination path, not just a directory.
 - `ls`, `cat` and ordinary `echo` spawn separate EL0 utilities with string args
   and inherited cwd, then immediately wait for them. `echo text > path`
-  truncates/creates and writes directly through VFS. `mkdir`, `rm`, `rmdir`,
-  `mv`, `cd` and `pwd` are also direct syscalls. Utility failures return status 1.
+  truncates/creates; `echo text >> path` appends/creates directly through VFS.
+  `mkdir`, `rm`, `rmdir`, `mv`, `cd` and `pwd` are also direct syscalls.
+  `clear` emits clear/home and `uname` prints the fixed OS/version/arch string.
+  Utility failures return status 1.
 - `ps` uses a fixed 32-entry userspace array and prints ID/program/argument/state.
   `spawn` parses an optional checked decimal u64 and reports the new task ID.
   `kill` terminates a non-current task; `wait` prints and consumes its status.
@@ -470,8 +475,8 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 1. **Console ownership and job control:** spawned programs currently share UART
    output with the shell; add foreground/background ownership before RX IRQs.
-2. **Grow VFS semantics:** append mode, file-size quotas and overwrite/rename
-   options if needed. Persistent storage still needs a block driver.
+2. **Grow VFS semantics:** file-size quotas and overwrite/rename options if
+   needed. Persistent storage still needs a block driver.
 3. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.

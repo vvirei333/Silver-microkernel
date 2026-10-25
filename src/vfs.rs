@@ -11,6 +11,7 @@ use crate::interrupts;
 pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_PATH_LEN: usize = 191;
 pub const OPEN_WRITE: u64 = 1;
+pub const OPEN_APPEND: u64 = 2;
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -36,6 +37,7 @@ struct OpenFile {
     path: String,
     offset: usize,
     writable: bool,
+    append: bool,
 }
 
 struct Vfs {
@@ -222,14 +224,23 @@ impl Vfs {
     }
 
     fn open(&mut self, owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {
-        if flags & !OPEN_WRITE != 0 {
+        if flags & !(OPEN_WRITE | OPEN_APPEND) != 0
+            || (flags & OPEN_APPEND != 0 && flags & OPEN_WRITE == 0)
+        {
             return Err(());
         }
         let resolved = resolve_path(cwd, path)?;
-        match &find_node(&self.root, &resolved).ok_or(())?.kind {
-            NodeKind::File(_) => {}
+        let append = flags & OPEN_APPEND != 0;
+        let offset = match &find_node(&self.root, &resolved).ok_or(())?.kind {
+            NodeKind::File(data) => {
+                if append {
+                    data.len()
+                } else {
+                    0
+                }
+            }
             NodeKind::Directory(_) => return Err(()),
-        }
+        };
 
         let mut fd = 3_u64;
         while self
@@ -243,8 +254,9 @@ impl Vfs {
             owner,
             fd,
             path: resolved,
-            offset: 0,
+            offset,
             writable: flags & OPEN_WRITE != 0,
+            append,
         });
         Ok(fd)
     }
@@ -295,6 +307,11 @@ impl Vfs {
             NodeKind::File(data) => data,
             NodeKind::Directory(_) => return Err(()),
         };
+        // O_APPEND semantics: every write starts at the current EOF, even if
+        // another handle extended the file after this one was opened.
+        if handle.append {
+            handle.offset = data.len();
+        }
         if handle.offset > data.len() {
             return Err(());
         }

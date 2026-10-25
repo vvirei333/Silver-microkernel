@@ -76,8 +76,8 @@ fn execute(command: &str) {
             syscall::print("  fastfetch  Show OS, uptime and memory information\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
-            syscall::print("  echo <text> [> file]\r\n");
-            syscall::print("             Print text or truncate and write a file\r\n");
+            syscall::print("  echo <text> [> file | >> file]\r\n");
+            syscall::print("             Print, truncate/write, or append to a file\r\n");
             syscall::print("  mkdir <path>\r\n");
             syscall::print("  rm <file>  Remove a closed file\r\n");
             syscall::print("  rmdir <path>\r\n");
@@ -86,6 +86,8 @@ fn execute(command: &str) {
             syscall::print("             Rename or move a closed file/unused directory\r\n");
             syscall::print("  cd <path>  Change current working directory\r\n");
             syscall::print("  pwd        Print current working directory\r\n");
+            syscall::print("  clear      Clear the terminal screen\r\n");
+            syscall::print("  uname      Print kernel name, version and architecture\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
             syscall::print("  spawn <demo|nameserver|silvershell|ls|cat|echo> [arg]\r\n");
             syscall::print("  kill <id>  Kill a task\r\n");
@@ -100,6 +102,8 @@ fn execute(command: &str) {
         Some("mv") => rename_node(words.next(), words.next()),
         Some("cd") => change_directory(words.next()),
         Some("pwd") => print_working_directory(),
+        Some("clear") => clear_screen(),
+        Some("uname") => syscall::print("Silver Microkernel v0.1.0 aarch64\r\n"),
         Some("ps") => show_tasks(),
         Some("spawn") => spawn_program(words.next(), words.next()),
         Some("kill") => kill_task(words.next()),
@@ -130,14 +134,14 @@ fn execute_echo(arguments: &str) {
         return;
     };
     let text = unquote(text.trim());
-    if let Some(path) = destination {
-        write_file(unquote(path.trim()), text);
+    if let Some((path, append)) = destination {
+        write_file(unquote(path.trim()), text, append);
     } else {
         run_utility(syscall::PROGRAM_ECHO, text);
     }
 }
 
-fn split_redirection(input: &str) -> Result<(&str, Option<&str>), ()> {
+fn split_redirection(input: &str) -> Result<(&str, Option<(&str, bool)>), ()> {
     let mut quote = None;
     let mut redirect = None;
     for (index, byte) in input.bytes().enumerate() {
@@ -145,9 +149,14 @@ fn split_redirection(input: &str) -> Result<(&str, Option<&str>), ()> {
             b'\'' | b'"' if quote == Some(byte) => quote = None,
             b'\'' | b'"' if quote.is_none() => quote = Some(byte),
             b'>' if quote.is_none() => {
-                if redirect.replace(index).is_some() {
+                if matches!(redirect, Some((previous, true)) if previous + 1 == index) {
+                    continue;
+                }
+                if redirect.is_some() {
                     return Err(());
                 }
+                let append = input.as_bytes().get(index + 1) == Some(&b'>');
+                redirect = Some((index, append));
             }
             _ => {}
         }
@@ -155,12 +164,13 @@ fn split_redirection(input: &str) -> Result<(&str, Option<&str>), ()> {
     if quote.is_some() {
         return Err(());
     }
-    if let Some(index) = redirect {
-        let path = input[index + 1..].trim();
+    if let Some((index, append)) = redirect {
+        let path_start = index + 1 + usize::from(append);
+        let path = input[path_start..].trim();
         if path.is_empty() {
             return Err(());
         }
-        Ok((&input[..index], Some(path)))
+        Ok((&input[..index], Some((path, append))))
     } else {
         Ok((input, None))
     }
@@ -178,12 +188,36 @@ fn unquote(text: &str) -> &str {
     }
 }
 
-fn write_file(path: &str, text: &str) {
-    if path.is_empty() || !syscall::fs_create(path) {
-        syscall::print("echo: cannot create file\r\n");
+fn write_file(path: &str, text: &str, append: bool) {
+    if path.is_empty() {
+        syscall::print("echo: invalid destination\r\n");
         return;
     }
-    let Some(fd) = syscall::fs_open(path, syscall::OPEN_WRITE) else {
+    let flags = if append {
+        syscall::OPEN_WRITE | syscall::OPEN_APPEND
+    } else {
+        syscall::OPEN_WRITE
+    };
+    let fd = if append {
+        // Append preserves existing files and creates only a missing one.
+        let mut fd = syscall::fs_open(path, flags);
+        if fd.is_none() {
+            if !syscall::fs_create(path) {
+                syscall::print("echo: cannot create file\r\n");
+                return;
+            }
+            fd = syscall::fs_open(path, flags);
+        }
+        fd
+    } else {
+        // The '>' form retains its truncate-before-write behavior.
+        if !syscall::fs_create(path) {
+            syscall::print("echo: cannot create file\r\n");
+            return;
+        }
+        syscall::fs_open(path, flags)
+    };
+    let Some(fd) = fd else {
         syscall::print("echo: cannot open file\r\n");
         return;
     };
@@ -477,8 +511,12 @@ fn print_mib(bytes: u64) {
     syscall::print(" MiB");
 }
 
+fn clear_screen() {
+    syscall::print("\x1b[2J\x1b[H");
+}
+
 fn prompt() {
-    syscall::print("silvershell> ");
+    syscall::print("\x1b[1;36msilvershell>\x1b[0m ");
 }
 
 fn echo(byte: u8) {
