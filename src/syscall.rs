@@ -29,6 +29,7 @@ pub const SYS_SPAWN: u64 = 14;
 pub const SYS_EXIT: u64 = 15;
 pub const SYS_UNREGISTER: u64 = 16;
 pub const SYS_TASK_ALIVE: u64 = 17;
+pub const SYS_BRK: u64 = 18;
 
 /// Well-known task ID of the nameserver. Fixed by spawn order: the scheduler
 /// spawns it first, right after idle (which is always ID 0).
@@ -93,6 +94,9 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_EXIT => scheduler::exit_current(),
         SYS_UNREGISTER => sys_unregister_name(frame[0]),
         SYS_TASK_ALIVE => u64::from(scheduler::task_alive(frame[0])),
+        SYS_BRK => scheduler::change_program_break(frame[0] as usize)
+            .map(|address| address as u64)
+            .unwrap_or(SYSCALL_ERROR),
         _ => SYSCALL_ERROR,
     };
 

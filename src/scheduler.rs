@@ -72,6 +72,10 @@ pub struct Task {
     pub ttbr0: usize,
     /// Independently loaded ELF pages; released together with the address space.
     user_image: Option<UserImage>,
+    /// Physical heap frames in virtual-page order. The MMU frees them on reap.
+    heap_pages: Vec<usize>,
+    /// Current byte-granular program break within the reserved heap window.
+    program_break: usize,
     /// Queue containing this task while blocked, used for stale-waiter cleanup.
     waiting_on: Option<*const WaitQueue>,
     /// Mutexes owned by this task, released if it exits without unlocking.
@@ -212,6 +216,7 @@ pub fn init() {
     }
     let _lifecycle_supervisor = spawn_user(user_program::DEMO, 17);
     let _copyout_probe = spawn_user(user_program::DEMO, 19);
+    let _heap_probe = spawn_user(user_program::DEMO, 20);
 
     let manager = scheduler_manager().unwrap();
     manager.current_index = manager
@@ -340,6 +345,12 @@ pub fn task_alive(id: u64) -> bool {
                 .any(|task| task.id == id && task.state != TaskState::Dead)
         })
         .unwrap_or(false)
+}
+
+/// Queries or moves the current EL0 task's program break. Zero is the query
+/// form; failed growth leaves both the break and all heap mappings unchanged.
+pub fn change_program_break(requested: usize) -> Option<usize> {
+    current_task_mut()?.change_program_break(requested)
 }
 
 /// Switches from the boot context into the first task. This function never returns.
@@ -664,9 +675,54 @@ impl Task {
             user_stack,
             ttbr0,
             user_image,
+            heap_pages: Vec::new(),
+            program_break: mmu::USER_HEAP_VA,
             waiting_on: None,
             owned_mutexes: Vec::new(),
         })
+    }
+
+    fn change_program_break(&mut self, requested: usize) -> Option<usize> {
+        if requested == 0 {
+            return Some(self.program_break);
+        }
+        if self.user_image.is_none()
+            || requested < mmu::USER_HEAP_VA
+            || requested > mmu::USER_HEAP_VA + mmu::USER_HEAP_MAX_SIZE
+        {
+            return None;
+        }
+
+        let target_pages = (requested - mmu::USER_HEAP_VA).div_ceil(PAGE_SIZE);
+        let original_pages = self.heap_pages.len();
+        while self.heap_pages.len() < target_pages {
+            let index = self.heap_pages.len();
+            let Some(frame) = frame_allocator::alloc_page() else {
+                self.truncate_heap(original_pages);
+                return None;
+            };
+            if !mmu::map_user_heap_page(self.ttbr0, index, frame) {
+                frame_allocator::free_page(frame);
+                self.truncate_heap(original_pages);
+                return None;
+            }
+            self.heap_pages.push(frame);
+        }
+
+        self.truncate_heap(target_pages);
+        self.program_break = requested;
+        Some(requested)
+    }
+
+    fn truncate_heap(&mut self, target_pages: usize) {
+        while self.heap_pages.len() > target_pages {
+            let index = self.heap_pages.len() - 1;
+            let mapped = mmu::unmap_user_heap_page(self.ttbr0, index)
+                .expect("tracked user heap mapping is missing");
+            let tracked = self.heap_pages.pop().unwrap();
+            debug_assert_eq!(mapped, tracked);
+            frame_allocator::free_page(mapped);
+        }
     }
 
     fn release_mutexes(&mut self) -> Vec<u64> {

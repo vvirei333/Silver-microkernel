@@ -26,7 +26,8 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
 - [x] Two userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
 - [x] Per-task TTBR0 spaces: independent ELF image, fixed-VA stack and private page
-- [x] W^X user mappings: R-X text, R-- rodata, RW-NX data/stack/private memory
+- [x] Growable per-task heap: sparse 2 MB window, `brk`, zero-fill and cleanup on exit
+- [x] W^X user mappings: R-X text, R-- rodata, RW-NX data/heap/stack/private memory
 - [x] No kernel image, kernel data, heap, kernel stacks or MMIO in user TTBR0
 - [x] Tasks in EL0 (Ring 3): user stacks and SVC-only kernel access
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
@@ -124,15 +125,21 @@ the MMU, branches to the high PC, and removes the kernel's low identity map.
 
 ```text
 TTBR1 (EL1 only):  0xFFFF000000000000 + PA -> kernel image, heap, stacks, MMIO
-TTBR0 (per task): own ELF image + own fixed-VA stack + own private page
+TTBR0 (per task): own ELF + sparse heap + own fixed-VA stack + private page
 ```
 
 The scheduler changes only TTBR0_EL1 and flushes stale TLB entries. Its EL1
 code and SP_EL1 stack remain mapped through TTBR1_EL1. Every user task gets
 an independently loaded ELF image at `0x40000000`, an 8 KB stack at
 `0x7FE00000`, and a private 4 KB page at `0x0000_0080_0000_0000`. Equal VAs
-in different tasks have different physical backing. VM A/B verify both the
-private page and an ELF BSS variable by reading back only their own values.
+in different tasks have different physical backing. VM A/B verify the private
+page, ELF BSS and heap by reading back only their own values.
+
+`SYS_BRK` manages a byte-granular program break in a reserved 2 MB heap window
+at `0x40200000`. Growth maps zeroed RW-NX pages on demand; shrinking unmaps and
+frees whole pages; failed growth rolls back partial mappings. Reaping frees
+all remaining heap frames. This is a kernel VM API, not a userspace `malloc`
+yet, and the current heap limit is 2 MB per task.
 
 The userspace linker emits separate R-X, R-- and RW `PT_LOAD` segments. The
 loader accepts static ELF64/AArch64 `ET_EXEC` files inside a 2 MB image window,

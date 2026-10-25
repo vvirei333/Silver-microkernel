@@ -164,15 +164,22 @@ pub fn vm_task_b() -> ! {
 fn vm_task(label: u8, value: u64) -> ! {
     let cell = PRIVATE_WINDOW_VA as *mut u64;
     let elf_cell = core::ptr::addr_of_mut!(ELF_BSS_CELL);
+    let heap_cell = syscall::USER_HEAP_VA as *mut u64;
+    if !syscall::set_program_break(syscall::USER_HEAP_VA + 4096) {
+        syscall::print("VM HEAP MAP FAIL\r\n");
+        syscall::exit();
+    }
     loop {
         unsafe {
             core::ptr::write_volatile(cell, value);
             core::ptr::write_volatile(elf_cell, value);
+            core::ptr::write_volatile(heap_cell, value);
         }
         syscall::sleep(500);
         let observed = unsafe { core::ptr::read_volatile(cell) };
         let elf_observed = unsafe { core::ptr::read_volatile(elf_cell) };
-        if observed != value || elf_observed != value {
+        let heap_observed = unsafe { core::ptr::read_volatile(heap_cell) };
+        if observed != value || elf_observed != value || heap_observed != value {
             syscall::print("VM ISOLATION FAIL\r\n");
         }
         if label == b'X' {
@@ -185,6 +192,8 @@ fn vm_task(label: u8, value: u64) -> ! {
         syscall::print_hex_u64(observed);
         syscall::print(" ELF=0x");
         syscall::print_hex_u64(elf_observed);
+        syscall::print(" HEAP=0x");
+        syscall::print_hex_u64(heap_observed);
         syscall::print("\r\n");
     }
 }
@@ -285,6 +294,56 @@ pub fn copyout_probe() -> ! {
     } else {
         syscall::print("COPYOUT UNMAPPED REJECT=PASS\r\n");
     }
+    syscall::exit()
+}
+
+pub fn heap_probe() -> ! {
+    const PAGE: usize = 4096;
+    let base = syscall::USER_HEAP_VA;
+    let expanded = base + 3 * PAGE;
+    let bytes = base as *mut u8;
+
+    if syscall::program_break() != Some(base) || !syscall::set_program_break(expanded) {
+        syscall::print("HEAP INITIAL GROW=FAIL\r\n");
+        syscall::exit();
+    }
+    unsafe {
+        for page in 0..3 {
+            if core::ptr::read_volatile(bytes.add(page * PAGE)) != 0
+                || core::ptr::read_volatile(bytes.add((page + 1) * PAGE - 1)) != 0
+            {
+                syscall::print("HEAP ZERO FILL=FAIL\r\n");
+                syscall::exit();
+            }
+            core::ptr::write_volatile(bytes.add((page + 1) * PAGE - 1), 0x11 + page as u8);
+        }
+    }
+
+    if !syscall::set_program_break(base + PAGE)
+        || syscall::program_break() != Some(base + PAGE)
+        || !syscall::set_program_break(expanded)
+    {
+        syscall::print("HEAP SHRINK/REGROW=FAIL\r\n");
+        syscall::exit();
+    }
+    let contents_ok = unsafe {
+        core::ptr::read_volatile(bytes.add(PAGE - 1)) == 0x11
+            && core::ptr::read_volatile(bytes.add(2 * PAGE - 1)) == 0
+            && core::ptr::read_volatile(bytes.add(3 * PAGE - 1)) == 0
+    };
+    if !contents_ok {
+        syscall::print("HEAP CONTENTS=FAIL\r\n");
+        syscall::exit();
+    }
+    if syscall::set_program_break(base - 1)
+        || syscall::set_program_break(base + syscall::USER_HEAP_MAX_SIZE + 1)
+        || syscall::program_break() != Some(expanded)
+    {
+        syscall::print("HEAP BOUNDS=FAIL\r\n");
+        syscall::exit();
+    }
+
+    syscall::print("HEAP GROW/SHRINK=PASS\r\n");
     syscall::exit()
 }
 

@@ -3,26 +3,28 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-24 (lifecycle + PAN update)
+## State as of 2026-10-25 (growable user heap update)
 
-Latest verified features: **user-facing program/argument spawn and exit,
-resource cleanup, checked copyin/copyout, and SCTLR.PAN enabled**. The kernel
-embeds separate demo and nameserver ELFs. Every EL0 task still receives an
-independent image, stack and private page in TTBR0; privileged state remains
-only in the TTBR1 high half.
+Latest verified feature: **sparse per-task user heaps managed by `SYS_BRK`**.
+Growth maps zeroed RW-NX pages on demand, shrinking releases whole pages,
+failed growth rolls back partial mappings, and task reaping frees the remaining
+heap frames. Lifecycle cleanup, checked copyin/copyout and PAN remain intact.
 
-Verified with host, debug bare-metal and release bare-metal builds, five
-consecutive 8-second debug QEMU runs and a 12-second release run. Every run
-had exactly two intentional `TASK FAULT` reports and no `KERNEL PANIC`,
-`BAD SP`, isolation failures or stale debug output. Each debug run completed
-24 correct PING/PONG exchanges and all four new checks:
+Verified with host, debug bare-metal and release bare-metal builds, five debug
+QEMU runs (5–8 seconds each) and an 8-second release run. Every run had exactly
+two intentional `TASK FAULT` reports and no `KERNEL PANIC`, `BAD SP`, isolation
+failures or stale debug output. All runs passed these checks:
 
 ```text
 COPYOUT READONLY REJECT=PASS
 COPYOUT UNMAPPED REJECT=PASS
 LIFECYCLE EXIT/UNREGISTER=PASS
 LIFECYCLE MUTEX CLEANUP=PASS
+HEAP GROW/SHRINK=PASS
 ```
+
+VM A/B additionally write different values to the same heap VA and read back
+only their own values, proving that dynamic mappings remain task-private.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
 | --- | ---: | --- | --- |
@@ -59,6 +61,10 @@ Important fixes and invariants from the recent work must be preserved:
 9. **Mutex ownership and wait membership belong to the task.** Reaping removes
    dead waiters, releases owned mutexes and wakes the next FIFO waiter before
    freeing stacks or address spaces.
+10. **`brk` growth is all-or-nothing at the API boundary.** On frame exhaustion,
+    roll back every page added by the failed request and preserve the old break.
+    New mappings are zeroed before becoming visible; unmap and flush before
+    freeing a shrunken page.
 
 Always build like this:
 
@@ -122,18 +128,20 @@ frame allocator remains physical-address based. Kernel heap and kernel-stack
 virtual addresses, including SP_EL1, are high; allocator logs may separately
 show the physical heap base.
 
-Each task owns eight pages of TTBR0 tables plus its image and data pages:
+Each task owns nine pages of TTBR0 tables plus its image and data pages:
 
 - L0[0] → user L1; L1[1] → user L2; L2[0] → a task-owned image L3.
   The image L3 maps the freshly loaded ELF pages at `0x40000000`.
+- L2[1] → a task-owned heap L3 covering `0x40200000..0x40400000`. The table
+  starts empty and `SYS_BRK` adds/removes up to 512 data pages.
 - L2[511] → a task-owned L3 mapping two stack pages at fixed VA
   `0x7FE00000` (8 KB total). Equal stack VAs have different physical backing.
 - L0[1] → a private L1/L2/L3 chain mapping one writable 4 KB page at
   `0x0000008000000000`.
 - There are no user mappings for kernel text/rodata, MMIO, kernel `.data` or
   `.bss`, kernel heap, kernel stacks, unrelated DRAM or page-table pages.
-- `destroy_task_space()` frees all task-owned tables and the private page;
-  `Task::release_space()` then releases the independently owned ELF frames.
+- `destroy_task_space()` frees all task-owned tables, heap frames and the
+  private page; `Task::release_space()` then releases the ELF frames.
 
 ## ELF loading and W^X
 
@@ -150,9 +158,9 @@ executable segment. It allocates fresh contiguous frames, zeroes the whole
 image, copies `PT_LOAD` file bytes and records a `PageKind` for every page.
 
 The resulting mappings enforce W^X: text is R-X at EL0 and PXN; rodata is R--
-and UXN/PXN; data, stack and private memory are RW at EL0 and UXN/PXN. Each
-spawn loads another copy, so even writable ELF data/BSS is private. VM A/B
-write `0xAAAA` / `0xBBBB` to both their private page and `ELF_BSS_CELL` and
+and UXN/PXN; data, heap, stack and private memory are RW at EL0 and UXN/PXN.
+Each spawn loads another copy, so even writable ELF data/BSS is private. VM A/B
+write `0xAAAA` / `0xBBBB` to their private page, `ELF_BSS_CELL` and heap, then
 read back only their own values.
 
 ## EL0 execution and lifecycle model
@@ -173,11 +181,14 @@ read back only their own values.
   inspect SPSR.M[3:2]: EL0 goes to `silver_handle_task_fault`; EL1 is a
   kernel panic.
 - Syscalls include sleep, send, receive, register, lookup, unregister, print,
-  whoami, task_alive, spawn, exit, hex/dec print, mutex lock/unlock and channel
-  send/receive.
+  whoami, task_alive, spawn, exit, `brk`, hex/dec print, mutex lock/unlock and
+  channel send/receive.
+- `SYS_BRK(0)` queries the program break. Other values set an absolute break in
+  `0x40200000..0x40400000`; invalid requests and allocation failures return
+  `SYSCALL_ERROR` without changing the previous break or mappings.
 - `SYS_EXIT` removes the current mailbox and marks the task Dead. Reaping
   removes stale waiters, releases owned mutexes, wakes the next waiter, then
-  frees the ELF pages, page tables, private page and both stacks.
+  frees the ELF pages, heap frames, page tables, private page and both stacks.
 - Nameserver unregister is owner-checked. Its table is also purged through
   `task_alive` when later requests arrive, so names left by dead tasks do not
   remain permanently valid.
@@ -188,8 +199,8 @@ read back only their own values.
 
 - User ELF text is AP=0b11 (read-only at EL1 and EL0), executable at EL0 and
   PXN. User rodata is read-only and UXN/PXN.
-- User data, stacks and private pages are AP=0b01 and UXN/PXN. TTBR1 MMIO and
-  DRAM mappings are AP=0b00 and absent from TTBR0.
+- User data, heap pages, stacks and private pages are AP=0b01 and UXN/PXN.
+  TTBR1 MMIO and DRAM mappings are AP=0b00 and absent from TTBR0.
 - AP=0b10 is not user read-only: with the two-range EL1/EL0 regime it means
   read-only at EL1 and no EL0 access. Use AP=0b11 for user-readable rodata.
 - A page writable at EL0 (AP=0b01) is execute-never at EL1 regardless of PXN.
@@ -300,8 +311,9 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   external program storage, `kill`, `wait` or credential model yet.
 - Mutex queues, condvar queues and mailboxes have no growth limits.
 - `receive()` has no timeout.
-- Task address spaces hold one private page and one fixed-size 8 KB stack;
-  there is no per-task heap or growable user mapping.
+- The user heap is limited to one 2 MB L3 window and has no userspace allocator
+  above `brk`; there is no general `mmap`/`munmap` or growable stack. The user
+  stack remains fixed at 8 KB and the demo private window at one page.
 - UART lines from different tasks can interleave; an IRQ may even schedule
   another task during a FIFO wait.
 - `#[alloc_error_handler]` is unstable on stable Rust — instead a wrapper
@@ -309,8 +321,8 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 ## Next steps (by priority)
 
-1. **Grow per-task spaces:** multiple private pages, per-task heap region,
-   sparse image mappings and demand paging later.
+1. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
+   a userspace allocator over `brk`, growable stacks and demand paging later.
 2. **IPC hardening:** bounded mailboxes/backpressure, receive timeouts,
    nameserver watch notifications instead of lookup polling.
 3. **VirtIO-console / virtio-block** — first MMIO device driver, moving
@@ -329,5 +341,6 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
    times for scheduler/interrupt changes because races are timing-sensitive.
    Expect exactly the two intentional faults from tasks 15 and 16, plus
    `COPYOUT READONLY REJECT=PASS`, `COPYOUT UNMAPPED REJECT=PASS`,
-   `LIFECYCLE EXIT/UNREGISTER=PASS` and `LIFECYCLE MUTEX CLEANUP=PASS`.
+   `LIFECYCLE EXIT/UNREGISTER=PASS`, `LIFECYCLE MUTEX CLEANUP=PASS` and
+   `HEAP GROW/SHRINK=PASS`.
 6. Update the README checklist and this file.

@@ -19,7 +19,10 @@ const SYS_SPAWN: u64 = 14;
 const SYS_EXIT: u64 = 15;
 const SYS_UNREGISTER: u64 = 16;
 const SYS_TASK_ALIVE: u64 = 17;
+const SYS_BRK: u64 = 18;
 
+pub const USER_HEAP_VA: usize = 0x4020_0000;
+pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
 pub const PROGRAM_DEMO: u64 = 0;
 pub const PROGRAM_NAMESERVER: u64 = 1;
 const SYSCALL_ERROR: u64 = u64::MAX;
@@ -93,6 +96,21 @@ pub fn exit() -> ! {
 
 pub fn task_alive(id: u64) -> bool {
     unsafe { syscall1(SYS_TASK_ALIVE, id) != 0 }
+}
+
+/// Returns the current byte-granular program break.
+pub fn program_break() -> Option<usize> {
+    let address = unsafe { syscall1(SYS_BRK, 0) };
+    if address == SYSCALL_ERROR {
+        None
+    } else {
+        Some(address as usize)
+    }
+}
+
+/// Grows or shrinks the current task's heap to an absolute program break.
+pub fn set_program_break(address: usize) -> bool {
+    unsafe { syscall1(SYS_BRK, address as u64) == address as u64 }
 }
 
 pub fn register(name: &str) -> bool {

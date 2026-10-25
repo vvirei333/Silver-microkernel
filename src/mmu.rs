@@ -3,7 +3,7 @@
 //! TTBR1_EL1 maps physical memory at `KERNEL_VIRT_BASE + PA` for EL1 only:
 //! kernel code/data/stacks, page tables, the kernel heap, UART and GIC all
 //! live there. TTBR0_EL1 belongs to the current task and contains only its
-//! independently loaded ELF image, its own user stack and one private page.
+//! independently loaded ELF image, sparse heap, user stack and private page.
 //! No kernel image, kernel data or MMIO pages are shared with EL0.
 
 use crate::{
@@ -23,6 +23,13 @@ const DESC_PAGE: u64 = 0b11;
 /// Private 4 KB data window: L0 index 1, then L1/L2/L3 index 0.
 pub const PRIVATE_WINDOW_VA: usize = 0x0000_0080_0000_0000;
 const PRIVATE_WINDOW_L0_INDEX: usize = (PRIVATE_WINDOW_VA >> 39) & 0x1FF;
+/// A sparse, per-task heap window immediately after the 2 MB ELF image.
+/// Its L3 table is installed at spawn, while data pages are mapped by `brk`.
+pub const USER_HEAP_VA: usize = 0x0000_0000_4020_0000;
+pub const USER_HEAP_MAX_PAGES: usize = 512;
+pub const USER_HEAP_MAX_SIZE: usize = USER_HEAP_MAX_PAGES * GRANULE;
+const USER_HEAP_L2_INDEX: usize = (USER_HEAP_VA - DRAM_BASE) / BLOCK_2M;
+
 /// Every task's own stack appears at this user VA, backed by different PAs.
 pub const USER_STACK_VA: usize = 0x0000_0000_7FE0_0000;
 pub const USER_STACK_PAGES: usize = 2;
@@ -197,13 +204,14 @@ pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
 
 /// Builds a user TTBR0. `user_stack_start == 0` creates no stack mapping
 /// (used for the EL1 idle task). A loaded ELF supplies independently owned
-/// image pages instead of the old shared kernel text/rodata alias.
+/// image pages instead of the old shared kernel text/rodata alias. The heap
+/// starts empty: its L3 table exists, but data frames are added by `brk`.
 pub fn create_task_space(
     private_page: usize,
     user_stack_start: usize,
     image: Option<&crate::elf_loader::UserImage>,
 ) -> Option<usize> {
-    let mut pages = [0_usize; 8];
+    let mut pages = [0_usize; 9];
     for (index, slot) in pages.iter_mut().enumerate() {
         let Some(page) = frame_allocator::alloc_page() else {
             for prior in &pages[..index] {
@@ -213,7 +221,7 @@ pub fn create_task_space(
         };
         *slot = page;
     }
-    let [l0, l1_user, l2_user, l3_image, l3_stack, l1_priv, l2_priv, l3_priv] = pages;
+    let [l0, l1_user, l2_user, l3_image, l3_heap, l3_stack, l1_priv, l2_priv, l3_priv] = pages;
 
     unsafe {
         for &page in &pages {
@@ -224,6 +232,7 @@ pub fn create_task_space(
         write_entry(l0, PRIVATE_WINDOW_L0_INDEX, l1_priv as u64 | DESC_TABLE);
         write_entry(l1_user, 1, l2_user as u64 | DESC_TABLE);
         write_entry(l2_user, 0, l3_image as u64 | DESC_TABLE);
+        write_entry(l2_user, USER_HEAP_L2_INDEX, l3_heap as u64 | DESC_TABLE);
 
         if let Some(image) = image {
             for index in 0..image.page_count {
@@ -259,6 +268,45 @@ pub fn create_task_space(
     Some(l0)
 }
 
+/// Maps one zeroed, writable and non-executable heap page. The task records
+/// the frame for `brk` rollback/shrink; `destroy_task_space` ultimately frees it.
+pub fn map_user_heap_page(ttbr0: usize, index: usize, physical: usize) -> bool {
+    if index >= USER_HEAP_MAX_PAGES || physical % GRANULE != 0 {
+        return false;
+    }
+    unsafe {
+        let l1_user = follow_table(ttbr0, 0);
+        let l2_user = follow_table(l1_user, 1);
+        let l3_heap = follow_table(l2_user, USER_HEAP_L2_INDEX);
+        if read_entry(l3_heap, index) != 0 {
+            return false;
+        }
+        zero_page(physical);
+        write_entry(l3_heap, index, user_data_page(physical));
+        flush_after_table_change(l3_heap, GRANULE);
+    }
+    true
+}
+
+/// Removes a heap mapping and returns its physical frame to the caller.
+pub fn unmap_user_heap_page(ttbr0: usize, index: usize) -> Option<usize> {
+    if index >= USER_HEAP_MAX_PAGES {
+        return None;
+    }
+    unsafe {
+        let l1_user = follow_table(ttbr0, 0);
+        let l2_user = follow_table(l1_user, 1);
+        let l3_heap = follow_table(l2_user, USER_HEAP_L2_INDEX);
+        let entry = read_entry(l3_heap, index);
+        if entry & DESC_PAGE != DESC_PAGE {
+            return None;
+        }
+        write_entry(l3_heap, index, 0);
+        flush_after_table_change(l3_heap, GRANULE);
+        Some(descriptor_address(entry) as usize)
+    }
+}
+
 pub fn destroy_task_space(ttbr0: usize) {
     unsafe {
         let l1_user = follow_table(ttbr0, 0);
@@ -266,6 +314,17 @@ pub fn destroy_task_space(ttbr0: usize) {
         let image_table_entry = read_entry(l2_user, 0);
         if image_table_entry & DESC_TABLE == DESC_TABLE {
             frame_allocator::free_page(descriptor_address(image_table_entry) as usize);
+        }
+        let heap_table_entry = read_entry(l2_user, USER_HEAP_L2_INDEX);
+        if heap_table_entry & DESC_TABLE == DESC_TABLE {
+            let l3_heap = descriptor_address(heap_table_entry) as usize;
+            for index in 0..USER_HEAP_MAX_PAGES {
+                let entry = read_entry(l3_heap, index);
+                if entry & DESC_PAGE == DESC_PAGE {
+                    frame_allocator::free_page(descriptor_address(entry) as usize);
+                }
+            }
+            frame_allocator::free_page(l3_heap);
         }
         let stack_table_entry = read_entry(l2_user, USER_STACK_L2_INDEX);
         if stack_table_entry & DESC_TABLE == DESC_TABLE {
