@@ -96,7 +96,8 @@ fn execute(command: &str) {
             syscall::print("howl commands:\r\n");
             syscall::print("  help       Show this command list\r\n");
             syscall::print("  fastfetch  Show OS, uptime and memory information\r\n");
-            syscall::print("  diskread   Read sector 0 through the block driver\r\n");
+            syscall::print("  diskread [sector]\r\n");
+            syscall::print("             Read a sector (0 by default), show first 16 bytes\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
@@ -123,7 +124,19 @@ fn execute(command: &str) {
             syscall::print("  wait <cap> Wait for a task and print its exit status\r\n");
         }
         Some("fastfetch") => fastfetch(),
-        Some("diskread") => disk_read(),
+        Some("diskread") => {
+            let sector = match words.next() {
+                Some(value) => match parse_number(value) {
+                    Some(sector) => sector,
+                    None => {
+                        syscall::print("diskread: sector must be a non-negative integer\r\n");
+                        return;
+                    }
+                },
+                None => 0,
+            };
+            disk_read(sector);
+        }
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
@@ -144,9 +157,9 @@ fn execute(command: &str) {
     }
 }
 
-fn disk_read() {
+fn disk_read(sector: u64) {
     const BLOCK_DRIVER_TASK_ID: u64 = 5;
-    let request = ipc::Message::new(0, &[0]);
+    let request = ipc::Message::new(0, &sector.to_le_bytes());
     if !syscall::send(BLOCK_DRIVER_TASK_ID, &request) {
         syscall::print("DISK READ FAILED\r\n");
         return;
@@ -173,14 +186,15 @@ fn disk_read() {
         }
     }
 
-    let bytes = [
-        response.payload[1],
-        response.payload[2],
-        response.payload[3],
-        response.payload[4],
-    ];
-    syscall::print("DISK SECTOR 0: 0x");
-    syscall::print_hex_u64(u64::from(u32::from_be_bytes(bytes)));
+    let mut first = [0_u8; 8];
+    let mut second = [0_u8; 8];
+    first.copy_from_slice(&response.payload[1..9]);
+    second.copy_from_slice(&response.payload[9..17]);
+    syscall::print("DISK SECTOR ");
+    syscall::print_dec_u64(sector);
+    syscall::print(": 0x");
+    syscall::print_hex_u64(u64::from_be_bytes(first));
+    syscall::print_hex_u64(u64::from_be_bytes(second));
     syscall::print("\r\n");
 }
 

@@ -80,6 +80,7 @@ struct VirtqUsed {
 }
 
 static mut QUEUE: Option<Virtqueue> = None;
+static mut REQUEST_BUFFER: Option<(u64, u64)> = None;
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -139,17 +140,30 @@ pub extern "C" fn _start(_argument: u64) -> ! {
 }
 
 fn serve_ipc() -> ! {
+    unsafe { REQUEST_BUFFER = syscall::alloc_dma(4096) };
+    if unsafe { (*core::ptr::addr_of!(REQUEST_BUFFER)).is_none() } {
+        syscall::print("BLOCK DRIVER REQUEST DMA ALLOCATION FAILED\r\n");
+    }
+
     loop {
         let mut request = ipc::Message::new(0, &[]);
         if !syscall::receive(&mut request) || request.sender != 3 {
             continue;
         }
 
+        let mut sector_bytes = [0_u8; 8];
+        sector_bytes.copy_from_slice(&request.payload[..8]);
+        let sector = u64::from_le_bytes(sector_bytes);
         let queue = unsafe { (*core::ptr::addr_of!(QUEUE)).as_ref() };
         let response = if let Some(queue) = queue {
-            match unsafe { read_sector_zero(queue) } {
-                Some(bytes) => ipc::Message::new(0, &[1, bytes[0], bytes[1], bytes[2], bytes[3]]),
-                None => ipc::Message::new(0, &[0]),
+            let mut data = [0_u8; 512];
+            if unsafe { read_sector(queue, sector, &mut data) } {
+                let mut payload = [0_u8; 17];
+                payload[0] = 1;
+                payload[1..].copy_from_slice(&data[..16]);
+                ipc::Message::new(0, &payload)
+            } else {
+                ipc::Message::new(0, &[0])
             }
         } else {
             ipc::Message::new(0, &[2])
@@ -254,107 +268,101 @@ unsafe fn initialize_virtqueue(device: &VirtioBlk, mut queue: Virtqueue) -> Opti
     Some(queue)
 }
 
-unsafe fn read_sector_zero(queue: &Virtqueue) -> Option<[u8; 4]> {
-    const REQUEST_DMA_SIZE: u64 = 4096;
+unsafe fn read_sector(queue: &Virtqueue, sector: u64, buffer: &mut [u8; 512]) -> bool {
+    const REQUEST_DMA_SIZE: usize = 4096;
     const DATA_OFFSET: u64 = 16;
     const STATUS_OFFSET: u64 = DATA_OFFSET + 512;
     if queue.size < 3 {
-        return None;
+        return false;
     }
 
-    let (request_vaddr, request_paddr) = syscall::alloc_dma(REQUEST_DMA_SIZE)?;
-    unsafe { core::ptr::write_bytes(request_vaddr as *mut u8, 0, REQUEST_DMA_SIZE as usize) };
-    unsafe {
-        core::ptr::write_volatile(
-            request_vaddr as *mut VirtioBlkRequest,
-            VirtioBlkRequest {
-                request_type: 0,
-                reserved: 0,
-                sector: 0,
-            },
-        );
-    }
+    let Some((request_vaddr, request_paddr)) = (*core::ptr::addr_of!(REQUEST_BUFFER)) else {
+        return false;
+    };
+    core::ptr::write_bytes(request_vaddr as *mut u8, 0, REQUEST_DMA_SIZE);
+    core::ptr::write_volatile(
+        request_vaddr as *mut VirtioBlkRequest,
+        VirtioBlkRequest {
+            request_type: 0,
+            reserved: 0,
+            sector,
+        },
+    );
 
     let descriptors = queue.descriptors_vaddr as *mut VirtqDescriptor;
-    unsafe {
-        core::ptr::write_volatile(
-            descriptors,
-            VirtqDescriptor {
-                addr: request_paddr,
-                len: 16,
-                flags: 1,
-                next: 1,
-            },
-        );
-        core::ptr::write_volatile(
-            descriptors.add(1),
-            VirtqDescriptor {
-                addr: request_paddr + DATA_OFFSET,
-                len: 512,
-                flags: 1 | 2,
-                next: 2,
-            },
-        );
-        core::ptr::write_volatile(
-            descriptors.add(2),
-            VirtqDescriptor {
-                addr: request_paddr + STATUS_OFFSET,
-                len: 1,
-                flags: 2,
-                next: 0,
-            },
-        );
-    }
+    core::ptr::write_volatile(
+        descriptors,
+        VirtqDescriptor {
+            addr: request_paddr,
+            len: 16,
+            flags: 1,
+            next: 1,
+        },
+    );
+    core::ptr::write_volatile(
+        descriptors.add(1),
+        VirtqDescriptor {
+            addr: request_paddr + DATA_OFFSET,
+            len: 512,
+            flags: 1 | 2,
+            next: 2,
+        },
+    );
+    core::ptr::write_volatile(
+        descriptors.add(2),
+        VirtqDescriptor {
+            addr: request_paddr + STATUS_OFFSET,
+            len: 1,
+            flags: 2,
+            next: 0,
+        },
+    );
 
     let available = queue.available_vaddr as *mut VirtqAvailable;
     let used = queue.used_vaddr as *const VirtqUsed;
-    unsafe {
-        let available_idx = core::ptr::read_volatile(core::ptr::addr_of!((*available).idx));
-        let previous_used_idx = core::ptr::read_volatile(core::ptr::addr_of!((*used).idx));
-        core::ptr::write_volatile(core::ptr::addr_of_mut!((*available).flags), 0);
-        let available_ring = core::ptr::addr_of_mut!((*available).ring).cast::<u16>();
-        core::ptr::write_volatile(
-            available_ring.add(usize::from(available_idx % queue.size)),
-            0,
-        );
-        core::arch::asm!("dsb sy", options(nostack));
-        core::ptr::write_volatile(
-            core::ptr::addr_of_mut!((*available).idx),
-            available_idx.wrapping_add(1),
-        );
-        core::arch::asm!("dsb sy", options(nostack));
-        core::ptr::write_volatile(queue.notify_addr as *mut u16, queue.index);
+    let available_idx = core::ptr::read_volatile(core::ptr::addr_of!((*available).idx));
+    let previous_used_idx = core::ptr::read_volatile(core::ptr::addr_of!((*used).idx));
+    core::ptr::write_volatile(core::ptr::addr_of_mut!((*available).flags), 0);
+    let available_ring = core::ptr::addr_of_mut!((*available).ring).cast::<u16>();
+    core::ptr::write_volatile(
+        available_ring.add(usize::from(available_idx % queue.size)),
+        0,
+    );
+    core::arch::asm!("dsb sy", options(nostack));
+    core::ptr::write_volatile(
+        core::ptr::addr_of_mut!((*available).idx),
+        available_idx.wrapping_add(1),
+    );
+    core::arch::asm!("dsb sy", options(nostack));
+    core::ptr::write_volatile(queue.notify_addr as *mut u16, queue.index);
 
-        let mut remaining = 10_000_000_u32;
-        while core::ptr::read_volatile(core::ptr::addr_of!((*used).idx)) == previous_used_idx {
-            if remaining == 0 {
-                return None;
-            }
-            remaining -= 1;
-            core::hint::spin_loop();
+    let mut remaining = 10_000_000_u32;
+    while core::ptr::read_volatile(core::ptr::addr_of!((*used).idx)) == previous_used_idx {
+        if remaining == 0 {
+            return false;
         }
-        core::arch::asm!("dsb sy", options(nostack));
-
-        let used_ring = core::ptr::addr_of!((*used).ring).cast::<VirtqUsedElement>();
-        let used_element =
-            core::ptr::read_volatile(used_ring.add(usize::from(previous_used_idx % queue.size)));
-        if used_element.id != 0 {
-            return None;
-        }
-
-        let status = (request_vaddr + STATUS_OFFSET) as *const u8;
-        if core::ptr::read_volatile(status) != 0 {
-            return None;
-        }
-
-        let data = (request_vaddr + DATA_OFFSET) as *const u8;
-        Some([
-            core::ptr::read_volatile(data),
-            core::ptr::read_volatile(data.add(1)),
-            core::ptr::read_volatile(data.add(2)),
-            core::ptr::read_volatile(data.add(3)),
-        ])
+        remaining -= 1;
+        core::hint::spin_loop();
     }
+    core::arch::asm!("dsb sy", options(nostack));
+
+    let used_ring = core::ptr::addr_of!((*used).ring).cast::<VirtqUsedElement>();
+    let used_element =
+        core::ptr::read_volatile(used_ring.add(usize::from(previous_used_idx % queue.size)));
+    if used_element.id != 0 {
+        return false;
+    }
+
+    let status = (request_vaddr + STATUS_OFFSET) as *const u8;
+    if core::ptr::read_volatile(status) != 0 {
+        return false;
+    }
+
+    let data = (request_vaddr + DATA_OFFSET) as *const u8;
+    for (index, byte) in buffer.iter_mut().enumerate() {
+        *byte = core::ptr::read_volatile(data.add(index));
+    }
+    true
 }
 
 fn pci_config_address(bus: u8, device: u8, function: u8, offset: u16) -> u64 {
