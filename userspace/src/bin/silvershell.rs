@@ -98,6 +98,8 @@ fn execute(command: &str) {
             syscall::print("  fastfetch  Show OS, uptime and memory information\r\n");
             syscall::print("  diskread [sector]\r\n");
             syscall::print("             Read a sector (0 by default), show first 16 bytes\r\n");
+            syscall::print("  hexdump [sector]\r\n");
+            syscall::print("             Dump 512 bytes of a sector (0 by default)\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
@@ -136,6 +138,19 @@ fn execute(command: &str) {
                 None => 0,
             };
             disk_read(sector);
+        }
+        Some("hexdump") => {
+            let sector = match words.next() {
+                Some(value) => match parse_number(value) {
+                    Some(sector) => sector,
+                    None => {
+                        syscall::print("hexdump: sector must be a non-negative integer\r\n");
+                        return;
+                    }
+                },
+                None => 0,
+            };
+            hexdump(sector);
         }
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
@@ -236,6 +251,118 @@ fn disk_read(sector: u64) {
     syscall::print_hex_u64(u64::from_be_bytes(first));
     syscall::print_hex_u64(u64::from_be_bytes(second));
     syscall::print("\r\n");
+}
+
+fn hexdump(sector: u64) {
+    const BLOCK_DRIVER_TASK_ID: u64 = 5;
+    static mut SHARED_MAPPING: Option<(u64, u64)> = None;
+
+    let request = ipc::Message::new(0, &sector.to_le_bytes());
+    if !syscall::send(BLOCK_DRIVER_TASK_ID, &request) {
+        syscall::print("HEXDUMP FAILED\r\n");
+        return;
+    }
+
+    let mut response = ipc::Message::new(0, &[]);
+    if !receive_from(BLOCK_DRIVER_TASK_ID, &mut response) || response.payload[0] != 1 {
+        syscall::print("HEXDUMP FAILED\r\n");
+        return;
+    }
+
+    let mut physical_bytes = [0_u8; 8];
+    let mut length_bytes = [0_u8; 2];
+    physical_bytes.copy_from_slice(&response.payload[1..9]);
+    length_bytes.copy_from_slice(&response.payload[9..11]);
+    let physical_address = u64::from_le_bytes(physical_bytes);
+    let length = usize::from(u16::from_le_bytes(length_bytes));
+
+    if length != 512 {
+        syscall::print("HEXDUMP FAILED: BAD LENGTH\r\n");
+        acknowledge_disk_buffer();
+        return;
+    }
+
+    let mapped = unsafe {
+        match SHARED_MAPPING {
+            Some((cached_physical, virtual_address)) if cached_physical == physical_address => {
+                Some(virtual_address)
+            }
+            _ => {
+                let mapped = syscall::map_phys(physical_address, length as u64);
+                if let Some(virtual_address) = mapped {
+                    SHARED_MAPPING = Some((physical_address, virtual_address));
+                }
+                mapped
+            }
+        }
+    };
+
+    let Some(virtual_address) = mapped else {
+        syscall::print("HEXDUMP FAILED: MAP FAILED\r\n");
+        acknowledge_disk_buffer();
+        return;
+    };
+
+    let mut data = [0_u8; 512];
+    for (index, byte) in data.iter_mut().enumerate() {
+        *byte = unsafe { core::ptr::read_volatile((virtual_address as *const u8).add(index)) };
+    }
+    acknowledge_disk_buffer();
+
+    syscall::print("HEXDUMP SECTOR ");
+    syscall::print_dec_u64(sector);
+    syscall::print("\r\n");
+
+    for line in 0..32 {
+        let offset = line * 16;
+        
+        // Offset
+        print_offset(offset);
+        syscall::print("  ");
+
+        // Hex bytes
+        for i in 0..16 {
+            print_hex_byte(data[offset + i]);
+            syscall::print(" ");
+            if i == 7 {
+                syscall::print(" ");
+            }
+        }
+        
+        syscall::print(" |");
+
+        // ASCII
+        for i in 0..16 {
+            let b = data[offset + i];
+            let c = if (32..=126).contains(&b) { b } else { b'.' };
+            let buf = [c];
+            if let Ok(s) = core::str::from_utf8(&buf) {
+                syscall::print(s);
+            }
+        }
+        syscall::print("|\r\n");
+    }
+}
+
+fn print_offset(offset: usize) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut buf = [b'0'; 8];
+    let mut val = offset;
+    for i in (0..8).rev() {
+        buf[i] = HEX[val & 0xF];
+        val >>= 4;
+    }
+    if let Ok(s) = core::str::from_utf8(&buf) {
+        syscall::print(s);
+    }
+}
+
+fn print_hex_byte(b: u8) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let buf = [HEX[(b >> 4) as usize], HEX[(b & 0xF) as usize]];
+    if let Ok(s) = core::str::from_utf8(&buf) {
+        syscall::print(s);
+    }
 }
 
 fn acknowledge_disk_buffer() {
