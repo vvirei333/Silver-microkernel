@@ -79,6 +79,8 @@ struct VirtqUsed {
     ring: [VirtqUsedElement; 0],
 }
 
+static mut QUEUE: Option<Virtqueue> = None;
+
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(_argument: u64) -> ! {
@@ -121,13 +123,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
                 syscall::print("\r\n");
                 if let Some(queue) = initialize_virtqueue(&device, queue) {
                     syscall::print("VIRTIO-BLK INITIALIZED AND READY\r\n");
-                    if let Some(first_bytes) = read_sector_zero(&queue) {
-                        syscall::print("SECTOR 0: 0x");
-                        syscall::print_hex_u64(u64::from(u32::from_be_bytes(first_bytes)));
-                        syscall::print("\r\n");
-                    } else {
-                        syscall::print("SECTOR 0 READ FAILED\r\n");
-                    }
+                    QUEUE = Some(queue);
                 } else {
                     syscall::print("VIRTQUEUE 0 INITIALIZATION FAILED\r\n");
                 }
@@ -139,8 +135,26 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         syscall::print("VIRTIO-BLK NOT FOUND\r\n");
     }
 
+    serve_ipc()
+}
+
+fn serve_ipc() -> ! {
     loop {
-        syscall::sleep(1000);
+        let mut request = ipc::Message::new(0, &[]);
+        if !syscall::receive(&mut request) || request.sender != 3 {
+            continue;
+        }
+
+        let queue = unsafe { (*core::ptr::addr_of!(QUEUE)).as_ref() };
+        let response = if let Some(queue) = queue {
+            match unsafe { read_sector_zero(queue) } {
+                Some(bytes) => ipc::Message::new(0, &[1, bytes[0], bytes[1], bytes[2], bytes[3]]),
+                None => ipc::Message::new(0, &[0]),
+            }
+        } else {
+            ipc::Message::new(0, &[2])
+        };
+        let _ = syscall::send(request.sender, &response);
     }
 }
 

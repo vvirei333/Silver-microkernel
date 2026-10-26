@@ -96,6 +96,7 @@ fn execute(command: &str) {
             syscall::print("howl commands:\r\n");
             syscall::print("  help       Show this command list\r\n");
             syscall::print("  fastfetch  Show OS, uptime and memory information\r\n");
+            syscall::print("  diskread   Read sector 0 through the block driver\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
@@ -122,6 +123,7 @@ fn execute(command: &str) {
             syscall::print("  wait <cap> Wait for a task and print its exit status\r\n");
         }
         Some("fastfetch") => fastfetch(),
+        Some("diskread") => disk_read(),
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
@@ -139,6 +141,57 @@ fn execute(command: &str) {
         Some("kill") => kill_task(words.next()),
         Some("wait") => wait_task(words.next()),
         Some(_) => syscall::print("Unknown command. Type 'help'.\r\n"),
+    }
+}
+
+fn disk_read() {
+    const BLOCK_DRIVER_TASK_ID: u64 = 5;
+    let request = ipc::Message::new(0, &[0]);
+    if !syscall::send(BLOCK_DRIVER_TASK_ID, &request) {
+        syscall::print("DISK READ FAILED\r\n");
+        return;
+    }
+
+    let mut response = ipc::Message::new(0, &[]);
+    if !receive_from(BLOCK_DRIVER_TASK_ID, &mut response) {
+        syscall::print("DISK READ FAILED\r\n");
+        return;
+    }
+    match response.payload[0] {
+        0 => {
+            syscall::print("DISK READ FAILED\r\n");
+            return;
+        }
+        2 => {
+            syscall::print("DISK DRIVER NOT INITIALIZED (NO DISK?)\r\n");
+            return;
+        }
+        1 => {}
+        _ => {
+            syscall::print("DISK READ FAILED\r\n");
+            return;
+        }
+    }
+
+    let bytes = [
+        response.payload[1],
+        response.payload[2],
+        response.payload[3],
+        response.payload[4],
+    ];
+    syscall::print("DISK SECTOR 0: 0x");
+    syscall::print_hex_u64(u64::from(u32::from_be_bytes(bytes)));
+    syscall::print("\r\n");
+}
+
+fn receive_from(task_id: u64, buffer: &mut ipc::Message) -> bool {
+    loop {
+        if !syscall::receive(buffer) {
+            return false;
+        }
+        if buffer.sender == task_id {
+            return true;
+        }
     }
 }
 
