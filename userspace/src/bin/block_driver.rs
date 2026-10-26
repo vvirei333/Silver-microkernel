@@ -12,6 +12,12 @@ const ASSIGNED_BAR0: u32 = 0x1000_0000;
 const ASSIGNED_BAR4: u32 = 0x1010_0000;
 const BAR_MAPPING_SIZE: u64 = 64 * 1024;
 
+/// One timer tick is 10 ms. The driver polls for the client acknowledgement in
+/// 1 s slices and gives up after 10 s: a client that dies while holding the
+/// shared DMA window must not wedge the driver for every other caller.
+const ACK_POLL_TICKS: u64 = 100;
+const ACK_TIMEOUT_TICKS: u64 = 1000;
+
 #[allow(dead_code)]
 #[derive(Copy, Clone)]
 struct VirtioCapability {
@@ -147,7 +153,10 @@ fn serve_ipc() -> ! {
 
     loop {
         let mut request = ipc::Message::new(0, &[]);
-        if !syscall::receive(&mut request) || request.sender != 3 {
+        // Any live client may ask for a sector: the driver never assumes who
+        // the caller is, it answers `request.sender` from the kernel-built
+        // message header.
+        if !syscall::receive(&mut request) {
             continue;
         }
 
@@ -172,16 +181,28 @@ fn serve_ipc() -> ! {
             ipc::Message::new(0, &[2])
         };
         let shared_buffer = response.payload[0] == 1;
-        if syscall::send(request.sender, &response) && shared_buffer {
-            loop {
-                let mut acknowledgement = ipc::Message::new(0, &[]);
-                if syscall::receive(&mut acknowledgement)
-                    && acknowledgement.sender == request.sender
-                    && acknowledgement.payload[0] == 0xA5
-                {
-                    break;
-                }
+        if !syscall::send(request.sender, &response) || !shared_buffer {
+            continue;
+        }
+        await_acknowledgement(request.sender);
+    }
+}
+
+/// Keeps the shared DMA window private until the client releases it. A client
+/// that dies mid-read, or never sends the acknowledgement, is abandoned after
+/// `ACK_TIMEOUT_TICKS` so the next request is still served.
+fn await_acknowledgement(client: u64) {
+    let deadline = syscall::uptime_ticks().saturating_add(ACK_TIMEOUT_TICKS);
+    loop {
+        let mut acknowledgement = ipc::Message::new(0, &[]);
+        if syscall::receive_timeout(&mut acknowledgement, ACK_POLL_TICKS).is_err() {
+            if !syscall::task_alive(client) || syscall::uptime_ticks() >= deadline {
+                return;
             }
+            continue;
+        }
+        if acknowledgement.sender == client && acknowledgement.payload[0] == 0xA5 {
+            return;
         }
     }
 }

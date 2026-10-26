@@ -28,22 +28,6 @@ pub enum TaskState {
     Dead,
 }
 
-/// Saved execution state of a task. The context switch (`silver_context_switch`)
-/// stores/restores this whole block and finishes with `ret`, so every field
-/// maps 1:1 onto CPU state:
-///   registers          x19-x30 (callee-saved; the trampolines own x0-x18)
-///   stack_pointer      SP_EL1 while the task is inside the kernel
-///   user_stack_pointer SP_EL0 (user tasks only; 0 for kernel tasks)
-///   elr                resume PC, loaded into x30: the task entry point for
-///                      a fresh task, or silver_user_bootstrap for a fresh
-///                      EL0 task (entry passed in x19); for a running task it
-///                      is the saved x30, which returns into schedule() and
-///                      unwinds back to the trampoline epilogue (see main.rs)
-///
-/// Note there is deliberately NO spsr field: resume always lands at EL1h
-/// (the `ret` target is EL1 code), and the true return level (EL0t vs EL1h)
-/// lives in the exception frame's SPSR slot, restored by the trampoline
-/// epilogue.
 #[repr(C, align(16))]
 pub struct TaskContext {
     registers: [u64; 12],
@@ -75,37 +59,24 @@ pub struct TaskInfo {
 pub struct Task {
     pub id: u64,
     pub state: TaskState,
-    /// State to restore after fg; notifications may replace it while stopped.
     resume_state: Option<TaskState>,
     pub program: u64,
     pub argument: u64,
     pub cap_table: capability::CapTable,
     pub bound_irq: Option<u32>,
     irq_pending: bool,
-    /// Immutable byte string passed to SYS_ARGS in the new task.
     arguments: Vec<u8>,
-    /// Absolute working directory, inherited by child tasks.
     cwd: String,
-    /// UART access is granted only to the foreground owner in shell mode.
     owns_console: bool,
     pub context: TaskContext,
-    /// Kernel stack: used for SVC/IRQ trampolines whenever the task runs.
     pub stack: MemoryRegion,
-    /// User stack (SP_EL0) for EL0 tasks; empty for kernel tasks.
     pub user_stack: MemoryRegion,
-    /// Physical base of this task's translation tables (TTBR0_EL1 value).
     pub ttbr0: usize,
-    /// Independently loaded ELF pages; released together with the address space.
     user_image: Option<UserImage>,
-    /// Physical heap frames in virtual-page order. The MMU frees them on reap.
     heap_pages: Vec<usize>,
-    /// Contiguous DMA allocations: physical base and page count.
     dma_pages: Vec<(usize, usize)>,
-    /// Current byte-granular program break within the reserved heap window.
     program_break: usize,
-    /// Queue containing this task while blocked, used for stale-waiter cleanup.
     waiting_on: Option<*const WaitQueue>,
-    /// Mutexes owned by this task, released if it exits without unlocking.
     owned_mutexes: Vec<*mut mutex::MutexState>,
 }
 
@@ -113,13 +84,10 @@ pub struct TaskManager {
     tasks: Vec<Task>,
     current_index: usize,
     next_id: u64,
-    /// Shell waiting for the current foreground task; None at a shell prompt.
     console_parent: Option<u64>,
-    /// Bounded completion records let wait() succeed even after reaping.
     exit_statuses: Vec<(u64, u64)>,
 }
 
-// DEBUG: ring buffer of the last context switches (from, to, next sp, next elr).
 const TRACE_LEN: usize = 16;
 static mut SWITCH_TRACE: [(u64, u64, u64, u64); TRACE_LEN] = [(0, 0, 0, 0); TRACE_LEN];
 static mut TRACE_POS: usize = 0;
@@ -161,9 +129,6 @@ pub fn dump_switch_trace() {
 }
 
 struct SharedScheduler(UnsafeCell<Option<TaskManager>>);
-
-// Public scheduler entry points disable IRQs while mutating TaskManager. Timer IRQs
-// enter schedule() already masked. Add a real lock when SMP support appears.
 unsafe impl Sync for SharedScheduler {}
 
 static SCHEDULER: SharedScheduler = SharedScheduler(UnsafeCell::new(None));
@@ -175,14 +140,6 @@ core::arch::global_asm!(
     .section .text.scheduler, "ax"
     .global silver_context_switch
     .type silver_context_switch, %function
-// Saves the current task's x19-x30 and SP_EL1/SP_EL0 into the block at x0,
-// loads the same from the block at x1, and resumes the new task with `ret`.
-// x30 holds the resume PC: for a running task it is the return address into
-// schedule() (the call chain trampoline -> handler -> schedule unwinds back
-// to the trampoline epilogue, which still owns the correct SP and the saved
-// ELR/SPSR frame slots); for a fresh task it is the entry point (EL1) or
-// silver_user_bootstrap (EL0). ELR_EL1/SPSR_EL1 are deliberately NOT part of
-// the switch: they live in the trampoline frames.
 silver_context_switch:
     stp x19, x20, [x0, #0]
     stp x21, x22, [x0, #16]
@@ -194,7 +151,7 @@ silver_context_switch:
     str x9, [x0, #96]
     mrs x9, sp_el0
     str x9, [x0, #104]
-    str x30, [x0, #112]        // resume PC: return into schedule()
+    str x30, [x0, #112]
 
     ldr x9, [x1, #104]
     msr sp_el0, x9
@@ -206,13 +163,10 @@ silver_context_switch:
     ldp x25, x26, [x1, #48]
     ldp x27, x28, [x1, #64]
     ldp x29, x30, [x1, #80]
-    ldr x30, [x1, #112]        // resume PC (elr field) wins over saved x30
+    ldr x30, [x1, #112]
     ret
     .size silver_context_switch, . - silver_context_switch
 
-// First entry for a fresh EL0 task. x19 holds the ELF entry and x20 the
-// userspace argument. The bootstrap passes the argument in x0, then erets to
-// EL0t with interrupts unmasked.
     .global silver_user_bootstrap
     .type silver_user_bootstrap, %function
 silver_user_bootstrap:
@@ -240,11 +194,8 @@ pub fn init() {
         exit_statuses: Vec::new(),
     });
 
-    // Idle always exists, so the CPU has somewhere to run when all tasks sleep.
     let _idle_id = spawn_kernel(idle_task);
 
-    // Normal boot enters userspace only through silverd. The regression profile
-    // keeps Scout at task ID 1 because the demo IPC protocol depends on it.
     #[cfg(not(feature = "demo-tasks"))]
     {
         let silverd_id =
@@ -278,10 +229,8 @@ pub fn init() {
         .unwrap_or(0);
 }
 
-/// Voluntarily gives up the remainder of the current time slice.
 pub fn yield_current() {
     let saved_daif = interrupts::save_and_disable_irq();
-
     if let Some(task) = current_task_mut() {
         if task.state == TaskState::Running {
             task.state = TaskState::Ready;
@@ -291,33 +240,26 @@ pub fn yield_current() {
     interrupts::restore_irq(saved_daif);
 }
 
-/// Puts the current task to sleep for approximately the requested duration.
 pub fn sleep(milliseconds: u64) {
     if milliseconds == 0 {
         yield_current();
         return;
     }
-
     let saved_daif = interrupts::save_and_disable_irq();
     let wake_at = timer::ticks().saturating_add(timer::milliseconds_to_ticks(milliseconds));
-
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Sleeping(wake_at);
     }
-
     schedule();
     interrupts::restore_irq(saved_daif);
 }
 
-/// Blocks until the bound interrupt arrives. A pending flag closes the race
-/// between hardware delivery and entry into this syscall.
 pub fn wait_irq() -> bool {
     let saved_daif = interrupts::save_and_disable_irq();
     if current_task_mut().and_then(|task| task.bound_irq).is_none() {
         interrupts::restore_irq(saved_daif);
         return false;
     }
-
     loop {
         let Some(task) = current_task_mut() else {
             interrupts::restore_irq(saved_daif);
@@ -350,7 +292,6 @@ pub fn irq_is_bound(intid: u32) -> bool {
         .unwrap_or(false)
 }
 
-/// Called from the IRQ handler with interrupts already masked.
 pub fn wake_bound_irq(intid: u32) -> bool {
     let Some(manager) = scheduler_manager() else {
         return false;
@@ -367,8 +308,27 @@ pub fn wake_bound_irq(intid: u32) -> bool {
     true
 }
 
-/// Wakes a driver waiting in `wait_irq` when a non-IRQ event is queued for it.
-/// Howler uses the same event wait for hardware RX and IPC-based TX.
+/// Task that owns the PL011 interrupt, i.e. the userspace console sink.
+///
+/// Resolved from live scheduler state instead of a hardcoded task ID: the
+/// binding of INTID 33 is exclusive, so at most one task can be the sink, and
+/// console routing then survives any spawn order chosen by silverd or the shell.
+#[cfg(not(feature = "demo-tasks"))]
+pub fn console_sink_task() -> Option<u64> {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let sink = scheduler_manager().and_then(|manager| {
+        manager
+            .tasks
+            .iter()
+            .find(|task| {
+                task.state != TaskState::Dead && task.bound_irq == Some(crate::gic::UART_IRQ)
+            })
+            .map(|task| task.id)
+    });
+    interrupts::restore_irq(saved_daif);
+    sink
+}
+
 #[cfg(not(feature = "demo-tasks"))]
 pub fn notify_bound_task(id: u64) -> bool {
     let saved_daif = interrupts::save_and_disable_irq();
@@ -390,15 +350,12 @@ pub fn notify_bound_task(id: u64) -> bool {
     notified
 }
 
-/// Remembers a wait queue before its associated mutex is released.
 pub fn register_waiter(queue: &WaitQueue) {
     if let Some(task) = current_task_mut() {
         task.waiting_on = Some(queue as *const WaitQueue);
     }
 }
 
-/// Enqueues and blocks the current task. The queue pointer allows reaping to
-/// remove a dead waiter instead of leaving stale IDs behind.
 pub fn block_current_on(queue: &WaitQueue) {
     let saved_daif = interrupts::save_and_disable_irq();
     let id = current_task_id();
@@ -407,7 +364,6 @@ pub fn block_current_on(queue: &WaitQueue) {
         task.waiting_on = Some(queue as *const WaitQueue);
         task.state = TaskState::Blocked;
     }
-
     schedule();
     if let Some(task) = current_task_mut() {
         task.waiting_on = None;
@@ -415,9 +371,6 @@ pub fn block_current_on(queue: &WaitQueue) {
     interrupts::restore_irq(saved_daif);
 }
 
-/// Blocks on a condition queue until notified or an absolute timer deadline.
-/// Notification removes the ID from the queue; a timeout does not, so removal
-/// on resume is required to prevent a stale waiter from a later wakeup.
 pub fn block_current_on_until(queue: &WaitQueue, deadline: u64) {
     let saved_daif = interrupts::save_and_disable_irq();
     let id = current_task_id();
@@ -426,7 +379,6 @@ pub fn block_current_on_until(queue: &WaitQueue, deadline: u64) {
         task.waiting_on = Some(queue as *const WaitQueue);
         task.state = TaskState::BlockedUntil(deadline);
     }
-
     schedule();
     queue.remove(id);
     if let Some(task) = current_task_mut() {
@@ -437,13 +389,11 @@ pub fn block_current_on_until(queue: &WaitQueue, deadline: u64) {
 
 pub fn wake_task(id: u64) {
     let saved_daif = interrupts::save_and_disable_irq();
-
     if let Some(manager) = scheduler_manager() {
         if let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) {
             wake_blocked_task(task);
         }
     }
-
     interrupts::restore_irq(saved_daif);
 }
 
@@ -463,7 +413,6 @@ pub fn unregister_mutex(state: *mut mutex::MutexState) {
 
 const EXIT_STATUS_LIMIT: usize = 64;
 
-/// Terminates the current task successfully and switches to another task.
 pub fn exit_current() -> ! {
     exit_current_with_status(0)
 }
@@ -473,7 +422,6 @@ pub fn exit_current_with_status(status: u64) -> ! {
     crate::ipc::remove_task(id);
     vfs::close_task(id);
     let saved_daif = interrupts::save_and_disable_irq();
-
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Dead;
         task.bound_irq = None;
@@ -482,23 +430,19 @@ pub fn exit_current_with_status(status: u64) -> ! {
         recover_console(manager, id);
         record_exit(manager, id, status);
     }
-
     schedule();
     interrupts::restore_irq(saved_daif);
-
     loop {
         interrupts::wait_for_irq();
     }
 }
 
-/// Kills a non-current userspace task. Reaping releases its VM, stacks and locks.
 pub fn kill_task(id: u64) -> bool {
     if id == IDLE_TASK_ID || id == current_task_id() {
         return false;
     }
     crate::ipc::remove_task(id);
     vfs::close_task(id);
-
     let saved_daif = interrupts::save_and_disable_irq();
     let Some(manager) = scheduler_manager() else {
         interrupts::restore_irq(saved_daif);
@@ -530,9 +474,6 @@ fn recover_console(manager: &mut TaskManager, exited: u64) {
     }
     exited_task.owns_console = false;
     manager.console_parent = None;
-
-    // The regression profile intentionally lets all demo tasks print. Only
-    // remove the dead task's access; interactive mode returns to a live shell.
     if cfg!(feature = "demo-tasks") {
         return;
     }
@@ -552,7 +493,6 @@ pub enum WaitEvent {
     Stopped,
 }
 
-/// Waits only for termination and consumes its completion record.
 pub fn wait_for_task(id: u64) -> Option<u64> {
     match wait_inner(id, false) {
         Some(WaitEvent::Exited(status)) => Some(status),
@@ -560,7 +500,6 @@ pub fn wait_for_task(id: u64) -> Option<u64> {
     }
 }
 
-/// Foreground wait also returns when Ctrl-Z stops the child.
 pub fn wait_for_task_event(id: u64) -> Option<WaitEvent> {
     wait_inner(id, true)
 }
@@ -595,7 +534,6 @@ fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
             interrupts::restore_irq(saved_daif);
             return Some(WaitEvent::Stopped);
         }
-
         let waiter = current_task_id();
         PROCESS_WAIT_QUEUE.enqueue(waiter);
         if let Some(task) = current_task_mut() {
@@ -671,8 +609,6 @@ pub fn current_task_owns_console() -> bool {
         .unwrap_or(false)
 }
 
-/// Called after kernel PL011 or Howler consumes Ctrl-Z. A shell prompt has no
-/// console parent and is therefore immune to its own stop key.
 pub fn stop_console_owner() -> bool {
     let saved_daif = interrupts::save_and_disable_irq();
     let mut stopped = false;
@@ -701,7 +637,6 @@ pub fn stop_console_owner() -> bool {
     stopped
 }
 
-/// Resumes a stopped task in its saved state; a live running task is a no-op.
 pub fn resume_task(id: u64) -> bool {
     if id == IDLE_TASK_ID {
         return false;
@@ -729,8 +664,6 @@ pub fn resume_task(id: u64) -> bool {
     result
 }
 
-/// Assigns the single interactive UART owner. Background tasks keep running,
-/// but their print/read syscalls have no effect until they own the console.
 pub fn set_console_owner(id: u64) -> bool {
     let saved_daif = interrupts::save_and_disable_irq();
     let caller = current_task_id();
@@ -783,8 +716,6 @@ pub fn current_task_cwd() -> String {
         .unwrap_or_else(|| String::from("/"))
 }
 
-/// True if a live task has its cwd at this directory or below it. Callers
-/// must hold the VFS IRQ critical section so chdir cannot race the check.
 pub fn cwd_in_use(path: &str) -> bool {
     scheduler_manager()
         .map(|manager| {
@@ -809,7 +740,6 @@ pub fn set_current_task_cwd(cwd: String) -> bool {
     false
 }
 
-/// Snapshot for SYS_TASK_LIST. Numeric states are part of the userspace ABI.
 pub fn task_infos() -> Vec<TaskInfo> {
     scheduler_manager()
         .map(|manager| {
@@ -839,13 +769,10 @@ fn state_code(state: TaskState) -> u64 {
     }
 }
 
-/// Queries or moves the current EL0 task's program break. Zero is the query
-/// form; failed growth leaves both the break and all heap mappings unchanged.
 pub fn change_program_break(requested: usize) -> Option<usize> {
     current_task_mut()?.change_program_break(requested)
 }
 
-/// Switches from the boot context into the first task. This function never returns.
 pub fn start() -> ! {
     let saved_daif = interrupts::save_and_disable_irq();
     let manager = scheduler_manager().unwrap();
@@ -878,7 +805,6 @@ pub fn start() -> ! {
     }
 }
 
-/// Wakes expired sleepers, skips sleeping tasks, and switches to the next ready task.
 pub fn schedule() {
     let Some(manager) = scheduler_manager() else {
         return;
@@ -887,10 +813,6 @@ pub fn schedule() {
         return;
     }
 
-    // Capture BEFORE reap: does the task that owns the live CPU context
-    // intend to die? reap may remove it from the Vec and reset
-    // current_index to 0, after which tasks[current_index] is some innocent
-    // task — checking its state would answer the wrong question.
     let live_task_id = manager
         .tasks
         .get(manager.current_index)
@@ -945,9 +867,6 @@ pub fn schedule() {
     next_task.state = TaskState::Running;
     manager.current_index = next_index;
 
-    // A dead task may have been removed before the only ready task (idle),
-    // making both indices zero. It must still switch, and its live context
-    // must go to scratch rather than overwriting idle's saved context.
     let current_context = if live_is_dead {
         unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CONTEXT) }
     } else {
@@ -980,7 +899,6 @@ fn spawn_kernel(entry: extern "C" fn() -> !) -> Option<u64> {
     spawn_inner(Some(entry), None, Vec::new())
 }
 
-/// Creates a userspace task from a registered ELF and passes `argument` in x0.
 pub fn spawn_user(program: u64, argument: u64) -> Option<u64> {
     spawn_inner(None, Some((program, argument)), Vec::new())
 }
@@ -1061,7 +979,6 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
     result
 }
 
-/// Allocates, zeroes and maps contiguous DMA frames. Returns user VA and PA.
 pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
     if size == 0 || size > mmu::USER_DMA_MAX_SIZE {
         return None;
@@ -1216,10 +1133,8 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         .map(|task| task.id)
         .collect();
 
-    // Remember WHO owns the live CPU context before compacting the Vec.
     let live_id = manager.tasks.get(manager.current_index).map(|task| task.id);
 
-    // Remove stale waiters and release locks before freeing any task pages.
     let mut wake = Vec::new();
     for task in manager
         .tasks
@@ -1264,9 +1179,6 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         }
     });
 
-    // If the live task itself was Dead (exit path), it is gone from the
-    // list; index 0 is fine because the switch below parks the doomed
-    // context in scratch instead of overwriting task 0.
     manager.current_index = live_id
         .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
         .unwrap_or(0);
@@ -1342,7 +1254,7 @@ impl Task {
         } else {
             entry.expect("kernel task entry is required") as usize as u64
         };
-        context.registers[1] = user.map_or(0, |(_, argument)| argument); // x20 -> user x0
+        context.registers[1] = user.map_or(0, |(_, argument)| argument);
         context.elr = if user.is_some() {
             silver_user_bootstrap as *const () as usize as u64
         } else {
@@ -1357,6 +1269,9 @@ impl Task {
 
         let mut cap_table = capability::CapTable::new();
         match user.map(|(program, _)| program) {
+            Some(user_program::SILVERD) => {
+                cap_table.insert(id, capability::CAP_ALL); // <--- ДОБАВЛЕНО
+            }
             Some(user_program::HOWLER) => {
                 cap_table.insert(id, capability::CAP_MMIO | capability::CAP_IRQ);
             }
@@ -1377,8 +1292,6 @@ impl Task {
             irq_pending: false,
             arguments,
             cwd: String::from("/"),
-            // Legacy regression tasks share UART; interactive children start
-            // without console access until the shell explicitly foregrounds them.
             owns_console: cfg!(feature = "demo-tasks"),
             context,
             stack,
@@ -1479,9 +1392,6 @@ fn scheduler_manager() -> Option<&'static mut TaskManager> {
 }
 
 extern "C" fn idle_task() -> ! {
-    // The only kernel (EL1) task. Its initial context resumes with DAIF
-    // masked, so it must unmask IRQ itself; user tasks get unmasked PSTATE
-    // from the bootstrap instead.
     interrupts::enable_irq();
     loop {
         interrupts::wait_for_irq();

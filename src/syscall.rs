@@ -587,9 +587,17 @@ fn write_console_bytes(bytes: &[u8]) {
 
 #[cfg(not(feature = "demo-tasks"))]
 fn write_console_bytes(bytes: &[u8]) {
-    const HOWLER_TASK_ID: u64 = 4;
     const IPC_OUTPUT: u8 = 1;
     const DATA_CAPACITY: usize = ipc::PAYLOAD_SIZE - 2;
+
+    // Console output is drained by whichever task currently owns PL011's
+    // interrupt (Howler). Its task ID depends on spawn order, so it must never
+    // be hardcoded: another task reusing that ID would swallow the output.
+    // Before Howler binds INTID 33 the kernel writes to PL011 directly.
+    let Some(sink) = scheduler::console_sink_task() else {
+        pl011::write_bytes(bytes);
+        return;
+    };
 
     for chunk in bytes.chunks(DATA_CAPACITY) {
         let mut message = ipc::Message {
@@ -599,11 +607,11 @@ fn write_console_bytes(bytes: &[u8]) {
         message.payload[0] = IPC_OUTPUT;
         message.payload[1] = chunk.len() as u8;
         message.payload[2..2 + chunk.len()].copy_from_slice(chunk);
-        match ipc::try_send(HOWLER_TASK_ID, message) {
+        match ipc::try_send(sink, message) {
             Ok(()) => {
                 // TX IPC and hardware RX share Howler's event wait. Yield so a
                 // burst of small print calls cannot fill the bounded mailbox.
-                scheduler::notify_bound_task(HOWLER_TASK_ID);
+                scheduler::notify_bound_task(sink);
                 scheduler::yield_current();
             }
             Err(ipc::SendError::TargetDead) => pl011::write_bytes(chunk),

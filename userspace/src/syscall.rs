@@ -67,6 +67,7 @@ pub const PROGRAM_ECHO: u64 = 7;
 pub const PROGRAM_SAY: u64 = 8;
 pub const PROGRAM_SL: u64 = 9;
 pub const PROGRAM_BLOCK_DRIVER: u64 = 10;
+pub const PROGRAM_SFS_SERVER: u64 = 11;
 pub const CAP_MMIO: u32 = 1 << 4;
 pub const CAP_IRQ: u32 = 1 << 5;
 pub const CAP_PCI: u32 = 1 << 6;

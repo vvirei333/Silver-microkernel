@@ -11,6 +11,7 @@ pub const ECHO: u64 = 7;
 pub const SAY: u64 = 8;
 pub const SL: u64 = 9;
 pub const BLOCK_DRIVER: u64 = 10;
+pub const SFS_SERVER: u64 = 11; // <--- ДОБАВЛЕНО
 
 static DEMO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silver_userspace.elf"));
 static SILVERD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silverd.elf"));
@@ -23,6 +24,7 @@ static ECHO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo.elf"));
 static SAY_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/say.elf"));
 static SL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sl.elf"));
 static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block_driver.elf"));
+static SFS_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sfs_server.elf")); // <--- ДОБАВЛЕНО
 
 /// Selects an executable for spawn. Unknown program IDs are rejected.
 pub fn image(program: u64) -> Option<&'static [u8]> {
@@ -38,6 +40,7 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         SAY => Some(SAY_ELF),
         SL => Some(SL_ELF),
         BLOCK_DRIVER => Some(BLOCK_DRIVER_ELF),
+        SFS_SERVER => Some(SFS_SERVER_ELF), // <--- ДОБАВЛЕНО
         _ => None,
     }
 }

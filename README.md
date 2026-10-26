@@ -34,7 +34,7 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
 - [x] Eleven userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
-- [x] Init architecture: `silverd` starts Scout, Howl, Howler and the block-driver stub
+- [x] Init architecture: `silverd` starts Scout, block driver, Howl and Howler, all resolved by program ID
 - [x] howl: `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`, `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`
 - [x] Shell output redirection: `>` truncates, `>>` appends, quoted operators stay literal
 - [x] ANSI clear/home and a bold cyan `howl>` prompt
@@ -52,12 +52,12 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] Capability-protected kill/wait/console/IRQ/MMIO operations and capability delegation
 - [x] Userspace UART driver: IRQ-bound RX plus IPC-routed input and output
 - [x] DMA infrastructure: contiguous frames and Normal Non-Cacheable user mappings
-- [x] PCI ECAM read/write syscalls protected by `CAP_PCI`; no Virtio protocol yet
+- [x] PCI ECAM access plus a Virtio-PCI block driver: modern capabilities, split virtqueue and `read_sector`
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
 - [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
-- [ ] Virtio-block protocol, more drivers, resource quotas and persistent storage
+- [ ] SFS server, writes and interrupts on the block path, resource quotas and persistent storage
 
 ## Requirements
 
@@ -143,14 +143,27 @@ corresponding capability rights.
 
 During normal boot, Howler owns PL011 in EL0: hardware IRQ 33 wakes the driver,
 and input/output travel through IPC. The kernel retains a bounded RX fallback
-for early diagnostics, demo tasks and recovery if Howler dies.
+for early diagnostics, demo tasks and recovery if Howler dies. The output sink is
+resolved at runtime from the task bound to INTID 33, so console routing survives
+any spawn order (`spawn block_driver` reusing Howler's old task ID cannot capture
+the shell output).
+
+`diskread [sector]` and `hexdump [sector]` talk to the block driver over IPC and
+read real sectors from the attached `virtio-blk-pci` disk. Like the console sink,
+the driver is found by program ID through `SYS_TASK_LIST`, never by a fixed task
+number, and a request is bounded by a reply timeout. Killing or crashing the
+driver therefore prints an error and returns the prompt; the kernel and the shell
+keep running.
 
 Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
 `Cargo.toml` has `std` (default host stub), `no_std` (bare metal) and
 `demo-tasks` (opt-in regression programs). Normal bare-metal boot starts only
-silverd, which then starts Scout, Howl, Howler and the block-driver stub. To run
+silverd, which then starts Scout, the block driver, Howl and Howler in that
+order. No component depends on the resulting numbers: the console sink, Howler
+and the block driver are all looked up by program ID at runtime, and the block
+driver also answers whoever actually sent the request. To run
 the fault/VM/allocator/IPC regression programs instead, use
 `--features no_std,demo-tasks`. `build.rs` automatically builds and embeds every
 userspace ELF; no separate userspace command is needed.

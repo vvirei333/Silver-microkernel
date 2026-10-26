@@ -12,6 +12,23 @@ const LINE_CAPACITY: usize = 96;
 const TICKS_PER_SECOND: u64 = 100;
 const MIB: u64 = 1024 * 1024;
 
+const TASK_LIST_CAPACITY: usize = 32;
+const EMPTY_TASK: syscall::TaskInfo = syscall::TaskInfo {
+    id: 0,
+    state: 0,
+    program: 0,
+    argument: 0,
+};
+const TASK_DEAD: u64 = 6;
+const TASK_STOPPED: u64 = 7;
+/// Re-resolves Howler once a second so a respawned driver is picked up and a
+/// dead one is noticed without polling the task table on every keystroke.
+const HOWLER_REFRESH_TICKS: u64 = TICKS_PER_SECOND;
+/// A driver request is answered immediately; waiting two seconds keeps the
+/// shell responsive when the driver died between send and reply.
+const RESPONSE_TIMEOUT_TICKS: u64 = 2 * TICKS_PER_SECOND;
+const RESPONSE_POLL_TICKS: u64 = 10;
+
 const LOGO: &str = include_str!("../../../logo.txt");
 
 #[no_mangle]
@@ -24,8 +41,9 @@ pub extern "C" fn _start(howler_id: u64) -> ! {
 
     let mut line = [0_u8; LINE_CAPACITY];
     let mut length = 0_usize;
+    let mut howler = HowlerLink::new(howler_id);
     loop {
-        let Some(byte) = read_input(howler_id) else {
+        let Some(byte) = read_input(&mut howler) else {
             syscall::sleep(1);
             continue;
         };
@@ -56,10 +74,59 @@ pub extern "C" fn _start(howler_id: u64) -> ! {
     }
 }
 
-fn read_input(howler_id: u64) -> Option<u8> {
-    if howler_id == 0 || !syscall::task_alive(howler_id) {
-        return None;
+/// Tracks the UART driver task the shell reads keystrokes from.
+///
+/// silverd still passes the driver's task ID as the boot argument, but that
+/// value is only a hint: the ID is re-resolved from the live task table
+/// whenever the cached one stops being alive, so the shell never depends on the
+/// spawn order chosen by `silverd` or by a manual `spawn howler`.
+struct HowlerLink {
+    id: u64,
+    next_check: u64,
+}
+
+impl HowlerLink {
+    fn new(id: u64) -> Self {
+        Self {
+            id,
+            next_check: 0,
+        }
     }
+
+    /// Returns the live Howler task, refreshing the cached ID at most once per
+    /// `HOWLER_REFRESH_TICKS`. The boot argument is verified against the task
+    /// table first: it is only a hint, and accepting it blindly would make the
+    /// shell poll the wrong mailbox forever.
+    fn resolve(&mut self) -> Option<u64> {
+        let now = syscall::uptime_ticks();
+        if self.id != 0 {
+            if now < self.next_check {
+                return Some(self.id);
+            }
+            self.next_check = now.saturating_add(HOWLER_REFRESH_TICKS);
+            if let Some(id) = find_task_id_preferring(syscall::PROGRAM_HOWLER, self.id) {
+                self.id = id;
+                return Some(id);
+            }
+            self.id = 0;
+            return None;
+        }
+
+        if now < self.next_check {
+            return None;
+        }
+        self.next_check = now.saturating_add(HOWLER_REFRESH_TICKS);
+        self.id = find_task_id(syscall::PROGRAM_HOWLER).unwrap_or(0);
+        if self.id == 0 {
+            None
+        } else {
+            Some(self.id)
+        }
+    }
+}
+
+fn read_input(howler: &mut HowlerLink) -> Option<u8> {
+    let howler_id = howler.resolve()?;
 
     let mut message = ipc::Message::new(0, &[]);
     match syscall::receive_timeout(&mut message, 0) {
@@ -117,7 +184,7 @@ fn execute(command: &str) {
             syscall::print("  clear      Clear the terminal screen\r\n");
             syscall::print("  uname      Print kernel name, version and architecture\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
-            syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver> [arg]\r\n");
+            syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server> [arg]\r\n");
             syscall::print("  bg <program> [arg]\r\n");
             syscall::print("             Spawn without console ownership\r\n");
             syscall::print("  fg <cap>   Resume a task in the foreground\r\n");
@@ -172,18 +239,62 @@ fn execute(command: &str) {
     }
 }
 
+/// Resolves the live task whose executable is `program`.
+///
+/// Task IDs depend on the spawn order of the whole boot, so nothing may assume
+/// them. Dead and stopped tasks are skipped: a respawned driver must be found by
+/// its program, not by a stale ID that still sits in the task table.
+fn find_task_id(program: u64) -> Option<u64> {
+    find_task_id_preferring(program, 0)
+}
+
+/// Same as [`find_task_id`], but uses `preferred` when that task is alive and
+/// really runs `program`. A hint is never trusted on liveness alone.
+///
+/// The most recently spawned match wins. That matters for a hardware driver: a
+/// respawned instance re-runs device setup and therefore owns the device, while
+/// the older instance is left talking to a virtqueue the device no longer uses.
+fn find_task_id_preferring(program: u64, preferred: u64) -> Option<u64> {
+    let mut tasks = [EMPTY_TASK; TASK_LIST_CAPACITY];
+    let count = syscall::task_list(&mut tasks)?;
+    let tasks = &tasks[..count.min(TASK_LIST_CAPACITY)];
+    let live = |task: &syscall::TaskInfo| {
+        task.program == program && task.state != TASK_DEAD && task.state != TASK_STOPPED
+    };
+    tasks
+        .iter()
+        .rev()
+        .find(|task| task.id == preferred && live(task))
+        .or_else(|| tasks.iter().rev().find(|task| live(task)))
+        .map(|task| task.id)
+}
+
+/// Locates the block driver for one request, printing `message` when it is not
+/// running. Every call re-resolves the ID, so a driver that crashed and was
+/// respawned under a new ID is used again without restarting the shell.
+fn block_driver(message: &str) -> Option<u64> {
+    let driver = find_task_id(syscall::PROGRAM_BLOCK_DRIVER);
+    if driver.is_none() {
+        syscall::print(message);
+    }
+    driver
+}
+
 fn disk_read(sector: u64) {
-    const BLOCK_DRIVER_TASK_ID: u64 = 5;
     static mut SHARED_MAPPING: Option<(u64, u64)> = None;
 
+    let Some(driver) = block_driver("DISK DRIVER NOT RUNNING\r\n") else {
+        return;
+    };
+
     let request = ipc::Message::new(0, &sector.to_le_bytes());
-    if !syscall::send(BLOCK_DRIVER_TASK_ID, &request) {
+    if !syscall::send(driver, &request) {
         syscall::print("DISK READ FAILED\r\n");
         return;
     }
 
     let mut response = ipc::Message::new(0, &[]);
-    if !receive_from(BLOCK_DRIVER_TASK_ID, &mut response) {
+    if !receive_from(driver, &mut response) {
         syscall::print("DISK READ FAILED\r\n");
         return;
     }
@@ -211,7 +322,7 @@ fn disk_read(sector: u64) {
     let length = usize::from(u16::from_le_bytes(length_bytes));
     if length != 512 {
         syscall::print("DISK READ FAILED\r\n");
-        acknowledge_disk_buffer();
+        acknowledge_disk_buffer(driver);
         return;
     }
 
@@ -231,7 +342,7 @@ fn disk_read(sector: u64) {
     };
     let Some(virtual_address) = mapped else {
         syscall::print("DISK SHARED MEMORY MAP FAILED\r\n");
-        acknowledge_disk_buffer();
+        acknowledge_disk_buffer(driver);
         return;
     };
 
@@ -239,7 +350,7 @@ fn disk_read(sector: u64) {
     for (index, byte) in data.iter_mut().enumerate() {
         *byte = unsafe { core::ptr::read_volatile((virtual_address as *const u8).add(index)) };
     }
-    acknowledge_disk_buffer();
+    acknowledge_disk_buffer(driver);
 
     let mut first = [0_u8; 8];
     let mut second = [0_u8; 8];
@@ -254,17 +365,20 @@ fn disk_read(sector: u64) {
 }
 
 fn hexdump(sector: u64) {
-    const BLOCK_DRIVER_TASK_ID: u64 = 5;
     static mut SHARED_MAPPING: Option<(u64, u64)> = None;
 
+    let Some(driver) = block_driver("HEXDUMP FAILED: DISK DRIVER NOT RUNNING\r\n") else {
+        return;
+    };
+
     let request = ipc::Message::new(0, &sector.to_le_bytes());
-    if !syscall::send(BLOCK_DRIVER_TASK_ID, &request) {
+    if !syscall::send(driver, &request) {
         syscall::print("HEXDUMP FAILED\r\n");
         return;
     }
 
     let mut response = ipc::Message::new(0, &[]);
-    if !receive_from(BLOCK_DRIVER_TASK_ID, &mut response) || response.payload[0] != 1 {
+    if !receive_from(driver, &mut response) || response.payload[0] != 1 {
         syscall::print("HEXDUMP FAILED\r\n");
         return;
     }
@@ -278,7 +392,7 @@ fn hexdump(sector: u64) {
 
     if length != 512 {
         syscall::print("HEXDUMP FAILED: BAD LENGTH\r\n");
-        acknowledge_disk_buffer();
+        acknowledge_disk_buffer(driver);
         return;
     }
 
@@ -299,7 +413,7 @@ fn hexdump(sector: u64) {
 
     let Some(virtual_address) = mapped else {
         syscall::print("HEXDUMP FAILED: MAP FAILED\r\n");
-        acknowledge_disk_buffer();
+        acknowledge_disk_buffer(driver);
         return;
     };
 
@@ -307,7 +421,7 @@ fn hexdump(sector: u64) {
     for (index, byte) in data.iter_mut().enumerate() {
         *byte = unsafe { core::ptr::read_volatile((virtual_address as *const u8).add(index)) };
     }
-    acknowledge_disk_buffer();
+    acknowledge_disk_buffer(driver);
 
     syscall::print("HEXDUMP SECTOR ");
     syscall::print_dec_u64(sector);
@@ -315,12 +429,8 @@ fn hexdump(sector: u64) {
 
     for line in 0..32 {
         let offset = line * 16;
-        
-        // Offset
         print_offset(offset);
         syscall::print("  ");
-
-        // Hex bytes
         for i in 0..16 {
             print_hex_byte(data[offset + i]);
             syscall::print(" ");
@@ -328,10 +438,7 @@ fn hexdump(sector: u64) {
                 syscall::print(" ");
             }
         }
-        
         syscall::print(" |");
-
-        // ASCII
         for i in 0..16 {
             let b = data[offset + i];
             let c = if (32..=126).contains(&b) { b } else { b'.' };
@@ -365,19 +472,33 @@ fn print_hex_byte(b: u8) {
     }
 }
 
-fn acknowledge_disk_buffer() {
-    const BLOCK_DRIVER_TASK_ID: u64 = 5;
+/// Releases the driver's shared DMA window. Best effort: a driver that already
+/// exited is not an error, its buffer is reclaimed with the task.
+fn acknowledge_disk_buffer(driver: u64) {
     let acknowledgement = ipc::Message::new(0, &[0xA5]);
-    let _ = syscall::send(BLOCK_DRIVER_TASK_ID, &acknowledgement);
+    let _ = syscall::send(driver, &acknowledgement);
 }
 
+/// Waits for a reply from `task_id` only, bounded so a driver that dies without
+/// answering cannot block the shell forever. Unrelated queued messages are
+/// discarded, which is fine: nothing else sends to the interactive shell.
 fn receive_from(task_id: u64, buffer: &mut ipc::Message) -> bool {
+    let deadline = syscall::uptime_ticks().saturating_add(RESPONSE_TIMEOUT_TICKS);
     loop {
-        if !syscall::receive(buffer) {
+        if !syscall::task_alive(task_id) {
             return false;
         }
-        if buffer.sender == task_id {
-            return true;
+        match syscall::receive_timeout(buffer, RESPONSE_POLL_TICKS) {
+            Ok(()) => {
+                if buffer.sender == task_id {
+                    return true;
+                }
+            }
+            Err(_) => {
+                if syscall::uptime_ticks() >= deadline {
+                    return false;
+                }
+            }
         }
     }
 }
@@ -481,7 +602,6 @@ fn write_file(path: &str, text: &str, append: bool) {
         syscall::OPEN_WRITE
     };
     let fd = if append {
-        // Append preserves existing files and creates only a missing one.
         let mut fd = syscall::fs_open(path, flags);
         if fd.is_none() {
             if !syscall::fs_create(path) {
@@ -492,7 +612,6 @@ fn write_file(path: &str, text: &str, append: bool) {
         }
         fd
     } else {
-        // The '>' form retains its truncate-before-write behavior.
         if !syscall::fs_create(path) {
             syscall::print("echo: cannot create file\r\n");
             return;
@@ -641,13 +760,7 @@ fn wait_task(cap_id: Option<&str>) {
 }
 
 fn show_tasks() {
-    const EMPTY: syscall::TaskInfo = syscall::TaskInfo {
-        id: 0,
-        state: 0,
-        program: 0,
-        argument: 0,
-    };
-    let mut tasks = [EMPTY; 32];
+    let mut tasks = [EMPTY_TASK; TASK_LIST_CAPACITY];
     let Some(count) = syscall::task_list(&mut tasks) else {
         syscall::print("Could not read the task list.\r\n");
         return;
@@ -679,6 +792,7 @@ fn program_name(program: u64) -> &'static str {
         syscall::PROGRAM_SAY => "say         ",
         syscall::PROGRAM_SL => "sl          ",
         syscall::PROGRAM_BLOCK_DRIVER => "block_driver",
+        syscall::PROGRAM_SFS_SERVER => "sfs_server  ",
         _ => "kernel      ",
     }
 }
@@ -699,7 +813,7 @@ fn state_name(state: u64) -> &'static str {
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
         syscall::print(
-            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver> [arg]\r\n",
+            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server> [arg]\r\n",
         );
         return;
     };
@@ -714,7 +828,8 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
         "echo" => syscall::PROGRAM_ECHO,
         "say" => syscall::PROGRAM_SAY,
         "sl" => syscall::PROGRAM_SL,
-        "block_driver" => syscall::PROGRAM_BLOCK_DRIVER,
+        "block_driver" => syscall::PROGRAM_BLOCK_DRIVER, // <--- ДОБАВЛЕНО
+        "sfs_server" => syscall::PROGRAM_SFS_SERVER,     // <--- ДОБАВЛЕНО
         _ => {
             syscall::print("Unknown program. See 'help' for the program list.\r\n");
             return;

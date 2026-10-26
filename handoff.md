@@ -5,19 +5,39 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## State as of 2026-10-26 (DMA/PCI infrastructure and Ring 3 UART)
 
-Latest verified architecture: **silverd -> Scout, Howl, Howler, block_driver**.
-Normal boot creates only silverd (task 1). Silverd spawns Scout (task 2), waits
-for its `SCOUT READY` IPC handshake, spawns Howl (task 3) with Howler's ID as its
-argument, transfers the console, then spawns Howler (task 4) with Howl's ID and
-block_driver (task 5). The block driver is only an infrastructure smoke-test
-stub: no Virtio device protocol or block I/O is implemented yet.
+Latest verified architecture: **silverd -> Scout, block_driver, Howl, Howler**.
+Normal boot creates only silverd (task 1). Silverd spawns Scout, waits for its
+`SCOUT READY` IPC handshake (bounded to 2 s, boot continues on timeout), spawns
+block_driver with CAP_MMIO|CAP_PCI, then spawns Howl and transfers the console,
+and finally spawns Howler with Howl's ID as its input target. With the current
+spawn order that is Scout=2, block_driver=3, Howl=4, Howler=5, but **no
+component depends on those numbers**: every cross-task reference is resolved at
+runtime (see below). The block driver is a full Virtio-PCI block driver (modern
+common/notify capabilities, split virtqueue, descriptor chain, `read_sector`,
+shared DMA reply buffer) but it does not implement SFS; the filesystem server is
+not started at boot.
 Howler maps PL011 and binds INTID 33. Normal user RX and TX both pass through
 Howler in Ring 3: input messages are `[0, byte]`, while output messages are
 `[1, length, up to 30 bytes]`. `SYS_PRINT`, `SYS_PRINT_HEX` and `SYS_PRINT_DEC`
-chunk console output into nonblocking IPC messages to task 4. The kernel wakes
-Howler's event wait for TX as well as hardware RX and yields after each chunk.
-Early diagnostics, `demo-tasks` and a dead-Howler fallback still use kernel PL011;
-a full TX mailbox drops the remaining output instead of blocking.
+chunk console output into nonblocking IPC messages to the current console sink.
+The sink is resolved at runtime by `scheduler::console_sink_task()`: the live task
+whose `bound_irq` is INTID 33. Task IDs must never be hardcoded here — a spawned
+task that happens to reuse the old ID (e.g. `spawn block_driver` taking ID 4)
+would otherwise swallow the console output into an undrained mailbox. The kernel
+wakes the sink's event wait for TX as well as hardware RX and yields after each
+chunk. Early diagnostics, `demo-tasks` and a dead-Howler fallback still use kernel
+PL011; a full TX mailbox drops the remaining output instead of blocking.
+
+Userspace follows the same rule. `silvershell` resolves the block driver with
+`find_task_id(PROGRAM_BLOCK_DRIVER)` over `SYS_TASK_LIST`, skipping dead and
+stopped tasks, and resolves Howler the same way (`HowlerLink`, refreshed at most
+once per second) instead of trusting the boot argument on liveness alone. Both
+resolutions prefer the **most recently spawned** matching task: a respawned
+driver re-runs device setup and therefore owns the hardware, while an older
+instance keeps a virtqueue the device no longer uses. The driver itself accepts
+requests from any caller and answers `request.sender` from the kernel-built
+header, and it abandons a client that neither acknowledges nor stays alive within
+10 s, so a crashed client cannot wedge the device.
 
 The QEMU virt DTB describes the PL011 interrupt as SPI 1, level-high, which is
 GIC INTID 33. The kernel fallback uses PL011 RXIM and RTIM with a bounded
@@ -84,9 +104,22 @@ per-allocation quota exists yet.
 4-byte-aligned byte offset within QEMU virt's 256 MB ECAM at physical
 `0x4010000000`; reads/writes are volatile 32-bit accesses through a kernel
 Device-nGnRnE mapping. Program 10 (block_driver) receives self capabilities with
-CAP_MMIO and CAP_PCI at spawn, plus an explicit CAP_GRANT from silverd. Its stub
-checks a four-page DMA allocation and ECAM read, then sleeps. The Virtio ring,
-queue setup, interrupts and request protocol remain unimplemented.
+CAP_MMIO and CAP_PCI at spawn, plus an explicit CAP_GRANT from silverd. It walks
+the ECAM bus/device/function space for vendor `0x1AF4` with device `0x1001` or
+`0x1042`, maps BAR0/BAR4, negotiates VIRTIO_F_VERSION_1, allocates the split
+virtqueue (descriptor table, available and used rings in one DMA allocation),
+posts a `{type=0, sector}` request with inline 512-byte data and a status byte,
+and replies over IPC with the shared DMA physical address plus length. The client
+maps that buffer and releases it with a `0xA5` acknowledgement.
+
+Verified in QEMU debug and release with `-device virtio-blk-pci`: `ps` showed
+`scout`, `block_driver`, `howl`, `howler` as live tasks, `diskread` printed
+`DISK SECTOR 0: 0xDEADBEEF...` and `hexdump 0` dumped the sector read from
+`disk.img`. `spawn block_driver` created a second instance (ID 6) that re-ran
+device setup; `diskread` then used it, `kill` of its CapId did not disturb the
+shell, and `say`, `ls /`, `fastfetch`, `help` and the prompt kept working — a dead
+block driver degrades to a printed error, never a hang, and kernel output still
+falls back to PL011 when no console sink exists.
 
 Debug and release QEMU passed Howler-backed TX/RX and sleeping `demo 12`
 stop/kill/wait; debug also passed `fg` resume and `uname`. A twelve-second debug
@@ -131,8 +164,8 @@ tests passed in both profiles with spaced/unspaced `>>`, existing and new files,
 quoted literal operators and a `>` truncation regression check. ANSI prompt and
 clear sequences were observed, and uname printed the exact version string. No
 `KERNEL PANIC`, `BAD SP` or unexpected `FAIL` occurred. For the DMA/PCI change,
-both debug and release `ps` showed live sleeping block_driver task 5 after its
-DMA read/write and ECAM-read smoke checks; the 18-marker regression run still
+both debug and release `ps` showed a live block_driver task after its DMA
+read/write and ECAM-read smoke checks; the 18-marker regression run still
 had exactly the two intentional isolation faults.
 
 | Probe | Current ID | Address read from EL0 | Expected FAR |
@@ -328,8 +361,11 @@ read back only their own values.
   syscalls from non-owners succeed but discard their bytes; non-owner `SYS_READ`
   returns SYSCALL_ERROR without touching PL011.
 - On the normal path, console print syscalls copy and validate user bytes, then
-  send `[1, len, data]` chunks to Howler with `ipc::try_send`. Successful sends
-  set Howler's pending event, wake its `wait_irq` and yield the CPU. Howler polls
+  send `[1, len, data]` chunks to the console sink with `ipc::try_send`. The sink
+  is looked up per call through `scheduler::console_sink_task()` (the live task
+  bound to INTID 33), so a shell-spawned task cannot capture the output stream.
+  Successful sends set the sink's pending event, wake its `wait_irq` and yield
+  the CPU. Howler polls
   output IPC with zero timeout and waits for TXFF before writing DR. A dead
   Howler selects the kernel PL011 fallback; a full mailbox drops remaining bytes.
 - The unbound PL011 fallback drains INTID 33 into a 256-byte software FIFO and
@@ -428,14 +464,17 @@ read back only their own values.
 - Howl is an independent no_std/no_main ELF with no allocator. It uses a
   96-byte line buffer, accepts printable ASCII and CR/LF, echoes input, and
   implements Backspace/DEL by removing the last byte and erasing it onscreen.
-- Normal boot is automatic: silverd starts Scout and waits for its `SCOUT READY`
-  IPC, then starts Howl (task 3) with Howler's future ID 4 as its argument, gives
-  Howl the console, and starts Howler (task 4) with Howl's real ID 3. There is no
-  manual `start_uart_driver` command. Howler maps PL011, binds INTID 33 and sends
-  `[0, byte]` input messages directly to Howl's mailbox. Howl polls with a zero
-  timeout, accepts only type-0 messages from sender ID 4 and sleeps 1 ms when
-  empty. Normal output uses SYS_PRINT/SYS_PRINT_HEX/SYS_PRINT_DEC, whose typed
-  chunks return through IPC to Howler for the actual PL011 writes.
+- Normal boot is automatic: silverd starts Scout, waits (bounded) for its
+  `SCOUT READY` IPC, starts block_driver with PCI/MMIO rights, then starts Howl
+  and hands it the console, and finally starts Howler with Howl's ID as its input
+  target. There is no manual `start_uart_driver` command. Howler maps PL011,
+  binds INTID 33 and sends `[0, byte]` input messages directly to Howl's mailbox.
+  Howl polls with a zero timeout, accepts only type-0 messages from the Howler it
+  resolved from the task table, and sleeps 1 ms when empty. That ID is re-resolved
+  from `SYS_TASK_LIST` at most once per second, so a respawned Howler is adopted
+  automatically and a dead one is detected — `silverd` never has to know Howler's
+  number in advance. Normal output uses SYS_PRINT/SYS_PRINT_HEX/SYS_PRINT_DEC,
+  whose typed chunks return through IPC to Howler for the actual PL011 writes.
 - Startup emits ANSI clear/home, runs fastfetch once and shows a bold cyan
   `howl>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`,
   `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`,
@@ -460,10 +499,12 @@ read back only their own values.
 - Fastfetch converts ticks to seconds with hundredths and bytes to tenths of a
   MiB. Its three memory counters come from SYS_MEMINFO, not hardcoded free RAM.
   The architecture row is `Kernel: AArch64`.
-- Normal boot starts only silverd (task 1) in the kernel; silverd creates Scout
-  (task 2), Howl (task 3) and Howler (task 4). `demo-tasks` does not start
-  silverd: Scout remains task 1, the earlier regression IDs are preserved and
-  every demo opts into shared UART output.
+- Normal boot starts only silverd (task 1) in the kernel; silverd creates Scout,
+  block_driver, Howl and Howler in that order (currently tasks 2-5). Nothing in
+  userspace or the kernel reads those numbers: the console sink, Howler and
+  block_driver are all resolved from live scheduler state. `demo-tasks` does not
+  start silverd: Scout remains task 1, the earlier regression IDs are preserved
+  and every demo opts into shared UART output.
 
 ## Userspace allocation
 
