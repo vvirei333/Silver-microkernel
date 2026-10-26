@@ -9,6 +9,7 @@ mod syscall;
 use core::panic::PanicInfo;
 
 const ASSIGNED_BAR0: u32 = 0x1000_0000;
+const ASSIGNED_BAR4: u32 = 0x1010_0000;
 const BAR_MAPPING_SIZE: u64 = 64 * 1024;
 
 #[allow(dead_code)]
@@ -24,9 +25,20 @@ struct VirtioBlk {
     device: u8,
     function: u8,
     bar_base: u32,
+    bar4_base: u32,
     common_cfg: VirtioCapability,
+    common_cfg_addr: u64,
     notify_cfg: Option<VirtioCapability>,
+    notify_bar_vaddr: u64,
+    notify_off_multiplier: u32,
     device_cfg: Option<VirtioCapability>,
+}
+
+#[allow(dead_code)]
+struct Virtqueue {
+    index: u16,
+    size: u16,
+    notify_addr: u64,
 }
 
 #[no_mangle]
@@ -44,10 +56,43 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         }
     }
 
-    if let Some(device) = find_virtio_blk() {
+    if let Some((mut device, cfg_bar_vaddr, notify_bar_vaddr)) = find_virtio_blk() {
+        device.common_cfg_addr = cfg_bar_vaddr + u64::from(device.common_cfg.offset);
+        device.notify_bar_vaddr = notify_bar_vaddr;
         syscall::print("FOUND VIRTIO-BLK AT BAR0: 0x");
         syscall::print_hex_u64(u64::from(device.bar_base));
         syscall::print("\r\n");
+
+        unsafe {
+            let device_status = (device.common_cfg_addr + 0x14) as *mut u8;
+            core::ptr::write_volatile(device_status, 0);
+            core::ptr::write_volatile(device_status, 1);
+            core::ptr::write_volatile(device_status, 3);
+
+            let feature_select = device.common_cfg_addr as *mut u32;
+            core::ptr::write_volatile(feature_select, 0);
+            let features_low =
+                core::ptr::read_volatile((device.common_cfg_addr + 0x04) as *const u32);
+            core::ptr::write_volatile(feature_select, 1);
+            let features_high =
+                core::ptr::read_volatile((device.common_cfg_addr + 0x04) as *const u32);
+            let features = (u64::from(features_high) << 32) | u64::from(features_low);
+            syscall::print("DEVICE FEATURES: 0x");
+            syscall::print_hex_u64(features);
+            syscall::print("\r\n");
+
+            if features_high & 1 == 0 {
+                syscall::print("VIRTIO_F_VERSION_1 NOT SUPPORTED\r\n");
+            } else if let Some(queue) = prepare_virtqueue(&device) {
+                syscall::print("VIRTQUEUE 0 FOUND: SIZE ");
+                syscall::print_dec_u64(u64::from(queue.size));
+                syscall::print(", NOTIFY 0x");
+                syscall::print_hex_u64(queue.notify_addr);
+                syscall::print("\r\n");
+            } else {
+                syscall::print("VIRTQUEUE 0 NOT AVAILABLE\r\n");
+            }
+        }
     } else {
         syscall::print("VIRTIO-BLK NOT FOUND\r\n");
     }
@@ -55,6 +100,36 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     loop {
         syscall::sleep(1000);
     }
+}
+
+unsafe fn prepare_virtqueue(device: &VirtioBlk) -> Option<Virtqueue> {
+    let common = device.common_cfg_addr;
+    let notify_cfg = device.notify_cfg?;
+    if device.notify_off_multiplier == 0 {
+        return None;
+    }
+
+    let num_queues = unsafe { core::ptr::read_volatile((common + 0x12) as *const u16) };
+    if num_queues == 0 {
+        return None;
+    }
+
+    unsafe { core::ptr::write_volatile((common + 0x16) as *mut u16, 0) };
+    let queue_size = unsafe { core::ptr::read_volatile((common + 0x18) as *const u16) };
+    let queue_notify_off = unsafe { core::ptr::read_volatile((common + 0x1E) as *const u16) };
+    if queue_size == 0 {
+        return None;
+    }
+
+    let notify_addr = device.notify_bar_vaddr
+        + u64::from(notify_cfg.offset)
+        + u64::from(queue_notify_off) * u64::from(device.notify_off_multiplier);
+
+    Some(Virtqueue {
+        index: 0,
+        size: queue_size,
+        notify_addr,
+    })
 }
 
 fn pci_config_address(bus: u8, device: u8, function: u8, offset: u16) -> u64 {
@@ -73,7 +148,24 @@ fn assign_bar0(bus: u8, device: u8, function: u8) -> Option<u32> {
     }
 }
 
-fn find_virtio_blk() -> Option<VirtioBlk> {
+fn assign_bar4(bus: u8, device: u8, function: u8) -> Option<u32> {
+    let address = pci_config_address(bus, device, function, 0x20);
+    let bar4 = syscall::pci_read32(address)?;
+    let bar4_base = bar4 & !0xF;
+    if bar4_base == 0 || bar4_base == u32::MAX & !0xF {
+        if syscall::pci_write32(address, ASSIGNED_BAR4) {
+            Some(ASSIGNED_BAR4)
+        } else {
+            None
+        }
+    } else if bar4 & 0x1 == 0 {
+        Some(bar4_base)
+    } else {
+        None
+    }
+}
+
+fn find_virtio_blk() -> Option<(VirtioBlk, u64, u64)> {
     for bus in 0..=u8::MAX {
         for device in 0..32 {
             for function in 0..8 {
@@ -99,9 +191,11 @@ fn find_virtio_blk() -> Option<VirtioBlk> {
                     }
                     bar0 & !0xF
                 };
-                let _mmio_base = syscall::map_phys(u64::from(bar_base), BAR_MAPPING_SIZE)?;
-                let (common_cfg, notify_cfg, device_cfg) =
+                let bar0_vaddr = syscall::map_phys(u64::from(bar_base), BAR_MAPPING_SIZE)?;
+                let (common_cfg, notify_cfg, device_cfg, notify_off_multiplier) =
                     read_virtio_capabilities(bus, device, function)?;
+                let notify_cfg = notify_cfg?;
+                let notify_off_multiplier = notify_off_multiplier?;
 
                 syscall::print("COMMON CFG: BAR ");
                 syscall::print_dec_u64(u64::from(common_cfg.bar));
@@ -109,15 +203,42 @@ fn find_virtio_blk() -> Option<VirtioBlk> {
                 syscall::print_hex_u64(u64::from(common_cfg.offset));
                 syscall::print("\r\n");
 
-                return Some(VirtioBlk {
-                    bus,
-                    device,
-                    function,
-                    bar_base,
-                    common_cfg,
-                    notify_cfg,
-                    device_cfg,
-                });
+                let needs_bar4 = common_cfg.bar == 4 || notify_cfg.bar == 4;
+                let (bar4_base, bar4_vaddr) = if needs_bar4 {
+                    let bar4_base = assign_bar4(bus, device, function)?;
+                    let bar4_vaddr = syscall::map_phys(u64::from(bar4_base), BAR_MAPPING_SIZE)?;
+                    (bar4_base, Some(bar4_vaddr))
+                } else {
+                    (0, None)
+                };
+                let cfg_bar_vaddr = match common_cfg.bar {
+                    0 => bar0_vaddr,
+                    4 => bar4_vaddr?,
+                    _ => return None,
+                };
+                let notify_bar_vaddr = match notify_cfg.bar {
+                    0 => bar0_vaddr,
+                    4 => bar4_vaddr?,
+                    _ => return None,
+                };
+
+                return Some((
+                    VirtioBlk {
+                        bus,
+                        device,
+                        function,
+                        bar_base,
+                        bar4_base,
+                        common_cfg,
+                        common_cfg_addr: 0,
+                        notify_cfg: Some(notify_cfg),
+                        notify_bar_vaddr: 0,
+                        notify_off_multiplier,
+                        device_cfg,
+                    },
+                    cfg_bar_vaddr,
+                    notify_bar_vaddr,
+                ));
             }
         }
     }
@@ -132,6 +253,7 @@ fn read_virtio_capabilities(
     VirtioCapability,
     Option<VirtioCapability>,
     Option<VirtioCapability>,
+    Option<u32>,
 )> {
     let command_status = syscall::pci_read32(pci_config_address(bus, device, function, 0x04))?;
     let status = (command_status >> 16) as u16;
@@ -143,6 +265,7 @@ fn read_virtio_capabilities(
         (syscall::pci_read32(pci_config_address(bus, device, function, 0x34))? & 0xFF) as u16;
     let mut common_cfg = None;
     let mut notify_cfg = None;
+    let mut notify_off_multiplier = None;
     let mut device_cfg = None;
     let mut visited = 0;
 
@@ -167,7 +290,18 @@ fn read_virtio_capabilities(
             let capability = VirtioCapability { bar, offset };
             match cfg_type {
                 1 => common_cfg = Some(capability),
-                2 => notify_cfg = Some(capability),
+                2 => {
+                    if cap_len < 20 || cap_ptr > 0xEC {
+                        return None;
+                    }
+                    notify_off_multiplier = Some(syscall::pci_read32(pci_config_address(
+                        bus,
+                        device,
+                        function,
+                        cap_ptr + 16,
+                    ))?);
+                    notify_cfg = Some(capability);
+                }
                 4 => device_cfg = Some(capability),
                 _ => {}
             }
@@ -176,7 +310,7 @@ fn read_virtio_capabilities(
         visited += 1;
     }
 
-    Some((common_cfg?, notify_cfg, device_cfg))
+    Some((common_cfg?, notify_cfg, device_cfg, notify_off_multiplier))
 }
 
 #[panic_handler]
