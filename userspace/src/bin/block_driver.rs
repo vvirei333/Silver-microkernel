@@ -39,22 +39,15 @@ struct Virtqueue {
     index: u16,
     size: u16,
     notify_addr: u64,
+    descriptors_vaddr: u64,
+    available_vaddr: u64,
+    used_vaddr: u64,
 }
 
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(_argument: u64) -> ! {
     syscall::print("BLOCK DRIVER STARTED\r\n");
-
-    let Some((virtual_address, _physical_address)) = syscall::alloc_dma(4 * 4096) else {
-        syscall::exit_with_status(1);
-    };
-    unsafe {
-        core::ptr::write_volatile(virtual_address as *mut u32, 0x5349_4C56);
-        if core::ptr::read_volatile(virtual_address as *const u32) != 0x5349_4C56 {
-            syscall::exit_with_status(1);
-        }
-    }
 
     if let Some((mut device, cfg_bar_vaddr, notify_bar_vaddr)) = find_virtio_blk() {
         device.common_cfg_addr = cfg_bar_vaddr + u64::from(device.common_cfg.offset);
@@ -83,12 +76,19 @@ pub extern "C" fn _start(_argument: u64) -> ! {
 
             if features_high & 1 == 0 {
                 syscall::print("VIRTIO_F_VERSION_1 NOT SUPPORTED\r\n");
+            } else if !negotiate_features(&device) {
+                syscall::print("VIRTIO FEATURE NEGOTIATION FAILED\r\n");
             } else if let Some(queue) = prepare_virtqueue(&device) {
                 syscall::print("VIRTQUEUE 0 FOUND: SIZE ");
                 syscall::print_dec_u64(u64::from(queue.size));
                 syscall::print(", NOTIFY 0x");
                 syscall::print_hex_u64(queue.notify_addr);
                 syscall::print("\r\n");
+                if initialize_virtqueue(&device, queue).is_some() {
+                    syscall::print("VIRTIO-BLK INITIALIZED AND READY\r\n");
+                } else {
+                    syscall::print("VIRTQUEUE 0 INITIALIZATION FAILED\r\n");
+                }
             } else {
                 syscall::print("VIRTQUEUE 0 NOT AVAILABLE\r\n");
             }
@@ -99,6 +99,23 @@ pub extern "C" fn _start(_argument: u64) -> ! {
 
     loop {
         syscall::sleep(1000);
+    }
+}
+
+unsafe fn negotiate_features(device: &VirtioBlk) -> bool {
+    let common = device.common_cfg_addr;
+    let driver_feature_select = (common + 0x08) as *mut u32;
+    let driver_features = (common + 0x0C) as *mut u32;
+    unsafe {
+        core::ptr::write_volatile(driver_feature_select, 0);
+        core::ptr::write_volatile(driver_features, 0);
+        core::ptr::write_volatile(driver_feature_select, 1);
+        core::ptr::write_volatile(driver_features, 1);
+
+        let device_status = (common + 0x14) as *mut u8;
+        let status = core::ptr::read_volatile(device_status);
+        core::ptr::write_volatile(device_status, status | 0x08);
+        core::ptr::read_volatile(device_status) & 0x08 != 0
     }
 }
 
@@ -129,7 +146,56 @@ unsafe fn prepare_virtqueue(device: &VirtioBlk) -> Option<Virtqueue> {
         index: 0,
         size: queue_size,
         notify_addr,
+        descriptors_vaddr: 0,
+        available_vaddr: 0,
+        used_vaddr: 0,
     })
+}
+
+unsafe fn initialize_virtqueue(device: &VirtioBlk, mut queue: Virtqueue) -> Option<Virtqueue> {
+    const DMA_PAGE_SIZE: u64 = 4096;
+    let align_page = |size: u64| {
+        size.checked_add(DMA_PAGE_SIZE - 1)
+            .map(|size| size & !(DMA_PAGE_SIZE - 1))
+    };
+    let queue_size = u64::from(queue.size);
+    let descriptor_size = queue_size.checked_mul(16)?;
+    let available_size = queue_size.checked_mul(2)?.checked_add(6)?;
+    let used_size = queue_size.checked_mul(8)?.checked_add(6)?;
+    let descriptor_span = align_page(descriptor_size)?;
+    let available_span = align_page(available_size)?;
+    let used_span = align_page(used_size)?;
+    let used_offset = descriptor_span.checked_add(available_span)?;
+    let total_size = used_offset.checked_add(used_span)?;
+
+    let (vaddr, paddr) = syscall::alloc_dma(total_size)?;
+    unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, total_size as usize) };
+
+    queue.descriptors_vaddr = vaddr;
+    queue.available_vaddr = vaddr + descriptor_span;
+    queue.used_vaddr = vaddr + used_offset;
+
+    let common = device.common_cfg_addr;
+    unsafe {
+        core::ptr::write_volatile((common + 0x16) as *mut u16, queue.index);
+        core::ptr::write_volatile((common + 0x20) as *mut u64, paddr);
+        core::ptr::write_volatile((common + 0x28) as *mut u64, paddr + descriptor_span);
+        core::ptr::write_volatile((common + 0x30) as *mut u64, paddr + used_offset);
+        core::arch::asm!("dsb sy", options(nostack));
+        core::ptr::write_volatile((common + 0x1C) as *mut u16, 1);
+        if core::ptr::read_volatile((common + 0x1C) as *const u16) != 1 {
+            return None;
+        }
+
+        let device_status = (common + 0x14) as *mut u8;
+        let status = core::ptr::read_volatile(device_status);
+        core::ptr::write_volatile(device_status, status | 0x04);
+        if core::ptr::read_volatile(device_status) & 0x04 == 0 {
+            return None;
+        }
+    }
+
+    Some(queue)
 }
 
 fn pci_config_address(bus: u8, device: u8, function: u8, offset: u16) -> u64 {
