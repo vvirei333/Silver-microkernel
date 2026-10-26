@@ -1278,6 +1278,12 @@ impl Task {
             Some(user_program::BLOCK_DRIVER) => {
                 cap_table.insert(id, capability::CAP_MMIO | capability::CAP_PCI);
             }
+            // The filesystem server only needs MMIO to map the shared DMA
+            // window the block driver hands back; without this a server spawned
+            // by hand from the shell could never mount.
+            Some(user_program::SFS_SERVER) => {
+                cap_table.insert(id, capability::CAP_MMIO);
+            }
             _ => {}
         }
 

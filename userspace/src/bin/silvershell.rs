@@ -87,10 +87,7 @@ struct HowlerLink {
 
 impl HowlerLink {
     fn new(id: u64) -> Self {
-        Self {
-            id,
-            next_check: 0,
-        }
+        Self { id, next_check: 0 }
     }
 
     /// Returns the live Howler task, refreshing the cached ID at most once per
@@ -167,6 +164,7 @@ fn execute(command: &str) {
             syscall::print("             Read a sector (0 by default), show first 16 bytes\r\n");
             syscall::print("  hexdump [sector]\r\n");
             syscall::print("             Dump 512 bytes of a sector (0 by default)\r\n");
+            syscall::print("  sfsinfo    Show the mounted SFS superblock\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
@@ -219,6 +217,7 @@ fn execute(command: &str) {
             };
             hexdump(sector);
         }
+        Some("sfsinfo") => sfs_info(),
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
@@ -501,6 +500,64 @@ fn receive_from(task_id: u64, buffer: &mut ipc::Message) -> bool {
             }
         }
     }
+}
+
+/// Reads the SFS superblock through the filesystem server.
+///
+/// The server is resolved from the task table on every call, so it may be
+/// respawned (or absent) without the shell caching a stale task ID.
+fn sfs_info() {
+    let Some(server) = find_task_id(syscall::PROGRAM_SFS_SERVER) else {
+        syscall::print("SFS SERVER NOT RUNNING\r\n");
+        return;
+    };
+
+    // Opcode 0 asks for the superblock metadata; the server answers its own
+    // mounted copy, so the shell needs neither CAP_MMIO nor the block driver.
+    let request = ipc::Message::new(0, &[0]);
+    if !syscall::send(server, &request) {
+        syscall::print("SFS SERVER NOT RESPONDING\r\n");
+        return;
+    }
+
+    let mut response = ipc::Message::new(0, &[]);
+    if !receive_from(server, &mut response) {
+        syscall::print("SFS SERVER NOT RESPONDING\r\n");
+        return;
+    }
+    if response.payload[0] != 1 {
+        syscall::print("SFS NOT MOUNTED\r\n");
+        return;
+    }
+
+    let mut block_size = [0_u8; 4];
+    let mut total_blocks = [0_u8; 4];
+    let mut root_inode = [0_u8; 4];
+    let mut inode_count = [0_u8; 4];
+    let mut magic = [0_u8; 4];
+    block_size.copy_from_slice(&response.payload[1..5]);
+    total_blocks.copy_from_slice(&response.payload[5..9]);
+    root_inode.copy_from_slice(&response.payload[9..13]);
+    inode_count.copy_from_slice(&response.payload[13..17]);
+    magic.copy_from_slice(&response.payload[17..21]);
+
+    let block_size = u32::from_le_bytes(block_size);
+    let total_blocks = u32::from_le_bytes(total_blocks);
+
+    syscall::print("SFS MOUNTED\r\n");
+    syscall::print("  magic       0x");
+    syscall::print_hex_u64(u64::from(u32::from_le_bytes(magic)));
+    syscall::print("\r\n  block size  ");
+    syscall::print_dec_u64(u64::from(block_size));
+    syscall::print("\r\n  blocks      ");
+    syscall::print_dec_u64(u64::from(total_blocks));
+    syscall::print("\r\n  capacity    ");
+    syscall::print_dec_u64(u64::from(block_size) * u64::from(total_blocks) / 1024);
+    syscall::print(" KiB\r\n  root inode  ");
+    syscall::print_dec_u64(u64::from(u32::from_le_bytes(root_inode)));
+    syscall::print("\r\n  inodes      ");
+    syscall::print_dec_u64(u64::from(u32::from_le_bytes(inode_count)));
+    syscall::print("\r\n");
 }
 
 fn run_utility(program: u64, arguments: &str) {

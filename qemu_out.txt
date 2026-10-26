@@ -1,0 +1,12 @@
+MMU=OK
+HEAP=OK BASE=0000000040AEA000 VALUE=000000000000002A ADDR=FFFF000040AEA000
+IRQ READY
+HELLO, WORLD!
+SCHEDULER START
+SILVERD: BOOTING
+[2J[H                                       .==.       .:+:.
+                                      .-=-.       .+-:
+                                     .:-:-.      .+.-:
+                                    ..=.:-.:.   .=:.--...
+                                    .=. :=:.   .-: .-=..
+                                    .....    ...
