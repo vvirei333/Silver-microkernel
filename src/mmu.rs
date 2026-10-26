@@ -385,6 +385,37 @@ pub fn map_dma_to_user(
     map_user_pages(task, phys_addr, page_count, 0, user_dma_page)
 }
 
+/// Maps a registered DMA allocation shared by another task. The scheduler
+/// validates ownership of the physical range before calling this function.
+pub fn map_shared_dma_to_user(
+    task: &crate::scheduler::Task,
+    phys_addr: usize,
+    size: usize,
+) -> Option<usize> {
+    if size == 0 {
+        return None;
+    }
+    let physical_end = phys_addr.checked_add(size)?;
+    if phys_addr < DRAM_BASE || physical_end > DRAM_END {
+        return None;
+    }
+
+    let physical_start = phys_addr & !(GRANULE - 1);
+    let physical_offset = phys_addr - physical_start;
+    let mapped_size = physical_offset.checked_add(size)?;
+    let page_count = mapped_size.div_ceil(GRANULE);
+    if page_count == 0 || page_count > ENTRIES {
+        return None;
+    }
+    map_user_pages(
+        task,
+        physical_start,
+        page_count,
+        physical_offset,
+        user_dma_page,
+    )
+}
+
 fn map_user_pages(
     task: &crate::scheduler::Task,
     physical_start: usize,

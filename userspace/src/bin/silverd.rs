@@ -26,6 +26,9 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     if howl_id != HOWL_TASK_ID {
         fail("SILVERD: UNEXPECTED HOWL ID\r\n");
     }
+    if !syscall::cap_grant(howl_cap, howl_id, syscall::CAP_MMIO) {
+        fail("SILVERD: HOWL CAP GRANT FAILED\r\n");
+    }
     if !syscall::console_set(howl_cap) {
         fail("SILVERD: CONSOLE HANDOFF FAILED\r\n");
     }

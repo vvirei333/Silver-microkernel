@@ -158,9 +158,12 @@ fn serve_ipc() -> ! {
         let response = if let Some(queue) = queue {
             let mut data = [0_u8; 512];
             if unsafe { read_sector(queue, sector, &mut data) } {
-                let mut payload = [0_u8; 17];
+                let (_, request_paddr) = unsafe { (*core::ptr::addr_of!(REQUEST_BUFFER)).unwrap() };
+                let data_paddr = request_paddr + 16;
+                let mut payload = [0_u8; 11];
                 payload[0] = 1;
-                payload[1..].copy_from_slice(&data[..16]);
+                payload[1..9].copy_from_slice(&data_paddr.to_le_bytes());
+                payload[9..11].copy_from_slice(&512_u16.to_le_bytes());
                 ipc::Message::new(0, &payload)
             } else {
                 ipc::Message::new(0, &[0])
@@ -168,7 +171,18 @@ fn serve_ipc() -> ! {
         } else {
             ipc::Message::new(0, &[2])
         };
-        let _ = syscall::send(request.sender, &response);
+        let shared_buffer = response.payload[0] == 1;
+        if syscall::send(request.sender, &response) && shared_buffer {
+            loop {
+                let mut acknowledgement = ipc::Message::new(0, &[]);
+                if syscall::receive(&mut acknowledgement)
+                    && acknowledgement.sender == request.sender
+                    && acknowledgement.payload[0] == 0xA5
+                {
+                    break;
+                }
+            }
+        }
     }
 }
 

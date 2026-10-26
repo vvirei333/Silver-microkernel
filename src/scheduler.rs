@@ -1033,11 +1033,26 @@ pub fn current_task_has_rights(rights: u32) -> bool {
 pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
     let saved_daif = interrupts::save_and_disable_irq();
     let result = scheduler_manager().and_then(|manager| {
+        let shared_dma = manager.tasks.iter().any(|owner| {
+            owner.dma_pages.iter().any(|&(base, page_count)| {
+                base.checked_add(page_count * PAGE_SIZE)
+                    .is_some_and(|dma_end| {
+                        phys_addr >= base
+                            && phys_addr
+                                .checked_add(size)
+                                .is_some_and(|requested_end| requested_end <= dma_end)
+                    })
+            })
+        });
         let task = manager.tasks.get_mut(manager.current_index)?;
         if !task.cap_table.has_rights(capability::CAP_MMIO) {
             return None;
         }
-        let virtual_address = mmu::map_phys_to_user(task, phys_addr, size)?;
+        let virtual_address = if shared_dma {
+            mmu::map_shared_dma_to_user(task, phys_addr, size)?
+        } else {
+            mmu::map_phys_to_user(task, phys_addr, size)?
+        };
         task.cap_table
             .insert(virtual_address as u64, capability::CAP_MMIO);
         Some(virtual_address)

@@ -159,6 +159,8 @@ fn execute(command: &str) {
 
 fn disk_read(sector: u64) {
     const BLOCK_DRIVER_TASK_ID: u64 = 5;
+    static mut SHARED_MAPPING: Option<(u64, u64)> = None;
+
     let request = ipc::Message::new(0, &sector.to_le_bytes());
     if !syscall::send(BLOCK_DRIVER_TASK_ID, &request) {
         syscall::print("DISK READ FAILED\r\n");
@@ -186,16 +188,60 @@ fn disk_read(sector: u64) {
         }
     }
 
+    let mut physical_bytes = [0_u8; 8];
+    let mut length_bytes = [0_u8; 2];
+    physical_bytes.copy_from_slice(&response.payload[1..9]);
+    length_bytes.copy_from_slice(&response.payload[9..11]);
+    let physical_address = u64::from_le_bytes(physical_bytes);
+    let length = usize::from(u16::from_le_bytes(length_bytes));
+    if length != 512 {
+        syscall::print("DISK READ FAILED\r\n");
+        acknowledge_disk_buffer();
+        return;
+    }
+
+    let mapped = unsafe {
+        match SHARED_MAPPING {
+            Some((cached_physical, virtual_address)) if cached_physical == physical_address => {
+                Some(virtual_address)
+            }
+            _ => {
+                let mapped = syscall::map_phys(physical_address, length as u64);
+                if let Some(virtual_address) = mapped {
+                    SHARED_MAPPING = Some((physical_address, virtual_address));
+                }
+                mapped
+            }
+        }
+    };
+    let Some(virtual_address) = mapped else {
+        syscall::print("DISK SHARED MEMORY MAP FAILED\r\n");
+        acknowledge_disk_buffer();
+        return;
+    };
+
+    let mut data = [0_u8; 512];
+    for (index, byte) in data.iter_mut().enumerate() {
+        *byte = unsafe { core::ptr::read_volatile((virtual_address as *const u8).add(index)) };
+    }
+    acknowledge_disk_buffer();
+
     let mut first = [0_u8; 8];
     let mut second = [0_u8; 8];
-    first.copy_from_slice(&response.payload[1..9]);
-    second.copy_from_slice(&response.payload[9..17]);
+    first.copy_from_slice(&data[..8]);
+    second.copy_from_slice(&data[8..16]);
     syscall::print("DISK SECTOR ");
     syscall::print_dec_u64(sector);
     syscall::print(": 0x");
     syscall::print_hex_u64(u64::from_be_bytes(first));
     syscall::print_hex_u64(u64::from_be_bytes(second));
     syscall::print("\r\n");
+}
+
+fn acknowledge_disk_buffer() {
+    const BLOCK_DRIVER_TASK_ID: u64 = 5;
+    let acknowledgement = ipc::Message::new(0, &[0xA5]);
+    let _ = syscall::send(BLOCK_DRIVER_TASK_ID, &acknowledgement);
 }
 
 fn receive_from(task_id: u64, buffer: &mut ipc::Message) -> bool {
