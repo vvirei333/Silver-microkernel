@@ -8,7 +8,6 @@ mod syscall;
 
 use core::panic::PanicInfo;
 
-const ASSIGNED_BAR0: u32 = 0x1000_0000;
 const ASSIGNED_BAR4: u32 = 0x1010_0000;
 const BAR_MAPPING_SIZE: u64 = 64 * 1024;
 
@@ -108,8 +107,12 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     if let Some((mut device, cfg_bar_vaddr, notify_bar_vaddr)) = find_virtio_blk() {
         device.common_cfg_addr = cfg_bar_vaddr + u64::from(device.common_cfg.offset);
         device.notify_bar_vaddr = notify_bar_vaddr;
-        syscall::print("FOUND VIRTIO-BLK AT BAR0: 0x");
-        syscall::print_hex_u64(u64::from(device.bar_base));
+        syscall::print("VIRTIO-BLK FOUND ON PCI ");
+        syscall::print_dec_u64(u64::from(device.bus));
+        syscall::print(":");
+        syscall::print_dec_u64(u64::from(device.device));
+        syscall::print(".");
+        syscall::print_dec_u64(u64::from(device.function));
         syscall::print("\r\n");
 
         unsafe {
@@ -453,13 +456,14 @@ fn pci_config_address(bus: u8, device: u8, function: u8, offset: u16) -> u64 {
         | (u64::from(offset) & 0xFFC)
 }
 
-fn assign_bar0(bus: u8, device: u8, function: u8) -> Option<u32> {
-    let address = pci_config_address(bus, device, function, 0x10);
-    if syscall::pci_write32(address, ASSIGNED_BAR0) {
-        Some(ASSIGNED_BAR0)
-    } else {
-        None
+/// Memory BAR0 of a modern-only device. Transitional devices route BAR0 to
+/// the legacy I/O region instead; their callers must use the capability BARs.
+fn bar0_base(bus: u8, device: u8, function: u8) -> Option<u32> {
+    let bar0 = syscall::pci_read32(pci_config_address(bus, device, function, 0x10))?;
+    if bar0 & 0x1 != 0 {
+        return None;
     }
+    Some(bar0 & !0xF)
 }
 
 fn assign_bar4(bus: u8, device: u8, function: u8) -> Option<u32> {
@@ -496,16 +500,11 @@ fn find_virtio_blk() -> Option<(VirtioBlk, u64, u64)> {
                     return None;
                 }
 
-                let bar0 = syscall::pci_read32(pci_config_address(bus, device, function, 0x10))?;
-                let bar_base = if bar0 == 0 || bar0 == u32::MAX {
-                    assign_bar0(bus, device, function)?
-                } else {
-                    if bar0 & 0x1 != 0 {
-                        continue;
-                    }
-                    bar0 & !0xF
-                };
-                let bar0_vaddr = syscall::map_phys(u64::from(bar_base), BAR_MAPPING_SIZE)?;
+                // A transitional virtio-blk (QEMU's default) exposes a legacy
+                // I/O BAR0 and keeps the modern common/notify capabilities in
+                // BAR4, so BAR0 neither gates the match nor joins the setup;
+                // everything below is driven by the vendor capabilities.
+                let bar_base = 0_u32;
                 let (common_cfg, notify_cfg, device_cfg, notify_off_multiplier) =
                     read_virtio_capabilities(bus, device, function)?;
                 let notify_cfg = notify_cfg?;
@@ -526,12 +525,12 @@ fn find_virtio_blk() -> Option<(VirtioBlk, u64, u64)> {
                     (0, None)
                 };
                 let cfg_bar_vaddr = match common_cfg.bar {
-                    0 => bar0_vaddr,
+                    0 => syscall::map_phys(u64::from(bar0_base(bus, device, function)?), BAR_MAPPING_SIZE)?,
                     4 => bar4_vaddr?,
                     _ => return None,
                 };
                 let notify_bar_vaddr = match notify_cfg.bar {
-                    0 => bar0_vaddr,
+                    0 => syscall::map_phys(u64::from(bar0_base(bus, device, function)?), BAR_MAPPING_SIZE)?,
                     4 => bar4_vaddr?,
                     _ => return None,
                 };
