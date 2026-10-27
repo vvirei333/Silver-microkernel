@@ -3,6 +3,56 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## State as of 2026-10-27 evening (stage-code exit diagnostics; driver init under suspicion)
+
+`sfs_server` loads fine through the ELF loader but exits during mount. A
+release boot printed:
+
+```text
+EXIT: task=7 program=11 status=8589939716 (0x000000020001404)
+```
+
+Decoded: stage 4 (`STAGE_READ_REJECTED`), attempts 20, reads 0,
+`last_status` 2. **That 2 is NOT `VIRTIO_BLK_S_IOERR`.** In the block
+driver's reply protocol `payload[0] == 2` means *queue not initialized*
+(`QUEUE == None`): the driver answers from its IPC loop before any virtio
+request is ever submitted, so QEMU never saw the request and no device-level
+I/O error happened. The virtio descriptor chain in `read_sector`, the u64
+sector encoding (`virtio_blk_outhdr` at offset 8, IPC wire
+`payload[0]=opcode, payload[1..9]=sector`) and the volatile buffer zeroing
+(separate 4 KB `alloc_dma` page; the virtqueue is a separate block) were all
+audited and are correct — and unreachable until the queue exists.
+
+Changes made to find the failing driver init step:
+
+- `userspace/src/bin/sfs_server.rs`: mount failures now exit with
+  stage-coded statuses. `status & 0xFF` names where mount gave up
+  (`1..=7`: NO_DRIVER, SEND_FAILED, NO_REPLY, READ_REJECTED, SHORT_WINDOW,
+  MAP_FAILED, BAD_MAGIC); bits 8-15 attempts, 16-23 reads, 32-47 the last
+  driver status word. On a reply of 2 the status word packs the driver's
+  init failure stage into its high byte.
+- `userspace/src/bin/block_driver.rs`: `INIT_FAILURE` plus init stage codes
+  (1 NOT_FOUND, 2 BAD_VERSION, 3 FEATURES, 4 NO_QUEUE, 5 QUEUE_SETUP); the
+  "not initialized" reply is now `[2, stage]` so the client's exit report
+  pinpoints the driver step. The spec-violating
+  `notify_off_multiplier == 0 → None` rejection in `prepare_virtqueue` was
+  removed: a zero multiplier is legal (all queues notify through one
+  register; the written queue index selects the queue) and the notify
+  address formula already handles it. This guard is the prime suspect for
+  the queue never appearing on some QEMU builds.
+- `build_and_qemu.sh` (new): builds the kernel + embedded userspace ELFs
+  (release by default, `debug` arg) and boots QEMU with `disk.img` attached
+  as `virtio-blk-pci`. It also prepends rustup's toolchain bin dir to PATH
+  when cargo is not reachable (IDE sandbox shells). `--no-run` builds only.
+  **A QEMU invocation without `-device virtio-blk-pci` produces the exact
+  same EXIT signature as a driver init failure** — always boot with the
+  disk attached.
+
+Next step: boot via `./build_and_qemu.sh` and read the new EXIT status —
+bits 40-47 name the driver init stage (1 = no virtio-blk device in the
+command, 3 = feature negotiation, 5 = queue setup/`alloc_dma`), or `SFS
+MOUNTED` if the multiplier fix was the whole story.
+
 ## State as of 2026-10-27 (SFS mounts; `sfsinfo` still mismatched)
 
 **The SFS superblock now mounts.** A release boot shows neither

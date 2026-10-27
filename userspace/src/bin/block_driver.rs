@@ -87,6 +87,18 @@ struct VirtqUsed {
 
 static mut QUEUE: Option<Virtqueue> = None;
 static mut REQUEST_BUFFER: Option<(u64, u64)> = None;
+/// Why the virtqueue never came up; 0 means it is live. The driver owns no
+/// console, so its `print` output is discarded and this stage is the only
+/// channel back to the filesystem server's exit report.
+static mut INIT_FAILURE: u8 = 0;
+
+/// Init failure stages, carried in the "not initialized" reply so an
+/// unattended boot names the failing driver step without owning the console.
+const INIT_NOT_FOUND: u8 = 1;
+const INIT_BAD_VERSION: u8 = 2;
+const INIT_FEATURES: u8 = 3;
+const INIT_NO_QUEUE: u8 = 4;
+const INIT_QUEUE_SETUP: u8 = 5;
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -120,8 +132,10 @@ pub extern "C" fn _start(_argument: u64) -> ! {
 
             if features_high & 1 == 0 {
                 syscall::print("VIRTIO_F_VERSION_1 NOT SUPPORTED\r\n");
+                INIT_FAILURE = INIT_BAD_VERSION;
             } else if !negotiate_features(&device) {
                 syscall::print("VIRTIO FEATURE NEGOTIATION FAILED\r\n");
+                INIT_FAILURE = INIT_FEATURES;
             } else if let Some(queue) = prepare_virtqueue(&device) {
                 syscall::print("VIRTQUEUE 0 FOUND: SIZE ");
                 syscall::print_dec_u64(u64::from(queue.size));
@@ -133,13 +147,16 @@ pub extern "C" fn _start(_argument: u64) -> ! {
                     QUEUE = Some(queue);
                 } else {
                     syscall::print("VIRTQUEUE 0 INITIALIZATION FAILED\r\n");
+                    INIT_FAILURE = INIT_QUEUE_SETUP;
                 }
             } else {
                 syscall::print("VIRTQUEUE 0 NOT AVAILABLE\r\n");
+                INIT_FAILURE = INIT_NO_QUEUE;
             }
         }
     } else {
         syscall::print("VIRTIO-BLK NOT FOUND\r\n");
+        unsafe { INIT_FAILURE = INIT_NOT_FOUND };
     }
 
     serve_ipc()
@@ -185,7 +202,10 @@ fn serve_ipc() -> ! {
                 ipc::Message::new(0, &[0])
             }
         } else {
-            ipc::Message::new(0, &[2])
+            // 2 = "not initialized"; the second byte names the driver's init
+            // failure stage so the client's mount report pinpoints the step.
+            let stage = unsafe { *core::ptr::addr_of!(INIT_FAILURE) };
+            ipc::Message::new(0, &[2, stage])
         };
         let shared_buffer = response.payload[0] == 1;
         if !syscall::send(request.sender, &response) || !shared_buffer {
@@ -234,9 +254,10 @@ unsafe fn negotiate_features(device: &VirtioBlk) -> bool {
 unsafe fn prepare_virtqueue(device: &VirtioBlk) -> Option<Virtqueue> {
     let common = device.common_cfg_addr;
     let notify_cfg = device.notify_cfg?;
-    if device.notify_off_multiplier == 0 {
-        return None;
-    }
+    // notify_off_multiplier may legally be 0: all queues then notify through
+    // one register and the written queue index selects the queue, which the
+    // address formula below already handles. Rejecting 0 wrongly disabled the
+    // driver on QEMU builds that report a zero multiplier.
 
     let num_queues = unsafe { core::ptr::read_volatile((common + 0x12) as *const u16) };
     if num_queues == 0 {

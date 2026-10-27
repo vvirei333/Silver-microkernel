@@ -88,7 +88,8 @@ impl MountFailure {
     }
 
     /// Packed diagnostic: the stage code in the low byte, then the attempt
-    /// counter, the successful read counter and the last driver status word.
+    /// counter, the successful read counter and the last driver status word
+    /// (reply code in its low byte, the driver's init failure stage above).
     fn summary(self) -> u64 {
         u64::from(self.code)
             | u64::from(self.attempts) << 8
@@ -195,9 +196,12 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
         }
 
         // 1: data is in a shared DMA window, 2: driver not initialized yet,
-        // 0: read failed. Only 1 can be inspected.
+        // 0: read failed. Only 1 can be inspected. On 2 the next byte names
+        // the driver's init failure stage, so both are packed into
+        // `last_status`.
         if response.payload[0] != 1 {
-            last_status = u16::from(response.payload[0]);
+            last_status =
+                u16::from(response.payload[0]) | (u16::from(response.payload[1]) << 8);
             failure = MountFailure::new(MountFailure::STAGE_READ_REJECTED);
             syscall::sleep(MOUNT_POLL_TICKS);
             continue;

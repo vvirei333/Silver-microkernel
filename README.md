@@ -104,6 +104,21 @@ qemu-system-aarch64 \
   -kernel target/aarch64-unknown-none/debug/silver_microkernel
 ```
 
+Linux, one-shot with the SFS disk attached (what `sfs_server` needs):
+
+```bash
+./build_and_qemu.sh            # release build + QEMU with disk.img via virtio-blk-pci
+./build_and_qemu.sh debug      # same, debug build
+./build_and_qemu.sh --no-run   # build only
+```
+
+The script attaches `disk.img` (SFS-formatted with `format_sfs.py`) as a
+`virtio-blk-pci` device; without it the block driver reports "not
+initialized" and the filesystem server exits with a stage-coded status.
+Exit code diagnostics: the kernel prints `EXIT: task=… program=… status=…`
+(0x…) for every exiting task; for `sfs_server` the status low byte names the
+mount stage and bits 40-47 the block driver's init stage.
+
 At the `howl>` prompt, `help` lists all commands. Backspace edits the
 current line. A minimal file workflow looks like this:
 
