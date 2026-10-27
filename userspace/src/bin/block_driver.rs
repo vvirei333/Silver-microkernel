@@ -318,9 +318,20 @@ unsafe fn read_sector(queue: &Virtqueue, sector: u64, buffer: &mut [u8; 512]) ->
         return false;
     }
 
+    // Check if REQUEST_BUFFER was successfully allocated
+    if unsafe { (*core::ptr::addr_of!(REQUEST_BUFFER)).is_none() } {
+        syscall::print("BLOCK DRIVER: REQUEST_BUFFER not allocated\\r\\n");
+        return false;
+    }
+
     let Some((request_vaddr, request_paddr)) = (*core::ptr::addr_of!(REQUEST_BUFFER)) else {
         return false;
     };
+    // Protect against zero DMA address which would overwrite the zero page
+    if request_paddr == 0 {
+        syscall::print("BLOCK DRIVER: zero DMA address\\r\\n");
+        return false;
+    }
     // Zero the window with volatile stores. A plain `write_bytes` is a
     // non-volatile store, and LLVM is free to sink it past the volatile
     // completion polling below; in optimized builds that wiped the sector the

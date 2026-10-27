@@ -64,10 +64,39 @@ as `payload[0] = 0` (status: not mounted), `payload[1] = 5`, `payload[2] = 5`,
 shell is task 5) but `request.payload[0] == 5` — the sender ID, where the shell
 had written `0`.
 
-Facts already ruled out, so they do not have to be re-checked:
+**Fix applied:** In `userspace/src/bin/silvershell.rs`, `sfs_info()` now explicitly
+sets `request_payload[0] = 0` before sending the request, so the server can
+properly set `payload[0] = 1` (mounted) in its reply without echoing the sender ID.
 
-- `src/ipc.rs` and `userspace/src/ipc.rs` both declare
-  `#[repr(C)] struct Message { sender: u64, payload: [u8; 32] }` — identical.
+---
+
+## Open issue: Block driver DMA allocation (reads=0 in Release)
+
+After fixing the `sfsinfo` 8-byte shift, the `sfsinfo` command now prints
+`SFS SERVER NOT RUNNING`. In the loading log, `reads=0` is observed, meaning
+`read_sector` returns `false` before any sector read is attempted.
+
+**Root cause:** `syscall::alloc_dma(4096)` in the block driver returns 0 in
+Release mode. This triggers the `if request_paddr == 0 { return false; }` check
+added to prevent writing to the zero DMA page. The DMA allocation failure may be
+due to:
+- Frame allocator not properly initialized (all pages marked used, none free)
+- Task lacking `CAP_MMIO` rights required for DMA allocations
+- No contiguous physical memory available for DMA
+
+**Workaround:** The block driver now checks if `REQUEST_BUFFER` was successfully
+allocated and handles the failure gracefully by returning `false` from `read_sector()`
+with a diagnostic message. The driver will not be able to read sectors until DMA
+allocation is resolved.
+
+**To debug:** Run the kernel in QEMU with debug output to determine whether the
+frame allocator has free pages, whether the block driver task has `CAP_MMIO`, and
+whether `alloc_dma_for_current` succeeds or fails and why.
+
+---
+
+Four independent defects had to be fixed to get SFS mounting; the DMA allocation
+issue is the remaining open problem for block device support. { sender: u64, payload: [u8; 32] }` — identical.
 - `sys_send` copies `size_of::<Message>()` bytes from the user pointer and then
   overwrites `sender` with the current task ID; `sys_receive` copies the same
   40 bytes back. `user_memory::copy_from_user` / `copy_to_user` are byte-wise

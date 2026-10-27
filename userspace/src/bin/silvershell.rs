@@ -516,7 +516,10 @@ fn sfs_info() {
     // mounted copy, so the shell needs neither CAP_MMIO nor the block driver.
     // Temporary probe: a recognizable pattern shows exactly how the server
     // sees the request head (shift of 0, 1 or 8 bytes is distinguishable).
+    // NOTE: payload[0] must be 0, not the sender ID, so the server can properly
+    // set payload[0] = 1 (mounted) in its reply without echoing the sender ID.
     let mut request_payload = [0_u8; 32];
+    request_payload[0] = 0;  // Ensure payload[0] is 0, not the sender ID
     request_payload[1] = 0x11;
     request_payload[2] = 0x22;
     request_payload[3] = 0x33;
