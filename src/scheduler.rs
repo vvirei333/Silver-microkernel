@@ -251,7 +251,6 @@ pub fn sleep(milliseconds: u64) {
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Sleeping(wake_at);
     }
-    pl011::write_str("\n");
     schedule();
     interrupts::restore_irq(saved_daif);
 }
@@ -279,8 +278,7 @@ pub fn wait_irq() -> bool {
             crate::gic::enable_irq(intid);
         }
         task.state = TaskState::Blocked;
-    pl011::write_str("\n");
-    schedule();
+        schedule();
     }
 }
 
@@ -367,7 +365,6 @@ pub fn block_current_on(queue: &WaitQueue) {
         task.waiting_on = Some(queue as *const WaitQueue);
         task.state = TaskState::Blocked;
     }
-    pl011::write_str("\n");
     schedule();
     if let Some(task) = current_task_mut() {
         task.waiting_on = None;
@@ -383,7 +380,6 @@ pub fn block_current_on_until(queue: &WaitQueue, deadline: u64) {
         task.waiting_on = Some(queue as *const WaitQueue);
         task.state = TaskState::BlockedUntil(deadline);
     }
-    pl011::write_str("\n");
     schedule();
     queue.remove(id);
     if let Some(task) = current_task_mut() {
@@ -424,6 +420,21 @@ pub fn exit_current() -> ! {
 
 pub fn exit_current_with_status(status: u64) -> ! {
     let id = current_task_id();
+    // Kernel-side trace: syscall::print is discarded for tasks that do not own
+    // the console, so a task dying silently leaves no user-visible evidence.
+    // pl011 writes here are raw MMIO pokes and stay visible for every task.
+    let program = current_task_mut().map_or(u64::MAX, |task| task.program);
+    pl011::write_str("EXIT: task=");
+    pl011::write_dec_u64(id);
+    pl011::write_str(" program=");
+    pl011::write_dec_u64(program);
+    pl011::write_str(" status=");
+    pl011::write_dec_u64(status);
+    // Packed reports (see the filesystem server's mount failure) are unreadable
+    // in decimal, so the same value is repeated in hex on the same line.
+    pl011::write_str(" (0x");
+    pl011::write_hex_u64(status);
+    pl011::write_str(")\r\n");
     crate::ipc::remove_task(id);
     vfs::close_task(id);
     let saved_daif = interrupts::save_and_disable_irq();
@@ -435,7 +446,6 @@ pub fn exit_current_with_status(status: u64) -> ! {
         recover_console(manager, id);
         record_exit(manager, id, status);
     }
-    pl011::write_str("\n");
     schedule();
     interrupts::restore_irq(saved_daif);
     loop {
@@ -466,7 +476,6 @@ pub fn kill_task(id: u64) -> bool {
     task.bound_irq = None;
     recover_console(manager, id);
     record_exit(manager, id, 1);
-    pl011::write_str("\n");
     schedule();
     interrupts::restore_irq(saved_daif);
     true
@@ -547,8 +556,7 @@ fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
             task.waiting_on = Some(&PROCESS_WAIT_QUEUE);
             task.state = TaskState::Blocked;
         }
-    pl011::write_str("\n");
-    schedule();
+        schedule();
         PROCESS_WAIT_QUEUE.remove(waiter);
         if let Some(task) = current_task_mut() {
             task.waiting_on = None;
@@ -997,39 +1005,39 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
     let result = scheduler_manager().and_then(|manager| {
         let task = manager.tasks.get_mut(manager.current_index)?;
         if !task.cap_table.has_rights(capability::CAP_MMIO) {
-            pl011::write_str("DMA: FAIL - no CAP_MMIO rights\n");
+            pl011::write_str("DMA: FAIL - no CAP_MMIO rights\r\n");
             return None;
         }
         pl011::write_str("DMA: has CAP_MMIO, allocating ");
         pl011::write_hex_u64(page_count as u64);
-        pl011::write_str(" pages\n");
+        pl011::write_str(" pages\r\n");
         let physical = match frame_allocator::alloc_contiguous_pages(page_count) {
             Some(p) => {
                 pl011::write_str("DMA: alloc_contiguous_pages OK, physical= ");
                 pl011::write_hex_u64(p as u64);
-                pl011::write_str("\n");
+                pl011::write_str("\r\n");
                 p
             }
             None => {
-                pl011::write_str("DMA: FAIL - alloc_contiguous_pages returned None\n");
+                pl011::write_str("DMA: FAIL - alloc_contiguous_pages returned None\r\n");
                 return None;
             }
         };
         unsafe { core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, mapped_size) };
         pl011::write_str("DMA: virt addr = ");
         pl011::write_hex_u64(phys_to_virt(physical) as u64);
-        pl011::write_str("\n");
-        pl011::write_str("DMA: zeroing...\n");
-        pl011::write_str("DMA: zeroing OK\n");
-        pl011::write_str("DMA: mapping to user...\n");
+        pl011::write_str("\r\n");
+        pl011::write_str("DMA: zeroing...\r\n");
+        pl011::write_str("DMA: zeroing OK\r\n");
+        pl011::write_str("DMA: mapping to user...\r\n");
         let Some(virtual_address) = mmu::map_dma_to_user(task, physical, mapped_size) else {
-            pl011::write_str("DMA: FAIL - mmu::map_dma_to_user returned None\n");
+            pl011::write_str("DMA: FAIL - mmu::map_dma_to_user returned None\r\n");
             release_pages(physical, page_count);
             return None;
         };
         pl011::write_str("DMA: mapped va=");
         pl011::write_hex_u64(virtual_address as u64);
-        pl011::write_str("\n");
+        pl011::write_str("\r\n");
         task.dma_pages.push((physical, page_count));
         Some((virtual_address, physical))
     });
@@ -1092,6 +1100,11 @@ fn spawn_inner(
 ) -> Option<u64> {
     let manager = scheduler_manager()?;
     let id = manager.next_id;
+    pl011::write_str("SPAWN: start id=");
+    pl011::write_dec_u64(id);
+    pl011::write_str(" program=");
+    pl011::write_dec_u64(user.map_or(u64::MAX, |(program, _)| program));
+    pl011::write_str("\r\n");
     let cwd = manager
         .tasks
         .get(manager.current_index)
@@ -1102,6 +1115,9 @@ fn spawn_inner(
 
     manager.tasks.push(task);
     manager.next_id += 1;
+    pl011::write_str("SPAWN: success id=");
+    pl011::write_dec_u64(id);
+    pl011::write_str("\r\n");
     Some(id)
 }
 
@@ -1231,20 +1247,37 @@ impl Task {
         user: Option<(u64, u64)>,
         arguments: Vec<u8>,
     ) -> Option<Self> {
-        let stack_start = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES)?;
+        let program_label = user.map_or(u64::MAX, |(program, _)| program);
+        pl011::write_str("SPAWN: alloc stack (");
+        pl011::write_dec_u64(TASK_STACK_PAGES as u64);
+        pl011::write_str(" pages)...\r\n");
+        let Some(stack_start) = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES) else {
+            pl011::write_str("SPAWN: FAIL - no contiguous kernel stack run\r\n");
+            return None;
+        };
+        pl011::write_str("SPAWN: kernel stack at ");
+        pl011::write_hex_u64(stack_start as u64);
+        pl011::write_str("\r\n");
 
         let user_stack = if user.is_some() {
+            pl011::write_str("SPAWN: alloc user stack...\r\n");
             let Some(user_start) = frame_allocator::alloc_contiguous_pages(TASK_USER_STACK_PAGES)
             else {
+                pl011::write_str("SPAWN: FAIL - no contiguous user stack run\r\n");
                 release_pages(stack_start, TASK_STACK_PAGES);
                 return None;
             };
+            pl011::write_str("SPAWN: user stack at ");
+            pl011::write_hex_u64(user_start as u64);
+            pl011::write_str("\r\n");
             MemoryRegion::new(user_start, user_start + TASK_USER_STACK_SIZE)
         } else {
             MemoryRegion::new(0, 0)
         };
 
+        pl011::write_str("SPAWN: alloc private page...\r\n");
         let Some(private_page) = frame_allocator::alloc_page() else {
+            pl011::write_str("SPAWN: FAIL - no frame for the private window\r\n");
             if !user_stack.is_empty() {
                 release_pages(user_stack.start, TASK_USER_STACK_PAGES);
             }
@@ -1253,7 +1286,29 @@ impl Task {
         };
 
         let user_image = if let Some((program, _)) = user {
-            let Some(image) = user_program::image(program).and_then(elf_loader::load) else {
+            pl011::write_str("SPAWN: load elf program=");
+            pl011::write_dec_u64(program);
+            pl011::write_str("...\r\n");
+            // Split the two lookups so a stall is attributable: the embedded
+            // blob lookup is pure table work, the loader allocates and copies.
+            let image_bytes = user_program::image(program);
+            match image_bytes {
+                Some(bytes) => {
+                    pl011::write_str("SPAWN: embedded image bytes=");
+                    pl011::write_dec_u64(bytes.len() as u64);
+                    pl011::write_str("\r\n");
+                }
+                None => {
+                    pl011::write_str("SPAWN: FAIL - no embedded image for program=");
+                    pl011::write_dec_u64(program);
+                    pl011::write_str("\r\n");
+                }
+            }
+            let loaded = image_bytes.and_then(elf_loader::load);
+            let Some(image) = loaded else {
+                pl011::write_str("SPAWN: FAIL - elf_loader::load rejected program=");
+                pl011::write_dec_u64(program);
+                pl011::write_str("\r\n");
                 frame_allocator::free_page(private_page);
                 if !user_stack.is_empty() {
                     release_pages(user_stack.start, TASK_USER_STACK_PAGES);
@@ -1261,14 +1316,21 @@ impl Task {
                 release_pages(stack_start, TASK_STACK_PAGES);
                 return None;
             };
+            pl011::write_str("SPAWN: elf loaded entry=");
+            pl011::write_hex_u64(image.entry as u64);
+            pl011::write_str(" pages=");
+            pl011::write_dec_u64(image.page_count as u64);
+            pl011::write_str("\r\n");
             Some(image)
         } else {
             None
         };
 
+        pl011::write_str("SPAWN: build task space (9 tables)...\r\n");
         let Some(ttbr0) =
             mmu::create_task_space(private_page, user_stack.start, user_image.as_ref())
         else {
+            pl011::write_str("SPAWN: FAIL - mmu::create_task_space returned None\r\n");
             if let Some(image) = &user_image {
                 image.release();
             }
@@ -1279,6 +1341,9 @@ impl Task {
             release_pages(stack_start, TASK_STACK_PAGES);
             return None;
         };
+        pl011::write_str("SPAWN: task space ttbr0=");
+        pl011::write_hex_u64(ttbr0 as u64);
+        pl011::write_str("\r\n");
 
         let stack = MemoryRegion::new(stack_start, stack_start + TASK_STACK_SIZE);
         let mut context = TaskContext::zero();
@@ -1300,6 +1365,10 @@ impl Task {
             0
         };
 
+        pl011::write_str("SPAWN: registers set program=");
+        pl011::write_dec_u64(program_label);
+        pl011::write_str("\r\n");
+
         let mut cap_table = capability::CapTable::new();
         match user.map(|(program, _)| program) {
             Some(user_program::SILVERD) => {
@@ -1315,6 +1384,13 @@ impl Task {
             // window the block driver hands back; without this a server spawned
             // by hand from the shell could never mount.
             Some(user_program::SFS_SERVER) => {
+                cap_table.insert(id, capability::CAP_MMIO);
+            }
+            // The shell hands device rights to the tasks it spawns by hand
+            // (`spawn block_driver`), and `CapTable::grant` only allows a task
+            // to pass on a right it already holds. Without this entry every
+            // delegation from the shell would fail.
+            Some(user_program::HOWL) => {
                 cap_table.insert(id, capability::CAP_MMIO);
             }
             _ => {}

@@ -61,10 +61,17 @@ struct MountFailure {
 }
 
 impl MountFailure {
-    const DRIVER_UNAVAILABLE: u8 = 1;
-    const READ_REJECTED: u8 = 2;
-    const MAPPING_FAILED: u8 = 3;
-    const BAD_FILESYSTEM: u8 = 4;
+    /// Stage codes, reported in the exit status low byte. The previous single
+    /// `1` only said "mount failed"; these name the stage the server actually
+    /// died in, and the kernel repeats the whole status as `EXIT: ... status=`
+    /// even for a task that owns no console.
+    const STAGE_NO_DRIVER: u8 = 1;
+    const STAGE_SEND_FAILED: u8 = 2;
+    const STAGE_NO_REPLY: u8 = 3;
+    const STAGE_READ_REJECTED: u8 = 4;
+    const STAGE_SHORT_WINDOW: u8 = 5;
+    const STAGE_MAP_FAILED: u8 = 6;
+    const STAGE_BAD_MAGIC: u8 = 7;
 
     /// Fills a report with no diagnostics attached.
     fn new(code: u8) -> Self {
@@ -80,8 +87,8 @@ impl MountFailure {
         }
     }
 
-    /// Packed diagnostic: the reason code in the low byte, then the attempt
-    /// counter and the last driver status byte.
+    /// Packed diagnostic: the stage code in the low byte, then the attempt
+    /// counter, the successful read counter and the last driver status word.
     fn summary(self) -> u64 {
         u64::from(self.code)
             | u64::from(self.attempts) << 8
@@ -113,11 +120,32 @@ pub extern "C" fn _start(silverd_hint: u64) -> ! {
     let superblock = match mount() {
         Ok(superblock) => superblock,
         Err(reason) => {
+            // `print` is discarded for any task that does not own the console,
+            // so these lines only reach the UART when the server was handed the
+            // console explicitly. They are kept because that is exactly what a
+            // debugging run with `demo-tasks` needs.
+            syscall::print("SFS: MOUNT FAILED\r\n");
+            syscall::print("SFS: stage=");
+            syscall::print_dec_u64(u64::from(reason.code));
+            syscall::print(" attempts=");
+            syscall::print_dec_u64(u64::from(reason.attempts));
+            syscall::print(" reads=");
+            syscall::print_dec_u64(u64::from(reason.reads));
+            syscall::print(" last_status=");
+            syscall::print_dec_u64(u64::from(reason.last_status));
+            syscall::print("\r\n");
             announce(silverd_hint, Some(reason));
             // Exiting is the only honest answer when the filesystem cannot be
             // served: staying alive would make clients pick this task and fail,
             // hiding the healthy instance that was started earlier.
-            syscall::exit_with_status(1)
+            //
+            // The status carries the whole report instead of a bare `1`: the
+            // kernel prints `EXIT: ... status=` for every task, and that is the
+            // only channel that survives a task without the console. The low
+            // byte is the stage code, so `status & 0xFF` names where the mount
+            // gave up (`1..=7`); the upper bytes add the attempt counter, the
+            // successful read counter and the last block-driver status word.
+            syscall::exit_with_status(reason.summary())
         }
     };
     announce(silverd_hint, None);
@@ -132,13 +160,14 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
     let mut attempt = 0;
     let mut reads = 0_u8;
     let mut last_status = 0xFFFF_u16;
-    let mut failure = MountFailure::new(MountFailure::DRIVER_UNAVAILABLE);
+    let mut failure = MountFailure::new(MountFailure::STAGE_NO_DRIVER);
     while attempt < MOUNT_ATTEMPTS {
         attempt += 1;
 
         // The driver is resolved per attempt: it may not exist yet, and a
         // respawned driver has a new ID.
         let Some(driver) = find_task_id(syscall::PROGRAM_BLOCK_DRIVER) else {
+            failure = MountFailure::new(MountFailure::STAGE_NO_DRIVER);
             syscall::sleep(MOUNT_POLL_TICKS);
             continue;
         };
@@ -152,6 +181,7 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
         let request = ipc::Message::new(0, &request_payload);
         syscall::print("SFS: sending request to block driver\r\n");
         if !syscall::send(driver, &request) {
+            failure = MountFailure::new(MountFailure::STAGE_SEND_FAILED);
             syscall::sleep(MOUNT_POLL_TICKS);
             continue;
         }
@@ -159,6 +189,7 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
         let mut response = ipc::Message::new(0, &[]);
         syscall::print("SFS: waiting for response from block driver\r\n");
         if !receive_from(driver, &mut response) {
+            failure = MountFailure::new(MountFailure::STAGE_NO_REPLY);
             syscall::sleep(MOUNT_POLL_TICKS);
             continue;
         }
@@ -167,6 +198,7 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
         // 0: read failed. Only 1 can be inspected.
         if response.payload[0] != 1 {
             last_status = u16::from(response.payload[0]);
+            failure = MountFailure::new(MountFailure::STAGE_READ_REJECTED);
             syscall::sleep(MOUNT_POLL_TICKS);
             continue;
         }
@@ -181,11 +213,15 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
 
         if length < SFS_SUPERBLOCK_SIZE as u64 {
             acknowledge(driver);
-            return Err(MountFailure::new(MountFailure::READ_REJECTED));
+            return Err(MountFailure::new(MountFailure::STAGE_SHORT_WINDOW));
         }
 
-        syscall::print("SFS: mapping physical 0x" ); syscall::print_hex_u64(physical_address); syscall::print(", len "); syscall::print_hex_u64(length); syscall::print("
-"); let mapped = syscall::map_phys(physical_address, length);
+        syscall::print("SFS: mapping physical 0x");
+        syscall::print_hex_u64(physical_address);
+        syscall::print(", len ");
+        syscall::print_hex_u64(length);
+        syscall::print("\r\n");
+        let mapped = syscall::map_phys(physical_address, length);
         // The window is Normal Non-Cacheable memory shared with the device, so
         // it is read byte by byte with volatile loads. A struct-wide
         // `read_volatile` may be lowered to a non-volatile copy.
@@ -195,7 +231,7 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
         acknowledge(driver);
 
         let Some(superblock) = superblock else {
-            return Err(MountFailure::new(MountFailure::MAPPING_FAILED));
+            return Err(MountFailure::new(MountFailure::STAGE_MAP_FAILED));
         };
         if superblock.magic != SFS_MAGIC {
             // A wrong magic right after a successful read is retried: the very
@@ -204,7 +240,7 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
             let mut leading = [0_u8; 8];
             leading.copy_from_slice(&superblock.raw[..8]);
             failure = MountFailure {
-                code: MountFailure::BAD_FILESYSTEM,
+                code: MountFailure::STAGE_BAD_MAGIC,
                 leading: u64::from_le_bytes(leading),
                 physical: physical_address,
                 driver_view: u32::from_le_bytes(response.payload[11..15].try_into().unwrap()),
@@ -220,8 +256,9 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
         return Ok(superblock);
     }
 
-    // Nothing mounted after every attempt: report the last attempt's state so
-    // an unattended log distinguishes "no driver" from "unreadable sector".
+    // Nothing mounted after every attempt: the report names the stage of the
+    // last failed attempt, so an unattended log distinguishes "no driver",
+    // "driver silent", "read rejected" and "unreadable sector".
     failure.attempts = attempt as u8;
     failure.reads = reads;
     failure.last_status = last_status;
@@ -262,7 +299,7 @@ fn read_superblock(virtual_address: u64) -> SfsSuperblock {
 /// Reports the mount result to silverd. `hint` comes from the boot argument and
 /// is used only when the task table confirms it really is silverd.
 ///
-/// `failure` carries the reason code on an unsuccessful mount: the server never
+/// `failure` carries the stage code on an unsuccessful mount: the server never
 /// owns the console, so its own `print` output would be discarded and this is
 /// the only way the cause reaches an unattended boot log.
 fn announce(hint: u64, failure: Option<MountFailure>) {

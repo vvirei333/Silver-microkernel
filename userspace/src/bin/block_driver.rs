@@ -320,7 +320,7 @@ unsafe fn read_sector(queue: &Virtqueue, sector: u64, buffer: &mut [u8; 512]) ->
 
     // Check if REQUEST_BUFFER was successfully allocated
     if unsafe { (*core::ptr::addr_of!(REQUEST_BUFFER)).is_none() } {
-        syscall::print("BLOCK DRIVER: REQUEST_BUFFER not allocated\\r\\n");
+        syscall::print("BLOCK DRIVER: REQUEST_BUFFER not allocated\r\n");
         return false;
     }
 
@@ -329,7 +329,7 @@ unsafe fn read_sector(queue: &Virtqueue, sector: u64, buffer: &mut [u8; 512]) ->
     };
     // Protect against zero DMA address which would overwrite the zero page
     if request_paddr == 0 {
-        syscall::print("BLOCK DRIVER: zero DMA address\\r\\n");
+        syscall::print("BLOCK DRIVER: zero DMA address\r\n");
         return false;
     }
     // Zero the window with volatile stores. A plain `write_bytes` is a

@@ -13,7 +13,10 @@ const ICR: *mut u32 = (BASE + 0x44) as *mut u32;
 
 const CTRL_Z: u8 = 0x1A;
 const RX_INTERRUPT: u32 = 1 << 4;
-const RX_TIMEOUT_INTERRUPT: u32 = 1 << 5;
+/// IMSC/ICR bit 6 is RTIM, the receive-timeout interrupt. Bit 5 is TXIM: masking
+/// it in would make the UART assert its line for as long as the TX FIFO stays
+/// empty, storming INTID 33 and starving whichever task owns it.
+const RX_TIMEOUT_INTERRUPT: u32 = 1 << 6;
 const RX_CAPACITY: usize = 256;
 static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static mut RX_QUEUE: [u8; RX_CAPACITY] = [0; RX_CAPACITY];

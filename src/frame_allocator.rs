@@ -98,31 +98,53 @@ pub fn alloc_page() -> Option<usize> {
     None
 }
 
-/// Allocates a contiguous run of physical pages or frees the partial run on failure.
+/// Allocates a run of `page_count` physically contiguous pages.
+///
+/// Searches the bitmap for the lowest run of `page_count` consecutive free bits
+/// and claims the whole run at once. Fragmented memory is never returned: DMA
+/// consumers (VirtIO rings) need one physically contiguous buffer, so a missing
+/// run is reported as `None` instead of being spread across the bitmap.
+///
+/// The state is borrowed exactly once per call. The helpers used below take a
+/// `&mut FrameAllocatorState` instead of going back through `alloc_page` or
+/// `free_page`, which would borrow the same state a second time.
 pub fn alloc_contiguous_pages(page_count: usize) -> Option<usize> {
-    if page_count == 0 {
+    if page_count == 0 || page_count > MAX_PHYSICAL_PAGES {
         return None;
     }
 
-    let first = alloc_page()?;
-    let mut last = first;
-
-    for _ in 1..page_count {
-        let Some(page) = alloc_page() else {
-            release_contiguous_pages(first, last);
-            return None;
-        };
-
-        if page != last + PAGE_SIZE {
-            release_contiguous_pages(first, last);
-            free_page(page);
-            return None;
-        }
-
-        last = page;
+    let state = state();
+    if page_count > state.free_pages {
+        return None;
     }
 
-    Some(first)
+    let mut run_start = 0_usize;
+    let mut run_length = 0_usize;
+
+    for page_index in 0..state.total_pages {
+        let word = state.bitmap[page_index / BITS_PER_WORD];
+        let is_free = word & (1_u64 << (page_index % BITS_PER_WORD)) == 0;
+
+        if !is_free {
+            run_length = 0;
+            continue;
+        }
+
+        if run_length == 0 {
+            run_start = page_index;
+        }
+        run_length += 1;
+
+        if run_length == page_count {
+            for index in run_start..run_start + page_count {
+                mark_used(state, index);
+            }
+            state.free_pages -= page_count;
+            return Some(state.available.start + run_start * PAGE_SIZE);
+        }
+    }
+
+    None
 }
 
 /// Returns a previously allocated page to the allocator.
@@ -151,15 +173,6 @@ pub fn free_page(address: usize) {
     }
 }
 
-/// Releases a contiguous run [first, last] previously built by alloc_contiguous_pages.
-fn release_contiguous_pages(first: usize, last: usize) {
-    let mut page = first;
-    while page <= last {
-        free_page(page);
-        page += PAGE_SIZE;
-    }
-}
-
 /// Verifies allocation, contiguity and reuse without changing the final state.
 pub fn run_self_test() -> bool {
     let Some(first) = alloc_page() else {
@@ -184,7 +197,30 @@ pub fn run_self_test() -> bool {
     }
     free_page(reused);
 
-    sequential && reuse_ok
+    sequential && reuse_ok && run_contiguous_self_test()
+}
+
+/// Allocates the same short run twice. The first run is released before the
+/// second attempt, so the bitmap is back to its previous contents and the scan
+/// has to return the identical base address.
+fn run_contiguous_self_test() -> bool {
+    const PROBE_PAGES: usize = 3;
+
+    let Some(first) = alloc_contiguous_pages(PROBE_PAGES) else {
+        return false;
+    };
+    for index in 0..PROBE_PAGES {
+        free_page(first + index * PAGE_SIZE);
+    }
+
+    let Some(second) = alloc_contiguous_pages(PROBE_PAGES) else {
+        return false;
+    };
+    for index in 0..PROBE_PAGES {
+        free_page(second + index * PAGE_SIZE);
+    }
+
+    first % PAGE_SIZE == 0 && first == second
 }
 
 const fn align_up(address: usize, alignment: usize) -> usize {

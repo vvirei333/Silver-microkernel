@@ -409,7 +409,7 @@ pub fn map_dma_to_user(
     phys_addr: usize,
     size: usize,
 ) -> Option<usize> {
-    crate::pl011::write_str("MMU: map_dma_to_user called\n");
+    crate::pl011::write_str("MMU: map_dma_to_user called\r\n");
     if size == 0 || phys_addr % GRANULE != 0 || size % GRANULE != 0 {
         return None;
     }

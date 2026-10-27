@@ -9,6 +9,7 @@ use alloc::{vec, vec::Vec};
 use crate::{
     frame_allocator,
     memory::{phys_to_virt, PAGE_SIZE},
+    pl011,
 };
 
 pub const USER_IMAGE_VA: usize = 0x4000_0000;
@@ -60,13 +61,26 @@ pub fn load(bytes: &[u8]) -> Option<UserImage> {
         return None;
     }
 
+    // Temporary bring-up probes: the caller prints "load elf" before this call,
+    // so every step below is reported to pin down where a spawn stalls. Remove
+    // once sfs_server mounts reliably.
+    pl011::write_str("ELF: begin size=");
+    pl011::write_dec_u64(bytes.len() as u64);
+    pl011::write_str("\r\n");
+
     let entry = usize::try_from(read_u64(bytes, 24)?).ok()?;
     let program_offset = usize::try_from(read_u64(bytes, 32)?).ok()?;
     let program_size = read_u16(bytes, 54)? as usize;
     let program_count = read_u16(bytes, 56)? as usize;
     if program_size < PROGRAM_HEADER_SIZE || program_count == 0 {
+        pl011::write_str("ELF: reject - bad program header size/count\r\n");
         return None;
     }
+    pl011::write_str("ELF: header ok entry=");
+    pl011::write_hex_u64(entry as u64);
+    pl011::write_str(" phnum=");
+    pl011::write_dec_u64(program_count as u64);
+    pl011::write_str("\r\n");
 
     let mut segments = Vec::new();
     let mut image_end = USER_IMAGE_VA;
@@ -78,7 +92,23 @@ pub fn load(bytes: &[u8]) -> Option<UserImage> {
         }
 
         let flags = read_u32(header, 4)?;
+        let file_offset = usize::try_from(read_u64(header, 8)?).ok()?;
+        let virtual_address = usize::try_from(read_u64(header, 16)?).ok()?;
+        let file_size = usize::try_from(read_u64(header, 32)?).ok()?;
+        let memory_size = usize::try_from(read_u64(header, 40)?).ok()?;
+
+        pl011::write_str("ELF SEGMENT: vaddr=");
+        pl011::write_hex_u64(virtual_address as u64);
+        pl011::write_str(" filesz=");
+        pl011::write_hex_u64(file_size as u64);
+        pl011::write_str(" memsz=");
+        pl011::write_hex_u64(memory_size as u64);
+        pl011::write_str(" flags=");
+        pl011::write_dec_u64(flags as u64);
+        pl011::write_str("\r\n");
+
         if flags & PF_R == 0 || flags & PF_W != 0 && flags & PF_X != 0 {
+            pl011::write_str("ELF: reject - segment flags unusable (W^X)\r\n");
             return None;
         }
         let kind = if flags & PF_X != 0 {
@@ -88,10 +118,6 @@ pub fn load(bytes: &[u8]) -> Option<UserImage> {
         } else {
             PageKind::ReadOnly
         };
-        let file_offset = usize::try_from(read_u64(header, 8)?).ok()?;
-        let virtual_address = usize::try_from(read_u64(header, 16)?).ok()?;
-        let file_size = usize::try_from(read_u64(header, 32)?).ok()?;
-        let memory_size = usize::try_from(read_u64(header, 40)?).ok()?;
         if memory_size == 0 {
             continue;
         }
@@ -100,6 +126,7 @@ pub fn load(bytes: &[u8]) -> Option<UserImage> {
             || virtual_address.checked_add(memory_size)? > USER_IMAGE_VA + USER_IMAGE_SIZE
             || file_offset.checked_add(file_size)? > bytes.len()
         {
+            pl011::write_str("ELF: reject - segment outside the user window\r\n");
             return None;
         }
         image_end = image_end.max(virtual_address.checked_add(memory_size)?);
@@ -119,14 +146,21 @@ pub fn load(bytes: &[u8]) -> Option<UserImage> {
                 && entry < segment.virtual_address + segment.memory_size
         })
     {
+        pl011::write_str("ELF: reject - entry outside every text segment\r\n");
         return None;
     }
 
     let image_size = image_end.checked_sub(USER_IMAGE_VA)?;
     let page_count = image_size.checked_add(PAGE_SIZE - 1)? / PAGE_SIZE;
     if page_count == 0 || page_count > USER_IMAGE_SIZE / PAGE_SIZE {
+        pl011::write_str("ELF: reject - image size out of range\r\n");
         return None;
     }
+    pl011::write_str("ELF: image_size=");
+    pl011::write_hex_u64(image_size as u64);
+    pl011::write_str(" pages=");
+    pl011::write_dec_u64(page_count as u64);
+    pl011::write_str("\r\n");
     let mut kinds = vec![PageKind::ReadOnly; page_count];
     let mut mapped = vec![false; page_count];
     for segment in &segments {
@@ -141,10 +175,20 @@ pub fn load(bytes: &[u8]) -> Option<UserImage> {
         }
     }
     if mapped.iter().any(|mapped| !mapped) {
+        pl011::write_str("ELF: reject - image has a hole no segment covers\r\n");
         return None;
     }
 
-    let physical_start = frame_allocator::alloc_contiguous_pages(page_count)?;
+    pl011::write_str("ELF: alloc run pages=");
+    pl011::write_dec_u64(page_count as u64);
+    pl011::write_str("\r\n");
+    let Some(physical_start) = frame_allocator::alloc_contiguous_pages(page_count) else {
+        pl011::write_str("ELF: reject - no contiguous physical run\r\n");
+        return None;
+    };
+    pl011::write_str("ELF: run at ");
+    pl011::write_hex_u64(physical_start as u64);
+    pl011::write_str("\r\n");
     unsafe {
         core::ptr::write_bytes(
             phys_to_virt(physical_start) as *mut u8,
@@ -158,7 +202,9 @@ pub fn load(bytes: &[u8]) -> Option<UserImage> {
             core::ptr::copy_nonoverlapping(source, destination, segment.file_size);
         }
     }
+    pl011::write_str("ELF: zero+copy done\r\n");
 
+    pl011::write_str("ELF: done\r\n");
     Some(UserImage {
         entry,
         physical_start,

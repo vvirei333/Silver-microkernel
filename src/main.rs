@@ -448,7 +448,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     pl011::write_str("IRQ READY\r\n");
 
-    for &byte in b"HELLO, WORLD!\n" {
+    for &byte in b"HELLO, WORLD!\r\n" {
         pl011::write_byte(byte);
     }
 

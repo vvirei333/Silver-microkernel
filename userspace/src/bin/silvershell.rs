@@ -894,6 +894,27 @@ fn state_name(state: u64) -> &'static str {
     }
 }
 
+/// Hands a hand-spawned driver the rights the kernel does not grant by itself.
+///
+/// `CapTable::grant` requires the caller (the shell) to hold the right it passes
+/// on, so only `CAP_MMIO` is delegated here — that is the entry `silvershell`
+/// receives. `CAP_PCI` is granted by the kernel at spawn time for the block
+/// driver and is deliberately not held by the shell.
+///
+/// Spawning still succeeds when the grant fails; the task simply runs without
+/// device access, which is a diagnosable state rather than a silent one.
+fn grant_device_rights(cap_id: u64, task_id: u64, program: u64) {
+    let rights = match program {
+        syscall::PROGRAM_BLOCK_DRIVER | syscall::PROGRAM_SFS_SERVER => syscall::CAP_MMIO,
+        _ => return,
+    };
+    // Recipient must be the task ID: the CapId only names the shell's own entry
+    // for that task, and the kernel resolves recipients by task ID.
+    if !syscall::cap_grant(cap_id, task_id, rights) {
+        syscall::print("Spawned, but CAP_MMIO grant failed: the task has no device access.\r\n");
+    }
+}
+
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
         syscall::print(
@@ -932,6 +953,7 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
 
     if let Some(cap_id) = syscall::spawn(program, argument) {
         if let Some(id) = syscall::cap_get_task_id(cap_id) {
+            grant_device_rights(cap_id, id, program);
             syscall::print("Spawned task ID=");
             syscall::print_dec_u64(id);
             syscall::print(" CapId=");

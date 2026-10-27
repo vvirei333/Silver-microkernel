@@ -15,7 +15,10 @@ const UART_FR: usize = 0x18;
 const UART_ICR: usize = 0x44;
 const UART_FR_RXFE: u32 = 1 << 4;
 const UART_FR_TXFF: u32 = 1 << 5;
-const UART_RX_RT_CLEAR: u32 = 0x30;
+/// ICR bits: RXIC (bit 4) and RTIC (bit 6). The receive-timeout flag is raised
+/// even when no byte is left in the FIFO, so acknowledging only RXIC leaves the
+/// interrupt asserted and the driver spins on it forever.
+const UART_RX_RT_CLEAR: u32 = 0x50;
 const IPC_INPUT: u8 = 0;
 const IPC_OUTPUT: u8 = 1;
 const CTRL_Z: u8 = 0x1A;
@@ -38,9 +41,10 @@ pub extern "C" fn _start(target_task_id: u64) -> ! {
     loop {
         drain_output(base);
         syscall::wait_irq();
-        if read32(base + UART_FR) & UART_FR_RXFE == 0 {
+        // Drain the whole FIFO: several bytes can arrive between two wakeups and
+        // every one of them has to reach the console owner.
+        while read32(base + UART_FR) & UART_FR_RXFE == 0 {
             let byte = read32(base + UART_DR) as u8;
-            write32(base + UART_ICR, UART_RX_RT_CLEAR);
             if byte == CTRL_Z {
                 syscall::stop_console();
             } else {
@@ -48,6 +52,10 @@ pub extern "C" fn _start(target_task_id: u64) -> ! {
                 let _ = syscall::try_send(target_task_id, &message);
             }
         }
+        // Acknowledged unconditionally: an RT interrupt may arrive with no byte
+        // left to read, and clearing ICR only inside the read branch would leave
+        // it pending. The GIC then re-delivers the same event on every unmask.
+        write32(base + UART_ICR, UART_RX_RT_CLEAR);
     }
 }
 
