@@ -3,6 +3,52 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## State as of 2026-10-27 late evening (BAR0 fix: transitional virtio-blk; SFS mounts end-to-end)
+
+**The `driver_status=258` mystery is solved and SFS mounts.** A release boot
+now prints `SFS MOUNTED`, `sfsinfo` reports magic `0x53465321` and `ls` lists
+`bin/ etc/ tmp/` — the whole IPC/DMA path works end-to-end.
+
+Root cause of `258` (`payload[2, 1]` = NOT_INITIALIZED, stage NOT_FOUND):
+QEMU 11's default `virtio-blk-pci` is a **transitional** device. It reports
+device id `0x1001` (so the vendor/device match was always correct) but routes
+the legacy region into **BAR0 as an I/O BAR** (bit 0 = 1) and keeps the modern
+common/notify capabilities in BAR4. `find_virtio_blk()` read BAR0 and did
+`if bar0 & 0x1 != 0 { continue; }` — discarding the device it had just
+matched, even though BAR0 never participates in the capability-driven setup.
+The scan therefore "found nothing" → stage 1.
+
+Diagnosis path worth repeating (driver prints are discarded without the
+console):
+
+- `qemu-system-aarch64 ... -monitor unix:/tmp/qmon,server,nowait` and
+  `info pci` shows vendor/device ids and BAR types directly (`BAR0: I/O`,
+  `BAR4: 64 bit prefetchable`). It also revealed QEMU's implicit default
+  `virtio-net-pci` (`1af4:1000`) on the bus, which the driver correctly skips.
+- The ECAM hardcode is **not** a bug: the QEMU virt DTB says
+  `reg = <0x40 0x10000000 0 0x10000000>` (base `0x4010000000`, 256 MB, buses
+  0–255), exactly matching `mmu::PCI_ECAM_BASE/SIZE`.
+
+Fix applied in `userspace/src/bin/block_driver.rs`: BAR0 no longer gates the
+match. `ASSIGNED_BAR0` and `assign_bar0()` are gone; BAR0 is mapped lazily via
+a new `bar0_base()` helper (rejects I/O BARs) only when a capability actually
+references BAR0 (modern-only devices), and the `_start` print now reports the
+PCI BDF instead of "AT BAR0".
+
+**Second, separate issue found by the fix:** with the driver alive, mount
+still failed with `code=7` (`STAGE_BAD_MAGIC`, `reads=20`) — because
+`disk.img` was not SFS-formatted at all (sector 0 started with the `dead beef`
+pattern). **`disk.img` must be formatted once with `python3 format_sfs.py`**
+after `run_disk.bat` or any other reset of the image; `run_disk.bat`
+recreates it with the `DEADBEEF` pattern, which is not a superblock. Both
+images were identical `dead beef` at the time of writing, so no data was
+lost; formatting is safe and `disk.img` is git-tracked.
+
+Also in this session: `build_and_qemu.sh` verification requires killing stale
+QEMU processes (a running instance holds the `write` lock on `disk.img`), and
+this environment's `pkill` is shadowed by an AppImage wrapper — use
+`kill -9 <pid>` with a PID from `fuser disk.img` instead.
+
 ## State as of 2026-10-27 evening (stage-code exit diagnostics; driver init under suspicion)
 
 `sfs_server` loads fine through the ELF loader but exits during mount. A
@@ -938,6 +984,13 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 - `#[alloc_error_handler]` is unstable on stable Rust. The kernel converts a
   null from its `GlobalAlloc` into a panic; the demo userspace wrapper instead
   prints the layout and exits only the current EL0 task.
+- The block driver's `INIT_NOT_FOUND` stage (1) is overloaded: `find_virtio_blk()`
+  returns `None` both when the ECAM scan matches no device and when any `?`
+  fails *after* a match (capability parsing, `assign_bar4`, `map_phys`). The
+  2026-10-27 BAR0 incident showed how expensive that ambiguity is — stage 1
+  pointed at "no device on the bus" while the device had been found and
+  dropped. Split the stage into "scan found nothing" and "device found, setup
+  failed" (the client report then names the exact step).
 - The EL1/kernel path is a stub. `silver_handle_exception(kind, esr, elr, far)`
   ignores all four arguments, so a kernel bug, an unhandled IRQ (`kind = 8`) or
   a failed boot check (`kind = 6|7` in `kernel_main`) only exits the current
