@@ -107,6 +107,7 @@ struct SfsSuperblock {
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(silverd_hint: u64) -> ! {
+    syscall::print("SFS SERVER STARTING\r\n");
     // The boot argument is only a hint: this server must not trust it blindly,
     // so it is validated against the task table when announcing readiness.
     let superblock = match mount() {
@@ -149,12 +150,14 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
         request_payload[0] = OP_READ_SECTOR;
         request_payload[1..9].copy_from_slice(&SUPERBLOCK_SECTOR.to_le_bytes());
         let request = ipc::Message::new(0, &request_payload);
+        syscall::print("SFS: sending request to block driver\r\n");
         if !syscall::send(driver, &request) {
             syscall::sleep(MOUNT_POLL_TICKS);
             continue;
         }
 
         let mut response = ipc::Message::new(0, &[]);
+        syscall::print("SFS: waiting for response from block driver\r\n");
         if !receive_from(driver, &mut response) {
             syscall::sleep(MOUNT_POLL_TICKS);
             continue;
@@ -181,7 +184,8 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
             return Err(MountFailure::new(MountFailure::READ_REJECTED));
         }
 
-        let mapped = syscall::map_phys(physical_address, length);
+        syscall::print("SFS: mapping physical 0x" ); syscall::print_hex_u64(physical_address); syscall::print(", len "); syscall::print_hex_u64(length); syscall::print("
+"); let mapped = syscall::map_phys(physical_address, length);
         // The window is Normal Non-Cacheable memory shared with the device, so
         // it is read byte by byte with volatile loads. A struct-wide
         // `read_volatile` may be lowered to a non-volatile copy.
@@ -287,6 +291,7 @@ fn announce(hint: u64, failure: Option<MountFailure>) {
 /// to `request.sender`, which the kernel fills in, so no client is hardcoded.
 fn serve(superblock: SfsSuperblock) -> ! {
     loop {
+        syscall::print("SFS: waiting for request\r\n");
         let mut request = ipc::Message::new(0, &[]);
         if !syscall::receive(&mut request) {
             continue;
@@ -318,7 +323,6 @@ fn info_reply(superblock: &SfsSuperblock) -> ipc::Message {
     payload[17..21].copy_from_slice(&superblock.magic.to_le_bytes());
     ipc::Message::new(0, &payload)
 }
-
 /// Releases the driver's shared DMA window. Best effort: a driver that already
 /// exited reclaims its buffer with the task.
 fn acknowledge(driver: u64) {

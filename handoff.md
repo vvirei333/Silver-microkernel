@@ -43,6 +43,38 @@ still open for `sfsinfo`.
    success, `payload[1..9]` = DMA window physical address, `payload[9..11]` = 512.
 
 
+### Exception path: EL0 fault diagnostics are Rust again
+
+The EL0 sync vector had `pl011::write_str` / `write_hex_u64` calls spliced into
+its `global_asm!` block. Rust calls cannot appear in an assembly template, so
+that block could never assemble (the strings would have been fed to the
+assembler as instructions). The dump now lives in `silver_handle_task_fault`,
+which already receives `esr` / `elr` / `far` in x0-x2 per AAPCS64 from a
+four-instruction vector body:
+
+```asm
+exception_user_fault:
+    mrs x0, esr_el1
+    mrs x1, elr_el1
+    mrs x2, far_el1
+    b silver_handle_task_fault
+```
+
+A fault prints one block and then kills only the guilty task:
+
+```text
+EL0 SYNC FAULT!
+ESR_EL1=000000009200000E
+ELR_EL1=0000000040005AF0
+FAR_EL1=FFFF000040000000
+SWITCH TRACE from,to,sp,elr:
+15->1 sp=FFFF000040740000 elr=FFFF00004009037C
+```
+
+`scheduler::dump_switch_trace()` is called again before `exit_current()`, so
+the 16-entry ring is no longer dead code. Labels use fixed-width uppercase hex
+and `\r\n`, like every other kernel dump.
+
 ### Open issue: `sfsinfo` gets opcode 5 instead of 0
 
 `SFS NOT MOUNTED` is printed when the reply's `payload[0] != 1`. A probe that
@@ -290,7 +322,8 @@ falls back to PL011 when no console sink exists.
 Debug and release QEMU passed Howler-backed TX/RX and sleeping `demo 12`
 stop/kill/wait; debug also passed `fg` resume and `uname`. A twelve-second debug
 `demo-tasks` run passed 18 markers with exactly two intentional `TASK FAULT`
-reports:
+reports (the same dump is labelled `EL0 SYNC FAULT!` since the exception-path
+cleanup):
 
 ```text
 CONDVAR TEST: beta silent = PASS
@@ -339,9 +372,9 @@ had exactly the two intentional isolation faults.
 | High-half kernel | 15 | `0xFFFF000040000000` | `FFFF000040000000` |
 | Removed low kernel text alias | 16 | `0x0000000040080000` | `0000000040080000` |
 
-Both report `EC=0x24`, a data abort from a lower exception level. These are
-expected translation/permission failures, not kernel regressions. IDs depend
-on spawn order and are not a stable userspace API.
+Both have `ESR_EL1 >> 26 = 0x24`, a data abort from a lower exception level.
+These are expected translation/permission failures, not kernel regressions.
+IDs depend on spawn order and are not a stable userspace API.
 
 Important fixes and invariants from the recent work must be preserved:
 
@@ -516,8 +549,9 @@ read back only their own values.
   `tlbi vmalle1; dsb ish; isb`. High kernel text and SP_EL1 remain valid
   through TTBR1 throughout the switch.
 - The sync exception entry recognizes SVC by EC=0b010101. Other exceptions
-  inspect SPSR.M[3:2]: EL0 goes to `silver_handle_task_fault`; EL1 is a
-  kernel panic.
+  inspect SPSR.M[3:2]: EL0 goes to `silver_handle_task_fault`, which prints
+  `ESR_EL1` / `ELR_EL1` / `FAR_EL1`, dumps the switch trace and kills only that
+  task; EL1 goes to `silver_handle_exception` (kernel panic).
 - Syscalls include sleep, IPC, nameserver, print, task control, spawn/args,
   wait/kill, stop/resume, `brk`, UART read, console ownership and RAM-VFS.
 - `SYS_CONSOLE_SET(cap_id)` requires `CAP_CONSOLE_GRANT`, then rejects idle,
@@ -776,7 +810,8 @@ read back only their own values.
     trampolines.
 14. **Fault diagnostics must not create a second fault.** Validate every
     userspace stack word before printing it; print `<unmapped>` at the first
-    invalid word.
+    invalid word. (The SP_EL0 stack walk itself is not emitted right now — see
+    Debugging aids — but the rule stands as soon as it comes back.)
 
 ## Why IPC uses Mutex + Condvar
 
@@ -797,10 +832,24 @@ a client's mailbox is full; demos must not issue RPC to an already-full mailbox.
 ## Debugging aids
 
 `scheduler.rs` keeps a 16-entry ring of recent context switches
-(`from`, `to`, next SP, next resume PC). `silver_handle_task_fault` dumps it
-before killing the task. It costs no output during normal operation; keep it
-until task lifecycle and isolation are more battle-tested. Fault stack dumps
-stop at the first unmapped word.
+(`from`, `to`, next SP, next resume PC). `silver_handle_task_fault` prints the
+fault registers and then dumps that ring before killing the task:
+
+```text
+EL0 SYNC FAULT!
+ESR_EL1=<esr>
+ELR_EL1=<elr>
+FAR_EL1=<far>
+SWITCH TRACE from,to,sp,elr:
+<from>-><to> sp=<next sp> elr=<resume pc>
+```
+
+It costs no output during normal operation; keep it until task lifecycle and
+isolation are more battle-tested. The handler only pokes PL011 registers: it
+never allocates and never takes a lock, because the dying task may still own
+either. Not emitted today, although earlier revisions had them: the task `ID`,
+the `EC` field (`esr >> 26`) and the eight-word SP_EL0 stack walk that stops at
+the first unmapped word.
 
 QEMU exception tracing is invaluable for resume/fault bugs:
 
@@ -839,6 +888,13 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 - `#[alloc_error_handler]` is unstable on stable Rust. The kernel converts a
   null from its `GlobalAlloc` into a panic; the demo userspace wrapper instead
   prints the layout and exits only the current EL0 task.
+- The EL1/kernel path is a stub. `silver_handle_exception(kind, esr, elr, far)`
+  ignores all four arguments, so a kernel bug, an unhandled IRQ (`kind = 8`) or
+  a failed boot check (`kind = 6|7` in `kernel_main`) only exits the current
+  task — during boot that is idle — instead of halting with a register dump;
+  just `panic_handler`'s `PANIC AT file:line` survives. Restore the dump and
+  the `wfe` halt loop from git history (`HEAD` still has them). The four unused
+  arguments also produce compiler warnings today.
 
 ## Next steps (by priority)
 
@@ -877,8 +933,8 @@ and the full-mailbox selective-receive limitation recorded above.
    `fg 3`, stop again and verify kill/wait. Repeat with blocked `demo 7` and
    verify a notification received while stopped is delivered after resume.
    For demo-tasks, run 5–30 seconds,
-   repeat timing-sensitive runs and expect exactly two intentional faults from
-   tasks 15 and 16, plus
+   repeat timing-sensitive runs and expect exactly two intentional `EL0 SYNC
+   FAULT!` blocks from tasks 15 and 16, plus
    `COPYOUT READONLY REJECT=PASS`, `COPYOUT UNMAPPED REJECT=PASS`,
    `LIFECYCLE EXIT/UNREGISTER=PASS`, `LIFECYCLE MUTEX CLEANUP=PASS`,
    `HEAP GROW/SHRINK=PASS`, `MALLOC FREE/REUSE=PASS`,

@@ -18,7 +18,7 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 
 - [x] Bare-metal boot: `_start`, custom linker script, `.bss` zeroing
 - [x] PL011 UART console input/output with IRQ-driven RX, echo and line editing
-- [x] ARM64 exception handler: kernel panic with error code and address
+- [x] ARM64 exception vectors: SVC and IRQ trampolines, `panic!` file:line reports, EL0 fault containment
 - [x] Physical memory map + page frame allocator (bitmap)
 - [x] Kernel heap + Rust global allocator (`alloc`: `Box`, `Vec`)
 - [x] GICv2 + ARM Generic Timer (IRQ 30, 100 Hz tick) + PL011 RX (INTID 33)
@@ -55,6 +55,7 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] PCI ECAM access plus a Virtio-PCI block driver: modern capabilities, split virtqueue and `read_sector`
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
+- [x] EL0 fault triage: `ESR_EL1`/`ELR_EL1`/`FAR_EL1` dump and a 16-entry context-switch trace before the guilty task dies
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
 - [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
 - [ ] SFS server, writes and interrupts on the block path, resource quotas and persistent storage
@@ -174,7 +175,7 @@ userspace ELF; no separate userspace command is needed.
 | --- | --- |
 | `build.rs` | Builds and embeds all eleven userspace ELFs for bare-metal profiles |
 | `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
-| `src/exceptions.rs` | Task fault diagnostics and kernel panic |
+| `src/exceptions.rs` | EL0 fault register dump, switch trace and the kernel exit path |
 | `src/pl011.rs` | Kernel UART diagnostics and bounded RX fallback |
 | `src/memory.rs` | Physical memory map and high-half address conversion |
 | `src/frame_allocator.rs` | Physical page frame allocator (bitmap) |
@@ -252,7 +253,9 @@ can block.
 Two intentional probes prove isolation: task 15 reads
 `0xFFFF000040000000` (high-half kernel) and task 16 reads
 `0x0000000040080000` (the old kernel text alias). Each must produce one
-`TASK FAULT` with `EC=0x24`; all other tasks continue running.
+`EL0 SYNC FAULT!` block (`ESR_EL1`, `ELR_EL1`, `FAR_EL1` and the switch trace;
+`ESR_EL1 >> 26 = 0x24`, a data abort from EL0); all other tasks continue
+running.
 
 `spawn(program, argument)` selects a registered ELF and passes a numeric argument
 to its entry point. `spawn_with_args` additionally copies a bounded byte string

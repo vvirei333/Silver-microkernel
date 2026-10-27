@@ -38,6 +38,7 @@ fn state() -> &'static mut FrameAllocatorState {
 pub fn init(available: MemoryRegion) -> usize {
     let start = align_up(available.start, PAGE_SIZE);
     let end = align_down(available.end, PAGE_SIZE);
+    assert!(end > start, "Available memory region is empty: start >= end");
     let requested_pages = if end > start {
         (end - start) / PAGE_SIZE
     } else {

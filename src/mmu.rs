@@ -409,6 +409,7 @@ pub fn map_dma_to_user(
     phys_addr: usize,
     size: usize,
 ) -> Option<usize> {
+    crate::pl011::write_str("MMU: map_dma_to_user called\n");
     if size == 0 || phys_addr % GRANULE != 0 || size % GRANULE != 0 {
         return None;
     }
@@ -424,7 +425,9 @@ pub fn map_dma_to_user(
     // The allocator and zeroing path use the cacheable kernel alias. Push those
     // lines to the point of coherency before the device can observe the buffer.
     clean_dma_range(phys_addr, size);
-    map_user_pages(task, phys_addr, page_count, 0, user_dma_page)
+    let virtual_address = map_user_pages(task, phys_addr, page_count, 0, user_dma_page)?;
+    invalidate_user_page(virtual_address);
+    Some(virtual_address)
 }
 
 /// Maps a registered DMA allocation shared by another task. The scheduler
@@ -469,7 +472,12 @@ fn map_user_pages(
         let l3_mmio = user_mmio_table(task.ttbr0)?;
         let mut first = ENTRIES;
         let mut run_length = 0;
+        let mut iter_count = 0;
         for index in 0..ENTRIES {
+            iter_count += 1;
+            if iter_count > 1000 {
+                panic!("MMU: infinite loop!");
+            }
             if read_entry(l3_mmio, index) == 0 {
                 if run_length == 0 {
                     first = index;
@@ -486,7 +494,12 @@ fn map_user_pages(
             return None;
         }
 
+        let mut iter_count2 = 0;
         for page_index in 0..page_count {
+            iter_count2 += 1;
+            if iter_count2 > 1000 {
+                panic!("MMU: infinite loop!");
+            }
             write_entry(
                 l3_mmio,
                 first + page_index,
@@ -499,7 +512,12 @@ fn map_user_pages(
         // the previous mapping of this window.
         clean_table_lines(l3_mmio, GRANULE);
         let virtual_address = USER_MMIO_VA + first * GRANULE;
+        let mut iter_count3 = 0;
         for page_index in 0..page_count {
+            iter_count3 += 1;
+            if iter_count3 > 1000 {
+                panic!("MMU: infinite loop!");
+            }
             invalidate_user_page(virtual_address + page_index * GRANULE);
         }
         Some(virtual_address + physical_offset)

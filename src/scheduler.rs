@@ -236,6 +236,7 @@ pub fn yield_current() {
             task.state = TaskState::Ready;
         }
     }
+   
     schedule();
     interrupts::restore_irq(saved_daif);
 }
@@ -250,6 +251,7 @@ pub fn sleep(milliseconds: u64) {
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Sleeping(wake_at);
     }
+    pl011::write_str("\n");
     schedule();
     interrupts::restore_irq(saved_daif);
 }
@@ -277,7 +279,8 @@ pub fn wait_irq() -> bool {
             crate::gic::enable_irq(intid);
         }
         task.state = TaskState::Blocked;
-        schedule();
+    pl011::write_str("\n");
+    schedule();
     }
 }
 
@@ -364,6 +367,7 @@ pub fn block_current_on(queue: &WaitQueue) {
         task.waiting_on = Some(queue as *const WaitQueue);
         task.state = TaskState::Blocked;
     }
+    pl011::write_str("\n");
     schedule();
     if let Some(task) = current_task_mut() {
         task.waiting_on = None;
@@ -379,6 +383,7 @@ pub fn block_current_on_until(queue: &WaitQueue, deadline: u64) {
         task.waiting_on = Some(queue as *const WaitQueue);
         task.state = TaskState::BlockedUntil(deadline);
     }
+    pl011::write_str("\n");
     schedule();
     queue.remove(id);
     if let Some(task) = current_task_mut() {
@@ -430,6 +435,7 @@ pub fn exit_current_with_status(status: u64) -> ! {
         recover_console(manager, id);
         record_exit(manager, id, status);
     }
+    pl011::write_str("\n");
     schedule();
     interrupts::restore_irq(saved_daif);
     loop {
@@ -460,6 +466,7 @@ pub fn kill_task(id: u64) -> bool {
     task.bound_irq = None;
     recover_console(manager, id);
     record_exit(manager, id, 1);
+    pl011::write_str("\n");
     schedule();
     interrupts::restore_irq(saved_daif);
     true
@@ -540,7 +547,8 @@ fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
             task.waiting_on = Some(&PROCESS_WAIT_QUEUE);
             task.state = TaskState::Blocked;
         }
-        schedule();
+    pl011::write_str("\n");
+    schedule();
         PROCESS_WAIT_QUEUE.remove(waiter);
         if let Some(task) = current_task_mut() {
             task.waiting_on = None;
@@ -989,14 +997,39 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
     let result = scheduler_manager().and_then(|manager| {
         let task = manager.tasks.get_mut(manager.current_index)?;
         if !task.cap_table.has_rights(capability::CAP_MMIO) {
+            pl011::write_str("DMA: FAIL - no CAP_MMIO rights\n");
             return None;
         }
-        let physical = frame_allocator::alloc_contiguous_pages(page_count)?;
+        pl011::write_str("DMA: has CAP_MMIO, allocating ");
+        pl011::write_hex_u64(page_count as u64);
+        pl011::write_str(" pages\n");
+        let physical = match frame_allocator::alloc_contiguous_pages(page_count) {
+            Some(p) => {
+                pl011::write_str("DMA: alloc_contiguous_pages OK, physical= ");
+                pl011::write_hex_u64(p as u64);
+                pl011::write_str("\n");
+                p
+            }
+            None => {
+                pl011::write_str("DMA: FAIL - alloc_contiguous_pages returned None\n");
+                return None;
+            }
+        };
         unsafe { core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, mapped_size) };
+        pl011::write_str("DMA: virt addr = ");
+        pl011::write_hex_u64(phys_to_virt(physical) as u64);
+        pl011::write_str("\n");
+        pl011::write_str("DMA: zeroing...\n");
+        pl011::write_str("DMA: zeroing OK\n");
+        pl011::write_str("DMA: mapping to user...\n");
         let Some(virtual_address) = mmu::map_dma_to_user(task, physical, mapped_size) else {
+            pl011::write_str("DMA: FAIL - mmu::map_dma_to_user returned None\n");
             release_pages(physical, page_count);
             return None;
         };
+        pl011::write_str("DMA: mapped va=");
+        pl011::write_hex_u64(virtual_address as u64);
+        pl011::write_str("\n");
         task.dma_pages.push((physical, page_count));
         Some((virtual_address, physical))
     });
