@@ -165,14 +165,21 @@ fn serve_ipc() -> ! {
         let sector = u64::from_le_bytes(sector_bytes);
         let queue = unsafe { (*core::ptr::addr_of!(QUEUE)).as_ref() };
         let response = if let Some(queue) = queue {
+            syscall::print("BLOCK SECTOR 0x");
+            syscall::print_hex_u64(sector);
+            syscall::print("\r\n");
             let mut data = [0_u8; 512];
             if unsafe { read_sector(queue, sector, &mut data) } {
                 let (_, request_paddr) = unsafe { (*core::ptr::addr_of!(REQUEST_BUFFER)).unwrap() };
                 let data_paddr = request_paddr + 16;
-                let mut payload = [0_u8; 11];
+                let mut payload = [0_u8; 27];
                 payload[0] = 1;
                 payload[1..9].copy_from_slice(&data_paddr.to_le_bytes());
                 payload[9..11].copy_from_slice(&512_u16.to_le_bytes());
+                // Temporary probe: what this task itself reads back from the
+                // window, plus the sector number it parsed out of the request.
+                payload[11..15].copy_from_slice(&u32::from_le_bytes(data[..4].try_into().unwrap()).to_le_bytes());
+                payload[15] = sector as u8;
                 ipc::Message::new(0, &payload)
             } else {
                 ipc::Message::new(0, &[0])
@@ -314,7 +321,14 @@ unsafe fn read_sector(queue: &Virtqueue, sector: u64, buffer: &mut [u8; 512]) ->
     let Some((request_vaddr, request_paddr)) = (*core::ptr::addr_of!(REQUEST_BUFFER)) else {
         return false;
     };
-    core::ptr::write_bytes(request_vaddr as *mut u8, 0, REQUEST_DMA_SIZE);
+    // Zero the window with volatile stores. A plain `write_bytes` is a
+    // non-volatile store, and LLVM is free to sink it past the volatile
+    // completion polling below; in optimized builds that wiped the sector the
+    // device had just written, so every client read back zeroes.
+    for index in 0..REQUEST_DMA_SIZE / 8 {
+        core::ptr::write_volatile((request_vaddr as *mut u64).add(index), 0);
+    }
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     core::ptr::write_volatile(
         request_vaddr as *mut VirtioBlkRequest,
         VirtioBlkRequest {

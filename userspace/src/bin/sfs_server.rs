@@ -47,6 +47,10 @@ struct MountFailure {
     leading: u64,
     /// Physical address of the shared DMA window the driver returned.
     physical: u64,
+    /// Temporary probe: first four bytes the block driver itself reads back.
+    driver_view: u32,
+    /// Temporary probe: the sector number the driver parsed from the request.
+    driver_sector: u8,
     attempts: u8,
     reads: u8,
     last_status: u16,
@@ -64,6 +68,8 @@ impl MountFailure {
             code,
             leading: 0,
             physical: 0,
+            driver_view: 0,
+            driver_sector: 0,
             attempts: 0,
             reads: 0,
             last_status: 0,
@@ -187,6 +193,8 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
                 code: MountFailure::BAD_FILESYSTEM,
                 leading: u64::from_le_bytes(leading),
                 physical: physical_address,
+                driver_view: u32::from_le_bytes(response.payload[11..15].try_into().unwrap()),
+                driver_sector: response.payload[15],
                 attempts: attempt as u8,
                 reads,
                 last_status,
@@ -217,6 +225,10 @@ fn read_superblock(virtual_address: u64) -> SfsSuperblock {
     for (index, byte) in bytes.iter_mut().enumerate() {
         *byte = unsafe { core::ptr::read_volatile(base.add(index)) };
     }
+    // The window is filled by the device, not by this task, so keep the loads
+    // above ordered before the magic check: a reordered or hoisted read would
+    // observe the zeroed buffer instead of the completed transfer.
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     let word = |offset: usize| {
         let mut value = [0_u8; 4];
         value.copy_from_slice(&bytes[offset..offset + 4]);
@@ -253,7 +265,8 @@ fn announce(hint: u64, failure: Option<MountFailure>) {
             payload[..9].copy_from_slice(b"SFS ERROR");
             payload[10..18].copy_from_slice(&failure.summary().to_le_bytes());
             payload[18..26].copy_from_slice(&failure.leading.to_le_bytes());
-            payload[26..32].copy_from_slice(&failure.physical.to_le_bytes()[..6]);
+            payload[26..30].copy_from_slice(&failure.driver_view.to_le_bytes());
+            payload[30] = failure.driver_sector;
             ipc::Message::new(0, &payload)
         }
     };

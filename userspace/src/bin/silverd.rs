@@ -112,16 +112,19 @@ fn await_sfs_ready(sfs_id: u64) -> bool {
                 b"SFS ERROR" => {
                     let mut summary_bytes = [0_u8; 8];
                     let mut leading_bytes = [0_u8; 8];
-                    let mut physical_bytes = [0_u8; 8];
+                    let mut driver_bytes = [0_u8; 4];
                     summary_bytes.copy_from_slice(&message.payload[10..18]);
                     leading_bytes.copy_from_slice(&message.payload[18..26]);
-                    physical_bytes[..6].copy_from_slice(&message.payload[26..32]);
+                    driver_bytes.copy_from_slice(&message.payload[26..30]);
+                    let driver_sector = message.payload[30];
                     syscall::print("SILVERD: SFS MOUNT FAILED, SUMMARY 0x");
                     syscall::print_hex_u64(u64::from_le_bytes(summary_bytes));
                     syscall::print(" FIRST 0x");
                     syscall::print_hex_u64(u64::from_le_bytes(leading_bytes));
-                    syscall::print(" PADDR 0x");
-                    syscall::print_hex_u64(u64::from_le_bytes(physical_bytes));
+                    syscall::print(" DRIVER 0x");
+                    syscall::print_hex_u64(u64::from(u32::from_le_bytes(driver_bytes)));
+                    syscall::print(" SECTOR 0x");
+                    syscall::print_hex_u64(u64::from(driver_sector));
                     syscall::print("\r\n");
                     return false;
                 }

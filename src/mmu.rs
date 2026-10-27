@@ -50,6 +50,9 @@ const PCI_ECAM_L1_INDEX: usize = (PCI_ECAM_BASE >> 30) & 0x1FF;
 const PCI_ECAM_L2_INDEX: usize = ((PCI_ECAM_BASE >> 21) & 0x1FF) as usize;
 const PCI_ECAM_L2_BLOCKS: usize = PCI_ECAM_SIZE / BLOCK_2M;
 
+/// MAIR attribute indices. `ATTR_NORMAL` is cacheable write-back, `ATTR_DEVICE`
+/// is Device-nGnRnE and `ATTR_NORMAL_NC` is Normal Non-Cacheable. These must
+/// match the byte positions in `MAIR_VALUE` exactly.
 const ATTR_NORMAL: u64 = 0;
 const ATTR_DEVICE: u64 = 1;
 const ATTR_NORMAL_NC: u64 = 2;
@@ -64,7 +67,16 @@ const UXN: u64 = 1 << 54;
 const PXN: u64 = 1 << 53;
 
 const ADDRESS_MASK: u64 = 0x0000_FFFF_FFFF_F000;
-const MAIR_VALUE: u64 = 0x00_44_FF;
+/// MAIR_EL1 attribute bytes, one per `ATTR_*` index:
+/// * index 0 = `0xFF` Normal, Outer/Inner Write-Back Non-transient (cacheable)
+/// * index 1 = `0x00` Device-nGnRnE (MMIO)
+/// * index 2 = `0x44` Normal, Outer/Inner Non-Cacheable (DMA)
+///
+/// The byte order matters: a descriptor selects a byte with bits [4:2], so
+/// index 1 must be the second byte of this value. Writing the two non-cacheable
+/// attributes in the opposite order silently maps DMA as Device-nGnRnE and MMIO
+/// as Normal Non-Cacheable.
+const MAIR_VALUE: u64 = 0x44_00_FF;
 
 /// 48-bit VAs on both TTBRs (T0SZ=T1SZ=16), 4 KB granules, 40-bit PAs,
 /// inner-shareable WB table walks. TG0/TG1 are zero: 4 KB on both halves.
@@ -198,6 +210,22 @@ fn configure_and_enable() {
 /// Clean and invalidate after changing a task's tables. `table_start` is a
 /// physical table address; the CPU accesses it through the high alias.
 pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
+    clean_table_lines(table_start, table_bytes);
+    unsafe {
+        core::arch::asm!(
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            options(nostack),
+        );
+    }
+}
+
+/// Pushes the dirty translation-table lines to the point of coherency.
+///
+/// Only the *table* is cleaned here: without it the table walker may fetch a
+/// stale descriptor from memory even though the invalidating `tlbi` follows.
+fn clean_table_lines(table_start: usize, table_bytes: usize) {
     let start = phys_to_virt(table_start) & !63;
     let end = (phys_to_virt(table_start) + table_bytes + 63) & !63;
     unsafe {
@@ -210,11 +238,25 @@ pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
             );
             line += 64;
         }
+        core::arch::asm!("dsb ishst", options(nostack));
+    }
+}
+
+/// Invalidates the EL1&0 translation of one 4 KB user page by address.
+///
+/// `tlbi vmalle1` would be equally correct, but it discards every cached
+/// translation system-wide on each mapping request. The address form keeps the
+/// rest of the TLB warm and, unlike a block-wide flush, cannot be skipped by
+/// accident when a task maps into a page table that was just installed.
+fn invalidate_user_page(virtual_address: usize) {
+    unsafe {
         core::arch::asm!(
             "dsb ishst",
-            "tlbi vmalle1",
+            // VA[55:12] is what VAE1IS takes; the low 12 bits are the offset.
+            "tlbi vaae1is, {va}",
             "dsb ish",
             "isb",
+            va = in(reg) (virtual_address as u64) >> 12,
             options(nostack),
         );
     }
@@ -451,8 +493,16 @@ fn map_user_pages(
                 descriptor(physical_start + page_index * GRANULE),
             );
         }
-        flush_after_table_change(l3_mmio, GRANULE);
-        Some(USER_MMIO_VA + first * GRANULE + physical_offset)
+        // The descriptor lives in memory, so it has to reach the point of
+        // coherency before the stale translation is dropped; otherwise the
+        // walker can still load the old (empty) slot and the task keeps seeing
+        // the previous mapping of this window.
+        clean_table_lines(l3_mmio, GRANULE);
+        let virtual_address = USER_MMIO_VA + first * GRANULE;
+        for page_index in 0..page_count {
+            invalidate_user_page(virtual_address + page_index * GRANULE);
+        }
+        Some(virtual_address + physical_offset)
     }
 }
 
