@@ -514,7 +514,17 @@ fn sfs_info() {
 
     // Opcode 0 asks for the superblock metadata; the server answers its own
     // mounted copy, so the shell needs neither CAP_MMIO nor the block driver.
-    let request = ipc::Message::new(0, &[0]);
+    // Temporary probe: a recognizable pattern shows exactly how the server
+    // sees the request head (shift of 0, 1 or 8 bytes is distinguishable).
+    let mut request_payload = [0_u8; 32];
+    request_payload[1] = 0x11;
+    request_payload[2] = 0x22;
+    request_payload[3] = 0x33;
+    request_payload[4] = 0x44;
+    request_payload[5] = 0x55;
+    request_payload[6] = 0x66;
+    request_payload[7] = 0x77;
+    let request = ipc::Message::new(0, &request_payload);
     if !syscall::send(server, &request) {
         syscall::print("SFS SERVER NOT RESPONDING\r\n");
         return;
@@ -526,7 +536,21 @@ fn sfs_info() {
         return;
     }
     if response.payload[0] != 1 {
+        // Temporary probe: dump the whole reply, four little-endian 64-bit
+        // words covering all 32 payload bytes, so the actual structure is
+        // visible instead of guessed.
         syscall::print("SFS NOT MOUNTED\r\n");
+        let mut offset = 0;
+        while offset < 32 {
+            let mut word = [0_u8; 8];
+            word.copy_from_slice(&response.payload[offset..offset + 8]);
+            syscall::print("  +");
+            syscall::print_dec_u64(offset as u64);
+            syscall::print("  0x");
+            syscall::print_hex_u64(u64::from_le_bytes(word));
+            syscall::print("\r\n");
+            offset += 8;
+        }
         return;
     }
 

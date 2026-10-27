@@ -161,7 +161,7 @@ fn serve_ipc() -> ! {
         }
 
         let mut sector_bytes = [0_u8; 8];
-        sector_bytes.copy_from_slice(&request.payload[..8]);
+        sector_bytes.copy_from_slice(&request.payload[1..9]);
         let sector = u64::from_le_bytes(sector_bytes);
         let queue = unsafe { (*core::ptr::addr_of!(QUEUE)).as_ref() };
         let response = if let Some(queue) = queue {

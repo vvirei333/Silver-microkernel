@@ -37,6 +37,10 @@ const SFS_SUPERBLOCK_SIZE: usize = 24;
 /// Filesystem server opcodes, shared with the shell's `sfsinfo` command.
 const OP_INFO: u8 = 0;
 
+/// Block driver opcodes. `OP_READ_SECTOR` takes the sector number in
+/// `payload[1..9]` and replies with a shared DMA window.
+const OP_READ_SECTOR: u8 = 1;
+
 /// Why a mount attempt failed, with enough detail to diagnose an unattended
 /// boot: the server never owns the console, so `print` output would be
 /// discarded and this struct is the only channel back to silverd.
@@ -138,7 +142,13 @@ fn mount() -> Result<SfsSuperblock, MountFailure> {
             continue;
         };
 
-        let request = ipc::Message::new(0, &0_u64.to_le_bytes());
+        // Request wire format: payload[0] is the opcode (OP_READ_SECTOR) and
+        // payload[1..9] carries the little-endian sector number.
+        const SUPERBLOCK_SECTOR: u64 = 0;
+        let mut request_payload = [0_u8; 9];
+        request_payload[0] = OP_READ_SECTOR;
+        request_payload[1..9].copy_from_slice(&SUPERBLOCK_SECTOR.to_le_bytes());
+        let request = ipc::Message::new(0, &request_payload);
         if !syscall::send(driver, &request) {
             syscall::sleep(MOUNT_POLL_TICKS);
             continue;
@@ -285,7 +295,14 @@ fn serve(superblock: SfsSuperblock) -> ! {
         let reply = if request.payload[0] == OP_INFO {
             info_reply(&superblock)
         } else {
-            ipc::Message::new(0, &[0])
+            // Temporary probe: echo the request head back so the client can see
+            // exactly which bytes the server received and where.
+            let mut payload = [0_u8; 32];
+            payload[1] = request.payload[0];
+            payload[2] = request.sender as u8;
+            payload[3] = OP_INFO;
+            payload[8..16].copy_from_slice(&request.payload[..8]);
+            ipc::Message::new(0, &payload)
         };
         let _ = syscall::send(request.sender, &reply);
     }

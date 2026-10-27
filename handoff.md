@@ -3,6 +3,143 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## State as of 2026-10-27 (SFS mounts; `sfsinfo` still mismatched)
+
+**The SFS superblock now mounts.** A release boot shows neither
+`SILVERD: SFS MOUNT FAILED` nor `SILVERD: SFS SERVER NOT READY, CONTINUING`,
+which means `await_sfs_ready` received `SFS READY` and `sfs_server` entered
+`serve()`. The client reads the DMA window correctly (magic `0x53465321`
+matched), so the "client sees zeroes / wrong sector" symptom is gone.
+
+Four independent defects had to be fixed to get there; only the last one is
+still open for `sfsinfo`.
+
+1. **The DMA window was zeroed *after* the device wrote it.**
+   `read_sector` cleared the 4 KB request buffer with
+   `core::ptr::write_bytes`, a non-volatile store. LLVM is allowed to sink it
+   past the volatile completion polling, and in optimized builds it did exactly
+   that: the sector the device had just transferred was wiped before the client
+   mapped the window. Debug builds looked fine, release builds returned zeroes.
+   It now clears with `write_volatile` in 8-byte units followed by
+   `compiler_fence(SeqCst)`, and `read_superblock` fences after its volatile
+   loads so the magic check cannot be hoisted above them.
+2. **`MAIR_EL1` selected the wrong attribute bytes.** `MAIR_VALUE` was
+   `0x00_44_FF`, i.e. index 1 (`ATTR_DEVICE`, used for MMIO) resolved to `0x44`
+   Normal Non-Cacheable and index 2 (`ATTR_NORMAL_NC`, used for the DMA window)
+   resolved to `0x00` Device-nGnRnE — the two attributes were swapped. The value
+   is now `0x44_00_FF`: index 0 `0xFF` Normal WB, index 1 `0x00` Device-nGnRnE,
+   index 2 `0x44` Normal Non-Cacheable.
+3. **Stale translations on remap.** `map_user_pages` relied on one global
+   flush after installing L3 descriptors. It now cleans the L3 line
+   (`clean_table_lines`, `dc cvac` + `dsb ishst`) and then invalidates each page
+   by address (`invalidate_user_page`, `tlbi vaae1is`) instead of a single
+   `flush_after_table_change`. The address form keeps the rest of the TLB warm
+   and cannot be silently skipped when a page table was just installed.
+4. **Block-driver request layout disagreed with the client.** The client put
+   the sector at `payload[0..8]` and the driver read `payload[..8]`, while every
+   other option is prefixed with an opcode. The wire format is now explicit on
+   both sides: `payload[0] = OP_READ_SECTOR` (`= 1`),
+   `payload[1..9] = sector.to_le_bytes()`. Reply unchanged: `payload[0] = 1` on
+   success, `payload[1..9]` = DMA window physical address, `payload[9..11]` = 512.
+
+
+### Open issue: `sfsinfo` gets opcode 5 instead of 0
+
+`SFS NOT MOUNTED` is printed when the reply's `payload[0] != 1`. A probe that
+dumps all 32 reply bytes returns, on a release run:
+
+```
+howl> sfsinfo
+SFS NOT MOUNTED
+  +0  0x0000000000050500
+  +8  0x0000000000000000
+  +16 0x0000000000000000
+  +24 0x0000000000000000
+```
+
+The server-side probe fills `payload[1] = request.payload[0]`,
+`payload[2] = request.sender as u8`, `payload[3] = OP_INFO`, so the reply decodes
+as `payload[0] = 0` (status: not mounted), `payload[1] = 5`, `payload[2] = 5`,
+`payload[3] = 0`. The server therefore saw `request.sender == 5` (correct: the
+shell is task 5) but `request.payload[0] == 5` — the sender ID, where the shell
+had written `0`.
+
+Facts already ruled out, so they do not have to be re-checked:
+
+- `src/ipc.rs` and `userspace/src/ipc.rs` both declare
+  `#[repr(C)] struct Message { sender: u64, payload: [u8; 32] }` — identical.
+- `sys_send` copies `size_of::<Message>()` bytes from the user pointer and then
+  overwrites `sender` with the current task ID; `sys_receive` copies the same
+  40 bytes back. `user_memory::copy_from_user` / `copy_to_user` are byte-wise
+  with `+ index` addressing, so neither can shift the payload.
+- The reply direction has no shift: the shell's dump is byte-for-byte what the
+  server's probe wrote.
+- Task table on this build (`ps`): `0 kernel`, `1 silverd`, `2 scout`,
+  `3 block_driver`, `4 sfs_server`, `5 howl`, `6 howler`. `sfs_server` is task 4
+  and the reply really comes from it (`receive_from` filters on
+  `buffer.sender == task_id`).
+
+The decisive experiment is staged in the working tree but **has not been run**:
+the shell sends `[0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, ...]` and the
+server echoes `request.payload[..8]` into the reply's `payload[8..16]`. The `+8`
+word of the dump gives the shift directly:
+
+- `0x0000776655443322` — the server received exactly what was sent; then the bug
+  is specific to the one-byte `&[0]` request path, not to marshalling.
+- zeroes, or a variant with the bytes shifted by one — a real shift; keep the
+  `payload[0] = opcode` convention and move the affected field accordingly.
+- a word containing `0x05` — the sender ID is being substituted for
+  `payload[0]` somewhere between `sys_send` and `serve()`.
+
+Until that is settled `sfsinfo` reports `SFS NOT MOUNTED` even though the
+filesystem itself is mounted.
+
+### Verifying a boot (harness)
+
+`run_disk.bat` must **not** be used for SFS work: it recreates `disk.img` with a
+`DEADBEEF` pattern and boots the debug kernel. Use the Python harness instead —
+it attaches the existing `disk.img`, waits for the `howl>` prompt and sends the
+command terminated with `\r\n` (a bare `\r` never executes):
+
+```powershell
+Get-Process qemu-system-aarch64 -ErrorAction SilentlyContinue | Stop-Process -Force
+cd 'F:\My Projects\Silver microkernel'
+cargo build --release --target aarch64-unknown-none --no-default-features --features no_std
+python 'C:\Users\Public\sfs_check.py' 'target/aarch64-unknown-none/release/silver_microkernel' 'sfsinfo' 12
+```
+
+A hanging QEMU keeps `disk.img` locked, so always kill it first.
+`C:\Users\Public\sfs_check.py` takes `<kernel-elf> <command> <seconds>`.
+
+Note for any new probe: `syscall::print` from a task that does not own the
+console silently returns 0, so `block_driver` and `sfs_server` cannot print
+anything. Probes must travel back inside the IPC reply payload.
+
+### Temporary probes in the working tree (remove before committing)
+
+- `userspace/src/bin/block_driver.rs`: a `BLOCK SECTOR 0x…` `syscall::print`
+  (invisible, harmless); the reply payload is **27 bytes** instead of 11, with
+  `payload[11..15]` = first four bytes the driver reads back (`data[..4]`) and
+  `payload[15]` = the sector it parsed.
+- `userspace/src/bin/sfs_server.rs`: `MountFailure.driver_view` /
+  `driver_sector` and their use in `announce` (`payload[26..30]`, `payload[30]`
+  replacing the DMA physical address), plus the `serve()` else branch that
+  echoes `request.payload[0]`, `request.sender` and `OP_INFO` and copies
+  `request.payload[..8]` into `payload[8..16]`. Restore the else branch to
+  `ipc::Message::new(0, &[0])` and the 11-byte success payload.
+- `userspace/src/bin/silverd.rs`: prints `DRIVER 0x… SECTOR 0x…` from
+  `payload[26..30]` / `payload[30]`; restore the `PADDR` print from
+  `payload[26..32]` once `driver_view` / `driver_sector` are gone.
+- `userspace/src/bin/silvershell.rs`: the patterned request payload and the
+  32-byte dump loop in `sfs_info`'s `SFS NOT MOUNTED` branch. Restore
+  `ipc::Message::new(0, &[0])` and the single-line message.
+
+Changes in these files that must stay: the volatile zeroing plus fence in
+`block_driver::read_sector`, decoding the sector from `payload[1..9]`, the
+`OP_READ_SECTOR` request header in `sfs_server::mount`, the fence in
+`read_superblock`, and the four `mmu.rs` fixes above.
+
+
 ## State as of 2026-10-26 (DMA/PCI infrastructure and Ring 3 UART)
 
 Latest verified architecture: **silverd -> Scout, block_driver, Howl, Howler**.
