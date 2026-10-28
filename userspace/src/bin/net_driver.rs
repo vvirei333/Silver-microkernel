@@ -84,7 +84,6 @@ struct VirtioNet {
     device_cfg_addr: u64,
 }
 
-#[allow(dead_code)]
 struct Virtqueue {
     index: u16,
     size: u16,
@@ -92,13 +91,70 @@ struct Virtqueue {
     descriptors_vaddr: u64,
     available_vaddr: u64,
     used_vaddr: u64,
+    /// Frame buffers appended to the same DMA allocation as the rings. One
+    /// descriptor always points at the buffer with the same index, so a used
+    /// entry's `id` is also the slot to recycle.
+    buffers_vaddr: u64,
+    buffers_paddr: u64,
+    buffer_size: u32,
+    buffer_count: u16,
+    /// Next available-ring slot the driver will fill, and the number of
+    /// buffers ever published. Wrapping as u16 is part of the ring ABI.
+    avail_idx: u16,
+    /// RX: next used-ring entry to consume. TX: newest used-ring index seen,
+    /// which makes `avail_idx - last_used_idx` the number of frames in flight.
+    last_used_idx: u16,
+    next_buffer: u16,
 }
 
-/// Kept live for the RX/TX path that follows in Phase 4. Setup already
-/// programs both queues; no buffers are published yet.
-#[allow(dead_code)]
+#[repr(C)]
+struct VirtqDescriptor {
+    addr: u64,
+    len: u32,
+    flags: u16,
+    next: u16,
+}
+
+#[repr(C)]
+struct VirtqAvailable {
+    flags: u16,
+    idx: u16,
+    ring: [u16; 0],
+}
+
+#[repr(C)]
+struct VirtqUsedElement {
+    id: u32,
+    len: u32,
+}
+
+#[repr(C)]
+struct VirtqUsed {
+    flags: u16,
+    idx: u16,
+    ring: [VirtqUsedElement; 0],
+}
+
+/// The device writes receive frames into descriptors with this flag set.
+const VIRTQ_DESC_F_WRITE: u16 = 2;
+
+/// Sixteen 2 KiB frames per queue is enough for a test exchange and keeps the
+/// DMA allocation small (about 44 KiB per queue including the rings).
+const BUFFER_COUNT_MAX: u16 = 16;
+const BUFFER_SIZE: u32 = 2048;
+
+/// QEMU negotiates `VIRTIO_F_VERSION_1`, and a modern device prefixes every
+/// frame with the 12-byte header (the `num_buffers` field is present even
+/// without `VIRTIO_NET_F_MRG_RXBUF`). The driver sends a zeroed header and
+/// skips it on receive.
+const VIRTIO_NET_HDR_SIZE: usize = 12;
+
+/// Reasons `send_packet` can fail, reported like the init stages.
+const SEND_NOT_READY: u8 = 1;
+const SEND_NO_BUFFER: u8 = 2;
+const SEND_TOO_LARGE: u8 = 3;
+
 static mut RX_QUEUE: Option<Virtqueue> = None;
-#[allow(dead_code)]
 static mut TX_QUEUE: Option<Virtqueue> = None;
 
 #[no_mangle]
@@ -115,13 +171,19 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     print_bdf(&device);
     syscall::print("\r\n");
 
-    match unsafe { initialize(&device) } {
+    let mac = match unsafe { initialize(&device) } {
         Ok(mac) => {
             syscall::print("VIRTIO-NET INITIALIZED AND READY\r\n");
             print_mac(&mac);
+            mac
         }
         Err(stage) => fail(stage, "VIRTIO-NET INITIALIZATION FAILED\r\n"),
-    }
+    };
+
+    // Phase 4 smoke test: ask the QEMU slirp gateway for its MAC, then poll for
+    // the reply. Everything here has to finish inside silverd's one-second
+    // console lend, so the poll is bounded to roughly 400 ms.
+    test_packets(&mac);
 
     // No interrupts or IPC yet: keep the task alive (and the device configured)
     // so the next phase can attach handlers without redoing setup.
@@ -212,8 +274,12 @@ unsafe fn initialize(device: &VirtioNet) -> Result<[u8; 6], u8> {
             return Err(INIT_FEATURES);
         }
 
-        let rx = setup_virtqueue(device, QUEUE_RX)?;
+        let mut rx = setup_virtqueue(device, QUEUE_RX)?;
         let tx = setup_virtqueue(device, QUEUE_TX)?;
+
+        // Receive buffers must be in the available ring before the device is
+        // told the driver is ready, but they must not be notified yet.
+        publish_rx_buffers(&mut rx);
 
         syscall::print("QUEUE 0 (RX): SIZE ");
         syscall::print_dec_u64(u64::from(rx.size));
@@ -232,6 +298,11 @@ unsafe fn initialize(device: &VirtioNet) -> Result<[u8; 6], u8> {
             (common + COMMON_DEVICE_STATUS) as *mut u8,
             status | VIRTIO_STATUS_DRIVER_OK,
         );
+        core::arch::asm!("dsb sy", options(nostack));
+
+        // Only a device that is DRIVER_OK may be notified that RX buffers are
+        // waiting. TX has nothing outstanding yet.
+        notify(&rx);
 
         RX_QUEUE = Some(rx);
         TX_QUEUE = Some(tx);
@@ -281,7 +352,13 @@ unsafe fn setup_virtqueue(device: &VirtioNet, index: u16) -> Result<Virtqueue, u
     let used_offset = descriptor_span
         .checked_add(available_span)
         .ok_or(INIT_DMA)?;
-    let total_size = used_offset.checked_add(used_span).ok_or(INIT_DMA)?;
+
+    let buffer_count = size.min(BUFFER_COUNT_MAX);
+    let buffer_size = BUFFER_SIZE;
+    let buffers_offset = used_offset.checked_add(used_span).ok_or(INIT_DMA)?;
+    let buffers_span =
+        align_page(u64::from(buffer_count) * u64::from(buffer_size)).ok_or(INIT_DMA)?;
+    let total_size = buffers_offset.checked_add(buffers_span).ok_or(INIT_DMA)?;
 
     let (vaddr, paddr) = syscall::alloc_dma(total_size).ok_or(INIT_DMA)?;
     unsafe { core::ptr::write_bytes(vaddr as *mut u8, 0, total_size as usize) };
@@ -315,7 +392,247 @@ unsafe fn setup_virtqueue(device: &VirtioNet, index: u16) -> Result<Virtqueue, u
         descriptors_vaddr: vaddr,
         available_vaddr: vaddr + available_offset,
         used_vaddr: vaddr + used_offset,
+        buffers_vaddr: vaddr + buffers_offset,
+        buffers_paddr: paddr + buffers_offset,
+        buffer_size,
+        buffer_count,
+        avail_idx: 0,
+        last_used_idx: 0,
+        next_buffer: 0,
     })
+}
+
+/// The DMA buffer behind a descriptor slot. Descriptor `slot` always points at
+/// buffer `slot`, so used-ring `id` values are slot numbers.
+impl Virtqueue {
+    fn buffer_vaddr(&self, slot: u16) -> u64 {
+        self.buffers_vaddr + u64::from(slot) * u64::from(self.buffer_size)
+    }
+
+    fn buffer_paddr(&self, slot: u16) -> u64 {
+        self.buffers_paddr + u64::from(slot) * u64::from(self.buffer_size)
+    }
+}
+
+/// Fills a descriptor with the slot's buffer address. `flags` is
+/// `VIRTQ_DESC_F_WRITE` for receive slots and zero for transmit slots, where
+/// the device only reads.
+unsafe fn write_descriptor(queue: &Virtqueue, slot: u16, length: u32, flags: u16) {
+    let descriptor =
+        unsafe { (queue.descriptors_vaddr as *mut VirtqDescriptor).add(usize::from(slot)) };
+    unsafe {
+        core::ptr::write_volatile(
+            descriptor,
+            VirtqDescriptor {
+                addr: queue.buffer_paddr(slot),
+                len: length,
+                flags,
+                next: 0,
+            },
+        );
+    }
+}
+
+/// Appends `slot` to the available ring and publishes the new index. The
+/// caller has already written the descriptor and (for TX) the frame. Both
+/// barriers are mandatory: the device may read the ring entry only after it
+/// observes the index, and it may read the index only after the entry landed.
+unsafe fn publish_buffer(queue: &mut Virtqueue, slot: u16) {
+    let available = queue.available_vaddr as *mut VirtqAvailable;
+    let ring = unsafe { core::ptr::addr_of_mut!((*available).ring).cast::<u16>() };
+    let ring_index = usize::from(queue.avail_idx % queue.size);
+    unsafe { core::ptr::write_volatile(ring.add(ring_index), slot) };
+    core::arch::asm!("dsb sy", options(nostack));
+    queue.avail_idx = queue.avail_idx.wrapping_add(1);
+    unsafe {
+        core::ptr::write_volatile(core::ptr::addr_of_mut!((*available).idx), queue.avail_idx);
+    }
+    core::arch::asm!("dsb sy", options(nostack));
+}
+
+unsafe fn notify(queue: &Virtqueue) {
+    core::arch::asm!("dsb sy", options(nostack));
+    unsafe { core::ptr::write_volatile(queue.notify_addr as *mut u16, queue.index) };
+}
+
+/// Posts every RX buffer before `DRIVER_OK`. No notification is sent here:
+/// the spec forbids touching the notify register until the device is ready.
+unsafe fn publish_rx_buffers(queue: &mut Virtqueue) {
+    for slot in 0..queue.buffer_count {
+        unsafe { write_descriptor(queue, slot, queue.buffer_size, VIRTQ_DESC_F_WRITE) };
+        unsafe { publish_buffer(queue, slot) };
+    }
+}
+
+/// Collects completed TX descriptors. TX frames retire in submission order, so
+/// once the used index advances, the oldest outstanding slot is reusable and
+/// the difference to `avail_idx` is the number of frames still in flight.
+unsafe fn reclaim_tx(queue: &mut Virtqueue) -> u16 {
+    let used = queue.used_vaddr as *const VirtqUsed;
+    let used_idx = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*used).idx)) };
+    core::arch::asm!("dmb sy", options(nostack));
+    queue.last_used_idx = used_idx;
+    queue.avail_idx.wrapping_sub(used_idx)
+}
+
+/// Sends one Ethernet frame. Returns a stage code when the queue is full or the
+/// frame does not fit in a 2 KiB buffer.
+fn send_packet(data: &[u8]) -> Result<(), u8> {
+    let queue = unsafe { (*core::ptr::addr_of_mut!(TX_QUEUE)).as_mut() }.ok_or(SEND_NOT_READY)?;
+
+    let in_flight = unsafe { reclaim_tx(queue) };
+    if in_flight >= queue.buffer_count {
+        return Err(SEND_NO_BUFFER);
+    }
+
+    let total = VIRTIO_NET_HDR_SIZE + data.len();
+    if total > queue.buffer_size as usize {
+        return Err(SEND_TOO_LARGE);
+    }
+
+    // Round-robin slot selection is safe because the device completes in
+    // order: with fewer than `buffer_count` frames in flight, `next_buffer` is
+    // always the oldest, already-completed slot.
+    let slot = queue.next_buffer;
+    queue.next_buffer = (slot + 1) % queue.buffer_count;
+
+    let buffer = queue.buffer_vaddr(slot);
+    unsafe {
+        // A zeroed virtio_net_hdr asks for no offloads: plain Ethernet frame.
+        for index in 0..VIRTIO_NET_HDR_SIZE {
+            core::ptr::write_volatile((buffer as *mut u8).add(index), 0);
+        }
+        core::ptr::copy_nonoverlapping(
+            data.as_ptr(),
+            (buffer as *mut u8).add(VIRTIO_NET_HDR_SIZE),
+            data.len(),
+        );
+        write_descriptor(queue, slot, total as u32, 0);
+        publish_buffer(queue, slot);
+        notify(queue);
+    }
+
+    Ok(())
+}
+
+/// Copies at most one received frame into `buffer`, skipping the virtio header,
+/// and returns the number of payload bytes. The RX slot is immediately
+/// recycled, so the device can fill it again while the caller processes the
+/// copy. Returns `None` when the used ring has no new entry.
+fn receive_packet(buffer: &mut [u8]) -> Option<usize> {
+    let queue = unsafe { (*core::ptr::addr_of_mut!(RX_QUEUE)).as_mut() }?;
+    let used = queue.used_vaddr as *const VirtqUsed;
+    let used_idx = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*used).idx)) };
+    if used_idx == queue.last_used_idx {
+        return None;
+    }
+    // The device wrote the ring entry before bumping `idx`; order the reads.
+    unsafe { core::arch::asm!("dmb sy", options(nostack)) };
+
+    let element_index = usize::from(queue.last_used_idx % queue.size);
+    let element = unsafe {
+        let ring = core::ptr::addr_of!((*used).ring).cast::<VirtqUsedElement>();
+        core::ptr::read_volatile(ring.add(element_index))
+    };
+    queue.last_used_idx = queue.last_used_idx.wrapping_add(1);
+
+    let slot = element.id as u16;
+    if slot >= queue.buffer_count {
+        return None;
+    }
+
+    let length = element.len as usize;
+    let payload_length = length.saturating_sub(VIRTIO_NET_HDR_SIZE);
+    let copied = payload_length.min(buffer.len());
+    unsafe {
+        let source = (queue.buffer_vaddr(slot) as *const u8).add(VIRTIO_NET_HDR_SIZE);
+        for (index, byte) in buffer.iter_mut().take(copied).enumerate() {
+            *byte = core::ptr::read_volatile(source.add(index));
+        }
+        // Hand the slot straight back: the caller keeps only the copy.
+        write_descriptor(queue, slot, queue.buffer_size, VIRTQ_DESC_F_WRITE);
+        publish_buffer(queue, slot);
+        notify(queue);
+    }
+
+    Some(copied)
+}
+
+/// Sends an ARP request for QEMU slirp's gateway (10.0.2.2) and polls briefly
+/// for its reply. Slirp answers on its own, so a healthy TX and RX path shows
+/// up as a second frame even though no real network is attached.
+fn test_packets(mac: &[u8; 6]) {
+    let mut frame = [0_u8; 42];
+    build_arp_request(mac, &mut frame);
+
+    match send_packet(&frame) {
+        Ok(()) => syscall::print("PACKET SENT (ARP REQUEST FOR 10.0.2.2)\r\n"),
+        Err(stage) => {
+            syscall::print("PACKET SEND FAILED: STAGE ");
+            syscall::print_dec_u64(u64::from(stage));
+            syscall::print("\r\n");
+            return;
+        }
+    }
+
+    // 40 polls x 10 ms keeps the test inside silverd's console window.
+    let mut received = [0_u8; 1600];
+    for _ in 0..40 {
+        if let Some(length) = receive_packet(&mut received) {
+            syscall::print("PACKET RECEIVED: ");
+            syscall::print_dec_u64(length as u64);
+            syscall::print(" BYTES\r\n");
+            print_arp_reply(&received[..length]);
+            return;
+        }
+        syscall::sleep(10);
+    }
+    syscall::print("NO PACKET RECEIVED BEFORE TIMEOUT\r\n");
+}
+
+fn build_arp_request(mac: &[u8; 6], frame: &mut [u8; 42]) {
+    // Ethernet: broadcast to this NIC, ARP ethertype.
+    frame[0..6].copy_from_slice(&[0xFF_u8; 6]);
+    frame[6..12].copy_from_slice(mac);
+    frame[12..14].copy_from_slice(&[0x08, 0x06]);
+    // ARP for IPv4 over Ethernet: request, sender 10.0.2.15, target 10.0.2.2.
+    frame[14..16].copy_from_slice(&[0x00, 0x01]);
+    frame[16..18].copy_from_slice(&[0x08, 0x00]);
+    frame[18] = 6;
+    frame[19] = 4;
+    frame[20..22].copy_from_slice(&[0x00, 0x01]);
+    frame[22..28].copy_from_slice(mac);
+    frame[28..32].copy_from_slice(&[10, 0, 2, 15]);
+    frame[32..38].fill(0);
+    frame[38..42].copy_from_slice(&[10, 0, 2, 2]);
+}
+
+fn print_arp_reply(frame: &[u8]) {
+    if frame.len() < 42 || frame[12] != 0x08 || frame[13] != 0x06 {
+        return;
+    }
+    if frame[20] != 0x00 || frame[21] != 0x02 {
+        return;
+    }
+    syscall::print("ARP REPLY: ");
+    print_ipv4(&frame[28..32]);
+    syscall::print(" IS AT ");
+    for (index, byte) in frame[22..28].iter().enumerate() {
+        if index > 0 {
+            syscall::print(":");
+        }
+        print_hex_byte(*byte);
+    }
+    syscall::print("\r\n");
+}
+
+fn print_ipv4(address: &[u8]) {
+    for (index, byte) in address.iter().enumerate() {
+        if index > 0 {
+            syscall::print(".");
+        }
+        syscall::print_dec_u64(u64::from(*byte));
+    }
 }
 
 /// The MAC is `virtio_net_config.mac`, the first field of the device-specific
