@@ -878,6 +878,7 @@ fn program_name(program: u64) -> &'static str {
         syscall::PROGRAM_BLOCK_DRIVER => "block_driver",
         syscall::PROGRAM_SFS_SERVER => "sfs_server  ",
         syscall::PROGRAM_NET_DRIVER => "net_driver  ",
+        syscall::PROGRAM_NET_SERVER => "net_server  ",
         _ => "kernel      ",
     }
 }
@@ -908,7 +909,8 @@ fn grant_device_rights(cap_id: u64, task_id: u64, program: u64) {
     let rights = match program {
         syscall::PROGRAM_BLOCK_DRIVER
         | syscall::PROGRAM_SFS_SERVER
-        | syscall::PROGRAM_NET_DRIVER => syscall::CAP_MMIO,
+        | syscall::PROGRAM_NET_DRIVER
+        | syscall::PROGRAM_NET_SERVER => syscall::CAP_MMIO,
         _ => return,
     };
     // Recipient must be the task ID: the CapId only names the shell's own entry
@@ -921,7 +923,7 @@ fn grant_device_rights(cap_id: u64, task_id: u64, program: u64) {
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
         syscall::print(
-            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server|net_driver> [arg]\r\n",
+            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server|net_driver|net_server> [arg]\r\n",
         );
         return;
     };
@@ -939,6 +941,7 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
         "block_driver" => syscall::PROGRAM_BLOCK_DRIVER, // <--- ДОБАВЛЕНО
         "sfs_server" => syscall::PROGRAM_SFS_SERVER,     // <--- ДОБАВЛЕНО
         "net_driver" => syscall::PROGRAM_NET_DRIVER,
+        "net_server" => syscall::PROGRAM_NET_SERVER,
         _ => {
             syscall::print("Unknown program. See 'help' for the program list.\r\n");
             return;

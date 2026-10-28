@@ -5,6 +5,15 @@ edition = "2021"
 license = "MIT"
 
 [dependencies]
+# Bare-metal TCP/IP stack. `std`/`alloc` stay off: the server uses fixed
+# static storage for sockets and frame buffers. `medium-ethernet` implies
+# smoltcp's `socket` feature, which only compiles with a concrete socket type;
+# UDP is the first one the server will use.
+smoltcp = { version = "0.14", default-features = false, features = [
+    "medium-ethernet",
+    "proto-ipv4",
+    "socket-udp",
+] }
 
 [profile.dev]
 panic = "abort"

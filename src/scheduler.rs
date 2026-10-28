@@ -1389,6 +1389,11 @@ impl Task {
             Some(user_program::SFS_SERVER) => {
                 cap_table.insert(id, capability::CAP_MMIO);
             }
+            // The network server allocates its own DMA window and may map the
+            // driver's buffers as the protocol grows.
+            Some(user_program::NET_SERVER) => {
+                cap_table.insert(id, capability::CAP_MMIO);
+            }
             // The shell hands device rights to the tasks it spawns by hand
             // (`spawn block_driver`), and `CapTable::grant` only allows a task
             // to pass on a right it already holds. Without this entry every

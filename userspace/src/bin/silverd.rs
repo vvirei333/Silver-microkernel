@@ -67,7 +67,17 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         syscall::print("SILVERD: SFS SERVER NOT READY, CONTINUING\r\n");
     }
 
-    // 5. Howl (shell)
+    // 5. Network server (smoltcp). It receives the driver's task ID so it can
+    // attach its DMA mailbox; the attach is retried, so no readiness wait.
+    let net_server_cap = syscall::spawn(syscall::PROGRAM_NET_SERVER, net_id)
+        .unwrap_or_else(|| fail("SILVERD: NET SERVER SPAWN FAILED\r\n"));
+    let net_server_id = syscall::cap_get_task_id(net_server_cap)
+        .unwrap_or_else(|| fail("SILVERD: NET SERVER CAP LOOKUP FAILED\r\n"));
+    if !syscall::cap_grant(net_server_cap, net_server_id, syscall::CAP_MMIO) {
+        fail("SILVERD: NET SERVER CAP GRANT FAILED\r\n");
+    }
+
+    // 6. Howl (shell)
     let howl_id = syscall::spawn(syscall::PROGRAM_HOWL, syscall::task_id())
         .unwrap_or_else(|| fail("SILVERD: HOWL SPAWN FAILED\r\n"));
     if !syscall::cap_grant(howl_id, howl_id, syscall::CAP_MMIO) {
@@ -77,7 +87,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("SILVERD: CONSOLE HANDOFF FAILED\r\n");
     }
 
-    // 6. Howler (UART)
+    // 7. Howler (UART)
     let howler_id = syscall::spawn(syscall::PROGRAM_HOWLER, howl_id)
         .unwrap_or_else(|| fail("SILVERD: HOWLER SPAWN FAILED\r\n"));
     if !syscall::cap_grant(howler_id, howler_id, syscall::CAP_MMIO | syscall::CAP_IRQ) {

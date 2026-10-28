@@ -13,6 +13,7 @@ pub const SL: u64 = 9;
 pub const BLOCK_DRIVER: u64 = 10;
 pub const SFS_SERVER: u64 = 11; // <--- ДОБАВЛЕНО
 pub const NET_DRIVER: u64 = 12;
+pub const NET_SERVER: u64 = 13;
 
 static DEMO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silver_userspace.elf"));
 static SILVERD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silverd.elf"));
@@ -27,6 +28,7 @@ static SL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sl.elf"));
 static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block_driver.elf"));
 static SFS_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sfs_server.elf")); // <--- ДОБАВЛЕНО
 static NET_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_driver.elf"));
+static NET_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_server.elf"));
 
 /// Selects an executable for spawn. Unknown program IDs are rejected.
 pub fn image(program: u64) -> Option<&'static [u8]> {
@@ -44,6 +46,7 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         BLOCK_DRIVER => Some(BLOCK_DRIVER_ELF),
         SFS_SERVER => Some(SFS_SERVER_ELF), // <--- ДОБАВЛЕНО
         NET_DRIVER => Some(NET_DRIVER_ELF),
+        NET_SERVER => Some(NET_SERVER_ELF),
         _ => None,
     }
 }
