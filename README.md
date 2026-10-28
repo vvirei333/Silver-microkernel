@@ -33,8 +33,8 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] Condition variable: per-mailbox wait queues, targeted wakeups and timed waits
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
-- [x] Eleven userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
-- [x] Init architecture: `silverd` starts Scout, block driver, Howl and Howler, all resolved by program ID
+- [x] Fourteen userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
+- [x] Init architecture: `silverd` starts Scout, the block driver, the network driver, the SFS server, the network server, Howl and Howler, all resolved by program ID
 - [x] howl: `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`, `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`
 - [x] Shell output redirection: `>` truncates, `>>` appends, quoted operators stay literal
 - [x] ANSI clear/home and a bold cyan `howl>` prompt
@@ -53,12 +53,28 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] Userspace UART driver: IRQ-bound RX plus IPC-routed input and output
 - [x] DMA infrastructure: contiguous frames and Normal Non-Cacheable user mappings
 - [x] PCI ECAM access plus a Virtio-PCI block driver: modern capabilities, split virtqueue and `read_sector`
+- [x] VirtIO-Net driver: modern virtio-pci capabilities, split RX/TX virtqueues, 16 x 2 KiB buffers and MAC discovery
+- [x] Shared-memory frame transport: one 8 KiB DMA mailbox, `OP_ATTACH`/`OP_ATTACHED`, `OP_FRAME`/`OP_TX` doorbells, length-word fencing and backpressure
+- [x] `net_server`: `smoltcp` in a separate EL0 task with static 10.0.2.15/24 addressing, ARP and IPv4
+- [x] ICMP echo end-to-end: boot-time ping to the QEMU slirp gateway 10.0.2.2, reply verified and relayed to the shell
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
 - [x] EL0 fault triage: `ESR_EL1`/`ELR_EL1`/`FAR_EL1` dump and a 16-entry context-switch trace before the guilty task dies
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
 - [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
-- [ ] SFS server, writes and interrupts on the block path, resource quotas and persistent storage
+- [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
+
+## Phase 4: Network — complete
+
+VirtIO-Net, the userspace `smoltcp` server, the shared-memory frame transport
+and the ICMP echo path all work end-to-end. A release boot prints:
+
+```text
+NET: ICMP REPLY FROM 10.0.2.2
+```
+
+The reply has crossed the NIC, both virtio queues, the DMA mailbox in both
+directions, smoltcp's ARP and IPv4/ICMP layers, and the checksum check.
 
 ## Requirements
 
@@ -176,19 +192,65 @@ prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
 `Cargo.toml` has `std` (default host stub), `no_std` (bare metal) and
 `demo-tasks` (opt-in regression programs). Normal bare-metal boot starts only
-silverd, which then starts Scout, the block driver, Howl and Howler in that
-order. No component depends on the resulting numbers: the console sink, Howler
-and the block driver are all looked up by program ID at runtime, and the block
-driver also answers whoever actually sent the request. To run
+silverd, which then starts Scout, the block driver, the network driver, the SFS
+server, the network server, Howl and Howler in that order. No component depends
+on the resulting numbers: the console sink, Howler, the block driver and both
+network tasks are looked up by program ID at runtime, and the block and network
+drivers also answer the sender of each request. To run
 the fault/VM/allocator/IPC regression programs instead, use
 `--features no_std,demo-tasks`. `build.rs` automatically builds and embeds every
 userspace ELF; no separate userspace command is needed.
+
+## Network
+
+`net_driver` owns the VirtIO-Net PCI function; `net_server` runs `smoltcp` in
+its own EL0 task. An Ethernet frame does not fit in the 32-byte IPC message, so
+the server allocates one 8 KiB DMA window and the two tasks exchange only
+doorbells; frame bytes travel through the shared window.
+
+| Offset | Contents |
+| --- | --- |
+| `0x000` | `u32` RX length, written by the driver |
+| `0x004` | `u32` TX length, written by the server |
+| `0x800` | `MAX_FRAME` (1536) bytes, driver -> server |
+| `0x1000` | `MAX_FRAME` (1536) bytes, server -> driver |
+
+| Opcode | Direction | Meaning |
+| --- | --- | --- |
+| `OP_ATTACH` (1) | server -> driver | publish the DMA physical address and size |
+| `OP_ATTACHED` (2) | driver -> server | window mapped; carries the NIC MAC |
+| `OP_FRAME` (3) | driver -> server | a received frame is in the RX slot |
+| `OP_TX` (4) | server -> driver | a frame to transmit is in the TX slot |
+
+The driver maps the window with `SYS_MAP_PHYS` (Normal Non-Cacheable), polls
+virtio RX on every IPC loop (10 ms idle timeout), and moves at most one frame in
+each direction. A producer writes the payload, executes `dmb ish`, then
+publishes the length; a consumer reads the length, executes `dmb ish`, copies,
+then clears it. The server publishes TX only when the slot is free, so a slow
+driver cannot cause the server to overwrite a frame in flight. TX doorbells are
+accepted only from the server task that owns the window.
+
+`net_server` uses the MAC from `OP_ATTACHED`, configures `10.0.2.15/24` and
+default gateway `10.0.2.2`, then sends one ICMPv4 echo request after the window
+is attached. smoltcp resolves the gateway with ARP and keeps the echo queued
+until the neighbor is usable. QEMU user-mode networking answers both the ARP and
+the ping, so a successful boot exercises TX, RX, ARP, IPv4 and ICMP checksum
+verification in one path. Because `net_server` does not own the console, it
+sends `NET ICMP REPLY OK` to `howl`, which prints the human-readable line.
+
+`build_and_qemu.sh` relies on QEMU's implicit default `virtio-net-pci` on the
+`virt` machine; no explicit network device is needed. The current limitations
+are deliberate: IPv4 only, a static address and gateway, one frame slot per
+direction, no virtio-net interrupts (RX is polled), and no TCP/UDP services,
+DHCP, DNS or `ping` shell command yet. The driver assigns its 64 KiB BAR window
+at `0x1020_0000`; this assumes the block driver keeps `0x1010_0000`. Both tasks
+are visible in `ps`.
 
 ## Project layout
 
 | File | Purpose |
 | --- | --- |
-| `build.rs` | Builds and embeds all eleven userspace ELFs for bare-metal profiles |
+| `build.rs` | Builds and embeds all fourteen userspace ELFs for bare-metal profiles |
 | `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
 | `src/exceptions.rs` | EL0 fault register dump, switch trace and the kernel exit path |
 | `src/pl011.rs` | Kernel UART diagnostics and bounded RX fallback |
@@ -214,6 +276,9 @@ userspace ELF; no separate userspace command is needed.
 | `src/vfs.rs` | RAM file tree, normalized paths and per-task file descriptors |
 | `userspace/src/allocator.rs` | Per-task first-fit `malloc/free` over `SYS_BRK` |
 | `userspace/src/bin/silvershell.rs` | Interactive shell and `logo.txt` fastfetch screen |
+| `userspace/src/bin/net_driver.rs` | VirtIO-Net driver, split virtqueues and frame mailbox |
+| `userspace/src/bin/net_server.rs` | `smoltcp` TCP/IP stack and ICMP echo |
+| `userspace/src/net_ipc.rs` | Shared-memory frame protocol used by both network tasks |
 | `userspace/src/bin/{ls,cat,echo}.rs` | Separate EL0 file/console utilities |
 | `userspace/` | Separate demo, nameserver, shell and utility EL0 programs |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |

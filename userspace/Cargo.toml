@@ -8,10 +8,11 @@ license = "MIT"
 # Bare-metal TCP/IP stack. `std`/`alloc` stay off: the server uses fixed
 # static storage for sockets and frame buffers. `medium-ethernet` implies
 # smoltcp's `socket` feature, which only compiles with a concrete socket type;
-# UDP is the first one the server will use.
+# ICMP provides the boot-time echo request, UDP is for later services.
 smoltcp = { version = "0.14", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",
+    "socket-icmp",
     "socket-udp",
 ] }
 

@@ -126,12 +126,18 @@ fn read_input(howler: &mut HowlerLink) -> Option<u8> {
     let howler_id = howler.resolve()?;
 
     let mut message = ipc::Message::new(0, &[]);
-    match syscall::receive_timeout(&mut message, 0) {
-        Ok(()) if message.sender == howler_id && message.payload[0] == 0 => {
-            Some(message.payload[1])
+    while syscall::receive_timeout(&mut message, 0).is_ok() {
+        if message.sender == howler_id && message.payload[0] == 0 {
+            return Some(message.payload[1]);
         }
-        _ => None,
+        // The network server has no console of its own, so it reports the
+        // ping result here. Only this exact status text is printed.
+        if message.text() == b"NET ICMP REPLY OK" {
+            syscall::print("\r\nNET: ICMP REPLY FROM 10.0.2.2\r\n");
+            prompt();
+        }
     }
+    None
 }
 
 fn execute(command: &str) {

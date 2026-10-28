@@ -1,8 +1,12 @@
 #![no_std]
 #![no_main]
 
+#[allow(dead_code)]
 #[path = "../ipc.rs"]
 mod ipc;
+#[allow(dead_code)]
+#[path = "../net_ipc.rs"]
+mod net_ipc;
 #[path = "../syscall.rs"]
 mod syscall;
 
@@ -157,6 +161,28 @@ const SEND_TOO_LARGE: u8 = 3;
 static mut RX_QUEUE: Option<Virtqueue> = None;
 static mut TX_QUEUE: Option<Virtqueue> = None;
 
+/// One received Ethernet frame, copied out of the virtqueue before the slot is
+/// recycled. Static because the userspace stack is only 8 KiB.
+static mut RX_FRAME_BUFFER: [u8; net_ipc::MAX_FRAME] = [0_u8; net_ipc::MAX_FRAME];
+/// One frame copied out of the server's TX slot before the slot is released.
+static mut TX_FRAME_BUFFER: [u8; net_ipc::MAX_FRAME] = [0_u8; net_ipc::MAX_FRAME];
+
+/// The server's DMA mailbox, once it has been announced over IPC.
+#[derive(Copy, Clone)]
+struct Mailbox {
+    vaddr: u64,
+    paddr: u64,
+    size: u64,
+    /// Task ID that owns the window; doorbells and TX frames must come from it.
+    server: u64,
+}
+
+static mut MAILBOX: Option<Mailbox> = None;
+
+/// One timer tick is 10 ms. Receiving with this timeout wakes up for a frame
+/// poll even when the server sends no IPC.
+const IDLE_POLL_TICKS: u64 = 1;
+
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(_argument: u64) -> ! {
@@ -180,16 +206,144 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         Err(stage) => fail(stage, "VIRTIO-NET INITIALIZATION FAILED\r\n"),
     };
 
-    // Phase 4 smoke test: ask the QEMU slirp gateway for its MAC, then poll for
-    // the reply. Everything here has to finish inside silverd's one-second
-    // console lend, so the poll is bounded to roughly 400 ms.
-    test_packets(&mac);
+    // The server owns smoltcp and announces a DMA mailbox over IPC.
+    // From here on this task only moves frames between virtio-net and that
+    // window.
+    serve(&mac);
+}
 
-    // No interrupts or IPC yet: keep the task alive (and the device configured)
-    // so the next phase can attach handlers without redoing setup.
+/// IPC and frame forwarding loop. `receive_timeout` doubles as the idle sleep,
+/// so a doorbell is handled immediately while RX is still polled every tick.
+fn serve(mac: &[u8; 6]) -> ! {
     loop {
-        syscall::sleep(1000);
+        let mut message = ipc::Message::new(0, &[]);
+        if syscall::receive_timeout(&mut message, IDLE_POLL_TICKS).is_ok() {
+            handle_message(&message, mac);
+            // Drain anything that arrived while the first message was handled.
+            while syscall::receive_timeout(&mut message, 0).is_ok() {
+                handle_message(&message, mac);
+            }
+        }
+        poll_receive();
     }
+}
+
+fn handle_message(message: &ipc::Message, mac: &[u8; 6]) {
+    match message.payload[0] {
+        net_ipc::OP_ATTACH => attach_mailbox(message, mac),
+        net_ipc::OP_TX => transmit_from_mailbox(message),
+        _ => {}
+    }
+}
+
+/// Maps the server's DMA window and acknowledges it with the NIC MAC. `net_server`
+/// repeats `OP_ATTACH` once a second until this reply arrives, so the same
+/// physical window is not mapped twice.
+fn attach_mailbox(message: &ipc::Message, mac: &[u8; 6]) {
+    let paddr = net_ipc::attach_paddr(message);
+    let size = net_ipc::attach_size(message);
+    if size < net_ipc::DMA_SIZE {
+        syscall::print("NET DRIVER: MAILBOX TOO SMALL\r\n");
+        return;
+    }
+
+    let vaddr = match current_mailbox() {
+        Some(mailbox) if mailbox.paddr == paddr && mailbox.size == size => mailbox.vaddr,
+        _ => {
+            let Some(vaddr) = syscall::map_phys(paddr, size) else {
+                syscall::print("NET DRIVER: MAILBOX MAP FAILED\r\n");
+                return;
+            };
+            syscall::print("NET DRIVER: MAILBOX ATTACHED\r\n");
+            vaddr
+        }
+    };
+
+    // Re-announcing the same window is also how a restarted server refreshes
+    // its task ID without forcing a second mapping.
+    unsafe {
+        *core::ptr::addr_of_mut!(MAILBOX) = Some(Mailbox {
+            vaddr,
+            paddr,
+            size,
+            server: message.sender,
+        });
+    }
+
+    let _ = syscall::try_send(message.sender, &net_ipc::attached(mac));
+}
+
+/// Sends one frame that the server published in its TX slot. The frame is
+/// copied out before the length is cleared so the server can publish the next
+/// one without racing a virtqueue that is still reading the window.
+fn transmit_from_mailbox(message: &ipc::Message) {
+    let Some(mailbox) = current_mailbox() else {
+        return;
+    };
+    if message.sender != mailbox.server {
+        return;
+    }
+
+    let length = read_u32(mailbox.vaddr, net_ipc::TX_LENGTH) as usize;
+    if length == 0 || length > net_ipc::MAX_FRAME {
+        write_u32(mailbox.vaddr, net_ipc::TX_LENGTH, 0);
+        return;
+    }
+
+    net_ipc::fence();
+    let frame = unsafe { &mut *core::ptr::addr_of_mut!(TX_FRAME_BUFFER) };
+    let source = mailbox.vaddr + net_ipc::TX_FRAME;
+    for (index, byte) in frame[..length].iter_mut().enumerate() {
+        *byte = unsafe { core::ptr::read_volatile((source + index as u64) as *const u8) };
+    }
+    net_ipc::fence();
+    write_u32(mailbox.vaddr, net_ipc::TX_LENGTH, 0);
+
+    if send_packet(&frame[..length]).is_err() {
+        syscall::print("NET DRIVER: TX FRAME DROPPED\r\n");
+    }
+}
+
+/// Moves at most one received frame into the server's RX slot. The next frame
+/// waits in virtio until the server clears `rx_len`, so a slow server applies
+/// backpressure instead of losing frames.
+fn poll_receive() {
+    let Some(mailbox) = current_mailbox() else {
+        return;
+    };
+    if read_u32(mailbox.vaddr, net_ipc::RX_LENGTH) != 0 {
+        return;
+    }
+
+    let frame = unsafe { &mut *core::ptr::addr_of_mut!(RX_FRAME_BUFFER) };
+    let Some(length) = receive_packet(frame) else {
+        return;
+    };
+    if length == 0 {
+        return;
+    }
+
+    let destination = mailbox.vaddr + net_ipc::RX_FRAME;
+    for (index, byte) in frame[..length].iter().enumerate() {
+        unsafe {
+            core::ptr::write_volatile((destination + index as u64) as *mut u8, *byte);
+        }
+    }
+    net_ipc::fence();
+    write_u32(mailbox.vaddr, net_ipc::RX_LENGTH, length as u32);
+    let _ = syscall::try_send(mailbox.server, &net_ipc::frame_doorbell(length as u16));
+}
+
+fn current_mailbox() -> Option<Mailbox> {
+    unsafe { *core::ptr::addr_of!(MAILBOX) }
+}
+
+fn read_u32(base: u64, offset: u64) -> u32 {
+    unsafe { core::ptr::read_volatile(base.wrapping_add(offset) as *const u32) }
+}
+
+fn write_u32(base: u64, offset: u64, value: u32) {
+    unsafe { core::ptr::write_volatile(base.wrapping_add(offset) as *mut u32, value) };
 }
 
 fn fail(stage: u8, message: &str) -> ! {
@@ -556,83 +710,6 @@ fn receive_packet(buffer: &mut [u8]) -> Option<usize> {
     }
 
     Some(copied)
-}
-
-/// Sends an ARP request for QEMU slirp's gateway (10.0.2.2) and polls briefly
-/// for its reply. Slirp answers on its own, so a healthy TX and RX path shows
-/// up as a second frame even though no real network is attached.
-fn test_packets(mac: &[u8; 6]) {
-    let mut frame = [0_u8; 42];
-    build_arp_request(mac, &mut frame);
-
-    match send_packet(&frame) {
-        Ok(()) => syscall::print("PACKET SENT (ARP REQUEST FOR 10.0.2.2)\r\n"),
-        Err(stage) => {
-            syscall::print("PACKET SEND FAILED: STAGE ");
-            syscall::print_dec_u64(u64::from(stage));
-            syscall::print("\r\n");
-            return;
-        }
-    }
-
-    // 40 polls x 10 ms keeps the test inside silverd's console window.
-    let mut received = [0_u8; 1600];
-    for _ in 0..40 {
-        if let Some(length) = receive_packet(&mut received) {
-            syscall::print("PACKET RECEIVED: ");
-            syscall::print_dec_u64(length as u64);
-            syscall::print(" BYTES\r\n");
-            print_arp_reply(&received[..length]);
-            return;
-        }
-        syscall::sleep(10);
-    }
-    syscall::print("NO PACKET RECEIVED BEFORE TIMEOUT\r\n");
-}
-
-fn build_arp_request(mac: &[u8; 6], frame: &mut [u8; 42]) {
-    // Ethernet: broadcast to this NIC, ARP ethertype.
-    frame[0..6].copy_from_slice(&[0xFF_u8; 6]);
-    frame[6..12].copy_from_slice(mac);
-    frame[12..14].copy_from_slice(&[0x08, 0x06]);
-    // ARP for IPv4 over Ethernet: request, sender 10.0.2.15, target 10.0.2.2.
-    frame[14..16].copy_from_slice(&[0x00, 0x01]);
-    frame[16..18].copy_from_slice(&[0x08, 0x00]);
-    frame[18] = 6;
-    frame[19] = 4;
-    frame[20..22].copy_from_slice(&[0x00, 0x01]);
-    frame[22..28].copy_from_slice(mac);
-    frame[28..32].copy_from_slice(&[10, 0, 2, 15]);
-    frame[32..38].fill(0);
-    frame[38..42].copy_from_slice(&[10, 0, 2, 2]);
-}
-
-fn print_arp_reply(frame: &[u8]) {
-    if frame.len() < 42 || frame[12] != 0x08 || frame[13] != 0x06 {
-        return;
-    }
-    if frame[20] != 0x00 || frame[21] != 0x02 {
-        return;
-    }
-    syscall::print("ARP REPLY: ");
-    print_ipv4(&frame[28..32]);
-    syscall::print(" IS AT ");
-    for (index, byte) in frame[22..28].iter().enumerate() {
-        if index > 0 {
-            syscall::print(":");
-        }
-        print_hex_byte(*byte);
-    }
-    syscall::print("\r\n");
-}
-
-fn print_ipv4(address: &[u8]) {
-    for (index, byte) in address.iter().enumerate() {
-        if index > 0 {
-            syscall::print(".");
-        }
-        syscall::print_dec_u64(u64::from(*byte));
-    }
 }
 
 /// The MAC is `virtio_net_config.mac`, the first field of the device-specific

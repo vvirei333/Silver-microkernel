@@ -45,9 +45,9 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     if !syscall::cap_grant(net_cap, net_id, syscall::CAP_PCI | syscall::CAP_MMIO) {
         fail("SILVERD: NET DRIVER CAP GRANT FAILED\r\n");
     }
-    // The net driver has no IPC yet, so it cannot report its MAC back. Lend it
-    // the console for one second while it probes PCI and prints; it delays its
-    // first line so this handoff wins even if the scheduler preempts us.
+    // Lend the driver the console for one second while it probes PCI and
+    // prints; it delays its first line so this handoff wins even if the
+    // scheduler preempts us. Its MAC reaches the network server over IPC later.
     if syscall::console_set(net_cap) {
         syscall::sleep(1000);
         if !syscall::console_set(syscall::task_id()) {

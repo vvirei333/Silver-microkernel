@@ -3,6 +3,147 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## State as of 2026-10-28 (Phase 4 complete: VirtIO-Net, smoltcp, shared-memory IPC and ICMP)
+
+**Phase 4 (Network) is complete and verified end-to-end in QEMU.** A release
+boot prints:
+
+```text
+NET: ICMP REPLY FROM 10.0.2.2
+```
+
+That line appears only after the whole path succeeds: `net_driver` finds and
+initializes VirtIO-Net; `net_server` allocates an 8 KiB DMA window and announces
+it; the driver maps the window and returns the NIC MAC; smoltcp resolves the
+slirp gateway with ARP; the echo request crosses the TX mailbox and the TX
+virtqueue; the reply crosses the RX virtqueue and the RX mailbox; and smoltcp
+accepts it with a valid IPv4/ICMP checksum. `net_server` owns no console, so it
+relays `NET ICMP REPLY OK` to Howl, which prints the readable line.
+
+### Current boot chain
+
+`silverd` starts, in order:
+
+1. Scout (bounded `SCOUT READY` handshake)
+2. `block_driver` with `CAP_MMIO | CAP_PCI`
+3. `net_driver` with `CAP_MMIO | CAP_PCI`, then lends it the console for 1 s
+4. `sfs_server` with `CAP_MMIO`, then waits (bounded) for `SFS READY`
+5. `net_server` with `CAP_MMIO`, passing the driver's task ID
+6. Howl, then transfers the console
+7. Howler with `CAP_MMIO | CAP_IRQ` and Howl's ID as its input target
+
+Task IDs are runtime values, never API. The network server resolves the driver
+from the task list (preferring the spawn hint only while it is live). The pair
+is restart-tolerant: a restarted `net_server` re-attaches, and a restarted
+`net_driver` is rediscovered by the server.
+
+### VirtIO-Net driver (`userspace/src/bin/net_driver.rs`)
+
+- PCI scan accepts vendor `1af4` with device `0x1000` (transitional) or `0x1041`
+  (modern-only); both are driven through modern common/notify capabilities. The
+  legacy I/O BAR is never used.
+- Its 64 KiB BAR window is assigned at `0x1020_0000`; the block driver keeps
+  `0x1010_0000`.
+- Split virtqueues: RX is queue 0, TX is queue 1, with 16 descriptors of 2 KiB
+  per queue. Every frame carries the 12-byte modern virtio-net header; the
+  driver sends a zeroed header and skips it on receive.
+- There is no virtio-net interrupt. `serve()` calls
+  `receive_timeout(..., IDLE_POLL_TICKS = 1)` (10 ms), so IPC wakes it early and
+  otherwise it polls `receive_packet()` once per tick. This is polling, not
+  IRQ-driven networking.
+- `OP_ATTACH`: reject windows smaller than `DMA_SIZE`; map with `SYS_MAP_PHYS`;
+  store `{vaddr, paddr, size, server}`. Re-announcing the same window keeps the
+  mapping and refreshes the server task ID; it is not mapped twice. Reply with
+  `OP_ATTACHED` and the MAC.
+- `OP_TX`: accept only from the recorded server task ID; read `TX_LENGTH`; copy
+  at most `MAX_FRAME` bytes into a static buffer; clear `TX_LENGTH` *before*
+  `send_packet`, so the server may publish the next frame without racing the
+  virtqueue.
+- RX: only when `RX_LENGTH == 0`; copy one frame into `RX_FRAME`, `dmb ish`,
+  publish the length and send `OP_FRAME`.
+- RX and TX copies use static frame buffers because the userspace stack is only
+  8 KiB.
+
+### Shared-memory frame protocol (`userspace/src/net_ipc.rs`)
+
+`net_server` allocates `DMA_SIZE = 8192` through `SYS_ALLOC_DMA`; the kernel maps
+it Normal Non-Cacheable in both address spaces. IPC carries only control
+messages and doorbells; an Ethernet frame never enters the 32-byte mailbox.
+
+| Offset | Contents |
+| --- | --- |
+| `0x000` | `u32` RX length, written by the driver |
+| `0x004` | `u32` TX length, written by the server |
+| `0x800` | `MAX_FRAME` (1536) bytes, driver -> server |
+| `0x1000` | `MAX_FRAME` (1536) bytes, server -> driver |
+
+| Opcode | Direction | Meaning |
+| --- | --- | --- |
+| `OP_ATTACH` (1) | server -> driver | DMA physical address and size |
+| `OP_ATTACHED` (2) | driver -> server | window mapped; NIC MAC follows |
+| `OP_FRAME` (3) | driver -> server | a frame is in the RX slot |
+| `OP_TX` (4) | server -> driver | a frame is in the TX slot |
+
+Publication rule: payload stores, then `dmb ish`, then the length store. The
+consumer loads the length, `dmb ish`, copies the frame, then clears the length.
+There is exactly one slot per direction. A producer publishes only when the
+length word is zero, so a slow consumer applies backpressure instead of
+overwriting a frame. TX doorbells from any task other than the attached server
+are ignored; an oversized or zero TX length is reset and dropped.
+
+### smoltcp server (`userspace/src/bin/net_server.rs`)
+
+- `no_std`/`no_alloc`, with `medium-ethernet`, `proto-ipv4`, `socket-icmp` and
+  `socket-udp`. A static `FrameDevice` holds one maximum-size (1536-byte) frame
+  buffer per direction; the interface plan is IPv4 only.
+- Starts with QEMU's default MAC, `10.0.2.15/24` and default route `10.0.2.2`.
+  `OP_ATTACHED` replaces the MAC with the real one read by the driver. The MAC
+  must not be hardcoded: ARP would otherwise use the wrong source address.
+- Allocates and zeroes both length words before the first attach. Retries
+  `OP_ATTACH` once a second until `OP_ATTACHED`, then queues one ICMPv4 echo
+  request (identifier `0x5349`). smoltcp performs ARP first and keeps the echo
+  queued in the socket until the neighbor resolves.
+- Main loop: poll the RX length word, hand the frame to smoltcp, clear the word,
+  run `interface.poll`, drain ICMP replies, publish at most one TX frame when
+  the slot is free, then sleep 10 ms. The loop also drains IPC doorbells so the
+  driver's mailbox cannot fill up; frame delivery does not depend on a doorbell
+  arriving.
+- The reply is drained with `recv_slice` and reported to Howl as
+  `NET ICMP REPLY OK`. Only that exact text is printed by the shell; arbitrary
+  network/server diagnostics are still discarded because `net_server` owns no
+  console.
+- Once the echo is queued, it is not resent: one request per server lifetime is
+  enough to prove the path, and smoltcp keeps retrying ARP/egress for the queued
+  packet. A missing reply is never printed as success.
+
+### Verification
+
+```bash
+./build_and_qemu.sh release
+```
+
+Expected observable result at the `howl>` prompt:
+
+```text
+NET: ICMP REPLY FROM 10.0.2.2
+```
+
+`ps` shows live `net_driver` and `net_server` tasks. `build_and_qemu.sh` does not
+pass an explicit NIC; the `virt` machine's implicit default `virtio-net-pci`
+provides QEMU user-mode networking with guest `10.0.2.15`, gateway `10.0.2.2`.
+If the NIC were absent, the driver would exit with a stage-coded status and
+`net_server` would keep retrying the attach.
+
+### Network limitations recorded for the next phase
+
+- IPv4 only, static address/gateway; no DHCP, DNS, IPv6 or TCP/UDP services.
+- One frame slot per direction; no zero-copy, scatter-gather or multi-queue.
+- RX is polled, not interrupt-driven; latency and throughput are bounded by the
+  10 ms loop. No virtio-net IRQ is wired.
+- No shell `ping`/network command yet; the boot-time ICMP test is the only
+  network workload. There is no detach/unmap protocol: if `net_server` dies, the
+  driver keeps the old mapping until a new attach.
+
 ## State as of 2026-10-27 late evening (BAR0 fix: transitional virtio-blk; SFS mounts end-to-end)
 
 **The `driver_status=258` mystery is solved and SFS mounts.** A release boot
@@ -297,9 +438,12 @@ Changes in these files that must stay: the volatile zeroing plus fence in
 `read_superblock`, and the four `mmu.rs` fixes above.
 
 
-## State as of 2026-10-26 (DMA/PCI infrastructure and Ring 3 UART)
+## State as of 2026-10-26 (DMA/PCI infrastructure and Ring 3 UART; historical)
 
-Latest verified architecture: **silverd -> Scout, block_driver, Howl, Howler**.
+> Boot order, SFS and network status in this section are historical. The
+> 2026-10-28 section above is the current boot chain.
+
+Architecture at that point: **silverd -> Scout, block_driver, Howl, Howler**.
 Normal boot creates only silverd (task 1). Silverd spawns Scout, waits for its
 `SCOUT READY` IPC handshake (bounded to 2 s, boot continues on timeout), spawns
 block_driver with CAP_MMIO|CAP_PCI, then spawns Howl and transfers the console,
@@ -527,7 +671,8 @@ For bare-metal profiles, `build.rs` invokes Cargo in `userspace/`, uses
 `target/userspace` as its target directory, matches debug/release profile and
 copies every userspace ELF into `OUT_DIR`. `src/user_program.rs` assigns IDs
 0 (demo), 1 (silverd), 2 (Scout), 3 (Howl), 4 (Howler), 5 (ls), 6 (cat),
-7 (echo), 8 (say), 9 (sl) and 10 (block_driver). Host builds skip userspace. Normal boot starts
+7 (echo), 8 (say), 9 (sl), 10 (block_driver), 11 (sfs_server),
+12 (net_driver) and 13 (net_server). Host builds skip userspace. Normal boot starts
 only silverd; `demo-tasks` starts Scout and the regression task set instead.
 
 Interactive QEMU: `qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M
@@ -547,6 +692,11 @@ handles both CR and LF from UART.
 - Timer: ARM Generic Timer, IRQ 30, 100 Hz tick (`timer::TICK_INTERVAL_MS = 10`).
   UART priority is 0x80 and timer priority 0xA0; ordinary RX does not schedule.
 - PCI ECAM: physical `0x4010000000`, 256 MB, kernel-only Device-nGnRnE mapping.
+- VirtIO-Net: QEMU `virt`'s implicit default NIC is a transitional `1af4:1000`
+  (`1af4:1041` modern-only is accepted too). The driver assigns 64 KiB at
+  physical `0x1020_0000`, uses modern common/notify capabilities, queues 0 (RX)
+  and 1 (TX), 16 x 2 KiB buffers per queue, and the 12-byte modern virtio-net
+  header. No virtio-net IRQ is wired; RX is polled every loop.
 - FP/SIMD enabled in `_start` (CPACR_EL1 = 0x300000, CPTR_EL2 = 0) —
   without this the first use of a float register traps with EC=7
 - Runtime is EL1h for the kernel and EL0t for user tasks: QEMU `-kernel`
@@ -796,11 +946,12 @@ read back only their own values.
   MiB. Its three memory counters come from SYS_MEMINFO, not hardcoded free RAM.
   The architecture row is `Kernel: AArch64`.
 - Normal boot starts only silverd (task 1) in the kernel; silverd creates Scout,
-  block_driver, Howl and Howler in that order (currently tasks 2-5). Nothing in
-  userspace or the kernel reads those numbers: the console sink, Howler and
-  block_driver are all resolved from live scheduler state. `demo-tasks` does not
-  start silverd: Scout remains task 1, the earlier regression IDs are preserved
-  and every demo opts into shared UART output.
+  block_driver, net_driver, sfs_server, net_server, Howl and Howler in that
+  order. Nothing in userspace or the kernel reads those numbers: the console
+  sink, Howler, block_driver, net_driver and net_server are all resolved from
+  live scheduler state. `demo-tasks` does not start silverd: Scout remains task 1,
+  the earlier regression IDs are preserved and every demo opts into shared UART
+  output.
 
 ## Userspace allocation
 
@@ -908,6 +1059,20 @@ read back only their own values.
     userspace stack word before printing it; print `<unmapped>` at the first
     invalid word. (The SP_EL0 stack walk itself is not emitted right now — see
     Debugging aids — but the rule stands as soon as it comes back.)
+15. **The network mailbox length word is the publication barrier.** Write the
+    payload first, `dmb ish`, then the length; on consume, read the length,
+    `dmb ish`, copy, then clear. The window is Normal Non-Cacheable; volatile
+    accesses alone do not order the payload against the length.
+16. **One frame slot per direction, with backpressure.** Publish only when the
+    length word is zero. Never write `RX_FRAME`/`TX_FRAME` while the peer owns
+    it. `MAX_FRAME` is 1536 bytes; every copy is clamped to it.
+17. **Bind the mailbox to one server task.** `OP_TX` and RX doorbells use the
+    `server` task ID recorded by `OP_ATTACH`. A re-attach may refresh that ID
+    but must not map the same physical window twice.
+18. **Use the NIC MAC from `OP_ATTACHED`, never the QEMU default.** The network
+    server replaces its initial hardware address before sending; otherwise ARP
+    advertises the wrong source. Resolve both network tasks by program ID, not
+    by fixed task numbers.
 
 ## Why IPC uses Mutex + Condvar
 
@@ -991,6 +1156,14 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   pointed at "no device on the bus" while the device had been found and
   dropped. Split the stage into "scan found nothing" and "device found, setup
   failed" (the client report then names the exact step).
+- Networking is IPv4-only with a static `10.0.2.15/24` address and gateway
+  `10.0.2.2`. `net_server` polls every 10 ms; one frame fits per direction;
+  there are no virtio-net interrupts, TCP/UDP services, DHCP/DNS or shell
+  network commands. The driver assigns its 64 KiB BAR at a fixed
+  `0x1020_0000` on the assumption that the block driver keeps `0x1010_0000`.
+  There is no detach/unmap protocol, so a dead `net_server` leaves the driver
+  holding the old mapping until the next attach. TX-ring exhaustion drops the
+  frame (`NET DRIVER: TX FRAME DROPPED`) rather than blocking the server.
 - The EL1/kernel path is a stub. `silver_handle_exception(kind, esr, elr, far)`
   ignores all four arguments, so a kernel bug, an unhandled IRQ (`kind = 8`) or
   a failed boot check (`kind = 6|7` in `kernel_main`) only exits the current
@@ -1006,13 +1179,16 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
    available through `SYS_CAP_GRANT`.
 2. **Resource quotas:** bound task count, per-task/kernel memory, wait queues and
    VFS file growth; define behavior under exhaustion before adding more services.
-3. **Grow VFS semantics:** file-size quotas and overwrite/rename options if
-   needed. Persistent storage still needs a block driver.
-4. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
+3. **Network services:** add TCP/UDP sockets on smoltcp, DHCP/DNS configuration
+   and shell `ping`/`net` commands. Replace the 10 ms RX poll with virtio-net
+   interrupts, then add multiple frames per direction and zero-copy or
+   scatter-gather TX.
+4. **SFS write path and persistence:** block-path interrupts, write support,
+   file-size quotas and overwrite/rename options; then keep the image across
+   reboot.
+5. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.
-5. **VirtIO-console / virtio-block** — first MMIO device driver, moving
-   UART output behind a driver interface.
 6. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
    `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
 
@@ -1030,7 +1206,9 @@ and the full-mailbox selective-receive limitation recorded above.
    `--features no_std,demo-tasks`; this replaces the interactive boot.
 5. For the default profile, verify `ls`, `echo 'hello' > test.txt`,
    `cat test.txt`, `mkdir docs`, quoted echo, `cd /bin`, `pwd`, relative paths,
-   `cd ..`, `ps`, and `spawn`/`kill`/`wait`. Also check fastfetch and the logo.
+   `cd ..`, `ps`, and `spawn`/`kill`/`wait`. Also check fastfetch and the logo,
+   confirm boot prints `NET: ICMP REPLY FROM 10.0.2.2`, and make sure `ps`
+   lists live `net_driver` and `net_server` tasks.
    Run `bg demo 12`, confirm shell output stays free of `AWAKE`, then `fg 3`.
    Send Ctrl-Z, verify `ps` = stopped and silence while stopped, resume with
    `fg 3`, stop again and verify kill/wait. Repeat with blocked `demo 7` and

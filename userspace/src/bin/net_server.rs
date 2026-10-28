@@ -3,8 +3,8 @@
 //! `net_driver` owns virtio-net and moves raw Ethernet frames in and out of
 //! the NIC. This server owns smoltcp: it announces a DMA mailbox to the
 //! driver, feeds received frames to the interface, and hands generated frames
-//! back. Sockets are intentionally not created yet; the loop below is the
-//! skeleton the protocol handlers will plug into.
+//! back. An ICMP echo request to the QEMU slirp gateway exercises the whole
+//! path: ARP resolution, frame TX, frame RX, and checksum verification.
 
 #![no_std]
 #![no_main]
@@ -19,18 +19,28 @@ mod net_ipc;
 mod syscall;
 
 use core::panic::PanicInfo;
-use smoltcp::iface::{Config, Interface, SocketSet, SocketStorage};
-use smoltcp::phy::{self, Device, DeviceCapabilities, Medium};
+use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
+use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
+use smoltcp::socket::icmp;
+use smoltcp::storage::{PacketBuffer, PacketMetadata};
 use smoltcp::time::Instant;
-use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{
+    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+};
 
 /// Interface polling period. It is also the clock granularity smoltcp sees.
 const POLL_MILLIS: u64 = 10;
 /// The driver may still be probing the NIC when this task starts, so the attach
 /// request is retried instead of assuming a boot order.
 const ATTACH_RETRY_MILLIS: u64 = 1000;
-/// Storage reserved for future TCP/UDP sockets.
+/// Storage reserved for the ICMP socket and future TCP/UDP sockets.
 const SOCKET_COUNT: usize = 4;
+
+/// ICMP echo identifier; the stack only accepts replies carrying this one.
+const PING_IDENT: u16 = 0x5349;
+const PING_PAYLOAD: &[u8] = b"silver-ping";
+const ICMP_METADATA_COUNT: usize = 4;
+const ICMP_PAYLOAD_SIZE: usize = 256;
 
 const TASK_LIST_CAPACITY: usize = 32;
 const EMPTY_TASK: syscall::TaskInfo = syscall::TaskInfo {
@@ -51,6 +61,7 @@ const GUEST_PREFIX: u8 = 24;
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
 
 const EXIT_NO_DMA: u64 = 1;
+const EXIT_NO_ICMP: u64 = 2;
 
 /// The frame buffers live in `.bss`, not on the 8 KiB userspace stack.
 static mut DEVICE: FrameDevice = FrameDevice::new();
@@ -89,10 +100,28 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
         core::array::from_fn(|_| SocketStorage::EMPTY);
     let mut sockets = SocketSet::new(&mut socket_storage[..]);
 
+    // ICMP echo storage. The packet buffers borrow these arrays for the whole
+    // run, exactly like `socket_storage` above.
+    let mut icmp_rx_metadata = [PacketMetadata::<IpAddress>::EMPTY; ICMP_METADATA_COUNT];
+    let mut icmp_rx_payload = [0_u8; ICMP_PAYLOAD_SIZE];
+    let mut icmp_tx_metadata = [PacketMetadata::<IpAddress>::EMPTY; ICMP_METADATA_COUNT];
+    let mut icmp_tx_payload = [0_u8; ICMP_PAYLOAD_SIZE];
+    let mut icmp_socket = icmp::Socket::new(
+        PacketBuffer::new(&mut icmp_rx_metadata[..], &mut icmp_rx_payload[..]),
+        PacketBuffer::new(&mut icmp_tx_metadata[..], &mut icmp_tx_payload[..]),
+    );
+    if icmp_socket.bind(icmp::Endpoint::Ident(PING_IDENT)).is_err() {
+        fail(EXIT_NO_ICMP, "NET SERVER: ICMP BIND FAILED\r\n");
+    }
+    let icmp_handle = sockets.add(icmp_socket);
+    let capabilities = device.capabilities();
+
     let mut driver = resolve_driver(driver_hint);
     let mut attached = false;
     let mut next_attach = 0_u64;
     let mut now_millis = 0_i64;
+    let mut ping_sent = false;
+    let mut ping_status_pending = false;
 
     syscall::print("NET SERVER READY\r\n");
 
@@ -133,11 +162,35 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
             write_u32(dma_vaddr, net_ipc::RX_LENGTH, 0);
         }
 
+        // The driver has mapped the mailbox: queue one echo request to the
+        // slirp gateway. smoltcp resolves 10.0.2.2 with ARP first and keeps
+        // the ICMP packet queued in the socket until the neighbour is usable.
+        if attached && !ping_sent {
+            if send_ping(&mut sockets, icmp_handle, &capabilities.checksum, 0) {
+                ping_sent = true;
+                syscall::print("NET SERVER: ICMP ECHO SENT TO 10.0.2.2\r\n");
+            }
+        }
+
         let _ = interface.poll(now, device, &mut sockets);
+        if receive_pings(&mut sockets, icmp_handle) {
+            ping_status_pending = true;
+        }
+
+        // This task owns no console, so hand the result to the shell, which
+        // does. Retry until the shell exists and its mailbox accepts the text.
+        if ping_status_pending {
+            if let Some(shell) = resolve_task(syscall::PROGRAM_HOWL) {
+                if syscall::try_send(shell, &ipc::Message::new(0, b"NET ICMP REPLY OK")) {
+                    ping_status_pending = false;
+                }
+            }
+        }
 
         // smoltcp delivers at most one frame per poll (`max_burst_size`), so
-        // one TX slot is enough and the last consumed token is the frame to go.
-        if device.tx_len > 0 {
+        // one TX slot is enough. Wait until the driver has released the
+        // previous slot before publishing the next frame.
+        if device.tx_len > 0 && read_u32(dma_vaddr, net_ipc::TX_LENGTH) == 0 {
             write_dma_frame(dma_vaddr, net_ipc::TX_FRAME, &device.tx[..device.tx_len]);
             net_ipc::fence();
             write_u32(dma_vaddr, net_ipc::TX_LENGTH, device.tx_len as u32);
@@ -148,6 +201,59 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
         }
 
         syscall::sleep(POLL_MILLIS);
+    }
+}
+
+/// Queues an ICMPv4 echo request. The socket owns the bytes; `emit` fills in
+/// the type/code/identifier/sequence header and the checksum.
+fn send_ping(
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    checksum: &ChecksumCapabilities,
+    seq_no: u16,
+) -> bool {
+    let repr = Icmpv4Repr::EchoRequest {
+        ident: PING_IDENT,
+        seq_no,
+        data: PING_PAYLOAD,
+    };
+    let destination = IpAddress::v4(GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3]);
+    let socket = sockets.get_mut::<icmp::Socket>(handle);
+    let Ok(buffer) = socket.send(repr.buffer_len(), destination) else {
+        return false;
+    };
+    let mut packet = Icmpv4Packet::new_unchecked(buffer);
+    repr.emit(&mut packet, checksum);
+    true
+}
+
+/// Drains every echo reply smoltcp has delivered to the ICMP socket. Returns
+/// true if at least one reply was consumed.
+fn receive_pings(sockets: &mut SocketSet<'_>, handle: SocketHandle) -> bool {
+    let mut payload = [0_u8; ICMP_PAYLOAD_SIZE];
+    let mut received = false;
+    loop {
+        let socket = sockets.get_mut::<icmp::Socket>(handle);
+        let Ok((length, source)) = socket.recv_slice(&mut payload) else {
+            return received;
+        };
+        received = true;
+        syscall::print("NET SERVER: ICMP REPLY ");
+        syscall::print_dec_u64(length as u64);
+        syscall::print(" BYTES FROM ");
+        print_ipv4(source);
+        syscall::print("\r\n");
+    }
+}
+
+fn print_ipv4(address: IpAddress) {
+    // Only `proto-ipv4` is enabled, so `IpAddress` has no other variant.
+    let IpAddress::Ipv4(address) = address;
+    for (index, byte) in address.octets().iter().enumerate() {
+        if index > 0 {
+            syscall::print(".");
+        }
+        syscall::print_dec_u64(u64::from(*byte));
     }
 }
 
@@ -164,6 +270,19 @@ fn handle_doorbell(message: &ipc::Message, interface: &mut Interface, attached: 
         }
         _ => {}
     }
+}
+
+/// Finds the newest live task running `program`.
+fn resolve_task(program: u64) -> Option<u64> {
+    let mut tasks = [EMPTY_TASK; TASK_LIST_CAPACITY];
+    let count = syscall::task_list(&mut tasks)?;
+    tasks[..count.min(TASK_LIST_CAPACITY)]
+        .iter()
+        .rev()
+        .find(|task| {
+            task.program == program && task.state != TASK_DEAD && task.state != TASK_STOPPED
+        })
+        .map(|task| task.id)
 }
 
 /// Resolves the live net driver task. The hint is the task ID silverd passed
