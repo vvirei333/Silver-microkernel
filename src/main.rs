@@ -13,6 +13,8 @@ mod channel;
 #[cfg(not(feature = "std"))]
 mod condvar;
 #[cfg(not(feature = "std"))]
+mod elf;
+#[cfg(not(feature = "std"))]
 mod elf_loader;
 #[cfg(not(feature = "std"))]
 mod exceptions;
