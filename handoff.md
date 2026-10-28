@@ -3,6 +3,123 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## State as of 2026-10-28 (Phase 5 complete: ramfb graphics + virtio-tablet input, live engineer menu)
+
+**Phase 5 (Graphics + Input) is complete and verified in QEMU.** `gpu_driver`
+paints a static "engineer menu" (BIOS / iPhone Field-Test style) onto a `ramfb`
+framebuffer, and `input_driver` turns the `virtio-tablet-pci` mouse into a live
+cursor that presses and releases the menu buttons.
+
+Why `ramfb`, not PL111: the `virt` machine has no PL111 (that PrimeCell CLCD
+exists only on realview/versatile/vexpress boards). `ramfb` is QEMU's native
+plain-RAM framebuffer: the guest allocates a contiguous frame buffer, writes a
+28-byte `RAMFBCfg` descriptor to the `etc/ramfb` `fw_cfg` file, and then paints
+pixels; QEMU's display surface scans the RAM out.
+
+### Current boot chain
+
+`silverd` starts, in order:
+
+1. Scout (bounded `SCOUT READY` handshake)
+2. `block_driver` with `CAP_MMIO | CAP_PCI`
+3. `net_driver` with `CAP_MMIO | CAP_PCI`, then lends it the console for 1 s
+4. `sfs_server` with `CAP_MMIO`, then waits (bounded) for `SFS READY`
+5. `net_server` with `CAP_MMIO`, passing the driver's task ID
+6. `gpu_driver` with `CAP_MMIO`, then lends it the console for 1 s
+7. `input_driver` with `CAP_PCI | CAP_MMIO`, then lends it the console for 1 s
+8. Howl, then transfers the console
+9. Howler with `CAP_MMIO | CAP_IRQ` and Howl's ID as its input target
+
+`gpu_driver` registers the name `gpu_driver` before the input driver is spawned,
+so `input_driver` resolves it with `SYS_LOOKUP` on its first pointer sample.
+
+### Graphics driver (`userspace/src/bin/gpu_driver.rs`)
+
+- Resolution 640x480, 32-bit ARGB. The frame buffer comes from `SYS_ALLOC_DMA`
+  (Normal Non-Cacheable, `(vaddr, paddr)`); `SYS_MAP_PHYS` maps only the
+  `fw_cfg` MMIO window, because `map_phys_to_user` rejects DRAM. The same split
+  would hold for a real PL111: registers are MMIO, the scan-out buffer is RAM.
+- `fw_cfg` MMIO is at `0x09020000` (`data` @+0x00, `ctl` @+0x08, `dma` @+0x10).
+  Transfers use the DMA interface only: a 16-byte `FWCfgDmaAccess` struct is
+  written to a scratch DMA page, then a single 8-byte store to the `dma`
+  register (big-endian, so `value.swap_bytes()`) triggers the transfer. Byte
+  stores to the `dma` register are rejected by QEMU and surface as
+  `EL0 SYNC FAULT` (`ESR_EL1=0x92000050`, DFSC=0x10 external abort) — the
+  register accepts only 4- or 8-byte stores.
+- `find_ramfb_selector` scans the `fw_cfg` file directory (key `0x19`, 64-byte
+  big-endian entries) for `etc/ramfb`; `configure_ramfb` writes the big-endian
+  `RAMFBCfg { addr, fourcc=0x34325241, flags, width, height, stride }`.
+- Drawing helpers: `clear_screen`, `draw_rect` (1 px border), `draw_text` /
+  `draw_text_centered` over an embedded public-domain 8x8 font. The menu draws
+  three grey status cells ("Num", "No Data", "Date"), a 3x2 grid of blue buttons
+  ("Phone", "SMS", "Web", "Media", "Power", "Settings") and a bottom panel with
+  "SN: 877..." and "Silver Microkernel v0.1".
+- Live UI loop: `serve()` blocks on `SYS_RECEIVE`, decodes `InputMsg`, moves the
+  cursor, tracks `pressed_btn`, and repaints the whole frame (clear + menu +
+  cursor) after every report boundary. A held button fills dark blue
+  (`0x003366`); releasing restores the normal blue and prints `Button clicked!`.
+- `draw_cursor` draws an 8x8 white arrow last, on top of the menu.
+
+### Input driver (`userspace/src/bin/input_driver.rs`)
+
+- PCI scan matches vendor `1af4` device `0x1052` (`VIRTIO_ID_INPUT`, modern-only;
+  there is no transitional virtio-input). Its 64 KiB BAR window is assigned at
+  `0x1030_0000` (after the block `0x1010_0000` and net `0x1020_0000` windows).
+- Single event queue (queue 0). QEMU creates a 64-entry queue; the driver
+  provides 64 buffers of 8 bytes each (one `virtio_input_event =
+  { type: u16, code: u16, value: u32 }` per buffer, all little-endian).
+- QEMU's `virtio_input_send` queues events and flushes one batch per
+  `EV_SYN`/`SYN_REPORT`, popping one available buffer per event and firing an
+  IRQ. The driver polls the used ring every 10 ms (`sleep(1)`), so no virtio
+  IRQ is wired.
+- Event handling: `EV_ABS` code 0x00/0x01 updates raw X/Y, `EV_KEY` code
+  `0x110` (`BTN_LEFT`) updates the click state, `EV_SYN` code 0 forwards one
+  sample. Raw absolute values `0..=32767` are scaled to `0..=639`/`0..=479`.
+- Each `EV_SYN` sends one `InputMsg` to `gpu_driver`, resolved once via
+  `SYS_LOOKUP("gpu_driver")` and cached; `SYS_TRY_SEND` drops samples if the
+  mailbox is full rather than blocking the poll loop.
+
+### Shared protocol (`userspace/src/input_proto.rs`)
+
+`InputMsg { x: u16, y: u16, left_clicked: bool }` packed into an `OP_POINTER` (1)
+IPC message (`x`, `y` little-endian, `left_clicked` in `payload[5]`). A sample is
+small enough for the 32-byte mailbox, so it travels over IPC directly — no DMA
+mailbox is needed (unlike `net_ipc`).
+
+### QEMU flags
+
+`build_and_qemu.sh` replaced `-nographic` with:
+
+```text
+-device ramfb
+-device virtio-tablet-pci,disable-legacy=on,id=tablet0
+-display gtk,show-cursor=on
+-serial mon:stdio
+```
+
+### Verification
+
+Boot log shows `GPU DRIVER: ENGINEER MENU DRAWN` and `VIRTIO-INPUT READY`.
+Headless verification drives the pipeline with QMP `input-send-event` (each
+command ends in an implicit `EV_SYN`; there is no explicit `sync` event type),
+then `screendump` plus pixel sampling confirmed: the cursor moves to the target
+and leaves no trail; pressing over "Phone" fills it `(0,51,102)`; releasing
+restores `(0,90,181)` while "SMS" stays normal.
+
+### Limitations recorded for the next phase
+
+- The menu is single-buffered: every sample repaints the whole 640x480 frame
+  (clear + menu + cursor). There is no backbuffer/flip, so `render()` is the
+  `present()`.
+- Input is polled at ~100 Hz, not IRQ-driven; virtio-input MSI-X/INTx is not
+  wired. Absolute scaling assumes QEMU's `0..32767` range (the device-config
+  `ABS_INFO` min/max is not read).
+- `Button clicked!` uses `syscall::print`, which the kernel drops because
+  `gpu_driver` does not own the console (Howl does). The only observable click
+  feedback today is the button colour change.
+- The input driver's BAR is fixed at `0x1030_0000` (assumes block `0x1010_0000`
+  and net `0x1020_0000`).
+
 ## State as of 2026-10-28 (Phase 4 complete: VirtIO-Net, smoltcp, shared-memory IPC and shell ping)
 
 **Phase 4 (Network) is complete and verified end-to-end in QEMU.** The shell
@@ -724,6 +841,15 @@ handles both CR and LF from UART.
   physical `0x1020_0000`, uses modern common/notify capabilities, queues 0 (RX)
   and 1 (TX), 16 x 2 KiB buffers per queue, and the 12-byte modern virtio-net
   header. No virtio-net IRQ is wired; RX is polled every loop.
+- fw_cfg: MMIO at physical `0x09020000` (`data` `+0x00`, `ctl` `+0x08`, `dma`
+  `+0x10`). The `dma` register is big-endian and accepts only 4- or 8-byte
+  stores; byte stores raise an external abort. `ramfb` (`-device ramfb`) is a
+  plain RAM framebuffer configured through the `etc/ramfb` fw_cfg file with a
+  big-endian `RAMFBCfg` (fourcc `0x34325241` = ARGB8888).
+- VirtIO-Input: `-device virtio-tablet-pci` is a modern-only `1af4:1052` device
+  with one event queue (queue 0, 64 entries, 8-byte little-endian events).
+  Absolute X/Y are reported `0..32767`. The driver assigns 64 KiB at physical
+  `0x1030_0000`.
 - FP/SIMD enabled in `_start` (CPACR_EL1 = 0x300000, CPTR_EL2 = 0) —
   without this the first use of a float register traps with EC=7
 - Runtime is EL1h for the kernel and EL0t for user tasks: QEMU `-kernel`
@@ -1192,6 +1318,15 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   dead `net_server` leaves the driver holding the old mapping until the next
   attach. TX-ring exhaustion drops the frame (`NET DRIVER: TX FRAME DROPPED`)
   rather than blocking the server.
+- The graphics menu is single-buffered: `gpu_driver` repaints the entire
+  640x480 frame (clear + menu + cursor) on every pointer sample, with no
+  dirty-region tracking; `ramfb` has no hardware flip or vsync. The input driver
+  polls the virtio event queue at ~100 Hz instead of using a virtio IRQ, and
+  assumes QEMU's fixed `0..32767` absolute range. `Button clicked!` is printed
+  with `syscall::print` and therefore dropped, because `gpu_driver` does not own
+  the console. The input driver's 64 KiB BAR is fixed at `0x1030_0000`,
+  extending the fixed-BAR assumption already used by the block (`0x1010_0000`)
+  and net (`0x1020_0000`) drivers.
 - The EL1/kernel path is a stub. `silver_handle_exception(kind, esr, elr, far)`
   ignores all four arguments, so a kernel bug, an unhandled IRQ (`kind = 8`) or
   a failed boot check (`kind = 6|7` in `kernel_main`) only exits the current
@@ -1202,8 +1337,12 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 ## Next steps (by priority)
 
-1. **Phase 5: Graphics (Framebuffer / PL111).** Bring up the PL111 display
-   controller and a framebuffer on QEMU `virt`, then a Ring-3 graphics driver.
+1. **Graphics/input polish.** Double-buffer the menu and repaint only the dirty
+   region under the cursor/button instead of the whole frame; wire virtio-input
+   interrupts to replace the 100 Hz poll; read `ABS_INFO` min/max from the
+   device config instead of assuming `0..32767`; give `gpu_driver` a visible
+   channel for its click feedback (a log channel or an on-screen status line);
+   and turn the six menu buttons into real actions.
 2. **Program credentials:** define which embedded programs a task may request;
    currently any task can still spawn the shell ELF. Capability delegation is
    available through `SYS_CAP_GRANT`.

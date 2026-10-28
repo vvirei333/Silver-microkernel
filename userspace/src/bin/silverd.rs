@@ -96,7 +96,27 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         syscall::print("SILVERD: GPU DRIVER CONSOLE LEND FAILED\r\n");
     }
 
-    // 7. Howl (shell)
+    // 7. Input driver (virtio-tablet). Spawned after gpu_driver so "gpu_driver"
+    // is already registered in the nameserver by the time the first pointer
+    // sample is forwarded. It needs CAP_PCI to probe the device and CAP_MMIO to
+    // map its BAR and allocate the event-ring DMA window.
+    let input_cap = syscall::spawn(syscall::PROGRAM_INPUT_DRIVER, syscall::task_id())
+        .unwrap_or_else(|| fail("SILVERD: INPUT DRIVER SPAWN FAILED\r\n"));
+    let input_id = syscall::cap_get_task_id(input_cap)
+        .unwrap_or_else(|| fail("SILVERD: INPUT DRIVER CAP LOOKUP FAILED\r\n"));
+    if !syscall::cap_grant(input_cap, input_id, syscall::CAP_PCI | syscall::CAP_MMIO) {
+        fail("SILVERD: INPUT DRIVER CAP GRANT FAILED\r\n");
+    }
+    if syscall::console_set(input_cap) {
+        syscall::sleep(1000);
+        if !syscall::console_set(syscall::task_id()) {
+            fail("SILVERD: CONSOLE RECLAIM FAILED\r\n");
+        }
+    } else {
+        syscall::print("SILVERD: INPUT DRIVER CONSOLE LEND FAILED\r\n");
+    }
+
+    // 8. Howl (shell)
     let howl_id = syscall::spawn(syscall::PROGRAM_HOWL, syscall::task_id())
         .unwrap_or_else(|| fail("SILVERD: HOWL SPAWN FAILED\r\n"));
     if !syscall::cap_grant(howl_id, howl_id, syscall::CAP_MMIO) {
@@ -106,7 +126,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("SILVERD: CONSOLE HANDOFF FAILED\r\n");
     }
 
-    // 8. Howler (UART)
+    // 9. Howler (UART)
     let howler_id = syscall::spawn(syscall::PROGRAM_HOWLER, howl_id)
         .unwrap_or_else(|| fail("SILVERD: HOWLER SPAWN FAILED\r\n"));
     if !syscall::cap_grant(howler_id, howler_id, syscall::CAP_MMIO | syscall::CAP_IRQ) {

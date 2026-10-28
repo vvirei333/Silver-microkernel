@@ -44,6 +44,7 @@ fn main() {
         ("net_driver", "net_driver.elf"),
         ("net_server", "net_server.elf"),
         ("gpu_driver", "gpu_driver.elf"),
+        ("input_driver", "input_driver.elf"),
     ] {
         let elf = target_dir
             .join("aarch64-unknown-none")

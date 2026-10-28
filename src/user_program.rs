@@ -15,6 +15,7 @@ pub const SFS_SERVER: u64 = 11; // <--- ДОБАВЛЕНО
 pub const NET_DRIVER: u64 = 12;
 pub const NET_SERVER: u64 = 13;
 pub const GPU_DRIVER: u64 = 14;
+pub const INPUT_DRIVER: u64 = 15;
 
 static DEMO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silver_userspace.elf"));
 static SILVERD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silverd.elf"));
@@ -31,6 +32,7 @@ static SFS_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sfs_ser
 static NET_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_driver.elf"));
 static NET_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_server.elf"));
 static GPU_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_driver.elf"));
+static INPUT_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/input_driver.elf"));
 
 /// Selects an executable for spawn. Unknown program IDs are rejected.
 pub fn image(program: u64) -> Option<&'static [u8]> {
@@ -50,6 +52,7 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         NET_DRIVER => Some(NET_DRIVER_ELF),
         NET_SERVER => Some(NET_SERVER_ELF),
         GPU_DRIVER => Some(GPU_DRIVER_ELF),
+        INPUT_DRIVER => Some(INPUT_DRIVER_ELF),
         _ => None,
     }
 }

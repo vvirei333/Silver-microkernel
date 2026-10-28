@@ -20,6 +20,9 @@
 #[allow(dead_code)]
 #[path = "../ipc.rs"]
 mod ipc;
+#[allow(dead_code)]
+#[path = "../input_proto.rs"]
+mod input_proto;
 #[path = "../syscall.rs"]
 mod syscall;
 
@@ -69,6 +72,8 @@ const COLOR_GRAY: u32 = 0xFF80_8080;
 const COLOR_LIGHT_GRAY: u32 = 0xFFC0_C0C0;
 const COLOR_DARK_GRAY: u32 = 0xFF40_4040;
 const COLOR_BLUE: u32 = 0xFF00_5A_B5;
+/// Pressed-button fill (dark blue), shown while the pointer holds a button.
+const COLOR_PRESSED_BLUE: u32 = 0xFF00_33_66;
 
 /// Layout of the 8192-byte DMA scratch allocation.
 const SCRATCH_SIZE: u64 = 8192;
@@ -87,11 +92,38 @@ struct Framebuffer {
 
 static mut FRAMEBUFFER: Option<Framebuffer> = None;
 
+/// Live pointer state, updated from [`input_proto::InputMsg`] samples.
+#[derive(Copy, Clone)]
+struct UiState {
+    cursor_x: u16,
+    cursor_y: u16,
+    /// Button index held by the left button, or `None` while released.
+    pressed_btn: Option<usize>,
+}
+
+static mut UI: UiState = UiState {
+    cursor_x: SCREEN_WIDTH as u16 / 2,
+    cursor_y: SCREEN_HEIGHT as u16 / 2,
+    pressed_btn: None,
+};
+
+/// Center 3 x 2 button grid geometry (shared by drawing and hit-testing).
+const BUTTON_W: u32 = 120;
+const BUTTON_H: u32 = 60;
+const BUTTON_GAP: u32 = 16;
+const BUTTON_GRID_X: u32 = (SCREEN_WIDTH - (3 * BUTTON_W + 2 * BUTTON_GAP)) / 2;
+const BUTTON_GRID_Y: u32 = 150;
+const BUTTON_LABELS: [&str; 6] = ["Phone", "SMS", "Web", "Media", "Power", "Settings"];
+
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(_argument: u64) -> ! {
     syscall::sleep(100);
     syscall::print("GPU DRIVER STARTED\r\n");
+    // The input driver finds us by this name to deliver pointer samples.
+    if !syscall::register("gpu_driver") {
+        fail("GPU DRIVER: REGISTER FAILED\r\n");
+    }
 
     let Some((fb_vaddr, fb_paddr)) = syscall::alloc_dma(SCREEN_BYTES) else {
         fail("GPU DRIVER: FRAMEBUFFER ALLOCATION FAILED\r\n");
@@ -134,15 +166,52 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     syscall::print_dec_u64(u64::from(SCREEN_HEIGHT));
     syscall::print(")\r\n");
 
-    draw_engineer_menu();
+    let (cursor_x, cursor_y, pressed_btn) = unsafe {
+        let ui = core::ptr::addr_of!(UI);
+        ((*ui).cursor_x, (*ui).cursor_y, (*ui).pressed_btn)
+    };
+    render(cursor_x, cursor_y, pressed_btn);
 
     syscall::print("GPU DRIVER: ENGINEER MENU DRAWN\r\n");
 
     // The frame buffer must stay mapped for the life of the display; exiting
-    // would release the DMA pages and leave ramfb scanning freed RAM.
+    // would release the DMA pages and leave ramfb scanning freed RAM. Block on
+    // pointer samples from the input driver and repaint on each one.
+    serve();
+}
+
+/// Blocks on [`input_proto::InputMsg`] samples and repaints the menu and cursor
+/// after each report boundary.
+fn serve() -> ! {
     loop {
-        syscall::sleep(60_000);
+        let mut message = ipc::Message::new(0, &[]);
+        if syscall::receive(&mut message) {
+            if let Some(input) = input_proto::decode(&message) {
+                handle_pointer(input);
+            }
+        }
     }
+}
+
+/// Applies one pointer sample: moves the cursor, tracks button press/release,
+/// and repaints the whole frame so the cursor and button state stay consistent.
+fn handle_pointer(input: input_proto::InputMsg) {
+    let ui = unsafe { &mut *core::ptr::addr_of_mut!(UI) };
+    ui.cursor_x = input.x;
+    ui.cursor_y = input.y;
+
+    if input.left_clicked {
+        // Pressing over a button selects it; releasing leaves it selected.
+        if let Some(index) = button_at(input.x, input.y) {
+            ui.pressed_btn = Some(index);
+        }
+    } else if ui.pressed_btn.take().is_some() {
+        // The button reverts to its normal colour because `render` no longer
+        // sees it as pressed; report the click.
+        syscall::print("Button clicked!\r\n");
+    }
+
+    render(ui.cursor_x, ui.cursor_y, ui.pressed_btn);
 }
 
 // ---------------------------------------------------------------------------
@@ -404,9 +473,9 @@ fn plot(framebuffer: Framebuffer, x: u32, y: u32, color: u32) {
 // Engineer menu
 // ---------------------------------------------------------------------------
 
-fn draw_engineer_menu() {
-    clear_screen(COLOR_BLACK);
-
+/// Draws the full engineer menu (cells, buttons, panel) without clearing the
+/// frame or drawing the cursor. `pressed_btn` selects the pressed button fill.
+fn draw_menu(pressed_btn: Option<usize>) {
     // Top: three small grey status cells.
     const CELL_Y: u32 = 20;
     const CELL_H: u32 = 44;
@@ -422,26 +491,8 @@ fn draw_engineer_menu() {
     }
 
     // Center: 3 x 2 grid of blue buttons with white text.
-    const BUTTON_W: u32 = 120;
-    const BUTTON_H: u32 = 60;
-    const BUTTON_GAP: u32 = 16;
-    let grid_width = 3 * BUTTON_W + 2 * BUTTON_GAP;
-    let grid_x = (SCREEN_WIDTH - grid_width) / 2;
-    let grid_y = 150;
-
-    let buttons: [(&str, u32, u32); 6] = [
-        ("Phone", 0, 0),
-        ("SMS", 1, 0),
-        ("Web", 2, 0),
-        ("Media", 0, 1),
-        ("Power", 1, 1),
-        ("Settings", 2, 1),
-    ];
-    for (label, col, row) in buttons {
-        let x = grid_x + col * (BUTTON_W + BUTTON_GAP);
-        let y = grid_y + row * (BUTTON_H + BUTTON_GAP);
-        draw_rect(x, y, BUTTON_W, BUTTON_H, COLOR_BLUE, COLOR_DARK_GRAY);
-        draw_text_centered(x + BUTTON_W / 2, y + BUTTON_H / 2 - 4, label, COLOR_WHITE);
+    for index in 0..BUTTON_LABELS.len() {
+        draw_button(index, pressed_btn == Some(index));
     }
 
     // Bottom: one wide grey panel with serial and OS version.
@@ -457,6 +508,70 @@ fn draw_engineer_menu() {
     );
     draw_text_centered(SCREEN_WIDTH / 2, PANEL_Y + 24, "SN: 877...", COLOR_BLACK);
     draw_text_centered(SCREEN_WIDTH / 2, PANEL_Y + 56, "Silver Microkernel v0.1", COLOR_BLACK);
+}
+
+/// Repaints the whole frame: clear, menu, then the cursor on top.
+fn render(cursor_x: u16, cursor_y: u16, pressed_btn: Option<usize>) {
+    clear_screen(COLOR_BLACK);
+    draw_menu(pressed_btn);
+    draw_cursor(cursor_x, cursor_y);
+}
+
+/// Returns the pixel rectangle of button `index` (row-major, 3 columns).
+fn button_rect(index: usize) -> (u32, u32, u32, u32) {
+    let col = (index % 3) as u32;
+    let row = (index / 3) as u32;
+    let x = BUTTON_GRID_X + col * (BUTTON_W + BUTTON_GAP);
+    let y = BUTTON_GRID_Y + row * (BUTTON_H + BUTTON_GAP);
+    (x, y, BUTTON_W, BUTTON_H)
+}
+
+/// Draws one button, dark blue while `pressed` and the normal blue otherwise.
+fn draw_button(index: usize, pressed: bool) {
+    let (x, y, w, h) = button_rect(index);
+    let fill = if pressed { COLOR_PRESSED_BLUE } else { COLOR_BLUE };
+    draw_rect(x, y, w, h, fill, COLOR_DARK_GRAY);
+    draw_text_centered(x + w / 2, y + h / 2 - 4, BUTTON_LABELS[index], COLOR_WHITE);
+}
+
+/// Returns the index of the button under `(x, y)`, if any.
+fn button_at(x: u16, y: u16) -> Option<usize> {
+    for index in 0..BUTTON_LABELS.len() {
+        let (bx, by, bw, bh) = button_rect(index);
+        let within_x = u32::from(x) >= bx && u32::from(x) < bx + bw;
+        let within_y = u32::from(y) >= by && u32::from(y) < by + bh;
+        if within_x && within_y {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Draws a small white arrow pointer with its tip at `(x, y)`.
+fn draw_cursor(x: u16, y: u16) {
+    // 8x8 arrow: bit 7 of each row byte is the leftmost pixel, so row 0 is the
+    // tip and each row grows one pixel to the right.
+    const CURSOR: [u8; 8] = [
+        0b1000_0000,
+        0b1100_0000,
+        0b1110_0000,
+        0b1111_0000,
+        0b1111_1000,
+        0b1111_1100,
+        0b1111_1110,
+        0b1111_1111,
+    ];
+    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+        return;
+    };
+    for row in 0..8_u32 {
+        let bits = CURSOR[row as usize];
+        for col in 0..8_u32 {
+            if bits & (1_u8 << (7 - col)) != 0 {
+                plot(framebuffer, u32::from(x) + col, u32::from(y) + row, COLOR_WHITE);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

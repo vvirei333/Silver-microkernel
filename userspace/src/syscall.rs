@@ -71,6 +71,7 @@ pub const PROGRAM_SFS_SERVER: u64 = 11;
 pub const PROGRAM_NET_DRIVER: u64 = 12;
 pub const PROGRAM_NET_SERVER: u64 = 13;
 pub const PROGRAM_GPU_DRIVER: u64 = 14;
+pub const PROGRAM_INPUT_DRIVER: u64 = 15;
 pub const CAP_MMIO: u32 = 1 << 4;
 pub const CAP_IRQ: u32 = 1 << 5;
 pub const CAP_PCI: u32 = 1 << 6;

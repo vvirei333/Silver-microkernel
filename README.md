@@ -33,8 +33,8 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] Condition variable: per-mailbox wait queues, targeted wakeups and timed waits
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
-- [x] Fourteen userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
-- [x] Init architecture: `silverd` starts Scout, the block driver, the network driver, the SFS server, the network server, Howl and Howler, all resolved by program ID
+- [x] Sixteen userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
+- [x] Init architecture: `silverd` starts Scout, the block, network, graphics and input drivers, the SFS and network servers, Howl and Howler, all resolved by program ID
 - [x] howl: `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`, `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`
 - [x] Shell output redirection: `>` truncates, `>>` appends, quoted operators stay literal
 - [x] ANSI clear/home and a bold cyan `howl>` prompt
@@ -62,6 +62,8 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] EL0 fault triage: `ESR_EL1`/`ELR_EL1`/`FAR_EL1` dump and a 16-entry context-switch trace before the guilty task dies
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
 - [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
+- [x] Graphics driver: `ramfb` framebuffer through `fw_cfg` DMA, a 640x480 ARGB engineer menu with an 8x8 font
+- [x] Input driver: `virtio-tablet-pci` absolute pointer over a virtio event queue, IPC to the graphics driver, live cursor and button press/release
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
 
 ## Phase 4: Network — complete
@@ -79,6 +81,38 @@ The reply has crossed the NIC, both virtio queues, the DMA mailbox in both
 directions, smoltcp's ARP and IPv4/ICMP layers, and the checksum check. Any
 IPv4 address can be pinged — not only the slirp gateway — and success is
 reported only on a matching echo reply before the timeout.
+
+## Phase 5: Graphics and input — complete
+
+The graphics and input path works end-to-end. `gpu_driver` paints a static
+"engineer menu" (BIOS / iPhone Field-Test style) onto a `ramfb` framebuffer, and
+`input_driver` drives the `virtio-tablet-pci` mouse into a live cursor that
+presses and releases the menu buttons.
+
+`ramfb` (not PL111, which the `virt` machine does not have) is QEMU's plain-RAM
+framebuffer: the guest allocates a contiguous 640x480 ARGB frame buffer with
+`SYS_ALLOC_DMA`, writes a big-endian `RAMFBCfg` descriptor to the `etc/ramfb`
+`fw_cfg` file through the `fw_cfg` DMA interface (`0x09020000`), and then paints
+pixels directly into the RAM. `input_driver` finds the modern-only
+`virtio-tablet-pci` (`1af4:1052`) device, provides 64 x 8-byte
+`virtio_input_event` buffers on its event queue, and on every `EV_SYN` scales the
+absolute `0..32767` coordinates to 640x480 and sends one `InputMsg` to
+`gpu_driver` (resolved by name through the nameserver).
+
+The menu draws three grey status cells ("Num", "No Data", "Date"), a 3x2 grid of
+blue buttons ("Phone", "SMS", "Web", "Media", "Power", "Settings") and a bottom
+panel ("SN: 877...", "Silver Microkernel v0.1"). Moving the mouse repaints the
+frame with a white arrow cursor on top; holding a button fills it dark blue
+(`0x003366`) and releasing restores the normal blue.
+
+```bash
+./build_and_qemu.sh release   # opens a GTK window (ramfb + tablet, show-cursor)
+```
+
+The script now passes `-device ramfb -device virtio-tablet-pci,disable-legacy=on`
+and `-display gtk,show-cursor=on` (the shell stays multiplexed on stdio via
+`-serial mon:stdio`). To run headless, substitute `-display vnc=...` and drive
+the mouse with QMP `input-send-event`.
 
 ## Requirements
 
@@ -197,7 +231,8 @@ prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 `Cargo.toml` has `std` (default host stub), `no_std` (bare metal) and
 `demo-tasks` (opt-in regression programs). Normal bare-metal boot starts only
 silverd, which then starts Scout, the block driver, the network driver, the SFS
-server, the network server, Howl and Howler in that order. No component depends
+server, the network server, the graphics and input drivers, Howl and Howler in
+that order. No component depends
 on the resulting numbers: the console sink, Howler, the block driver and both
 network tasks are looked up by program ID at runtime, and the block and network
 drivers also answer the sender of each request. To run
@@ -257,7 +292,7 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 
 | File | Purpose |
 | --- | --- |
-| `build.rs` | Builds and embeds all fourteen userspace ELFs for bare-metal profiles |
+| `build.rs` | Builds and embeds all sixteen userspace ELFs for bare-metal profiles |
 | `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
 | `src/exceptions.rs` | EL0 fault register dump, switch trace and the kernel exit path |
 | `src/pl011.rs` | Kernel UART diagnostics and bounded RX fallback |
@@ -286,6 +321,9 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `userspace/src/bin/net_driver.rs` | VirtIO-Net driver, split virtqueues and frame mailbox |
 | `userspace/src/bin/net_server.rs` | `smoltcp` TCP/IP stack and ICMP echo |
 | `userspace/src/net_ipc.rs` | Shared-memory frame protocol used by both network tasks |
+| `userspace/src/bin/gpu_driver.rs` | ramfb framebuffer, engineer menu, cursor and button UI |
+| `userspace/src/bin/input_driver.rs` | virtio-tablet absolute-pointer driver |
+| `userspace/src/input_proto.rs` | Pointer-sample IPC shared by the input and graphics drivers |
 | `userspace/src/bin/{ls,cat,echo}.rs` | Separate EL0 file/console utilities |
 | `userspace/` | Separate demo, nameserver, shell and utility EL0 programs |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |

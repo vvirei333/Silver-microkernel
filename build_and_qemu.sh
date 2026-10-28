@@ -47,5 +47,6 @@ exec qemu-system-aarch64 \
     -drive file=disk.img,format=raw,if=none,id=hd \
     -device virtio-blk-pci,drive=hd \
     -device ramfb \
-    -display gtk \
+    -device virtio-tablet-pci,disable-legacy=on,id=tablet0 \
+    -display gtk,show-cursor=on \
     -serial mon:stdio
