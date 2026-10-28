@@ -3,6 +3,9 @@
 
 #[path = "../ipc.rs"]
 mod ipc;
+#[allow(dead_code)]
+#[path = "../net_ipc.rs"]
+mod net_ipc;
 #[path = "../syscall.rs"]
 mod syscall;
 
@@ -130,12 +133,6 @@ fn read_input(howler: &mut HowlerLink) -> Option<u8> {
         if message.sender == howler_id && message.payload[0] == 0 {
             return Some(message.payload[1]);
         }
-        // The network server has no console of its own, so it reports the
-        // ping result here. Only this exact status text is printed.
-        if message.text() == b"NET ICMP REPLY OK" {
-            syscall::print("\r\nNET: ICMP REPLY FROM 10.0.2.2\r\n");
-            prompt();
-        }
     }
     None
 }
@@ -171,6 +168,7 @@ fn execute(command: &str) {
             syscall::print("  hexdump [sector]\r\n");
             syscall::print("             Dump 512 bytes of a sector (0 by default)\r\n");
             syscall::print("  sfsinfo    Show the mounted SFS superblock\r\n");
+            syscall::print("  ping <ip>  Send one ICMP echo request\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
@@ -224,6 +222,7 @@ fn execute(command: &str) {
             hexdump(sector);
         }
         Some("sfsinfo") => sfs_info(),
+        Some("ping") => ping_command(words.next()),
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
@@ -505,6 +504,95 @@ fn receive_from(task_id: u64, buffer: &mut ipc::Message) -> bool {
                 }
             }
         }
+    }
+}
+
+/// Sends one ICMP echo through the network server.
+///
+/// The server owns smoltcp and the driver, so the shell only ships the parsed
+/// address and waits for the outcome. The server answers "timeout" after its
+/// own two-second wait, so the shell's deadline must exceed that: three
+/// seconds leaves a full second for scheduler latency on the reply.
+fn ping_command(argument: Option<&str>) {
+    const PING_WAIT_TICKS: u64 = 3 * TICKS_PER_SECOND;
+
+    let Some(argument) = argument else {
+        syscall::print("usage: ping <a.b.c.d>\r\n");
+        return;
+    };
+    let Some(address) = parse_ipv4(argument) else {
+        syscall::print("ping: address must be a.b.c.d with octets 0-255\r\n");
+        return;
+    };
+    let Some(server) = find_task_id(syscall::PROGRAM_NET_SERVER) else {
+        syscall::print("NET SERVER NOT RUNNING\r\n");
+        return;
+    };
+    if !syscall::send(server, &net_ipc::ping(address)) {
+        syscall::print("NET SERVER NOT RESPONDING\r\n");
+        return;
+    }
+
+    let deadline = syscall::uptime_ticks().saturating_add(PING_WAIT_TICKS);
+    let mut response = ipc::Message::new(0, &[]);
+    let replied = loop {
+        if !syscall::task_alive(server) {
+            break false;
+        }
+        match syscall::receive_timeout(&mut response, RESPONSE_POLL_TICKS) {
+            Ok(()) if response.sender == server => break true,
+            Ok(()) => {}
+            Err(_) if syscall::uptime_ticks() >= deadline => break false,
+            Err(_) => {}
+        }
+    };
+    if !replied {
+        syscall::print("NET SERVER NOT RESPONDING\r\n");
+        return;
+    }
+    syscall::print("PING ");
+    print_dotted(address);
+    syscall::print(": ");
+    match net_ipc::ping_reply_fields(&response) {
+        Some((replied, true)) if replied == address => syscall::print("OK\r\n"),
+        _ => syscall::print("TIMEOUT\r\n"),
+    }
+}
+
+/// Parses a strict dotted-quad IPv4 address: four decimal octets, no spaces,
+/// every octet 0..=255.
+fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
+    let mut address = [0_u8; 4];
+    let mut octets = text.split('.');
+    for octet in address.iter_mut() {
+        let value = octets.next()?;
+        if value.is_empty() || value.len() > 3 {
+            return None;
+        }
+        let mut number = 0_u16;
+        for byte in value.bytes() {
+            if !byte.is_ascii_digit() {
+                return None;
+            }
+            number = number * 10 + u16::from(byte - b'0');
+        }
+        if number > 255 {
+            return None;
+        }
+        *octet = number as u8;
+    }
+    if octets.next().is_some() {
+        return None;
+    }
+    Some(address)
+}
+
+fn print_dotted(address: [u8; 4]) {
+    for (index, octet) in address.iter().enumerate() {
+        if index > 0 {
+            syscall::print(".");
+        }
+        syscall::print_dec_u64(u64::from(*octet));
     }
 }
 

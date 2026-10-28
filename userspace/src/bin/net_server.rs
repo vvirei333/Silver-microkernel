@@ -41,6 +41,9 @@ const PING_IDENT: u16 = 0x5349;
 const PING_PAYLOAD: &[u8] = b"silver-ping";
 const ICMP_METADATA_COUNT: usize = 4;
 const ICMP_PAYLOAD_SIZE: usize = 256;
+/// How long a shell-requested echo waits for its reply before the server
+/// reports a timeout to the shell.
+const PING_TIMEOUT_MILLIS: u64 = 2000;
 
 const TASK_LIST_CAPACITY: usize = 32;
 const EMPTY_TASK: syscall::TaskInfo = syscall::TaskInfo {
@@ -120,8 +123,12 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
     let mut attached = false;
     let mut next_attach = 0_u64;
     let mut now_millis = 0_i64;
-    let mut ping_sent = false;
-    let mut ping_status_pending = false;
+    let mut next_seq = 0_u16;
+    /// The echo request awaiting its reply, if any. One at a time: the ICMP
+    /// socket is identified, so every pending request would match every reply.
+    let mut pending_ping: Option<PendingPing> = None;
+    /// Result waiting for the shell to accept it, if any.
+    let mut ping_reply: Option<([u8; 4], bool)> = None;
 
     syscall::print("NET SERVER READY\r\n");
 
@@ -144,10 +151,26 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
 
         // Doorbells only say "look at the mailbox". Draining them keeps the
         // driver's mailbox from filling up; the frame itself is read below.
+        // Shell pings ride the same drain: `OP_PING` starts an echo request,
+        // everything else the shell sends is discarded.
         let mut message = ipc::Message::new(0, &[]);
         while syscall::receive_timeout(&mut message, 0).is_ok() {
             if Some(message.sender) == driver {
                 handle_doorbell(&message, &mut interface, &mut attached);
+            } else if message.payload[0] == net_ipc::OP_PING {
+                if ping_reply.is_none() {
+                    let address = net_ipc::ping_address(&message);
+                    ping_reply = start_ping(
+                        address,
+                        attached,
+                        &mut pending_ping,
+                        &mut next_seq,
+                        now_millis,
+                        &mut sockets,
+                        icmp_handle,
+                        &capabilities.checksum,
+                    );
+                }
             }
         }
 
@@ -162,28 +185,37 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
             write_u32(dma_vaddr, net_ipc::RX_LENGTH, 0);
         }
 
-        // The driver has mapped the mailbox: queue one echo request to the
-        // slirp gateway. smoltcp resolves 10.0.2.2 with ARP first and keeps
-        // the ICMP packet queued in the socket until the neighbour is usable.
-        if attached && !ping_sent {
-            if send_ping(&mut sockets, icmp_handle, &capabilities.checksum, 0) {
-                ping_sent = true;
-                syscall::print("NET SERVER: ICMP ECHO SENT TO 10.0.2.2\r\n");
+        let _ = interface.poll(now, device, &mut sockets);
+        if let Some(source) = receive_pings(&mut sockets, icmp_handle) {
+            if let Some(pending) = &pending_ping {
+                if source == pending.address {
+                    let address = pending.address;
+                    pending_ping = None;
+                    ping_reply = Some((address, true));
+                }
             }
         }
 
-        let _ = interface.poll(now, device, &mut sockets);
-        if receive_pings(&mut sockets, icmp_handle) {
-            ping_status_pending = true;
+        // A request that outlives its two-second window is answered with a
+        // timeout even if the reply arrives right after: the shell gets a
+        // bounded answer either way.
+        if let Some(pending) = &pending_ping {
+            if now_millis >= pending.deadline_millis {
+                let address = pending.address;
+                pending_ping = None;
+                ping_reply = Some((address, false));
+            }
         }
 
         // This task owns no console, so hand the result to the shell, which
-        // does. Retry until the shell exists and its mailbox accepts the text.
-        if ping_status_pending {
+        // does. Retry until the shell exists and its mailbox accepts it.
+        if let Some((address, success)) = ping_reply {
             if let Some(shell) = resolve_task(syscall::PROGRAM_HOWL) {
-                if syscall::try_send(shell, &ipc::Message::new(0, b"NET ICMP REPLY OK")) {
-                    ping_status_pending = false;
+                if syscall::try_send(shell, &net_ipc::ping_reply(address, success)) {
+                    ping_reply = None;
                 }
+            } else {
+                ping_reply = None;
             }
         }
 
@@ -204,6 +236,44 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
     }
 }
 
+/// One shell-requested echo in flight.
+struct PendingPing {
+    address: [u8; 4],
+    deadline_millis: i64,
+}
+
+/// Starts a shell-requested ping. `Some` becomes the immediate error reply
+/// when the request cannot even be queued (driver not attached, another ping
+/// still in flight, or the socket rejected the packet); `None` means the
+/// request is now pending and the reply arrives within two seconds either way.
+#[allow(clippy::too_many_arguments)]
+fn start_ping(
+    address: [u8; 4],
+    attached: bool,
+    pending_ping: &mut Option<PendingPing>,
+    next_seq: &mut u16,
+    now_millis: i64,
+    sockets: &mut SocketSet<'_>,
+    handle: SocketHandle,
+    checksum: &ChecksumCapabilities,
+) -> Option<([u8; 4], bool)> {
+    if !attached || pending_ping.is_some() {
+        return Some((address, false));
+    }
+    // The socket buffers the request, so a missing ARP entry does not fail
+    // here: smoltcp resolves the neighbour at poll time and emits the packet
+    // once the neighbour is usable.
+    if !send_ping(sockets, handle, checksum, next_seq.wrapping_add(1), address) {
+        return Some((address, false));
+    }
+    *next_seq = next_seq.wrapping_add(1);
+    *pending_ping = Some(PendingPing {
+        address,
+        deadline_millis: now_millis + PING_TIMEOUT_MILLIS as i64,
+    });
+    None
+}
+
 /// Queues an ICMPv4 echo request. The socket owns the bytes; `emit` fills in
 /// the type/code/identifier/sequence header and the checksum.
 fn send_ping(
@@ -211,13 +281,14 @@ fn send_ping(
     handle: SocketHandle,
     checksum: &ChecksumCapabilities,
     seq_no: u16,
+    address: [u8; 4],
 ) -> bool {
     let repr = Icmpv4Repr::EchoRequest {
         ident: PING_IDENT,
         seq_no,
         data: PING_PAYLOAD,
     };
-    let destination = IpAddress::v4(GATEWAY_IP[0], GATEWAY_IP[1], GATEWAY_IP[2], GATEWAY_IP[3]);
+    let destination = IpAddress::v4(address[0], address[1], address[2], address[3]);
     let socket = sockets.get_mut::<icmp::Socket>(handle);
     let Ok(buffer) = socket.send(repr.buffer_len(), destination) else {
         return false;
@@ -228,16 +299,18 @@ fn send_ping(
 }
 
 /// Drains every echo reply smoltcp has delivered to the ICMP socket. Returns
-/// true if at least one reply was consumed.
-fn receive_pings(sockets: &mut SocketSet<'_>, handle: SocketHandle) -> bool {
+/// the octets of the last consumed reply's source, if any.
+fn receive_pings(sockets: &mut SocketSet<'_>, handle: SocketHandle) -> Option<[u8; 4]> {
     let mut payload = [0_u8; ICMP_PAYLOAD_SIZE];
-    let mut received = false;
+    let mut last_source = None;
     loop {
         let socket = sockets.get_mut::<icmp::Socket>(handle);
         let Ok((length, source)) = socket.recv_slice(&mut payload) else {
-            return received;
+            return last_source;
         };
-        received = true;
+        // Only `proto-ipv4` is enabled, so `IpAddress` has no other variant.
+        let IpAddress::Ipv4(address) = source;
+        last_source = Some(address.octets());
         syscall::print("NET SERVER: ICMP REPLY ");
         syscall::print_dec_u64(length as u64);
         syscall::print(" BYTES FROM ");

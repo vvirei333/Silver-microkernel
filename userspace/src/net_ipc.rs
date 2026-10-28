@@ -40,8 +40,40 @@ pub const OP_FRAME: u8 = 3;
 pub const OP_TX: u8 = 4;
 /// Shell -> server: `payload[1..5]` is the IPv4 address to ping.
 pub const OP_PING: u8 = 5;
-/// Server -> shell: the reply is tagged with this byte at `payload[6]`.
+/// Server -> shell: `payload[1]` is 1 on success and 0 on timeout/error,
+/// `payload[2..6]` echoes the address the request asked about.
 pub const OP_PING_REPLY: u8 = 6;
+
+/// Shell -> server: one echo request to `address`.
+pub fn ping(address: [u8; 4]) -> ipc::Message {
+    let mut payload = [0_u8; 5];
+    payload[0] = OP_PING;
+    payload[1..5].copy_from_slice(&address);
+    ipc::Message::new(0, &payload)
+}
+
+/// Server -> shell: the outcome of one `ping`.
+pub fn ping_reply(address: [u8; 4], success: bool) -> ipc::Message {
+    let mut payload = [0_u8; 6];
+    payload[0] = OP_PING_REPLY;
+    payload[1] = u8::from(success);
+    payload[2..6].copy_from_slice(&address);
+    ipc::Message::new(0, &payload)
+}
+
+/// Shell -> server: the address carried by an `OP_PING` request.
+pub fn ping_address(message: &ipc::Message) -> [u8; 4] {
+    [message.payload[1], message.payload[2], message.payload[3], message.payload[4]]
+}
+
+/// Server -> shell: decodes an `OP_PING_REPLY` into (address, success).
+pub fn ping_reply_fields(message: &ipc::Message) -> Option<([u8; 4], bool)> {
+    if message.payload[0] != OP_PING_REPLY {
+        return None;
+    }
+    let address = [message.payload[2], message.payload[3], message.payload[4], message.payload[5]];
+    Some((address, message.payload[1] == 1))
+}
 
 /// Server -> driver: the mailbox window and its size.
 pub fn attach(dma_paddr: u64, dma_size: u64) -> ipc::Message {
