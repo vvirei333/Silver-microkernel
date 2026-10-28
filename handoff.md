@@ -3,6 +3,48 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## State as of 2026-10-28 (Phase 7 complete: EL0 fault containment + task teardown)
+
+**Phase 7 (EL0 fault handling + teardown) is complete and verified in QEMU.** A
+Ring 3 task — embedded or dynamically loaded — that faults (bad pointer,
+privileged MSR, EL1-only MMIO) is killed cleanly and the system keeps running.
+
+```text
+howl> run bin/crash
+crash: writing to 0x0...
+Task 11 killed: Page Fault at 0x0000000000000000 (ESR: 0x0000000092000045)
+howl> ps        # task 11 is gone; silverd/scout/howl/howler still listed
+```
+
+### What changed
+
+- The sync-exception vector already split EL0/EL1 (`SPSR.M[3:2] == 0b00` →
+  `silver_handle_task_fault`); this phase tightened the two handlers rather than
+  rebuilding the teardown, which was already correct for dynamic tasks.
+- `silver_handle_task_fault` now logs `Task <id> killed: Page Fault at 0x...
+  (ESR: 0x...)` (task ID from `scheduler::current_task_id()`, plus `ELR_EL1` and
+  the switch trace), then calls `scheduler::exit_current()`. Teardown marks the
+  task Dead, closes its IPC/VFS, recovers the console and schedules away;
+  `reap_dead_tasks` then releases the kernel and user stacks, the TTBR0 page
+  tables and `image.release()` (the ELF frames) — the same path embedded and
+  dynamic tasks share, so a crashed `run` program frees exactly its own pages.
+- `silver_handle_exception` (the EL1 path) now **halts** in a `wfe` loop after
+  dumping kind/ESR/ELR/FAR, instead of `exit_current()`. An EL1 exception is a
+  kernel bug that cannot be survived; boot/allocator/IRQ failures reported
+  through kind 4..8 use the same halt. This closes the long-standing "EL1 path
+  is a stub" tech-debt item.
+- `userspace/src/bin/crash.rs` writes to `0x0` via `write_volatile` (so the
+  store survives release optimization) and is seeded at `/bin/crash` like
+  `hello.elf`. `run bin/crash` faults with a data abort from EL0
+  (`ESR 0x92000045`: EC 0x24, DFSC 0x05 translation fault), the kernel kills
+  the task and the shell returns to the prompt.
+
+### Verification
+
+`run bin/crash` → `Task 11 killed: Page Fault at 0x0...` → `howl>` returns; `ps`
+no longer lists task 11 and `run bin/hello` still prints `Hello from ELF!`. The
+embedded boot chain is unchanged.
+
 ## State as of 2026-10-28 (Phase 6 complete: dynamic ELF loader)
 
 **Phase 6 (Dynamic ELF loading) is complete and verified in QEMU.** The kernel
@@ -1043,8 +1085,10 @@ read back only their own values.
   through TTBR1 throughout the switch.
 - The sync exception entry recognizes SVC by EC=0b010101. Other exceptions
   inspect SPSR.M[3:2]: EL0 goes to `silver_handle_task_fault`, which prints
-  `ESR_EL1` / `ELR_EL1` / `FAR_EL1`, dumps the switch trace and kills only that
-  task; EL1 goes to `silver_handle_exception` (kernel panic).
+  `Task <id> killed: Page Fault at 0x... (ESR: 0x...)` plus `ELR_EL1`, dumps
+  the switch trace and kills only that task; EL1 goes to
+  `silver_handle_exception`, which dumps kind/ESR/ELR/FAR and halts (kernel
+  panic).
 - Syscalls include sleep, IPC, nameserver, print, task control, spawn/args,
   dynamic ELF spawn (`SYS_SPAWN_PATH`), wait/kill, stop/resume, `brk`, UART
   read, console ownership and RAM-VFS.
@@ -1345,10 +1389,8 @@ a client's mailbox is full; demos must not issue RPC to an already-full mailbox.
 fault registers and then dumps that ring before killing the task:
 
 ```text
-EL0 SYNC FAULT!
-ESR_EL1=<esr>
+Task <id> killed: Page Fault at 0x<far> (ESR: 0x<esr>)
 ELR_EL1=<elr>
-FAR_EL1=<far>
 SWITCH TRACE from,to,sp,elr:
 <from>-><to> sp=<next sp> elr=<resume pc>
 ```
@@ -1356,9 +1398,9 @@ SWITCH TRACE from,to,sp,elr:
 It costs no output during normal operation; keep it until task lifecycle and
 isolation are more battle-tested. The handler only pokes PL011 registers: it
 never allocates and never takes a lock, because the dying task may still own
-either. Not emitted today, although earlier revisions had them: the task `ID`,
-the `EC` field (`esr >> 26`) and the eight-word SP_EL0 stack walk that stops at
-the first unmapped word.
+either. Not emitted today, although earlier revisions had them: the `EC` field
+(`esr >> 26`) and the eight-word SP_EL0 stack walk that stops at the first
+unmapped word.
 
 QEMU exception tracing is invaluable for resume/fault bugs:
 
@@ -1426,13 +1468,12 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   the console. The input driver's 64 KiB BAR is fixed at `0x1030_0000`,
   extending the fixed-BAR assumption already used by the block (`0x1010_0000`)
   and net (`0x1020_0000`) drivers.
-- The EL1/kernel path is a stub. `silver_handle_exception(kind, esr, elr, far)`
-  ignores all four arguments, so a kernel bug, an unhandled IRQ (`kind = 8`) or
-  a failed boot check (`kind = 6|7` in `kernel_main`) only exits the current
-  task — during boot that is idle — instead of halting with a register dump;
-  just `panic_handler`'s `PANIC AT file:line` survives. Restore the dump and
-  the `wfe` halt loop from git history (`HEAD` still has them). The four unused
-  arguments also produce compiler warnings today.
+- The EL1/kernel exception path now halts (`silver_handle_exception` dumps the
+  registers and spins in a `wfe` loop) instead of resuming the current task;
+  see the Phase 7 section. The remaining gap is that the halt is a bare spin —
+  it does not reset the machine or turn the fault into a debuggable
+  core/register dump for offline triage.
+
 
 ## Next steps (by priority)
 

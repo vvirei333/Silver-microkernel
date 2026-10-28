@@ -65,6 +65,7 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] Graphics driver: `ramfb` framebuffer through `fw_cfg` DMA, a 640x480 ARGB engineer menu with an 8x8 font
 - [x] Input driver: `virtio-tablet-pci` absolute pointer over a virtio event queue, IPC to the graphics driver, live cursor and button press/release
 - [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh Ring 3 task with its own W^X address space
+- [x] EL0 fault containment: a crashed Ring 3 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
 
 ## Phase 4: Network — complete
@@ -145,6 +146,28 @@ u64::MAX - 1`).
 program table, so `run bin/hello` is the only way to execute it — proving the
 loader path end-to-end. The embedded `spawn` path is unchanged and shares the
 same `elf::load_elf` (via the thin `elf_loader` shim).
+
+## Phase 7: EL0 fault containment + teardown — complete
+
+A Ring 3 task that faults is killed cleanly and the kernel keeps running. The
+sync-exception vector routes EL0 faults (bad pointer, privileged MSR, EL1-only
+MMIO) to `silver_handle_task_fault`, which logs `Task <id> killed: Page Fault at
+0x... (ESR: 0x...)` and kills only that task; its kernel stack, user stack,
+TTBR0 page tables and ELF image frames are all released on teardown. An EL1
+exception, in contrast, is a kernel bug: `silver_handle_exception` dumps the
+registers and halts in a `wfe` loop.
+
+`bin/crash` is a test program (seeded alongside `bin/hello`) that writes to
+`0x0` to exercise the path deterministically:
+
+```text
+howl> run bin/crash
+crash: writing to 0x0...
+Task 11 killed: Page Fault at 0x0000000000000000 (ESR: 0x0000000092000045)
+howl> ps      # task 11 is gone; the shell and all drivers are still live
+```
+
+After the fault the shell returns to the prompt and `run bin/hello` still works.
 
 ## Requirements
 
@@ -360,6 +383,7 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `userspace/src/input_proto.rs` | Pointer-sample IPC shared by the input and graphics drivers |
 | `userspace/src/bin/{ls,cat,echo}.rs` | Separate EL0 file/console utilities |
 | `userspace/src/bin/hello.rs` | Test program loaded dynamically via `run bin/hello` |
+| `userspace/src/bin/crash.rs` | Fault-containment test: writes to `0x0`, run via `run bin/crash` |
 | `userspace/` | Separate demo, nameserver, shell and utility EL0 programs |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
@@ -413,9 +437,9 @@ can block.
 Two intentional probes prove isolation: task 15 reads
 `0xFFFF000040000000` (high-half kernel) and task 16 reads
 `0x0000000040080000` (the old kernel text alias). Each must produce one
-`EL0 SYNC FAULT!` block (`ESR_EL1`, `ELR_EL1`, `FAR_EL1` and the switch trace;
-`ESR_EL1 >> 26 = 0x24`, a data abort from EL0); all other tasks continue
-running.
+`Task <id> killed: Page Fault at 0x... (ESR: 0x...)` block (`ESR_EL1` / `ELR_EL1`
+and the switch trace; `ESR_EL1 >> 26 = 0x24`, a data abort from EL0); all other
+tasks continue running.
 
 `spawn(program, argument)` selects a registered ELF and passes a numeric argument
 to its entry point. `spawn_with_args` additionally copies a bounded byte string
