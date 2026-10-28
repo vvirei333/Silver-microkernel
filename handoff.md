@@ -3,6 +3,93 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## State as of 2026-10-28 (Phase 6 complete: dynamic ELF loader)
+
+**Phase 6 (Dynamic ELF loading) is complete and verified in QEMU.** The kernel
+now loads an ELF64 file from the RAM-VFS into a fresh Ring 3 task, without the
+binary being embedded at build time. The shell command `run <path>` reads the
+file by path, the kernel parses and loads it, and the new task runs in EL0 with
+its own address space, stack and W^X page permissions.
+
+```text
+howl> run bin/hello
+Spawning ELF at 0x0000000040000000 with stack at 0x000000007FE00000
+Hello from ELF!
+```
+
+### What changed
+
+- `src/elf.rs` is the loader proper. `Elf64Ehdr`/`Elf64Phdr` parse the header and
+  program table; `load_elf(bytes) -> Result<LoadedImage, ElfError>` allocates
+  contiguous frames per `PT_LOAD` segment, copies file bytes, zero-fills BSS and
+  returns an owned `LoadedImage { physical_start, page_count, entry, kinds }`.
+  `PageKind` classifies every page as Text (R-X), ReadOnly (R--) or Data (RW),
+  and `load_elf` enforces W^X by rejecting writable-executable and unreadable
+  segments, overlapping permissions on one page, holes in the image and an entry
+  point outside a text segment. `error_name` maps each `ElfError` to a short log
+  label. `USER_IMAGE_VA = 0x4000_0000` and the 2 MB image window live here.
+- `elf_loader.rs` is now a thin shim: `load(bytes)` delegates to `elf::load_elf`
+  and logs the reason on rejection. There are no more parallel `UserImage` /
+  `PageKind` types — `elf::LoadedImage` is the single image type everywhere.
+- `mmu::create_task_space` and `scheduler::Task.user_image` take
+  `elf::LoadedImage`; `Task::new` no longer loads ELF itself. The embedded path
+  resolves the image in `spawn_inner` (before any frame is allocated, so a
+  rejection needs no cleanup), and the dynamic path passes a pre-loaded image to
+  `spawn_elf`.
+- `spawn_elf(image, argument) -> Option<CapId>` mirrors `spawn_user_with_cap`:
+  it allocates a kernel stack, the user stack and a private page, builds TTBR0,
+  sets the entry from `image.entry`, pushes the task READY and returns a
+  capability handle so the parent can lend the console, wait and kill. The new
+  task receives **no** kernel-granted capabilities — device rights must be
+  delegated by its parent. `spawn_elf_task` emits
+  `Spawning ELF at 0x... with stack at 0x...` over the kernel UART.
+- New syscall `SYS_SPAWN_PATH = 70` (`sys_spawn_path`): the kernel reads the file
+  by path from the VFS (`vfs::read_file`), runs `elf::load_elf` and calls
+  `spawn_elf`. The kernel reads the file itself because the ELF (tens of KiB) far
+  exceeds the 4 KiB single-copy limit; the path is a small checked copyin.
+  `EXEC_FILE_LIMIT` (4 MiB) bounds the blob before loading.
+- `run <path>` in Howl (`run_elf`) calls `spawn_path`, lends the child the console
+  via `console_set`, waits on `wait_event`, and reports exit/stop status exactly
+  like `run_utility`; Ctrl-Z (Howler `stop_console`) returns control to the shell.
+- `src/seed.rs` seeds `/bin/hello` into the VFS at boot (initramfs-style) from
+  `include_bytes!(OUT_DIR/hello.elf)`. `build.rs` builds `hello.elf` alongside the
+  other binaries but keeps it **out** of `user_program::image`, so the only way to
+  run it is the dynamic loader. `seed::seed()` runs right after `vfs::init()`.
+- `PROGRAM_DYNAMIC = u64::MAX - 1` is the sentinel program ID for dynamically
+  loaded tasks (`ps` shows them as `elf`), distinct from `u64::MAX` (kernel tasks).
+
+### Design decisions to preserve
+
+- The image type is `elf::LoadedImage`, not a tuple: the scheduler needs
+  `physical_start` and `page_count` to install TTBR0_EL1 and later free the
+  frames.
+- The user stack is reused as-is: `0x7FE0_0000`, 2 pages (8 KB). The image window
+  stays `0x40000000..0x40200000` (2 MB). The dynamic loader introduces no second
+  stack or image layout.
+- Dynamic tasks get an empty capability table by default (secure), unlike
+  embedded programs which receive self capabilities at spawn.
+
+### Verification
+
+`run bin/hello` from the `howl>` prompt prints `Spawning ELF at 0x0000000040000000
+with stack at 0x000000007FE00000` and then `Hello from ELF!`. The embedded boot
+chain is unchanged: all drivers and the shell start normally, and `ps` lists the
+dynamic task as `elf`. Build is clean except the pre-existing `capability.rs`
+warning.
+
+### Limitations recorded for the next phase
+
+- `run` reads the whole file into kernel memory before parsing it (bounded by
+  `EXEC_FILE_LIMIT`), rather than streaming segments. Only static `ET_EXEC`
+  images are supported; there is no PIE, dynamic linking, relocation or shared
+  libraries.
+- The dynamic task's argument is always `0`; there is no argv beyond the fixed
+  numeric argument. `/bin/hello` is the only seeded file, and it is built by
+  `build.rs` (not read from the on-disk SFS, whose server still exposes only the
+  superblock).
+- The user stack is fixed at 2 pages and the image at 2 MB, matching the embedded
+  path; neither is configurable per program.
+
 ## State as of 2026-10-28 (Phase 5 complete: ramfb graphics + virtio-tablet input, live engineer menu)
 
 **Phase 5 (Graphics + Input) is complete and verified in QEMU.** `gpu_driver`
@@ -816,7 +903,10 @@ For bare-metal profiles, `build.rs` invokes Cargo in `userspace/`, uses
 copies every userspace ELF into `OUT_DIR`. `src/user_program.rs` assigns IDs
 0 (demo), 1 (silverd), 2 (Scout), 3 (Howl), 4 (Howler), 5 (ls), 6 (cat),
 7 (echo), 8 (say), 9 (sl), 10 (block_driver), 11 (sfs_server),
-12 (net_driver) and 13 (net_server). Host builds skip userspace. Normal boot starts
+12 (net_driver), 13 (net_server), 14 (gpu_driver) and 15 (input_driver).
+`PROGRAM_DYNAMIC = u64::MAX - 1` marks dynamically loaded (`run`) tasks and is
+not part of the table; `hello.elf` is built but only seeded into the VFS. Host
+builds skip userspace. Normal boot starts
 only silverd; `demo-tasks` starts Scout and the regression task set instead.
 
 Interactive QEMU: `qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M
@@ -919,12 +1009,16 @@ separate R-X text, R-- rodata and RW data `PT_LOAD` segments. `.bss` is
 `NOLOAD` and belongs to the RW segment, so its memory size can exceed its
 file size.
 
-`elf_loader::load()` currently accepts ELF64 little-endian AArch64 `ET_EXEC`
-files only. It checks program-header and file bounds, requires every loadable
+`elf::load_elf()` accepts ELF64 little-endian AArch64 `ET_EXEC` files only. It
+checks the ELF header, program-header and file bounds, requires every loadable
 segment to fit within the 2 MB image window, rejects W+X segments and rejects
 different permissions sharing one 4 KB page. The entry must lie in an
 executable segment. It allocates fresh contiguous frames, zeroes the whole
-image, copies `PT_LOAD` file bytes and records a `PageKind` for every page.
+image, copies `PT_LOAD` file bytes and records a `PageKind` for every page,
+returning an owned `LoadedImage { physical_start, page_count, entry, kinds }`.
+`elf_loader::load()` is a thin wrapper over it that logs the rejection reason;
+both the embedded `spawn` path and the dynamic `run <path>` path share this one
+loader.
 
 The resulting mappings enforce W^X: text is R-X at EL0 and PXN; rodata is R--
 and UXN/PXN; data, heap, stack and private memory are RW at EL0 and UXN/PXN.
@@ -952,7 +1046,8 @@ read back only their own values.
   `ESR_EL1` / `ELR_EL1` / `FAR_EL1`, dumps the switch trace and kills only that
   task; EL1 goes to `silver_handle_exception` (kernel panic).
 - Syscalls include sleep, IPC, nameserver, print, task control, spawn/args,
-  wait/kill, stop/resume, `brk`, UART read, console ownership and RAM-VFS.
+  dynamic ELF spawn (`SYS_SPAWN_PATH`), wait/kill, stop/resume, `brk`, UART
+  read, console ownership and RAM-VFS.
 - `SYS_CONSOLE_SET(cap_id)` requires `CAP_CONSOLE_GRANT`, then rejects idle,
   missing and dead target IDs. On success it makes the selected task the sole
   interactive UART owner under one IRQ-critical
@@ -1076,7 +1171,7 @@ read back only their own values.
   whose typed chunks return through IPC to Howler for the actual PL011 writes.
 - Startup emits ANSI clear/home, runs fastfetch once and shows a bold cyan
   `howl>` prompt. Commands are `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`,
-  `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`,
+  `sl`, `run`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`,
   `spawn`, `bg`, `fg`, `kill` and `wait`; empty lines only reprompt. Echo parsing
   preserves quoted spaces, strips outer quotes and recognizes `>`/`>>` only
   outside quotes. `mv old new` takes a full destination path, not just a directory.
@@ -1277,11 +1372,15 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 - The loader supports only static `ET_EXEC`, a contiguous 2 MB image window
   and page-uniform permissions; there is no PIE, dynamic linking, demand
-  loading or sparse multi-window image layout.
-- Programs are selected from ELFs embedded at kernel build time; there is no
-  external program storage or program credential model. Task control and rights
-  delegation use per-task capabilities, but any task can still request an
-  embedded shell ELF.
+  loading or sparse multi-window image layout. `run <path>` loads a whole file
+  into kernel memory before parsing it (bounded by `EXEC_FILE_LIMIT`), and the
+  dynamic task's argument is always `0`.
+- Programs come either from ELFs embedded at kernel build time or from the
+  RAM-VFS via `run <path>`; there is no persistent on-disk program storage (the
+  on-disk SFS server still exposes only the superblock) and no program
+  credential model. Task control and rights delegation use per-task
+  capabilities, but any task can still request an embedded shell ELF or load
+  any VFS file it can name.
 - Mutex and condvar wait queues still have no growth limits. Mailboxes are
   bounded at 16 messages, but nameserver/control replies also obey backpressure;
   a full client mailbox can therefore block the nameserver. Selective receive
@@ -1358,7 +1457,11 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 6. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.
-7. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
+7. **Dynamic loader follow-ups:** pass argv/`char*` to `run`'d programs, stream
+   segments instead of slurping the whole file, load from the on-disk SFS once
+   it can read files, and add PIE/dynamic linking later. A program-credential
+   model should gate both `spawn` and `run` (see step 2).
+8. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
    `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
 
 Nameserver watch notifications are explicitly deferred. Later IPC control-plane

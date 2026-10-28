@@ -35,7 +35,7 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
 - [x] Sixteen userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
 - [x] Init architecture: `silverd` starts Scout, the block, network, graphics and input drivers, the SFS and network servers, Howl and Howler, all resolved by program ID
-- [x] howl: `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`, `sl`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`
+- [x] howl: `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`, `sl`, `run`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`
 - [x] Shell output redirection: `>` truncates, `>>` appends, quoted operators stay literal
 - [x] ANSI clear/home and a bold cyan `howl>` prompt
 - [x] RAM-VFS: `/bin`, `/etc`, `/tmp`, files/directories and per-task descriptors
@@ -64,6 +64,7 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
 - [x] Graphics driver: `ramfb` framebuffer through `fw_cfg` DMA, a 640x480 ARGB engineer menu with an 8x8 font
 - [x] Input driver: `virtio-tablet-pci` absolute pointer over a virtio event queue, IPC to the graphics driver, live cursor and button press/release
+- [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh Ring 3 task with its own W^X address space
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
 
 ## Phase 4: Network — complete
@@ -113,6 +114,37 @@ The script now passes `-device ramfb -device virtio-tablet-pci,disable-legacy=on
 and `-display gtk,show-cursor=on` (the shell stays multiplexed on stdio via
 `-serial mon:stdio`). To run headless, substitute `-display vnc=...` and drive
 the mouse with QMP `input-send-event`.
+
+## Phase 6: Dynamic ELF loader — complete
+
+The kernel can now load an ELF64 binary from the RAM-VFS into a fresh Ring 3
+task — the binary no longer has to be embedded at build time. `src/elf.rs`
+parses the header and program table (`load_elf -> LoadedImage { physical_start,
+page_count, entry, kinds }`), allocates a frame per `PT_LOAD` page, copies file
+bytes, zero-fills BSS and enforces W^X with per-page `PageKind` permissions
+(Text R-X, ReadOnly R--, Data RW).
+
+```text
+howl> run bin/hello
+Spawning ELF at 0x0000000040000000 with stack at 0x000000007FE00000
+Hello from ELF!
+```
+
+The path is: `run <path>` in the shell → `SYS_SPAWN_PATH` (the kernel reads the
+file by path, since the ELF is far larger than the 4 KiB copyin limit) →
+`elf::load_elf` → `spawn_elf`, which builds TTBR0, maps the image and the user
+stack (`0x7FE0_0000`, 2 pages), sets the entry point and returns a capability
+handle so the shell can lend the console and wait. The new task starts with an
+empty capability table — any device rights must be delegated by its parent. A
+dynamically loaded task shows up in `ps` as `elf` (`PROGRAM_DYNAMIC =
+u64::MAX - 1`).
+
+`/bin/hello` is seeded into the VFS at boot from the build artefact
+(`src/seed.rs`, `include_bytes!(OUT_DIR/hello.elf)`). `hello.elf` is built by
+`build.rs` like every other binary but deliberately omitted from the embedded
+program table, so `run bin/hello` is the only way to execute it — proving the
+loader path end-to-end. The embedded `spawn` path is unchanged and shares the
+same `elf::load_elf` (via the thin `elf_loader` shim).
 
 ## Requirements
 
@@ -292,7 +324,7 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 
 | File | Purpose |
 | --- | --- |
-| `build.rs` | Builds and embeds all sixteen userspace ELFs for bare-metal profiles |
+| `build.rs` | Builds and embeds the userspace ELFs; also copies `hello.elf` for the VFS seed |
 | `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
 | `src/exceptions.rs` | EL0 fault register dump, switch trace and the kernel exit path |
 | `src/pl011.rs` | Kernel UART diagnostics and bounded RX fallback |
@@ -313,9 +345,11 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `src/semaphore.rs` | Counting semaphore on mutex + condvar |
 | `src/channel.rs` | Bounded channel: two semaphores + a mutex (backpressure) |
 | `src/mmu.rs` | TTBR1 kernel map, per-task TTBR0 maps, permission validation |
-| `src/elf_loader.rs` | Static ELF64/AArch64 `PT_LOAD` loader and image ownership |
+| `src/elf_loader.rs` | Thin shim over `elf::load_elf` for embedded images |
+| `src/elf.rs` | Dynamic ELF64/AArch64 `PT_LOAD` loader, `LoadedImage`, `PageKind`, `ElfError` |
 | `src/user_program.rs` | Program IDs and embedded userspace ELF selection |
 | `src/vfs.rs` | RAM file tree, normalized paths and per-task file descriptors |
+| `src/seed.rs` | Boot-time VFS seeding of `/bin/hello` for the dynamic loader |
 | `userspace/src/allocator.rs` | Per-task first-fit `malloc/free` over `SYS_BRK` |
 | `userspace/src/bin/silvershell.rs` | Interactive shell and `logo.txt` fastfetch screen |
 | `userspace/src/bin/net_driver.rs` | VirtIO-Net driver, split virtqueues and frame mailbox |
@@ -325,6 +359,7 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `userspace/src/bin/input_driver.rs` | virtio-tablet absolute-pointer driver |
 | `userspace/src/input_proto.rs` | Pointer-sample IPC shared by the input and graphics drivers |
 | `userspace/src/bin/{ls,cat,echo}.rs` | Separate EL0 file/console utilities |
+| `userspace/src/bin/hello.rs` | Test program loaded dynamically via `run bin/hello` |
 | `userspace/` | Separate demo, nameserver, shell and utility EL0 programs |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
