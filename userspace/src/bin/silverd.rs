@@ -35,7 +35,29 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("SILVERD: BLOCK DRIVER CAP GRANT FAILED\r\n");
     }
 
-    // 3. Filesystem server
+    // 3. Network driver
+    let net_cap = syscall::spawn(syscall::PROGRAM_NET_DRIVER, syscall::task_id())
+        .unwrap_or_else(|| fail("SILVERD: NET DRIVER SPAWN FAILED\r\n"));
+    // `spawn` returns a capability id, not the task id, so resolve it before
+    // granting: `cap_grant` addresses the recipient by task id.
+    let net_id = syscall::cap_get_task_id(net_cap)
+        .unwrap_or_else(|| fail("SILVERD: NET DRIVER CAP LOOKUP FAILED\r\n"));
+    if !syscall::cap_grant(net_cap, net_id, syscall::CAP_PCI | syscall::CAP_MMIO) {
+        fail("SILVERD: NET DRIVER CAP GRANT FAILED\r\n");
+    }
+    // The net driver has no IPC yet, so it cannot report its MAC back. Lend it
+    // the console for one second while it probes PCI and prints; it delays its
+    // first line so this handoff wins even if the scheduler preempts us.
+    if syscall::console_set(net_cap) {
+        syscall::sleep(1000);
+        if !syscall::console_set(syscall::task_id()) {
+            fail("SILVERD: CONSOLE RECLAIM FAILED\r\n");
+        }
+    } else {
+        syscall::print("SILVERD: NET DRIVER CONSOLE LEND FAILED\r\n");
+    }
+
+    // 4. Filesystem server
     let sfs_id = syscall::spawn(syscall::PROGRAM_SFS_SERVER, syscall::task_id())
         .unwrap_or_else(|| fail("SILVERD: SFS SERVER SPAWN FAILED\r\n"));
     if !syscall::cap_grant(sfs_id, sfs_id, syscall::CAP_MMIO) {
@@ -45,7 +67,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         syscall::print("SILVERD: SFS SERVER NOT READY, CONTINUING\r\n");
     }
 
-    // 4. Howl (shell)
+    // 5. Howl (shell)
     let howl_id = syscall::spawn(syscall::PROGRAM_HOWL, syscall::task_id())
         .unwrap_or_else(|| fail("SILVERD: HOWL SPAWN FAILED\r\n"));
     if !syscall::cap_grant(howl_id, howl_id, syscall::CAP_MMIO) {
@@ -55,7 +77,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("SILVERD: CONSOLE HANDOFF FAILED\r\n");
     }
 
-    // 5. Howler (UART)
+    // 6. Howler (UART)
     let howler_id = syscall::spawn(syscall::PROGRAM_HOWLER, howl_id)
         .unwrap_or_else(|| fail("SILVERD: HOWLER SPAWN FAILED\r\n"));
     if !syscall::cap_grant(howler_id, howler_id, syscall::CAP_MMIO | syscall::CAP_IRQ) {

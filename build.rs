@@ -41,6 +41,7 @@ fn main() {
         ("uart_driver", "uart_driver.elf"),
         ("block_driver", "block_driver.elf"),
         ("sfs_server", "sfs_server.elf"), // <--- ДОБАВЛЕНО
+        ("net_driver", "net_driver.elf"),
     ] {
         let elf = target_dir
             .join("aarch64-unknown-none")
