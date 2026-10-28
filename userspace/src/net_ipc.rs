@@ -38,6 +38,10 @@ pub const OP_ATTACH: u8 = 1;
 pub const OP_ATTACHED: u8 = 2;
 pub const OP_FRAME: u8 = 3;
 pub const OP_TX: u8 = 4;
+/// Shell -> server: `payload[1..5]` is the IPv4 address to ping.
+pub const OP_PING: u8 = 5;
+/// Server -> shell: the reply is tagged with this byte at `payload[6]`.
+pub const OP_PING_REPLY: u8 = 6;
 
 /// Server -> driver: the mailbox window and its size.
 pub fn attach(dma_paddr: u64, dma_size: u64) -> ipc::Message {
