@@ -4,7 +4,8 @@ use alloc::{string::String, vec::Vec};
 
 use crate::{
     capability,
-    elf_loader::{self, UserImage},
+    elf::LoadedImage,
+    elf_loader,
     frame_allocator, interrupts,
     memory::{phys_to_virt, virt_to_phys, MemoryRegion, PAGE_SIZE},
     mmu, mutex, pl011, timer, user_program, vfs,
@@ -72,7 +73,7 @@ pub struct Task {
     pub stack: MemoryRegion,
     pub user_stack: MemoryRegion,
     pub ttbr0: usize,
-    user_image: Option<UserImage>,
+    user_image: Option<LoadedImage>,
     heap_pages: Vec<usize>,
     dma_pages: Vec<(usize, usize)>,
     program_break: usize,
@@ -925,6 +926,46 @@ pub fn spawn_user_with_cap(program: u64, argument: u64) -> Option<capability::Ca
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
 }
 
+/// Spawns a task from an already-loaded dynamic ELF image (the VFS/`run`
+/// path). The image is consumed; on success the caller receives a capability
+/// handle to the new task so it can lend it the console, wait on it and kill
+/// it, exactly like [`spawn_user_with_cap`]. Unlike embedded programs, a
+/// dynamically loaded task receives no kernel-granted capabilities by default
+/// — any device rights must be delegated by its parent.
+pub fn spawn_elf(image: LoadedImage, argument: u64) -> Option<capability::CapId> {
+    let task_id = spawn_elf_task(image, argument)?;
+    let parent = current_task_mut()?;
+    Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
+}
+
+fn spawn_elf_task(image: LoadedImage, argument: u64) -> Option<u64> {
+    let manager = scheduler_manager()?;
+    let id = manager.next_id;
+    let cwd = manager
+        .tasks
+        .get(manager.current_index)
+        .map(|task| task.cwd.clone())
+        .unwrap_or_else(|| String::from("/"));
+    let entry = image.entry;
+    let stack_va = mmu::USER_STACK_VA;
+    let mut task = Task::new(
+        id,
+        None,
+        Some((user_program::PROGRAM_DYNAMIC, argument)),
+        Some(image),
+        Vec::new(),
+    )?;
+    task.cwd = cwd;
+    manager.tasks.push(task);
+    manager.next_id += 1;
+    pl011::write_str("Spawning ELF at 0x");
+    pl011::write_hex_u64(entry as u64);
+    pl011::write_str(" with stack at 0x");
+    pl011::write_hex_u64(stack_va as u64);
+    pl011::write_str("\r\n");
+    Some(id)
+}
+
 pub fn capability_task_id(cap_id: capability::CapId) -> Option<u64> {
     capability_task_id_with_rights(cap_id, 0)
 }
@@ -1105,12 +1146,24 @@ fn spawn_inner(
     pl011::write_str(" program=");
     pl011::write_dec_u64(user.map_or(u64::MAX, |(program, _)| program));
     pl011::write_str("\r\n");
+
+    // Resolve the embedded image before `Task::new`: a lookup or load failure
+    // then needs no cleanup, because no frame has been allocated yet. The
+    // dynamic path passes a pre-loaded image straight to `spawn_elf`.
+    let image = match user {
+        Some((program, _)) => {
+            let bytes = user_program::image(program)?;
+            Some(elf_loader::load(bytes)?)
+        }
+        None => None,
+    };
+
     let cwd = manager
         .tasks
         .get(manager.current_index)
         .map(|task| task.cwd.clone())
         .unwrap_or_else(|| String::from("/"));
-    let mut task = Task::new(id, entry, user, arguments)?;
+    let mut task = Task::new(id, entry, user, image, arguments)?;
     task.cwd = cwd;
 
     manager.tasks.push(task);
@@ -1245,6 +1298,7 @@ impl Task {
         id: u64,
         entry: Option<extern "C" fn() -> !>,
         user: Option<(u64, u64)>,
+        image: Option<LoadedImage>,
         arguments: Vec<u8>,
     ) -> Option<Self> {
         let program_label = user.map_or(u64::MAX, |(program, _)| program);
@@ -1285,46 +1339,7 @@ impl Task {
             return None;
         };
 
-        let user_image = if let Some((program, _)) = user {
-            pl011::write_str("SPAWN: load elf program=");
-            pl011::write_dec_u64(program);
-            pl011::write_str("...\r\n");
-            // Split the two lookups so a stall is attributable: the embedded
-            // blob lookup is pure table work, the loader allocates and copies.
-            let image_bytes = user_program::image(program);
-            match image_bytes {
-                Some(bytes) => {
-                    pl011::write_str("SPAWN: embedded image bytes=");
-                    pl011::write_dec_u64(bytes.len() as u64);
-                    pl011::write_str("\r\n");
-                }
-                None => {
-                    pl011::write_str("SPAWN: FAIL - no embedded image for program=");
-                    pl011::write_dec_u64(program);
-                    pl011::write_str("\r\n");
-                }
-            }
-            let loaded = image_bytes.and_then(elf_loader::load);
-            let Some(image) = loaded else {
-                pl011::write_str("SPAWN: FAIL - elf_loader::load rejected program=");
-                pl011::write_dec_u64(program);
-                pl011::write_str("\r\n");
-                frame_allocator::free_page(private_page);
-                if !user_stack.is_empty() {
-                    release_pages(user_stack.start, TASK_USER_STACK_PAGES);
-                }
-                release_pages(stack_start, TASK_STACK_PAGES);
-                return None;
-            };
-            pl011::write_str("SPAWN: elf loaded entry=");
-            pl011::write_hex_u64(image.entry as u64);
-            pl011::write_str(" pages=");
-            pl011::write_dec_u64(image.page_count as u64);
-            pl011::write_str("\r\n");
-            Some(image)
-        } else {
-            None
-        };
+        let user_image = image;
 
         pl011::write_str("SPAWN: build task space (9 tables)...\r\n");
         let Some(ttbr0) =

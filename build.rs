@@ -45,6 +45,9 @@ fn main() {
         ("net_server", "net_server.elf"),
         ("gpu_driver", "gpu_driver.elf"),
         ("input_driver", "input_driver.elf"),
+        // Seeded into the VFS (see src/seed.rs) so `run bin/hello` exercises the
+        // dynamic ELF loader; deliberately NOT in user_program::image.
+        ("hello", "hello.elf"),
     ] {
         let elf = target_dir
             .join("aarch64-unknown-none")

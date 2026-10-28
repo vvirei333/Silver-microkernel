@@ -17,6 +17,10 @@ pub const NET_SERVER: u64 = 13;
 pub const GPU_DRIVER: u64 = 14;
 pub const INPUT_DRIVER: u64 = 15;
 
+/// Sentinel program ID for tasks spawned from a dynamically loaded ELF (the
+/// `run <path>` path). Distinct from `u64::MAX`, which marks kernel tasks.
+pub const PROGRAM_DYNAMIC: u64 = u64::MAX - 1;
+
 static DEMO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silver_userspace.elf"));
 static SILVERD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silverd.elf"));
 static SCOUT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scout.elf"));

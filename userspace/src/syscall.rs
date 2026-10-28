@@ -53,6 +53,7 @@ const SYS_STOP_CONSOLE: u64 = 66;
 const SYS_ALLOC_DMA: u64 = 67;
 const SYS_PCI_READ: u64 = 68;
 const SYS_PCI_WRITE: u64 = 69;
+const SYS_SPAWN_PATH: u64 = 70;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -72,6 +73,8 @@ pub const PROGRAM_NET_DRIVER: u64 = 12;
 pub const PROGRAM_NET_SERVER: u64 = 13;
 pub const PROGRAM_GPU_DRIVER: u64 = 14;
 pub const PROGRAM_INPUT_DRIVER: u64 = 15;
+/// Sentinel program ID for tasks spawned from a dynamically loaded ELF.
+pub const PROGRAM_DYNAMIC: u64 = u64::MAX - 1;
 pub const CAP_MMIO: u32 = 1 << 4;
 pub const CAP_IRQ: u32 = 1 << 5;
 pub const CAP_PCI: u32 = 1 << 6;
@@ -309,6 +312,14 @@ pub fn spawn_with_args(program: u64, argument: u64, arguments: &str) -> Option<u
             arguments.len() as u64,
         )
     };
+    optional_id(cap_id)
+}
+
+/// Loads the ELF file at `path` from the filesystem and spawns it, returning a
+/// capability handle to the new task. The kernel reads the file, so the shell
+/// passes only the path.
+pub fn spawn_path(path: &str) -> Option<u64> {
+    let cap_id = with_path(path, |ptr| unsafe { syscall1(SYS_SPAWN_PATH, ptr) });
     optional_id(cap_id)
 }
 

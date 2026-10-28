@@ -358,6 +358,30 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedImage, ElfError> {
     })
 }
 
+/// Short diagnostic name for an [`ElfError`], for kernel log lines.
+pub fn error_name(error: ElfError) -> &'static str {
+    match error {
+        ElfError::BadMagic => "bad magic",
+        ElfError::BadClass => "bad class",
+        ElfError::BadDataEncoding => "bad data encoding",
+        ElfError::NotExecutable => "not ET_EXEC",
+        ElfError::WrongMachine => "wrong machine",
+        ElfError::Truncated => "truncated",
+        ElfError::NoProgramHeaders => "no program headers",
+        ElfError::BadProgramHeader => "bad program header",
+        ElfError::WritableExecutable => "writable+executable segment",
+        ElfError::NoReadPermission => "unreadable segment",
+        ElfError::FileLargerThanMemory => "filesz > memsz",
+        ElfError::SegmentOutOfRange => "segment out of range",
+        ElfError::NoLoadSegments => "no load segments",
+        ElfError::EntryOutsideText => "entry outside text",
+        ElfError::ImageTooLarge => "image too large",
+        ElfError::OverlappingKinds => "overlapping segments",
+        ElfError::HoleInImage => "hole in image",
+        ElfError::OutOfMemory => "out of memory",
+    }
+}
+
 fn read_array<const N: usize>(bytes: &[u8], offset: usize) -> Result<[u8; N], ElfError> {
     let end = offset.checked_add(N).ok_or(ElfError::Truncated)?;
     let slice = bytes.get(offset..end).ok_or(ElfError::Truncated)?;

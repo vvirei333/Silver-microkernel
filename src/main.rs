@@ -37,6 +37,8 @@ mod pl011;
 #[cfg(not(feature = "std"))]
 mod scheduler;
 #[cfg(not(feature = "std"))]
+mod seed;
+#[cfg(not(feature = "std"))]
 mod semaphore;
 #[cfg(not(feature = "std"))]
 mod syscall;
@@ -446,6 +448,7 @@ pub extern "C" fn kernel_main() -> ! {
     gic::init();
     timer::init();
     vfs::init();
+    seed::seed();
     scheduler::init();
 
     pl011::write_str("IRQ READY\r\n");

@@ -359,6 +359,42 @@ impl Vfs {
             })
             .collect())
     }
+
+    /// Returns the entire contents of a file, resolved by path. Used by the
+    /// dynamic ELF loader, which needs the whole image in one buffer.
+    fn read_file(&self, cwd: &str, path: &str) -> Result<Vec<u8>, ()> {
+        let resolved = resolve_path(cwd, path)?;
+        match &find_node(&self.root, &resolved).ok_or(())?.kind {
+            NodeKind::File(data) => Ok(data.clone()),
+            NodeKind::Directory(_) => Err(()),
+        }
+    }
+
+    /// Creates (or overwrites) a file at `path` with `contents`. Bootstrap-only:
+    /// the dynamic loader needs an executable in the tree before any program
+    /// can write files into it.
+    fn seed_file(&mut self, cwd: &str, path: &str, contents: &[u8]) -> Result<(), ()> {
+        let resolved = resolve_path(cwd, path)?;
+        let components = components(&resolved).ok_or(())?;
+        let (&name, parent) = components.split_last().ok_or(())?;
+        let children = directory_mut(&mut self.root, parent)?;
+        if let Some(existing) = children.iter_mut().find(|node| node.name == name) {
+            return match &mut existing.kind {
+                NodeKind::File(data) => {
+                    data.clear();
+                    data.extend_from_slice(contents);
+                    Ok(())
+                }
+                NodeKind::Directory(_) => Err(()),
+            };
+        }
+        let mut node = Node::file(name);
+        if let NodeKind::File(data) = &mut node.kind {
+            data.extend_from_slice(contents);
+        }
+        children.push(node);
+        Ok(())
+    }
 }
 
 pub fn init() {
@@ -421,6 +457,16 @@ pub fn write(owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
 
 pub fn read_dir(cwd: &str, path: &str) -> Result<Vec<DirEntry>, ()> {
     with_vfs(|vfs| vfs.read_dir(cwd, path))
+}
+
+/// Reads a whole file by path (dynamic ELF loader).
+pub fn read_file(cwd: &str, path: &str) -> Result<Vec<u8>, ()> {
+    with_vfs(|vfs| vfs.read_file(cwd, path))
+}
+
+/// Seeds a bootstrap file into the tree (initramfs-style, boot-time only).
+pub fn seed_file(cwd: &str, path: &str, contents: &[u8]) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.seed_file(cwd, path, contents))
 }
 
 pub fn resolve_directory(cwd: &str, path: &str) -> Result<String, ()> {

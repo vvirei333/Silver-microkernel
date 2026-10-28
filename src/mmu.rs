@@ -273,7 +273,7 @@ fn invalidate_user_page(virtual_address: usize) {
 pub fn create_task_space(
     private_page: usize,
     user_stack_start: usize,
-    image: Option<&crate::elf_loader::UserImage>,
+    image: Option<&crate::elf::LoadedImage>,
 ) -> Option<usize> {
     let mut pages = [0_usize; 9];
     for (index, slot) in pages.iter_mut().enumerate() {
@@ -302,9 +302,9 @@ pub fn create_task_space(
             for index in 0..image.page_count {
                 let physical = image.physical_start + index * GRANULE;
                 let descriptor = match image.kinds[index] {
-                    crate::elf_loader::PageKind::Text => user_text_page(physical),
-                    crate::elf_loader::PageKind::ReadOnly => user_rodata_page(physical),
-                    crate::elf_loader::PageKind::Data => user_data_page(physical),
+                    crate::elf::PageKind::Text => user_text_page(physical),
+                    crate::elf::PageKind::ReadOnly => user_rodata_page(physical),
+                    crate::elf::PageKind::Data => user_data_page(physical),
                 };
                 write_entry(l3_image, index, descriptor);
             }

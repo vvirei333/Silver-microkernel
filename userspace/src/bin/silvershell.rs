@@ -171,6 +171,7 @@ fn execute(command: &str) {
             syscall::print("  ping <ip>  Send one ICMP echo request\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
+            syscall::print("  run <path>  Load and run an ELF file from the filesystem\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
             syscall::print("             Print, truncate/write, or append to a file\r\n");
             syscall::print("  say <text> Print text\r\n");
@@ -225,6 +226,7 @@ fn execute(command: &str) {
         Some("ping") => ping_command(words.next()),
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
+        Some("run") => run_elf(words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
         Some("mkdir") => make_directory(words.next()),
         Some("rm") => remove_file(words.next()),
@@ -709,6 +711,44 @@ fn run_utility(program: u64, arguments: &str) {
     }
 }
 
+/// Loads an ELF from the filesystem (`run <path>`) and runs it in the
+/// foreground: the kernel reads the file, loads it and spawns it, then the
+/// shell lends it the console and waits — mirroring `run_utility`, but with the
+/// executable resolved from the VFS instead of the embedded program table.
+fn run_elf(path: &str) {
+    if path.is_empty() {
+        syscall::print("Usage: run <path>\r\n");
+        return;
+    }
+    let Some(cap_id) = syscall::spawn_path(path) else {
+        syscall::print("run: cannot load '");
+        syscall::print(path);
+        syscall::print("'\r\n");
+        return;
+    };
+    if !syscall::console_set(cap_id) {
+        syscall::print("run: could not assign the foreground console.\r\n");
+        let _ = syscall::kill(cap_id);
+        let _ = syscall::wait(cap_id);
+        return;
+    }
+    let event = syscall::wait_event(cap_id);
+    match event {
+        Some(syscall::WaitEvent::Exited(0)) => {}
+        Some(syscall::WaitEvent::Exited(status)) => {
+            syscall::print("Program exited with status ");
+            syscall::print_dec_u64(status);
+            syscall::print("\r\n");
+        }
+        Some(syscall::WaitEvent::Stopped) => {
+            syscall::print("Program CapId=");
+            syscall::print_dec_u64(cap_id);
+            syscall::print(" stopped\r\n");
+        }
+        None => syscall::print("run: could not wait for program.\r\n"),
+    }
+}
+
 fn execute_echo(arguments: &str) {
     let Ok((text, destination)) = split_redirection(arguments) else {
         syscall::print("echo: invalid quotes or redirection\r\n");
@@ -973,6 +1013,7 @@ fn program_name(program: u64) -> &'static str {
         syscall::PROGRAM_SFS_SERVER => "sfs_server  ",
         syscall::PROGRAM_NET_DRIVER => "net_driver  ",
         syscall::PROGRAM_NET_SERVER => "net_server  ",
+        syscall::PROGRAM_DYNAMIC => "elf         ",
         _ => "kernel      ",
     }
 }

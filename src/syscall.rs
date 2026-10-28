@@ -12,7 +12,7 @@
 use alloc::{vec, vec::Vec};
 
 use crate::{
-    capability, channel, frame_allocator, ipc, memory, mmu, mutex, pl011, scheduler, timer,
+    capability, channel, elf, frame_allocator, ipc, memory, mmu, mutex, pl011, scheduler, timer,
     user_memory, vfs,
 };
 
@@ -67,10 +67,14 @@ pub const SYS_STOP_CONSOLE: u64 = 66;
 pub const SYS_ALLOC_DMA: u64 = 67;
 pub const SYS_PCI_READ: u64 = 68;
 pub const SYS_PCI_WRITE: u64 = 69;
+pub const SYS_SPAWN_PATH: u64 = 70;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
 const IO_LIMIT: usize = 4096;
+/// Upper bound on a file loaded for execution, so a huge VFS blob cannot be
+/// cloned into kernel memory before `elf::load_elf` rejects its segments.
+const EXEC_FILE_LIMIT: usize = 4 * 1024 * 1024;
 
 /// Well-known Scout task ID. Demo boot starts Scout directly after idle;
 /// normal boot starts silverd first and lets silverd create Scout second.
@@ -253,6 +257,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         },
         SYS_PCI_READ => sys_pci_read(frame[0]),
         SYS_PCI_WRITE => sys_pci_write(frame[0], frame[1]),
+        SYS_SPAWN_PATH => sys_spawn_path(frame[0]),
         _ => SYSCALL_ERROR,
     };
 
@@ -302,6 +307,29 @@ fn sys_spawn_with_args(program: u64, argument: u64, ptr: u64, len: u64) -> u64 {
         return SYSCALL_ERROR;
     }
     scheduler::spawn_user_with_args_and_cap(program, argument, arguments).unwrap_or(SYSCALL_ERROR)
+}
+
+/// Loads the file at `path` from the VFS and spawns it as a dynamically loaded
+/// ELF task. Returns the capability handle to the new task, or `SYSCALL_ERROR`.
+///
+/// The kernel reads the file itself (rather than the shell shipping the bytes):
+/// the ELF is far larger than the 4 KiB single-copy limit, and the loader
+/// already validates every byte against the 2 MiB image window.
+fn sys_spawn_path(path_ptr: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
+    with_path(path_ptr, |path| {
+        let Ok(bytes) = vfs::read_file(&cwd, path) else {
+            return SYSCALL_ERROR;
+        };
+        if bytes.len() > EXEC_FILE_LIMIT {
+            return SYSCALL_ERROR;
+        }
+        let image = match elf::load_elf(&bytes) {
+            Ok(image) => image,
+            Err(_) => return SYSCALL_ERROR,
+        };
+        scheduler::spawn_elf(image, 0).unwrap_or(SYSCALL_ERROR)
+    })
 }
 
 fn sys_arguments(buffer_ptr: u64, capacity: u64) -> u64 {
