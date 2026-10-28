@@ -56,7 +56,7 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] VirtIO-Net driver: modern virtio-pci capabilities, split RX/TX virtqueues, 16 x 2 KiB buffers and MAC discovery
 - [x] Shared-memory frame transport: one 8 KiB DMA mailbox, `OP_ATTACH`/`OP_ATTACHED`, `OP_FRAME`/`OP_TX` doorbells, length-word fencing and backpressure
 - [x] `net_server`: `smoltcp` in a separate EL0 task with static 10.0.2.15/24 addressing, ARP and IPv4
-- [x] ICMP echo end-to-end: boot-time ping to the QEMU slirp gateway 10.0.2.2, reply verified and relayed to the shell
+- [x] ICMP ping end-to-end: `ping <ip>` shell command with strict IPv4 parsing and timeout, verified against 8.8.8.8
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
 - [x] EL0 fault triage: `ESR_EL1`/`ELR_EL1`/`FAR_EL1` dump and a 16-entry context-switch trace before the guilty task dies
@@ -66,15 +66,19 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 
 ## Phase 4: Network — complete
 
-VirtIO-Net, the userspace `smoltcp` server, the shared-memory frame transport
-and the ICMP echo path all work end-to-end. A release boot prints:
+The network stack works end-to-end and is driven from the shell. Working: the
+VirtIO-Net driver, the userspace `smoltcp` server, shared-memory IPC over a DMA
+mailbox, and a `ping <ip>` command with strict IPv4 validation and a timeout.
 
 ```text
-NET: ICMP REPLY FROM 10.0.2.2
+howl> ping 8.8.8.8
+PING 8.8.8.8: OK
 ```
 
 The reply has crossed the NIC, both virtio queues, the DMA mailbox in both
-directions, smoltcp's ARP and IPv4/ICMP layers, and the checksum check.
+directions, smoltcp's ARP and IPv4/ICMP layers, and the checksum check. Any
+IPv4 address can be pinged — not only the slirp gateway — and success is
+reported only on a matching echo reply before the timeout.
 
 ## Requirements
 
@@ -221,6 +225,8 @@ doorbells; frame bytes travel through the shared window.
 | `OP_ATTACHED` (2) | driver -> server | window mapped; carries the NIC MAC |
 | `OP_FRAME` (3) | driver -> server | a received frame is in the RX slot |
 | `OP_TX` (4) | server -> driver | a frame to transmit is in the TX slot |
+| `OP_PING` (5) | shell -> server | request one ICMP echo; `payload[1..5]` is the IPv4 address |
+| `OP_PING_REPLY` (6) | server -> shell | `payload[1]` is success, `payload[2..6]` echoes the address |
 
 The driver maps the window with `SYS_MAP_PHYS` (Normal Non-Cacheable), polls
 virtio RX on every IPC loop (10 ms idle timeout), and moves at most one frame in
@@ -230,21 +236,22 @@ then clears it. The server publishes TX only when the slot is free, so a slow
 driver cannot cause the server to overwrite a frame in flight. TX doorbells are
 accepted only from the server task that owns the window.
 
-`net_server` uses the MAC from `OP_ATTACHED`, configures `10.0.2.15/24` and
-default gateway `10.0.2.2`, then sends one ICMPv4 echo request after the window
-is attached. smoltcp resolves the gateway with ARP and keeps the echo queued
-until the neighbor is usable. QEMU user-mode networking answers both the ARP and
-the ping, so a successful boot exercises TX, RX, ARP, IPv4 and ICMP checksum
-verification in one path. Because `net_server` does not own the console, it
-sends `NET ICMP REPLY OK` to `howl`, which prints the human-readable line.
+`net_server` uses the MAC from `OP_ATTACHED` and configures `10.0.2.15/24` with
+default gateway `10.0.2.2`. It no longer pings at boot; instead it waits for an
+`OP_PING` from the shell, queues one ICMPv4 echo request, and answers
+`OP_PING_REPLY` with the outcome. smoltcp resolves the gateway (or any routed
+neighbor) with ARP and keeps the echo queued until that neighbor is usable.
+QEMU user-mode networking answers ARP and the echo, so `ping 8.8.8.8` exercises
+TX, RX, ARP, IPv4 and ICMP checksum verification in one path. Because
+`net_server` does not own the console, it relays the result to `howl`, which
+prints the human-readable `PING <ip>: OK` (or `TIMEOUT`).
 
 `build_and_qemu.sh` relies on QEMU's implicit default `virtio-net-pci` on the
 `virt` machine; no explicit network device is needed. The current limitations
 are deliberate: IPv4 only, a static address and gateway, one frame slot per
 direction, no virtio-net interrupts (RX is polled), and no TCP/UDP services,
-DHCP, DNS or `ping` shell command yet. The driver assigns its 64 KiB BAR window
-at `0x1020_0000`; this assumes the block driver keeps `0x1010_0000`. Both tasks
-are visible in `ps`.
+DHCP or DNS. The driver assigns its 64 KiB BAR window at `0x1020_0000`; this
+assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 
 ## Project layout
 

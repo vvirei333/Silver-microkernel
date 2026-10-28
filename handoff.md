@@ -3,22 +3,43 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## State as of 2026-10-28 (Phase 4 complete: VirtIO-Net, smoltcp, shared-memory IPC and ICMP)
+## State as of 2026-10-28 (Phase 4 complete: VirtIO-Net, smoltcp, shared-memory IPC and shell ping)
 
-**Phase 4 (Network) is complete and verified end-to-end in QEMU.** A release
-boot prints:
+**Phase 4 (Network) is complete and verified end-to-end in QEMU.** The shell
+drives the stack:
 
 ```text
-NET: ICMP REPLY FROM 10.0.2.2
+howl> ping 8.8.8.8
+PING 8.8.8.8: OK
 ```
 
 That line appears only after the whole path succeeds: `net_driver` finds and
 initializes VirtIO-Net; `net_server` allocates an 8 KiB DMA window and announces
-it; the driver maps the window and returns the NIC MAC; smoltcp resolves the
+it; the driver maps the window and returns the NIC MAC; Howl parses `8.8.8.8`
+with the strict dotted-quad parser and sends `OP_PING`; smoltcp resolves the
 slirp gateway with ARP; the echo request crosses the TX mailbox and the TX
 virtqueue; the reply crosses the RX virtqueue and the RX mailbox; and smoltcp
 accepts it with a valid IPv4/ICMP checksum. `net_server` owns no console, so it
-relays `NET ICMP REPLY OK` to Howl, which prints the readable line.
+relays `OP_PING_REPLY` to Howl, which prints the readable line.
+
+`net_driver` (Ring 3) owns the VirtIO-Net PCI function; `net_server` (Ring 3)
+runs smoltcp. The two exchange only doorbells, and frame bytes travel through
+one shared DMA mailbox (see below). The shell reaches the stack over ordinary
+IPC with `OP_PING` / `OP_PING_REPLY`.
+
+### Fixes landed in this phase
+
+- **PCI scan no longer drops transitional virtio-blk.** `find_virtio_blk()`
+  matched `1af4:1001` but discarded it whenever BAR0 was an I/O BAR. BAR0 no
+  longer gates the match; it is mapped lazily only when a modern capability
+  actually references it. (Full diagnosis in the 2026-10-27 section below.)
+- **`ping` timeout race.** The shell waits 3 s (`PING_WAIT_TICKS`) while
+  `net_server` times out its own wait at 2 s (`PING_TIMEOUT_MILLIS`), so the
+  server's timeout reply always has a full second to reach the shell before it
+  gives up.
+- **Strict IPv4 parser.** `parse_ipv4` accepts exactly a dotted quad of four
+  decimal octets 0–255 (no spaces, at most three digits each); anything else is
+  rejected with a usage message.
 
 ### Current boot chain
 
@@ -83,6 +104,8 @@ messages and doorbells; an Ethernet frame never enters the 32-byte mailbox.
 | `OP_ATTACHED` (2) | driver -> server | window mapped; NIC MAC follows |
 | `OP_FRAME` (3) | driver -> server | a frame is in the RX slot |
 | `OP_TX` (4) | server -> driver | a frame is in the TX slot |
+| `OP_PING` (5) | shell -> server | one ICMP echo request; `payload[1..5]` is the IPv4 address |
+| `OP_PING_REPLY` (6) | server -> shell | `payload[1]` is success, `payload[2..6]` echoes the address |
 
 Publication rule: payload stores, then `dmb ish`, then the length store. The
 consumer loads the length, `dmb ish`, copies the frame, then clears the length.
@@ -99,22 +122,25 @@ are ignored; an oversized or zero TX length is reset and dropped.
 - Starts with QEMU's default MAC, `10.0.2.15/24` and default route `10.0.2.2`.
   `OP_ATTACHED` replaces the MAC with the real one read by the driver. The MAC
   must not be hardcoded: ARP would otherwise use the wrong source address.
-- Allocates and zeroes both length words before the first attach. Retries
-  `OP_ATTACH` once a second until `OP_ATTACHED`, then queues one ICMPv4 echo
-  request (identifier `0x5349`). smoltcp performs ARP first and keeps the echo
-  queued in the socket until the neighbor resolves.
+- Allocates and zeroes both length words before the first attach, and retries
+  `OP_ATTACH` once a second until `OP_ATTACHED`. It no longer pings at boot:
+  the ICMP socket (identifier `0x5349`) is idle until the shell sends `OP_PING`.
+- On `OP_PING`, the server queues one ICMPv4 echo request to the given address.
+  smoltcp performs ARP first and keeps the echo queued in the socket until the
+  neighbor resolves. Only one echo is pending at a time: the ICMP socket is
+  identified, so every pending request would match every reply.
 - Main loop: poll the RX length word, hand the frame to smoltcp, clear the word,
   run `interface.poll`, drain ICMP replies, publish at most one TX frame when
   the slot is free, then sleep 10 ms. The loop also drains IPC doorbells so the
   driver's mailbox cannot fill up; frame delivery does not depend on a doorbell
   arriving.
-- The reply is drained with `recv_slice` and reported to Howl as
-  `NET ICMP REPLY OK`. Only that exact text is printed by the shell; arbitrary
-  network/server diagnostics are still discarded because `net_server` owns no
-  console.
-- Once the echo is queued, it is not resent: one request per server lifetime is
-  enough to prove the path, and smoltcp keeps retrying ARP/egress for the queued
-  packet. A missing reply is never printed as success.
+- A pending echo that outlives its two-second window (`PING_TIMEOUT_MILLIS =
+  2000`) is answered as a timeout. The result is reported to Howl as
+  `OP_PING_REPLY` (success bit + the echoed address); the shell prints
+  `PING <ip>: OK` or `PING <ip>: TIMEOUT`. Arbitrary network/server diagnostics
+  are still discarded because `net_server` owns no console.
+- A missing reply is never printed as success: the server answers a timeout
+  itself, and the shell additionally checks that the echoed address matches.
 
 ### Verification
 
@@ -125,7 +151,8 @@ are ignored; an oversized or zero TX length is reset and dropped.
 Expected observable result at the `howl>` prompt:
 
 ```text
-NET: ICMP REPLY FROM 10.0.2.2
+howl> ping 8.8.8.8
+PING 8.8.8.8: OK
 ```
 
 `ps` shows live `net_driver` and `net_server` tasks. `build_and_qemu.sh` does not
@@ -140,9 +167,9 @@ If the NIC were absent, the driver would exit with a stage-coded status and
 - One frame slot per direction; no zero-copy, scatter-gather or multi-queue.
 - RX is polled, not interrupt-driven; latency and throughput are bounded by the
   10 ms loop. No virtio-net IRQ is wired.
-- No shell `ping`/network command yet; the boot-time ICMP test is the only
-  network workload. There is no detach/unmap protocol: if `net_server` dies, the
-  driver keeps the old mapping until a new attach.
+- `ping` is one-shot and single-flight: one ICMP echo request at a time, no
+  timing statistics or continuous mode. There is no detach/unmap protocol: if
+  `net_server` dies, the driver keeps the old mapping until a new attach.
 
 ## State as of 2026-10-27 late evening (BAR0 fix: transitional virtio-blk; SFS mounts end-to-end)
 
@@ -1158,12 +1185,13 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   failed" (the client report then names the exact step).
 - Networking is IPv4-only with a static `10.0.2.15/24` address and gateway
   `10.0.2.2`. `net_server` polls every 10 ms; one frame fits per direction;
-  there are no virtio-net interrupts, TCP/UDP services, DHCP/DNS or shell
-  network commands. The driver assigns its 64 KiB BAR at a fixed
-  `0x1020_0000` on the assumption that the block driver keeps `0x1010_0000`.
-  There is no detach/unmap protocol, so a dead `net_server` leaves the driver
-  holding the old mapping until the next attach. TX-ring exhaustion drops the
-  frame (`NET DRIVER: TX FRAME DROPPED`) rather than blocking the server.
+  there are no virtio-net interrupts, TCP/UDP services or DHCP/DNS. The shell
+  `ping` is single-flight ICMP only (no `net`/TCP command surface yet). The
+  driver assigns its 64 KiB BAR at a fixed `0x1020_0000` on the assumption that
+  the block driver keeps `0x1010_0000`. There is no detach/unmap protocol, so a
+  dead `net_server` leaves the driver holding the old mapping until the next
+  attach. TX-ring exhaustion drops the frame (`NET DRIVER: TX FRAME DROPPED`)
+  rather than blocking the server.
 - The EL1/kernel path is a stub. `silver_handle_exception(kind, esr, elr, far)`
   ignores all four arguments, so a kernel bug, an unhandled IRQ (`kind = 8`) or
   a failed boot check (`kind = 6|7` in `kernel_main`) only exits the current
@@ -1174,22 +1202,24 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 ## Next steps (by priority)
 
-1. **Program credentials:** define which embedded programs a task may request;
+1. **Phase 5: Graphics (Framebuffer / PL111).** Bring up the PL111 display
+   controller and a framebuffer on QEMU `virt`, then a Ring-3 graphics driver.
+2. **Program credentials:** define which embedded programs a task may request;
    currently any task can still spawn the shell ELF. Capability delegation is
    available through `SYS_CAP_GRANT`.
-2. **Resource quotas:** bound task count, per-task/kernel memory, wait queues and
+3. **Resource quotas:** bound task count, per-task/kernel memory, wait queues and
    VFS file growth; define behavior under exhaustion before adding more services.
-3. **Network services:** add TCP/UDP sockets on smoltcp, DHCP/DNS configuration
-   and shell `ping`/`net` commands. Replace the 10 ms RX poll with virtio-net
-   interrupts, then add multiple frames per direction and zero-copy or
-   scatter-gather TX.
-4. **SFS write path and persistence:** block-path interrupts, write support,
+4. **Network services:** add TCP/UDP sockets on smoltcp, DHCP/DNS configuration
+   and a `net` command surface beyond `ping`. Replace the 10 ms RX poll with
+   virtio-net interrupts, then add multiple frames per direction and zero-copy
+   or scatter-gather TX.
+5. **SFS write path and persistence:** block-path interrupts, write support,
    file-size quotas and overwrite/rename options; then keep the image across
    reboot.
-5. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
+6. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
    growable stacks and demand paging later. Add over-aligned user allocations
    and explicit `realloc`/`calloc` when their use cases appear.
-6. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
+7. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
    `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
 
 Nameserver watch notifications are explicitly deferred. Later IPC control-plane
@@ -1207,7 +1237,7 @@ and the full-mailbox selective-receive limitation recorded above.
 5. For the default profile, verify `ls`, `echo 'hello' > test.txt`,
    `cat test.txt`, `mkdir docs`, quoted echo, `cd /bin`, `pwd`, relative paths,
    `cd ..`, `ps`, and `spawn`/`kill`/`wait`. Also check fastfetch and the logo,
-   confirm boot prints `NET: ICMP REPLY FROM 10.0.2.2`, and make sure `ps`
+   confirm `ping 8.8.8.8` prints `PING 8.8.8.8: OK`, and make sure `ps`
    lists live `net_driver` and `net_server` tasks.
    Run `bg demo 12`, confirm shell output stays free of `AWAKE`, then `fg 3`.
    Send Ctrl-Z, verify `ps` = stopped and silence while stopped, resume with
