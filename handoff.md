@@ -3,6 +3,40 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## State as of 2026-10-28 (power-off via PSCI; the GPU "Power" button shuts the machine down)
+
+**Power-off is complete and verified in QEMU.** Clicking the "Power" button on
+the engineer menu shuts the virtual machine down through PSCI `SYSTEM_OFF`.
+
+### What changed
+
+- `SYS_POWER_OFF = 71` (`sys_power_off`): issues PSCI 0.2 `SYSTEM_OFF`
+  (`0x8400_0008`) with `x1..x3 = 0` via **`hvc #0`**. QEMU's `virt` machine
+  boots the guest at EL2 and exposes PSCI through the **HVC** conduit, so an
+  `smc` would trap as an EL1 sync exception and halt (`EL1 EXCEPTION kind=0`);
+  `hvc` reaches the hypervisor's PSCI handler, QEMU prints "Power down" and
+  exits. The call never returns. (The user's original spec said `smc #0`; HVC is
+  the correct conduit for this machine.)
+- `userspace/src/bin/gpu_driver.rs`: the click handler now calls
+  `syscall::power_off()` when the released button is "Power" (index 4 in
+  `BUTTON_LABELS`). The `Button clicked!` / `Power: shutting down...` prints are
+  dropped (`gpu_driver` does not own the console), but the kernel's
+  `POWER OFF: PSCI SYSTEM_OFF` line is a raw PL011 write and always visible.
+
+### Verification
+
+Headless: QMP `input-send-event` moves the tablet pointer to the Power button
+center (raw `(16409, 17512)` → pixel `(320, 256)`) and clicks. The serial shows
+`POWER OFF: PSCI SYSTEM_OFF` and QEMU exits (no `PSCI returned`, no
+`EL1 EXCEPTION`).
+
+### Note for later
+
+`SYS_POWER_OFF` is currently ungated: any task can request it and halt the whole
+system. It is intentionally narrow (PSCI `SYSTEM_OFF` only — no `SYSTEM_RESET`,
+no arguments), but a capability bit or a console-owner check is the natural
+hardening once multi-user isolation matters.
+
 ## State as of 2026-10-28 (Phase 7 complete: EL0 fault containment + task teardown)
 
 **Phase 7 (EL0 fault handling + teardown) is complete and verified in QEMU.** A

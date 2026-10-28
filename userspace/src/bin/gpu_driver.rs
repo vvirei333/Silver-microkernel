@@ -114,6 +114,8 @@ const BUTTON_GAP: u32 = 16;
 const BUTTON_GRID_X: u32 = (SCREEN_WIDTH - (3 * BUTTON_W + 2 * BUTTON_GAP)) / 2;
 const BUTTON_GRID_Y: u32 = 150;
 const BUTTON_LABELS: [&str; 6] = ["Phone", "SMS", "Web", "Media", "Power", "Settings"];
+/// Index of "Power" in [`BUTTON_LABELS`]; clicking it shuts the machine down.
+const POWER_BUTTON_INDEX: usize = 4;
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -205,10 +207,14 @@ fn handle_pointer(input: input_proto::InputMsg) {
         if let Some(index) = button_at(input.x, input.y) {
             ui.pressed_btn = Some(index);
         }
-    } else if ui.pressed_btn.take().is_some() {
+    } else if let Some(index) = ui.pressed_btn.take() {
         // The button reverts to its normal colour because `render` no longer
         // sees it as pressed; report the click.
         syscall::print("Button clicked!\r\n");
+        if index == POWER_BUTTON_INDEX {
+            syscall::print("Power: shutting down...\r\n");
+            syscall::power_off();
+        }
     }
 
     render(ui.cursor_x, ui.cursor_y, ui.pressed_btn);

@@ -66,6 +66,7 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] Input driver: `virtio-tablet-pci` absolute pointer over a virtio event queue, IPC to the graphics driver, live cursor and button press/release
 - [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh Ring 3 task with its own W^X address space
 - [x] EL0 fault containment: a crashed Ring 3 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
+- [x] Power off: the GPU "Power" button shuts QEMU down via PSCI `SYSTEM_OFF`
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
 
 ## Phase 4: Network — complete
@@ -168,6 +169,15 @@ howl> ps      # task 11 is gone; the shell and all drivers are still live
 ```
 
 After the fault the shell returns to the prompt and `run bin/hello` still works.
+
+## Power off — complete
+
+The "Power" button on the engineer menu shuts the machine down. `gpu_driver`
+calls `syscall::power_off()` on release; the kernel's `SYS_POWER_OFF` (71) then
+issues PSCI `SYSTEM_OFF` (`0x8400_0008`) through `hvc #0` — the HVC conduit,
+because QEMU `virt` boots the guest at EL2 with no EL3 (an `smc` there would trap
+as an EL1 exception). QEMU prints "Power down" and exits; the serial shows
+`POWER OFF: PSCI SYSTEM_OFF` first.
 
 ## Requirements
 

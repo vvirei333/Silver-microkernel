@@ -68,6 +68,7 @@ pub const SYS_ALLOC_DMA: u64 = 67;
 pub const SYS_PCI_READ: u64 = 68;
 pub const SYS_PCI_WRITE: u64 = 69;
 pub const SYS_SPAWN_PATH: u64 = 70;
+pub const SYS_POWER_OFF: u64 = 71;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -258,6 +259,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_PCI_READ => sys_pci_read(frame[0]),
         SYS_PCI_WRITE => sys_pci_write(frame[0], frame[1]),
         SYS_SPAWN_PATH => sys_spawn_path(frame[0]),
+        SYS_POWER_OFF => sys_power_off(),
         _ => SYSCALL_ERROR,
     };
 
@@ -330,6 +332,31 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
         };
         scheduler::spawn_elf(image, 0).unwrap_or(SYSCALL_ERROR)
     })
+}
+
+/// Powers the machine down through PSCI `SYSTEM_OFF` (0.2+ `FN_SYSTEM_OFF` =
+/// `0x8400_0008`). QEMU's `virt` machine boots the guest at EL2 and exposes PSCI
+/// through the **HVC** conduit, so the call is `hvc #0` (an `smc` here traps as
+/// an EL1 exception because no EL3 is present). QEMU prints "Power down" and
+/// exits; the call never returns. The write is a raw PL011 poke (visible
+/// regardless of console ownership) so the shutdown is observable first.
+fn sys_power_off() -> u64 {
+    pl011::write_str("POWER OFF: PSCI SYSTEM_OFF\r\n");
+    unsafe {
+        core::arch::asm!(
+            "hvc #0",
+            in("x0") 0x8400_0008_u64, // FN_SYSTEM_OFF
+            in("x1") 0_u64,
+            in("x2") 0_u64,
+            in("x3") 0_u64,
+            options(nomem, nostack),
+        );
+    }
+    // SYSTEM_OFF does not return; a missing PSCI/EL2 traps here as an EL1
+    // exception and halts (see silver_handle_exception). This line is defensive
+    // only, in case some platform's firmware returns without powering down.
+    pl011::write_str("POWER OFF: PSCI returned (unexpected)\r\n");
+    0
 }
 
 fn sys_arguments(buffer_ptr: u64, capacity: u64) -> u64 {

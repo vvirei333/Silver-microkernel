@@ -54,6 +54,7 @@ const SYS_ALLOC_DMA: u64 = 67;
 const SYS_PCI_READ: u64 = 68;
 const SYS_PCI_WRITE: u64 = 69;
 const SYS_SPAWN_PATH: u64 = 70;
+const SYS_POWER_OFF: u64 = 71;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -297,6 +298,12 @@ pub fn wait_irq() {
 
 pub fn stop_console() {
     unsafe { syscall0(SYS_STOP_CONSOLE) };
+}
+
+/// Powers the machine down via PSCI `SYSTEM_OFF`. Does not return on QEMU
+/// `virt`; the kernel issues `smc #0` and QEMU exits ("Power down").
+pub fn power_off() {
+    unsafe { syscall0(SYS_POWER_OFF) };
 }
 
 pub fn spawn_with_args(program: u64, argument: u64, arguments: &str) -> Option<u64> {
