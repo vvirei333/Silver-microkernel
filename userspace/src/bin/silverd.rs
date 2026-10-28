@@ -77,7 +77,26 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("SILVERD: NET SERVER CAP GRANT FAILED\r\n");
     }
 
-    // 6. Howl (shell)
+    // 6. Graphics driver (ramfb). It paints the engineer menu and then idles
+    // forever so the frame buffer stays mapped. Lend the console for one second
+    // so its init status is visible before Howl takes over.
+    let gpu_cap = syscall::spawn(syscall::PROGRAM_GPU_DRIVER, syscall::task_id())
+        .unwrap_or_else(|| fail("SILVERD: GPU DRIVER SPAWN FAILED\r\n"));
+    let gpu_id = syscall::cap_get_task_id(gpu_cap)
+        .unwrap_or_else(|| fail("SILVERD: GPU DRIVER CAP LOOKUP FAILED\r\n"));
+    if !syscall::cap_grant(gpu_cap, gpu_id, syscall::CAP_MMIO) {
+        fail("SILVERD: GPU DRIVER CAP GRANT FAILED\r\n");
+    }
+    if syscall::console_set(gpu_cap) {
+        syscall::sleep(1000);
+        if !syscall::console_set(syscall::task_id()) {
+            fail("SILVERD: CONSOLE RECLAIM FAILED\r\n");
+        }
+    } else {
+        syscall::print("SILVERD: GPU DRIVER CONSOLE LEND FAILED\r\n");
+    }
+
+    // 7. Howl (shell)
     let howl_id = syscall::spawn(syscall::PROGRAM_HOWL, syscall::task_id())
         .unwrap_or_else(|| fail("SILVERD: HOWL SPAWN FAILED\r\n"));
     if !syscall::cap_grant(howl_id, howl_id, syscall::CAP_MMIO) {
@@ -87,7 +106,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("SILVERD: CONSOLE HANDOFF FAILED\r\n");
     }
 
-    // 7. Howler (UART)
+    // 8. Howler (UART)
     let howler_id = syscall::spawn(syscall::PROGRAM_HOWLER, howl_id)
         .unwrap_or_else(|| fail("SILVERD: HOWLER SPAWN FAILED\r\n"));
     if !syscall::cap_grant(howler_id, howler_id, syscall::CAP_MMIO | syscall::CAP_IRQ) {
