@@ -50,6 +50,17 @@ const PCI_ECAM_L1_INDEX: usize = (PCI_ECAM_BASE >> 30) & 0x1FF;
 const PCI_ECAM_L2_INDEX: usize = ((PCI_ECAM_BASE >> 21) & 0x1FF) as usize;
 const PCI_ECAM_L2_BLOCKS: usize = PCI_ECAM_SIZE / BLOCK_2M;
 
+/// Anonymous `mmap` region: a large window between the sparse heap and the user
+/// stack where `SYS_MMAP` places kernel-chosen mappings. It spans the free
+/// `l2_user` slots, so page tables are only allocated once a mapping is placed.
+pub const USER_MMAP_VA: usize = 0x0000_0000_4040_0000;
+pub const USER_MMAP_MAX_VA: usize = 0x0000_0000_7FE0_0000; // == USER_STACK_VA
+
+/// `prot` bits for anonymous mappings. Read is always granted; these flags
+/// select write and execute in `user_anonymous_page`.
+pub const PROT_WRITE: u64 = 2;
+pub const PROT_EXEC: u64 = 4;
+
 /// MAIR attribute indices. `ATTR_NORMAL` is cacheable write-back, `ATTR_DEVICE`
 /// is Device-nGnRnE and `ATTR_NORMAL_NC` is Normal Non-Cacheable. These must
 /// match the byte positions in `MAIR_VALUE` exactly.
@@ -368,6 +379,112 @@ pub fn unmap_user_heap_page(ttbr0: usize, index: usize) -> Option<usize> {
         write_entry(l3_heap, index, 0);
         flush_after_table_change(l3_heap, GRANULE);
         Some(descriptor_address(entry) as usize)
+    }
+}
+
+/// Maps `page_count` anonymous pages at `virtual_address` into the current
+/// task's TTBR0, allocating intermediate L3 tables on demand. The physical
+/// frames must already be allocated contiguously at `physical_start`; each page
+/// is described with the `prot`-derived permissions (read always, write/execute
+/// per the flags).
+///
+/// Only the user image/heap/stack window (`l2_user`, `[DRAM_BASE, DRAM_BASE+1G)`)
+/// is traversed, so `virtual_address` must lie inside it.
+pub fn map_user_pages_at(
+    ttbr0: usize,
+    virtual_address: usize,
+    physical_start: usize,
+    page_count: usize,
+    prot: u64,
+) -> bool {
+    if page_count == 0 || virtual_address % GRANULE != 0 || physical_start % GRANULE != 0 {
+        return false;
+    }
+    let Some(end) = virtual_address.checked_add(page_count * GRANULE) else {
+        return false;
+    };
+    if virtual_address < DRAM_BASE || end > DRAM_BASE + 0x4000_0000 {
+        return false;
+    }
+
+    unsafe {
+        let l1_user = follow_table(ttbr0, 0);
+        let l2_user = follow_table(l1_user, 1);
+        for index in 0..page_count {
+            let va = virtual_address + index * GRANULE;
+            let l2_index = (va - DRAM_BASE) / BLOCK_2M;
+            let l3_index = (va >> 12) & 0x1FF;
+            let l2_entry = read_entry(l2_user, l2_index);
+            let l3 = if l2_entry == 0 {
+                let Some(page) = frame_allocator::alloc_page() else {
+                    return false;
+                };
+                zero_page(page);
+                write_entry(l2_user, l2_index, page as u64 | DESC_TABLE);
+                flush_after_table_change(l2_user, GRANULE);
+                page
+            } else if l2_entry & DESC_TABLE == DESC_TABLE {
+                descriptor_address(l2_entry) as usize
+            } else {
+                return false;
+            };
+            if read_entry(l3, l3_index) != 0 {
+                return false;
+            }
+            write_entry(
+                l3,
+                l3_index,
+                user_anonymous_page(physical_start + index * GRANULE, prot),
+            );
+            flush_after_table_change(l3, GRANULE);
+        }
+    }
+    true
+}
+
+/// Removes `page_count` pages starting at `virtual_address`, freeing an L3 table
+/// once its last entry is gone. The physical frames are returned to the caller
+/// by address (tracked separately by the scheduler), so this only edits tables.
+pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usize) -> bool {
+    if page_count == 0 || virtual_address % GRANULE != 0 {
+        return false;
+    }
+    unsafe {
+        let l1_user = follow_table(ttbr0, 0);
+        let l2_user = follow_table(l1_user, 1);
+        for index in 0..page_count {
+            let va = virtual_address + index * GRANULE;
+            let l2_index = (va - DRAM_BASE) / BLOCK_2M;
+            let l3_index = (va >> 12) & 0x1FF;
+            let l2_entry = read_entry(l2_user, l2_index);
+            if l2_entry & DESC_TABLE != DESC_TABLE {
+                return false;
+            }
+            let l3 = descriptor_address(l2_entry) as usize;
+            if read_entry(l3, l3_index) & DESC_PAGE != DESC_PAGE {
+                return false;
+            }
+            write_entry(l3, l3_index, 0);
+            flush_after_table_change(l3, GRANULE);
+            if table_empty(l3) {
+                write_entry(l2_user, l2_index, 0);
+                flush_after_table_change(l2_user, GRANULE);
+                frame_allocator::free_page(l3);
+            }
+        }
+    }
+    true
+}
+
+fn table_empty(table: usize) -> bool {
+    unsafe {
+        let entries = phys_to_virt(table) as *const u64;
+        for index in 0..ENTRIES {
+            if core::ptr::read_volatile(entries.add(index)) != 0 {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -726,6 +843,27 @@ fn user_data_page(output_address: usize) -> u64 {
         | AF
         | UXN
         | PXN
+}
+
+/// Anonymous `mmap` page: always readable, writable/executable per `prot`, and
+/// never executable from EL1. Write-only combinations fall back to read-only
+/// (read permission is assumed present for every mapping).
+fn user_anonymous_page(output_address: usize, prot: u64) -> u64 {
+    let mut descriptor = descriptor_address(output_address as u64)
+        | DESC_PAGE
+        | (ATTR_NORMAL << 2)
+        | SH_INNER
+        | AF
+        | PXN;
+    if prot & PROT_WRITE != 0 {
+        descriptor |= AP_EL0_RW;
+    } else {
+        descriptor |= AP_BOTH_RO;
+    }
+    if prot & PROT_EXEC == 0 {
+        descriptor |= UXN;
+    }
+    descriptor
 }
 
 /// User MMIO: MAIR index 1 is 0x00, Device-nGnRnE, never executable.

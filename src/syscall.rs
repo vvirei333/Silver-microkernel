@@ -69,6 +69,8 @@ pub const SYS_PCI_READ: u64 = 68;
 pub const SYS_PCI_WRITE: u64 = 69;
 pub const SYS_SPAWN_PATH: u64 = 70;
 pub const SYS_POWER_OFF: u64 = 71;
+pub const SYS_MMAP: u64 = 72;
+pub const SYS_MUNMAP: u64 = 73;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -260,6 +262,16 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_PCI_WRITE => sys_pci_write(frame[0], frame[1]),
         SYS_SPAWN_PATH => sys_spawn_path(frame[0]),
         SYS_POWER_OFF => sys_power_off(),
+        SYS_MMAP => scheduler::mmap_anonymous(frame[1] as usize, frame[2])
+            .map(|address| address as u64)
+            .unwrap_or(SYSCALL_ERROR),
+        SYS_MUNMAP => {
+            if scheduler::munmap(frame[0] as usize, frame[1] as usize) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
         _ => SYSCALL_ERROR,
     };
 

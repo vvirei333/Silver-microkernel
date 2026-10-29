@@ -99,6 +99,16 @@ const INIT_FEATURES: u8 = 3;
 const INIT_NO_QUEUE: u8 = 4;
 const INIT_QUEUE_SETUP: u8 = 5;
 
+/// Client request opcodes carried in `payload[0]`. `OP_READ_SECTOR` matches what
+/// `sfs_server` sends today; the legacy caller that omitted the opcode byte is
+/// still served as a read.
+const OP_READ_SECTOR: u8 = 1;
+const OP_WRITE_SECTOR: u8 = 2;
+/// Client acknowledgement byte: `ACK_READ_DONE` releases the shared window after
+/// a read, `ACK_WRITE_READY` signals that the client has filled it for a write.
+const ACK_READ_DONE: u8 = 0xA5;
+const ACK_WRITE_READY: u8 = 0xA6;
+
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(_argument: u64) -> ! {
@@ -184,54 +194,104 @@ fn serve_ipc() -> ! {
         sector_bytes.copy_from_slice(&request.payload[1..9]);
         let sector = u64::from_le_bytes(sector_bytes);
         let queue = unsafe { (*core::ptr::addr_of!(QUEUE)).as_ref() };
-        let response = if let Some(queue) = queue {
-            syscall::print("BLOCK SECTOR 0x");
-            syscall::print_hex_u64(sector);
-            syscall::print("\r\n");
-            let mut data = [0_u8; 512];
-            if unsafe { read_sector(queue, sector, &mut data) } {
-                let (_, request_paddr) = unsafe { (*core::ptr::addr_of!(REQUEST_BUFFER)).unwrap() };
-                let data_paddr = request_paddr + 16;
-                let mut payload = [0_u8; 27];
-                payload[0] = 1;
-                payload[1..9].copy_from_slice(&data_paddr.to_le_bytes());
-                payload[9..11].copy_from_slice(&512_u16.to_le_bytes());
-                // Temporary probe: what this task itself reads back from the
-                // window, plus the sector number it parsed out of the request.
-                payload[11..15].copy_from_slice(&u32::from_le_bytes(data[..4].try_into().unwrap()).to_le_bytes());
-                payload[15] = sector as u8;
-                ipc::Message::new(0, &payload)
-            } else {
-                ipc::Message::new(0, &[0])
+
+        match request.payload[0] {
+            OP_WRITE_SECTOR => {
+                let Some(queue) = queue else {
+                    let stage = unsafe { *core::ptr::addr_of!(INIT_FAILURE) };
+                    let _ = syscall::send(request.sender, &ipc::Message::new(0, &[2, stage]));
+                    continue;
+                };
+                // Hand the client the data window to fill, then wait for the
+                // commit before issuing the virtio write.
+                if !send_write_window(request.sender) {
+                    continue;
+                }
+                await_message(request.sender, ACK_WRITE_READY);
+                let ok = unsafe { write_sector(queue, sector) };
+                let reply = if ok {
+                    ipc::Message::new(0, &[1])
+                } else {
+                    ipc::Message::new(0, &[0])
+                };
+                let _ = syscall::send(request.sender, &reply);
             }
-        } else {
-            // 2 = "not initialized"; the second byte names the driver's init
-            // failure stage so the client's mount report pinpoints the step.
-            let stage = unsafe { *core::ptr::addr_of!(INIT_FAILURE) };
-            ipc::Message::new(0, &[2, stage])
-        };
-        let shared_buffer = response.payload[0] == 1;
-        if !syscall::send(request.sender, &response) || !shared_buffer {
-            continue;
+            _ => {
+                // Read path: OP_READ_SECTOR and any legacy caller that omits the
+                // opcode byte both read the sector named in payload[1..9].
+                let response = if let Some(queue) = queue {
+                    syscall::print("BLOCK SECTOR 0x");
+                    syscall::print_hex_u64(sector);
+                    syscall::print("\r\n");
+                    let mut data = [0_u8; 512];
+                    if unsafe { read_sector(queue, sector, &mut data) } {
+                        let (_, request_paddr) = unsafe { (*core::ptr::addr_of!(REQUEST_BUFFER)).unwrap() };
+                        let data_paddr = request_paddr + 16;
+                        let mut payload = [0_u8; 27];
+                        payload[0] = 1;
+                        payload[1..9].copy_from_slice(&data_paddr.to_le_bytes());
+                        payload[9..11].copy_from_slice(&512_u16.to_le_bytes());
+                        // Temporary probe: what this task itself reads back from the
+                        // window, plus the sector number it parsed out of the request.
+                        payload[11..15].copy_from_slice(&u32::from_le_bytes(data[..4].try_into().unwrap()).to_le_bytes());
+                        payload[15] = sector as u8;
+                        ipc::Message::new(0, &payload)
+                    } else {
+                        ipc::Message::new(0, &[0])
+                    }
+                } else {
+                    // 2 = "not initialized"; the second byte names the driver's init
+                    // failure stage so the client's mount report pinpoints the step.
+                    let stage = unsafe { *core::ptr::addr_of!(INIT_FAILURE) };
+                    ipc::Message::new(0, &[2, stage])
+                };
+                let shared_buffer = response.payload[0] == 1;
+                if !syscall::send(request.sender, &response) || !shared_buffer {
+                    continue;
+                }
+                await_acknowledgement(request.sender);
+            }
         }
-        await_acknowledgement(request.sender);
     }
+}
+
+/// Sends the shared DMA window address so the client can fill it with the bytes
+/// it wants written to disk. The client maps it read/write, writes 512 bytes and
+/// then commits with `ACK_WRITE_READY`.
+fn send_write_window(client: u64) -> bool {
+    let (_, request_paddr) = match unsafe { (*core::ptr::addr_of!(REQUEST_BUFFER)) } {
+        Some(pair) => pair,
+        None => return false,
+    };
+    let data_paddr = request_paddr + 16;
+    let mut payload = [0_u8; 11];
+    payload[0] = 1;
+    payload[1..9].copy_from_slice(&data_paddr.to_le_bytes());
+    payload[9..11].copy_from_slice(&512_u16.to_le_bytes());
+    syscall::send(client, &ipc::Message::new(0, &payload))
 }
 
 /// Keeps the shared DMA window private until the client releases it. A client
 /// that dies mid-read, or never sends the acknowledgement, is abandoned after
 /// `ACK_TIMEOUT_TICKS` so the next request is still served.
 fn await_acknowledgement(client: u64) {
+    await_message(client, ACK_READ_DONE);
+}
+
+/// Waits for one specific message from `client`. This generalizes the read-path
+/// acknowledgement to the write-path commit handshake: the caller names the
+/// exact byte it expects in `payload[0]`.
+fn await_message(client: u64, expected: u8) {
     let deadline = syscall::uptime_ticks().saturating_add(ACK_TIMEOUT_TICKS);
     loop {
-        let mut acknowledgement = ipc::Message::new(0, &[]);
-        if syscall::receive_timeout(&mut acknowledgement, ACK_POLL_TICKS).is_err() {
+        let mut message = ipc::Message::new(0, &[]);
+        if syscall::receive_timeout(&mut message, ACK_POLL_TICKS).is_err() {
             if !syscall::task_alive(client) || syscall::uptime_ticks() >= deadline {
                 return;
             }
             continue;
         }
-        if acknowledgement.sender == client && acknowledgement.payload[0] == 0xA5 {
+        if message.sender == client && message.payload[0] == expected {
             return;
         }
     }
@@ -447,6 +507,113 @@ unsafe fn read_sector(queue: &Virtqueue, sector: u64, buffer: &mut [u8; 512]) ->
         *byte = core::ptr::read_volatile(data.add(index));
     }
     true
+}
+
+/// Writes one sector to the device. The caller has already placed the 512 bytes
+/// in the shared window at `DATA_OFFSET` and committed, so this only builds the
+/// virtio request and waits for completion.
+///
+/// A write (`VIRTIO_BLK_T_OUT = 1`) is the mirror of a read: the header and the
+/// data descriptors are device-readable (no `VRING_DESC_F_WRITE` on the data),
+/// while the status byte stays device-writable.
+unsafe fn write_sector(queue: &Virtqueue, sector: u64) -> bool {
+    const DATA_OFFSET: u64 = 16;
+    const STATUS_OFFSET: u64 = DATA_OFFSET + 512;
+    if queue.size < 3 {
+        return false;
+    }
+
+    let Some((request_vaddr, request_paddr)) = (*core::ptr::addr_of!(REQUEST_BUFFER)) else {
+        return false;
+    };
+    // Protect against a zero DMA address which would overwrite the zero page.
+    if request_paddr == 0 {
+        return false;
+    }
+
+    // The client already filled the data window; only the status byte needs to
+    // be cleared before the device writes into it.
+    core::ptr::write_volatile((request_vaddr + STATUS_OFFSET) as *mut u8, 0);
+
+    core::ptr::write_volatile(
+        request_vaddr as *mut VirtioBlkRequest,
+        VirtioBlkRequest {
+            request_type: 1, // VIRTIO_BLK_T_OUT
+            reserved: 0,
+            sector,
+        },
+    );
+
+    let descriptors = queue.descriptors_vaddr as *mut VirtqDescriptor;
+    // Header: device-readable.
+    core::ptr::write_volatile(
+        descriptors,
+        VirtqDescriptor {
+            addr: request_paddr,
+            len: 16,
+            flags: 1,
+            next: 1,
+        },
+    );
+    // Data: device-readable — the WRITE flag is deliberately omitted so the
+    // device reads (rather than writes) this buffer.
+    core::ptr::write_volatile(
+        descriptors.add(1),
+        VirtqDescriptor {
+            addr: request_paddr + DATA_OFFSET,
+            len: 512,
+            flags: 1,
+            next: 2,
+        },
+    );
+    // Status: device-writable.
+    core::ptr::write_volatile(
+        descriptors.add(2),
+        VirtqDescriptor {
+            addr: request_paddr + STATUS_OFFSET,
+            len: 1,
+            flags: 2,
+            next: 0,
+        },
+    );
+
+    let available = queue.available_vaddr as *mut VirtqAvailable;
+    let used = queue.used_vaddr as *const VirtqUsed;
+    let available_idx = core::ptr::read_volatile(core::ptr::addr_of!((*available).idx));
+    let previous_used_idx = core::ptr::read_volatile(core::ptr::addr_of!((*used).idx));
+    core::ptr::write_volatile(core::ptr::addr_of_mut!((*available).flags), 0);
+    let available_ring = core::ptr::addr_of_mut!((*available).ring).cast::<u16>();
+    core::ptr::write_volatile(
+        available_ring.add(usize::from(available_idx % queue.size)),
+        0,
+    );
+    core::arch::asm!("dsb sy", options(nostack));
+    core::ptr::write_volatile(
+        core::ptr::addr_of_mut!((*available).idx),
+        available_idx.wrapping_add(1),
+    );
+    core::arch::asm!("dsb sy", options(nostack));
+    core::ptr::write_volatile(queue.notify_addr as *mut u16, queue.index);
+
+    let mut remaining = 10_000_000_u32;
+    while core::ptr::read_volatile(core::ptr::addr_of!((*used).idx)) == previous_used_idx {
+        if remaining == 0 {
+            return false;
+        }
+        remaining -= 1;
+        core::hint::spin_loop();
+    }
+    core::arch::asm!("dsb sy", options(nostack));
+
+    let used_ring = core::ptr::addr_of!((*used).ring).cast::<VirtqUsedElement>();
+    let used_element =
+        core::ptr::read_volatile(used_ring.add(usize::from(previous_used_idx % queue.size)));
+    if used_element.id != 0 {
+        return false;
+    }
+
+    let status = (request_vaddr + STATUS_OFFSET) as *const u8;
+    core::ptr::read_volatile(status) == 0
 }
 
 fn pci_config_address(bus: u8, device: u8, function: u8, offset: u16) -> u64 {

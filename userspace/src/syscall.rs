@@ -55,6 +55,15 @@ const SYS_PCI_READ: u64 = 68;
 const SYS_PCI_WRITE: u64 = 69;
 const SYS_SPAWN_PATH: u64 = 70;
 const SYS_POWER_OFF: u64 = 71;
+const SYS_MMAP: u64 = 72;
+const SYS_MUNMAP: u64 = 73;
+
+/// `prot` bits for `mmap`: read / write / execute.
+pub const PROT_READ: u64 = 1;
+pub const PROT_WRITE: u64 = 2;
+pub const PROT_EXEC: u64 = 4;
+/// `mmap` flag for a private anonymous mapping (no file backing).
+pub const MAP_ANONYMOUS: u64 = 0x20;
 
 pub const USER_HEAP_VA: usize = 0x4020_0000;
 pub const USER_HEAP_MAX_SIZE: usize = 0x20_0000;
@@ -304,6 +313,20 @@ pub fn stop_console() {
 /// `virt`; the kernel issues `smc #0` and QEMU exits ("Power down").
 pub fn power_off() {
     unsafe { syscall0(SYS_POWER_OFF) };
+}
+
+/// Maps `length` bytes of anonymous memory. When `addr` is 0 the kernel chooses
+/// a free virtual range; returns the mapped address or `None` on failure.
+pub fn mmap(addr: usize, length: usize, prot: u64) -> Option<usize> {
+    match unsafe { syscall3(SYS_MMAP, addr as u64, length as u64, prot) } {
+        SYSCALL_ERROR => None,
+        address => Some(address as usize),
+    }
+}
+
+/// Unmaps the anonymous region at `addr` previously returned by `mmap`.
+pub fn munmap(addr: usize, length: usize) -> bool {
+    unsafe { syscall2(SYS_MUNMAP, addr as u64, length as u64) == 0 }
 }
 
 pub fn spawn_with_args(program: u64, argument: u64, arguments: &str) -> Option<u64> {

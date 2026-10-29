@@ -57,6 +57,14 @@ pub struct TaskInfo {
     pub argument: u64,
 }
 
+/// One anonymous mapping installed by `SYS_MMAP`. Kept sorted by
+/// `virtual_address` so the first-fit allocator can scan in a single pass.
+struct MmapRegion {
+    virtual_address: usize,
+    page_count: usize,
+    physical_start: usize,
+}
+
 pub struct Task {
     pub id: u64,
     pub state: TaskState,
@@ -76,6 +84,7 @@ pub struct Task {
     user_image: Option<LoadedImage>,
     heap_pages: Vec<usize>,
     dma_pages: Vec<(usize, usize)>,
+    mmap_regions: Vec<MmapRegion>,
     program_break: usize,
     waiting_on: Option<*const WaitQueue>,
     owned_mutexes: Vec<*mut mutex::MutexState>,
@@ -790,6 +799,19 @@ pub fn change_program_break(requested: usize) -> Option<usize> {
     current_task_mut()?.change_program_break(requested)
 }
 
+/// Allocates `length` bytes of anonymous memory for the current task and maps
+/// them into a kernel-chosen free virtual range with `prot` permissions.
+pub fn mmap_anonymous(length: usize, prot: u64) -> Option<usize> {
+    current_task_mut()?.mmap_anonymous(length, prot)
+}
+
+/// Unmaps an anonymous region previously returned by `mmap_anonymous`.
+pub fn munmap(address: usize, length: usize) -> bool {
+    current_task_mut()
+        .map(|task| task.munmap(address, length))
+        .unwrap_or(false)
+}
+
 pub fn start() -> ! {
     let saved_daif = interrupts::save_and_disable_irq();
     let manager = scheduler_manager().unwrap();
@@ -1438,6 +1460,7 @@ impl Task {
             user_image,
             heap_pages: Vec::new(),
             dma_pages: Vec::new(),
+            mmap_regions: Vec::new(),
             program_break: mmu::USER_HEAP_VA,
             waiting_on: None,
             owned_mutexes: Vec::new(),
@@ -1487,6 +1510,65 @@ impl Task {
         }
     }
 
+    /// Allocates and maps `length` bytes of anonymous memory into a free virtual
+    /// range in the task's TTBR0, returning the chosen address.
+    fn mmap_anonymous(&mut self, length: usize, prot: u64) -> Option<usize> {
+        let page_count = length.div_ceil(PAGE_SIZE);
+        if page_count == 0 {
+            return None;
+        }
+
+        // First-fit over the already-sorted region list.
+        let mut cursor = mmu::USER_MMAP_VA;
+        for region in &self.mmap_regions {
+            let gap_end = cursor.checked_add(page_count * PAGE_SIZE)?;
+            if gap_end <= region.virtual_address {
+                break;
+            }
+            cursor = region.virtual_address + region.page_count * PAGE_SIZE;
+        }
+        let virtual_address = cursor;
+        if virtual_address.checked_add(page_count * PAGE_SIZE)? > mmu::USER_MMAP_MAX_VA {
+            return None;
+        }
+
+        let physical_start = frame_allocator::alloc_contiguous_pages(page_count)?;
+        if !mmu::map_user_pages_at(self.ttbr0, virtual_address, physical_start, page_count, prot) {
+            release_pages(physical_start, page_count);
+            return None;
+        }
+
+        let region = MmapRegion {
+            virtual_address,
+            page_count,
+            physical_start,
+        };
+        let position = self
+            .mmap_regions
+            .iter()
+            .position(|existing| existing.virtual_address > virtual_address)
+            .unwrap_or(self.mmap_regions.len());
+        self.mmap_regions.insert(position, region);
+        Some(virtual_address)
+    }
+
+    /// Unmaps the anonymous region that exactly matches `address` and `length`.
+    fn munmap(&mut self, address: usize, length: usize) -> bool {
+        let page_count = length.div_ceil(PAGE_SIZE);
+        if page_count == 0 {
+            return false;
+        }
+        let Some(position) = self.mmap_regions.iter().position(|region| {
+            region.virtual_address == address && region.page_count == page_count
+        }) else {
+            return false;
+        };
+        let region = self.mmap_regions.remove(position);
+        mmu::unmap_user_pages_at(self.ttbr0, region.virtual_address, region.page_count);
+        release_pages(region.physical_start, region.page_count);
+        true
+    }
+
     fn release_mutexes(&mut self) -> Vec<u64> {
         let mut wake = Vec::new();
         for state in self.owned_mutexes.drain(..) {
@@ -1505,6 +1587,10 @@ impl Task {
     }
 
     fn release_space(&self) {
+        for region in &self.mmap_regions {
+            mmu::unmap_user_pages_at(self.ttbr0, region.virtual_address, region.page_count);
+            release_pages(region.physical_start, region.page_count);
+        }
         mmu::destroy_task_space(self.ttbr0);
         for &(physical, page_count) in &self.dma_pages {
             release_pages(physical, page_count);

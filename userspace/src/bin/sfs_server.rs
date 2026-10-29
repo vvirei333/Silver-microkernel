@@ -32,14 +32,50 @@ const TASK_DEAD: u64 = 6;
 const TASK_STOPPED: u64 = 7;
 
 const SFS_MAGIC: u32 = 0x5346_5321; // "SFS!"
-const SFS_SUPERBLOCK_SIZE: usize = 24;
+/// On-disk superblock: ten little-endian u32 fields (40 bytes).
+const SFS_SUPERBLOCK_SIZE: usize = 40;
 
 /// Filesystem server opcodes, shared with the shell's `sfsinfo` command.
 const OP_INFO: u8 = 0;
+/// Create an empty file if it does not already exist. Payload: `name`.
+const OP_TOUCH: u8 = 1;
+/// Overwrite a file's contents. Payload: `name` + `data`.
+const OP_WRITE_FILE: u8 = 2;
+/// Read a file's contents back. Payload: `name`.
+const OP_READ_FILE: u8 = 3;
 
 /// Block driver opcodes. `OP_READ_SECTOR` takes the sector number in
 /// `payload[1..9]` and replies with a shared DMA window.
 const OP_READ_SECTOR: u8 = 1;
+const OP_WRITE_SECTOR: u8 = 2;
+
+// --- On-disk layout (must match `format_sfs.py`) --------------------------
+const BLOCK_SIZE: usize = 512;
+const INODE_SIZE: usize = 64;
+/// Direct block pointers per inode; a file may span up to 12 blocks (6 KiB).
+const DIRECT_BLOCKS: usize = 12;
+/// One single-indirect pointer is reserved for later but not yet followed.
+const INODE_INDIRECT_OFFSET: usize = 8 + DIRECT_BLOCKS * 4;
+const INODE_KIND_FREE: u32 = 0;
+const INODE_KIND_FILE: u32 = 1;
+const INODE_KIND_DIR: u32 = 2;
+const DIR_ENTRY_SIZE: usize = 32;
+const DIR_ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DIR_ENTRY_SIZE;
+const NAME_MAX: usize = DIR_ENTRY_SIZE - 5; // inode(4) + len(1) + name
+const MAX_INODES: usize = 128;
+/// Bitmap covers 2048 blocks in 256 bytes.
+const BITMAP_BYTES: usize = 256;
+
+/// Cached mapping of the block driver's shared DMA window, reused across calls
+/// so repeated sector access does not leak the finite user MMIO window.
+static mut DMA_WINDOW: Option<(u64, u64)> = None;
+/// In-memory free-block bitmap (2048 bits) and the full inode table, loaded
+/// once at serve time and flushed back on every mutation.
+static mut BITMAP: [u8; BITMAP_BYTES] = [0; BITMAP_BYTES];
+static mut INODES: [u8; MAX_INODES * INODE_SIZE] = [0; MAX_INODES * INODE_SIZE];
+/// Scratch buffer for reading a file back (direct blocks only, 12 × 512 B).
+const READ_BUFFER_SIZE: usize = DIRECT_BLOCKS * BLOCK_SIZE;
+static mut READ_BUFFER: [u8; READ_BUFFER_SIZE] = [0; READ_BUFFER_SIZE];
 
 /// Why a mount attempt failed, with enough detail to diagnose an unattended
 /// boot: the server never owns the console, so `print` output would be
@@ -107,6 +143,14 @@ struct SfsSuperblock {
     total_blocks: u32,
     root_inode: u32,
     inode_count: u32,
+    /// Block holding the free-block bitmap (2048 bits in one 512-byte block).
+    bitmap_block: u32,
+    /// First block of the inode table.
+    inode_table_block: u32,
+    /// Number of blocks the inode table spans.
+    inode_table_blocks: u32,
+    /// First data block (everything below this is filesystem metadata).
+    data_block_start: u32,
     /// The bytes exactly as they were read from the disk, kept so a rejected
     /// magic can be reported instead of being silently swallowed.
     raw: [u8; SFS_SUPERBLOCK_SIZE],
@@ -296,6 +340,10 @@ fn read_superblock(virtual_address: u64) -> SfsSuperblock {
         total_blocks: word(12),
         root_inode: word(16),
         inode_count: word(20),
+        bitmap_block: word(24),
+        inode_table_block: word(28),
+        inode_table_blocks: word(32),
+        data_block_start: word(36),
         raw: bytes,
     }
 }
@@ -331,27 +379,511 @@ fn announce(hint: u64, failure: Option<MountFailure>) {
 /// Answers filesystem queries. Any live client may ask; the reply always goes
 /// to `request.sender`, which the kernel fills in, so no client is hardcoded.
 fn serve(superblock: SfsSuperblock) -> ! {
+    // Load the free-block bitmap and inode table into memory once; every
+    // mutation below flushes the affected blocks back to disk.
+    load_storage(&superblock);
+
     loop {
-        syscall::print("SFS: waiting for request\r\n");
         let mut request = ipc::Message::new(0, &[]);
         if !syscall::receive(&mut request) {
             continue;
         }
 
-        let reply = if request.payload[0] == OP_INFO {
-            info_reply(&superblock)
-        } else {
-            // Temporary probe: echo the request head back so the client can see
-            // exactly which bytes the server received and where.
-            let mut payload = [0_u8; 32];
-            payload[1] = request.payload[0];
-            payload[2] = request.sender as u8;
-            payload[3] = OP_INFO;
-            payload[8..16].copy_from_slice(&request.payload[..8]);
-            ipc::Message::new(0, &payload)
+        let reply = match request.payload[0] {
+            OP_INFO => info_reply(&superblock),
+            OP_TOUCH => match read_name(&request.payload[1..]) {
+                Some(name) => match find_task_id(syscall::PROGRAM_BLOCK_DRIVER) {
+                    Some(driver) => match sfs_touch(&superblock, driver, name) {
+                        Some(inode) => touch_reply(inode),
+                        None => ipc::Message::new(0, &[0]),
+                    },
+                    None => ipc::Message::new(0, &[0]),
+                },
+                None => ipc::Message::new(0, &[0]),
+            },
+            OP_WRITE_FILE => match read_name_data(&request.payload[1..]) {
+                Some((name, data)) => match find_task_id(syscall::PROGRAM_BLOCK_DRIVER) {
+                    Some(driver) => match sfs_write_file(&superblock, driver, name, data) {
+                        Ok((inode, size, blocks)) => write_reply(inode, size, &blocks),
+                        Err(()) => ipc::Message::new(0, &[0]),
+                    },
+                    None => ipc::Message::new(0, &[0]),
+                },
+                None => ipc::Message::new(0, &[0]),
+            },
+            OP_READ_FILE => match read_name(&request.payload[1..]) {
+                Some(name) => match find_task_id(syscall::PROGRAM_BLOCK_DRIVER) {
+                    Some(driver) => match sfs_read_file(&superblock, driver, name) {
+                        Some(data) => read_reply(data),
+                        None => ipc::Message::new(0, &[0]),
+                    },
+                    None => ipc::Message::new(0, &[0]),
+                },
+                None => ipc::Message::new(0, &[0]),
+            },
+            _ => ipc::Message::new(0, &[0]),
         };
         let _ = syscall::send(request.sender, &reply);
     }
+}
+
+/// Parses a length-prefixed name from a payload that has already had its opcode
+/// byte stripped: `[name_len][name bytes...]`.
+fn read_name(payload: &[u8]) -> Option<&str> {
+    let name_len = usize::from(*payload.get(0)?);
+    if name_len == 0 || name_len > NAME_MAX || 1 + name_len > payload.len() {
+        return None;
+    }
+    core::str::from_utf8(&payload[1..1 + name_len]).ok()
+}
+
+/// Parses `[name_len][name][data_len][data]` from an opcode-stripped payload.
+fn read_name_data(payload: &[u8]) -> Option<(&str, &[u8])> {
+    let name_len = usize::from(*payload.get(0)?);
+    if name_len == 0 || name_len > NAME_MAX || 1 + name_len > payload.len() {
+        return None;
+    }
+    let name = core::str::from_utf8(&payload[1..1 + name_len]).ok()?;
+    let data_len = usize::from(*payload.get(1 + name_len)?);
+    let data_start = 2 + name_len;
+    if data_start + data_len > payload.len() {
+        return None;
+    }
+    Some((name, &payload[data_start..data_start + data_len]))
+}
+
+fn touch_reply(inode: u32) -> ipc::Message {
+    let mut payload = [0_u8; 9];
+    payload[0] = 1;
+    payload[1..5].copy_from_slice(&inode.to_le_bytes());
+    ipc::Message::new(0, &payload)
+}
+
+fn write_reply(inode: u32, size: u32, blocks: &[u32]) -> ipc::Message {
+    let mut payload = [0_u8; 32];
+    payload[0] = 1;
+    payload[1..5].copy_from_slice(&inode.to_le_bytes());
+    payload[5..9].copy_from_slice(&size.to_le_bytes());
+    // Block numbers are allocated contiguously from index 0 and are always
+    // >= data_block_start, so a leading zero marks the first unused slot.
+    let count = blocks
+        .iter()
+        .take_while(|&&block| block != 0)
+        .count()
+        .min(4);
+    payload[9] = count as u8;
+    for (index, &block) in blocks[..count].iter().enumerate() {
+        let offset = 10 + index * 4;
+        payload[offset..offset + 4].copy_from_slice(&block.to_le_bytes());
+    }
+    ipc::Message::new(0, &payload)
+}
+
+fn read_reply(data: &[u8]) -> ipc::Message {
+    let mut payload = [0_u8; 32];
+    payload[0] = 1;
+    payload[1..5].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    let len = data.len().min(27);
+    payload[5..5 + len].copy_from_slice(&data[..len]);
+    ipc::Message::new(0, &payload)
+}
+
+/// Creates the file if it does not exist; `touch` never truncates an existing
+/// file, so a present inode is returned unchanged.
+fn sfs_touch(superblock: &SfsSuperblock, driver: u64, name: &str) -> Option<u32> {
+    if let Some(inode) = sfs_find_inode(superblock, driver, name) {
+        return Some(inode);
+    }
+    sfs_create_inode(superblock, driver, name)
+}
+
+/// Overwrites a file's contents. This is the core of the write path: find (or
+/// create) the inode, release its old blocks, allocate fresh ones, write the
+/// data through the block driver, and persist the inode and the bitmap.
+fn sfs_write_file(
+    superblock: &SfsSuperblock,
+    driver: u64,
+    name: &str,
+    data: &[u8],
+) -> Result<(u32, u32, [u32; DIRECT_BLOCKS]), ()> {
+    let inode = match sfs_find_inode(superblock, driver, name) {
+        Some(inode) => inode,
+        None => sfs_create_inode(superblock, driver, name).ok_or(())?,
+    };
+
+    sfs_release_blocks(inode);
+    let needed = data.len().div_ceil(BLOCK_SIZE);
+    if needed > DIRECT_BLOCKS {
+        return Err(());
+    }
+
+    let mut blocks = [0_u32; DIRECT_BLOCKS];
+    for slot in blocks.iter_mut().take(needed) {
+        *slot = sfs_allocate_block(superblock).ok_or(())?;
+    }
+
+    for (index, &block) in blocks.iter().enumerate().take(needed) {
+        let start = index * BLOCK_SIZE;
+        let end = (start + BLOCK_SIZE).min(data.len());
+        let mut sector = [0_u8; BLOCK_SIZE];
+        sector[..end - start].copy_from_slice(&data[start..end]);
+        if !block_write_sector(driver, u64::from(block), &sector) {
+            return Err(());
+        }
+    }
+
+    inode_put_u32(inode, 4, data.len() as u32);
+    for (index, &block) in blocks.iter().enumerate() {
+        inode_put_u32(inode, 8 + index * 4, block);
+    }
+    inode_put_u32(inode, INODE_INDIRECT_OFFSET, 0);
+    flush_inode(superblock, driver, inode);
+    flush_bitmap(superblock, driver);
+    Ok((inode, data.len() as u32, blocks))
+}
+
+/// Reads a file's contents into a scratch buffer and returns the populated
+/// prefix. Only direct blocks are followed (single-indirect is not yet).
+fn sfs_read_file(superblock: &SfsSuperblock, driver: u64, name: &str) -> Option<&'static [u8]> {
+    let inode = sfs_find_inode(superblock, driver, name)?;
+    let size = inode_get_u32(inode, 4) as usize;
+    if size > READ_BUFFER_SIZE {
+        return None;
+    }
+    let mut read = 0_usize;
+    for index in 0..DIRECT_BLOCKS {
+        let block = inode_get_u32(inode, 8 + index * 4);
+        if block == 0 {
+            break;
+        }
+        let mut sector = [0_u8; BLOCK_SIZE];
+        if !block_read_sector(driver, u64::from(block), &mut sector) {
+            return None;
+        }
+        let take = (size - read).min(BLOCK_SIZE);
+        unsafe { READ_BUFFER[read..read + take].copy_from_slice(&sector[..take]) };
+        read += take;
+        if read >= size {
+            break;
+        }
+    }
+    Some(unsafe { &READ_BUFFER[..read] })
+}
+
+/// Allocates one free data block: finds a clear bitmap bit, marks it used and
+/// returns the block number. The caller is responsible for flushing the bitmap.
+fn sfs_allocate_block(superblock: &SfsSuperblock) -> Option<u32> {
+    for block in superblock.data_block_start..superblock.total_blocks {
+        if !bitmap_test(block) {
+            bitmap_set(block, true);
+            return Some(block);
+        }
+    }
+    None
+}
+
+/// Creates a new empty file: claims a free inode, records it as a regular file,
+/// and adds a directory entry under the root directory.
+fn sfs_create_inode(superblock: &SfsSuperblock, driver: u64, name: &str) -> Option<u32> {
+    let mut inode = None;
+    for index in 1..MAX_INODES as u32 {
+        if inode_get_u32(index, 0) == INODE_KIND_FREE {
+            inode = Some(index);
+            break;
+        }
+    }
+    let inode = inode?;
+
+    inode_put_u32(inode, 0, INODE_KIND_FILE);
+    inode_put_u32(inode, 4, 0);
+    for index in 0..DIRECT_BLOCKS {
+        inode_put_u32(inode, 8 + index * 4, 0);
+    }
+    inode_put_u32(inode, INODE_INDIRECT_OFFSET, 0);
+
+    if !add_dir_entry(superblock, driver, superblock.root_inode, name, inode) {
+        inode_put_u32(inode, 0, INODE_KIND_FREE);
+        return None;
+    }
+    flush_inode(superblock, driver, inode);
+    Some(inode)
+}
+
+/// Finds the inode named `name` under the root directory, scanning every
+/// populated directory block for a matching entry.
+fn sfs_find_inode(superblock: &SfsSuperblock, driver: u64, name: &str) -> Option<u32> {
+    if name.len() > NAME_MAX {
+        return None;
+    }
+    let mut sector = [0_u8; BLOCK_SIZE];
+    for index in 0..DIRECT_BLOCKS {
+        let block = inode_get_u32(superblock.root_inode, 8 + index * 4);
+        if block == 0 {
+            return None;
+        }
+        if !block_read_sector(driver, u64::from(block), &mut sector) {
+            return None;
+        }
+        for slot in 0..DIR_ENTRIES_PER_BLOCK {
+            let offset = slot * DIR_ENTRY_SIZE;
+            let entry_inode =
+                u32::from_le_bytes(sector[offset..offset + 4].try_into().unwrap());
+            if entry_inode == 0 {
+                continue;
+            }
+            let entry_len = usize::from(sector[offset + 4]);
+            if entry_len == name.len()
+                && &sector[offset + 5..offset + 5 + entry_len] == name.as_bytes()
+            {
+                return Some(entry_inode);
+            }
+        }
+    }
+    None
+}
+
+/// Releases every direct block of `inode` back to the free-list.
+fn sfs_release_blocks(inode: u32) {
+    for index in 0..DIRECT_BLOCKS {
+        let block = inode_get_u32(inode, 8 + index * 4);
+        if block == 0 {
+            continue;
+        }
+        bitmap_set(block, false);
+        inode_put_u32(inode, 8 + index * 4, 0);
+    }
+}
+
+/// Appends an entry to a directory: reuses a free slot in an existing block, or
+/// allocates a new data block for the directory when none is free.
+fn add_dir_entry(
+    superblock: &SfsSuperblock,
+    driver: u64,
+    dir_inode: u32,
+    name: &str,
+    child: u32,
+) -> bool {
+    if name.len() > NAME_MAX {
+        return false;
+    }
+    let mut entry = [0_u8; DIR_ENTRY_SIZE];
+    entry[0..4].copy_from_slice(&child.to_le_bytes());
+    entry[4] = name.len() as u8;
+    entry[5..5 + name.len()].copy_from_slice(name.as_bytes());
+
+    let mut sector = [0_u8; BLOCK_SIZE];
+    for index in 0..DIRECT_BLOCKS {
+        let block = inode_get_u32(dir_inode, 8 + index * 4);
+        if block == 0 {
+            break;
+        }
+        if !block_read_sector(driver, u64::from(block), &mut sector) {
+            return false;
+        }
+        for slot in 0..DIR_ENTRIES_PER_BLOCK {
+            let offset = slot * DIR_ENTRY_SIZE;
+            if u32::from_le_bytes(sector[offset..offset + 4].try_into().unwrap()) == 0 {
+                sector[offset..offset + DIR_ENTRY_SIZE].copy_from_slice(&entry);
+                return block_write_sector(driver, u64::from(block), &sector);
+            }
+        }
+    }
+
+    let Some(block) = sfs_allocate_block(superblock) else {
+        return false;
+    };
+    let mut placed = false;
+    for index in 0..DIRECT_BLOCKS {
+        if inode_get_u32(dir_inode, 8 + index * 4) == 0 {
+            inode_put_u32(dir_inode, 8 + index * 4, block);
+            placed = true;
+            break;
+        }
+    }
+    if !placed {
+        bitmap_set(block, false);
+        return false;
+    }
+    let mut new_sector = [0_u8; BLOCK_SIZE];
+    new_sector[..DIR_ENTRY_SIZE].copy_from_slice(&entry);
+    if !block_write_sector(driver, u64::from(block), &new_sector) {
+        return false;
+    }
+    flush_inode(superblock, driver, dir_inode);
+    flush_bitmap(superblock, driver);
+    true
+}
+
+/// Loads the free-block bitmap and the whole inode table into memory.
+fn load_storage(superblock: &SfsSuperblock) {
+    let Some(driver) = find_task_id(syscall::PROGRAM_BLOCK_DRIVER) else {
+        return;
+    };
+    let mut sector = [0_u8; BLOCK_SIZE];
+    if block_read_sector(driver, u64::from(superblock.bitmap_block), &mut sector) {
+        unsafe {
+            for index in 0..BITMAP_BYTES {
+                BITMAP[index] = sector[index];
+            }
+        }
+    }
+    for index in 0..superblock.inode_table_blocks as usize {
+        if block_read_sector(
+            driver,
+            u64::from(superblock.inode_table_block) + index as u64,
+            &mut sector,
+        ) {
+            let base = index * BLOCK_SIZE;
+            unsafe {
+                for offset in 0..BLOCK_SIZE {
+                    INODES[base + offset] = sector[offset];
+                }
+            }
+        }
+    }
+}
+
+/// Reads one sector through the block driver and acknowledges the shared window.
+fn block_read_sector(driver: u64, sector: u64, data: &mut [u8; BLOCK_SIZE]) -> bool {
+    let mut request_payload = [0_u8; 9];
+    request_payload[0] = OP_READ_SECTOR;
+    request_payload[1..9].copy_from_slice(&sector.to_le_bytes());
+    if !syscall::send(driver, &ipc::Message::new(0, &request_payload)) {
+        return false;
+    }
+    let mut response = ipc::Message::new(0, &[]);
+    if !receive_from(driver, &mut response) || response.payload[0] != 1 {
+        return false;
+    }
+    let physical = le_u64(&response.payload[1..9]);
+    let length = usize::from(u16::from_le_bytes([response.payload[9], response.payload[10]]));
+    if length != BLOCK_SIZE {
+        acknowledge(driver);
+        return false;
+    }
+    let Some(virtual_address) = window_map(physical, length) else {
+        acknowledge(driver);
+        return false;
+    };
+    for (index, byte) in data.iter_mut().enumerate() {
+        *byte = unsafe { core::ptr::read_volatile((virtual_address as *const u8).add(index)) };
+    }
+    acknowledge(driver);
+    true
+}
+
+/// Writes one sector: requests the shared window, fills it, commits, and checks
+/// the driver's status reply.
+fn block_write_sector(driver: u64, sector: u64, data: &[u8; BLOCK_SIZE]) -> bool {
+    let mut request_payload = [0_u8; 9];
+    request_payload[0] = OP_WRITE_SECTOR;
+    request_payload[1..9].copy_from_slice(&sector.to_le_bytes());
+    if !syscall::send(driver, &ipc::Message::new(0, &request_payload)) {
+        return false;
+    }
+    let mut response = ipc::Message::new(0, &[]);
+    if !receive_from(driver, &mut response) || response.payload[0] != 1 {
+        return false;
+    }
+    let physical = le_u64(&response.payload[1..9]);
+    let length = usize::from(u16::from_le_bytes([response.payload[9], response.payload[10]]));
+    let Some(virtual_address) = (length == BLOCK_SIZE).then(|| window_map(physical, length)).flatten()
+    else {
+        let _ = syscall::send(driver, &ipc::Message::new(0, &[0xA6]));
+        return false;
+    };
+    for (index, byte) in data.iter().enumerate() {
+        unsafe { core::ptr::write_volatile((virtual_address as *mut u8).add(index), *byte) };
+    }
+    if !syscall::send(driver, &ipc::Message::new(0, &[0xA6])) {
+        return false;
+    }
+    let mut status = ipc::Message::new(0, &[]);
+    if !receive_from(driver, &mut status) {
+        return false;
+    }
+    status.payload[0] == 1
+}
+
+/// Cached mapping of the block driver's shared DMA window.
+fn window_map(physical: u64, length: usize) -> Option<u64> {
+    unsafe {
+        match *core::ptr::addr_of!(DMA_WINDOW) {
+            Some((cached_physical, virtual_address)) if cached_physical == physical => {
+                Some(virtual_address)
+            }
+            _ => {
+                let virtual_address = syscall::map_phys(physical, length as u64)?;
+                core::ptr::addr_of_mut!(DMA_WINDOW).write(Some((physical, virtual_address)));
+                Some(virtual_address)
+            }
+        }
+    }
+}
+
+fn le_u64(bytes: &[u8]) -> u64 {
+    let mut buffer = [0_u8; 8];
+    buffer.copy_from_slice(bytes);
+    u64::from_le_bytes(buffer)
+}
+
+fn bitmap_test(block: u32) -> bool {
+    let byte = (block / 8) as usize;
+    let bit = (block % 8) as usize;
+    unsafe { BITMAP[byte] & (1 << bit) != 0 }
+}
+
+fn bitmap_set(block: u32, used: bool) {
+    let byte = (block / 8) as usize;
+    let bit = (block % 8) as usize;
+    unsafe {
+        if used {
+            BITMAP[byte] |= 1 << bit;
+        } else {
+            BITMAP[byte] &= !(1 << bit);
+        }
+    }
+}
+
+fn inode_get_u32(inode: u32, offset: usize) -> u32 {
+    let base = inode as usize * INODE_SIZE + offset;
+    u32::from_le_bytes([
+        unsafe { INODES[base] },
+        unsafe { INODES[base + 1] },
+        unsafe { INODES[base + 2] },
+        unsafe { INODES[base + 3] },
+    ])
+}
+
+fn inode_put_u32(inode: u32, offset: usize, value: u32) {
+    let base = inode as usize * INODE_SIZE + offset;
+    let bytes = value.to_le_bytes();
+    unsafe {
+        INODES[base] = bytes[0];
+        INODES[base + 1] = bytes[1];
+        INODES[base + 2] = bytes[2];
+        INODES[base + 3] = bytes[3];
+    }
+}
+
+fn flush_inode(superblock: &SfsSuperblock, driver: u64, inode: u32) {
+    let inodes_per_block = superblock.block_size as usize / INODE_SIZE;
+    let block_index = inode as usize / inodes_per_block;
+    let block = u64::from(superblock.inode_table_block) + block_index as u64;
+    let base = block_index * superblock.block_size as usize;
+    let mut sector = [0_u8; BLOCK_SIZE];
+    for offset in 0..BLOCK_SIZE {
+        sector[offset] = unsafe { INODES[base + offset] };
+    }
+    let _ = block_write_sector(driver, block, &sector);
+}
+
+fn flush_bitmap(superblock: &SfsSuperblock, driver: u64) {
+    let mut sector = [0_u8; BLOCK_SIZE];
+    for offset in 0..BITMAP_BYTES {
+        sector[offset] = unsafe { BITMAP[offset] };
+    }
+    let _ = block_write_sector(driver, u64::from(superblock.bitmap_block), &sector);
 }
 
 fn info_reply(superblock: &SfsSuperblock) -> ipc::Message {

@@ -19,6 +19,14 @@ const MIB: u64 = 1024 * 1024;
 /// `gpu_driver.rs`.
 const GUI_BUTTON_PRESSED: u8 = 2;
 
+/// On-disk SFS server opcodes for the write path (`sfsinfo` uses opcode 0).
+const SFS_OP_TOUCH: u8 = 1;
+const SFS_OP_WRITE_FILE: u8 = 2;
+const SFS_OP_READ_FILE: u8 = 3;
+/// Longest filename and combined name+data the single-shot SFS IPC carries.
+const SFS_NAME_MAX: usize = 27;
+const SFS_NAME_DATA_LIMIT: usize = 29;
+
 const TASK_LIST_CAPACITY: usize = 32;
 const EMPTY_TASK: syscall::TaskInfo = syscall::TaskInfo {
     id: 0,
@@ -190,12 +198,15 @@ fn execute(command: &str) {
             syscall::print("  hexdump [sector]\r\n");
             syscall::print("             Dump 512 bytes of a sector (0 by default)\r\n");
             syscall::print("  sfsinfo    Show the mounted SFS superblock\r\n");
+            syscall::print("  memtest    mmap 1 MiB, write/read it back\r\n");
             syscall::print("  ping <ip>  Send one ICMP echo request\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  run <path>  Load and run an ELF file from the filesystem\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
             syscall::print("             Print, truncate/write, or append to a file\r\n");
+            syscall::print("  touch <file>\r\n");
+            syscall::print("             Create an empty file in the on-disk SFS\r\n");
             syscall::print("  say <text> Print text\r\n");
             syscall::print("  sl         Run an animated steam locomotive\r\n");
             syscall::print("  mkdir <path>\r\n");
@@ -245,9 +256,11 @@ fn execute(command: &str) {
             hexdump(sector);
         }
         Some("sfsinfo") => sfs_info(),
+        Some("memtest") => memtest(),
         Some("ping") => ping_command(words.next()),
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
+        Some("touch") => touch_command(words.next()),
         Some("run") => run_elf(words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
         Some("mkdir") => make_directory(words.next()),
@@ -315,7 +328,10 @@ fn disk_read(sector: u64) {
         return;
     };
 
-    let request = ipc::Message::new(0, &sector.to_le_bytes());
+    let mut request_payload = [0_u8; 9];
+    request_payload[0] = 1; // OP_READ_SECTOR
+    request_payload[1..9].copy_from_slice(&sector.to_le_bytes());
+    let request = ipc::Message::new(0, &request_payload);
     if !syscall::send(driver, &request) {
         syscall::print("DISK READ FAILED\r\n");
         return;
@@ -399,7 +415,10 @@ fn hexdump(sector: u64) {
         return;
     };
 
-    let request = ipc::Message::new(0, &sector.to_le_bytes());
+    let mut request_payload = [0_u8; 9];
+    request_payload[0] = 1; // OP_READ_SECTOR
+    request_payload[1..9].copy_from_slice(&sector.to_le_bytes());
+    let request = ipc::Message::new(0, &request_payload);
     if !syscall::send(driver, &request) {
         syscall::print("HEXDUMP FAILED\r\n");
         return;
@@ -832,52 +851,194 @@ fn unquote(text: &str) -> &str {
 }
 
 fn write_file(path: &str, text: &str, append: bool) {
-    if path.is_empty() {
+    if path.is_empty() || path.len() > SFS_NAME_MAX {
         syscall::print("echo: invalid destination\r\n");
         return;
     }
-    let flags = if append {
-        syscall::OPEN_WRITE | syscall::OPEN_APPEND
-    } else {
-        syscall::OPEN_WRITE
-    };
-    let fd = if append {
-        let mut fd = syscall::fs_open(path, flags);
-        if fd.is_none() {
-            if !syscall::fs_create(path) {
-                syscall::print("echo: cannot create file\r\n");
-                return;
-            }
-            fd = syscall::fs_open(path, flags);
-        }
-        fd
-    } else {
-        if !syscall::fs_create(path) {
-            syscall::print("echo: cannot create file\r\n");
-            return;
-        }
-        syscall::fs_open(path, flags)
-    };
-    let Some(fd) = fd else {
-        syscall::print("echo: cannot open file\r\n");
+    let Some(server) = find_task_id(syscall::PROGRAM_SFS_SERVER) else {
+        syscall::print("SFS SERVER NOT RUNNING\r\n");
         return;
     };
-    let ok = write_all(fd, text.as_bytes()) && write_all(fd, b"\r\n");
-    syscall::fs_close(fd);
-    if !ok {
-        syscall::print("echo: write failed\r\n");
-    }
+
+    // Assemble the data; append first reads the file's current content.
+    let mut data = [0_u8; SFS_NAME_DATA_LIMIT];
+    let data_len = if append {
+        let mut existing = [0_u8; SFS_NAME_DATA_LIMIT];
+        match sfs_read_file(server, path, &mut existing) {
+            Some(existing_len) => {
+                let total = existing_len + text.len();
+                if total > SFS_NAME_DATA_LIMIT {
+                    syscall::print("echo: result too long for SFS write\r\n");
+                    return;
+                }
+                data[..existing_len].copy_from_slice(&existing[..existing_len]);
+                data[existing_len..total].copy_from_slice(text.as_bytes());
+                total
+            }
+            None => {
+                let len = text.len();
+                if len > SFS_NAME_DATA_LIMIT - path.len() {
+                    syscall::print("echo: text too long for SFS write\r\n");
+                    return;
+                }
+                data[..len].copy_from_slice(text.as_bytes());
+                len
+            }
+        }
+    } else {
+        let len = text.len();
+        if len > SFS_NAME_DATA_LIMIT - path.len() {
+            syscall::print("echo: text too long for SFS write\r\n");
+            return;
+        }
+        data[..len].copy_from_slice(text.as_bytes());
+        len
+    };
+
+    sfs_write_file(server, path, &data[..data_len]);
 }
 
-fn write_all(fd: u64, bytes: &[u8]) -> bool {
-    let mut written = 0;
-    while written < bytes.len() {
-        match syscall::fs_write(fd, &bytes[written..]) {
-            Some(0) | None => return false,
-            Some(count) => written += count,
+/// Reads a file's contents through the filesystem server. Returns the number of
+/// bytes written into `buffer`, or `None` when the file is missing/unreadable.
+fn sfs_read_file(server: u64, path: &str, buffer: &mut [u8]) -> Option<usize> {
+    let mut payload = [0_u8; 32];
+    payload[0] = SFS_OP_READ_FILE;
+    payload[1] = path.len() as u8;
+    payload[2..2 + path.len()].copy_from_slice(path.as_bytes());
+    if !syscall::send(server, &ipc::Message::new(0, &payload)) {
+        return None;
+    }
+    let mut response = ipc::Message::new(0, &[]);
+    if !receive_from(server, &mut response) || response.payload[0] != 1 {
+        return None;
+    }
+    let size = u32::from_le_bytes(response.payload[1..5].try_into().unwrap()) as usize;
+    let len = size.min(buffer.len()).min(27);
+    buffer[..len].copy_from_slice(&response.payload[5..5 + len]);
+    Some(len)
+}
+
+/// Sends a write-file request and prints the outcome (inode, size, blocks).
+fn sfs_write_file(server: u64, path: &str, data: &[u8]) {
+    let mut payload = [0_u8; 32];
+    payload[0] = SFS_OP_WRITE_FILE;
+    payload[1] = path.len() as u8;
+    payload[2..2 + path.len()].copy_from_slice(path.as_bytes());
+    payload[2 + path.len()] = data.len() as u8;
+    payload[3 + path.len()..3 + path.len() + data.len()].copy_from_slice(data);
+    if !syscall::send(server, &ipc::Message::new(0, &payload)) {
+        syscall::print("echo: SFS server not responding\r\n");
+        return;
+    }
+    let mut response = ipc::Message::new(0, &[]);
+    if !receive_from(server, &mut response) || response.payload[0] != 1 {
+        syscall::print("echo: SFS write failed\r\n");
+        return;
+    }
+    let inode = u32::from_le_bytes(response.payload[1..5].try_into().unwrap());
+    let size = u32::from_le_bytes(response.payload[5..9].try_into().unwrap());
+    let nblocks = usize::from(response.payload[9]);
+    syscall::print("SFS: wrote ");
+    syscall::print_dec_u64(u64::from(size));
+    syscall::print(" bytes to inode ");
+    syscall::print_dec_u64(u64::from(inode));
+    if nblocks > 0 {
+        syscall::print(" (blocks:");
+        for index in 0..nblocks {
+            let offset = 10 + index * 4;
+            let block =
+                u32::from_le_bytes(response.payload[offset..offset + 4].try_into().unwrap());
+            syscall::print(" ");
+            syscall::print_dec_u64(u64::from(block));
+        }
+        syscall::print(")");
+    }
+    syscall::print("\r\n");
+}
+
+fn touch_command(path: Option<&str>) {
+    let Some(path) = path else {
+        syscall::print("Usage: touch <file>\r\n");
+        return;
+    };
+    if path.is_empty() || path.len() > SFS_NAME_MAX {
+        syscall::print("touch: invalid path\r\n");
+        return;
+    }
+    let Some(server) = find_task_id(syscall::PROGRAM_SFS_SERVER) else {
+        syscall::print("SFS SERVER NOT RUNNING\r\n");
+        return;
+    };
+    let mut payload = [0_u8; 32];
+    payload[0] = SFS_OP_TOUCH;
+    payload[1] = path.len() as u8;
+    payload[2..2 + path.len()].copy_from_slice(path.as_bytes());
+    if !syscall::send(server, &ipc::Message::new(0, &payload)) {
+        syscall::print("touch: SFS server not responding\r\n");
+        return;
+    }
+    let mut response = ipc::Message::new(0, &[]);
+    if !receive_from(server, &mut response) || response.payload[0] != 1 {
+        syscall::print("touch: failed\r\n");
+        return;
+    }
+    let inode = u32::from_le_bytes(response.payload[1..5].try_into().unwrap());
+    syscall::print("touch: created inode ");
+    syscall::print_dec_u64(u64::from(inode));
+    syscall::print("\r\n");
+}
+
+/// Exercises `SYS_MMAP`: map 1 MiB of anonymous memory, write a string and a
+/// byte pattern, read both back, then unmap.
+fn memtest() {
+    const SIZE: usize = 1024 * 1024;
+    let Some(base) = syscall::mmap(0, SIZE, syscall::PROT_READ | syscall::PROT_WRITE) else {
+        syscall::print("memtest: mmap failed\r\n");
+        return;
+    };
+    syscall::print("memtest: mapped 1 MiB at 0x");
+    syscall::print_hex_u64(base as u64);
+    syscall::print("\r\n");
+
+    let pointer = base as *mut u8;
+    let message = b"Silver memtest!";
+    for (index, &byte) in message.iter().enumerate() {
+        unsafe { core::ptr::write_volatile(pointer.add(index), byte) };
+    }
+
+    let mut round_trip = true;
+    for (index, &byte) in message.iter().enumerate() {
+        if unsafe { core::ptr::read_volatile(pointer.add(index)) } != byte {
+            round_trip = false;
         }
     }
-    true
+    syscall::print(if round_trip {
+        "memtest: string round-trip OK (\"Silver memtest!\")\r\n"
+    } else {
+        "memtest: string MISMATCH\r\n"
+    });
+
+    for index in 0..SIZE {
+        unsafe { core::ptr::write_volatile(pointer.add(index), (index & 0xFF) as u8) };
+    }
+    let mut pattern_ok = true;
+    for index in 0..SIZE {
+        if unsafe { core::ptr::read_volatile(pointer.add(index)) } != (index & 0xFF) as u8 {
+            pattern_ok = false;
+            break;
+        }
+    }
+    syscall::print(if pattern_ok {
+        "memtest: 1 MiB pattern OK\r\n"
+    } else {
+        "memtest: 1 MiB pattern MISMATCH\r\n"
+    });
+
+    if syscall::munmap(base, SIZE) {
+        syscall::print("memtest: unmapped\r\n");
+    } else {
+        syscall::print("memtest: munmap failed\r\n");
+    }
 }
 
 fn make_directory(path: Option<&str>) {
