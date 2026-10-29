@@ -23,8 +23,17 @@ impl MemoryRegion {
 }
 
 pub const PAGE_SIZE: usize = 4096;
+#[cfg(not(feature = "tablet"))]
 pub const DRAM_BASE: usize = 0x4000_0000;
+#[cfg(not(feature = "tablet"))]
 pub const DRAM_SIZE: usize = 128 * 1024 * 1024;
+/// Tablet (SM8650): the kernel Image is loaded at 0xA800_0000 by ABL, inside a
+/// 1 GiB window mapped from 0x8000_0000. The first boot uses this window; the
+/// full fragmented map (6 GiB high chunk) comes later.
+#[cfg(feature = "tablet")]
+pub const DRAM_BASE: usize = 0x8000_0000;
+#[cfg(feature = "tablet")]
+pub const DRAM_SIZE: usize = 0x4000_0000;
 pub const DRAM_END: usize = DRAM_BASE + DRAM_SIZE;
 pub const DRAM: MemoryRegion = MemoryRegion::new(DRAM_BASE, DRAM_END);
 

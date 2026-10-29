@@ -15,9 +15,9 @@ pub const CRASH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/crash.elf
 /// Seeds the bootstrap files into the already-initialized VFS.
 pub fn seed() {
     if crate::vfs::seed_file("/", "/bin/hello", HELLO_ELF).is_err() {
-        crate::pl011::write_str("SEED: failed to seed /bin/hello\r\n");
+        crate::console::write_str("SEED: failed to seed /bin/hello\r\n");
     }
     if crate::vfs::seed_file("/", "/bin/crash", CRASH_ELF).is_err() {
-        crate::pl011::write_str("SEED: failed to seed /bin/crash\r\n");
+        crate::console::write_str("SEED: failed to seed /bin/crash\r\n");
     }
 }

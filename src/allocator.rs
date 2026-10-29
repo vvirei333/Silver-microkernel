@@ -2,7 +2,7 @@ use core::alloc::{GlobalAlloc, Layout};
 
 use linked_list_allocator::LockedHeap;
 
-use crate::{exceptions, frame_allocator, memory, pl011};
+use crate::{exceptions, frame_allocator, memory, console};
 
 pub const HEAP_PAGES: usize = 256;
 pub const HEAP_SIZE: usize = HEAP_PAGES * crate::memory::PAGE_SIZE;
@@ -49,9 +49,9 @@ pub fn init() -> Option<usize> {
 // `#[alloc_error_handler]` is unstable on Rust 1.99, so GlobalAlloc intercepts
 // a failed allocation and reports it here before entering the kernel panic path.
 fn allocation_error(layout: Layout) -> ! {
-    pl011::write_str("ALLOCATION ERROR\r\nSIZE=");
-    pl011::write_hex_u64(layout.size() as u64);
-    pl011::write_str("\r\nALIGN=");
-    pl011::write_hex_u64(layout.align() as u64);
+    console::write_str("ALLOCATION ERROR\r\nSIZE=");
+    console::write_hex_u64(layout.size() as u64);
+    console::write_str("\r\nALIGN=");
+    console::write_hex_u64(layout.align() as u64);
     exceptions::silver_handle_exception(7, 0, 0, 0)
 }

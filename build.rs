@@ -7,12 +7,28 @@ fn main() {
         return;
     }
 
+    // Link the kernel at the platform's load address: QEMU `virt` places DRAM
+    // at 0x4000_0000, the tablet's ABL loads the Image at 0xA800_0000. The
+    // linker script also defines `__dram_base` for the boot stub and `mmu.rs`.
+    let linker = if env::var_os("CARGO_FEATURE_TABLET").is_some() {
+        "linker_tablet.ld"
+    } else {
+        "linker.ld"
+    };
+    println!("cargo:rustc-link-arg=-T{linker}");
+
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let profile = env::var("PROFILE").unwrap();
     let target_dir = root.join("target").join("userspace");
     let cargo = env::var_os("CARGO").unwrap();
     let mut command = Command::new(cargo);
+    // The kernel's RUSTFLAGS (linker script selection) must NOT leak into the
+    // userspace sub-build: userspace has its own `-Tlinker.ld` in
+    // userspace/.cargo/config.toml, and an inherited CARGO_ENCODED_RUSTFLAGS
+    // would override it and link the user binaries at the wrong address.
     command
+        .env_remove("RUSTFLAGS")
+        .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .current_dir(root.join("userspace"))
         .arg("build")
         .arg("--target")

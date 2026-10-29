@@ -12,7 +12,7 @@
 use alloc::{vec, vec::Vec};
 
 use crate::{
-    capability, channel, elf, frame_allocator, ipc, memory, mmu, mutex, pl011, scheduler, timer,
+    capability, channel, elf, frame_allocator, ipc, memory, mmu, mutex, console, scheduler, timer,
     user_memory, vfs,
 };
 
@@ -158,7 +158,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             .unwrap_or(SYSCALL_ERROR),
         SYS_READ => {
             if scheduler::current_task_owns_console() {
-                pl011::read_byte().map(u64::from).unwrap_or(SYSCALL_ERROR)
+                console::read_byte().map(u64::from).unwrap_or(SYSCALL_ERROR)
             } else {
                 SYSCALL_ERROR
             }
@@ -353,7 +353,7 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
 /// exits; the call never returns. The write is a raw PL011 poke (visible
 /// regardless of console ownership) so the shutdown is observable first.
 fn sys_power_off() -> u64 {
-    pl011::write_str("POWER OFF: PSCI SYSTEM_OFF\r\n");
+    console::write_str("POWER OFF: PSCI SYSTEM_OFF\r\n");
     unsafe {
         core::arch::asm!(
             "hvc #0",
@@ -367,7 +367,7 @@ fn sys_power_off() -> u64 {
     // SYSTEM_OFF does not return; a missing PSCI/EL2 traps here as an EL1
     // exception and halts (see silver_handle_exception). This line is defensive
     // only, in case some platform's firmware returns without powering down.
-    pl011::write_str("POWER OFF: PSCI returned (unexpected)\r\n");
+    console::write_str("POWER OFF: PSCI returned (unexpected)\r\n");
     0
 }
 
@@ -594,7 +594,7 @@ fn sys_meminfo(info_ptr: u64) -> u64 {
 
 fn sys_print(ptr: u64, len: u64) -> u64 {
     // Background output is deliberately discarded in the interactive MVP.
-    // Kernel diagnostics use pl011 directly and remain visible for all tasks.
+    // Kernel diagnostics use console directly and remain visible for all tasks.
     if !scheduler::current_task_owns_console() {
         return 0;
     }
@@ -649,7 +649,7 @@ fn sys_print_dec(value: u64) -> u64 {
 
 #[cfg(feature = "demo-tasks")]
 fn write_console_bytes(bytes: &[u8]) {
-    pl011::write_bytes(bytes);
+    console::write_bytes(bytes);
 }
 
 #[cfg(not(feature = "demo-tasks"))]
@@ -662,7 +662,7 @@ fn write_console_bytes(bytes: &[u8]) {
     // be hardcoded: another task reusing that ID would swallow the output.
     // Before Howler binds INTID 33 the kernel writes to PL011 directly.
     let Some(sink) = scheduler::console_sink_task() else {
-        pl011::write_bytes(bytes);
+        console::write_bytes(bytes);
         return;
     };
 
@@ -681,7 +681,7 @@ fn write_console_bytes(bytes: &[u8]) {
                 scheduler::notify_bound_task(sink);
                 scheduler::yield_current();
             }
-            Err(ipc::SendError::TargetDead) => pl011::write_bytes(chunk),
+            Err(ipc::SendError::TargetDead) => console::write_bytes(chunk),
             Err(ipc::SendError::QueueFull) => return,
         }
     }

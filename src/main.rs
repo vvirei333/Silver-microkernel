@@ -7,11 +7,15 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 mod allocator;
 #[cfg(not(feature = "std"))]
+mod boot_metrics;
+#[cfg(not(feature = "std"))]
 mod capability;
 #[cfg(not(feature = "std"))]
 mod channel;
 #[cfg(not(feature = "std"))]
 mod condvar;
+#[cfg(not(feature = "std"))]
+mod console;
 #[cfg(not(feature = "std"))]
 mod elf;
 #[cfg(not(feature = "std"))]
@@ -20,6 +24,8 @@ mod elf_loader;
 mod exceptions;
 #[cfg(not(feature = "std"))]
 mod frame_allocator;
+#[cfg(not(feature = "std"))]
+mod geni_uart;
 #[cfg(not(feature = "std"))]
 mod gic;
 #[cfg(not(feature = "std"))]
@@ -34,6 +40,8 @@ mod mmu;
 mod mutex;
 #[cfg(not(feature = "std"))]
 mod pl011;
+#[cfg(not(feature = "std"))]
+mod platform;
 #[cfg(not(feature = "std"))]
 mod scheduler;
 #[cfg(not(feature = "std"))]
@@ -126,13 +134,18 @@ _start:
     add x8, x5, #12288
     add x9, x5, #16384
 
+    ldr x15, =__dram_base
+
     orr x10, x7, #3
     str x10, [x5]
     str x10, [x6]
     orr x10, x8, #3
     str x10, [x7]
+    // DRAM L1 slot = __dram_base >> 30 (identity alias at the right index).
+    lsr x16, x15, #30
+    lsl x16, x16, #3
     orr x10, x9, #3
-    str x10, [x7, #8]
+    str x10, [x7, x16]
 
     // 512 x 2 MB blocks per gigabyte. Attr1 device-nGnRnE for MMIO,
     // attr0 normal WB inner-shareable for DRAM; AP=EL1_RW, AF=1, UXN=1.
@@ -142,7 +155,6 @@ _start:
     movk x13, #0x40, lsl #48
     mov x14, #0x701
     movk x14, #0x40, lsl #48
-    mov x15, #0x40000000
 1:
     lsl x16, x11, #21
     orr x17, x16, x13
@@ -416,13 +428,21 @@ exception_dispatch:
 #[cfg(not(feature = "std"))]
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
+    boot_metrics::mark_boot_start();
+
     mmu::init();
 
     let memory_map = memory::current();
     let available_pages = frame_allocator::init(memory_map.available);
 
-    pl011::init();
-    pl011::write_str("MMU=OK\r\n");
+    console::init();
+    if platform::detect().is_tablet() {
+        console::write_str("PLATFORM=SM8650\r\n");
+    } else {
+        console::write_str("PLATFORM=QEMU\r\n");
+    }
+    console::write_str("MMU=OK\r\n");
+    boot_metrics::log_milestone("MMU init");
 
     if !memory_map.is_valid() || available_pages == 0 || !frame_allocator::run_self_test() {
         exceptions::silver_handle_exception(6, 0, 0, 0);
@@ -435,15 +455,25 @@ pub extern "C" fn kernel_main() -> ! {
     let value = alloc::boxed::Box::new(42_u64);
     let value_address = (&*value as *const u64) as usize;
 
-    pl011::write_str("HEAP=OK BASE=");
-    pl011::write_hex_u64(heap_base as u64);
-    pl011::write_str(" VALUE=");
-    pl011::write_hex_u64(*value);
-    pl011::write_str(" ADDR=");
-    pl011::write_hex_u64(value_address as u64);
-    pl011::write_str("\r\n");
+    console::write_str("HEAP=OK BASE=");
+    console::write_hex_u64(heap_base as u64);
+    console::write_str(" VALUE=");
+    console::write_hex_u64(*value);
+    console::write_str(" ADDR=");
+    console::write_hex_u64(value_address as u64);
+    console::write_str("\r\n");
+    boot_metrics::log_milestone("Heap init");
 
     drop(value);
+
+    if platform::detect().is_tablet() {
+        // First tablet boot: MMU + memory + GENI UART are up. GICv3, the timer
+        // PPI and the scheduler (which spawns user tasks) are the next step.
+        console::write_str("TABLET BOOT OK — halting (GIC/scheduler next)\r\n");
+        loop {
+            core::hint::spin_loop();
+        }
+    }
 
     gic::init();
     timer::init();
@@ -451,13 +481,14 @@ pub extern "C" fn kernel_main() -> ! {
     seed::seed();
     scheduler::init();
 
-    pl011::write_str("IRQ READY\r\n");
+    console::write_str("IRQ READY\r\n");
 
     for &byte in b"HELLO, WORLD!\r\n" {
-        pl011::write_byte(byte);
+        console::write_byte(byte);
     }
 
-    pl011::write_str("SCHEDULER START\r\n");
+    boot_metrics::log_milestone("Scheduler start");
+    console::write_str("SCHEDULER START\r\n");
     scheduler::start();
 }
 
@@ -465,16 +496,16 @@ pub extern "C" fn kernel_main() -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     if let Some(location) = info.location() {
-        pl011::write_str("PANIC AT ");
-        pl011::write_str(location.file());
-        pl011::write_str(":");
-        pl011::write_dec_u64(location.line() as u64);
-        pl011::write_str("\r\n");
+        console::write_str("PANIC AT ");
+        console::write_str(location.file());
+        console::write_str(":");
+        console::write_dec_u64(location.line() as u64);
+        console::write_str("\r\n");
     }
     if let Some(message) = info.message().as_str() {
-        pl011::write_str("PANIC MSG ");
-        pl011::write_str(message);
-        pl011::write_str("\r\n");
+        console::write_str("PANIC MSG ");
+        console::write_str(message);
+        console::write_str("\r\n");
     }
     exceptions::silver_handle_exception(4, 0, 0, 0)
 }

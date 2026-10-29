@@ -17,6 +17,8 @@ const GRANULE: usize = 4096;
 const TABLE_BYTES: usize = ENTRIES * 8;
 const BLOCK_2M: usize = 0x20_0000;
 const PHYSICAL_ADDRESS_LIMIT: usize = 1 << 40;
+/// L1 slot that maps the DRAM gigabyte; identity (VA == PA) at the right index.
+const DRAM_L1_INDEX: usize = DRAM_BASE >> 30;
 
 const DESC_TABLE: u64 = 0b11;
 const DESC_BLOCK: u64 = 0b01;
@@ -25,21 +27,24 @@ const DESC_PAGE: u64 = 0b11;
 /// Private 4 KB data window: L0 index 1, then L1/L2/L3 index 0.
 pub const PRIVATE_WINDOW_VA: usize = 0x0000_0080_0000_0000;
 const PRIVATE_WINDOW_L0_INDEX: usize = (PRIVATE_WINDOW_VA >> 39) & 0x1FF;
+/// Physical base of the user address space (the 2 MB user ELF image loads here).
+/// In QEMU this is the DRAM base (0x4000_0000); on the tablet it is 0x8000_0000.
+pub const USER_IMAGE_VA: usize = DRAM_BASE;
 /// A sparse, per-task heap window immediately after the 2 MB ELF image.
 /// Its L3 table is installed at spawn, while data pages are mapped by `brk`.
-pub const USER_HEAP_VA: usize = 0x0000_0000_4020_0000;
+pub const USER_HEAP_VA: usize = USER_IMAGE_VA + 0x20_0000;
 pub const USER_HEAP_MAX_PAGES: usize = 512;
 pub const USER_HEAP_MAX_SIZE: usize = USER_HEAP_MAX_PAGES * GRANULE;
 const USER_HEAP_L2_INDEX: usize = (USER_HEAP_VA - DRAM_BASE) / BLOCK_2M;
 
 /// Every task's own stack appears at this user VA, backed by different PAs.
-pub const USER_STACK_VA: usize = 0x0000_0000_7FE0_0000;
+pub const USER_STACK_VA: usize = USER_IMAGE_VA + 0x3FE0_0000;
 pub const USER_STACK_PAGES: usize = 2;
 pub const USER_STACK_SIZE: usize = USER_STACK_PAGES * GRANULE;
 const USER_STACK_L2_INDEX: usize = (USER_STACK_VA - DRAM_BASE) / BLOCK_2M;
 
 /// A 2 MB first-fit window for explicitly authorized user MMIO and DMA mappings.
-pub const USER_MMIO_VA: usize = 0x0000_0000_8000_0000;
+pub const USER_MMIO_VA: usize = USER_IMAGE_VA + 0x4000_0000;
 pub const USER_DMA_MAX_SIZE: usize = ENTRIES * GRANULE;
 const USER_MMIO_L1_INDEX: usize = (USER_MMIO_VA >> 30) & 0x1FF;
 const USER_MMIO_L2_INDEX: usize = 0;
@@ -53,8 +58,8 @@ const PCI_ECAM_L2_BLOCKS: usize = PCI_ECAM_SIZE / BLOCK_2M;
 /// Anonymous `mmap` region: a large window between the sparse heap and the user
 /// stack where `SYS_MMAP` places kernel-chosen mappings. It spans the free
 /// `l2_user` slots, so page tables are only allocated once a mapping is placed.
-pub const USER_MMAP_VA: usize = 0x0000_0000_4040_0000;
-pub const USER_MMAP_MAX_VA: usize = 0x0000_0000_7FE0_0000; // == USER_STACK_VA
+pub const USER_MMAP_VA: usize = USER_IMAGE_VA + 0x40_0000;
+pub const USER_MMAP_MAX_VA: usize = USER_STACK_VA; // == USER_STACK_VA
 
 /// `prot` bits for anonymous mappings. Read is always granted; these flags
 /// select write and execute in `user_anonymous_page`.
@@ -137,7 +142,7 @@ pub fn init() {
         low0.entries[0] = 0;
         high0.entries[0] = table_descriptor(level1);
         level1.entries[0] = table_descriptor(mmio);
-        level1.entries[1] = table_descriptor(dram);
+        level1.entries[DRAM_L1_INDEX] = table_descriptor(dram);
         level1.entries[PCI_ECAM_L1_INDEX] = table_descriptor(pci);
 
         for index in 0..ENTRIES {
@@ -526,7 +531,7 @@ pub fn map_dma_to_user(
     phys_addr: usize,
     size: usize,
 ) -> Option<usize> {
-    crate::pl011::write_str("MMU: map_dma_to_user called\r\n");
+    crate::console::write_str("MMU: map_dma_to_user called\r\n");
     if size == 0 || phys_addr % GRANULE != 0 || size % GRANULE != 0 {
         return None;
     }

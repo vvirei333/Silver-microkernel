@@ -12,6 +12,7 @@ SECTIONS
     /* High-half VMA, low physical LMA. QEMU loads the ELF at the physical
        addresses and starts at __boot_entry with the MMU still disabled. */
     __kernel_virt_base = 0xFFFF000000000000;
+    __dram_base = 0x40000000;
     . = 0xFFFF000040080000;
     __kernel_start = .;
     __text_start = .;

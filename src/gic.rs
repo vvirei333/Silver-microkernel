@@ -1,6 +1,6 @@
 use core::ptr;
 
-use crate::{exceptions, memory, pl011, scheduler, timer};
+use crate::{exceptions, memory, console, scheduler, timer};
 
 pub const TIMER_IRQ: u32 = 30;
 /// QEMU virt DTB: PL011 is SPI 1, so its GIC interrupt ID is 32 + 1.
@@ -101,8 +101,8 @@ pub extern "C" fn silver_handle_irq() {
             scheduler::schedule();
         }
         UART_IRQ => {
-            pl011::handle_irq();
-            let stopped = pl011::take_stop_request() && scheduler::stop_console_owner();
+            console::handle_irq();
+            let stopped = console::take_stop_request() && scheduler::stop_console_owner();
             end_interrupt(acknowledge_register);
             // Ordinary input only fills the RX queue. Ctrl-Z changes scheduler
             // state and must switch back to the shell immediately.
