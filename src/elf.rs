@@ -1,4 +1,4 @@
-//! ELF64 loader for dynamically loaded (SFS-backed) Ring 3 programs.
+//! ELF64 loader for dynamically loaded (SFS-backed) EL0 (userspace) programs.
 //!
 //! This is the *new* loading path for Phase 2. It parses a static `ET_EXEC`
 //! AArch64 ELF64 image, maps its `PT_LOAD` segments into fresh physical pages,

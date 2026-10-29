@@ -14,6 +14,10 @@ use core::panic::PanicInfo;
 const LINE_CAPACITY: usize = 96;
 const TICKS_PER_SECOND: u64 = 100;
 const MIB: u64 = 1024 * 1024;
+/// IPC opcode for a button press reported by `gpu_driver` (the shell owns the
+/// console, so it prints `GUI: Button '<name>' pressed!`). Matches the value in
+/// `gpu_driver.rs`.
+const GUI_BUTTON_PRESSED: u8 = 2;
 
 const TASK_LIST_CAPACITY: usize = 32;
 const EMPTY_TASK: syscall::TaskInfo = syscall::TaskInfo {
@@ -39,6 +43,7 @@ const LOGO: &str = include_str!("../../../logo.txt");
 pub extern "C" fn _start(howler_id: u64) -> ! {
     syscall::print("\x1b[2J\x1b[H");
     fastfetch();
+    syscall::register("howl");
     syscall::print("\r\nhowl ready. Type 'help' for commands.\r\n");
     prompt();
 
@@ -133,8 +138,25 @@ fn read_input(howler: &mut HowlerLink) -> Option<u8> {
         if message.sender == howler_id && message.payload[0] == 0 {
             return Some(message.payload[1]);
         }
+        if message.payload[0] == GUI_BUTTON_PRESSED {
+            report_gui_press(&message.payload[1..]);
+        }
     }
     None
+}
+
+/// Prints a button-press notification received from `gpu_driver`. This is what
+/// makes a GUI click visible in the console: `gpu_driver` does not own the
+/// console, so its own `syscall::print` would be discarded.
+fn report_gui_press(label: &[u8]) {
+    let end = label
+        .iter()
+        .position(|&byte| byte == 0)
+        .unwrap_or(label.len());
+    let name = core::str::from_utf8(&label[..end]).unwrap_or("?");
+    syscall::print("GUI: Button '");
+    syscall::print(name);
+    syscall::print("' pressed!\r\n");
 }
 
 fn execute(command: &str) {

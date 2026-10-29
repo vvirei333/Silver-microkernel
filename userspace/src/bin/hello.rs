@@ -1,4 +1,4 @@
-//! Minimal Ring 3 program used to exercise the dynamic ELF loader (Phase 2).
+//! Minimal EL0 (userspace) program used to exercise the dynamic ELF loader (Phase 2).
 //!
 //! This program is intentionally NOT embedded into the kernel via
 //! `include_bytes!`. It builds alongside the other userspace binaries as a

@@ -1,4 +1,4 @@
-//! Ring 3 graphics driver: a static "engineer menu" on QEMU `virt`.
+//! EL0 (userspace) graphics driver: a static "engineer menu" on QEMU `virt`.
 //!
 //! `virt` has no PL111 (that LCD controller lives on realview/vexpress/
 //! versatile boards), so this driver uses QEMU's native `ramfb` device instead:
@@ -107,6 +107,10 @@ static mut UI: UiState = UiState {
     pressed_btn: None,
 };
 
+/// Cached shell (Howl) task ID, resolved lazily via the nameserver at the first
+/// click so button presses can be reported to the console owner.
+static mut HOWL_ID: Option<u64> = None;
+
 /// Center 3 x 2 button grid geometry (shared by drawing and hit-testing).
 const BUTTON_W: u32 = 120;
 const BUTTON_H: u32 = 60;
@@ -116,6 +120,9 @@ const BUTTON_GRID_Y: u32 = 150;
 const BUTTON_LABELS: [&str; 6] = ["Phone", "SMS", "Web", "Media", "Power", "Settings"];
 /// Index of "Power" in [`BUTTON_LABELS`]; clicking it shuts the machine down.
 const POWER_BUTTON_INDEX: usize = 4;
+/// IPC opcode for a button press reported to the shell (which owns the console).
+/// `0` and `1` are taken by Howler input and pointer samples respectively.
+const GUI_BUTTON_PRESSED: u8 = 2;
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -209,15 +216,45 @@ fn handle_pointer(input: input_proto::InputMsg) {
         }
     } else if let Some(index) = ui.pressed_btn.take() {
         // The button reverts to its normal colour because `render` no longer
-        // sees it as pressed; report the click.
-        syscall::print("Button clicked!\r\n");
+        // sees it as pressed. Report the click to the shell, which owns the
+        // console (this driver's own `syscall::print` is discarded).
+        notify_press(index);
         if index == POWER_BUTTON_INDEX {
-            syscall::print("Power: shutting down...\r\n");
             syscall::power_off();
         }
     }
 
     render(ui.cursor_x, ui.cursor_y, ui.pressed_btn);
+}
+
+/// Reports a completed button click to the shell (Howl), which owns the console.
+/// The message carries the button label so the shell can print it without
+/// duplicating [`BUTTON_LABELS`]. `try_send` never blocks: if the shell's mailbox
+/// is full or it has died, the notification is simply dropped.
+fn notify_press(index: usize) {
+    let Some(howl) = resolve_howl() else {
+        return;
+    };
+    let label = BUTTON_LABELS[index].as_bytes();
+    let mut payload = [0_u8; ipc::PAYLOAD_SIZE];
+    payload[0] = GUI_BUTTON_PRESSED;
+    let len = label.len().min(ipc::PAYLOAD_SIZE - 1);
+    payload[1..1 + len].copy_from_slice(&label[..len]);
+    let message = ipc::Message::new(0, &payload[..1 + len]);
+    let _ = syscall::try_send(howl, &message);
+}
+
+/// Resolves the shell task through the nameserver, caching the result. Howl
+/// registers itself as `"howl"` at startup; the lookup happens lazily at click
+/// time, well after Howl has spawned, so the spawn order does not matter.
+fn resolve_howl() -> Option<u64> {
+    let cached = unsafe { HOWL_ID };
+    if cached.is_some() {
+        return cached;
+    }
+    let id = syscall::lookup("howl");
+    unsafe { HOWL_ID = id };
+    id
 }
 
 // ---------------------------------------------------------------------------

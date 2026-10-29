@@ -3,6 +3,25 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## State as of 2026-10-29 (visible GUI clicks; "EL0" terminology)
+
+Two polish items landed on top of the existing graphics/input work:
+
+- **Button clicks are now visible in the console.** `gpu_driver` no longer
+  relies on its own `syscall::print` (which the kernel drops because the driver
+  does not own the console). On a button release it sends an IPC message to the
+  shell, which owns the console and prints `GUI: Button '<name>' pressed!`.
+  Howl registers itself as `"howl"` at startup; `gpu_driver` resolves that name
+  lazily at the first click, so spawn order does not matter. The "Power" button
+  still also calls `syscall::power_off()`. The message uses IPC opcode `2`
+  (`GUI_BUTTON_PRESSED`), carrying the button label; `0`/`1` are already taken
+  by Howler input and pointer samples respectively.
+- **Terminology.** ARM64 has no "protection rings": user code runs at EL0 and
+  the kernel at EL1. "Ring 3" was replaced with "EL0" (or "EL0 (userspace)")
+  project-wide — README, handoff and source comments. Function/variable names
+  had no "ring" to rename; the virtqueue "used/available/descriptor ring" names
+  are the unrelated circular-buffer meaning and were left alone.
+
 ## State as of 2026-10-28 (power-off via PSCI; the GPU "Power" button shuts the machine down)
 
 **Power-off is complete and verified in QEMU.** Clicking the "Power" button on
@@ -17,10 +36,9 @@ the engineer menu shuts the virtual machine down through PSCI `SYSTEM_OFF`.
   `hvc` reaches the hypervisor's PSCI handler, QEMU prints "Power down" and
   exits. The call never returns. (The user's original spec said `smc #0`; HVC is
   the correct conduit for this machine.)
-- `userspace/src/bin/gpu_driver.rs`: the click handler now calls
-  `syscall::power_off()` when the released button is "Power" (index 4 in
-  `BUTTON_LABELS`). The `Button clicked!` / `Power: shutting down...` prints are
-  dropped (`gpu_driver` does not own the console), but the kernel's
+- `userspace/src/bin/gpu_driver.rs`: the click handler reports every release to
+  the shell over IPC (see the 2026-10-29 section) and calls `syscall::power_off()`
+  when the released button is "Power" (index 4 in `BUTTON_LABELS`). The kernel's
   `POWER OFF: PSCI SYSTEM_OFF` line is a raw PL011 write and always visible.
 
 ### Verification
@@ -39,8 +57,8 @@ hardening once multi-user isolation matters.
 
 ## State as of 2026-10-28 (Phase 7 complete: EL0 fault containment + task teardown)
 
-**Phase 7 (EL0 fault handling + teardown) is complete and verified in QEMU.** A
-Ring 3 task — embedded or dynamically loaded — that faults (bad pointer,
+**Phase 7 (EL0 fault handling + teardown) is complete and verified in QEMU.** An
+EL0 task — embedded or dynamically loaded — that faults (bad pointer,
 privileged MSR, EL1-only MMIO) is killed cleanly and the system keeps running.
 
 ```text
@@ -82,7 +100,7 @@ embedded boot chain is unchanged.
 ## State as of 2026-10-28 (Phase 6 complete: dynamic ELF loader)
 
 **Phase 6 (Dynamic ELF loading) is complete and verified in QEMU.** The kernel
-now loads an ELF64 file from the RAM-VFS into a fresh Ring 3 task, without the
+now loads an ELF64 file from the RAM-VFS into a fresh EL0 task, without the
 binary being embedded at build time. The shell command `run <path>` reads the
 file by path, the kernel parses and loads it, and the new task runs in EL0 with
 its own address space, stack and W^X page permissions.
@@ -277,9 +295,6 @@ restores `(0,90,181)` while "SMS" stays normal.
 - Input is polled at ~100 Hz, not IRQ-driven; virtio-input MSI-X/INTx is not
   wired. Absolute scaling assumes QEMU's `0..32767` range (the device-config
   `ABS_INFO` min/max is not read).
-- `Button clicked!` uses `syscall::print`, which the kernel drops because
-  `gpu_driver` does not own the console (Howl does). The only observable click
-  feedback today is the button colour change.
 - The input driver's BAR is fixed at `0x1030_0000` (assumes block `0x1010_0000`
   and net `0x1020_0000`).
 
@@ -302,7 +317,7 @@ virtqueue; the reply crosses the RX virtqueue and the RX mailbox; and smoltcp
 accepts it with a valid IPv4/ICMP checksum. `net_server` owns no console, so it
 relays `OP_PING_REPLY` to Howl, which prints the readable line.
 
-`net_driver` (Ring 3) owns the VirtIO-Net PCI function; `net_server` (Ring 3)
+`net_driver` (EL0) owns the VirtIO-Net PCI function; `net_server` (EL0)
 runs smoltcp. The two exchange only doorbells, and frame bytes travel through
 one shared DMA mailbox (see below). The shell reaches the stack over ordinary
 IPC with `OP_PING` / `OP_PING_REPLY`.
@@ -745,7 +760,7 @@ Changes in these files that must stay: the volatile zeroing plus fence in
 `read_superblock`, and the four `mmu.rs` fixes above.
 
 
-## State as of 2026-10-26 (DMA/PCI infrastructure and Ring 3 UART; historical)
+## State as of 2026-10-26 (DMA/PCI infrastructure and EL0 UART; historical)
 
 > Boot order, SFS and network status in this section are historical. The
 > 2026-10-28 section above is the current boot chain.
@@ -762,7 +777,7 @@ common/notify capabilities, split virtqueue, descriptor chain, `read_sector`,
 shared DMA reply buffer) but it does not implement SFS; the filesystem server is
 not started at boot.
 Howler maps PL011 and binds INTID 33. Normal user RX and TX both pass through
-Howler in Ring 3: input messages are `[0, byte]`, while output messages are
+Howler in EL0 (userspace): input messages are `[0, byte]`, while output messages are
 `[1, length, up to 30 bytes]`. `SYS_PRINT`, `SYS_PRINT_HEX` and `SYS_PRINT_DEC`
 chunk console output into nonblocking IPC messages to the current console sink.
 The sink is resolved at runtime by `scheduler::console_sink_task()`: the live task
@@ -1497,11 +1512,9 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   640x480 frame (clear + menu + cursor) on every pointer sample, with no
   dirty-region tracking; `ramfb` has no hardware flip or vsync. The input driver
   polls the virtio event queue at ~100 Hz instead of using a virtio IRQ, and
-  assumes QEMU's fixed `0..32767` absolute range. `Button clicked!` is printed
-  with `syscall::print` and therefore dropped, because `gpu_driver` does not own
-  the console. The input driver's 64 KiB BAR is fixed at `0x1030_0000`,
-  extending the fixed-BAR assumption already used by the block (`0x1010_0000`)
-  and net (`0x1020_0000`) drivers.
+  assumes QEMU's fixed `0..32767` absolute range. The input driver's 64 KiB BAR
+  is fixed at `0x1030_0000`, extending the fixed-BAR assumption already used by
+  the block (`0x1010_0000`) and net (`0x1020_0000`) drivers.
 - The EL1/kernel exception path now halts (`silver_handle_exception` dumps the
   registers and spins in a `wfe` loop) instead of resuming the current task;
   see the Phase 7 section. The remaining gap is that the halt is a bare spin —
@@ -1514,9 +1527,8 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 1. **Graphics/input polish.** Double-buffer the menu and repaint only the dirty
    region under the cursor/button instead of the whole frame; wire virtio-input
    interrupts to replace the 100 Hz poll; read `ABS_INFO` min/max from the
-   device config instead of assuming `0..32767`; give `gpu_driver` a visible
-   channel for its click feedback (a log channel or an on-screen status line);
-   and turn the six menu buttons into real actions.
+   device config instead of assuming `0..32767`; and turn the six menu buttons
+   into real actions.
 2. **Program credentials:** define which embedded programs a task may request;
    currently any task can still spawn the shell ELF. Capability delegation is
    available through `SYS_CAP_GRANT`.

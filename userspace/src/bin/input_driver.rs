@@ -1,4 +1,4 @@
-//! Ring 3 input driver for QEMU `virt`'s `virtio-tablet-pci`.
+//! EL0 (userspace) input driver for QEMU `virt`'s `virtio-tablet-pci`.
 //!
 //! A virtio-input tablet is a modern-only virtio device (`VIRTIO_ID_INPUT`,
 //! PCI device ID `0x1052`). It exposes a single event queue (queue 0) into

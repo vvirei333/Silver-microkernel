@@ -6,9 +6,9 @@
 //! (`run bin/hello`), which reads it back out of the VFS and ELF-loads it —
 //! proving the loader path without embedding the program in the kernel.
 
-/// The `hello` Ring 3 program, loaded dynamically by `run bin/hello`.
+/// The `hello` EL0 (userspace) program, loaded dynamically by `run bin/hello`.
 pub const HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
-/// The `crash` Ring 3 program, loaded dynamically by `run bin/crash`. It writes
+/// The `crash` EL0 (userspace) program, loaded dynamically by `run bin/crash`. It writes
 /// to `0x0` so the EL0 fault handler has a deterministic way to be exercised.
 pub const CRASH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/crash.elf"));
 

@@ -48,7 +48,7 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] Userspace `GlobalAlloc`: `Box`, growable `Vec` and deallocation in EL0
 - [x] W^X user mappings: R-X text, R-- rodata, RW-NX data/heap/stack/private memory
 - [x] No kernel image, kernel data, heap, kernel stacks or unauthorized MMIO in user TTBR0
-- [x] Tasks in EL0 (Ring 3): user stacks and SVC-only kernel access
+- [x] Tasks in EL0 (userspace): user stacks and SVC-only kernel access
 - [x] Capability-protected kill/wait/console/IRQ/MMIO operations and capability delegation
 - [x] Userspace UART driver: IRQ-bound RX plus IPC-routed input and output
 - [x] DMA infrastructure: contiguous frames and Normal Non-Cacheable user mappings
@@ -63,9 +63,9 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
 - [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
 - [x] Graphics driver: `ramfb` framebuffer through `fw_cfg` DMA, a 640x480 ARGB engineer menu with an 8x8 font
-- [x] Input driver: `virtio-tablet-pci` absolute pointer over a virtio event queue, IPC to the graphics driver, live cursor and button press/release
-- [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh Ring 3 task with its own W^X address space
-- [x] EL0 fault containment: a crashed Ring 3 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
+- [x] Input driver: `virtio-tablet-pci` absolute pointer over a virtio event queue, IPC to the graphics driver, live cursor, button press/release and console click notifications (`GUI: Button '<name>' pressed!`)
+- [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh EL0 task with its own W^X address space
+- [x] EL0 fault containment: a crashed EL0 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
 - [x] Power off: the GPU "Power" button shuts QEMU down via PSCI `SYSTEM_OFF`
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
 
@@ -119,7 +119,7 @@ the mouse with QMP `input-send-event`.
 
 ## Phase 6: Dynamic ELF loader — complete
 
-The kernel can now load an ELF64 binary from the RAM-VFS into a fresh Ring 3
+The kernel can now load an ELF64 binary from the RAM-VFS into a fresh EL0
 task — the binary no longer has to be embedded at build time. `src/elf.rs`
 parses the header and program table (`load_elf -> LoadedImage { physical_start,
 page_count, entry, kinds }`), allocates a frame per `PT_LOAD` page, copies file
@@ -150,7 +150,7 @@ same `elf::load_elf` (via the thin `elf_loader` shim).
 
 ## Phase 7: EL0 fault containment + teardown — complete
 
-A Ring 3 task that faults is killed cleanly and the kernel keeps running. The
+An EL0 task that faults is killed cleanly and the kernel keeps running. The
 sync-exception vector routes EL0 faults (bad pointer, privileged MSR, EL1-only
 MMIO) to `silver_handle_task_fault`, which logs `Task <id> killed: Page Fault at
 0x... (ESR: 0x...)` and kills only that task; its kernel stack, user stack,
