@@ -60,24 +60,70 @@ pub fn log(text: &str) {
 }
 
 // ---------------------------------------------------------------------------
-// Framebuffer progress: the cont_splash region (reserved-memory/splash_region,
-// 0xD5100000, 1600x2560 XRGB32) is live panel scanout — the firmware draws the
-// boot logo there and GRUB rendered its menu through it. Painting colored bars
-// after every milestone makes the boot progress visible with zero log
-// infrastructure: white=entry, green=MMU, yellow=frames, cyan=heap,
-// magenta=GIC, blue=VFS, full green=scheduler, full red=exception.
+// Framebuffer progress. The live panel scanout is the UEFI GOP framebuffer —
+// the very buffer GRUB renders its menu through, so the panel provably scans it
+// out. The EFI stub queries GOP and stashes {magic, base, width, height,
+// stride, format} at physical 0xA7FFE000; we read that here and paint colored
+// bars after every milestone, falling back to the cont_splash region
+// (0xD5100000) if the stub never ran. white=entry, green=MMU, yellow=frames,
+// cyan=heap, magenta=GIC, blue=VFS, full green=scheduler, full red=exception.
 // ---------------------------------------------------------------------------
 
-const FB_PHYS: usize = 0xD510_0000;
-const FB_WIDTH: usize = 1600;
-const FB_STRIDE: usize = FB_WIDTH * 4;
+const FB_INFO_ADDR: usize = 0xA7FF_E000;
+const FB_INFO_MAGIC: u64 = 0x4246_5245_564C_4953; // "SILVERFB" (LE)
+
+// Fallback (cont_splash) values, used when the EFI stub did not stash GOP info.
+const FB_PHYS_FB: usize = 0xD510_0000;
+const FB_WIDTH_FB: usize = 1600;
+const FB_HEIGHT_FB: usize = 2560;
+const FB_STRIDE_FB: usize = 1600; // pixels per scanline
+
 const BAR_HEIGHT: usize = 24;
 const BAR_BASE_Y: usize = 40;
 
 static BAR_INDEX: AtomicUsize = AtomicUsize::new(0);
 
-fn fb_color(r: u32, g: u32, b: u32) -> u32 {
-    0xFF00_0000 | (r << 16) | (g << 8) | b
+struct FbInfo {
+    base: usize,
+    width: usize,
+    height: usize,
+    stride: usize, // pixels per scanline
+    format: u32,
+}
+
+fn fb_info() -> FbInfo {
+    if ENABLED {
+        unsafe {
+            let p = phys_to_virt(FB_INFO_ADDR) as *const u64;
+            if p.read_volatile() == FB_INFO_MAGIC {
+                let p32 = p as *const u32;
+                return FbInfo {
+                    base: p.add(1).read_volatile() as usize,
+                    width: p32.add(4).read_volatile() as usize,
+                    height: p32.add(5).read_volatile() as usize,
+                    stride: p32.add(6).read_volatile() as usize,
+                    format: p32.add(7).read_volatile(),
+                };
+            }
+        }
+    }
+    FbInfo {
+        base: FB_PHYS_FB,
+        width: FB_WIDTH_FB,
+        height: FB_HEIGHT_FB,
+        stride: FB_STRIDE_FB,
+        format: 1,
+    }
+}
+
+fn fb_color(r: u32, g: u32, b: u32, format: u32) -> u32 {
+    if format == 0 {
+        // PixelRedGreenBlueReserved8BitPerColor: memory bytes [R][G][B][FF].
+        0xFF00_0000 | (b << 16) | (g << 8) | r
+    } else {
+        // PixelBlueGreenRedReserved8BitPerColor (default): bytes [B][G][R][FF].
+        0xFF00_0000 | (r << 16) | (g << 8) | b
+    }
 }
 
 /// Paints one progress bar and leaves the framebuffer base for the next.
@@ -85,20 +131,21 @@ pub fn fb_progress() {
     if !ENABLED {
         return;
     }
+    let info = fb_info();
     let colors = [
-        fb_color(255, 255, 255), // entry
-        fb_color(0, 255, 0),     // MMU
-        fb_color(255, 255, 0),   // frames
-        fb_color(0, 255, 255),   // heap
-        fb_color(255, 0, 255),   // GIC
-        fb_color(80, 80, 255),   // VFS
-        fb_color(0, 160, 0),     // scheduler
+        fb_color(255, 255, 255, info.format), // entry
+        fb_color(0, 255, 0, info.format),     // MMU
+        fb_color(255, 255, 0, info.format),   // frames
+        fb_color(0, 255, 255, info.format),   // heap
+        fb_color(255, 0, 255, info.format),   // GIC
+        fb_color(80, 80, 255, info.format),   // VFS
+        fb_color(0, 160, 0, info.format),     // scheduler
     ];
     let index = BAR_INDEX.fetch_add(1, Ordering::Relaxed);
     if index >= colors.len() {
         return;
     }
-    fb_rect(0, BAR_BASE_Y + index * BAR_HEIGHT, FB_WIDTH, BAR_HEIGHT, colors[index]);
+    fb_rect(0, BAR_BASE_Y + index * BAR_HEIGHT, info.width, BAR_HEIGHT, colors[index]);
 }
 
 /// Fills the whole screen — red on a kernel panic, green after scheduler start.
@@ -106,30 +153,36 @@ pub fn fb_fill(r: u32, g: u32, b: u32) {
     if !ENABLED {
         return;
     }
-    fb_rect(0, 0, FB_WIDTH, 2560, fb_color(r, g, b));
+    let info = fb_info();
+    let color = fb_color(r, g, b, info.format);
+    fb_rect(0, 0, info.width, info.height, color);
 }
 
 fn fb_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
-    let base = phys_to_virt(FB_PHYS) as *mut u32;
+    let info = fb_info();
+    let base = phys_to_virt(info.base) as *mut u32;
+    let stride_px = info.stride;
     for row in 0..h {
         let line = y + row;
-        if line >= 2560 {
+        if line >= info.height {
             break;
         }
+        let columns = w.min(info.width.saturating_sub(x));
         unsafe {
-            let row_ptr = base.add(line * FB_STRIDE / 4 + x);
-            for col in 0..w {
+            let row_ptr = base.add(line * stride_px + x);
+            for col in 0..columns {
                 row_ptr.add(col).write_volatile(color);
             }
         }
     }
-    clean_fb(x, y, w, h);
+    clean_fb(x, y, w, h, &info);
 }
 
 /// Pushes the drawn rect to the point of coherency (panel DMA reads DRAM).
-fn clean_fb(x: usize, y: usize, w: usize, h: usize) {
-    let start = phys_to_virt(FB_PHYS + y * FB_STRIDE + x * 4) & !63;
-    let end = phys_to_virt(FB_PHYS + (y + h) * FB_STRIDE + (x + w) * 4 + 63) & !63;
+fn clean_fb(x: usize, y: usize, w: usize, h: usize, info: &FbInfo) {
+    let stride_bytes = info.stride * 4;
+    let start = phys_to_virt(info.base + y * stride_bytes + x * 4) & !63;
+    let end = phys_to_virt(info.base + (y + h) * stride_bytes + (x + w) * 4 + 63) & !63;
     unsafe {
         let mut line = start;
         while line < end {

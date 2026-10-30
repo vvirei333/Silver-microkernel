@@ -660,9 +660,9 @@ pub extern "C" fn kernel_main() -> ! {
     // only log channel, on QEMU ram_log is a no-op (the UART is the channel).
     ram_log::init();
     ram_log::log("KERNEL ENTRY");
-    ram_log::fb_progress();
 
     mmu::init();
+    ram_log::fb_progress(); // entry bar — after mmu::init so the fb is mapped
 
     let memory_map = memory::current();
     let available_pages = frame_allocator::init(memory_map.available);

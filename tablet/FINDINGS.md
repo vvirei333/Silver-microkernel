@@ -41,3 +41,39 @@ decompiled to `tablet.dts` (38799 lines).
 
 ## cmdline (from chosen/bootargs) — for boot.img
   loglevel=6 kpti=0 ... rootwait ro init=/init ... (full string in tablet.dts)
+
+## 5. Boot chain + EFI stub (2026-10-30, breakthrough)
+
+### Splash framebuffer (live panel scanout)
+- Node `splash_region` (label `cont_splash_region`), tablet.dts line ~399:
+  `reg = <0x00 0xd5100000 0x00 0x2b00000>` → **base 0xD5100000, 43 MiB**
+  (~2.6 frames of 1600x2560x4). GRUB renders its menu through it; the panel
+  provably scans it out. `disp_rdump_region@d5100000` (line 757) also uses it.
+
+### ramoops (confirmed)
+- `ramoops@0xa2000000` (tablet.dts line 382): `reg = <0x00 0xa2000000 0x00
+  0x400000>` (4 MiB). Module params win over DTB: mem 0xA2000000, console 2 MiB
+  (0xA2000000..0xA2200000), pmsg 2 MiB (0xA2200000..0xA2400000).
+- **pmsg-ramoops-0 NEVER appears** on this device (even after `echo > /dev/pmsg0`
+  + reboot). console-ramoops-0 exists but is overwritten by Android's boot log
+  each boot. → ramoops readback is unusable as a debug channel.
+
+### EFI/PE stub (the working route)
+- The stock ColorOS kernel is a PE32+ EFI stub ('MZ', machine 0xAA64, Subsystem
+  EFI_APPLICATION, ImageBase=0, NO .reloc). ABL (UEFI) boots it via LoadImage.
+- `fastboot boot` with a v4+MZ/PE image → **QCDUMP** (ABL's fastboot-boot path
+  does not LoadImage; it expects gzip/arm64). Dead end.
+- **Working route**: `fastboot boot /tmp/y700_boot.img` (the disguised EDK2
+  UEFI) → Y700BOOT (FAT32, /dev/block/sda14) → QCOMRAMP (GRUB fork) → linux.cfg
+  → `chainloader /Image.efi` + `boot` → StartImage → our `efi_entry`.
+- The hand-rolled `build_efi_wrapper.py` was BROKEN: optional-header fields
+  shifted 10 bytes (`HHH` vs `HHHH`) → Subsystem=UNKNOWN → LoadImage rejects.
+  `lld-link /subsystem:efi_application /entry:efi_entry /machine:arm64 /base:0`
+  generates a correct PE.
+- GOP via `LocateProtocol` may be ABSENT in the port's EDK2 — paint 0xD5100000
+  directly (hardcoded) instead of querying GOP.
+
+### Milestone status (colored bands in splash)
+- green (entry) + white (kernel copied to 0xA8000000) appear; NO magenta →
+  the stub hangs at its own MMU-disable (code at LoadImage's arbitrary VA is not
+  identity-mapped → post-MMU-off fetch aborts).

@@ -3,6 +3,21 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## TABLET PORT (Lenovo Legion Y700, SM8650) — see tablet/HANDOFF.md for details
+
+The tablet port (real hardware, not QEMU) lives in `tablet/` and is documented
+authoritatively in **tablet/HANDOFF.md**. High-level status (2026-10-30):
+
+- **Breakthrough**: the EFI/PE stub (`tablet/efi_stub.S` → `tablet/Image.efi`)
+  now EXECUTES on the device via GRUB `chainloader`. First visible proof: the
+  stub paints the splash framebuffer (0xD5100000) and a GREEN band appears.
+- Current milestone: the stub reaches entry + kernel copy (green+white bands),
+  but HANGS at its own MMU-disable step. Fix in progress (PC-relative MMU-off,
+  or skip MMU-off and let the kernel `_start` handle it at its identity-mapped
+  0xA8000000).
+- Diagnostics: pmsg/ramoops readback is DEAD on this device; the ONLY channel is
+  the GOP framebuffer (0xD5100000). QEMU regression is clean throughout.
+
 ## State as of 2026-10-29 (visible GUI clicks; "EL0" terminology)
 
 Two polish items landed on top of the existing graphics/input work:
