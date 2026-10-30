@@ -38,6 +38,11 @@ fn main() {
     if profile == "release" {
         command.arg("--release");
     }
+    // User ELFs must link at the same base the kernel validates against
+    // (`elf::USER_IMAGE_VA`): tablet kernel → tablet user images at 0x8000_0000.
+    if env::var_os("CARGO_FEATURE_TABLET").is_some() {
+        command.arg("--features").arg("tablet");
+    }
     let status = command
         .status()
         .expect("failed to invoke userspace cargo build");

@@ -11,7 +11,8 @@
 //!
 //! Layout contract (must match `userspace/linker.ld`):
 //!
-//! * base virtual address `0x4000_0000`, three `PT_LOAD` segments —
+//! * base virtual address `0x4000_0000` (tablet: `0x8000_0000`), three
+//!   `PT_LOAD` segments —
 //!   `text` (R-X), `rodata` (R--) and `data` (RW-, with `NOLOAD` `.bss`);
 //! * every byte of the 2 MiB image window is covered (no holes), so a single
 //!   contiguous physical run is enough and matches how `create_task_space`
@@ -32,8 +33,13 @@ use crate::{
     memory::{phys_to_virt, PAGE_SIZE},
 };
 
-/// Base of the 2 MiB user image window. Linked to by `userspace/linker.ld`
-/// (`. = 0x40000000`) and mirrored by `elf_loader::USER_IMAGE_VA`.
+/// Base of the 2 MiB user image window. `userspace/linker.ld` links to
+/// `. = 0x40000000` (QEMU DRAM) and `userspace/linker_tablet.ld` to
+/// `. = 0x80000000` (tablet DRAM base); this const mirrors whichever script
+/// the current build selected (`feature = "tablet"` drives both).
+#[cfg(feature = "tablet")]
+pub const USER_IMAGE_VA: usize = 0x8000_0000;
+#[cfg(not(feature = "tablet"))]
 pub const USER_IMAGE_VA: usize = 0x4000_0000;
 /// Size of the image window; `elf_loader` uses the same bound.
 pub const USER_IMAGE_SIZE: usize = 0x20_0000;

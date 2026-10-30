@@ -347,13 +347,27 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
 }
 
 /// Powers the machine down through PSCI `SYSTEM_OFF` (0.2+ `FN_SYSTEM_OFF` =
-/// `0x8400_0008`). QEMU's `virt` machine boots the guest at EL2 and exposes PSCI
-/// through the **HVC** conduit, so the call is `hvc #0` (an `smc` here traps as
-/// an EL1 exception because no EL3 is present). QEMU prints "Power down" and
-/// exits; the call never returns. The write is a raw PL011 poke (visible
+/// `0x8400_0008`). The conduit follows the PSCI node of each platform's device
+/// tree: QEMU `virt` boots the guest at EL2 and exposes PSCI through **HVC**
+/// (an `smc` there traps as an EL1 exception — no EL3), while the tablet's ABL
+/// specifies `method = "smc"`. Arguments follow SMC Calling Convention /
+/// PSCI 1.0: function id in x0, unused x1-x3 zeroed. QEMU prints "Power down"
+/// and exits; the call never returns. The write is a raw console poke (visible
 /// regardless of console ownership) so the shutdown is observable first.
 fn sys_power_off() -> u64 {
     console::write_str("POWER OFF: PSCI SYSTEM_OFF\r\n");
+    #[cfg(feature = "tablet")]
+    unsafe {
+        core::arch::asm!(
+            "smc #0",
+            in("x0") 0x8400_0008_u64, // FN_SYSTEM_OFF
+            in("x1") 0_u64,
+            in("x2") 0_u64,
+            in("x3") 0_u64,
+            options(nomem, nostack),
+        );
+    }
+    #[cfg(not(feature = "tablet"))]
     unsafe {
         core::arch::asm!(
             "hvc #0",

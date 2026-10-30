@@ -1,6 +1,6 @@
 use core::ptr;
 
-use crate::{exceptions, memory, console, scheduler, timer};
+use crate::{exceptions, memory, console, scheduler, timer, platform, gicv3};
 
 pub const TIMER_IRQ: u32 = 30;
 /// QEMU virt DTB: PL011 is SPI 1, so its GIC interrupt ID is 32 + 1.
@@ -24,6 +24,11 @@ const GICC_IAR: usize = 0x00C;
 const GICC_EOIR: usize = 0x010;
 
 pub fn init() {
+    if platform::detect().is_tablet() {
+        gicv3::init();
+        return;
+    }
+
     write32(DISTRIBUTOR_BASE + GICD_CTLR, 0);
 
     write8(
@@ -65,25 +70,44 @@ pub fn init() {
 }
 
 pub fn enable_irq(irq: u32) {
+    if platform::detect().is_tablet() {
+        gicv3::enable_irq(irq);
+        return;
+    }
     let offset = GICD_ISENABLER + (irq as usize / 32) * 4;
     write32(DISTRIBUTOR_BASE + offset, 1_u32 << (irq % 32));
 }
 
 pub fn disable_irq(irq: u32) {
+    if platform::detect().is_tablet() {
+        gicv3::disable_irq(irq);
+        return;
+    }
     let offset = GICD_ICENABLER + (irq as usize / 32) * 4;
     write32(DISTRIBUTOR_BASE + offset, 1_u32 << (irq % 32));
 }
 
 pub fn acknowledge() -> u32 {
+    if platform::detect().is_tablet() {
+        return gicv3::acknowledge();
+    }
     read32(CPU_INTERFACE_BASE + GICC_IAR)
 }
 
 pub fn end_interrupt(acknowledge_register: u32) {
+    if platform::detect().is_tablet() {
+        gicv3::end_interrupt(acknowledge_register);
+        return;
+    }
     write32(CPU_INTERFACE_BASE + GICC_EOIR, acknowledge_register);
 }
 
 #[no_mangle]
 pub extern "C" fn silver_handle_irq() {
+    if platform::detect().is_tablet() {
+        return gicv3::handle_irq();
+    }
+
     let acknowledge_register = acknowledge();
     let irq = acknowledge_register & 0x3FF;
 

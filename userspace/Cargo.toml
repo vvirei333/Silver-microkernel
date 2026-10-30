@@ -4,6 +4,9 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 
+[features]
+tablet = []
+
 [dependencies]
 # Bare-metal TCP/IP stack. `std`/`alloc` stay off: the server uses fixed
 # static storage for sockets and frame buffers. `medium-ethernet` implies

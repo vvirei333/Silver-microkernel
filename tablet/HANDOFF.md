@@ -136,42 +136,71 @@ e1bb0000-ff7fffff : System RAM     ← 477 МБ
 
 ## 6. ЧТО ОСТАЛОСЬ СДЕЛАТЬ (по порядку)
 
-### A. Довести память планшета (главное!)
-1. **Расширить DRAM-маппинг до 2 ГБ** (0x80000000..0x1_0000_0000), чтобы покрыть
-   frame-allocator регион (0xD5100000+). Сейчас бутстаб/mmu мапят 1 ГБ.
-   - В бутстабе (main.rs global_asm): сейчас 6 таблиц TABLES (low L0, high L0, L1, MMIO L2,
-     DRAM L2, PCI L2). Нужна вторая DRAM L2 (итого 7 таблиц) и 2 L1-входа (индексы 2 и 3),
-     либо один 2 ГБ блок через L1-block-descriptor.
-   - В `mmu.rs`: `TABLE_COUNT` 6→7, `INDEX_LEVEL2_DRAM` + вторая таблица, в `init()` два
-     L1-входа `DRAM_L1_INDEX` и `DRAM_L1_INDEX+1`.
-2. **frame_allocator регион**: для tablet `available = [0xD5100000, 0xD8000000)` (47 МБ,
-   первый System RAM кусок после запретного региона) — ИЛИ регион 6 ГБ @ 0x980000000.
-   - В `memory.rs`: добавить tablet-константы `FRAME_ALLOC_START/SIZE`, в `current()`
-     под `#[cfg(feature="tablet")]` вернуть фиксированный регион (не `kernel_image.end..DRAM.end`).
-   - Ослабить `memory::is_valid()`: `available.end == dram.end` → `<=` (+ `dram.contains(start)`).
-3. `DRAM_SIZE` для tablet поднять до 2 ГБ (0x80000000), `DRAM_END=0x1_0000_0000`.
+### A. Довести память планшета — ✅ СДЕЛАНО (2026-10-29)
+1. **DRAM-маппинг 2 ГБ** — сделано: `mmu.rs` TABLE_COUNT 6→7 (под feature `tablet`),
+   вторая L2 `INDEX_LEVEL2_DRAM_HIGH` мапит `0xC0000000..0x1_00000000` в `mmu::init()`
+   (бутстаб не трогали — он мапит только первый гигабайт, второй достраивается уже
+   через high alias). `memory.rs`: tablet `DRAM_SIZE = 0x8000_0000`.
+2. **frame_allocator регион**: `memory.rs` — tablet-константы
+   `FRAME_ALLOC_START = 0xD510_0000`, `FRAME_ALLOC_END = 0xD800_0000` (47 МБ, первый
+   System RAM кусок после запретного `0xA2400000..0xD4E23000`); `current()` под
+   `#[cfg(feature = "tablet")]` возвращает этот фиксированный регион.
+   `is_valid()` ослаблен: `available.end <= dram.end && dram.contains(available.start)`.
+   `MAX_PHYSICAL_PAGES` вырос до 2 ГБ/4 КБ → bitmap 64 КБ в .bss — ок.
+   В `kernel_main` добавлен вывод `FRAME=<start>..<end> PAGES=<n>` (ожидается
+   `FRAME=00000000D5100000..00000000D8000000 PAGES=12032` на планшете).
+   QEMU-регрессии нет (`FRAME=0000000040207000..0000000048000000 PAGES=32249`, boot до `howl>`).
 
-### B. GICv3 (нужно для таймера и шедулера)
-- Текущий `gic.rs` — GICv2 (DISTRIBUTOR 0x08000000, CPU IF 0x08010000). Для планшета нужен
-  GICv3: GICD 0x17100000, GICR 0x17180000 (per-CPU redistributor). Написать `gicv3` или
-  расширить `gic.rs` через `platform::detect()`. Таймер PPI 14 (вместо 30), UART SPI 462.
-- После GICv3 убрать гейт в `kernel_main` (п. tablet-halt) и запустить шедулер.
+### B. GICv3 — ✅ СДЕЛАНО (2026-10-29), проверить на железе
+- Новый **`src/gicv3.rs`**: GICD 0x17100000, GICR 0x17180000 (stride 0x40000,
+  ядро однoядерное — только core-0 редистрибьютор, SGI-фрейм на +0x10000).
+  Последовательность: `icc_sre_el1.SRE=1` → будим GICR (WAKER.ProcessorSleep=0,
+  ждём ChildrenAsleep=0) → SGI/PPI: IGROUPR0/IGRPMODR0 (Group 1 NS) + приоритет 0xA0
+  + ISENABLER0 bit14 (таймер INTID 30) → UART SPI 462 (INTID 494) настроен в GICD
+  (IGROUPR/IGRPMODR/ICFGR level/приоритет 0x80), но **НЕ включён** (geni_uart пока
+  polling TX-only — включённая линия дала бы необработанные IRQ) → GICD_CTLR=
+  EnableGrp1NS + опрос RWP → ICC_CTLR_EL1=0, ICC_PMR_EL1=0xFF, ICC_IGRPEN1_EL1=1.
+- `gic.rs` теперь диспетчер: tablet → gicv3 (init/enable/disable/acknowledge/
+  end_interrupt/silver_handle_irq), иначе GICv2. scheduler.rs не менялся.
+- Таймер: PPI 14 DTB = INTID 30 — совпало с QEMU (TIMER_IRQ=30); timer.rs читает
+  cntfrq_el0 (19.2 МГц), `cntp_tval/ctl_el0` — NS physical timer, без изменений.
+- Гейт tablet-halt в `kernel_main` снят: tablet идёт по общей загрузке (gic→timer→
+  vfs→seed→scheduler). IRQ маска снимается в scheduler::init (`daifclr, #2`).
+  **FIQ (`daifclr, #3`) намеренно НЕ включён**: у нас Group 1 NS → IRQ; включение
+  FIQ без Group 0-настройки направило бы FIQ в дефолтный обработчик исключений.
+- ВАЖНО: запуск юзерспейса на планшете упадёт/не заработает до пункта E
+  (перелинковка userspace на 0x80000000+) — silverd-ELF линкуется на 0x40000000.
+  Ждать на серийном выводе: PLATFORM=SM8650 → MMU=OK → FRAME=…D5100000..…D8000000
+  → HEAP=OK → IRQ READY → SCHEDULER START (таймерные тики видны по uptime в fastfetch).
+- QEMU-регрессии нет (boot до `howl>`); tablet-билд собирается чисто.
 
-### C. PSCI smc
-- В `syscall.rs` `sys_power_off()` сейчас `hvc #0`. Под tablet → `smc #0` (по `platform::detect()`).
+### C. PSCI smc — ✅ СДЕЛАНО (2026-10-29)
+- Единственное место с PSCI — `src/syscall.rs::sys_power_off` (SYSTEM_OFF
+  0x8400_0008, x1-x3=0 по SMC Calling Convention). Под `feature = "tablet"` —
+  `smc #0`, иначе `hvc #0`. CPU_ON/вторичные ядра ядром пока не вызываются
+  (однoядерный шедулер) — при добавлении использовать тот же conduit-паттерн.
 
-### D. boot.img + fastboot
+### D. boot.img + fastboot — ОСТАЛОСЬ (следующий шаг)
 - Собрать raw Image: `aarch64-linux-gnu-objcopy -O binary target/.../silver_microkernel
-  tablet/Image` (ядра собрано под `--features "no_std,tablet"`, LMA=0xA8000000).
+  tablet/Image` (ядро собрано под `--features "no_std,tablet"`, LMA=0xA8000000).
 - `mkbootimg` (v2, чтобы задать адрес) или v3. Проверить, что ABL грузит по 0xA8000000.
 - `fastboot boot boot.img`.
 
-### E. Юзерспейс (отдельно, позже)
-- `elf.rs` держит `USER_IMAGE_VA = 0x40000000` (и `userspace/linker.ld` линкует юзер-программы
-  на 0x40000000). Для планшета юзер-VA должны уйти на 0x80000000+. В `mmu.rs` я уже сделал
-  `USER_IMAGE_VA = DRAM_BASE` (таблетка → 0x80000000), НО `elf.rs`/`userspace/linker.ld`
-  ещё на 0x40000000 — рассогласование. На первом бутe юзер-задач нет (шедулер загейчен),
-  поэтому не критично, но перед запуском юзерспейса нужно перелинковать.
+### E. Перелинковка userspace — ✅ СДЕЛАНО (2026-10-29)
+- `userspace/linker_tablet.ld` (база `. = 0x80000000`) рядом с `linker.ld`
+  (0x40000000). Выбор скрипта перенесён из `userspace/.cargo/config.toml` в новый
+  `userspace/build.rs` (по `CARGO_FEATURE_TABLET`); в userspace `Cargo.toml`
+  добавлена пустая фича `tablet = []`.
+- Корневой `build.rs` при tablet-сборке ядра передаёт `--features tablet` в
+  userspace-подсборку → silverd линкуется на 0x80000000 (проверено readelf).
+- `src/elf.rs::USER_IMAGE_VA` стал cfg-константой: tablet → 0x8000_0000
+  (совпадает с `mmu::USER_IMAGE_VA = DRAM_BASE`), QEMU → 0x4000_0000. Валидация
+  сегментов теперь автоматически принимает 0x80000000.
+- ВАЖНО: userspace-ELF-ы для планшета получаются ТОЛЬКО из tablet-сборки ядра
+  (встраиваются в бинарник kernel'а на этапе build.rs). Ручная сборка
+  `cd userspace && cargo build` без фичи даёт 0x40000000-варианты.
+- QEMU-регрессии нет: silverd на 0x40000000, boot до `howl>`; tablet-билд
+  собирается, entry ядра 0xA8000000.
 
 ---
 
@@ -230,4 +259,74 @@ adb shell "su -c 'cat /proc/iomem'"          # адрес ядра / System RAM
 adb shell "su -c 'cat /sys/firmware/fdt' > /data/local/tmp/fdt && chmod 644 ...'"
 adb pull /data/local/tmp/fdt tablet.dtb
 fastboot devices                              # (пусто, пока устройство в Android)
+```
+
+---
+
+## 11. СЕССИЯ 2026-10-30: бут-цепочка UEFI вскрыта, payload не стартует — читать перед продолжением!
+
+### Что сделано (все шаги 1-3 + E закрыты, D — в процессе)
+1. **Память** ✅: DRAM 2 ГБ, frame allocator 0xD6200000..0xD8000000.
+   **ВАЖНО: 0xD5100000..0xD60B0000 = живой framebuffer (cont_splash, 1600×2560 XRGB32,
+   16.4 МБ на кадр, всего 43 МБ)** — frame allocator сдвинут выше, чтобы не рисовать
+   мусор на экране. QEMU-регрессий нет.
+2. **GICv3** ✅ (`src/gicv3.rs`, gic.rs = диспетчер). **PSCI smc** ✅. **userspace 0x80000000** ✅.
+3. **ram_log.rs** — RAM-консоль в pstore ramoops pmsg (0xA2200000, dc cvac после записи),
+   RAM-маркеры в бутстабе (K0-K3), framebuffer-полосы прогресса (`fb_progress`,
+   красный экран при исключении). **На tablet console:: полностью выключен**
+   (QEMU-MMIO под feature=tablet не дёргается).
+4. **Мини-векторы** в бутстабе (VBAR EL1+EL2 до рискованных операций, дамп ESR/FAR/ELR в pmsg).
+
+### Вскрытая бут-цепочка устройства (факты, проверено экспериментами!)
+- **boot.img порта (Kubuntu/`vitalo233-eng/tb321fu-linux`) — это EDK2 UEFI,
+  замаскированное под arm64 Image** (v3 + gzip + магия ARM\x64). ABL грузит его как ядро,
+  оно поднимает UEFI → GRUB-форк **QCOMRAMP** (guf296, "grub2-ram-partition-ab") →
+  `linuxdirect /Image` → Linux.
+- ABL: payload **без** ARM\x64-магии на 0x38 → мгновенный QCDUMP. С магией — грузится глубже.
+- **USB в UEFI не работает** (FSA4480 не подаёт VBUS до ядра) — флешки не видны, только eMMC.
+- **Y700BOOT создан БЕЗ потери данных**: переименованы пустые `rawdump`(256МБ)+`pstoredump`
+  (128МБ) в один Y700BOOT 384МБ (ESP GUID, имя "Y700BOOT"); `lenovoraw` восстановлен.
+  Бэкапы: `tablet/backups/` (GPT стока, хвост GPT, lenovoraw, QCOMRAMP/BOOTAA64/platform.dtb).
+- **QCOMRAMP требует**: FAT32 (FAT16 GRUB-форк не читает!), 4К-сектора, файлы:
+  `/Image`, `/dtb/platform.dtb`, `/EFI/BOOT/{BOOTAA64.EFI=QCOMRAMP, QCOMRAMP.EFI, linux.cfg, grub.cfg}`.
+- **linux.cfg ОБЯЗАН содержать `qcomfdtmem source rampartition` + `qcomfdtmem disable-reserved
+  ...4 пути...` перед linuxdirect** — иначе «table info not found» → QCDUMP.
+  Встроенный конфиг QCOMRAMP лежит в бинарнике (offset ~0x3d1ce9, menuentry "TB321FU Linux").
+- **ARM64-заголовок Image: text_offset = 0** (GRUB использует как смещение прыжка).
+- ramoops: **pmsg = 0xA2200000** (модульные параметры: mem 0xA2000000, 4МБ, console 2МБ,
+  pmsg 2МБ; DTB-узел врёт про 2МБ), после краша с RAMDUMP зоны стираются; тёплый ребут — нет.
+
+### ТЕКУЩАЯ ЗАГВОЗДКА
+GRUB-цепочка доходит до `qcomfdtmem: disabled reserved-memory paths: 4`, затем
+`linuxdirect /Image` → тишина: **ни одного SILVER-маркера в ramoops, ни одной полосы
+K0 (рисование в 3 кадра splash прямо из первых инструкций бутстаба)**.
+→ Скорее всего linuxdirect НЕ прыгает в наш payload (не-exec Image? проверка формата?
+jump мимо?) или прыгает в неверное место. Эксперименты (стоппер-wfe, K0-краска)
+неоднозначны: стоппер «висел», но это может быть зависание самого GRUB.
+
+### СЛЕДУЮЩИЕ ШАГИ (по приоритету)
+1. **kexec через их Linux (рекомендовано юзером)**: поставить их Ubuntu-порт по
+   официальному гайду (раздел 10 этого файла, НУЖЕН factory reset userdata! или
+   USB-SSD с rootfs по их docs) → из рабочего Linux: `kexec -l Image --dtb
+   platform.dtb && kexec -e` — гарантированно чистый handover, мимо ABL/GRUB.
+2. Альтернатива: **PE/EFI-стаб** — заготовка `tablet/build_efi_wrapper.py`
+   (PE32+ + EFI-вход печатает SILVER через ConOut). Не проверена — мой минимальный
+   PE падал в QCDUMP, вероятно кривой заголовок; можно взять за основу GNU EFI или
+   вытащить PE-обёртку из их Image (он MZ+PE! распакуй /tmp/orig_boot/kernel gzip
+   → там полный EFI-стаб Linux — можно скопировать layout).
+3. Крайний вариант диагностики: UART. console=ttyMSM0; поискать выводы UART на плате.
+4. Если kexec сработает: маркеры покажут реальный адрес загрузки → при необходимости
+   перелинковка (linker_tablet.ld) → шелл на экране через fb_progress.
+
+### Команды быстрого повтора
+```bash
+# сборка tablet + образ для Y700BOOT
+cargo build --release --target aarch64-unknown-none --no-default-features --features "no_std,tablet"
+aarch64-linux-gnu-objcopy -O binary target/.../silver_microkernel /tmp/usb_Image
+adb push /tmp/usb_Image /data/local/tmp/Image
+adb shell "su -c 'mount -t vfat /dev/block/by-name/Y700BOOT /mnt/y700 && cp /data/local/tmp/Image /mnt/y700/Image && sync && umount /mnt/y700'"
+# бут UEFI (UEFI = tablet/backups/uefi_boot_img.img)
+fastboot boot tablet/backups/uefi_boot_img.img
+# чтение лога после форс-ребута в Android
+adb shell "su -c 'cat /sys/fs/pstore/pmsg-ramoops-0'" | grep -a SILVER
 ```

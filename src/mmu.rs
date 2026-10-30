@@ -17,7 +17,9 @@ const GRANULE: usize = 4096;
 const TABLE_BYTES: usize = ENTRIES * 8;
 const BLOCK_2M: usize = 0x20_0000;
 const PHYSICAL_ADDRESS_LIMIT: usize = 1 << 40;
-/// L1 slot that maps the DRAM gigabyte; identity (VA == PA) at the right index.
+/// L1 slot that maps the first DRAM gigabyte; identity (VA == PA) at the
+/// right index. On the tablet a second entry (`DRAM_L1_INDEX + 1`) maps the
+/// second gigabyte, so the frame-allocator region at 0xD510_0000 is covered.
 const DRAM_L1_INDEX: usize = DRAM_BASE >> 30;
 
 const DESC_TABLE: u64 = 0b11;
@@ -108,13 +110,18 @@ struct Table {
     entries: [u64; ENTRIES],
 }
 
+/// QEMU maps one DRAM gigabyte; the tablet needs two (0x8000_0000..0x1_0000_0000).
+#[cfg(feature = "tablet")]
+const TABLE_COUNT: usize = 7;
+#[cfg(not(feature = "tablet"))]
 const TABLE_COUNT: usize = 6;
 const EMPTY_TABLE: Table = Table {
     entries: [0; ENTRIES],
 };
 
 /// The assembly boot stub fills the first five tables before enabling the MMU.
-/// The sixth is zeroed with .bss and populated for PCI ECAM in `init`.
+/// The sixth is zeroed with .bss and populated for PCI ECAM in `init`; on the
+/// tablet the seventh holds the second DRAM gigabyte, also populated in `init`.
 #[no_mangle]
 static mut TABLES: [Table; TABLE_COUNT] = [EMPTY_TABLE; TABLE_COUNT];
 
@@ -124,6 +131,8 @@ const INDEX_LEVEL1: usize = 2;
 const INDEX_LEVEL2_MMIO: usize = 3;
 const INDEX_LEVEL2_DRAM: usize = 4;
 const INDEX_LEVEL2_PCI: usize = 5;
+#[cfg(feature = "tablet")]
+const INDEX_LEVEL2_DRAM_HIGH: usize = 6;
 
 /// Replaces the temporary boot identity TTBR0 with an empty kernel TTBR0 and
 /// retains the high TTBR1 map. User TTBR0s are installed by the scheduler.
@@ -149,6 +158,21 @@ pub fn init() {
             mmio.entries[index] = block_descriptor(index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
             dram.entries[index] =
                 block_descriptor(DRAM_BASE + index * BLOCK_2M, ATTR_NORMAL, SH_INNER);
+        }
+        // The boot stub only fills the first DRAM gigabyte. The tablet's frame
+        // allocator works in the second one (0xD510_0000..0xD800_0000), so a
+        // second L2 is installed here, after the MMU is running.
+        #[cfg(feature = "tablet")]
+        {
+            let dram_high = &mut *base.add(INDEX_LEVEL2_DRAM_HIGH);
+            level1.entries[DRAM_L1_INDEX + 1] = table_descriptor(dram_high);
+            for index in 0..ENTRIES {
+                dram_high.entries[index] = block_descriptor(
+                    DRAM_BASE + 0x4000_0000 + index * BLOCK_2M,
+                    ATTR_NORMAL,
+                    SH_INNER,
+                );
+            }
         }
         for index in 0..PCI_ECAM_L2_BLOCKS {
             pci.entries[PCI_ECAM_L2_INDEX + index] =

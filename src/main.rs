@@ -28,6 +28,7 @@ mod frame_allocator;
 mod geni_uart;
 #[cfg(not(feature = "std"))]
 mod gic;
+mod gicv3;
 #[cfg(not(feature = "std"))]
 mod interrupts;
 #[cfg(not(feature = "std"))]
@@ -42,6 +43,7 @@ mod mutex;
 mod pl011;
 #[cfg(not(feature = "std"))]
 mod platform;
+mod ram_log;
 #[cfg(not(feature = "std"))]
 mod scheduler;
 #[cfg(not(feature = "std"))]
@@ -71,12 +73,143 @@ compile_error!("Features 'std' and 'no_std' are mutually exclusive");
 compile_error!("The bare-metal kernel currently supports only AArch64");
 
 #[cfg(all(not(feature = "std"), target_arch = "aarch64"))]
+// RAM-log boot markers, tablet only: with the MMU off every write is Device
+// memory, so a store to the unassigned 0xA2200000 would abort on QEMU. The
+// assembler flag RAM_LOG_MARKS (set in the tiny global_asm below) switches the
+// marker code in the boot stub at assembly time.
+#[cfg(feature = "tablet")]
+core::arch::global_asm!(".set RAM_LOG_MARKS, 1");
+#[cfg(not(feature = "tablet"))]
+core::arch::global_asm!(".set RAM_LOG_MARKS, 0");
+
 core::arch::global_asm!(
     r#"
     .section .text.boot, "ax"
+    .global _head
+    // arm64 Image header: ABL (UEFI-style) looks for the "ARM\\x64" magic at
+    // 0x38 and image_size at 0x10 before it will decompress/jump. Without it
+    // a raw objcopy binary is not recognized and the device lands in the
+    // Qualcomm crashdump. code0 branches over the 64-byte header into _start.
+    // NOTE: the kernel is NOT self-relocating (linked at 0xA8000000); the boot
+    // marker records the actual load PC into the pmsg ramoops zone so a wrong
+    // load address can be read back from Android and the kernel relinked.
+    _head:
+        b       1f                          // 0x00 code0: jump past header
+        .word   0                           // 0x04 code1
+        .quad   0                           // 0x08 text_offset: GRUB jumps to payload start (Linux convention)
+        .quad   __kernel_end - _head        // 0x10 image_size
+        .quad   0                           // 0x18 flags
+        .quad   0                           // 0x20 reserved
+        .quad   0                           // 0x28 reserved
+        .quad   0                           // 0x30 reserved
+        .word   0x644D5241                  // 0x38 magic "ARM\\x64"
+        .word   0                           // 0x3C reserved
     .global _start
     .type _start, %function
+1:
 _start:
+    // Secondary cores park FIRST: on the tablet eight cores may come out of
+    // ABL running, and QEMU starts only one. Any secondary executing this
+    // stub would zero .bss twice and scribble over the page tables; a wfe
+    // loop waits for the (never yet implemented) PSCI_CPU_ON wake-up.
+    mrs x10, mpidr_el1
+    ubfx x10, x10, #0, #24    // Aff0/Aff1/Aff2: CPU0 is 0x0 in the device tree
+    cmp x10, #0
+    b.ne 6f
+
+    // --- K0: PAINT — the very first observable action ----------------------
+    // Fill the top 64 lines of all three 16 MiB frame slots inside the
+    // cont_splash region with white. MMU is off: physical stores, VA == PA.
+    // If ANY of the three appears on screen, the payload executes and the
+    // panel scans out that slot; silence means GRUB never jumped into us.
+.if RAM_LOG_MARKS
+    ldr x18, =0xD5100000        // frame 0
+    bl 19f
+    ldr x18, =0xD60B0000        // frame 1
+    bl 19f
+    ldr x18, =0xD7060000        // frame 2
+    bl 19f
+    b 20f
+19: mov w15, #0xFFF            // white, low byte 0xFFF&0xFF... build 0xFFFFFFFF
+    movk w15, #0xFFFF, lsl #16
+    mov x16, #64               // 64 rows
+    mov x17, #6400             // stride bytes (1600*4)
+1:  mov x14, x18
+    mov x13, #400              // 1600 px / 4 px per word? 1600*4B = 6400B = 800 words
+    mov x13, #800
+2:  str w15, [x14], #4
+    sub x13, x13, #1
+    cbnz x13, 2b
+    add x18, x18, x17
+    sub x16, x16, #1
+    cbnz x16, 1b
+    ret
+20:
+.endif
+
+    // --- K1: MEASURE before touching anything -----------------------------
+    // adr gives the real PC (the address ABL actually loaded us at, which may
+    // differ from the link address); SCTLR is recorded raw so we can see
+    // whether the MMU or caches were still on at handover.
+    adr x9, .
+    mrs x10, CurrentEL
+    mrs x11, sctlr_el1
+
+    // --- K2: NORMALIZE: MMU + D-cache + I-cache off at the current EL -----
+    // Every physical store below assumes VA == PA. Note the measurement above
+    // happens first: if markers now show up, x11 tells us the handover state.
+    mrs x13, CurrentEL
+    lsr x13, x13, #2
+    cmp x13, #2
+    b.eq 10f
+    bic x14, x11, #(1 << 12)  // I
+    bic x14, x14, #(1 << 2)   // C
+    bic x14, x14, #1          // M
+    msr sctlr_el1, x14
+    b 11f
+10:
+    mrs x14, sctlr_el2
+    bic x14, x14, #(1 << 12)
+    bic x14, x14, #(1 << 2)
+    bic x14, x14, #1
+    msr sctlr_el2, x14
+    bic x14, x11, #(1 << 12)
+    bic x14, x14, #(1 << 2)
+    bic x14, x14, #1
+    msr sctlr_el1, x14
+11:
+    dsb sy
+    tlbi vmalle1
+    ic iallu
+    dsb sy
+    isb
+
+    // --- K3: RECORD the measurement into both ramoops zones ---------------
+    // Live layout (module params + the 4 MiB hole in /proc/iomem):
+    // console 0xA2000000..0xA2200000, pmsg 0xA2200000..0xA2400000. Both get a
+    // valid persistent_ram header so pstore exposes the block verbatim:
+    //   +0x20 M0: PC at entry   +0x28 M1: CurrentEL   +0x30 M2: SCTLR raw
+    //   +0x38 M3: zero after .bss zeroing   +0x40 M4: zero after tables
+    .macro PROBE base
+    ldr x18, =\base
+    ldr x19, =0x43474239        // persistent_ram sig
+    str x19, [x18]
+    str wzr, [x18, #4]          // start = 0
+    mov w19, #0x48
+    str w19, [x18, #8]          // size: header + M0..M4
+    str x9,  [x18, #0x20]       // M0: PC
+    str x10, [x18, #0x28]       // M1: CurrentEL
+    str x11, [x18, #0x30]       // M2: SCTLR_EL1 at entry
+    dc cvac, x18
+    dsb sy
+    .endm
+
+.if RAM_LOG_MARKS
+    PROBE 0xA2000000
+    PROBE 0xA2200000
+.endif
+
+
     // The ELF is linked at high VAs but loaded at low physical addresses.
     // Until the MMU is on, convert every linked data address to physical.
     ldr x0, =__stack_top
@@ -89,18 +222,45 @@ _start:
     cmp x2, #2
     b.ne 4f
 
-    // EL2 (QEMU -kernel default): enable FP for EL1, then drop to EL1h.
+    // EL2 (QEMU -kernel default; ABL may also hand over here): enable FP for
+    // EL1, route timer control to EL1, then drop to EL1h with the mini
+    // vectors installed so any abort before mmu::init lands in the ramoops
+    // log instead of going to EL3 as an anonymous QCDUMP.
     msr cptr_el2, xzr
     mov x2, #0x300000
     msr cpacr_el1, x2
-    mov x2, #(1 << 31)
+    mov x2, #(1 << 31)      // HCR_EL2.RW: EL1 is AArch64
     msr hcr_el2, x2
+    mov x2, #3              // CNTHCTL_EL2: EL1PCVEN|EL1PCTEN
+    msr cnthctl_el2, x2
+    ldr x2, =0x30C50838     // initial SCTLR_EL1 (MMU off, caches per spec)
+    msr sctlr_el1, x2
+    // VBAR_EL1 = mini_vectors at its PHYSICAL address (MMU is off here).
+    ldr x2, =mini_vectors
+    ldr x3, =__kernel_virt_base
+    sub x2, x2, x3
+    msr vbar_el1, x2
+    msr vbar_el2, x2        // aborts taken at EL2 (before the eret) too
+    isb
     mov x2, #0x3c5
     msr spsr_el2, x2
     adr x2, 4f
     msr elr_el2, x2
     eret
 4:
+    // Mini vectors first, on BOTH exception levels the entry may run at, so
+    // any abort before mmu::init is logged into the ramoops pmsg zone instead
+    // of vanishing into an EL3 QCDUMP.
+    ldr x11, =mini_vectors
+    ldr x12, =__kernel_virt_base
+    sub x11, x11, x12       // physical address: MMU is off (or identity)
+    msr vbar_el1, x11
+    mrs x2, CurrentEL
+    lsr x2, x2, #2
+    cmp x2, #2
+    b.ne 5f
+    msr vbar_el2, x11
+5:
     mov x2, #0x300000
     msr cpacr_el1, x2
     isb
@@ -119,6 +279,15 @@ _start:
     cmp x3, x4
     b.lo 2b
 3:
+.if RAM_LOG_MARKS
+    // M3: .bss (and the page tables inside it) are zeroed.
+    ldr x18, =0xA2000000
+    str xzr, [x18, #0x38]
+    ldr x18, =0xA2200000
+    str xzr, [x18, #0x38]
+    dc cvac, x18
+    dsb sy
+.endif
     // TABLES layout (see mmu.rs):
     //   +0     low TTBR0 L0 (identity map during this boot stub only)
     //   +4096  high TTBR1 L0
@@ -183,11 +352,23 @@ _start:
     dsb ish
     isb
 
+.if RAM_LOG_MARKS
+    // M4: the boot page tables are built and the MMU is on; the zones are now
+    // reachable only through the high alias. Clean to the PoC.
+    ldr x18, =0xFFFF0000A2000000
+    str xzr, [x18, #0x40]
+    dc cvac, x18
+    ldr x18, =0xFFFF0000A2200000
+    str xzr, [x18, #0x40]
+    dc cvac, x18
+    dsb sy
+.endif
+
     // The identity alias is still live here, so the next fetch is safe.
     // Jump to the linked high PC and never execute kernel code low again.
-    ldr x0, =5f
+    ldr x0, =8f
     br x0
-5:
+8:
     ldr x0, =__stack_top
     mov sp, x0
     ldr x1, =exception_vectors
@@ -197,6 +378,46 @@ _start:
 1:
     wfe
     b 1b
+6:
+    // Secondary core parking lot: never woken up yet (PSCI_CPU_ON is not
+    // implemented); any spurious event just loops back to sleep.
+    wfe
+    b 6b
+
+    // Mini exception vectors: active from the EL2 drop until mmu::init
+    // installs the real vector table. No stack, position-independent, MMU
+    // state unknown — the handler only stores registers into the ramoops
+    // console zone (physical address, VA==PA with the MMU off) and halts.
+    .balign 2048
+    .global mini_vectors
+mini_vectors:
+    .rept 16
+    b mini_handler
+    .space 124 // each vector slot is 128 bytes
+    .endr
+
+mini_handler:
+    mrs x8, CurrentEL
+    mrs x9, esr_el1
+    mrs x10, far_el1
+    mrs x11, elr_el1
+    ldr x12, =0xA2040000        // ramoops pmsg zone (from the device DTB)
+    ldr x13, =0x43474239        // persistent_ram sig
+    str x13, [x12]
+    str wzr, [x12, #4]          // start = 0
+    mov w13, #0x100             // size = 256 bytes of evidence
+    str w13, [x12, #8]
+    ldr x13, =0x21435845        // 'E','X','C','!' little-endian: text "EXC!" at +0x40
+    str w13, [x12, #0x40]
+    str x8, [x12, #0x48]        // CurrentEL
+    str x9, [x12, #0x50]        // ESR_EL1
+    str x10, [x12, #0x58]       // FAR_EL1
+    str x11, [x12, #0x60]       // ELR_EL1
+    dc cvac, x12
+    dsb sy
+9:
+    wfe
+    b 9b
     .size _start, . - _start
 "#
 );
@@ -428,84 +649,119 @@ exception_dispatch:
 #[cfg(not(feature = "std"))]
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
+    // The tablet has no readable UART, so EVERY console/boot_metrics call is
+    // compiled out there: a stray write to a QEMU address (PL011 0x09000000,
+    // GICv2 0x08000000) would be a bus abort -> QCDUMP before any log. On the
+    // tablet the only output channel is the ramoops RAM log.
+    #[cfg(not(feature = "tablet"))]
     boot_metrics::mark_boot_start();
+
+    // The ramoops console zone lives in reserved DRAM; on the tablet it is the
+    // only log channel, on QEMU ram_log is a no-op (the UART is the channel).
+    ram_log::init();
+    ram_log::log("KERNEL ENTRY");
+    ram_log::fb_progress();
 
     mmu::init();
 
     let memory_map = memory::current();
     let available_pages = frame_allocator::init(memory_map.available);
 
-    console::init();
-    if platform::detect().is_tablet() {
-        console::write_str("PLATFORM=SM8650\r\n");
-    } else {
+    #[cfg(not(feature = "tablet"))]
+    {
+        console::init();
         console::write_str("PLATFORM=QEMU\r\n");
+        console::write_str("MMU=OK\r\n");
+        boot_metrics::log_milestone("MMU init");
     }
-    console::write_str("MMU=OK\r\n");
-    boot_metrics::log_milestone("MMU init");
+    #[cfg(feature = "tablet")]
+    console::init(); // GENI UART at 0x89C000, inside the mapped low gigabyte
+    ram_log::log("MMU OK");
+    ram_log::fb_progress();
 
     if !memory_map.is_valid() || available_pages == 0 || !frame_allocator::run_self_test() {
         exceptions::silver_handle_exception(6, 0, 0, 0);
     }
+    ram_log::log("FRAME ALLOC OK");
+    ram_log::fb_progress();
 
     let Some(heap_base) = allocator::init() else {
         exceptions::silver_handle_exception(7, 0, 0, 0);
     };
 
     let value = alloc::boxed::Box::new(42_u64);
-    let value_address = (&*value as *const u64) as usize;
-
-    console::write_str("HEAP=OK BASE=");
-    console::write_hex_u64(heap_base as u64);
-    console::write_str(" VALUE=");
-    console::write_hex_u64(*value);
-    console::write_str(" ADDR=");
-    console::write_hex_u64(value_address as u64);
-    console::write_str("\r\n");
-    boot_metrics::log_milestone("Heap init");
+    #[cfg(not(feature = "tablet"))]
+    {
+        let value_address = (&*value as *const u64) as usize;
+        console::write_str("HEAP=OK BASE=");
+        console::write_hex_u64(heap_base as u64);
+        console::write_str(" VALUE=");
+        console::write_hex_u64(*value);
+        console::write_str(" ADDR=");
+        console::write_hex_u64(value_address as u64);
+        console::write_str("\r\n");
+        boot_metrics::log_milestone("Heap init");
+    }
+    ram_log::log("HEAP OK");
+    ram_log::fb_progress();
 
     drop(value);
 
-    if platform::detect().is_tablet() {
-        // First tablet boot: MMU + memory + GENI UART are up. GICv3, the timer
-        // PPI and the scheduler (which spawns user tasks) are the next step.
-        console::write_str("TABLET BOOT OK — halting (GIC/scheduler next)\r\n");
-        loop {
-            core::hint::spin_loop();
-        }
-    }
-
+    // The tablet path shares the QEMU boot sequence from here on: gic::init
+    // dispatches to gicv3, the timer PPI is INTID 30 on both platforms, and
+    // scheduler::init unconditionally unmasks IRQs (daifclr #2).
     gic::init();
     timer::init();
+    ram_log::log("GICv3+TIMER OK");
+    ram_log::fb_progress();
     vfs::init();
     seed::seed();
+    ram_log::log("VFS+SEED OK");
+    ram_log::fb_progress();
     scheduler::init();
 
-    console::write_str("IRQ READY\r\n");
-
-    for &byte in b"HELLO, WORLD!\r\n" {
-        console::write_byte(byte);
+    #[cfg(not(feature = "tablet"))]
+    {
+        console::write_str("IRQ READY\r\n");
+        for &byte in b"HELLO, WORLD!\r\n" {
+            console::write_byte(byte);
+        }
+        boot_metrics::log_milestone("Scheduler start");
+        console::write_str("SCHEDULER START\r\n");
     }
-
-    boot_metrics::log_milestone("Scheduler start");
-    console::write_str("SCHEDULER START\r\n");
+    ram_log::log("SCHEDULER START - BOOT COMPLETE");
+    ram_log::fb_fill(0, 120, 0); // full green = fully booted
     scheduler::start();
 }
 
 #[cfg(not(feature = "std"))]
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    if let Some(location) = info.location() {
-        console::write_str("PANIC AT ");
-        console::write_str(location.file());
-        console::write_str(":");
-        console::write_dec_u64(location.line() as u64);
-        console::write_str("\r\n");
+    // Tablet: no console output at all — the line number and message go into
+    // the ramoops log; a stray UART write here could abort before logging.
+    #[cfg(feature = "tablet")]
+    {
+        crate::ram_log::log("PANIC");
+        if let Some(location) = info.location() {
+            crate::ram_log::log_raw(" line=");
+            crate::ram_log::log_hex(location.line() as u64);
+            crate::ram_log::log_raw("\n");
+        }
     }
-    if let Some(message) = info.message().as_str() {
-        console::write_str("PANIC MSG ");
-        console::write_str(message);
-        console::write_str("\r\n");
+    #[cfg(not(feature = "tablet"))]
+    {
+        if let Some(location) = info.location() {
+            console::write_str("PANIC AT ");
+            console::write_str(location.file());
+            console::write_str(":");
+            console::write_dec_u64(location.line() as u64);
+            console::write_str("\r\n");
+        }
+        if let Some(message) = info.message().as_str() {
+            console::write_str("PANIC MSG ");
+            console::write_str(message);
+            console::write_str("\r\n");
+        }
     }
     exceptions::silver_handle_exception(4, 0, 0, 0)
 }
