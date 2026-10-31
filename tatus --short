@@ -1,0 +1,222 @@
+[1mdiff --git a/src/lib.rs b/src/lib.rs[m
+[1mindex 0c9ac1a..77734fc 100644[m
+[1m--- a/src/lib.rs[m
+[1m+++ b/src/lib.rs[m
+[36m@@ -1 +1,134 @@[m
+[31m-#![no_std][m
+[32m+[m[32m#![cfg_attr(not(test), no_std)][m
+[32m+[m
+[32m+[m[32m//! Shared pure logic of the Silver microkernel.[m
+[32m+[m[32m//![m
+[32m+[m[32m//! This module is deliberately free of kernel state so the placement[m
+[32m+[m[32m//! arithmetic can be regression-tested on the host (`cargo test --lib`)[m
+[32m+[m[32m//! while the no_std kernel links the very same code.[m
+[32m+[m
+[32m+[m[32m/// Pure first-fit placement for anonymous `SYS_MMAP` requests.[m
+[32m+[m[32m///[m
+[32m+[m[32m/// Everything attacker-controlled (`length`) is bounded or checked before any[m
+[32m+[m[32m/// arithmetic that could overflow `usize`:[m
+[32m+[m[32m///[m
+[32m+[m[32m/// 1. the requested page count is rejected up front when it cannot fit the[m
+[32m+[m[32m///    `[min_va, max_va)` window at all, so the span multiplication below is[m
+[32m+[m[32m///    guaranteed small (checked anyway as a second line of defence);[m
+[32m+[m[32m/// 2. every span is computed with `checked_mul` / `checked_add`.[m
+[32m+[m[32m///[m
+[32m+[m[32m/// Returns the placed virtual address and the page count derived from[m
+[32m+[m[32m/// `length`, or `None` when the request is impossible: zero length, a span[m
+[32m+[m[32m/// that does not fit the window, or no free gap. Never panics.[m
+[32m+[m[32mpub fn mmap_place<I>([m
+[32m+[m[32m    length: usize,[m
+[32m+[m[32m    min_va: usize,[m
+[32m+[m[32m    max_va: usize,[m
+[32m+[m[32m    page_size: usize,[m
+[32m+[m[32m    regions: I,[m
+[32m+[m[32m) -> Option<(usize, usize)>[m
+[32m+[m[32mwhere[m
+[32m+[m[32m    I: Iterator<Item = (usize, usize)>,[m
+[32m+[m[32m{[m
+[32m+[m[32m    if page_size == 0 || min_va >= max_va || max_va % page_size != 0 || min_va % page_size != 0 {[m
+[32m+[m[32m        return None;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    // Explicit upper bound before any span arithmetic: a mapping must fit the[m
+[32m+[m[32m    // window, so anything larger is rejected without computing a span at all.[m
+[32m+[m[32m    // For `length = usize::MAX` this is what prevents the historical[m
+[32m+[m[32m    // `page_count * page_size` overflow.[m
+[32m+[m[32m    let max_pages = (max_va - min_va) / page_size;[m
+[32m+[m[32m    let page_count = length.div_ceil(page_size);[m
+[32m+[m[32m    if page_count == 0 || page_count > max_pages {[m
+[32m+[m[32m        return None;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    let span = page_count.checked_mul(page_size)?;[m
+[32m+[m
+[32m+[m[32m    // First-fit over the sorted, non-overlapping region list.[m
+[32m+[m[32m    let mut cursor = min_va;[m
+[32m+[m[32m    for (virtual_address, region_pages) in regions {[m
+[32m+[m[32m        let region_end = virtual_address.checked_add(region_pages.checked_mul(page_size)?)?;[m
+[32m+[m[32m        if cursor.checked_add(span)? <= virtual_address {[m
+[32m+[m[32m            break;[m
+[32m+[m[32m        }[m
+[32m+[m[32m        cursor = region_end;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    let virtual_address = cursor;[m
+[32m+[m[32m    if virtual_address.checked_add(span)? > max_va {[m
+[32m+[m[32m        return None;[m
+[32m+[m[32m    }[m
+[32m+[m[32m    Some((virtual_address, page_count))[m
+[32m+[m[32m}[m
+[32m+[m
+[32m+[m[32m#[cfg(test)][m
+[32m+[m[32mmod tests {[m
+[32m+[m[32m    use super::mmap_place;[m
+[32m+[m
+[32m+[m[32m    const PAGE: usize = 4096;[m
+[32m+[m[32m    // A scaled-down model of the kernel window (mmu::USER_MMAP_VA ..[m
+[32m+[m[32m    // mmu::USER_MMAP_MAX_VA), aligned the same way.[m
+[32m+[m[32m    const MIN_VA: usize = 0x0040_0000;[m
+[32m+[m[32m    const MAX_VA: usize = 0x4020_0000; // MIN_VA + 1024 MiB[m
+[32m+[m[32m    const MAX_PAGES: usize = (MAX_VA - MIN_VA) / PAGE; // 262144 pages[m
+[32m+[m[32m    const MAX_LENGTH: usize = MAX_PAGES * PAGE; // largest accepted length[m
+[32m+[m
+[32m+[m[32m    fn regions(list: &[(usize, usize)]) -> impl Iterator<Item = (usize, usize)> + '_ {[m
+[32m+[m[32m        list.iter().copied()[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn usize_max_is_rejected_without_overflow() {[m
+[32m+[m[32m        // Regression: `page_count * PAGE_SIZE` used to overflow here.[m
+[32m+[m[32m        // In debug builds this panicked (kernel halt); it must simply fail.[m
+[32m+[m[32m        assert_eq!(mmap_place(usize::MAX, MIN_VA, MAX_VA, PAGE, regions(&[])), None);[m
+[32m+[m[32m        // The exact 4095-value overflow window, plus its lower neighbour.[m
+[32m+[m[32m        assert_eq!(mmap_place(usize::MAX - 4095, MIN_VA, MAX_VA, PAGE, regions(&[])), None);[m
+[32m+[m[32m        assert_eq!(mmap_place(usize::MAX - 4096, MIN_VA, MAX_VA, PAGE, regions(&[])), None);[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn max_allowed_length_fits_exactly() {[m
+[32m+[m[32m        let placed = mmap_place(MAX_LENGTH, MIN_VA, MAX_VA, PAGE, regions(&[]));[m
+[32m+[m[32m        assert_eq!(placed, Some((MIN_VA, MAX_PAGES)));[m
+[32m+[m[32m        assert_eq!(placed.unwrap().0 + MAX_LENGTH, MAX_VA);[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn one_page_above_the_limit_is_rejected() {[m
+[32m+[m[32m        assert_eq!([m
+[32m+[m[32m            mmap_place(MAX_LENGTH + PAGE, MIN_VA, MAX_VA, PAGE, regions(&[])),[m
+[32m+[m[32m            None[m
+[32m+[m[32m        );[m
+[32m+[m[32m        // One byte above the limit still rounds up to a page too many.[m
+[32m+[m[32m        assert_eq!([m
+[32m+[m[32m            mmap_place(MAX_LENGTH + 1, MIN_VA, MAX_VA, PAGE, regions(&[])),[m
+[32m+[m[32m            None[m
+[32m+[m[32m        );[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn zero_length_is_rejected() {[m
+[32m+[m[32m        assert_eq!(mmap_place(0, MIN_VA, MAX_VA, PAGE, regions(&[])), None);[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn first_fit_skips_existing_regions() {[m
+[32m+[m[32m        let existing = [(MIN_VA, 4)]; // one region at the window start[m
+[32m+[m[32m        let placed = mmap_place(2 * PAGE, MIN_VA, MAX_VA, PAGE, regions(&existing));[m
+[32m+[m[32m        assert_eq!(placed, Some((MIN_VA + 4 * PAGE, 2)));[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn no_gap_before_next_region_falls_through() {[m
+[32m+[m[32m        // Region occupies everything the request could want at the start.[m
+[32m+[m[32m        let existing = [(MIN_VA, 8)];[m
+[32m+[m[32m        let placed = mmap_place(8 * PAGE, MIN_VA, MAX_VA, PAGE, regions(&existing));[m
+[32m+[m[32m        assert_eq!(placed, Some((MIN_VA + 8 * PAGE, 8)));[m
+[32m+[m[32m    }[m
+[32m+[m
+[32m+[m[32m    #[test][m
+[32m+[m[32m    fn overflowing_region_list_is_rejected_cleanly() {[m
+[32m+[m[32m        // Corrupted kernel-side region data must not panic the helper either.[m
+[32m+[m[32m        let bad = [(usize::MAX - PAGE / 2, usize::MAX)];[m
+[32m+[m[32m        assert_eq!(mmap_place(PAGE, MIN_VA, MAX_VA, PAGE, regions(&bad)), None);[m
+[32m+[m[32m    }[m
+[32m+[m[32m}[m
+[1mdiff --git a/src/mmu.rs b/src/mmu.rs[m
+[1mindex 9331e95..831cef6 100644[m
+[1m--- a/src/mmu.rs[m
+[1m+++ b/src/mmu.rs[m
+[36m@@ -63,6 +63,10 @@[m [mconst PCI_ECAM_L2_BLOCKS: usize = PCI_ECAM_SIZE / BLOCK_2M;[m
+ pub const USER_MMAP_VA: usize = USER_IMAGE_VA + 0x40_0000;[m
+ pub const USER_MMAP_MAX_VA: usize = USER_STACK_VA; // == USER_STACK_VA[m
+ [m
+[32m+[m[32m/// Upper bound on the page count of a single anonymous mapping. User-supplied[m
+[32m+[m[32m/// lengths are rejected against this before any span arithmetic.[m
+[32m+[m[32mpub const USER_MMAP_MAX_PAGES: usize = (USER_MMAP_MAX_VA - USER_MMAP_VA) / GRANULE;[m
+[32m+[m
+ /// `prot` bits for anonymous mappings. Read is always granted; these flags[m
+ /// select write and execute in `user_anonymous_page`.[m
+ pub const PROT_WRITE: u64 = 2;[m
+[36m@@ -429,7 +433,12 @@[m [mpub fn map_user_pages_at([m
+     if page_count == 0 || virtual_address % GRANULE != 0 || physical_start % GRANULE != 0 {[m
+         return false;[m
+     }[m
+[31m-    let Some(end) = virtual_address.checked_add(page_count * GRANULE) else {[m
+[32m+[m[32m    // checked_mul: `page_count` is bounded by the callers, but this function[m
+[32m+[m[32m    // must not depend on that for overflow safety.[m
+[32m+[m[32m    let Some(span) = page_count.checked_mul(GRANULE) else {[m
+[32m+[m[32m        return false;[m
+[32m+[m[32m    };[m
+[32m+[m[32m    let Some(end) = virtual_address.checked_add(span) else {[m
+         return false;[m
+     };[m
+     if virtual_address < DRAM_BASE || end > DRAM_BASE + 0x4000_0000 {[m
+[1mdiff --git a/src/scheduler.rs b/src/scheduler.rs[m
+[1mindex 6d327e5..de76240 100644[m
+[1m--- a/src/scheduler.rs[m
+[1m+++ b/src/scheduler.rs[m
+[36m@@ -1514,24 +1514,19 @@[m [mimpl Task {[m
+     /// Allocates and maps `length` bytes of anonymous memory into a free virtual[m
+     /// range in the task's TTBR0, returning the chosen address.[m
+     fn mmap_anonymous(&mut self, length: usize, prot: u64) -> Option<usize> {[m
+[31m-        let page_count = length.div_ceil(PAGE_SIZE);[m
+[31m-        if page_count == 0 {[m
+[31m-            return None;[m
+[31m-        }[m
+[31m-[m
+[31m-        // First-fit over the already-sorted region list.[m
+[31m-        let mut cursor = mmu::USER_MMAP_VA;[m
+[31m-        for region in &self.mmap_regions {[m
+[31m-            let gap_end = cursor.checked_add(page_count * PAGE_SIZE)?;[m
+[31m-            if gap_end <= region.virtual_address {[m
+[31m-                break;[m
+[31m-            }[m
+[31m-            cursor = region.virtual_address + region.page_count * PAGE_SIZE;[m
+[31m-        }[m
+[31m-        let virtual_address = cursor;[m
+[31m-        if virtual_address.checked_add(page_count * PAGE_SIZE)? > mmu::USER_MMAP_MAX_VA {[m
+[31m-            return None;[m
+[31m-        }[m
+[32m+[m[32m        // `length` is user-controlled: the pure placement helper bounds the[m
+[32m+[m[32m        // page count against the window and uses checked arithmetic, so an[m
+[32m+[m[32m        // absurd request (e.g. `usize::MAX`) returns None instead of[m
+[32m+[m[32m        // overflowing `page_count * PAGE_SIZE` and panicking the kernel.[m
+[32m+[m[32m        let (virtual_address, page_count) = silver_microkernel::mmap_place([m
+[32m+[m[32m            length,[m
+[32m+[m[32m            mmu::USER_MMAP_VA,[m
+[32m+[m[32m            mmu::USER_MMAP_MAX_VA,[m
+[32m+[m[32m            PAGE_SIZE,[m
+[32m+[m[32m            self.mmap_regions[m
+[32m+[m[32m                .iter()[m
+[32m+[m[32m                .map(|region| (region.virtual_address, region.page_count)),[m
+[32m+[m[32m        )?;[m
+ [m
+         let physical_start = frame_allocator::alloc_contiguous_pages(page_count)?;[m
+         if !mmu::map_user_pages_at(self.ttbr0, virtual_address, physical_start, page_count, prot) {[m
+[36m@@ -1556,7 +1551,9 @@[m [mimpl Task {[m
+     /// Unmaps the anonymous region that exactly matches `address` and `length`.[m
+     fn munmap(&mut self, address: usize, length: usize) -> bool {[m
+         let page_count = length.div_ceil(PAGE_SIZE);[m
+[31m-        if page_count == 0 {[m
+[32m+[m[32m        // Same user-controlled bound as `mmap_anonymous`: an absurd length[m
+[32m+[m[32m        // must be rejected up front, before the unmap loop walks pages.[m
+[32m+[m[32m        if page_count == 0 || page_count > mmu::USER_MMAP_MAX_PAGES {[m
+             return false;[m
+         }[m
+         let Some(position) = self.mmap_regions.iter().position(|region| {[m

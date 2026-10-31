@@ -1,37 +1,110 @@
 // efi_stub.S — PE32+/EFI wrapper around the Silver kernel Image.
 //
-// Loaded via GRUB `chainloader /Image.efi` + `boot` (StartImage), this stub:
-//   0. paints milestone bands into the splash framebuffer (0xD5100000, the
-//      buffer the panel scans out) so progress is VISIBLE with no UEFI
-//      protocol dependency. Bands (top of screen, 32 rows each):
-//        GREEN   (y=0)   : entry
-//        WHITE   (y=32)  : kernel copied to 0xA8000000 + cache cleaned
-//        MAGENTA (y=64)  : running at EL2
-//        CYAN    (y=64)  : running at EL1
-//        YELLOW  (y=96)  : MMU successfully disabled
-//   1. verifies SystemTable signature, prints "SILVER BOOT" via ConOut;
-//   2. copies the embedded kernel to its link address 0xA8000000;
-//   3. disables the MMU (and D-cache) at the current EL — PC-relative
-//      `b` + `isb` immediately after each `msr sctlr` so the post-MMU-off
-//      fetch re-reads a predictable physical address;
-//   4. paints YELLOW (MMU off done), then `br 0xA8000000` into the kernel.
+// Loaded via GRUB `chainloader /Image.efi` + `boot` (StartImage). One boot,
+// three sensors:
+//   - frame-buffer bands (slot 0, 0xD5100000): GREEN entry, WHITE copy
+//     verified, ORANGE pre-MMU-off (+EL2 block at y=128 if EL2), CYAN after
+//     VBAR_EL1 install, BLUE before the SCTLR write, VIOLET after it,
+//     YELLOW after ic iallu, then br 0xA8000000.
+//   - exception trap: all 16 vector entries point at one inline handler that
+//     paints a DARK-RED band (y=224) and renders ESR_EL1 (y=416) and
+//     FAR_EL1 (y=448) as 32 bit-blocks (bit31 leftmost, white=1).
+//   - pmsg markers ("0=ENTRY", "0=VBAR", "0=EXC") at +0x400 of both pmsg
+//     zones (0xA2040000 Android/DTB, 0xA2200000 module params).
+// After VBAR install NO bl/milestone: every paint is inline (traps must be
+// catchable with no call stack and no unresolved PC-relative surprises).
 //
-// pmsg marker write was REMOVED: pmsg-ramoops-0 never appears on this device,
-// so the marker was unreadable; the kernel's own `_start` records markers.
-//
-// Built with clang (COFF) + lld-link (ImageBase=0).
+// Built with clang (COFF) + lld-link (ImageBase=0): ./tablet/build_efi_img.sh
 
     .text
     .globl  efi_entry
 
-efi_entry:
-    mov     x19, x1                     // save SystemTable (x19 = callee-saved)
+// band: inline paint of a 32-row band on slot 0 (0xD5100000), 1600 px/row.
+// Clobbers x12-x17.
+.macro band y, color
+    movz    x16, #0xD510, lsl #16
+    movz    x17, #(\y)
+    mov     x14, #6400
+    mul     x17, x17, x14         // offset = y * 6400
+    add     x16, x16, x17
+    mov     x17, #6400              // row stride (x17 reused)
+    mov     w15, #(\color)
+    mov     w14, #1600
+    mov     w13, #32
+9991:
+    mov     x12, x16
+9992:
+    str     w15, [x12], #4
+    sub     w14, w14, #1
+    cbnz    w14, 9992b
+    add     x16, x16, x17
+    mov     w14, #1600
+    sub     w13, w13, #1
+    cbnz    w13, 9991b
+.endm
 
-    // --- 0. Entry: GREEN ---------------------------------------------------
+// bits: render the low 32 bits of \val as 32 blocks of 8x32 px at row \y,
+// bit 31 leftmost, white=1 / black=0. Inline. Clobbers x9-x17.
+.macro bits val, y
+    movz    x16, #0xD510, lsl #16
+    movz    x17, #(\y)
+    mov     x14, #6400
+    mul     x17, x17, x14         // offset = y * 6400
+    add     x16, x16, x17        // x16 = left edge of the bit row
+    mov     x17, #6400           // row stride
+    mov     x12, \val
+    mov     x13, #32             // 32 blocks
+9961:
+    tst     x12, #(1 << 31)
+    mov     w14, #0xFFFFFFFF     // white = 1
+    mov     w15, #0x00000000     // black = 0
+    csel    w15, w14, w15, ne
+    mov     x11, x16
+    mov     x10, #32             // rows per block
+9962:
+    mov     x9, x11
+    mov     x14, #8              // pixels per block
+9963:
+    str     w15, [x9], #4
+    sub     x14, x14, #1
+    cbnz    x14, 9963b
+    add     x11, x11, x17
+    sub     x10, x10, #1
+    cbnz    x10, 9962b
+    add     x16, x16, #32        // next block (8 px * 4 bytes)
+    lsl     x12, x12, #1
+    sub     x13, x13, #1
+    cbnz    x13, 9961b
+.endm
+
+// pmark: store 8 bytes (4 halfwords, little-endian ASCII, NUL-padded) at
+// +0x400 of both pmsg zones and clean to PoC. Inline. Clobbers x16, x17.
+.macro pmark hw0, hw1, hw2, hw3
+    movz    x16, #\hw0
+    movk    x16, #\hw1, lsl #16
+    movk    x16, #\hw2, lsl #32
+    movk    x16, #\hw3, lsl #48
+    movz    x17, #0xA204, lsl #16
+    add     x17, x17, #0x400
+    str     x16, [x17]
+    dc      cvac, x17
+    movz    x17, #0xA220, lsl #16
+    add     x17, x17, #0x400
+    str     x16, [x17]
+    dc      cvac, x17
+    dsb     sy
+.endm
+
+efi_entry:
+    mov     x19, x1                     // save SystemTable (callee-saved)
+
+    // --- GREEN: entry ------------------------------------------------------
     mov     x0, #0
     mov     w1, #0xFF00
     movk    w1, #0xFF00, lsl #16        // 0xFF00FF00 green
     bl      milestone
+
+    pmark   0x3D30, 0x454E, 0x5452, 0x0A59   // pmsg "0=ENTRY\n" (calibration)
 
     // --- 1. Verify SystemTable->Hdr.Signature == "IBI SYST" ----------------
     ldr     x2, [x19]
@@ -72,15 +145,18 @@ copy_loop:
     str     x5, [x4], #8
     b       copy_loop
 copy_done:
+    mov     x20, x2                     // x20 = dest base (survives milestone)
 
-    // --- 5. Clean the copied region to PoC --------------------------------
-    sub     x1, x1, x0
-    add     x1, x1, x2
+    // --- 5. Clean the fixed range [0xA8000000, 0xA8000000+KERNEL_SIZE) ----
+    .set    KERNEL_SIZE, 0x200000       // 2 MiB, with margin
+    movz    x0, #0xA800, lsl #16
+    movz    x1, #0xA800, lsl #16
+    movz    x3, #(KERNEL_SIZE >> 16), lsl #16
+    add     x1, x1, x3
     mrs     x15, ctr_el0
     ubfx    x15, x15, #16, #4
     mov     x6, #4
     lsl     x6, x6, x15
-    mov     x0, x2
 clean_loop:
     dc      cvac, x0
     add     x0, x0, x6
@@ -88,57 +164,107 @@ clean_loop:
     b.lo    clean_loop
     dsb     sy
 
-    // --- 5b. Milestone: WHITE (copy + clean done) --------------------------
+    // --- 5b. Verify the copy: compare 2 words at 0xA8000000 ----------------
+    adrp    x3, kernel_start
+    add     x3, x3, :lo12:kernel_start
+    ldr     x5, [x3]
+    ldr     x6, [x20]
+    ldr     x7, [x3, #8]
+    ldr     x8, [x20, #8]
+    eor     x5, x5, x6
+    eor     x7, x7, x8
+    orr     x5, x5, x7
     mov     x0, #32
+    cbnz    x5, copy_bad
     mov     w1, #0xFFFF
-    movk    w1, #0xFFFF, lsl #16        // 0xFFFFFFFF white
+    movk    w1, #0xFFFF, lsl #16        // 0xFFFFFFFF white = copy OK
+    bl      milestone
+    b       copy_verified
+
+copy_bad:
+    mov     w1, #0x0000
+    movk    w1, #0xFFFF, lsl #16        // 0xFFFF0000 red = copy mismatch
     bl      milestone
 
-    // --- 6. EL check, band, and MMU-off -----------------------------------
-    msr     daifset, #0xf               // mask async exceptions first
+copy_verified:
+    // --- 6. ORANGE: right before MMU off -----------------------------------
+    mov     x0, #64
+    mov     w1, #0x8000
+    movk    w1, #0xFFFF, lsl #16        // 0xFFFF8000 orange
+    bl      milestone
+
+    // EL indicator: filled ORANGE block at y=128 if EL2, empty if EL1
     mrs     x13, CurrentEL
     lsr     x13, x13, #2
     cmp     x13, #2
-    b.eq    el2_path
-
-    // EL1: cyan band, then disable MMU + D-cache via SCTLR_EL1.
-    mov     x0, #64
-    mov     w1, #0xFFFF
-    movk    w1, #0xFF00, lsl #16        // 0xFF00FFFF cyan
+    b.ne    el1_mark
+    mov     x0, #128
+    mov     w1, #0x8000
+    movk    w1, #0xFFFF, lsl #16
     bl      milestone
-    mrs     x14, sctlr_el1
-    bic     x14, x14, #(1 << 2)         // C
-    bic     x14, x14, #1                // M
-    msr     sctlr_el1, x14
+el1_mark:
+
+    // --- 7. Trap installation: VBAR_EL1 -> vbar_table ----------------------
+    adr     x14, vbar_table
+    msr     vbar_el1, x14
     isb
-    b       mmu_off_done
+    band    160, 0xFF00FFFF             // CYAN: VBAR_EL1 written + isb done
+    pmark   0x3D30, 0x4256, 0x5241, 0x000A   // pmsg "0=VBAR\n"
 
-el2_path:
-    // EL2: magenta band, then disable MMU + D-cache via SCTLR_EL2.
-    mov     x0, #64
-    mov     w1, #0x00FF
-    movk    w1, #0xFFFF, lsl #16        // 0xFFFF00FF magenta
-    bl      milestone
-    mrs     x14, sctlr_el2
-    bic     x14, x14, #(1 << 2)         // C
-    bic     x14, x14, #1                // M
-    msr     sctlr_el2, x14
+    // --- 8. MMU off (EL-conditional), inline everything from here ----------
+    band    320, 0xFF0000FF             // BLUE: right before the SCTLR write
+    msr     daifset, #0xf               // mask async exceptions first
+    movz    x9, #0xA800, lsl #16        // jump target (inline code keeps x9)
+    mrs     x10, CurrentEL
+    lsr     x10, x10, #2
+    cmp     x10, #2
+    b.eq    1f
+    // EL1
+    mrs     x11, sctlr_el1
+    bic     x11, x11, #1                // M
+    bic     x11, x11, #4                // C
+    bic     x11, x11, #(1 << 12)        // I
+    msr     sctlr_el1, x11
+    b       2f
+1:  // EL2
+    mrs     x11, sctlr_el2
+    bic     x11, x11, #1                // M
+    bic     x11, x11, #4                // C
+    bic     x11, x11, #(1 << 12)        // I
+    msr     sctlr_el2, x11
+2:  isb
+    band    352, 0xFFFF0080             // VIOLET: SCTLR write + isb survived
+    ic      iallu
+    dsb     sy
     isb
-    b       mmu_off_done
+    band    384, 0xFFFFFF00             // YELLOW: ic iallu survived
 
-mmu_off_done:
-    // --- 7. Milestone: YELLOW (MMU disabled) ------------------------------
-    mov     x0, #96
-    mov     w1, #0xFF00
-    movk    w1, #0xFFFF, lsl #16        // 0xFFFFFF00 yellow
-    bl      milestone
+    br      x9                          // -> 0xA8000000
 
-    // --- 8. Jump into the kernel at 0xA8000000 -----------------------------
-    movz    x0, #0xA800, lsl #16
-    br      x0
+    // --- trap handler: all 16 entries land here, inline, no stack ----------
+    .balign 0x800
+vbar_table:
+    .rept 16
+    b       handler
+    .space  0x80 - 4
+    .endr
+
+handler:
+    msr     daifset, #0xf
+    mrs     x19, esr_el1
+    mrs     x20, far_el1
+    mrs     x21, elr_el1
+    band    224, 0xFF800000             // dark red: exception caught at EL1
+    bits    x19, 416                    // ESR_EL1 as bit blocks
+    bits    x20, 448                    // FAR_EL1 as bit blocks
+    pmark   0x3D30, 0x5845, 0x0A43, 0x0000   // pmsg "0=EXC\n"
+9970:
+    wfe
+    b       9970b
 
     // milestone: paint a 32-row band at row `x0` with color `w1` on all 3
     // frame slots (0xD5100000/0xD60B0000/0xD7060000). Clobbers x7-x13.
+    // Only used BEFORE vbar_table is installed.
 milestone:
     mov     x7, #3
     adr     x8, slot_bases

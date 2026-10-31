@@ -4,8 +4,8 @@
 //! Senders block while 16 messages are queued; removing any message wakes one.
 //! Receivers can wait forever, poll, or sleep until an absolute timer deadline.
 
-use alloc::boxed::Box;
 use alloc::collections::VecDeque;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::{condvar::Condvar, mutex::Mutex, scheduler, timer};
@@ -47,9 +47,11 @@ pub enum ReceiveError {
 struct Mailbox {
     owner: u64,
     queue: VecDeque<Message>,
-    /// Boxed so their addresses survive `mailboxes.push()` and Vec relocation.
-    not_empty: Box<Condvar>,
-    not_full: Box<Condvar>,
+    /// Arc'd so their addresses survive `mailboxes.push()` and Vec relocation;
+    /// blocked tasks hold a clone, which keeps the queue alive for their
+    /// lifecycle unlink no matter when the mailbox is dropped.
+    not_empty: Arc<Condvar>,
+    not_full: Arc<Condvar>,
 }
 
 impl Mailbox {
@@ -57,8 +59,8 @@ impl Mailbox {
         Self {
             owner,
             queue: VecDeque::new(),
-            not_empty: Box::new(Condvar::new()),
-            not_full: Box::new(Condvar::new()),
+            not_empty: Arc::new(Condvar::new()),
+            not_full: Arc::new(Condvar::new()),
         }
     }
 }
@@ -87,8 +89,8 @@ pub fn send(target: u64, message: Message) -> Result<(), SendError> {
             return Ok(());
         }
 
-        let not_full = &*mailbox.not_full as *const Condvar;
-        guard = unsafe { (*not_full).wait(guard) };
+        let not_full = Arc::clone(&mailbox.not_full);
+        guard = not_full.wait(guard);
     }
 }
 
@@ -148,11 +150,11 @@ fn receive_matching(sender: Option<u64>, timeout_ticks: u64) -> Result<Message, 
             return Err(ReceiveError::Timeout);
         }
 
-        let not_empty = &*mailbox.not_empty as *const Condvar;
+        let not_empty = Arc::clone(&mailbox.not_empty);
         guard = if let Some(deadline) = deadline {
-            unsafe { (*not_empty).wait_until(guard, deadline) }
+            not_empty.wait_until(guard, deadline)
         } else {
-            unsafe { (*not_empty).wait(guard) }
+            not_empty.wait(guard)
         };
     }
 }

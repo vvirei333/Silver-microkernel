@@ -1,9 +1,12 @@
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
+use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
 
 use crate::{
     capability,
+    condvar::Condvar,
     elf::LoadedImage,
     elf_loader,
     frame_allocator, interrupts,
@@ -86,8 +89,24 @@ pub struct Task {
     dma_pages: Vec<(usize, usize)>,
     mmap_regions: Vec<MmapRegion>,
     program_break: usize,
-    waiting_on: Option<*const WaitQueue>,
+    waiting_on: Option<WaitLink>,
     owned_mutexes: Vec<*mut mutex::MutexState>,
+}
+
+/// How a blocked task is linked back to the wait queue it sleeps in.
+///
+/// The split makes every unlink provably safe, including from reap:
+///
+/// * [`WaitLink::Immortal`] queues are owned by kernel objects that are never
+///   dropped (`static`s and `MutexState`s) — the same trust level the task
+///   already carries in `owned_mutexes`. Unlinking is safe at any time.
+/// * [`WaitLink::Shared`] queues are refcounted mailbox condvars. Holding the
+///   `Arc` keeps the allocation alive, so unlinking stays safe even after the
+///   owning mailbox dropped its reference — a freed-then-dereferenced queue
+///   is no longer representable in this type.
+pub enum WaitLink {
+    Immortal(*const WaitQueue),
+    Shared(Arc<Condvar>),
 }
 
 pub struct TaskManager {
@@ -144,6 +163,11 @@ unsafe impl Sync for SharedScheduler {}
 static SCHEDULER: SharedScheduler = SharedScheduler(UnsafeCell::new(None));
 static PROCESS_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 static mut BOOT_CONTEXT: TaskContext = TaskContext::zero();
+
+/// Data frames of shared-DMA ranges whose revoke scan could not prove the
+/// absence of foreign mappings (see `reap_dead_tasks`): deliberately leaked
+/// instead of risking a use-after-free through a live foreign mapping.
+static DMA_LEAKED_FRAMES: AtomicUsize = AtomicUsize::new(0);
 
 core::arch::global_asm!(
     r#"
@@ -362,18 +386,12 @@ pub fn notify_bound_task(id: u64) -> bool {
     notified
 }
 
-pub fn register_waiter(queue: &WaitQueue) {
-    if let Some(task) = current_task_mut() {
-        task.waiting_on = Some(queue as *const WaitQueue);
-    }
-}
-
-pub fn block_current_on(queue: &WaitQueue) {
+pub fn block_current_on(queue: &WaitQueue, link: WaitLink) {
     let saved_daif = interrupts::save_and_disable_irq();
     let id = current_task_id();
     queue.enqueue(id);
     if let Some(task) = current_task_mut() {
-        task.waiting_on = Some(queue as *const WaitQueue);
+        task.waiting_on = Some(link);
         task.state = TaskState::Blocked;
     }
     schedule();
@@ -383,12 +401,12 @@ pub fn block_current_on(queue: &WaitQueue) {
     interrupts::restore_irq(saved_daif);
 }
 
-pub fn block_current_on_until(queue: &WaitQueue, deadline: u64) {
+pub fn block_current_on_until(queue: &WaitQueue, link: WaitLink, deadline: u64) {
     let saved_daif = interrupts::save_and_disable_irq();
     let id = current_task_id();
     queue.enqueue(id);
     if let Some(task) = current_task_mut() {
-        task.waiting_on = Some(queue as *const WaitQueue);
+        task.waiting_on = Some(link);
         task.state = TaskState::BlockedUntil(deadline);
     }
     schedule();
@@ -564,7 +582,7 @@ fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
         let waiter = current_task_id();
         PROCESS_WAIT_QUEUE.enqueue(waiter);
         if let Some(task) = current_task_mut() {
-            task.waiting_on = Some(&PROCESS_WAIT_QUEUE);
+            task.waiting_on = Some(WaitLink::Immortal(&PROCESS_WAIT_QUEUE));
             task.state = TaskState::Blocked;
         }
         schedule();
@@ -1218,6 +1236,26 @@ fn find_next_task(manager: &TaskManager) -> Option<usize> {
     None
 }
 
+/// Detaches a task from the wait queue recorded in `waiting_on` and clears
+/// the link. The task must still be in a blocked state when this runs.
+///
+/// Lifecycle invariant: a Ready/Running task carries no `waiting_on` and sits
+/// in no WaitQueue; a Dead task is unlinked by the reap backstop. This helper
+/// is the single place that restores the invariant when a blocked task leaves
+/// its queue without having been woken by a notify.
+///
+/// Safety of the unlink itself is structural, see [`WaitLink`]: `Immortal`
+/// queues are never dropped, `Shared` queues are kept alive by the waiter's
+/// own `Arc` reference. Neither variant can name freed memory. Callers run
+/// with IRQs masked inside `schedule()` on the single CPU.
+fn detach_from_wait_queue(task: &mut Task) {
+    match task.waiting_on.take() {
+        Some(WaitLink::Immortal(queue)) => unsafe { (*queue).remove(task.id) },
+        Some(WaitLink::Shared(condvar)) => condvar.remove_waiter(task.id),
+        None => {}
+    }
+}
+
 fn wake_expired_tasks(manager: &mut TaskManager, now: u64) {
     for task in &mut manager.tasks {
         if task.state == TaskState::Stopped {
@@ -1228,6 +1266,14 @@ fn wake_expired_tasks(manager: &mut TaskManager, now: u64) {
                 _ => false,
             };
             if expired {
+                // A stopped task whose blocked-underneath deadline expired
+                // must leave its queue before the resume is recorded: it is
+                // still killable while Stopped, and reap must not find it
+                // linked to a queue that a concurrent mailbox teardown could
+                // free.
+                if matches!(task.resume_state, Some(TaskState::BlockedUntil(_))) {
+                    detach_from_wait_queue(task);
+                }
                 task.resume_state = Some(TaskState::Ready);
             }
             continue;
@@ -1237,6 +1283,15 @@ fn wake_expired_tasks(manager: &mut TaskManager, now: u64) {
             _ => continue,
         };
         if now >= wake_at {
+            // Timeout path: detach from the wait queue before becoming Ready.
+            // Without this the task stays registered while Ready: a kill in
+            // this window frees its own mailbox queue and reap then
+            // dereferences the dangling `waiting_on` (use-after-free), and a
+            // notify in this window burns its pop on an already-Ready task
+            // (lost wakeup).
+            if matches!(task.state, TaskState::BlockedUntil(_)) {
+                detach_from_wait_queue(task);
+            }
             task.state = TaskState::Ready;
         }
     }
@@ -1260,15 +1315,65 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
 
     let live_id = manager.tasks.get(manager.current_index).map(|task| task.id);
 
+    // TASK №5: revoke foreign shared-DMA mappings of every dying task BEFORE
+    // any teardown. At this point every address space in `manager.tasks` —
+    // alive, stopped, blocked, and dead-but-not-reaped — still has intact
+    // page tables; running the scan inside `release_space`/`retain` instead
+    // would read page tables already freed by an earlier dead task's
+    // teardown in the same pass.
+    let mut dma_revokes: Vec<(usize, usize, mmu::RevokeResult)> = Vec::new();
+    for dead in manager.tasks.iter().filter(|task| task.state == TaskState::Dead) {
+        for &(physical, page_count) in &dead.dma_pages {
+            let fail = mmu::RevokeResult {
+                unmapped: 0,
+                safe_to_free: false,
+            };
+            let Some(span) = page_count.checked_mul(PAGE_SIZE) else {
+                dma_revokes.push((physical, page_count, fail));
+                continue;
+            };
+            let Some(phys_end) = physical.checked_add(span) else {
+                dma_revokes.push((physical, page_count, fail));
+                continue;
+            };
+            let mut aggregated = mmu::RevokeResult {
+                unmapped: 0,
+                safe_to_free: true,
+            };
+            let mut affected_tasks = 0usize;
+            for other in manager.tasks.iter() {
+                let result = mmu::revoke_phys_range(other.ttbr0, physical, phys_end);
+                aggregated.unmapped += result.unmapped;
+                aggregated.safe_to_free &= result.safe_to_free;
+                if result.unmapped > 0 {
+                    affected_tasks += 1;
+                }
+            }
+            console::write_str("DMA revoke: range 0x");
+            console::write_hex_u64(physical as u64);
+            console::write_str("-0x");
+            console::write_hex_u64(phys_end as u64);
+            console::write_str(": unmapped ");
+            console::write_dec_u64(aggregated.unmapped as u64);
+            console::write_str(" from ");
+            console::write_dec_u64(affected_tasks as u64);
+            console::write_str(" task(s), safe_to_free=");
+            console::write_str(if aggregated.safe_to_free { "true" } else { "false" });
+            console::write_str("\r\n");
+            dma_revokes.push((physical, page_count, aggregated));
+        }
+    }
+
     let mut wake = Vec::new();
     for task in manager
         .tasks
         .iter_mut()
         .filter(|task| task.state == TaskState::Dead)
     {
-        if let Some(queue) = task.waiting_on.take() {
-            unsafe { &*queue }.remove(task.id);
-        }
+        // Backstop unlink: ipc queues were already detached in `remove_task`
+        // before their free, so a Dead task's pointer here is either None or
+        // a `'static` queue (e.g. PROCESS_WAIT_QUEUE).
+        detach_from_wait_queue(task);
         wake.extend(task.release_mutexes());
         task.cap_table.remove_all();
         task.bound_irq = None;
@@ -1297,7 +1402,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     manager.tasks.retain(|task| {
         if task.state == TaskState::Dead {
             task.release_stack();
-            task.release_space();
+            task.release_space(&dma_revokes);
             false
         } else {
             true
@@ -1514,24 +1619,19 @@ impl Task {
     /// Allocates and maps `length` bytes of anonymous memory into a free virtual
     /// range in the task's TTBR0, returning the chosen address.
     fn mmap_anonymous(&mut self, length: usize, prot: u64) -> Option<usize> {
-        let page_count = length.div_ceil(PAGE_SIZE);
-        if page_count == 0 {
-            return None;
-        }
-
-        // First-fit over the already-sorted region list.
-        let mut cursor = mmu::USER_MMAP_VA;
-        for region in &self.mmap_regions {
-            let gap_end = cursor.checked_add(page_count * PAGE_SIZE)?;
-            if gap_end <= region.virtual_address {
-                break;
-            }
-            cursor = region.virtual_address + region.page_count * PAGE_SIZE;
-        }
-        let virtual_address = cursor;
-        if virtual_address.checked_add(page_count * PAGE_SIZE)? > mmu::USER_MMAP_MAX_VA {
-            return None;
-        }
+        // `length` is user-controlled: the pure placement helper bounds the
+        // page count against the window and uses checked arithmetic, so an
+        // absurd request (e.g. `usize::MAX`) returns None instead of
+        // overflowing `page_count * PAGE_SIZE` and panicking the kernel.
+        let (virtual_address, page_count) = silver_microkernel::mmap_place(
+            length,
+            mmu::USER_MMAP_VA,
+            mmu::USER_MMAP_MAX_VA,
+            PAGE_SIZE,
+            self.mmap_regions
+                .iter()
+                .map(|region| (region.virtual_address, region.page_count)),
+        )?;
 
         let physical_start = frame_allocator::alloc_contiguous_pages(page_count)?;
         if !mmu::map_user_pages_at(self.ttbr0, virtual_address, physical_start, page_count, prot) {
@@ -1556,7 +1656,9 @@ impl Task {
     /// Unmaps the anonymous region that exactly matches `address` and `length`.
     fn munmap(&mut self, address: usize, length: usize) -> bool {
         let page_count = length.div_ceil(PAGE_SIZE);
-        if page_count == 0 {
+        // Same user-controlled bound as `mmap_anonymous`: an absurd length
+        // must be rejected up front, before the unmap loop walks pages.
+        if page_count == 0 || page_count > mmu::USER_MMAP_MAX_PAGES {
             return false;
         }
         let Some(position) = self.mmap_regions.iter().position(|region| {
@@ -1587,14 +1689,39 @@ impl Task {
         }
     }
 
-    fn release_space(&self) {
+    /// Tears the task's address space down. `dma_revokes` carries the revoke
+    /// results collected in `reap_dead_tasks` (before any teardown): a range
+    /// is released only when its scan proved `safe_to_free`; otherwise the
+    /// frames are deliberately leaked (see `DMA_LEAKED_FRAMES`) rather than
+    /// handed back while a foreign mapping might still reference them.
+    fn release_space(&self, dma_revokes: &[(usize, usize, mmu::RevokeResult)]) {
         for region in &self.mmap_regions {
             mmu::unmap_user_pages_at(self.ttbr0, region.virtual_address, region.page_count);
             release_pages(region.physical_start, region.page_count);
         }
         mmu::destroy_task_space(self.ttbr0);
         for &(physical, page_count) in &self.dma_pages {
-            release_pages(physical, page_count);
+            // Exact (physical, page_count) match: allocator ranges never
+            // overlap, so a dead task's own range cannot be confused with
+            // another dead task's range in the same reap pass.
+            let record = dma_revokes
+                .iter()
+                .find(|(base, pages, _)| *base == physical && *pages == page_count);
+            match record {
+                Some((_, _, result)) if result.safe_to_free => {
+                    release_pages(physical, page_count);
+                }
+                _ => {
+                    DMA_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
+                    console::write_str("DMA LEAK: range 0x");
+                    console::write_hex_u64(physical as u64);
+                    console::write_str(" orphaned (");
+                    console::write_dec_u64(page_count as u64);
+                    console::write_str(" pages, total leaked frames ");
+                    console::write_dec_u64(DMA_LEAKED_FRAMES.load(Ordering::Relaxed) as u64);
+                    console::write_str(")\r\n");
+                }
+            }
         }
         if let Some(image) = &self.user_image {
             image.release();

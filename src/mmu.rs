@@ -7,6 +7,10 @@
 //! explicitly authorized Device-nGnRnE MMIO and Normal Non-Cacheable DMA.
 //! No kernel image or kernel data is shared with EL0.
 
+use core::cell::UnsafeCell;
+
+use alloc::vec::Vec;
+
 use crate::{
     frame_allocator,
     memory::{phys_to_virt, virt_to_phys, DRAM_BASE, DRAM_END},
@@ -25,6 +29,101 @@ const DRAM_L1_INDEX: usize = DRAM_BASE >> 30;
 const DESC_TABLE: u64 = 0b11;
 const DESC_BLOCK: u64 = 0b01;
 const DESC_PAGE: u64 = 0b11;
+
+/// Registry of physical frames whose contents are page tables.
+///
+/// There is no allocator-level notion of "page-table frame": every table is a
+/// plain `alloc_page()` result. This registry is the ground truth for revoke's
+/// table validation: a frame is registered exactly where a table is created
+/// (`create_task_space`, `map_user_pages_at`, `user_mmio_table`) and retired
+/// exactly where it is freed (`free_table_frame`). A descriptor naming any
+/// frame outside the registry — freed, data, or corrupted — cannot be
+/// distinguished from a table by its contents alone, so validation fails
+/// closed (`safe_to_free = false`, frames leak) instead of reading attacker-
+/// or corruption-controlled data as a page table.
+///
+/// Invariants, both enforced loudly rather than silently:
+/// - at most one registry record per frame: registration happens on fresh
+///   `alloc_page()` results only (a registered frame is used, so the
+///   allocator cannot hand it out again), and the registration path refuses
+///   a duplicate with a diagnostic and a debug assertion;
+/// - a frame is linked into a page table only after a successful
+///   registration: every creation site registers before its `write_entry`,
+///   and on registration failure frees the still-unlinked frame directly.
+struct PageTableRegistry(UnsafeCell<Vec<usize>>);
+
+unsafe impl Sync for PageTableRegistry {}
+
+// Same discipline as the frame allocator: single core, and every site that
+// mutates the registry (table creation/teardown, syscalls, reap) runs with
+// IRQs masked or before they are ever enabled. The revoke scan only reads.
+static PAGE_TABLE_FRAMES: PageTableRegistry = PageTableRegistry(UnsafeCell::new(Vec::new()));
+
+/// Registers a freshly created table frame. Returns `false` — leaving the
+/// frame unregistered — on duplicate registration (kernel bug) or when the
+/// registry cannot grow (out of memory). The caller must then not link the
+/// frame into any table and release it with a plain `free_page`.
+fn page_table_register(frame: usize) -> bool {
+    let frames = unsafe { &mut *PAGE_TABLE_FRAMES.0.get() };
+    if frames.iter().any(|&registered| registered == frame) {
+        crate::console::write_str("PAGE TABLE REGISTRY: duplicate registration of frame 0x");
+        crate::console::write_hex_u64(frame as u64);
+        crate::console::write_str(" - refused\r\n");
+        return false;
+    }
+    // Capacity is reserved explicitly: `push` after a successful
+    // `try_reserve(1)` cannot allocate, so registration cannot fail past
+    // this point and a link that follows it is always covered by a record.
+    if frames.try_reserve(1).is_err() {
+        crate::console::write_str("PAGE TABLE REGISTRY: out of memory, frame 0x");
+        crate::console::write_hex_u64(frame as u64);
+        crate::console::write_str(" not registered\r\n");
+        return false;
+    }
+    frames.push(frame);
+    true
+}
+
+/// Removes the record for `frame`. Returns `true` only when exactly one
+/// record was found and removed; `false` leaves the registry untouched.
+fn page_table_unregister(frame: usize) -> bool {
+    let frames = unsafe { &mut *PAGE_TABLE_FRAMES.0.get() };
+    let mut match_count = 0usize;
+    let mut match_position = 0usize;
+    for (position, &registered) in frames.iter().enumerate() {
+        if registered == frame {
+            match_count += 1;
+            match_position = position;
+        }
+    }
+    if match_count == 1 {
+        frames.swap_remove(match_position);
+        return true;
+    }
+    // match_count == 0 or > 1: the caller (free_table_frame) prints the
+    // diagnostic and fails closed.
+    false
+}
+
+fn page_table_registered(frame: usize) -> bool {
+    unsafe { (*PAGE_TABLE_FRAMES.0.get()).iter().any(|&registered| registered == frame) }
+}
+
+/// Frees a page-table frame and retires it from the registry in the same
+/// step. The only sanctioned way to release a table frame. Fail-closed: the
+/// frame is freed only when the registry confirmed exactly one record; an
+/// unregistered or multiply-registered frame is leaked with a diagnostic
+/// instead — a leaked frame can never be reallocated as data, so a stale
+/// record can never bless a foreign mapping.
+fn free_table_frame(frame: usize) {
+    if !page_table_unregister(frame) {
+        crate::console::write_str("PAGE TABLE REGISTRY: frame 0x");
+        crate::console::write_hex_u64(frame as u64);
+        crate::console::write_str(" is not uniquely registered - leaked, not freed\r\n");
+        return;
+    }
+    frame_allocator::free_page(frame);
+}
 
 /// Private 4 KB data window: L0 index 1, then L1/L2/L3 index 0.
 pub const PRIVATE_WINDOW_VA: usize = 0x0000_0080_0000_0000;
@@ -62,6 +161,10 @@ const PCI_ECAM_L2_BLOCKS: usize = PCI_ECAM_SIZE / BLOCK_2M;
 /// `l2_user` slots, so page tables are only allocated once a mapping is placed.
 pub const USER_MMAP_VA: usize = USER_IMAGE_VA + 0x40_0000;
 pub const USER_MMAP_MAX_VA: usize = USER_STACK_VA; // == USER_STACK_VA
+
+/// Upper bound on the page count of a single anonymous mapping. User-supplied
+/// lengths are rejected against this before any span arithmetic.
+pub const USER_MMAP_MAX_PAGES: usize = (USER_MMAP_MAX_VA - USER_MMAP_VA) / GRANULE;
 
 /// `prot` bits for anonymous mappings. Read is always granted; these flags
 /// select write and execute in `user_anonymous_page`.
@@ -318,11 +421,22 @@ pub fn create_task_space(
     let mut pages = [0_usize; 9];
     for (index, slot) in pages.iter_mut().enumerate() {
         let Some(page) = frame_allocator::alloc_page() else {
-            for prior in &pages[..index] {
-                frame_allocator::free_page(*prior);
+            // Rollback: every prior frame is a registered table; retire and
+            // free it through the sanctioned helper.
+            for &prior in &pages[..index] {
+                free_table_frame(prior);
             }
             return None;
         };
+        if !page_table_register(page) {
+            // Registration refused: the frame is still unlinked (tables are
+            // written only after this loop), so a plain free is correct.
+            frame_allocator::free_page(page);
+            for &prior in &pages[..index] {
+                free_table_frame(prior);
+            }
+            return None;
+        }
         *slot = page;
     }
     let [l0, l1_user, l2_user, l3_image, l3_heap, l3_stack, l1_priv, l2_priv, l3_priv] = pages;
@@ -417,6 +531,11 @@ pub fn unmap_user_heap_page(ttbr0: usize, index: usize) -> Option<usize> {
 /// is described with the `prot`-derived permissions (read always, write/execute
 /// per the flags).
 ///
+/// All-or-nothing contract: on any failure every partially installed mapping
+/// is unrolled (including page-table frames allocated for this call) before
+/// `false` is returned, so the caller's data-frame release is safe and the
+/// address space is left unchanged.
+///
 /// Only the user image/heap/stack window (`l2_user`, `[DRAM_BASE, DRAM_BASE+1G)`)
 /// is traversed, so `virtual_address` must lie inside it.
 pub fn map_user_pages_at(
@@ -429,7 +548,12 @@ pub fn map_user_pages_at(
     if page_count == 0 || virtual_address % GRANULE != 0 || physical_start % GRANULE != 0 {
         return false;
     }
-    let Some(end) = virtual_address.checked_add(page_count * GRANULE) else {
+    // checked_mul: `page_count` is bounded by the callers, but this function
+    // must not depend on that for overflow safety.
+    let Some(span) = page_count.checked_mul(GRANULE) else {
+        return false;
+    };
+    let Some(end) = virtual_address.checked_add(span) else {
         return false;
     };
     if virtual_address < DRAM_BASE || end > DRAM_BASE + 0x4000_0000 {
@@ -439,6 +563,11 @@ pub fn map_user_pages_at(
     unsafe {
         let l1_user = follow_table(ttbr0, 0);
         let l2_user = follow_table(l1_user, 1);
+        // All-or-nothing: `done` counts fully installed pages; every failure
+        // path unrolls them before returning. The rollback cannot refuse:
+        // each of the `done` slots was written by this call, so its L2 link
+        // and L3 descriptor are present (F1-created tables included).
+        let mut done = 0usize;
         for index in 0..page_count {
             let va = virtual_address + index * GRANULE;
             let l2_index = (va - DRAM_BASE) / BLOCK_2M;
@@ -446,18 +575,35 @@ pub fn map_user_pages_at(
             let l2_entry = read_entry(l2_user, l2_index);
             let l3 = if l2_entry == 0 {
                 let Some(page) = frame_allocator::alloc_page() else {
+                    // F1: no frame left for a new L3 table.
+                    unmap_user_pages_at(ttbr0, virtual_address, done);
                     return false;
                 };
                 zero_page(page);
+                if !page_table_register(page) {
+                    // Registration refused: the L2 entry below is only written
+                    // after a successful registration, so the frame is still
+                    // unlinked and a plain free is correct.
+                    frame_allocator::free_page(page);
+                    unmap_user_pages_at(ttbr0, virtual_address, done);
+                    return false;
+                }
+                // Registered before the first link; the rollback paths below
+                // free it through `unmap_user_pages_at`, which retires it via
+                // `free_table_frame`.
                 write_entry(l2_user, l2_index, page as u64 | DESC_TABLE);
                 flush_after_table_change(l2_user, GRANULE);
                 page
             } else if l2_entry & DESC_TABLE == DESC_TABLE {
                 descriptor_address(l2_entry) as usize
             } else {
+                // F2: unexpected descriptor kind in the user L2.
+                unmap_user_pages_at(ttbr0, virtual_address, done);
                 return false;
             };
             if read_entry(l3, l3_index) != 0 {
+                // F3: target slot already mapped.
+                unmap_user_pages_at(ttbr0, virtual_address, done);
                 return false;
             }
             write_entry(
@@ -466,6 +612,7 @@ pub fn map_user_pages_at(
                 user_anonymous_page(physical_start + index * GRANULE, prot),
             );
             flush_after_table_change(l3, GRANULE);
+            done += 1;
         }
     }
     true
@@ -498,7 +645,7 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
             if table_empty(l3) {
                 write_entry(l2_user, l2_index, 0);
                 flush_after_table_change(l2_user, GRANULE);
-                frame_allocator::free_page(l3);
+                free_table_frame(l3);
             }
         }
     }
@@ -514,6 +661,167 @@ fn table_empty(table: usize) -> bool {
             }
         }
         true
+    }
+}
+
+/// Result of a shared-DMA revoke scan over one address space.
+#[derive(Copy, Clone)]
+pub struct RevokeResult {
+    /// Number of page mappings removed from this address space.
+    pub unmapped: usize,
+    /// `true` only when the whole address space was verified: every
+    /// intermediate descriptor was a valid table descriptor and every
+    /// non-empty L3 entry was a valid page descriptor. Any unverifiable
+    /// structure forces `false`, and the caller must not free the frames.
+    pub safe_to_free: bool,
+}
+
+/// Validates a descriptor that names the next-level page table before the
+/// table frame is dereferenced, and returns the table's physical address.
+///
+/// A `DESC_TABLE` bit alone proves nothing about the safety of the address:
+/// corrupted memory can name any location, and `read_entry` through it would
+/// be a physical read of arbitrary memory. The address must therefore be a
+/// page-aligned, currently allocated frame **and a member of the page-table
+/// registry** (see [`PAGE_TABLE_FRAMES`]) — i.e. a frame this kernel itself
+/// created as a page table. Contents-based validation is impossible: data can
+/// mimic a valid table chain, so membership is checked, not inferred.
+///
+/// `None` means the address cannot be trusted: the caller must report the
+/// address space as unverifiable (`safe_to_free = false`) without reading it.
+fn follow_validated_table(descriptor: u64) -> Option<usize> {
+    if descriptor & DESC_TABLE != DESC_TABLE {
+        return None;
+    }
+    let physical = descriptor_address(descriptor) as usize;
+    if physical % GRANULE != 0
+        || !frame_allocator::frame_in_use(physical)
+        || !page_table_registered(physical)
+    {
+        return None;
+    }
+    Some(physical)
+}
+
+/// Revokes every page mapping whose physical address lies in the half-open
+/// range `[phys_base, phys_end)` from the MMIO window of one address space.
+///
+/// Read-only until a matching mapping is found: every intermediate level is
+/// validated before use (the descriptor must be a table **and** the table's
+/// physical address must be a page-aligned, currently allocated frame that
+/// the kernel itself registered as a page table — `ttbr0` itself included; a
+/// zero entry means the level is absent and the task is trivially clean) and
+/// no table is ever allocated. Only valid page descriptors (`DESC_PAGE`)
+/// whose physical address falls inside the range are removed; anything
+/// non-empty but not a valid page makes the whole window unverifiable
+/// (`safe_to_free = false`). Foreign mappings outside the range are kept.
+///
+/// Never allocates and never frees physical frames. Clearing a descriptor is
+/// followed by table cache maintenance and a full TLB invalidation before
+/// the caller may free the data frames.
+pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> RevokeResult {
+    if phys_base > phys_end
+        || phys_base % GRANULE != 0
+        || phys_end % GRANULE != 0
+        || phys_end > DRAM_END
+    {
+        return RevokeResult {
+            unmapped: 0,
+            safe_to_free: false,
+        };
+    }
+    if phys_base == phys_end {
+        return RevokeResult {
+            unmapped: 0,
+            safe_to_free: true,
+        };
+    }
+
+    unsafe {
+        // The root table named by `ttbr0` gets the same validation as every
+        // other level, registry included (`create_task_space` registers it).
+        // A `ttbr0` that fails any check means corrupted task state:
+        // unverifiable, and not read.
+        if ttbr0 % GRANULE != 0
+            || !frame_allocator::frame_in_use(ttbr0)
+            || !page_table_registered(ttbr0)
+        {
+            return RevokeResult {
+                unmapped: 0,
+                safe_to_free: false,
+            };
+        }
+
+        // L0 → L1_user. A zero entry means the user half is absent: nothing
+        // in this address space can map the range.
+        let root_entry = read_entry(ttbr0, 0);
+        if root_entry == 0 {
+            return RevokeResult {
+                unmapped: 0,
+                safe_to_free: true,
+            };
+        }
+        let Some(l1_user) = follow_validated_table(root_entry) else {
+            return RevokeResult {
+                unmapped: 0,
+                safe_to_free: false,
+            };
+        };
+
+        // L1 → mmio window. Zero means the task never opened an MMIO window.
+        let l1_entry = read_entry(l1_user, USER_MMIO_L1_INDEX);
+        if l1_entry == 0 {
+            return RevokeResult {
+                unmapped: 0,
+                safe_to_free: true,
+            };
+        }
+        let Some(l2_mmio) = follow_validated_table(l1_entry) else {
+            return RevokeResult {
+                unmapped: 0,
+                safe_to_free: false,
+            };
+        };
+
+        let l2_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
+        if l2_entry == 0 {
+            return RevokeResult {
+                unmapped: 0,
+                safe_to_free: true,
+            };
+        }
+        let Some(l3_mmio) = follow_validated_table(l2_entry) else {
+            return RevokeResult {
+                unmapped: 0,
+                safe_to_free: false,
+            };
+        };
+
+        let mut unmapped = 0usize;
+        for index in 0..ENTRIES {
+            let entry = read_entry(l3_mmio, index);
+            if entry == 0 {
+                continue;
+            }
+            if entry & DESC_PAGE != DESC_PAGE {
+                // Not a valid page descriptor: this window cannot be fully
+                // verified, so the caller must not free the frames.
+                return RevokeResult {
+                    unmapped,
+                    safe_to_free: false,
+                };
+            }
+            let physical = descriptor_address(entry) as usize;
+            if physical >= phys_base && physical < phys_end {
+                write_entry(l3_mmio, index, 0);
+                flush_after_table_change(l3_mmio, GRANULE);
+                unmapped += 1;
+            }
+        }
+        RevokeResult {
+            unmapped,
+            safe_to_free: true,
+        }
     }
 }
 
@@ -701,11 +1009,24 @@ fn user_mmio_table(ttbr0: usize) -> Option<usize> {
 
         let l2_mmio = frame_allocator::alloc_page()?;
         zero_page(l2_mmio);
-        let Some(l3_mmio) = frame_allocator::alloc_page() else {
+        if !page_table_register(l2_mmio) {
+            // Registration refused: `l1_user` is only linked after both
+            // registrations succeed, so the frame is still unlinked.
             frame_allocator::free_page(l2_mmio);
+            return None;
+        }
+        let Some(l3_mmio) = frame_allocator::alloc_page() else {
+            free_table_frame(l2_mmio);
             return None;
         };
         zero_page(l3_mmio);
+        if !page_table_register(l3_mmio) {
+            // `l3_mmio` was never linked (its L2 entry is written below);
+            // `l2_mmio` is registered but not yet linked into `l1_user`.
+            frame_allocator::free_page(l3_mmio);
+            free_table_frame(l2_mmio);
+            return None;
+        }
         write_entry(l2_mmio, USER_MMIO_L2_INDEX, l3_mmio as u64 | DESC_TABLE);
         write_entry(l1_user, USER_MMIO_L1_INDEX, l2_mmio as u64 | DESC_TABLE);
         flush_after_table_change(l3_mmio, GRANULE);
@@ -716,12 +1037,15 @@ fn user_mmio_table(ttbr0: usize) -> Option<usize> {
 }
 
 pub fn destroy_task_space(ttbr0: usize) {
+    // Every table frame below is released through `free_table_frame`, which
+    // retires it from the page-table registry in the same step (the heap data
+    // pages and the private page are data frames and stay on `free_page`).
     unsafe {
         let l1_user = follow_table(ttbr0, 0);
         let l2_user = follow_table(l1_user, 1);
         let image_table_entry = read_entry(l2_user, 0);
         if image_table_entry & DESC_TABLE == DESC_TABLE {
-            frame_allocator::free_page(descriptor_address(image_table_entry) as usize);
+            free_table_frame(descriptor_address(image_table_entry) as usize);
         }
         let heap_table_entry = read_entry(l2_user, USER_HEAP_L2_INDEX);
         if heap_table_entry & DESC_TABLE == DESC_TABLE {
@@ -732,20 +1056,20 @@ pub fn destroy_task_space(ttbr0: usize) {
                     frame_allocator::free_page(descriptor_address(entry) as usize);
                 }
             }
-            frame_allocator::free_page(l3_heap);
+            free_table_frame(l3_heap);
         }
         let stack_table_entry = read_entry(l2_user, USER_STACK_L2_INDEX);
         if stack_table_entry & DESC_TABLE == DESC_TABLE {
-            frame_allocator::free_page(descriptor_address(stack_table_entry) as usize);
+            free_table_frame(descriptor_address(stack_table_entry) as usize);
         }
         let mmio_table_entry = read_entry(l1_user, USER_MMIO_L1_INDEX);
         if mmio_table_entry & DESC_TABLE == DESC_TABLE {
             let l2_mmio = descriptor_address(mmio_table_entry) as usize;
             let l3_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
             if l3_entry & DESC_TABLE == DESC_TABLE {
-                frame_allocator::free_page(descriptor_address(l3_entry) as usize);
+                free_table_frame(descriptor_address(l3_entry) as usize);
             }
-            frame_allocator::free_page(l2_mmio);
+            free_table_frame(l2_mmio);
         }
 
         let l1_priv = follow_table(ttbr0, 1);
@@ -753,12 +1077,12 @@ pub fn destroy_task_space(ttbr0: usize) {
         let l3_priv = follow_table(l2_priv, 0);
         let private_page = descriptor_address(read_entry(l3_priv, 0));
         frame_allocator::free_page(private_page as usize);
-        frame_allocator::free_page(l3_priv);
-        frame_allocator::free_page(l2_priv);
-        frame_allocator::free_page(l1_priv);
-        frame_allocator::free_page(l2_user);
-        frame_allocator::free_page(l1_user);
-        frame_allocator::free_page(ttbr0);
+        free_table_frame(l3_priv);
+        free_table_frame(l2_priv);
+        free_table_frame(l1_priv);
+        free_table_frame(l2_user);
+        free_table_frame(l1_user);
+        free_table_frame(ttbr0);
     }
 }
 

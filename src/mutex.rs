@@ -5,6 +5,7 @@ use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 
 use crate::{interrupts, scheduler, wait_queue::WaitQueue};
+use scheduler::WaitLink;
 
 pub struct Mutex<T> {
     value: UnsafeCell<T>,
@@ -49,7 +50,9 @@ impl<T> Mutex<T> {
                 return;
             }
 
-            scheduler::block_current_on(&state.waiters);
+            // MutexState is never dropped: the Immortal link mirrors the
+            // existing `owned_mutexes` raw-pointer trust.
+            scheduler::block_current_on(&state.waiters, WaitLink::Immortal(&state.waiters));
             interrupts::restore_irq(saved_daif);
         }
     }

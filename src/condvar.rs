@@ -16,6 +16,7 @@
 //! The waiter list is plain data protected by the caller's mutex plus the
 //! IRQ mask (single-CPU kernel) — no blocking lock of its own.
 
+use alloc::sync::Arc;
 use crate::{interrupts, mutex::MutexGuard, scheduler, timer, wait_queue::WaitQueue};
 
 pub struct Condvar {
@@ -32,14 +33,16 @@ impl Condvar {
     }
 
     /// Releases `guard` and blocks until notified, then re-acquires the mutex.
-    pub fn wait<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+    ///
+    /// Shared-queue flavor: the caller holds this condvar in an `Arc` (mailbox
+    /// condvars), so the scheduler's wait link keeps the queue alive for as
+    /// long as the blocked task may still need to unlink from it.
+    pub fn wait<'a, T>(self: &Arc<Self>, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
         let mutex = guard.mutex();
         let saved_daif = interrupts::save_and_disable_irq();
         // Queue registration, unlock and sleep are atomic with IRQs masked.
-        // The scheduler also remembers the queue for exit cleanup.
-        scheduler::register_waiter(&self.waiters);
         drop(guard);
-        scheduler::block_current_on(&self.waiters);
+        scheduler::block_current_on(&self.waiters, scheduler::WaitLink::Shared(Arc::clone(self)));
         interrupts::restore_irq(saved_daif);
 
         mutex.lock()
@@ -48,18 +51,48 @@ impl Condvar {
     /// Timed variant using an absolute timer deadline. The caller must re-check
     /// its condition: notification and timeout can race, and the mutex is only
     /// re-acquired after the scheduler resumes this task.
-    pub fn wait_until<'a, T>(&self, guard: MutexGuard<'a, T>, deadline: u64) -> MutexGuard<'a, T> {
+    pub fn wait_until<'a, T>(
+        self: &Arc<Self>,
+        guard: MutexGuard<'a, T>,
+        deadline: u64,
+    ) -> MutexGuard<'a, T> {
         if timer::ticks() >= deadline {
             return guard;
         }
         let mutex = guard.mutex();
         let saved_daif = interrupts::save_and_disable_irq();
-        scheduler::register_waiter(&self.waiters);
         drop(guard);
-        scheduler::block_current_on_until(&self.waiters, deadline);
+        scheduler::block_current_on_until(
+            &self.waiters,
+            scheduler::WaitLink::Shared(Arc::clone(self)),
+            deadline,
+        );
         interrupts::restore_irq(saved_daif);
 
         mutex.lock()
+    }
+
+    /// `'static`-queue flavor for condvars embedded in kernel objects that are
+    /// never dropped (semaphores inside statics): the scheduler stores an
+    /// [`scheduler::WaitLink::Immortal`] link.
+    pub fn wait_immortal<'a, T>(&self, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        let mutex = guard.mutex();
+        let saved_daif = interrupts::save_and_disable_irq();
+        drop(guard);
+        scheduler::block_current_on(
+            &self.waiters,
+            scheduler::WaitLink::Immortal(&self.waiters),
+        );
+        interrupts::restore_irq(saved_daif);
+
+        mutex.lock()
+    }
+
+    /// Removes one task id from the wait queue without waking it. Used by the
+    /// scheduler's lifecycle cleanup; safe on an orphaned queue because the
+    /// waiter holds the `Arc`.
+    pub fn remove_waiter(&self, id: u64) {
+        self.waiters.remove(id);
     }
 
     pub fn notify_one(&self) {

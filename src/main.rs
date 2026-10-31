@@ -108,6 +108,10 @@ core::arch::global_asm!(
     .type _start, %function
 1:
 _start:
+    // Kimi step 1: mask IRQ/FIQ/SError first — the firmware handover may
+    // leave pending exceptions that would fire into a not-yet-set VBAR.
+    msr daifset, #0xf
+
     // Secondary cores park FIRST: on the tablet eight cores may come out of
     // ABL running, and QEMU starts only one. Any secondary executing this
     // stub would zero .bss twice and scribble over the page tables; a wfe
@@ -130,8 +134,8 @@ _start:
     ldr x18, =0xD7060000        // frame 2
     bl 19f
     b 20f
-19: mov w15, #0xFFF            // white, low byte 0xFFF&0xFF... build 0xFFFFFFFF
-    movk w15, #0xFFFF, lsl #16
+19: mov w15, #0xFF00          // GREEN band (Kimi step 7): 0xFF00FF00
+    movk w15, #0xFF00, lsl #16
     mov x16, #64               // 64 rows
     mov x17, #6400             // stride bytes (1600*4)
 1:  mov x14, x18
@@ -190,16 +194,19 @@ _start:
     // valid persistent_ram header so pstore exposes the block verbatim:
     //   +0x20 M0: PC at entry   +0x28 M1: CurrentEL   +0x30 M2: SCTLR raw
     //   +0x38 M3: zero after .bss zeroing   +0x40 M4: zero after tables
+    //   +0x48 DTB pointer from the handover (x0; 0 on QEMU)
+    //   +0x50 DTB totalsize (BE u32 from the DTB header, host order here)
     .macro PROBE base
     ldr x18, =\base
     ldr x19, =0x43474239        // persistent_ram sig
     str x19, [x18]
     str wzr, [x18, #4]          // start = 0
-    mov w19, #0x48
-    str w19, [x18, #8]          // size: header + M0..M4
+    mov w19, #0x58
+    str w19, [x18, #8]          // size: header + M0..M4 + DTB ptr + DTB size
     str x9,  [x18, #0x20]       // M0: PC
     str x10, [x18, #0x28]       // M1: CurrentEL
     str x11, [x18, #0x30]       // M2: SCTLR_EL1 at entry
+    str x0,  [x18, #0x48]       // Kimi step 5: DTB pointer from linuxdirect
     dc cvac, x18
     dsb sy
     .endm
@@ -209,13 +216,111 @@ _start:
     PROBE 0xA2200000
 .endif
 
+    // --- Kimi steps 2-4: temp stack, image_size, full-image cache flush ----
+    // PC-relative so it survives a load address != link address. The temp
+    // stack sits 2 MiB past _start: beyond the ~1.6 MiB image, inside free
+    // DRAM, away from bss/page tables that get zeroed right after.
+    adr x12, _start
+    mov sp, x12
+    movz x13, #0x200
+    lsl x13, x13, #12           // 0x200000
+    add sp, sp, x13
+    ldr x13, [x12, #-0x20]      // image_size @ _head+0x10 = _start-0x20
+    mrs x15, ctr_el0
+    ubfx x15, x15, #16, #4
+    mov x14, #4
+    lsl x14, x14, x15           // D-cache line size
+    add x15, x12, x13           // end = _start + image_size
+1:  dc cvac, x12                // Kimi step 4: clean the whole image
+    add x12, x12, x14
+    cmp x12, x15
+    b.lo 1b
+    dsb sy
+    ic iallu
+    dsb sy
+    isb
 
-    // The ELF is linked at high VAs but loaded at low physical addresses.
-    // Until the MMU is on, convert every linked data address to physical.
-    ldr x0, =__stack_top
-    ldr x1, =__kernel_virt_base
-    sub x0, x0, x1
-    mov sp, x0
+    // --- Kimi step 6: M0 ASCII stamp "SILVER PC=XXXXXXXX EL=n\n" -----------
+    // Written after the PROBE header (sig/start/size/M0-M2/DTB are already
+    // in place) into both zones, as printable text in console-ramoops-0 and
+    // pmsg-ramoops-0. x9/x10 are copies: PROBE stored the raw values above.
+.if RAM_LOG_MARKS
+    mov x20, x9
+    mov x21, x10
+    .macro M0TXT base, pc, el
+    ldr x18, =\base
+    movz x13, #0x4953           // "SILVER P" (8 bytes, LE)
+    movk x13, #0x564C, lsl #16
+    movk x13, #0x5245, lsl #32
+    movk x13, #0x5020, lsl #48
+    str x13, [x18, #0x20]
+    movz w13, #0x3D43           // "C="
+    str w13, [x18, #0x28]
+    mov x16, #8
+    add x15, x18, #0x2A         // hex digits start here
+22: lsr x13, \pc, #60
+    cmp x13, #10
+    blt 23f
+    add x13, x13, #55           // 'A'-10
+    b 24f
+23: add x13, x13, #48           // '0'
+24: strb w13, [x15], #1
+    lsl \pc, \pc, #4
+    sub x16, x16, #1
+    cbnz x16, 22b
+    movz w13, #0x4520           // " EL=" (LE: 20 45 4C 3D)
+    movk w13, #0x3D4C, lsl #16
+    str w13, [x15]
+    add x15, x15, #4
+    lsr x13, \el, #2
+    add x13, x13, #48
+    strb w13, [x15], #1
+    mov w13, #10                // '\n'
+    strb w13, [x15], #1
+    mov x14, x18                // clean the stamped 0x80 bytes to PoC
+    add x13, x18, #0x80
+25: dc cvac, x14
+    add x14, x14, #64
+    cmp x14, x13
+    b.lo 25b
+    dsb sy
+    .endm
+    M0TXT 0xA2000000, x20, x21
+    M0TXT 0xA2200000, x20, x21
+.endif
+
+    // --- Kimi step 6: DTB — copy to fixed physical scratch 0xA4000000 -----
+    // kexec purgatory (and ABL) pass the physical DTB in x0. BSS is
+    // linked-address dependent and wrong until the relink, so the copy goes
+    // to fixed free DRAM instead; it works no matter where we were loaded.
+    // The original x0 pointer is already in the marker zones (+0x48).
+.if RAM_LOG_MARKS
+    cbz x0, 27f                 // no DTB (QEMU -kernel): skip
+    ldr w13, [x0, #4]
+    rev w13, w13                // DTB totalsize: big-endian u32 at +4
+    mov x14, #0xA400
+    lsl x14, x14, #16           // dst = 0xA4000000 (free DRAM, nobody's)
+    mov x15, x0                 // src
+    mov x16, x14
+    mov x17, x13
+    mov x12, #0x100
+    lsl x12, x12, #20           // 1 MiB cap
+    cmp x17, x12
+    b.ls 26f
+    mov x17, x12
+26: ldr w11, [x15], #4
+    str w11, [x16], #4
+    sub x17, x17, #4
+    cbnz x17, 26b
+    ldr x18, =0xA2000000        // record totalsize at +0x50 of both zones
+    str w13, [x18, #0x50]
+    dc cvac, x18
+    ldr x18, =0xA2200000
+    str w13, [x18, #0x50]
+    dc cvac, x18
+    dsb sy
+27:
+.endif
 
     mrs x2, CurrentEL
     lsr x2, x2, #2

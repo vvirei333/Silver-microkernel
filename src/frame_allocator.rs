@@ -73,6 +73,28 @@ pub fn used_pages() -> usize {
     state.total_pages - state.free_pages
 }
 
+/// Read-only allocation query: `true` only when `address` is a page-aligned
+/// frame inside the managed range whose bitmap bit is currently set (used).
+///
+/// The allocator tracks allocation, not purpose: a `true` result proves the
+/// frame is live, but not what it holds (it could be data or a page table).
+/// A `false` result proves the address is not a live kernel allocation —
+/// exactly what a validation path needs to reject a descriptor that names
+/// unmanaged, freed, or unaligned memory.
+pub fn frame_in_use(address: usize) -> bool {
+    let state = state();
+    if address % PAGE_SIZE != 0 || !state.available.contains(address) {
+        return false;
+    }
+
+    let page_index = (address - state.available.start) / PAGE_SIZE;
+    if page_index >= state.total_pages {
+        return false;
+    }
+
+    state.bitmap[page_index / BITS_PER_WORD] & (1_u64 << (page_index % BITS_PER_WORD)) != 0
+}
+
 /// Allocates one physical page using first-fit search.
 pub fn alloc_page() -> Option<usize> {
     let state = state();

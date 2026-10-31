@@ -27,7 +27,7 @@ impl Semaphore {
     pub fn wait(&self) {
         let mut guard = self.permits.lock();
         while *guard == 0 {
-            guard = self.condvar.wait(guard);
+            guard = self.condvar.wait_immortal(guard);
         }
         *guard -= 1;
     }

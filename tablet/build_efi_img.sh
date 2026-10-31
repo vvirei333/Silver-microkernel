@@ -33,6 +33,22 @@ echo "==> objcopy raw kernel WITHOUT padding (the EFI stub copies exactly this)"
 aarch64-linux-gnu-objcopy -O binary "$KERNEL" tablet/Image.nopad
 ls -l tablet/Image.nopad
 
+echo "==> Raw arm64 Image for the FAT32 root (linuxdirect /Image)"
+cp tablet/Image.nopad tablet/Image
+echo "==> ARM64 Image header check (code0/text_offset/image_size/magic):"
+xxd -l 64 tablet/Image
+python3 - <<'EOF'
+import struct, os
+d = open('tablet/Image', 'rb').read(0x40)
+assert d[0x38:0x3C] == b'ARMd', 'missing ARMd magic'
+assert struct.unpack_from('<Q', d, 8)[0] == 0, 'text_offset must be 0'
+size = struct.unpack_from('<Q', d, 0x10)[0]
+fsize = os.path.getsize('tablet/Image')
+assert 0 < size < fsize + 16 * 1024 * 1024, 'bad image_size'
+print(f'header OK: image_size={size:#x} (file {fsize:#x}, '
+      f'delta=bss) text_offset=0 magic=ARMd')
+EOF
+
 echo "==> assembling efi_stub.S -> COFF object (embeds Image.nopad via .incbin)"
 clang --target=aarch64-unknown-windows-msvc -ffreestanding \
     -c tablet/efi_stub.S -o tablet/efi_stub.obj

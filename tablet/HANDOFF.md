@@ -399,3 +399,106 @@ adb shell "su -c 'cat /sys/fs/pstore/pmsg-ramoops-0'" | grep -a SILVER
 ### Ключевые цвета вех (BGRA, Qualcomm)
 - зелёный 0xFF00FF00 · белый 0xFFFFFFFF · пурпурный 0xFFFF00FF ·
   голубой 0xFF00FFFF · жёлтый 0xFFFFFF00
+
+## §12. 2026-10-30: Linux-трамплин — GPT, rootfs, Kubuntu-релиз, где остановились
+
+### Главные факты дня (все проверены на железе)
+1. **linuxdirect на этом ABL не работает ни для кого**: «UEFI dump table info not
+   found. Status = (0x0) / App Log Flush: 0 ms» — и с нашим конфигом, и с
+   авторским linux.cfg, и с их ядром, и через fastboot boot, и при прошивке
+   boot.img в boot_a. Не наша ошибка — особенность ABL/версии.
+2. **EFI-stub через GRUB chainloader — работает**: «Booting ... (EFI stub)» →
+   «EFI stub: ERROR: Invalid header detected on UEFI supplied FDT, ignoring ...».
+   Ядро стартовало! Фирмварь отдаёт битый FDT. GRUB `devicetree
+   /dtb/platform.dtb` не перекрыл его (почему — TBD: проверить, что файл
+   загрузился; DTB в образе валидный d00dfeed). После игнора FDT ядро молчит
+   (наверняка паника без DTB).
+3. **Рабочий релиз сообщества** (юзер его ранее грузил!):
+   `Kirby-Y700-2026-09-26/03-kubuntu-release/` (от GUF296 CI).
+   Схема: boot.img (EDK2) → **настоящий GRUB** (BOOTAA64.EFI, 753 КБ) →
+   grub.cfg `chainloader /EFI/BOOT/QCOMRAMP.EFI` → у QCOMRAMP **вшитый** конфиг
+   (root=PARTLABEL=userdata, dtb sm8650-lenovo-tb321fu.dtb) → Kubuntu на
+   userdata (20 ГБ ext4). НЕ linuxdirect из grub.cfg — у QCOMRAMP свой.
+   Наш повтор этой схемы упал: «Failed to boot both default and fallback
+   entries» — chainloader QCOMRAMP.EFI не сработал. Debug-план: в GRUB-шелл
+   (`c` в меню): `set debug=efi,linux; chainloader /EFI/BOOT/QCOMRAMP.EFI; boot`
+   и читать ошибку; проверить наличие /qcomramp.cfg (BOOT-INFO упоминает
+   qcomramp_cfg_name=qcomramp.cfg — возможно, файл нужен на FAT).
+4. **Прошивка без root**: fastboot flash работает на boot_a/Y700BOOT/userdata
+   (устройство разблокировано). userdata стирается из fastbootd
+   (`fastboot reboot fastboot` → `fastboot erase userdata`); из обычного
+   fastboot erase FAILED (в т.ч. fastboot -w).
+5. **GPT адаптирован под 256 ГБ** (`tablet/port_install/repartition_256g.py`,
+   исходник — их скрипт захардкожен под 512 ГБ): userdata 3613096..31924647
+   (108 ГиБ), sda17 Y700BOOT 31924648..32186791 (1 ГиБ), sda18 tb321fu-root
+   32186792..60884986 (109.5 ГиБ), sda14 переименован Y700BOOT→SILVERBOOT
+   (наши эксперименты целы). Бэкапы: tablet/backups/sda_gpt_current_20261030.bin.
+6. **В их ядре kexec ЕСТЬ**: CONFIG_KEXEC=y (строки kexec_core/kexec_file_load в
+   boot/Image). Пересборка не нужна.
+
+### Что на планшете сейчас
+- boot_a = Kubuntu boot.img (EDK2 UEFI); boot_b = сток-копия (бэкап жив).
+- Y700BOOT (sda17) = их y700boot.img (ядро 7.1.1 EFI-stub MZ, QCOMRAMP,
+  их linux.cfg) + **/silver-Image** (наш M0-бутстаб) + **/silver-dtb**.
+- userdata (sda16) = **Kubuntu rootfs 20 ГБ** (из рабочего релиза, rootfs.sparse).
+- tb321fu-root (sda18) = наш минимальный Ubuntu rootfs: root/silver123, ssh
+  включён, USB NCM гаджет 10.15.19.82 (unit usb-ncm.service), kexec-tools,
+  модули 7.1.1-g5df8e852ea72, прошивки. Образ: /tmp/silver_rootfs_build/
+  rootfs.img (пересобирается build-скриптом из этой секции).
+- Android в текущем виде отсутствует (userdata затёрт; вернуть = сток-рекавери
+  или перепрошивка; данные юзер согласился потерять).
+- TWRP-спасатель: `Kirby-Y700-2026-09-26/twrp-3.7.1_12-TB321FU-b0006.7z`
+  (`fastboot boot` всегда работает).
+
+### Минимальный rootfs — рецепт (без root на ПК!)
+ubuntu-base-24.04.5-arm64.tar.gz (cdimage.ubuntu.com) + 58 deb из
+ports.ubuntu.com (kexec-tools, openssh-server + зависимости; резолвер зависимостей
+по Packages.gz — скрипт в логах сессии) + packages/*.deb из их репо (модули,
+оверлей). Конфиги: fstab (PARTLABEL=tb321fu-root /), sshd (PermitRootLogin yes),
+usb-ncm.sh гаджет, root-пароль в /etc/shadow. Затем
+`fakeroot mkfs.ext4 -F -L tb321fu-root -d tree -E root_owner=0:0 rootfs.img`
+и `img2simg` → `fastboot flash tb321fu-root`. Владелец root без sudo на ПК.
+
+### Путь к запуску Silver (план на след. сессию)
+1. Починить GRUB→QCOMRAMP (факт 3) → грузится рабочий Kubuntu на userdata
+   (юзер его раньше видел живым) → из него kexec -l /silver-Image --dtb
+   /silver-dtb && kexec -e → M0-маркеры в pmsg → перелинковка.
+2. Или починить FDT для EFI-stub (факт 2) → грузится их ядро на наш sda18
+   rootfs (ssh 10.15.19.82) → тот же kexec.
+3. У обоих путей цель одна: любой их Linux → kexec → Silver → M0 → перелинковка
+   → шедулер на железе.
+
+## §13. 2026-10-31: D1-эксперимент — дошли до GRUB, застряли на вводе меню
+
+### Разрешённый и выполненный прогон (Этапы 1–4)
+- Этап 1 (preflight файлов): PASS — diag `7c36a91a…` = бэкапу, оригинал `cdcc52d6…`,
+  DTB `6f0707cd…`, grub.cfg `1ed9c1ad…`, fsck clean, размер 268435456.
+- Этап 2 (устройство): сначала попали в fastboot от EDK2 (getvar пустые,
+  is-userspace:no) — остановка; после ручного ребута в ABL-fastboot:
+  `partition-size:Y700BOOT = 0x40000000`, `product: kirby`, `current-slot: a` ✓
+- Этап 3: `fastboot flash Y700BOOT /tmp/kub/diag_y700boot.img` → OKAY/OKAY ✓
+- Этап 4: `fastboot boot …/extracted/boot.img` → OKAY (EDK2 стартовал в RAM) ✓
+
+### Результат загрузки (Этап 5)
+Достигнут этап 3 из 8: **EDK2 → GRUB меню отображается** (записи D1b/D1a видны).
+Дальше споткнулись: **ввод в GRUB не работает** — кнопка питания не выбирает
+пункт, экран мерцает (перерисовки меню). Авто-бут по timeout=20, видимо,
+сбивался нажатиями. **Ядро не достигнуто** — статус: `GRUB_REACHED`.
+
+Гипотезы (на завтра, не проверены):
+1. Input: EDK2 не отдаёт GRUB SimpleTextIn от кнопки питания (громкость должна
+   работать как стрелки — не проверено).
+2. Мерцание = gfxpayload=keep / GOP-режим; попробовать без gfxpayload=keep.
+3. Решение без инпута: **timeout=0** — GRUB сразу бутает default (D1b).
+
+### Готово к следующей сессии (всё в 03-kubuntu-release/backups/)
+- `diag_y700boot_t0.img` sha256 `127df567…` — то же D1b, но `set timeout=0`
+  (авто-бут D1b без всякого ввода). `diag_t0.cfg` рядом.
+- Планшет в текущем состоянии: boot_a = EDK2 (kub), Y700BOOT = diag (timeout=20),
+  userdata = kub rootfs, tb321fu-root = наш минимальный rootfs. Откат Y700BOOT:
+  `fastboot flash Y700BOOT …/backups/Y700BOOT_ORIGINAL_kub_grub.img` (`cdcc52d6…`).
+- Команды следующего шага (после разрешения): flash Y700BOOT ← t0-образ,
+  затем `fastboot boot …/extracted/boot.img`; смотреть экран: должно
+  автоматически пойти D1b → «chainloader OK, booting EFI stub» → лог ядра на tty1.
+- Статусы для отчёта: цель — сменить `GRUB_REACHED` на `KERNEL_STARTED` /
+  `KUBUNTU_BOOTED` (login prompt на экране).
