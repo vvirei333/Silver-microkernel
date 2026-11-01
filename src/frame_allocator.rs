@@ -1,6 +1,5 @@
-use core::cell::UnsafeCell;
-
 use crate::memory::{MemoryRegion, PAGE_SIZE};
+use crate::smp::SpinLock;
 
 pub const MAX_PHYSICAL_PAGES: usize = crate::memory::DRAM_SIZE / PAGE_SIZE;
 const BITS_PER_WORD: usize = 64;
@@ -14,22 +13,17 @@ struct FrameAllocatorState {
     free_pages: usize,
 }
 
-struct SharedState(UnsafeCell<FrameAllocatorState>);
-
-// The kernel is currently single-core and does not enable interrupts before tests finish.
-// Add a lock here when interrupt handlers or additional cores access the allocator.
-unsafe impl Sync for SharedState {}
-
-static STATE: SharedState = SharedState(UnsafeCell::new(FrameAllocatorState {
+/// The allocator state lives behind a spinlock: two CPUs racing in
+/// `alloc_page` would otherwise both claim the same free bit. All mutators
+/// (and the read-only queries used by revoke validation) take the lock;
+/// every call site runs with the kernel lock held, so the spin here is
+/// bounded by another CPU's short critical section.
+static STATE: SpinLock<FrameAllocatorState> = SpinLock::new(FrameAllocatorState {
     bitmap: [0; BITMAP_WORDS],
     available: MemoryRegion::new(0, 0),
     total_pages: 0,
     free_pages: 0,
-}));
-
-fn state() -> &'static mut FrameAllocatorState {
-    unsafe { &mut *STATE.0.get() }
-}
+});
 
 /// Initializes the allocator from page-aligned part of the available memory region.
 ///
@@ -47,29 +41,29 @@ pub fn init(available: MemoryRegion) -> usize {
     let total_pages = requested_pages.min(MAX_PHYSICAL_PAGES);
     let usable_end = start + total_pages * PAGE_SIZE;
 
-    let state = state();
+    let mut state = STATE.lock();
     state.bitmap.fill(ALL_PAGES_USED);
     state.available = MemoryRegion::new(start, usable_end);
     state.total_pages = total_pages;
     state.free_pages = total_pages;
 
     for page_index in 0..total_pages {
-        mark_free(state, page_index);
+        mark_free(&mut state, page_index);
     }
 
     total_pages
 }
 
 pub fn total_pages() -> usize {
-    state().total_pages
+    STATE.lock().total_pages
 }
 
 pub fn free_pages() -> usize {
-    state().free_pages
+    STATE.lock().free_pages
 }
 
 pub fn used_pages() -> usize {
-    let state = state();
+    let state = STATE.lock();
     state.total_pages - state.free_pages
 }
 
@@ -82,7 +76,7 @@ pub fn used_pages() -> usize {
 /// exactly what a validation path needs to reject a descriptor that names
 /// unmanaged, freed, or unaligned memory.
 pub fn frame_in_use(address: usize) -> bool {
-    let state = state();
+    let state = STATE.lock();
     if address % PAGE_SIZE != 0 || !state.available.contains(address) {
         return false;
     }
@@ -97,7 +91,7 @@ pub fn frame_in_use(address: usize) -> bool {
 
 /// Allocates one physical page using first-fit search.
 pub fn alloc_page() -> Option<usize> {
-    let state = state();
+    let mut state = STATE.lock();
     let word_count = state.total_pages.div_ceil(BITS_PER_WORD);
 
     for word_index in 0..word_count {
@@ -112,7 +106,7 @@ pub fn alloc_page() -> Option<usize> {
             return None;
         }
 
-        mark_used(state, page_index);
+        mark_used(&mut state, page_index);
         state.free_pages -= 1;
         return Some(state.available.start + page_index * PAGE_SIZE);
     }
@@ -135,7 +129,7 @@ pub fn alloc_contiguous_pages(page_count: usize) -> Option<usize> {
         return None;
     }
 
-    let state = state();
+    let mut state = STATE.lock();
     if page_count > state.free_pages {
         return None;
     }
@@ -159,7 +153,7 @@ pub fn alloc_contiguous_pages(page_count: usize) -> Option<usize> {
 
         if run_length == page_count {
             for index in run_start..run_start + page_count {
-                mark_used(state, index);
+                mark_used(&mut state, index);
             }
             state.free_pages -= page_count;
             return Some(state.available.start + run_start * PAGE_SIZE);
@@ -173,7 +167,7 @@ pub fn alloc_contiguous_pages(page_count: usize) -> Option<usize> {
 ///
 /// Invalid and unaligned addresses are ignored; double-free is checked in debug builds.
 pub fn free_page(address: usize) {
-    let state = state();
+    let mut state = STATE.lock();
     if address % PAGE_SIZE != 0 || !state.available.contains(address) {
         return;
     }

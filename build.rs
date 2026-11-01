@@ -35,7 +35,10 @@ fn main() {
         .arg("aarch64-unknown-none")
         .arg("--target-dir")
         .arg(&target_dir);
-    if profile == "release" {
+    // Always release: a debug-profile userspace ELF carries ~700 KiB of
+    // debug info and overflows the 1 MiB kernel heap at VFS seed time.
+    {
+        let _ = profile;
         command.arg("--release");
     }
     // User ELFs must link at the same base the kernel validates against

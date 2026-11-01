@@ -38,11 +38,18 @@ impl Condvar {
     /// condvars), so the scheduler's wait link keeps the queue alive for as
     /// long as the blocked task may still need to unlink from it.
     pub fn wait<'a, T>(self: &Arc<Self>, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
+        crate::console::write_str("C1\r\n");
+        crate::smp::probe(1);
         let mutex = guard.mutex();
         let saved_daif = interrupts::save_and_disable_irq();
+        crate::smp::probe(2);
         // Queue registration, unlock and sleep are atomic with IRQs masked.
         drop(guard);
+        crate::console::write_str("C2\r\n");
+        crate::smp::probe(3);
         scheduler::block_current_on(&self.waiters, scheduler::WaitLink::Shared(Arc::clone(self)));
+        crate::smp::probe(7);
+        crate::console::write_str("C3\r\n");
         interrupts::restore_irq(saved_daif);
 
         mutex.lock()

@@ -50,6 +50,7 @@ mod scheduler;
 mod seed;
 #[cfg(not(feature = "std"))]
 mod semaphore;
+mod smp;
 #[cfg(not(feature = "std"))]
 mod syscall;
 #[cfg(not(feature = "std"))]
@@ -682,6 +683,10 @@ exception_irq_dispatch:
     // and corrupt task contexts. eret restores the pre-interrupt PSTATE
     // from the frame.
     msr daifset, #2
+    // BISECT probes: 18 = dispatch entered, 17 = handler returned.
+    adrp x9, {probe}
+    mov w10, #18
+    str w10, [x9, #:lo12:{probe}]
     // Frame is 272 bytes like the SVC trampoline: x0-x30, then ELR, SPSR.
     // ELR_EL1/SPSR_EL1 MUST be saved and restored here — schedule() may
     // switch to another task whose exceptions overwrite these CPU-global
@@ -709,6 +714,9 @@ exception_irq_dispatch:
     mrs x9, spsr_el1
     str x9, [sp, #256]
     bl silver_handle_irq
+    adrp x9, {probe}
+    mov w10, #17
+    str w10, [x9, #:lo12:{probe}]
     // Fall through to the epilogue (see the SVC trampoline above).
 exception_irq_epilogue:
     ldr x9, [sp, #248]
@@ -748,12 +756,16 @@ exception_dispatch:
     mrs x2, elr_el1
     mrs x3, far_el1
     b silver_handle_exception
-"#
+"#,
+    probe = sym crate::smp::SMP_PROBE
 );
 
 #[cfg(not(feature = "std"))]
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
+    // Per-CPU identity first: every scheduler/lock path reads TPIDR_EL1.
+    smp::init_cpu(0);
+
     // The tablet has no readable UART, so EVERY console/boot_metrics call is
     // compiled out there: a stray write to a QEMU address (PL011 0x09000000,
     // GICv2 0x08000000) would be a bus abort -> QCDUMP before any log. On the
@@ -817,6 +829,22 @@ pub extern "C" fn kernel_main() -> ! {
     // scheduler::init unconditionally unmasks IRQs (daifclr #2).
     gic::init();
     timer::init();
+    // BISECT: isolated timer test — unmask IRQs in kernel context, wait for 3 ticks.
+    {
+        let saved = interrupts::save_and_disable_irq();
+        interrupts::enable_irq();
+        let mut spin: u32 = 0;
+        while timer::ticks() < 30 && spin < 800_000_000 {
+            spin += 1;
+            core::hint::spin_loop();
+        }
+        interrupts::restore_irq(saved);
+        console::write_str("TIMER TEST: ticks=");
+        console::write_dec_u64(timer::ticks());
+        console::write_str(" spins=");
+        console::write_dec_u64(spin as u64);
+        console::write_str("\r\n");
+    }
     ram_log::log("GICv3+TIMER OK");
     ram_log::fb_progress();
     vfs::init();

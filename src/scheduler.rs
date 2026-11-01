@@ -9,7 +9,7 @@ use crate::{
     condvar::Condvar,
     elf::LoadedImage,
     elf_loader,
-    frame_allocator, interrupts,
+    frame_allocator, interrupts, smp,
     memory::{phys_to_virt, virt_to_phys, MemoryRegion, PAGE_SIZE},
     mmu, mutex, console, timer, user_program, vfs,
     wait_queue::WaitQueue,
@@ -91,6 +91,9 @@ pub struct Task {
     program_break: usize,
     waiting_on: Option<WaitLink>,
     owned_mutexes: Vec<*mut mutex::MutexState>,
+    /// CPU currently executing this task; `Some` exactly while the task is
+    /// in `Running` state. Guarded by the kernel lock.
+    running_on: Option<usize>,
 }
 
 /// How a blocked task is linked back to the wait queue it sleeps in.
@@ -111,7 +114,6 @@ pub enum WaitLink {
 
 pub struct TaskManager {
     tasks: Vec<Task>,
-    current_index: usize,
     next_id: u64,
     console_parent: Option<u64>,
     exit_statuses: Vec<(u64, u64)>,
@@ -164,6 +166,20 @@ static SCHEDULER: SharedScheduler = SharedScheduler(UnsafeCell::new(None));
 static PROCESS_WAIT_QUEUE: WaitQueue = WaitQueue::new();
 static mut BOOT_CONTEXT: TaskContext = TaskContext::zero();
 
+/// Per-CPU parking contexts for the very first `schedule` on an AP: the AP
+/// enters from its own boot stack, which is never restored once it switches
+/// into a real task. One per CPU so parallel APs never share the slot.
+static mut AP_DUMMY_CONTEXTS: [TaskContext; smp::MAX_CPUS] = {
+    #[allow(clippy::declare_interior_mutable_const)]
+    const ZERO: TaskContext = TaskContext::zero();
+    [ZERO; smp::MAX_CPUS]
+};
+
+/// One-shot trigger: the secondary CPUs are powered on from the first
+/// scheduling pass, i.e. strictly after the boot CPU entered its first task
+/// and before any user task can observe a half-initialized scheduler.
+static AP_BOOT_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
 /// Data frames of shared-DMA ranges whose revoke scan could not prove the
 /// absence of foreign mappings (see `reap_dead_tasks`): deliberately leaked
 /// instead of risking a use-after-free through a live foreign mapping.
@@ -204,13 +220,20 @@ silver_context_switch:
     .global silver_user_bootstrap
     .type silver_user_bootstrap, %function
 silver_user_bootstrap:
+    // A first dispatch inherits one kernel-lock hold from the dispatching
+    // `schedule`/`start` acquire: drop it before entering user mode so the
+    // acquire/release pair stays balanced (see the locking contract in smp.rs).
+    // `bkl_release_asm` preserves x19/x20 (callee-saved), and the register
+    // reads below happen after the call.
+    bl {bkl_release}
     mov x0, x20
     msr elr_el1, x19
     mov x9, xzr
     msr spsr_el1, x9
     eret
     .size silver_user_bootstrap, . - silver_user_bootstrap
-"#
+"#,
+    bkl_release = sym crate::smp::bkl_release_asm
 );
 
 extern "C" {
@@ -222,7 +245,6 @@ pub fn init() {
     let slot = scheduler_slot();
     *slot = Some(TaskManager {
         tasks: Vec::new(),
-        current_index: 0,
         next_id: 0,
         console_parent: None,
         exit_statuses: Vec::new(),
@@ -255,13 +277,17 @@ pub fn init() {
         let _security_probe = spawn_user(user_program::DEMO, 27);
     }
 
-    let first_id = 1;
+    let first_id = 0; // BISECT: boot into idle (EL1 kernel task) first
     let manager = scheduler_manager().unwrap();
-    manager.current_index = manager
-        .tasks
-        .iter()
-        .position(|task| task.id == first_id)
-        .unwrap_or(0);
+    // Per-CPU "current": the boot CPU starts on the first spawned task; APs
+    // begin at no-task and pick one in their own first `schedule`.
+    smp::set_current_index(
+        manager
+            .tasks
+            .iter()
+            .position(|task| task.id == first_id)
+            .unwrap_or(0),
+    );
 }
 
 pub fn yield_current() {
@@ -272,7 +298,7 @@ pub fn yield_current() {
         }
     }
    
-    schedule();
+    schedule_released();
     interrupts::restore_irq(saved_daif);
 }
 
@@ -286,7 +312,7 @@ pub fn sleep(milliseconds: u64) {
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Sleeping(wake_at);
     }
-    schedule();
+    schedule_released();
     interrupts::restore_irq(saved_daif);
 }
 
@@ -313,7 +339,7 @@ pub fn wait_irq() -> bool {
             crate::gic::enable_irq(intid);
         }
         task.state = TaskState::Blocked;
-        schedule();
+        schedule_released();
     }
 }
 
@@ -387,14 +413,17 @@ pub fn notify_bound_task(id: u64) -> bool {
 }
 
 pub fn block_current_on(queue: &WaitQueue, link: WaitLink) {
+    crate::console::write_str("B1\r\n");
+    crate::smp::probe(4);
     let saved_daif = interrupts::save_and_disable_irq();
     let id = current_task_id();
     queue.enqueue(id);
+    crate::console::write_str("B2\r\n");
     if let Some(task) = current_task_mut() {
         task.waiting_on = Some(link);
         task.state = TaskState::Blocked;
     }
-    schedule();
+    schedule_released();
     if let Some(task) = current_task_mut() {
         task.waiting_on = None;
     }
@@ -409,7 +438,7 @@ pub fn block_current_on_until(queue: &WaitQueue, link: WaitLink, deadline: u64) 
         task.waiting_on = Some(link);
         task.state = TaskState::BlockedUntil(deadline);
     }
-    schedule();
+    schedule_released();
     queue.remove(id);
     if let Some(task) = current_task_mut() {
         task.waiting_on = None;
@@ -419,12 +448,17 @@ pub fn block_current_on_until(queue: &WaitQueue, link: WaitLink, deadline: u64) 
 
 pub fn wake_task(id: u64) {
     let saved_daif = interrupts::save_and_disable_irq();
+    smp::bkl_acquire();
     if let Some(manager) = scheduler_manager() {
         if let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) {
             wake_blocked_task(task);
         }
     }
+    smp::bkl_release();
     interrupts::restore_irq(saved_daif);
+    // The woken task may be pickable by a CPU that is currently idle or
+    // running something else: kick the others to re-evaluate their queues.
+    smp::ipi_reschedule_others();
 }
 
 pub fn register_mutex(state: *mut mutex::MutexState) {
@@ -436,8 +470,18 @@ pub fn register_mutex(state: *mut mutex::MutexState) {
 }
 
 pub fn unregister_mutex(state: *mut mutex::MutexState) {
-    if let Some(task) = current_task_mut() {
-        task.owned_mutexes.retain(|owned| *owned != state);
+    let Some(task) = current_task_mut() else {
+        crate::console::write_str("MUTEX: unregister with no current task\r\n");
+        return;
+    };
+    let before = task.owned_mutexes.len();
+    task.owned_mutexes.retain(|owned| *owned != state);
+    if task.owned_mutexes.len() == before {
+        // Unlocking a state this task never registered is an ownership-
+        // accounting bug. The diagnostic must stay: this branch used to be
+        // provable-unreachable for LLVM, which emitted a bare `b .` (UB) for
+        // it — it has to remain real, reachable code.
+        crate::console::write_str("MUTEX: unlock of unregistered mutex state\r\n");
     }
 }
 
@@ -475,7 +519,7 @@ pub fn exit_current_with_status(status: u64) -> ! {
         recover_console(manager, id);
         record_exit(manager, id, status);
     }
-    schedule();
+    schedule_released();
     interrupts::restore_irq(saved_daif);
     loop {
         interrupts::wait_for_irq();
@@ -505,7 +549,7 @@ pub fn kill_task(id: u64) -> bool {
     task.bound_irq = None;
     recover_console(manager, id);
     record_exit(manager, id, 1);
-    schedule();
+    schedule_released();
     interrupts::restore_irq(saved_daif);
     true
 }
@@ -565,7 +609,7 @@ fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
             .position(|(task_id, _)| *task_id == id)
         {
             let (_, status) = manager.exit_statuses.remove(index);
-            if let Some(waiter) = manager.tasks.get_mut(manager.current_index) {
+            if let Some(waiter) = manager.tasks.get_mut(smp::current_index()) {
                 waiter.cap_table.remove_for_target(id);
             }
             interrupts::restore_irq(saved_daif);
@@ -585,7 +629,7 @@ fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
             task.waiting_on = Some(WaitLink::Immortal(&PROCESS_WAIT_QUEUE));
             task.state = TaskState::Blocked;
         }
-        schedule();
+        schedule_released();
         PROCESS_WAIT_QUEUE.remove(waiter);
         if let Some(task) = current_task_mut() {
             task.waiting_on = None;
@@ -610,6 +654,7 @@ fn record_exit(manager: &mut TaskManager, id: u64, status: u64) {
 }
 
 fn wake_process_waiters(manager: &mut TaskManager) {
+    let mut woke_any = false;
     while let Some(waiter) = PROCESS_WAIT_QUEUE.pop() {
         if let Some(task) = manager
             .tasks
@@ -617,7 +662,11 @@ fn wake_process_waiters(manager: &mut TaskManager) {
             .find(|task| task.id == waiter && task.state != TaskState::Dead)
         {
             wake_blocked_task(task);
+            woke_any = true;
         }
+    }
+    if woke_any {
+        smp::ipi_reschedule_others();
     }
 }
 
@@ -642,19 +691,20 @@ fn wake_blocked_task(task: &mut Task) {
 
 pub fn current_task_id() -> u64 {
     scheduler_manager()
-        .and_then(|manager| manager.tasks.get(manager.current_index))
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
         .map(|task| task.id)
         .unwrap_or(0)
 }
 
 pub fn current_task_owns_console() -> bool {
     scheduler_manager()
-        .and_then(|manager| manager.tasks.get(manager.current_index))
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
         .map(|task| task.owns_console)
         .unwrap_or(false)
 }
 
 pub fn stop_console_owner() -> bool {
+    let _bkl = smp::BklGuard::new();
     let saved_daif = interrupts::save_and_disable_irq();
     let mut stopped = false;
     if let Some(manager) = scheduler_manager() {
@@ -749,14 +799,14 @@ pub fn task_alive(id: u64) -> bool {
 
 pub fn current_task_arguments() -> Vec<u8> {
     scheduler_manager()
-        .and_then(|manager| manager.tasks.get(manager.current_index))
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
         .map(|task| task.arguments.clone())
         .unwrap_or_default()
 }
 
 pub fn current_task_cwd() -> String {
     scheduler_manager()
-        .and_then(|manager| manager.tasks.get(manager.current_index))
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
         .map(|task| task.cwd.clone())
         .unwrap_or_else(|| String::from("/"))
 }
@@ -834,14 +884,19 @@ pub fn munmap(address: usize, length: usize) -> bool {
 pub fn start() -> ! {
     let saved_daif = interrupts::save_and_disable_irq();
     let manager = scheduler_manager().unwrap();
-    let current_index = manager.current_index;
+    let current_index = smp::current_index();
     let Some(first_task) = manager.tasks.get_mut(current_index) else {
         loop {
             interrupts::wait_for_irq();
         }
     };
 
+    // The boot switch runs under the kernel lock; `silver_user_bootstrap`
+    // drops it again right before `eret`-ing into the first user task, so
+    // the acquire/release pair stays balanced.
+    smp::bkl_acquire();
     first_task.state = TaskState::Running;
+    first_task.running_on = Some(0);
     trace_switch(
         0,
         first_task.id,
@@ -863,6 +918,20 @@ pub fn start() -> ! {
     }
 }
 
+/// One scheduling pass for a task that already holds the kernel lock:
+/// releases it (a blocked task must not pin the lock — another CPU has to be
+/// able to wake tasks), runs the pass, and re-acquires before returning so
+/// the caller keeps executing with the lock held.
+pub fn schedule_released() {
+    crate::console::write_str("R1\r\n");
+    smp::bkl_release();
+    crate::console::write_str("R2\r\n");
+    schedule();
+    crate::console::write_str("R3\r\n");
+    smp::bkl_acquire();
+    crate::console::write_str("R4\r\n");
+}
+
 pub fn schedule() {
     let Some(manager) = scheduler_manager() else {
         return;
@@ -871,36 +940,78 @@ pub fn schedule() {
         return;
     }
 
+    // The kernel lock is held for the whole pass. If this call switches
+    // away, the outgoing task is suspended before the matching release and
+    // the incoming task resumes inside its own suspended `schedule`, so the
+    // CPU keeps the lock across the switch without a transfer protocol.
+    crate::smp::probe(5);
+    smp::bkl_acquire();
+    {
+        static SCHED_SEEN: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !SCHED_SEEN.swap(true, core::sync::atomic::Ordering::AcqRel) {
+            crate::console::write_str("SMP: schedule() first entry\r\n");
+        }
+    }
+
     let live_task_id = manager
         .tasks
-        .get(manager.current_index)
+        .get(smp::current_index())
         .map(|task| task.id)
         .unwrap_or(IDLE_TASK_ID);
     let live_is_dead = manager
         .tasks
-        .get(manager.current_index)
+        .get(smp::current_index())
         .map(|task| task.state == TaskState::Dead)
         .unwrap_or(false);
 
     reap_dead_tasks(manager);
     wake_expired_tasks(manager, timer::ticks());
 
-    if manager.current_index >= manager.tasks.len() {
-        manager.current_index = 0;
+    if AP_BOOT_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
+        // BISECT: AP boot disabled
+        // smp::boot_secondary_cpus();
+        crate::console::write_str("SMP: first schedule reached\r\n");
     }
 
-    let current_index = manager.current_index;
+    if smp::current_index() >= manager.tasks.len() {
+        smp::set_current_index(0);
+    }
+
+    let current_index = smp::current_index();
     if manager.tasks[current_index].state == TaskState::Running {
         manager.tasks[current_index].state = TaskState::Ready;
     }
 
     let Some(next_index) = find_next_task(manager) else {
+        smp::bkl_release();
         return;
     };
     if next_index == current_index && !live_is_dead {
+        // Self-continuation: this CPU keeps running the same task and keeps
+        // holding the kernel lock for it.
+        smp::bkl_release();
         return;
     }
 
+    // Switching away: the outgoing task stops running on this CPU. Bounds-
+    // checked write: current_index was clamped above, but this is the one
+    // site where a stale index would silently corrupt memory.
+    match manager.tasks.get_mut(current_index) {
+        Some(outgoing) => outgoing.running_on = None,
+        None => {
+            console::write_str("SCHEDULE: current_index out of range: ");
+            console::write_dec_u64(current_index as u64);
+            console::write_str("\r\n");
+        }
+    }
+
+    // From here to the context switch the code only uses the raw `tasks`
+    // pointer: `next_task` used to be a `&mut Task` minted from the vector
+    // while `manager` kept being reborrowed (`tasks.len()`), which invalidates
+    // the reference under Stacked Borrows — exactly the class of UB the
+    // optimizer turned into a bare `b .` self-loop elsewhere.
+    let tasks_len = manager.tasks.len();
     let tasks = manager.tasks.as_mut_ptr();
     let next_task = unsafe { &mut *tasks.add(next_index) };
     let saved_stack_pointer = next_task.context.stack_pointer as usize;
@@ -922,20 +1033,35 @@ pub fn schedule() {
 
     let next_id = next_task.id;
     let next_ttbr0 = next_task.ttbr0;
+    let next_context_stack_pointer = next_task.context.stack_pointer;
+    let next_context_elr = next_task.context.elr;
     next_task.state = TaskState::Running;
-    manager.current_index = next_index;
+    next_task.running_on = Some(smp::this_cpu_id());
+    smp::set_current_index(next_index);
 
+    let has_current = current_index < tasks_len;
     let current_context = if live_is_dead {
         unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CONTEXT) }
-    } else {
+    } else if has_current {
         unsafe { &mut (*tasks.add(current_index)).context }
+    } else {
+        // An AP's first pass has no current task: its outgoing registers are
+        // parked in a dummy context that is never restored (the AP's boot
+        // stack frame is abandoned once it switches into a real task).
+        unsafe { &mut AP_DUMMY_CONTEXTS[smp::this_cpu_id()] }
     };
     let from_id = if live_is_dead {
         live_task_id
     } else {
         unsafe { (*tasks.add(current_index)).id }
     };
-    let current_ttbr0 = unsafe { (*tasks.add(current_index)).ttbr0 };
+    // An AP before its first pick has no current task and no current TTBR0:
+    // force the address-space switch to the first task it runs.
+    let current_ttbr0 = if has_current {
+        unsafe { (*tasks.add(current_index)).ttbr0 }
+    } else {
+        0
+    };
 
     if live_is_dead || next_ttbr0 != current_ttbr0 {
         mmu::switch_address_space(next_ttbr0);
@@ -944,13 +1070,21 @@ pub fn schedule() {
     trace_switch(
         from_id,
         next_id,
-        next_task.context.stack_pointer,
-        next_task.context.elr,
+        next_context_stack_pointer,
+        next_context_elr,
     );
 
     unsafe {
-        silver_context_switch(current_context, &next_task.context);
+        silver_context_switch(current_context, &(*tasks.add(next_index)).context);
     }
+
+    // Resumed here as the incoming task, inside our own suspended `schedule`:
+    // complete the release of this pass's acquire (see the locking contract
+    // in `smp::bkl_acquire`). A task that never ran before enters through
+    // `silver_user_bootstrap` instead, whose `bkl_release_asm` is the matching
+    // release for a first dispatch; this line only executes on the resumed
+    // path, so the kernel lock never stays pinned while a task sleeps.
+    smp::bkl_release();
 }
 
 fn spawn_kernel(entry: extern "C" fn() -> !) -> Option<u64> {
@@ -984,7 +1118,7 @@ fn spawn_elf_task(image: LoadedImage, argument: u64) -> Option<u64> {
     let id = manager.next_id;
     let cwd = manager
         .tasks
-        .get(manager.current_index)
+        .get(smp::current_index())
         .map(|task| task.cwd.clone())
         .unwrap_or_else(|| String::from("/"));
     let entry = image.entry;
@@ -1060,7 +1194,7 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
                     })
             })
         });
-        let task = manager.tasks.get_mut(manager.current_index)?;
+        let task = manager.tasks.get_mut(smp::current_index())?;
         if !task.cap_table.has_rights(capability::CAP_MMIO) {
             return None;
         }
@@ -1085,7 +1219,7 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
     let mapped_size = page_count * PAGE_SIZE;
     let saved_daif = interrupts::save_and_disable_irq();
     let result = scheduler_manager().and_then(|manager| {
-        let task = manager.tasks.get_mut(manager.current_index)?;
+        let task = manager.tasks.get_mut(smp::current_index())?;
         if !task.cap_table.has_rights(capability::CAP_MMIO) {
             console::write_str("DMA: FAIL - no CAP_MMIO rights\r\n");
             return None;
@@ -1134,7 +1268,7 @@ pub fn bind_irq(intid: u32) -> bool {
     let saved_daif = interrupts::save_and_disable_irq();
     let result = scheduler_manager()
         .map(|manager| {
-            let current_index = manager.current_index;
+            let current_index = smp::current_index();
             let Some(current) = manager.tasks.get(current_index) else {
                 return false;
             };
@@ -1201,7 +1335,7 @@ fn spawn_inner(
 
     let cwd = manager
         .tasks
-        .get(manager.current_index)
+        .get(smp::current_index())
         .map(|task| task.cwd.clone())
         .unwrap_or_else(|| String::from("/"));
     let mut task = Task::new(id, entry, user, image, arguments)?;
@@ -1219,7 +1353,7 @@ fn find_next_task(manager: &TaskManager) -> Option<usize> {
     let task_count = manager.tasks.len();
 
     for offset in 1..=task_count {
-        let index = (manager.current_index + offset) % task_count;
+        let index = (smp::current_index() + offset) % task_count;
         let task = &manager.tasks[index];
         if task.id != IDLE_TASK_ID && task.state == TaskState::Ready {
             return Some(index);
@@ -1227,7 +1361,7 @@ fn find_next_task(manager: &TaskManager) -> Option<usize> {
     }
 
     for offset in 1..=task_count {
-        let index = (manager.current_index + offset) % task_count;
+        let index = (smp::current_index() + offset) % task_count;
         if manager.tasks[index].state == TaskState::Ready {
             return Some(index);
         }
@@ -1306,14 +1440,28 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         return;
     }
 
+    // A task killed while Running on another CPU stays executable until its
+    // own CPU observes the death in `schedule` (live_is_dead) and switches
+    // away; reaping it earlier would pull the address space out from under
+    // the still-running context.
     let dead_ids: Vec<u64> = manager
         .tasks
         .iter()
-        .filter(|task| task.state == TaskState::Dead)
+        .filter(|task| task.state == TaskState::Dead && task.running_on.is_none())
         .map(|task| task.id)
         .collect();
+    // Snapshot every online CPU's current task: `retain` below shifts indices.
+    let cpu_current_ids: Vec<Option<u64>> = (0..smp::MAX_CPUS)
+        .filter(|&cpu| smp::cpu_online(cpu))
+        .map(|cpu| {
+            manager
+                .tasks
+                .get(smp::current_index_of(cpu))
+                .map(|task| task.id)
+        })
+        .collect();
 
-    let live_id = manager.tasks.get(manager.current_index).map(|task| task.id);
+    let live_id = manager.tasks.get(smp::current_index()).map(|task| task.id);
 
     // TASK №5: revoke foreign shared-DMA mappings of every dying task BEFORE
     // any teardown. At this point every address space in `manager.tasks` —
@@ -1322,7 +1470,11 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     // would read page tables already freed by an earlier dead task's
     // teardown in the same pass.
     let mut dma_revokes: Vec<(usize, usize, mmu::RevokeResult)> = Vec::new();
-    for dead in manager.tasks.iter().filter(|task| task.state == TaskState::Dead) {
+    for dead in manager
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Dead && task.running_on.is_none())
+    {
         for &(physical, page_count) in &dead.dma_pages {
             let fail = mmu::RevokeResult {
                 unmapped: 0,
@@ -1368,7 +1520,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     for task in manager
         .tasks
         .iter_mut()
-        .filter(|task| task.state == TaskState::Dead)
+        .filter(|task| task.state == TaskState::Dead && task.running_on.is_none())
     {
         // Backstop unlink: ipc queues were already detached in `remove_task`
         // before their free, so a Dead task's pointer here is either None or
@@ -1400,7 +1552,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     }
 
     manager.tasks.retain(|task| {
-        if task.state == TaskState::Dead {
+        if task.state == TaskState::Dead && task.running_on.is_none() {
             task.release_stack();
             task.release_space(&dma_revokes);
             false
@@ -1409,16 +1561,32 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         }
     });
 
-    manager.current_index = live_id
-        .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
-        .unwrap_or(0);
+    // Indices shifted: reposition every online CPU onto its own current task.
+    for (cpu, current_id) in (0..smp::MAX_CPUS)
+        .filter(|&cpu| smp::cpu_online(cpu))
+        .zip(cpu_current_ids)
+    {
+        let index = current_id
+            .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
+            .unwrap_or(0);
+        smp::set_current_index_for(cpu, index);
+    }
+
+    smp::set_current_index(
+        live_id
+            .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
+            .unwrap_or(0),
+    );
 }
 
 fn current_task_mut() -> Option<&'static mut Task> {
     let manager = scheduler_manager()?;
-    let index = manager.current_index;
-    let tasks = manager.tasks.as_mut_ptr();
-    unsafe { manager.tasks.get_mut(index).map(|_| &mut *tasks.add(index)) }
+    // Bounds-checked borrow. The former `get_mut(index).map(|_| &mut
+    // *tasks.add(index))` dance minted a second `&mut` alongside the one
+    // `get_mut` had already produced — aliasing UB the optimizer is free to
+    // exploit (observed as a self-loop in `receive_matching` once the
+    // per-CPU index load changed the codegen).
+    manager.tasks.get_mut(smp::current_index())
 }
 
 impl Task {
@@ -1570,6 +1738,7 @@ impl Task {
             program_break: mmu::USER_HEAP_VA,
             waiting_on: None,
             owned_mutexes: Vec::new(),
+            running_on: None,
         })
     }
 
@@ -1744,6 +1913,13 @@ fn scheduler_manager() -> Option<&'static mut TaskManager> {
 }
 
 extern "C" fn idle_task() -> ! {
+    // First dispatch on a CPU enters here with the kernel lock held by the
+    // dispatching `schedule` (user-mode bootstrap drops it in asm; kernel
+    // entries do it here). Idle never holds the lock again: it sleeps in
+    // `wfi` so other CPUs can schedule while this CPU waits for an IRQ.
+    if smp::bkl_depth() > 0 {
+        smp::bkl_release();
+    }
     interrupts::enable_irq();
     loop {
         interrupts::wait_for_irq();

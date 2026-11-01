@@ -19,6 +19,9 @@ use crate::{exceptions, memory, scheduler, timer};
 pub const TIMER_IRQ: u32 = 30;
 /// GENI SE15 debug UART SPI 462 → GIC INTID 32 + 462.
 pub const UART_IRQ: u32 = 494;
+/// Reschedule SGI, mirrors `gic::RESCHEDULE_IRQ` (the tablet is single-core
+/// today, but the mechanism must stay symmetric).
+pub const RESCHEDULE_IRQ: u32 = 0;
 const SPURIOUS_IRQ: u32 = 1023;
 
 const GICD_BASE: usize = memory::phys_to_virt(0x1710_0000);
@@ -37,6 +40,16 @@ const GICD_IGROUPR: usize = 0x080;
 const GICD_IGRPMODR: usize = 0xD00;
 
 const GICR_WAKER: usize = 0x014;
+/// SGI/PPI frame: ISPENDR0 (+0x200) / ISENABLER0 (+0x100) hold the banked
+/// pending/enable state of SGIs and PPIs of the owning PE.
+const GICR_ISPENDR0: usize = 0x200;
+/// Redistributor type register: Aff0 [7:0], Aff1 [15:8], Aff2 [23:16],
+/// Aff3 [39:32]. Redistributor frames are matched to CPUs through this
+/// register, never through the frame index — the frame order does not have
+/// to follow the MPIDR affinity values.
+const GICR_TYPER: usize = 0x008;
+const GICR_STRIDE: usize = 0x4_0000;
+const GICR_MAX_PE: usize = 8;
 const GICR_IGROUPR0: usize = 0x080;
 const GICR_ISENABLER0: usize = 0x100;
 const GICR_IPRIORITYR: usize = 0x400;
@@ -49,13 +62,26 @@ const WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 const GICD_CTLR_ENABLE_GRP1NS: u32 = 1 << 1;
 const GICD_CTLR_RWP: u32 = 1 << 31;
 
+/// Shared distributor setup: runs once on the boot CPU.
 pub fn init() {
+    configure_uart_spi();
+    start_distributor();
+    // The boot CPU brings up its own redistributor + interface right away.
+    cpu_init();
+}
+
+/// Per-CPU GICv3 bring-up: system-register interface, own redistributor
+/// (located by affinity via GICR_TYPER), banked SGI/PPI enables and the CPU
+/// interface registers. Runs on every CPU, including APs.
+pub fn cpu_init() {
+    // System-register interface for the CPU side (ICC_*_EL1), not the
+    // legacy MMIO one. `isb` right after, as the spec requires.
+    let sre: u64;
     unsafe {
-        // System-register interface for the CPU side (ICC_*_EL1), not the
-        // legacy MMIO one. `isb` right after, as the spec requires.
-        let sre: u64;
         core::arch::asm!("mrs {sre}, icc_sre_el1", sre = out(reg) sre, options(nostack));
-        if sre & 1 == 0 {
+    }
+    if sre & 1 == 0 {
+        unsafe {
             core::arch::asm!(
                 "msr icc_sre_el1, {sre}",
                 "isb",
@@ -63,14 +89,14 @@ pub fn init() {
                 options(nostack),
             );
         }
+    }
 
-        wake_redistributor();
-        configure_ppi();
-        configure_uart_spi();
-        start_distributor();
+    wake_redistributor();
+    configure_ppi();
 
-        // CPU interface: full priority mask, EOImode 0 (one write completes the
-        // interrupt), Group 1 NS signalling enabled.
+    // CPU interface: full priority mask, EOImode 0 (one write completes the
+    // interrupt), Group 1 NS signalling enabled.
+    unsafe {
         core::arch::asm!(
             "msr icc_ctlr_el1, {ctlr}",
             "msr icc_pmr_el1, {pmr}",
@@ -84,10 +110,33 @@ pub fn init() {
     }
 }
 
+/// Locates this CPU's redistributor control frame by matching the MPIDR
+/// affinity against GICR_TYPER. The frame index is deliberately not used:
+/// redistributor order does not have to follow MPIDR affinity values.
+fn redistributor_for_self() -> usize {
+    let mpidr: u64;
+    unsafe {
+        core::arch::asm!("mrs {mpidr}, mpidr_el1", mpidr = out(reg) mpidr, options(nostack));
+    }
+    let affinity = mpidr & 0xFF_FF_FF; // Aff0 | Aff1<<8 | Aff2<<16
+
+    for pe in 0..GICR_MAX_PE {
+        let rd = GICR_BASE + pe * GICR_STRIDE;
+        let typer = read32(rd + GICR_TYPER) as u64 | ((read32(rd + GICR_TYPER + 4) as u64) << 32);
+        if typer & 0xFF_FF_FF == affinity {
+            return rd;
+        }
+    }
+    // No matching redistributor: fall back to frame 0 rather than writing
+    // through a null mapping — the caller's PPI enables then behave exactly
+    // like the pre-SMP single-core code.
+    GICR_BASE
+}
+
 /// Clears GICR_WAKER.ProcessorSleep and waits for the redistributor to come up.
 /// A sleeping redistributor silently drops every interrupt, including the timer.
 fn wake_redistributor() {
-    let rd = GICR_BASE;
+    let rd = redistributor_for_self();
     let waker = read32(rd + GICR_WAKER);
     write32(rd + GICR_WAKER, waker & !WAKER_PROCESSOR_SLEEP);
     while read32(rd + GICR_WAKER) & WAKER_CHILDREN_ASLEEP != 0 {
@@ -95,19 +144,55 @@ fn wake_redistributor() {
     }
 }
 
-/// SGI/PPI frame of core 0 (single-core kernel): group 1 non-secure, low
-/// priority, level trigger for the timer, then enable INTID 30.
+/// SGI/PPI frame of THIS CPU (matched by GICR_TYPER): group 1 non-secure, low
+/// priority for the timer, then enable the timer PPI and the reschedule SGI.
 fn configure_ppi() {
-    let sgi = GICR_BASE + GICR_SGI_OFFSET;
+    let sgi = redistributor_for_self() + GICR_SGI_OFFSET;
     let timer_bit = 1_u32 << (TIMER_IRQ % 32);
+    let sgi_bit = 1_u32 << (RESCHEDULE_IRQ % 32);
 
-    write32(sgi + GICR_IGROUPR0, read32(sgi + GICR_IGROUPR0) | timer_bit);
-    write32(sgi + GICR_IGRPMODR0, read32(sgi + GICR_IGRPMODR0) & !timer_bit);
+    let groupr = read32(sgi + GICR_IGROUPR0) | timer_bit | sgi_bit;
+    write32(sgi + GICR_IGROUPR0, groupr);
+    let grpmodr = read32(sgi + GICR_IGRPMODR0) & !(timer_bit | sgi_bit);
+    write32(sgi + GICR_IGRPMODR0, grpmodr);
     // The NS physical timer asserts its line level-style while
     // CNTP_CTL.IStatus is set, which is what the reset ICFGR0 value
     // describes — no config change needed for a PPI.
     write8(sgi + GICR_IPRIORITYR + TIMER_IRQ as usize, 0xA0);
-    write32(sgi + GICR_ISENABLER0, timer_bit);
+    write32(sgi + GICR_ISENABLER0, timer_bit | sgi_bit);
+}
+
+/// P3 diagnostic (READ-ONLY): pending/enable of the physical-timer PPI in
+/// THIS PE's redistributor plus the CPU interface registers. No writes.
+/// Returns (GICR_ISPENDR0 & ppi_bit, GICR_ISENABLER0 & ppi_bit,
+/// ICC_CTLR_EL1, ICC_PMR_EL1).
+pub fn diag_redistributor_snapshot() -> (u32, u32, u32, u32) {
+    let sgi = redistributor_for_self() + GICR_SGI_OFFSET;
+    let ppi_bit = 1_u32 << (TIMER_IRQ % 32);
+    let pend = read32(sgi + GICR_ISPENDR0) & ppi_bit;
+    let en = read32(sgi + GICR_ISENABLER0) & ppi_bit;
+    let ctlr: u64;
+    let pmr: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, icc_ctlr_el1", out(reg) ctlr, options(nomem, nostack));
+        core::arch::asm!("mrs {}, icc_pmr_el1", out(reg) pmr, options(nomem, nostack));
+    }
+    (pend, en, ctlr as u32, pmr as u32)
+}
+
+/// Signals `intid` (an SGI) to every CPU in the inner-shareability domain.
+/// ICC_SGI1R_EL1 with IRM=1 broadcasts to all PEs in the domain; a
+/// self-directed SGI is harmless (the handler just re-evaluates the run
+/// queue), which the reschedule use tolerates.
+pub fn send_sgi_all_but_self(intid: u32) {
+    unsafe {
+        core::arch::asm!(
+            "msr icc_sgi1r_el1, {value}",
+            "isb",
+            value = in(reg) (1_u64 << 40) | u64::from(intid & 0x0F),
+            options(nostack),
+        );
+    }
 }
 
 /// Routes and classifies the UART SPI in GICD but does not enable it (see the
@@ -145,9 +230,9 @@ fn start_distributor() {
 
 pub fn enable_irq(irq: u32) {
     if irq < 32 {
-        // SGI/PPI frame: group routing was set at init, only the enable bit
-        // changes per interrupt.
-        let offset = GICR_BASE + GICR_SGI_OFFSET + GICD_ISENABLER;
+        // SGI/PPI frame of THIS CPU (matched via GICR_TYPER): group routing
+        // was set at init, only the enable bit changes per interrupt.
+        let offset = redistributor_for_self() + GICR_SGI_OFFSET + GICD_ISENABLER;
         write32(offset, 1_u32 << (irq % 32));
         return;
     }
@@ -164,7 +249,7 @@ pub fn enable_irq(irq: u32) {
 
 pub fn disable_irq(irq: u32) {
     let base = if irq < 32 {
-        GICR_BASE + GICR_SGI_OFFSET + GICD_ICENABLER
+        redistributor_for_self() + GICR_SGI_OFFSET + GICD_ICENABLER
     } else {
         GICD_BASE + GICD_ICENABLER
     };
@@ -199,6 +284,10 @@ pub fn handle_irq() {
     let irq = acknowledge_register & 0x3FF;
 
     match irq {
+        RESCHEDULE_IRQ => {
+            end_interrupt(acknowledge_register);
+            scheduler::schedule();
+        }
         TIMER_IRQ => {
             timer::handle_irq();
             end_interrupt(acknowledge_register);
@@ -206,7 +295,13 @@ pub fn handle_irq() {
         }
         SPURIOUS_IRQ => {}
         _ => {
-            if scheduler::irq_is_bound(irq) {
+            // Probe and wake are one kernel-lock-protected step (see gic.rs).
+            let bound = {
+                let _bkl = crate::smp::BklGuard::new();
+                scheduler::irq_is_bound(irq)
+            };
+            if bound {
+                let _bkl = crate::smp::BklGuard::new();
                 disable_irq(irq);
                 end_interrupt(acknowledge_register);
                 scheduler::wake_bound_irq(irq);

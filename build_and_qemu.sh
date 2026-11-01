@@ -42,7 +42,7 @@ if [ "$RUN" -ne 1 ]; then
 fi
 
 exec qemu-system-aarch64 \
-    -machine virt -cpu cortex-a72 -m 128M \
+    -machine virt -cpu cortex-a72 -smp 2 -m 128M \
     -kernel "target/aarch64-unknown-none/$PROFILE/silver_microkernel" \
     -drive file=disk.img,format=raw,if=none,id=hd \
     -device virtio-blk-pci,drive=hd \

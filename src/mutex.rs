@@ -1,5 +1,10 @@
 //! Blocking mutex with FIFO waiters and explicit ownership tracking.
-//! Single-CPU design — all state changes happen with IRQs disabled.
+//!
+//! Cross-CPU safety: every state transition runs with the kernel lock held
+//! (task context holds it from the syscall entry; IRQ paths take it around
+//! `wake_task`), so two CPUs can never both observe `owner == None`. The
+//! kernel lock is the mutex's real synchronization; IRQ masking is local
+//! belt-and-braces only.
 
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
@@ -38,6 +43,7 @@ impl<T> Mutex<T> {
     /// Acquires without a guard; ownership is registered with the current
     /// task so an exit cannot leave this mutex locked forever.
     pub fn raw_lock(&self) {
+        crate::smp::bkl_assert_held();
         loop {
             let saved_daif = interrupts::save_and_disable_irq();
             let state = unsafe { &mut *self.state.get() };
@@ -60,6 +66,7 @@ impl<T> Mutex<T> {
     /// Releases only a mutex owned by the calling task. Non-owner unlock is
     /// an ordinary error in every profile, never a debug-only assertion.
     pub fn raw_unlock(&self) -> bool {
+        crate::smp::bkl_assert_held();
         let saved_daif = interrupts::save_and_disable_irq();
         let state = unsafe { &mut *self.state.get() };
         let id = scheduler::current_task_id();

@@ -7,8 +7,6 @@
 //! explicitly authorized Device-nGnRnE MMIO and Normal Non-Cacheable DMA.
 //! No kernel image or kernel data is shared with EL0.
 
-use core::cell::UnsafeCell;
-
 use alloc::vec::Vec;
 
 use crate::{
@@ -42,6 +40,11 @@ const DESC_PAGE: u64 = 0b11;
 /// closed (`safe_to_free = false`, frames leak) instead of reading attacker-
 /// or corruption-controlled data as a page table.
 ///
+/// The registry lives behind a spinlock: two CPUs create tables (and retire
+/// them) concurrently, and a torn push/swap_remove here would defeat the
+/// revoke validation. All registry sites run with the kernel lock held, so
+/// the spin is bounded.
+///
 /// Invariants, both enforced loudly rather than silently:
 /// - at most one registry record per frame: registration happens on fresh
 ///   `alloc_page()` results only (a registered frame is used, so the
@@ -50,21 +53,14 @@ const DESC_PAGE: u64 = 0b11;
 /// - a frame is linked into a page table only after a successful
 ///   registration: every creation site registers before its `write_entry`,
 ///   and on registration failure frees the still-unlinked frame directly.
-struct PageTableRegistry(UnsafeCell<Vec<usize>>);
-
-unsafe impl Sync for PageTableRegistry {}
-
-// Same discipline as the frame allocator: single core, and every site that
-// mutates the registry (table creation/teardown, syscalls, reap) runs with
-// IRQs masked or before they are ever enabled. The revoke scan only reads.
-static PAGE_TABLE_FRAMES: PageTableRegistry = PageTableRegistry(UnsafeCell::new(Vec::new()));
+static PAGE_TABLE_FRAMES: crate::smp::SpinLock<Vec<usize>> = crate::smp::SpinLock::new(Vec::new());
 
 /// Registers a freshly created table frame. Returns `false` — leaving the
 /// frame unregistered — on duplicate registration (kernel bug) or when the
 /// registry cannot grow (out of memory). The caller must then not link the
 /// frame into any table and release it with a plain `free_page`.
 fn page_table_register(frame: usize) -> bool {
-    let frames = unsafe { &mut *PAGE_TABLE_FRAMES.0.get() };
+    let mut frames = PAGE_TABLE_FRAMES.lock();
     if frames.iter().any(|&registered| registered == frame) {
         crate::console::write_str("PAGE TABLE REGISTRY: duplicate registration of frame 0x");
         crate::console::write_hex_u64(frame as u64);
@@ -87,7 +83,7 @@ fn page_table_register(frame: usize) -> bool {
 /// Removes the record for `frame`. Returns `true` only when exactly one
 /// record was found and removed; `false` leaves the registry untouched.
 fn page_table_unregister(frame: usize) -> bool {
-    let frames = unsafe { &mut *PAGE_TABLE_FRAMES.0.get() };
+    let mut frames = PAGE_TABLE_FRAMES.lock();
     let mut match_count = 0usize;
     let mut match_position = 0usize;
     for (position, &registered) in frames.iter().enumerate() {
@@ -106,7 +102,10 @@ fn page_table_unregister(frame: usize) -> bool {
 }
 
 fn page_table_registered(frame: usize) -> bool {
-    unsafe { (*PAGE_TABLE_FRAMES.0.get()).iter().any(|&registered| registered == frame) }
+    PAGE_TABLE_FRAMES
+        .lock()
+        .iter()
+        .any(|&registered| registered == frame)
 }
 
 /// Frees a page-table frame and retires it from the registry in the same
@@ -320,10 +319,23 @@ fn clean_tables_to_point_of_coherency() {
 
 /// Installs empty-low/high-kernel TTBRs. The boot stub has already enabled
 /// translation, so this runs entirely through the high alias.
+/// TTBR1 value of the shared kernel high half, recorded at boot so APs can
+/// install the identical kernel mapping without rebuilding it.
+static KERNEL_TTBR1: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// The kernel-high-half TTBR1 value; valid after [`init`].
+pub fn kernel_ttbr1() -> usize {
+    KERNEL_TTBR1.load(core::sync::atomic::Ordering::Acquire)
+}
+
 fn configure_and_enable() {
     let table_base = core::ptr::addr_of!(TABLES) as usize;
     let ttbr0 = (virt_to_phys(table_base + INDEX_LOW_LEVEL0 * TABLE_BYTES) as u64) & ADDRESS_MASK;
     let ttbr1 = (virt_to_phys(table_base + INDEX_HIGH_LEVEL0 * TABLE_BYTES) as u64) & ADDRESS_MASK;
+    KERNEL_TTBR1.store(
+        ttbr1 as usize,
+        core::sync::atomic::Ordering::Release,
+    );
 
     unsafe {
         core::arch::asm!(
@@ -337,7 +349,7 @@ fn configure_and_enable() {
             "orr {sctlr}, {sctlr}, #(1 << 22)",
             "msr sctlr_el1, {sctlr}",
             "isb",
-            "tlbi vmalle1",
+            "tlbi vmalle1is",
             "dsb ish",
             "isb",
             low = in(reg) ttbr0,
@@ -352,11 +364,21 @@ fn configure_and_enable() {
 
 /// Clean and invalidate after changing a task's tables. `table_start` is a
 /// physical table address; the CPU accesses it through the high alias.
+///
+/// TLB shootdown contract: the `is` suffix broadcasts the invalidation to
+/// every PE in the inner-shareability domain, and the trailing `dsb ish`
+/// makes the issuing CPU wait until the broadcast has been *observed* by
+/// all of them (ARM DDI 0487: completion of a DSB after an IS-scope TLBI
+/// guarantees the invalidation is complete across the domain). Together
+/// with the preceding `clean_table_lines` + `dsb ishst` (table write made
+/// visible before the walk can re-fetch it) and the kernel lock excluding
+/// concurrent table editors, this is the full shootdown protocol: no CPU
+/// can hold or re-create a translation for a removed entry past this call.
 pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
     clean_table_lines(table_start, table_bytes);
     unsafe {
         core::arch::asm!(
-            "tlbi vmalle1",
+            "tlbi vmalle1is",
             "dsb ish",
             "isb",
             options(nostack),
@@ -1086,13 +1108,67 @@ pub fn destroy_task_space(ttbr0: usize) {
     }
 }
 
+/// Pushes `size` bytes at a kernel virtual (== physical, low identity)
+/// address to the point of coherency. Used to publish AP boot parameters to
+/// a CPU that starts with cold caches.
+pub fn clean_range_to_poc(start: usize, size: usize) {
+    let start = start & !63;
+    let end = (start + size + 63) & !63;
+    unsafe {
+        let mut line = start;
+        while line < end {
+            core::arch::asm!("dc cvac, {}", in(reg) line, options(nostack));
+            line += 64;
+        }
+        core::arch::asm!("dsb ish", options(nostack));
+    }
+}
+
+/// Enables the MMU on an application CPU: the shared kernel high half
+/// (`kernel_ttbr1`) plus a pre-built task-space root whose L0[0] identity-
+/// maps DRAM, so the AP keeps executing its low-address code and reaches the
+/// kernel through the high alias.
+///
+/// Runs with the MMU off: every address this function touches is PA == VA
+/// (the kernel is linked at its load address). The caller must have cleaned
+/// `ap_ttbr0` and the boot parameters to the point of coherency.
+pub fn ap_enable(ap_ttbr0: usize) {
+    let high = kernel_ttbr1() as u64;
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {low}",
+            "msr ttbr1_el1, {high}",
+            "msr mair_el1, {mair}",
+            "msr tcr_el1, {tcr}",
+            "isb",
+            "mrs {sctlr}, sctlr_el1",
+            "orr {sctlr}, {sctlr}, #1",
+            "orr {sctlr}, {sctlr}, #(1 << 22)",
+            "msr sctlr_el1, {sctlr}",
+            "isb",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            low = in(reg) ap_ttbr0 as u64,
+            high = in(reg) high,
+            mair = in(reg) MAIR_VALUE,
+            tcr = in(reg) TCR_VALUE,
+            sctlr = out(reg) _,
+            options(nostack),
+        );
+    }
+}
+
 /// Switches only the user half. The executing high-half kernel code and its
 /// stack remain visible through TTBR1_EL1 for every task.
 pub fn switch_address_space(ttbr0: usize) {
     unsafe {
         core::arch::asm!(
             "msr ttbr0_el1, {ttbr}",
-            "tlbi vmalle1",
+            // IS scope: other CPUs do not use this address space, but the
+            // broadcast is cheap and keeps every invalidation in the kernel
+            // domain-wide by contract.
+            "tlbi vmalle1is",
             "dsb ish",
             "isb",
             ttbr = in(reg) ttbr0 as u64,

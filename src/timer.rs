@@ -15,8 +15,23 @@ pub fn init() {
     set_control(1);
 }
 
+/// Per-CPU timer bring-up for APs: the interval is global (set by the boot
+/// CPU in `init`); each AP arms its own physical timer and enables it so its
+/// preemption tick runs.
+pub fn cpu_init() {
+    rearm();
+    set_control(1);
+}
+
 pub fn handle_irq() {
-    TICKS.fetch_add(1, Ordering::Relaxed);
+    // Every CPU has its own timer PPI, but they exist for preemption only:
+    // global time advances on the boot CPU alone, otherwise N CPUs would
+    // count N ticks per interval and every deadline would compress N-fold.
+    if crate::smp::this_cpu_id() == 0 {
+        TICKS.fetch_add(1, Ordering::Relaxed);
+    }
+    crate::smp::probe(21);
+    crate::smp::TICK_PROBE.bump();
     rearm();
 }
 

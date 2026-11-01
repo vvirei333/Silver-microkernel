@@ -4,7 +4,7 @@ use linked_list_allocator::LockedHeap;
 
 use crate::{exceptions, frame_allocator, memory, console};
 
-pub const HEAP_PAGES: usize = 256;
+pub const HEAP_PAGES: usize = 512; // BISECT: doubled from 256
 pub const HEAP_SIZE: usize = HEAP_PAGES * crate::memory::PAGE_SIZE;
 
 struct KernelAllocator {

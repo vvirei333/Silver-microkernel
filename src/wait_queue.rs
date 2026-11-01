@@ -1,7 +1,10 @@
 //! FIFO queue of blocked task IDs.
 //!
-//! Every operation runs with IRQs masked on the current single-CPU kernel.
-//! A blocked task remembers its queue so lifecycle cleanup can remove it.
+//! Every operation runs with the kernel lock held: task context holds it
+//! from the syscall entry, scheduler/IRQ paths take it around their queue
+//! access. IRQ masking alone is only local (one CPU) and is not the
+//! synchronization this queue relies on between CPUs. A blocked task
+//! remembers its queue so lifecycle cleanup can remove it.
 //!
 //! Lifecycle invariant (see `scheduler::detach_from_wait_queue`): a task that
 //! leaves the blocked state without being popped by a notify — timeout expiry
@@ -11,6 +14,18 @@
 
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
+
+/// Kernel-lock contract check. The host-test build has no `smp` module: the
+/// queue is exercised sequentially there, which is the same discipline.
+#[cfg(not(test))]
+#[inline]
+fn assert_kernel_lock_held() {
+    assert_kernel_lock_held();
+}
+
+#[cfg(test)]
+#[inline]
+fn assert_kernel_lock_held() {}
 
 pub struct WaitQueue {
     waiters: UnsafeCell<Vec<u64>>,
@@ -26,6 +41,7 @@ impl WaitQueue {
     }
 
     pub fn enqueue(&self, id: u64) {
+        assert_kernel_lock_held();
         let waiters = unsafe { &mut *self.waiters.get() };
         if !waiters.contains(&id) {
             waiters.push(id);
@@ -33,6 +49,7 @@ impl WaitQueue {
     }
 
     pub fn pop(&self) -> Option<u64> {
+        assert_kernel_lock_held();
         let waiters = unsafe { &mut *self.waiters.get() };
         if waiters.is_empty() {
             None
@@ -42,6 +59,7 @@ impl WaitQueue {
     }
 
     pub fn remove(&self, id: u64) {
+        assert_kernel_lock_held();
         unsafe { (*self.waiters.get()).retain(|waiter| *waiter != id) };
     }
 }
