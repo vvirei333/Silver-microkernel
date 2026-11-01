@@ -1,5 +1,14 @@
 # Legion Y700 (SM8650 "pineapple") — DTB findings
 
+> **СТАТУС (2026-11-01): порт на железо ЗАМОРОЖЕН.** Загрузочная цепочка
+> Qualcomm не пропустила ядро до рабочего MMU-стадия ни одним путём (raw ABL
+> → WDT/QCDUMP; linuxdirect сломан универсально; EFI-stub исполнялся
+> (полосы в splash) но вешался на собственном MMU-disable; GRUB-EL1 sctlr
+> трюк убивает vCPU тихо). Ramoops/pmsg мёртв на этом устройстве — единственный
+> канал был framebuffer. Итог: **fuck Qualcomm** — блокировка в бутчейне,
+> не в нашем ядре. Планшет возвращён на Android. Этот файл остаётся
+> справочником адресов/DTB, если порт когда-нибудь продолжат.
+
 Source: live `/sys/firmware/fdt` pulled from the device (1023750 bytes),
 decompiled to `tablet.dts` (38799 lines).
 

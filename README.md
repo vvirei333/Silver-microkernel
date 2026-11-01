@@ -68,6 +68,7 @@ QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace
 - [x] EL0 fault containment: a crashed EL0 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
 - [x] Power off: the GPU "Power" button shuts QEMU down via PSCI `SYSTEM_OFF`
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
+- [ ] SMP (`-smp 2`): **in progress, not working yet** — see `SMP_STATUS.md`. Single-CPU boot is the verified configuration; under `-smp 2` the kernel does not survive silverd's first blocking IPC receive. Known open issues: compiler-generated self-loops on reachable paths in O3+LTO builds (absent pre-SMP, root cause not established), and an O1-run infinite Prefetch Abort (ESR `0x86000006`, FAR `0x40081a00`) pointing at kernel translation-table damage still under investigation. CPU1 stays offline (PSCI `CPU_ON` returns `-1`). Do not boot on hardware expecting SMP.
 
 ## Phase 4: Network — complete
 

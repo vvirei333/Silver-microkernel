@@ -3,6 +3,49 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## SMP PROGRAM (TASK №6/№7) — in progress, checkpointed 2026-11-01
+
+Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
+
+- **Checkpoint commit `5f1f888`** ("wip(smp): checkpoint scheduler and IPC
+  investigation") holds the whole work delta after `ca84fc9`: TASK №6 phases
+  1–6 (new `src/smp.rs`: per-CPU area via TPIDR_EL1, SpinLock, reentrant BKL,
+  IPI helpers; per-CPU `current_index`; frame allocator / page-table registry
+  under spinlocks; GIC init/cpu_init split; per-CPU timer; TLB shootdown via
+  `vmalle1is + dsb ish`) plus TASK №7 fixes (bounds-checked `running_on`
+  clear, `&mut`-aliasing removed from `schedule()`, restored
+  `bkl_release_asm` in `silver_user_bootstrap`, post-switch `bkl_release()`,
+  defined `unregister_mutex` not-found path, ipc receive bisect bypass
+  removed).
+- **Verified working:** single-CPU boot unchanged; `cargo test --lib` 13/13;
+  debug and release builds pass.
+- **NOT working: `-smp 2`** dies at silverd's first blocking IPC receive.
+  Two independent failure layers, both new relative to pre-SMP:
+  - Layer A: O3+LTO emits literal `b .` self-loops on *reachable* paths
+    (~22 sites: raw_lock/raw_unlock, Semaphore::wait, Channel send/receive,
+    ipc send/try_send, sys_receive, drop glues…). The pre-SMP binary built
+    with the same toolchain has **zero**. Root cause NOT established;
+    `opt-level=1` builds have no holes. Bisect-excluded: BKL, IPI,
+    `#[inline(never)]`, tail-call elim, LTO off, debug-assertions.
+  - Layer B (probable primary): with a hole-free O1 build the kernel hits an
+    **infinite Prefetch Abort** (ESR `0x86000006`, FAR `0x40081a00`): the
+    exception-vector page itself becomes unexecutable at runtime — kernel
+    translation damage whose writer is still unidentified. This likely also
+    explains the "impossible" values (e.g. `1` in `owned_mutexes`) seen in
+    earlier gdb captures; that observation must NOT be treated as proven
+    memory corruption.
+- **CPU1 never comes online** (PSCI `CPU_ON` returns `-1`) and AP boot is
+  bisect-disabled; SMP is NOT verified end-to-end.
+- **Next steps (priority):** (1) catch the writer of frame `0x40081000`
+  (gdb hw-watchpoint on the TTBR1 L2 descriptor / physical frame);
+  (2) re-audit `git diff ca84fc9 -- src/mmu.rs` against TASK №5 semantics;
+  (3) if layer B is fixed, re-check whether layer A disappears;
+  (4) then: PSCI conduit/CPU_ON, AP boot re-enable, bisect-cruft cleanup
+  (list in SMP_STATUS.md), full QEMU regression -smp 1/2.
+- Diagnostic serial prints (M1–M5, S1/S2, `SYS <n> sp=`, C1–C3) and RAM
+  probes (`SMP_PROBE`/`TICK_PROBE`/`DIAG_SNAP`) are kept **on purpose**
+  until layer B is understood.
+
 ## TABLET PORT (Lenovo Legion Y700, SM8650) — see tablet/HANDOFF.md for details
 
 The tablet port (real hardware, not QEMU) lives in `tablet/` and is documented
