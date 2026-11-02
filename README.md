@@ -9,10 +9,11 @@ Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 
 ## Screenshot
 
-![Silver Microkernel fastfetch](assets/silver-fastfetch.png)
+![WerewolfOS fastfetch](assets/silver-fastfetch.png)
 
-The `fastfetch` screen above is real output from Silver Microkernel running in
-QEMU. The interactive `howl` shell and the `howler` UART driver run in userspace.
+The `fastfetch` screen above is real output from WerewolfOS (Silver Microkernel)
+running in QEMU. The interactive `howl` shell and the `howler` UART driver run in
+userspace.
 
 ## What already works
 

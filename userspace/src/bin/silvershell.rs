@@ -1312,11 +1312,18 @@ fn fastfetch() {
 
     print_logo();
     syscall::print("\r\n");
-    field("silver@howl");
-    field("---------------");
-    field("OS: Silver Microkernel");
-    field("Kernel: AArch64");
-    field("Shell: howl");
+    field("werewolf@howl");
+    field("-------------");
+    field("OS: WerewolfOS");
+    field("Kernel: Silver Microkernel");
+    field("Version: 0.x");
+    field("Codename: First Howl");
+    field("Arch: AArch64");
+    field("Platform: QEMU / ARM64");
+    field("Type: Microkernel");
+    field("Shell: Howl");
+    field("FS: SFS");
+    field("Status: Experimental");
 
     syscall::print("Uptime: ");
     print_uptime(uptime);
