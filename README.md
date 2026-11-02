@@ -500,6 +500,10 @@ limited or absent, so denial-of-service resistance remains incomplete.
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).
 
+## Community
+
+🐺 Developer Telegram: [Сильвер не кодит](https://t.me/rustdev_rs)
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
