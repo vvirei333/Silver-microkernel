@@ -25,6 +25,8 @@ pub const ROLE_IPC_EXIT_SENDER: u64 = 25;
 pub const ROLE_IPC_EXIT_RECEIVER: u64 = 26;
 pub const ROLE_SECURITY_PROBE: u64 = 27;
 pub const ROLE_SLEEP_OVERFLOW: u64 = 28;
+pub const ROLE_PROCESS_API_PROBE: u64 = 29;
+pub const ROLE_PROCESS_API_CHILD: u64 = 30;
 
 /// The kernel passes one argument in x0. Demo selection no longer depends on
 /// task ID: dynamically spawned copies can choose any role independently.
@@ -58,6 +60,8 @@ pub extern "C" fn _start(argument: u64) -> ! {
         ROLE_IPC_EXIT_RECEIVER => demos::ipc_exit_receiver(),
         ROLE_SECURITY_PROBE => demos::security_probe(),
         ROLE_SLEEP_OVERFLOW => demos::sleep_overflow(),
+        ROLE_PROCESS_API_PROBE => demos::process_api_probe(),
+        ROLE_PROCESS_API_CHILD => demos::process_api_child(),
         _ => demos::unknown_task(),
     }
 }

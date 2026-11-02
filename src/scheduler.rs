@@ -1,5 +1,5 @@
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
@@ -30,6 +30,9 @@ pub enum TaskState {
     BlockedUntil(u64),
     Stopped,
     Dead,
+    /// Terminated, executable resources already released; the small record
+    /// survives only until a permitted wait consumes its exit status.
+    Zombie,
 }
 
 #[repr(C, align(16))]
@@ -78,6 +81,18 @@ pub struct Task {
     pub bound_irq: Option<u32>,
     irq_pending: bool,
     arguments: Vec<u8>,
+    /// Parent PID recorded at spawn. Reparented to the live reaper when the
+    /// parent dies, so an orphan is never left pointing at a dead PID.
+    ppid: Option<u64>,
+    /// Exit status written by exit/kill and consumed exactly once by wait.
+    exit_status: Option<u64>,
+    /// Set when the executable resources (stacks, image, address space, DMA,
+    /// heap, cwd, argv/envp) have been released. A `Zombie` only keeps this
+    /// metadata; `wait` removes the record.
+    resources_released: bool,
+    /// Versioned argv/envp delivered on the initial user stack.
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
     cwd: String,
     owns_console: bool,
     pub context: TaskContext,
@@ -116,7 +131,6 @@ pub struct TaskManager {
     tasks: Vec<Task>,
     next_id: u64,
     console_parent: Option<u64>,
-    exit_statuses: Vec<(u64, u64)>,
 }
 
 const TRACE_LEN: usize = 16;
@@ -179,6 +193,14 @@ static mut AP_DUMMY_CONTEXTS: [TaskContext; smp::MAX_CPUS] = {
 /// scheduling pass, i.e. strictly after the boot CPU entered its first task
 /// and before any user task can observe a half-initialized scheduler.
 static AP_BOOT_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
+
+/// Set once `init` has published the first task and `set_current_index`.
+///
+/// Until then there is no valid current task: a timer IRQ can fire inside
+/// `scheduler::init` because the PL011 TX wait temporarily unmasks IRQs, and
+/// the clamp in `schedule` would mistake idle for the running task and save the
+/// boot stack into idle's context. `schedule` must be a no-op before this flag.
+static SCHEDULER_READY: AtomicBool = AtomicBool::new(false);
 
 /// Data frames of shared-DMA ranges whose revoke scan could not prove the
 /// absence of foreign mappings (see `reap_dead_tasks`): deliberately leaked
@@ -247,7 +269,6 @@ pub fn init() {
         tasks: Vec::new(),
         next_id: 0,
         console_parent: None,
-        exit_statuses: Vec::new(),
     });
 
     let _idle_id = spawn_kernel(idle_task);
@@ -275,6 +296,7 @@ pub fn init() {
             let _ = spawn_user(user_program::DEMO, role);
         }
         let _security_probe = spawn_user(user_program::DEMO, 27);
+        let _process_api_probe = spawn_user(user_program::DEMO, 29);
     }
 
     let first_id = 0; // BISECT: boot into idle (EL1 kernel task) first
@@ -288,6 +310,8 @@ pub fn init() {
             .position(|task| task.id == first_id)
             .unwrap_or(0),
     );
+    // From here on `schedule` may run: the current index names a real task.
+    SCHEDULER_READY.store(true, Ordering::Release);
 }
 
 pub fn yield_current() {
@@ -349,7 +373,7 @@ pub fn irq_is_bound(intid: u32) -> bool {
             manager
                 .tasks
                 .iter()
-                .any(|task| task.state != TaskState::Dead && task.bound_irq == Some(intid))
+                .any(|task| !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(intid))
         })
         .unwrap_or(false)
 }
@@ -361,7 +385,7 @@ pub fn wake_bound_irq(intid: u32) -> bool {
     let Some(task) = manager
         .tasks
         .iter_mut()
-        .find(|task| task.state != TaskState::Dead && task.bound_irq == Some(intid))
+        .find(|task| !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(intid))
     else {
         return false;
     };
@@ -383,7 +407,7 @@ pub fn console_sink_task() -> Option<u64> {
             .tasks
             .iter()
             .find(|task| {
-                task.state != TaskState::Dead && task.bound_irq == Some(crate::gic::UART_IRQ)
+                !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(crate::gic::UART_IRQ)
             })
             .map(|task| task.id)
     });
@@ -400,7 +424,7 @@ pub fn notify_bound_task(id: u64) -> bool {
                 .tasks
                 .iter_mut()
                 .find(|task| {
-                    task.id == id && task.state != TaskState::Dead && task.bound_irq.is_some()
+                    task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq.is_some()
                 })
                 .map(|task| {
                     task.irq_pending = true;
@@ -485,13 +509,23 @@ pub fn unregister_mutex(state: *mut mutex::MutexState) {
     }
 }
 
-const EXIT_STATUS_LIMIT: usize = 64;
+/// Upper bound on unwaited zombies. Beyond it the oldest zombie record is
+/// dropped (its status is lost), bounding metadata growth for a parent that
+/// never waits. Executable resources are already released at this point.
+const ZOMBIE_LIMIT: usize = 64;
 
 pub fn exit_current() -> ! {
     exit_current_with_status(0)
 }
 
 pub fn exit_current_with_status(status: u64) -> ! {
+    // The syscall path already holds the kernel lock; the EL0 fault vector
+    // enters without it. Acquire only when missing so the teardown below
+    // (`ipc::remove_task` takes the IPC mutex, which asserts the BKL) is valid
+    // in both paths. `schedule_released` balances the extra hold.
+    if smp::bkl_depth() == 0 {
+        smp::bkl_acquire();
+    }
     let id = current_task_id();
     // Kernel-side trace: syscall::print is discarded for tasks that do not own
     // the console, so a task dying silently leaves no user-visible evidence.
@@ -514,10 +548,16 @@ pub fn exit_current_with_status(status: u64) -> ! {
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Dead;
         task.bound_irq = None;
+        // The status survives the Dead -> Zombie transition in `reap`; the
+        // executable resources are released there, after this CPU has left
+        // the context (see `reap_dead_tasks`).
+        task.exit_status = Some(status);
     }
     if let Some(manager) = scheduler_manager() {
         recover_console(manager, id);
-        record_exit(manager, id, status);
+        // A dying parent must not leave its children pointing at a dead PID.
+        reparent_children(manager, id);
+        wake_process_waiters(manager);
     }
     schedule_released();
     interrupts::restore_irq(saved_daif);
@@ -537,18 +577,23 @@ pub fn kill_task(id: u64) -> bool {
         interrupts::restore_irq(saved_daif);
         return false;
     };
-    let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) else {
+    let Some(index) = manager.tasks.iter().position(|task| task.id == id) else {
         interrupts::restore_irq(saved_daif);
         return false;
     };
-    if task.state == TaskState::Dead {
+    if matches!(
+        manager.tasks[index].state,
+        TaskState::Dead | TaskState::Zombie
+    ) {
         interrupts::restore_irq(saved_daif);
         return false;
     }
-    task.state = TaskState::Dead;
-    task.bound_irq = None;
+    manager.tasks[index].state = TaskState::Dead;
+    manager.tasks[index].bound_irq = None;
+    manager.tasks[index].exit_status = Some(1);
     recover_console(manager, id);
-    record_exit(manager, id, 1);
+    reparent_children(manager, id);
+    wake_process_waiters(manager);
     schedule_released();
     interrupts::restore_irq(saved_daif);
     true
@@ -569,7 +614,10 @@ fn recover_console(manager: &mut TaskManager, exited: u64) {
     let fallback = manager
         .tasks
         .iter()
-        .find(|task| task.state != TaskState::Dead && task.program == user_program::HOWL)
+        .find(|task| {
+            !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+                && task.program == user_program::HOWL
+        })
         .map(|task| task.id);
     for task in &mut manager.tasks {
         task.owns_console = Some(task.id) == fallback;
@@ -593,37 +641,80 @@ pub fn wait_for_task_event(id: u64) -> Option<WaitEvent> {
     wait_inner(id, true)
 }
 
+/// PID-based wait (`SYS_WAITPID`). The target must be a child of the caller
+/// or covered by a `CAP_WAIT` capability; a foreign PID is reported as ECHILD
+/// by the syscall layer exactly like a consumed zombie, so existence does not
+/// leak.
+pub fn wait_for_pid(id: u64) -> Option<u64> {
+    if id == IDLE_TASK_ID || id == current_task_id() || !current_task_can_wait(id) {
+        return None;
+    }
+    wait_for_task(id)
+}
+
+fn current_task_can_wait(id: u64) -> bool {
+    let caller = current_task_id();
+    if caller == id {
+        return false;
+    }
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    if manager
+        .tasks
+        .iter()
+        .any(|task| task.id == id && task.ppid == Some(caller))
+    {
+        return true;
+    }
+    manager
+        .tasks
+        .iter()
+        .find(|task| task.id == caller)
+        .map(|task| task.cap_table.has_target_rights(id, capability::CAP_WAIT))
+        .unwrap_or(false)
+}
+
 fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
     if id == IDLE_TASK_ID || id == current_task_id() {
         return None;
     }
+    let waiter = current_task_id();
     let saved_daif = interrupts::save_and_disable_irq();
     loop {
         let Some(manager) = scheduler_manager() else {
             interrupts::restore_irq(saved_daif);
             return None;
         };
-        if let Some(index) = manager
-            .exit_statuses
-            .iter()
-            .position(|(task_id, _)| *task_id == id)
-        {
-            let (_, status) = manager.exit_statuses.remove(index);
-            if let Some(waiter) = manager.tasks.get_mut(smp::current_index()) {
-                waiter.cap_table.remove_for_target(id);
-            }
-            interrupts::restore_irq(saved_daif);
-            return Some(WaitEvent::Exited(status));
-        }
-        let Some(task) = manager.tasks.iter().find(|task| task.id == id) else {
+        let Some(index) = manager.tasks.iter().position(|task| task.id == id) else {
+            // Never existed, or the zombie record was already consumed here:
+            // the caller maps this to ECHILD.
             interrupts::restore_irq(saved_daif);
             return None;
         };
-        if report_stopped && task.state == TaskState::Stopped {
-            interrupts::restore_irq(saved_daif);
-            return Some(WaitEvent::Stopped);
+        match manager.tasks[index].state {
+            TaskState::Zombie => {
+                let status = manager.tasks[index].exit_status.unwrap_or(0);
+                // Removing the zombie shifts every index after it; snapshot
+                // the CPU current-task IDs first and remap afterwards.
+                let cpu_ids = snapshot_current_ids(manager);
+                let live_id = manager.tasks.get(smp::current_index()).map(|task| task.id);
+                manager.tasks.remove(index);
+                remap_current_indices(manager, &cpu_ids, live_id);
+                if let Some(current) = manager.tasks.get_mut(smp::current_index()) {
+                    current.cap_table.remove_for_target(id);
+                }
+                interrupts::restore_irq(saved_daif);
+                return Some(WaitEvent::Exited(status));
+            }
+            TaskState::Stopped if report_stopped => {
+                interrupts::restore_irq(saved_daif);
+                return Some(WaitEvent::Stopped);
+            }
+            _ => {}
         }
-        let waiter = current_task_id();
+        // Alive (including Dead-but-not-yet-reaped): block until the zombie
+        // transition broadcasts on the process wait queue.
         PROCESS_WAIT_QUEUE.enqueue(waiter);
         if let Some(task) = current_task_mut() {
             task.waiting_on = Some(WaitLink::Immortal(&PROCESS_WAIT_QUEUE));
@@ -637,20 +728,75 @@ fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
     }
 }
 
-fn record_exit(manager: &mut TaskManager, id: u64, status: u64) {
-    if let Some(record) = manager
-        .exit_statuses
-        .iter_mut()
-        .find(|(task_id, _)| *task_id == id)
-    {
-        *record = (id, status);
-    } else {
-        if manager.exit_statuses.len() == EXIT_STATUS_LIMIT {
-            manager.exit_statuses.remove(0);
+/// Moves every child of `dead_id` to the live reaper. Safe at any point: the
+/// dead task may be a zombie already or only marked Dead.
+fn reparent_children(manager: &mut TaskManager, dead_id: u64) {
+    let reaper = reaper_pid(manager, dead_id);
+    for task in &mut manager.tasks {
+        if task.ppid == Some(dead_id) && task.id != dead_id {
+            task.ppid = Some(reaper);
         }
-        manager.exit_statuses.push((id, status));
     }
-    wake_process_waiters(manager);
+}
+
+/// Chooses a live reaper without assuming PID 1 exists: the supervisor
+/// (`silverd`) first, then any live user task, finally the always-present
+/// idle task (0), which keeps orphans bounded via [`ZOMBIE_LIMIT`].
+fn reaper_pid(manager: &TaskManager, excluded: u64) -> u64 {
+    if let Some(task) = manager
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.id != excluded
+                && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+                && task.program == user_program::SILVERD
+        })
+        .min_by_key(|task| task.id)
+    {
+        return task.id;
+    }
+    if let Some(task) = manager
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.id != excluded
+                && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+                && task.program != u64::MAX
+        })
+        .min_by_key(|task| task.id)
+    {
+        return task.id;
+    }
+    IDLE_TASK_ID
+}
+
+fn snapshot_current_ids(manager: &TaskManager) -> Vec<Option<u64>> {
+    (0..smp::MAX_CPUS)
+        .filter(|&cpu| smp::cpu_online(cpu))
+        .map(|cpu| {
+            manager
+                .tasks
+                .get(smp::current_index_of(cpu))
+                .map(|task| task.id)
+        })
+        .collect()
+}
+
+fn remap_current_indices(manager: &TaskManager, snapshot: &[Option<u64>], live_id: Option<u64>) {
+    for (cpu, current_id) in (0..smp::MAX_CPUS)
+        .filter(|&cpu| smp::cpu_online(cpu))
+        .zip(snapshot)
+    {
+        let index = current_id
+            .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
+            .unwrap_or(0);
+        smp::set_current_index_for(cpu, index);
+    }
+    smp::set_current_index(
+        live_id
+            .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
+            .unwrap_or(0),
+    );
 }
 
 fn wake_process_waiters(manager: &mut TaskManager) {
@@ -659,7 +805,10 @@ fn wake_process_waiters(manager: &mut TaskManager) {
         if let Some(task) = manager
             .tasks
             .iter_mut()
-            .find(|task| task.id == waiter && task.state != TaskState::Dead)
+            .find(|task| {
+                task.id == waiter
+                    && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+            })
         {
             wake_blocked_task(task);
             woke_any = true;
@@ -696,6 +845,11 @@ pub fn current_task_id() -> u64 {
         .unwrap_or(0)
 }
 
+/// Parent PID of the calling task, or `None` for boot-spawned tasks.
+pub fn current_task_ppid() -> Option<u64> {
+    current_task_mut().and_then(|task| task.ppid)
+}
+
 pub fn current_task_owns_console() -> bool {
     scheduler_manager()
         .and_then(|manager| manager.tasks.get(smp::current_index()))
@@ -712,7 +866,7 @@ pub fn stop_console_owner() -> bool {
             if let Some(task) = manager
                 .tasks
                 .iter_mut()
-                .find(|task| task.owns_console && task.state != TaskState::Dead)
+                .find(|task| task.owns_console && !matches!(task.state, TaskState::Dead | TaskState::Zombie))
             {
                 let id = task.id;
                 let previous = if task.state == TaskState::Running {
@@ -742,7 +896,7 @@ pub fn resume_task(id: u64) -> bool {
             let Some(task) = manager
                 .tasks
                 .iter_mut()
-                .find(|task| task.id == id && task.state != TaskState::Dead)
+                .find(|task| task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie))
             else {
                 return false;
             };
@@ -768,7 +922,7 @@ pub fn set_console_owner(id: u64) -> bool {
                 && manager
                     .tasks
                     .iter()
-                    .any(|task| task.id == id && task.state != TaskState::Dead);
+                    .any(|task| task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie));
             if valid {
                 for task in &mut manager.tasks {
                     task.owns_console = task.id == id;
@@ -792,7 +946,7 @@ pub fn task_alive(id: u64) -> bool {
             manager
                 .tasks
                 .iter()
-                .any(|task| task.id == id && task.state != TaskState::Dead)
+                .any(|task| task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie))
         })
         .unwrap_or(false)
 }
@@ -815,7 +969,7 @@ pub fn cwd_in_use(path: &str) -> bool {
     scheduler_manager()
         .map(|manager| {
             manager.tasks.iter().any(|task| {
-                task.state != TaskState::Dead
+                !matches!(task.state, TaskState::Dead | TaskState::Zombie)
                     && (task.cwd == path
                         || (task.cwd.starts_with(path)
                             && task.cwd.as_bytes().get(path.len()) == Some(&b'/')))
@@ -861,6 +1015,9 @@ fn state_code(state: TaskState) -> u64 {
         TaskState::BlockedUntil(_) => 5,
         TaskState::Dead => 6,
         TaskState::Stopped => 7,
+        // Zombies are kernel bookkeeping for `wait`: existing `SYS_TASK_LIST`
+        // clients treat code 6 as "not selectable", so expose them as dead.
+        TaskState::Zombie => 6,
     }
 }
 
@@ -933,6 +1090,10 @@ pub fn schedule_released() {
 }
 
 pub fn schedule() {
+    if !SCHEDULER_READY.load(Ordering::Acquire) {
+        // Boot: no valid current task yet (see `SCHEDULER_READY`).
+        return;
+    }
     let Some(manager) = scheduler_manager() else {
         return;
     };
@@ -962,7 +1123,7 @@ pub fn schedule() {
     let live_is_dead = manager
         .tasks
         .get(smp::current_index())
-        .map(|task| task.state == TaskState::Dead)
+        .map(|task| matches!(task.state, TaskState::Dead | TaskState::Zombie))
         .unwrap_or(false);
 
     reap_dead_tasks(manager);
@@ -979,6 +1140,25 @@ pub fn schedule() {
     }
 
     let current_index = smp::current_index();
+    let had_current = current_index < manager.tasks.len();
+    // Boot window: `current_index` may already name idle while the CPU is
+    // still on the boot stack (a timer IRQ during `scheduler::init`). Saving
+    // that SP into idle's context corrupts it. `start()` performs the real
+    // first switch; until then `schedule` must not switch at all. An AP's
+    // first pass has no current task (`had_current == false`) and is handled
+    // by the dummy-context path below.
+    if !live_is_dead && had_current {
+        let sp_now: usize;
+        unsafe {
+            core::arch::asm!("mov {}, sp", out(reg) sp_now, options(nostack));
+        }
+        let current = &manager.tasks[current_index];
+        let physical = sp_now.wrapping_sub(crate::memory::KERNEL_VIRT_BASE);
+        if !current.stack.contains(physical.saturating_sub(1)) {
+            smp::bkl_release();
+            return;
+        }
+    }
     if manager.tasks[current_index].state == TaskState::Running {
         manager.tasks[current_index].state = TaskState::Ready;
     }
@@ -1027,7 +1207,16 @@ pub fn schedule() {
         console::write_hex_u64(next_task.stack.start as u64);
         console::write_str(",");
         console::write_hex_u64(next_task.stack.end as u64);
-        console::write_str("]\r\n");
+        console::write_str("] cur_idx=");
+        console::write_dec_u64(current_index as u64);
+        console::write_str(" live_id=");
+        console::write_dec_u64(live_task_id);
+        console::write_str(" dead=");
+        console::write_dec_u64(u64::from(live_is_dead));
+        console::write_str(" next_idx=");
+        console::write_dec_u64(next_index as u64);
+        console::write_str("\r\n");
+        dump_switch_trace();
         panic!("bad saved stack pointer");
     }
 
@@ -1088,11 +1277,17 @@ pub fn schedule() {
 }
 
 fn spawn_kernel(entry: extern "C" fn() -> !) -> Option<u64> {
-    spawn_inner(Some(entry), None, Vec::new())
+    spawn_inner(Some(entry), None, Vec::new(), Vec::new(), Vec::new())
 }
 
 pub fn spawn_user(program: u64, argument: u64) -> Option<u64> {
-    spawn_inner(None, Some((program, argument)), Vec::new())
+    spawn_inner(
+        None,
+        Some((program, argument)),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    )
 }
 
 pub fn spawn_user_with_cap(program: u64, argument: u64) -> Option<capability::CapId> {
@@ -1129,6 +1324,9 @@ fn spawn_elf_task(image: LoadedImage, argument: u64) -> Option<u64> {
         Some((user_program::PROGRAM_DYNAMIC, argument)),
         Some(image),
         Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        current_task_pid(),
     )?;
     task.cwd = cwd;
     manager.tasks.push(task);
@@ -1163,7 +1361,10 @@ pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, right
             if let Some(recipient) = manager
                 .tasks
                 .iter_mut()
-                .find(|task| task.id == recipient_task_id && task.state != TaskState::Dead)
+                .find(|task| {
+                    task.id == recipient_task_id
+                        && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+                })
             {
                 recipient.cap_table.insert(target_task, rights);
                 granted = true;
@@ -1277,7 +1478,7 @@ pub fn bind_irq(intid: u32) -> bool {
             }
             if manager.tasks.iter().enumerate().any(|(index, task)| {
                 index != current_index
-                    && task.state != TaskState::Dead
+                    && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
                     && task.bound_irq == Some(intid)
             }) {
                 return false;
@@ -1306,13 +1507,44 @@ pub fn spawn_user_with_args_and_cap(
 }
 
 pub fn spawn_user_with_args(program: u64, argument: u64, arguments: Vec<u8>) -> Option<u64> {
-    spawn_inner(None, Some((program, argument)), arguments)
+    spawn_inner(
+        None,
+        Some((program, argument)),
+        arguments,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+/// Spawns an embedded program with `argv`/`envp` delivered on its initial
+/// user stack (the versioned `SYS_SPAWN_ARGSV` path). The legacy flat
+/// `arguments` blob stays empty, so `SYS_ARGS` keeps its old behaviour.
+pub fn spawn_user_with_argv_envp_and_cap(
+    program: u64,
+    argument: u64,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> Option<capability::CapId> {
+    let task_id = spawn_inner(None, Some((program, argument)), Vec::new(), argv, envp)?;
+    let parent = current_task_mut()?;
+    Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
+}
+
+/// PID of the caller for parent tracking. Boot-spawned tasks (no current
+/// task yet, or the idle task) get `None` instead of a fake parent.
+fn current_task_pid() -> Option<u64> {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
+        .map(|task| task.id)
+        .filter(|&id| id != IDLE_TASK_ID)
 }
 
 fn spawn_inner(
     entry: Option<extern "C" fn() -> !>,
     user: Option<(u64, u64)>,
     arguments: Vec<u8>,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
 ) -> Option<u64> {
     let manager = scheduler_manager()?;
     let id = manager.next_id;
@@ -1333,12 +1565,13 @@ fn spawn_inner(
         None => None,
     };
 
+    let ppid = current_task_pid();
     let cwd = manager
         .tasks
         .get(smp::current_index())
         .map(|task| task.cwd.clone())
         .unwrap_or_else(|| String::from("/"));
-    let mut task = Task::new(id, entry, user, image, arguments)?;
+    let mut task = Task::new(id, entry, user, image, arguments, argv, envp, ppid)?;
     task.cwd = cwd;
 
     manager.tasks.push(task);
@@ -1440,35 +1673,20 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         return;
     }
 
+    // Snapshot every online CPU's current task: removals (zombie cap) shift
+    // indices, and the local CPU must be remapped too.
+    let cpu_current_ids = snapshot_current_ids(manager);
+    let live_id = manager.tasks.get(smp::current_index()).map(|task| task.id);
+
     // A task killed while Running on another CPU stays executable until its
     // own CPU observes the death in `schedule` (live_is_dead) and switches
     // away; reaping it earlier would pull the address space out from under
     // the still-running context.
-    let dead_ids: Vec<u64> = manager
-        .tasks
-        .iter()
-        .filter(|task| task.state == TaskState::Dead && task.running_on.is_none())
-        .map(|task| task.id)
-        .collect();
-    // Snapshot every online CPU's current task: `retain` below shifts indices.
-    let cpu_current_ids: Vec<Option<u64>> = (0..smp::MAX_CPUS)
-        .filter(|&cpu| smp::cpu_online(cpu))
-        .map(|cpu| {
-            manager
-                .tasks
-                .get(smp::current_index_of(cpu))
-                .map(|task| task.id)
-        })
-        .collect();
-
-    let live_id = manager.tasks.get(smp::current_index()).map(|task| task.id);
-
+    //
     // TASK №5: revoke foreign shared-DMA mappings of every dying task BEFORE
-    // any teardown. At this point every address space in `manager.tasks` —
-    // alive, stopped, blocked, and dead-but-not-reaped — still has intact
-    // page tables; running the scan inside `release_space`/`retain` instead
-    // would read page tables already freed by an earlier dead task's
-    // teardown in the same pass.
+    // any teardown. At this point every non-zombie address space in
+    // `manager.tasks` still has intact page tables. Zombies keep no address
+    // space (`ttbr0 == 0`) and are skipped rather than dereferenced.
     let mut dma_revokes: Vec<(usize, usize, mmu::RevokeResult)> = Vec::new();
     for dead in manager
         .tasks
@@ -1493,7 +1711,11 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
                 safe_to_free: true,
             };
             let mut affected_tasks = 0usize;
-            for other in manager.tasks.iter() {
+            for other in manager
+                .tasks
+                .iter()
+                .filter(|task| !task.resources_released && task.ttbr0 != 0)
+            {
                 let result = mmu::revoke_phys_range(other.ttbr0, physical, phys_end);
                 aggregated.unmapped += result.unmapped;
                 aggregated.safe_to_free &= result.safe_to_free;
@@ -1516,12 +1738,18 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         }
     }
 
-    let mut wake = Vec::new();
-    for task in manager
-        .tasks
-        .iter_mut()
-        .filter(|task| task.state == TaskState::Dead && task.running_on.is_none())
-    {
+    // Transition safely-dead tasks to Zombie, releasing executable resources
+    // exactly once. `clear_resources` empties the heavy fields, so a zombie
+    // carries only PID/PPID/exit status and small metadata until `wait`.
+    let mut became_zombie: Vec<u64> = Vec::new();
+    let mut wake: Vec<u64> = Vec::new();
+    for task in &mut manager.tasks {
+        if task.state != TaskState::Dead
+            || task.running_on.is_some()
+            || task.resources_released
+        {
+            continue;
+        }
         // Backstop unlink: ipc queues were already detached in `remove_task`
         // before their free, so a Dead task's pointer here is either None or
         // a `'static` queue (e.g. PROCESS_WAIT_QUEUE).
@@ -1530,53 +1758,66 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         task.cap_table.remove_all();
         task.bound_irq = None;
         task.irq_pending = false;
+        task.release_stack();
+        task.release_space(&dma_revokes);
+        task.clear_resources();
+        task.state = TaskState::Zombie;
+        became_zombie.push(task.id);
     }
-    for id in wake {
-        if let Some(task) = manager
+
+    // Orphans must point at a live reaper, never at a dead PID.
+    for &dead_id in &became_zombie {
+        reparent_children(manager, dead_id);
+    }
+
+    // Retire capability records targeting the new zombies, keeping CAP_WAIT so
+    // a holder can still wait for them.
+    for &dead_id in &became_zombie {
+        for task in manager
             .tasks
             .iter_mut()
-            .find(|task| task.id == id && task.state != TaskState::Dead)
+            .filter(|task| !matches!(task.state, TaskState::Dead | TaskState::Zombie))
         {
+            task.cap_table.retire_for_target(dead_id);
+        }
+    }
+
+    // Wake mutex waiters released by the teardown.
+    for id in wake {
+        if let Some(task) = manager.tasks.iter_mut().find(|task| {
+            task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+        }) {
             wake_blocked_task(task);
         }
     }
 
-    for task in manager
+    // Bound unwaited zombies (metadata only). The oldest statuses are lost;
+    // their executable resources are already gone.
+    let zombie_count = manager
         .tasks
-        .iter_mut()
-        .filter(|task| task.state != TaskState::Dead)
-    {
-        for dead_id in &dead_ids {
-            task.cap_table.retire_for_target(*dead_id);
-        }
+        .iter()
+        .filter(|task| task.state == TaskState::Zombie)
+        .count();
+    if zombie_count > ZOMBIE_LIMIT {
+        let mut zombie_ids: Vec<u64> = manager
+            .tasks
+            .iter()
+            .filter(|task| task.state == TaskState::Zombie)
+            .map(|task| task.id)
+            .collect();
+        zombie_ids.sort_unstable();
+        let drop_count = zombie_count - ZOMBIE_LIMIT;
+        let drop_ids: Vec<u64> = zombie_ids.into_iter().take(drop_count).collect();
+        manager
+            .tasks
+            .retain(|task| !(task.state == TaskState::Zombie && drop_ids.contains(&task.id)));
     }
 
-    manager.tasks.retain(|task| {
-        if task.state == TaskState::Dead && task.running_on.is_none() {
-            task.release_stack();
-            task.release_space(&dma_revokes);
-            false
-        } else {
-            true
-        }
-    });
+    remap_current_indices(manager, &cpu_current_ids, live_id);
 
-    // Indices shifted: reposition every online CPU onto its own current task.
-    for (cpu, current_id) in (0..smp::MAX_CPUS)
-        .filter(|&cpu| smp::cpu_online(cpu))
-        .zip(cpu_current_ids)
-    {
-        let index = current_id
-            .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
-            .unwrap_or(0);
-        smp::set_current_index_for(cpu, index);
+    if !became_zombie.is_empty() {
+        wake_process_waiters(manager);
     }
-
-    smp::set_current_index(
-        live_id
-            .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
-            .unwrap_or(0),
-    );
 }
 
 fn current_task_mut() -> Option<&'static mut Task> {
@@ -1596,8 +1837,26 @@ impl Task {
         user: Option<(u64, u64)>,
         image: Option<LoadedImage>,
         arguments: Vec<u8>,
+        argv: Vec<Vec<u8>>,
+        envp: Vec<Vec<u8>>,
+        ppid: Option<u64>,
     ) -> Option<Self> {
         let program_label = user.map_or(u64::MAX, |(program, _)| program);
+        // Build the argv/envp stack image before allocating anything: a
+        // malformed or oversized argument list must fail without leaking.
+        let argv_block = if argv.is_empty() && envp.is_empty() {
+            None
+        } else {
+            if user.is_none() {
+                return None;
+            }
+            Some(silver_microkernel::build_argv_envp(
+                &argv,
+                &envp,
+                mmu::USER_STACK_VA + mmu::USER_STACK_SIZE,
+                mmu::USER_STACK_SIZE - 1024,
+            )?)
+        };
         console::write_str("SPAWN: alloc stack (");
         console::write_dec_u64(TASK_STACK_PAGES as u64);
         console::write_str(" pages)...\r\n");
@@ -1656,6 +1915,26 @@ impl Task {
         console::write_hex_u64(ttbr0 as u64);
         console::write_str("\r\n");
 
+        // Publish the argv/envp block on the freshly mapped user stack before
+        // the task can run. The stack VA range is backed by `user_stack`, so
+        // the physical page behind a stack VA is `user_stack.start + offset`.
+        let user_stack_pointer = if let Some(layout) = &argv_block {
+            let offset = mmu::USER_STACK_SIZE - layout.block.len();
+            let destination = phys_to_virt(user_stack.start + offset) as *mut u8;
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    layout.block.as_ptr(),
+                    destination,
+                    layout.block.len(),
+                );
+            }
+            layout.sp as u64
+        } else if user.is_some() {
+            (mmu::USER_STACK_VA + mmu::USER_STACK_SIZE) as u64
+        } else {
+            0
+        };
+
         let stack = MemoryRegion::new(stack_start, stack_start + TASK_STACK_SIZE);
         let mut context = TaskContext::zero();
         context.registers[0] = if let Some(image) = &user_image {
@@ -1670,11 +1949,7 @@ impl Task {
             entry.expect("kernel task entry is required") as usize as u64
         };
         context.stack_pointer = phys_to_virt(stack.end) as u64;
-        context.user_stack_pointer = if user.is_some() {
-            (mmu::USER_STACK_VA + mmu::USER_STACK_SIZE) as u64
-        } else {
-            0
-        };
+        context.user_stack_pointer = user_stack_pointer;
 
         console::write_str("SPAWN: registers set program=");
         console::write_dec_u64(program_label);
@@ -1725,6 +2000,11 @@ impl Task {
             bound_irq: None,
             irq_pending: false,
             arguments,
+            ppid,
+            exit_status: None,
+            resources_released: false,
+            argv,
+            envp,
             cwd: String::from("/"),
             owns_console: cfg!(feature = "demo-tasks"),
             context,
@@ -1852,6 +2132,9 @@ impl Task {
     }
 
     fn release_stack(&self) {
+        if self.resources_released {
+            return;
+        }
         release_pages(self.stack.start, TASK_STACK_PAGES);
         if !self.user_stack.is_empty() {
             release_pages(self.user_stack.start, TASK_USER_STACK_PAGES);
@@ -1863,7 +2146,13 @@ impl Task {
     /// is released only when its scan proved `safe_to_free`; otherwise the
     /// frames are deliberately leaked (see `DMA_LEAKED_FRAMES`) rather than
     /// handed back while a foreign mapping might still reference them.
+    ///
+    /// Guarded by `resources_released`/`ttbr0`: a zombie has already run this
+    /// once, and calling it again with `ttbr0 == 0` would dereference zero.
     fn release_space(&self, dma_revokes: &[(usize, usize, mmu::RevokeResult)]) {
+        if self.resources_released || self.ttbr0 == 0 {
+            return;
+        }
         for region in &self.mmap_regions {
             mmu::unmap_user_pages_at(self.ttbr0, region.virtual_address, region.page_count);
             release_pages(region.physical_start, region.page_count);
@@ -1895,6 +2184,27 @@ impl Task {
         if let Some(image) = &self.user_image {
             image.release();
         }
+    }
+
+    /// Drops the last executable-resource references after teardown. The
+    /// zombie keeps only what `wait` needs (PID, PPID, exit status); clearing
+    /// the fields makes a second teardown a no-op (see the guards above).
+    fn clear_resources(&mut self) {
+        self.stack = MemoryRegion::new(0, 0);
+        self.user_stack = MemoryRegion::new(0, 0);
+        self.ttbr0 = 0;
+        self.user_image = None;
+        self.heap_pages.clear();
+        self.dma_pages.clear();
+        self.mmap_regions.clear();
+        self.arguments = Vec::new();
+        self.argv.clear();
+        self.envp.clear();
+        self.cwd = String::from("/");
+        self.resume_state = None;
+        self.waiting_on = None;
+        self.context = TaskContext::zero();
+        self.resources_released = true;
     }
 }
 

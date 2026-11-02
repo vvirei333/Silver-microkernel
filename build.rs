@@ -75,9 +75,13 @@ fn main() {
         ("hello", "hello.elf"),
         ("crash", "crash.elf"),
     ] {
+        // The userspace sub-build above is always `--release`, regardless of
+        // the kernel profile. Copy from `release/`, not `PROFILE`: a debug
+        // kernel used to embed a stale debug userspace ELF (1+ MiB, wrong
+        // dispatch) whenever one happened to exist.
         let elf = target_dir
             .join("aarch64-unknown-none")
-            .join(&profile)
+            .join("release")
             .join(binary);
         let out = out_dir.join(embedded);
         fs::copy(&elf, &out).unwrap_or_else(|error| {

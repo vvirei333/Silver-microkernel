@@ -60,6 +60,15 @@ impl CapTable {
             .any(|cap| cap.rights & rights_mask == rights_mask)
     }
 
+    /// True when a capability for `target_task` carries at least `rights_mask`.
+    /// Used by `SYS_WAITPID` to authorize a non-child target without exposing
+    /// arbitrary PID access.
+    pub fn has_target_rights(&self, target_task: u64, rights_mask: u32) -> bool {
+        self.caps.iter().any(|cap| {
+            cap.target_task == target_task && cap.rights & rights_mask == rights_mask
+        })
+    }
+
     pub fn get_mut(&mut self, id: CapId) -> Option<&mut Cap> {
         self.caps.iter_mut().find(|cap| cap.id == id)
     }

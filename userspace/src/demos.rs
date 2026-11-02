@@ -606,6 +606,69 @@ pub fn sleep_overflow() -> ! {
     syscall::exit();
 }
 
+/// End-to-end test for the versioned process-management API:
+/// `SYS_SPAWN_ARGSV` (argv/envp block), `SYS_GETPPID`, `SYS_WAITPID`, one-shot
+/// zombie consumption (repeat wait -> ECHILD), and denial of a foreign PID.
+/// The child validates its non-zero PPID and exits with status 7.
+pub fn process_api_probe() -> ! {
+    // Let boot settle so the child does not race task creation.
+    syscall::sleep(300);
+    if syscall::getppid() == 0 {
+        syscall::print("PROC BOOT PPID=PASS\r\n");
+    } else {
+        syscall::print("PROC BOOT PPID=FAIL\r\n");
+    }
+
+    let Some(cap) = syscall::spawn_with_argsv(
+        syscall::PROGRAM_DEMO,
+        crate::ROLE_PROCESS_API_CHILD,
+        &["proc-child", "one", "two"],
+        &["MODE=test", "EMPTY="],
+    ) else {
+        syscall::print("PROC SPAWN ARGSV=FAIL\r\n");
+        loop {
+            syscall::sleep(1000);
+        }
+    };
+    syscall::print("PROC SPAWN ARGSV=PASS\r\n");
+
+    let Some(child) = syscall::cap_get_task_id(cap) else {
+        syscall::print("PROC CHILD ID=FAIL\r\n");
+        loop {
+            syscall::sleep(1000);
+        }
+    };
+
+    match syscall::waitpid(child) {
+        Some(7) => syscall::print("PROC WAITPID STATUS=PASS\r\n"),
+        _ => syscall::print("PROC WAITPID STATUS=FAIL\r\n"),
+    }
+    match syscall::waitpid(child) {
+        None => syscall::print("PROC REPEAT ECHILD=PASS\r\n"),
+        Some(_) => syscall::print("PROC REPEAT ECHILD=FAIL\r\n"),
+    }
+    // PID 1 (Scout in demo boot) is neither our child nor covered by a
+    // capability; a foreign wait must be denied without blocking.
+    match syscall::waitpid(1) {
+        None => syscall::print("PROC FOREIGN DENY=PASS\r\n"),
+        Some(_) => syscall::print("PROC FOREIGN DENY=FAIL\r\n"),
+    }
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+pub fn process_api_child() -> ! {
+    let own = syscall::task_id();
+    let ppid = syscall::getppid();
+    if ppid != 0 && ppid != own {
+        syscall::print("PROC CHILD PPID=PASS\r\n");
+    } else {
+        syscall::print("PROC CHILD PPID=FAIL\r\n");
+    }
+    syscall::exit_with_status(7)
+}
+
 pub fn unknown_task() -> ! {
     syscall::print("UNKNOWN USER TASK\r\n");
     loop {

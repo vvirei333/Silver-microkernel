@@ -71,6 +71,11 @@ pub const SYS_SPAWN_PATH: u64 = 70;
 pub const SYS_POWER_OFF: u64 = 71;
 pub const SYS_MMAP: u64 = 72;
 pub const SYS_MUNMAP: u64 = 73;
+pub const SYS_MOUNT: u64 = 80;
+pub const SYS_UMOUNT: u64 = 81;
+pub const SYS_GETPPID: u64 = 82;
+pub const SYS_WAITPID: u64 = 83;
+pub const SYS_SPAWN_ARGSV: u64 = 84;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -78,6 +83,8 @@ const IO_LIMIT: usize = 4096;
 /// Upper bound on a file loaded for execution, so a huge VFS blob cannot be
 /// cloned into kernel memory before `elf::load_elf` rejects its segments.
 const EXEC_FILE_LIMIT: usize = 4 * 1024 * 1024;
+/// Upper bound on a versioned spawn-arguments block copied from userspace.
+const SPAWN_ARGS_LIMIT: usize = 4096;
 
 /// Well-known Scout task ID. Demo boot starts Scout directly after idle;
 /// normal boot starts silverd first and lets silverd create Scout second.
@@ -94,6 +101,8 @@ const NAME_LIMIT: usize = ipc::PAYLOAD_SIZE - 2;
 pub const SYSCALL_ERROR: u64 = u64::MAX;
 pub const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
 pub const SYSCALL_STOPPED: u64 = u64::MAX - 2;
+/// `SYS_WAITPID`: no such child, or its zombie record was already consumed.
+pub const SYSCALL_ECHILD: u64 = u64::MAX - 3;
 
 /// Frame layout built by the SVC trampoline: x0-x30, then ELR, then SPSR.
 const FRAME_QUADWORDS: usize = 33;
@@ -297,6 +306,11 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
                 SYSCALL_ERROR
             }
         }
+        SYS_MOUNT => sys_fs_mount(frame[0], frame[1], frame[2], frame[3]),
+        SYS_UMOUNT => sys_fs_umount(frame[0], frame[1]),
+        SYS_GETPPID => scheduler::current_task_ppid().unwrap_or(0),
+        SYS_WAITPID => sys_waitpid(frame[0], frame[1]),
+        SYS_SPAWN_ARGSV => sys_spawn_with_argsv(frame[0], frame[1], frame[2], frame[3]),
         _ => SYSCALL_ERROR,
     };
 
@@ -346,6 +360,43 @@ fn sys_spawn_with_args(program: u64, argument: u64, ptr: u64, len: u64) -> u64 {
         return SYSCALL_ERROR;
     }
     scheduler::spawn_user_with_args_and_cap(program, argument, arguments).unwrap_or(SYSCALL_ERROR)
+}
+
+/// `SYS_WAITPID(pid, status_ptr)`: waits for an authorized child (direct child
+/// or `CAP_WAIT` holder) and consumes its zombie record. `status_ptr == 0`
+/// skips the copyout. A consumed/absent/foreign target returns
+/// `SYSCALL_ECHILD`; a bad status pointer returns `SYSCALL_ERROR`.
+fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
+    match scheduler::wait_for_pid(pid) {
+        Some(status) => {
+            if status_ptr != 0 {
+                let bytes = status.to_le_bytes();
+                if user_memory::copy_to_user(&bytes[..], status_ptr).is_err() {
+                    return SYSCALL_ERROR;
+                }
+            }
+            0
+        }
+        None => SYSCALL_ECHILD,
+    }
+}
+
+/// `SYS_SPAWN_ARGSV(program, argument, block_ptr, block_len)`: validates the
+/// versioned argv/envp block and spawns an embedded program with it. The old
+/// `SYS_SPAWN_ARGS`/`SYS_ARGS` flat-blob path is untouched.
+fn sys_spawn_with_argsv(program: u64, argument: u64, block_ptr: u64, block_len: u64) -> u64 {
+    if block_len == 0 || block_len > SPAWN_ARGS_LIMIT as u64 {
+        return SYSCALL_ERROR;
+    }
+    let mut block = vec![0_u8; block_len as usize];
+    if user_memory::copy_from_user(block_ptr, &mut block).is_err() {
+        return SYSCALL_ERROR;
+    }
+    let Some(args) = silver_microkernel::parse_spawn_args(&block) else {
+        return SYSCALL_ERROR;
+    };
+    scheduler::spawn_user_with_argv_envp_and_cap(program, argument, args.argv, args.envp)
+        .unwrap_or(SYSCALL_ERROR)
 }
 
 /// Loads the file at `path` from the VFS and spawns it as a dynamically loaded
@@ -485,6 +536,40 @@ fn sys_fs_rename(source_ptr: u64, destination_ptr: u64) -> u64 {
                 SYSCALL_ERROR
             }
         })
+    })
+}
+
+/// `SYS_MOUNT(source, target, fstype, flags)`: mounts an in-kernel `ramfs`
+/// backend at `target`. The point must already be a directory and must not
+/// already carry a mount. The ABI is additive; old call numbers are untouched.
+fn sys_fs_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
+    with_path(source_ptr, |source| {
+        with_path(target_ptr, |target| {
+            with_path(fstype_ptr, |fstype| {
+                if vfs::mount(&cwd, target, fstype, source, flags, scheduler::cwd_in_use).is_ok() {
+                    0
+                } else {
+                    SYSCALL_ERROR
+                }
+            })
+        })
+    })
+}
+
+/// `SYS_UMOUNT(target, flags)`: refuses while the mount has child mounts,
+/// open files or a task cwd underneath it.
+fn sys_fs_umount(target_ptr: u64, flags: u64) -> u64 {
+    if flags != 0 {
+        return SYSCALL_ERROR;
+    }
+    let cwd = scheduler::current_task_cwd();
+    with_path(target_ptr, |target| {
+        if vfs::umount(&cwd, target, scheduler::cwd_in_use).is_ok() {
+            0
+        } else {
+            SYSCALL_ERROR
+        }
     })
 }
 

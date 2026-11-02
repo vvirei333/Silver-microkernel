@@ -15,13 +15,18 @@
 use alloc::vec::Vec;
 use core::cell::UnsafeCell;
 
-/// Kernel-lock contract check. The host-test build has no `smp` module: the
-/// queue is exercised sequentially there, which is the same discipline.
+/// Kernel-lock contract check. The host-test build has no `smp` module, and
+/// the library crate (`lib.rs`) does not link the kernel's `smp` either, so
+/// this stub stays a no-op. The real check is performed by the bin at the
+/// mutex/scheduler call sites (`mutex::raw_lock` / `raw_unlock` call
+/// `smp::bkl_assert_held` directly).
+///
+/// History: this body used to call itself unconditionally, which hung every
+/// `WaitQueue` operation (`pop`/`enqueue`/`remove`) before the first IPC wait
+/// completed. An empty body is the only safe library-side stub.
 #[cfg(not(test))]
 #[inline]
-fn assert_kernel_lock_held() {
-    assert_kernel_lock_held();
-}
+fn assert_kernel_lock_held() {}
 
 #[cfg(test)]
 #[inline]

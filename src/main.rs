@@ -851,6 +851,8 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::fb_progress();
     vfs::init();
     seed::seed();
+    #[cfg(not(feature = "tablet"))]
+    vfs::run_self_test();
     ram_log::log("VFS+SEED OK");
     ram_log::fb_progress();
     scheduler::init();

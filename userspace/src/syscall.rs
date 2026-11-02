@@ -57,6 +57,11 @@ const SYS_SPAWN_PATH: u64 = 70;
 const SYS_POWER_OFF: u64 = 71;
 const SYS_MMAP: u64 = 72;
 const SYS_MUNMAP: u64 = 73;
+const SYS_MOUNT: u64 = 80;
+const SYS_UMOUNT: u64 = 81;
+const SYS_GETPPID: u64 = 82;
+const SYS_WAITPID: u64 = 83;
+const SYS_SPAWN_ARGSV: u64 = 84;
 
 /// `prot` bits for `mmap`: read / write / execute.
 pub const PROT_READ: u64 = 1;
@@ -96,6 +101,7 @@ pub const PATH_LIMIT: usize = 191;
 const SYSCALL_ERROR: u64 = u64::MAX;
 const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
 const SYSCALL_STOPPED: u64 = u64::MAX - 2;
+const SYSCALL_ECHILD: u64 = u64::MAX - 3;
 const NAME_LIMIT: usize = ipc::PAYLOAD_SIZE - 2;
 
 #[derive(Copy, Clone)]
@@ -353,6 +359,94 @@ pub fn spawn_path(path: &str) -> Option<u64> {
     optional_id(cap_id)
 }
 
+/// Parent PID of the calling process (0 for boot-spawned tasks with no
+/// parent).
+pub fn getppid() -> u64 {
+    unsafe { syscall0(SYS_GETPPID) }
+}
+
+/// Waits for an authorized child (direct child or `CAP_WAIT` holder) and
+/// consumes its zombie record. Returns the exit status, or `None` for an
+/// absent / already-consumed / foreign PID (`ECHILD`).
+pub fn waitpid(pid: u64) -> Option<u64> {
+    let mut status = 0_u64;
+    let result = unsafe { syscall2(SYS_WAITPID, pid, &mut status as *mut u64 as u64) };
+    match result {
+        0 => Some(status),
+        SYSCALL_ECHILD => None,
+        _ => None,
+    }
+}
+
+const SPAWN_BLOCK_MAX: usize = 512;
+const MAX_SPAWN_ARGS: usize = 32;
+
+/// Spawns an embedded program with a versioned `argv`/`envp` block. The block
+/// is built on the caller's stack; the kernel validates it before spawning.
+/// The legacy `spawn_with_args` flat blob is untouched.
+pub fn spawn_with_argsv(
+    program: u64,
+    argument: u64,
+    argv: &[&str],
+    envp: &[&str],
+) -> Option<u64> {
+    let mut block = [0_u8; SPAWN_BLOCK_MAX];
+    let len = build_spawn_block(&mut block, argv, envp)?;
+    let result = unsafe {
+        syscall4(
+            SYS_SPAWN_ARGSV,
+            program,
+            argument,
+            block.as_ptr() as u64,
+            len as u64,
+        )
+    };
+    optional_id(result)
+}
+
+/// `[version][argc][envc][argv_off][envp_off][total_len]` + NUL-terminated
+/// strings, matching `silver_microkernel::parse_spawn_args`.
+fn build_spawn_block(block: &mut [u8], argv: &[&str], envp: &[&str]) -> Option<usize> {
+    const HEADER: usize = 24;
+    if block.len() < HEADER || argv.len() > MAX_SPAWN_ARGS || envp.len() > MAX_SPAWN_ARGS {
+        return None;
+    }
+    let mut cursor = HEADER;
+    let argv_off = cursor;
+    for text in argv {
+        if text.as_bytes().contains(&0) {
+            return None;
+        }
+        let end = cursor.checked_add(text.len())?.checked_add(1)?;
+        if end > block.len() {
+            return None;
+        }
+        block[cursor..cursor + text.len()].copy_from_slice(text.as_bytes());
+        block[cursor + text.len()] = 0;
+        cursor = end;
+    }
+    let envp_off = cursor;
+    for text in envp {
+        if text.as_bytes().contains(&0) {
+            return None;
+        }
+        let end = cursor.checked_add(text.len())?.checked_add(1)?;
+        if end > block.len() {
+            return None;
+        }
+        block[cursor..cursor + text.len()].copy_from_slice(text.as_bytes());
+        block[cursor + text.len()] = 0;
+        cursor = end;
+    }
+    block[0..4].copy_from_slice(&1_u32.to_le_bytes());
+    block[4..8].copy_from_slice(&(argv.len() as u32).to_le_bytes());
+    block[8..12].copy_from_slice(&(envp.len() as u32).to_le_bytes());
+    block[12..16].copy_from_slice(&(argv_off as u32).to_le_bytes());
+    block[16..20].copy_from_slice(&(envp_off as u32).to_le_bytes());
+    block[20..24].copy_from_slice(&(cursor as u32).to_le_bytes());
+    Some(cursor)
+}
+
 pub fn arguments(buffer: &mut [u8]) -> Option<usize> {
     match unsafe { syscall2(SYS_ARGS, buffer.as_mut_ptr() as u64, buffer.len() as u64) } {
         SYSCALL_ERROR => None,
@@ -452,6 +546,24 @@ pub fn fs_rename(source: &str, destination: &str) -> bool {
             syscall2(SYS_FS_RENAME, source_ptr, destination_ptr)
         })
     }) == 0
+}
+
+/// Mounts the in-kernel `ramfs` backend at `target` (must be an existing
+/// directory and must not already carry a mount).
+pub fn fs_mount(source: &str, target: &str, fstype: &str, flags: u64) -> bool {
+    with_path(source, |source_ptr| {
+        with_path(target, |target_ptr| {
+            with_path(fstype, |fstype_ptr| unsafe {
+                syscall4(SYS_MOUNT, source_ptr, target_ptr, fstype_ptr, flags)
+            })
+        })
+    }) == 0
+}
+
+/// Unmounts `target`; the kernel refuses while it has child mounts, open
+/// files or a task cwd underneath it.
+pub fn fs_umount(target: &str, flags: u64) -> bool {
+    with_path(target, |ptr| unsafe { syscall2(SYS_UMOUNT, ptr, flags) }) == 0
 }
 
 pub fn fs_close(fd: u64) -> bool {
