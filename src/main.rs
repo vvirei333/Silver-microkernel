@@ -683,10 +683,6 @@ exception_irq_dispatch:
     // and corrupt task contexts. eret restores the pre-interrupt PSTATE
     // from the frame.
     msr daifset, #2
-    // BISECT probes: 18 = dispatch entered, 17 = handler returned.
-    adrp x9, {probe}
-    mov w10, #18
-    str w10, [x9, #:lo12:{probe}]
     // Frame is 272 bytes like the SVC trampoline: x0-x30, then ELR, SPSR.
     // ELR_EL1/SPSR_EL1 MUST be saved and restored here — schedule() may
     // switch to another task whose exceptions overwrite these CPU-global
@@ -709,6 +705,12 @@ exception_irq_dispatch:
     stp x26, x27, [sp, #208]
     stp x28, x29, [sp, #224]
     str x30, [sp, #240]
+    // BISECT probes: 18 = dispatch entered, 17 = handler returned.
+    // x9/x10 are only scratch here: every user register is already saved in
+    // the frame above, and the epilogue restores x0-x30 from it.
+    adrp x9, {probe}
+    mov w10, #18
+    str w10, [x9, #:lo12:{probe}]
     mrs x9, elr_el1
     str x9, [sp, #248]
     mrs x9, spsr_el1
