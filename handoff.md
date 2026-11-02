@@ -3,6 +3,33 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
+## CURRENT STATUS (2026-11-03, TASK №23)
+
+Checkpoint: commit `82294d2` (`feat(fog): bring up Redmi 10C RAM-only boot with
+fail-closed relocation`).
+
+- **Redmi 10C / fog RAM-only bring-up is implemented but not hardware-verified.**
+  Authoritative document: [`redmi10c_poc/README.md`](redmi10c_poc/README.md).
+- The default `fog` build is **fail-closed**: relocation is disabled, and a
+  non-link entry records `pc`/`link`/`delta` in `BOOT_PARAMS` and parks. It
+  never copies into `0x4008_0000` by default.
+- `fog-reloc` is an explicit opt-in. It validates the ARM64 header, image size,
+  both source and destination span ends, overflow and every overlap before
+  copying, but still lacks a pre-copy live-FDT proof that the destination is
+  free. It is not the hardware-ready default.
+- GICv3 no longer falls back to redistributor frame 0. The boot CPU's frame is
+  matched by `GICR_TYPER` affinity in bits `[63:32]`; if no frame matches, the
+  timer PPI is left disabled and timer-dependent scheduling does not start.
+- Verified in this snapshot: **67 host tests**, fog QEMU relocation/at-link/
+  fail-closed-park cases, normal QEMU boot to `howl>`, demo regression
+  **66 PASS / 0 PANIC**, tablet build, and fog boot image v3.
+- **Hardware readiness: NOT READY — NEEDS DEVICE DATA.** The ABL load address,
+  live memory/reserved map, UART clock/pins, GIC/timer wiring and boot CPU
+  affinity of the specific unit are still unconfirmed.
+- The obsolete `tablet/` tree (including `tablet/HANDOFF.md`) was removed in
+  TASK №20.2. References to it below are historical; the current hardware port
+  is `fog`.
+
 ## SMP PROGRAM (TASK №6/№7) — in progress, checkpointed 2026-11-01
 
 Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
@@ -17,8 +44,9 @@ Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
   `bkl_release_asm` in `silver_user_bootstrap`, post-switch `bkl_release()`,
   defined `unregister_mutex` not-found path, ipc receive bisect bypass
   removed).
-- **Verified working:** single-CPU boot unchanged; `cargo test --lib` 13/13;
-  debug and release builds pass.
+- **Verified working at that checkpoint:** single-CPU boot unchanged;
+  `cargo test --lib` 13/13 (the current suite is 67/67); debug and release
+  builds pass.
 - **NOT working: `-smp 2`** dies at silverd's first blocking IPC receive.
   Two independent failure layers, both new relative to pre-SMP:
   - Layer A: O3+LTO emits literal `b .` self-loops on *reachable* paths
@@ -46,20 +74,23 @@ Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
   probes (`SMP_PROBE`/`TICK_PROBE`/`DIAG_SNAP`) are kept **on purpose**
   until layer B is understood.
 
-## TABLET PORT (Lenovo Legion Y700, SM8650) — see tablet/HANDOFF.md for details
+## TABLET PORT (Lenovo Legion Y700, SM8650) — historical, tree removed
 
-The tablet port (real hardware, not QEMU) lives in `tablet/` and is documented
-authoritatively in **tablet/HANDOFF.md**. High-level status (2026-10-30):
+> **Superseded (2026-11-03):** the `tablet/` directory, including
+> `tablet/HANDOFF.md`, was removed in TASK №20.2. The current hardware
+> bring-up target is the Redmi 10C (`fog`); see `redmi10c_poc/README.md`.
+> The text below records the earlier tablet investigation and is kept for
+> history only.
 
-- **Breakthrough**: the EFI/PE stub (`tablet/efi_stub.S` → `tablet/Image.efi`)
-  now EXECUTES on the device via GRUB `chainloader`. First visible proof: the
-  stub paints the splash framebuffer (0xD5100000) and a GREEN band appears.
-- Current milestone: the stub reaches entry + kernel copy (green+white bands),
-  but HANGS at its own MMU-disable step. Fix in progress (PC-relative MMU-off,
-  or skip MMU-off and let the kernel `_start` handle it at its identity-mapped
-  0xA8000000).
-- Diagnostics: pmsg/ramoops readback is DEAD on this device; the ONLY channel is
-  the GOP framebuffer (0xD5100000). QEMU regression is clean throughout.
+High-level status as of 2026-10-30:
+
+- **Breakthrough (historical)**: the (now removed) EFI/PE stub executed on the
+  device via GRUB `chainloader`. First visible proof: the stub painted the
+  splash framebuffer (`0xD5100000`) and a GREEN band appeared.
+- State when the tree was removed: the stub reached entry + kernel copy
+  (green+white bands) but hung at its own MMU-disable step.
+- Diagnostics on that device: pmsg/ramoops readback was dead; the only channel
+  was the GOP framebuffer. QEMU regression was clean throughout.
 
 ## State as of 2026-10-29 (visible GUI clicks; "EL0" terminology)
 

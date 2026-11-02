@@ -32,13 +32,34 @@ desktop boot are out of scope for the first hardware milestone.
 - Platform identity, memory, reservations, UART, GICv3 and the timer INTID are
   read from the live FDT. Nothing is inferred from "unknown CPU means tablet".
 - A full fog-path integration test runs on QEMU `virt` with a synthetic
-  khaje-like DTB and reaches `howl>`.
+  khaje-like DTB in three cases: `fog-reloc` relocation, default at-link boot,
+  and default fail-closed park.
 - **Real-device status: not yet verified.** The actual ABL load address, UART
   wiring/clocking and the live memory map of the specific unit still have to be
   measured. They are listed as unconfirmed below.
 
 The QEMU test is a validation of the Silver-side logic. It is not evidence that
 the same addresses or devices exist on the phone.
+
+### Verification snapshot (2026-11-03)
+
+| Check | Result |
+| --- | --- |
+| Host unit tests | 67 passed / 0 failed |
+| Fog QEMU, `fog-reloc` at `0x4040_0000` | PASS: relocation, `TIMER TEST: ticks=30`, `howl>` |
+| Fog QEMU, default at `0x4008_0000` | PASS: no relocation, `howl>` |
+| Fog QEMU, default at `0x4040_0000` | PASS fail-closed: no serial output, no `howl>`; `BOOT_PARAMS` holds pc/link/delta |
+| Normal QEMU | PASS: `PLATFORM=QEMU`, timer ticks, `howl>` |
+| Demo regression | 66 PASS / 0 unexpected FAIL / 0 PANIC |
+| Tablet build | PASS |
+| Fog boot image v3 | PASS: `ANDROID!`, header v3 |
+
+GICv3 now matches the boot CPU's redistributor by `GICR_TYPER` affinity and has
+**no frame-0 fallback**. When no redistributor matches, the timer PPI is left
+disabled, `TIMER TEST` is skipped and the scheduler does not pretend that
+preemption works.
+
+Hardware readiness remains **NOT READY — NEEDS DEVICE DATA**.
 
 ## Architecture decision
 
@@ -162,10 +183,15 @@ SILVER UART OK base=... debug=... kind=geni|pl011
 SILVER MMU OK
 SILVER FRAME ALLOCATOR OK
 SILVER HEAP OK base=...
+TIMER TEST: ticks=30 ...          # or: SKIP (no confirmed GIC redistributor)
 SILVER PLATFORM READY
 SILVER SCHEDULER START
 howl>
 ```
+
+If the GICv3 redistributor cannot be matched, the banner also contains
+`GICV3: no redistributor matches this CPU; timer PPI left disabled`, and the
+timer is not armed.
 
 `pc` is the address ABL actually used; `delta` is `pc - 0x4008_0000`. If those
 two disagree with expectations, the log already contains the measurement needed
@@ -292,15 +318,19 @@ log says so.
 ## Relevant files
 
 - `linker_fog.ld` — high-half VMA, `0x4008_0000` link/relocation slot.
-- `src/main.rs` — entry stub, hand-over capture, relocation, fog boot order.
+- `src/main.rs` — entry stub, hand-over capture, fail-closed placement policy,
+  fog boot order.
 - `src/boot.rs` — `BOOT_PARAMS` layout shared with the assembly stub.
 - `src/fdt.rs` — allocation-free DTB parser and boot-memory planner (host
   tested).
+- `src/reloc.rs` — host-tested relocation boundary policy mirrored by the stub.
 - `src/fog.rs` — khaje probe, FDT-derived memory window, banner.
 - `src/memory.rs` — fog DRAM window and the FDT-selected allocator window.
 - `src/platform.rs` — `Kind::{Qemu,Sm8650,Fog,Unknown}`.
 - `src/console.rs`, `src/geni_uart.rs`, `src/pl011.rs` — FDT-driven console.
-- `src/gic.rs`, `src/gicv3.rs` — runtime GIC configuration.
+- `src/gic.rs`, `src/gicv3.rs`, `src/gicv3_policy.rs` — runtime GIC
+  configuration and host-tested redistributor matching.
+- `src/timer.rs` — timer arming gated by `gic::timer_available()`.
 - `src/scheduler.rs` — `init_fog` (Scout + Howl).
 - `userspace/src/bin/silvershell.rs` — `SYS_READ` fallback when Howler is absent.
 - `redmi10c_poc/test_fog_qemu.sh` — end-to-end QEMU simulation.

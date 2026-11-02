@@ -5,7 +5,10 @@ bare-metal Rust (`no_std`), with drivers and services in C/C++ planned on top
 of it. Cross-platform development: Windows and Linux (Arch) share the same
 code — only the build commands and toolchain setup differ.
 
-Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
+Primary target: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
+Hardware bring-up target: Xiaomi Redmi 10C (`fog`, Qualcomm SM6225 / khaje),
+RAM-only boot. The hardware path is implemented but not yet verified on a
+physical unit; see [redmi10c_poc/README.md](redmi10c_poc/README.md).
 
 ## Community
 
@@ -26,7 +29,7 @@ userspace.
 - [x] ARM64 exception vectors: SVC and IRQ trampolines, `panic!` file:line reports, EL0 fault containment
 - [x] Physical memory map + page frame allocator (bitmap)
 - [x] Kernel heap + Rust global allocator (`alloc`: `Box`, `Vec`)
-- [x] GICv2 + ARM Generic Timer (IRQ 30, 100 Hz tick) + PL011 RX (INTID 33)
+- [x] GICv2 + ARM Generic Timer (QEMU: IRQ 30, 100 Hz tick) + PL011 RX (INTID 33); runtime GICv3 dispatch for SM8650/fog
 - [x] Round-robin scheduler: spawn with numeric/string arguments, `yield`, `sleep`, `kill`, `wait`
 - [x] Console ownership + job control: `bg`/`fg`, Ctrl-Z, `Stopped`, resume and shell recovery
 - [x] Lifecycle cleanup: address spaces, mailboxes, file handles, wait queues and owned mutexes
@@ -72,8 +75,65 @@ userspace.
 - [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh EL0 task with its own W^X address space
 - [x] EL0 fault containment: a crashed EL0 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
 - [x] Power off: the GPU "Power" button shuts QEMU down via PSCI `SYSTEM_OFF`
+- [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation (QEMU-verified only; see below)
+- [ ] Real Redmi 10C boot to `howl>` — **not yet verified on hardware**
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
 - [ ] SMP (`-smp 2`): **in progress, not working yet** — see `SMP_STATUS.md`. Single-CPU boot is the verified configuration; under `-smp 2` the kernel does not survive silverd's first blocking IPC receive. Known open issues: compiler-generated self-loops on reachable paths in O3+LTO builds (absent pre-SMP, root cause not established), and an O1-run infinite Prefetch Abort (ESR `0x86000006`, FAR `0x40081a00`) pointing at kernel translation-table damage still under investigation. CPU1 stays offline (PSCI `CPU_ON` returns `-1`). Do not boot on hardware expecting SMP.
+
+## Redmi 10C (`fog`, SM6225) — RAM-only bring-up
+
+Status as of 2026-11-03 (TASK №19–№23). The authoritative port document is
+[redmi10c_poc/README.md](redmi10c_poc/README.md).
+
+Implemented:
+
+- [x] Separate `fog` platform kind and `linker_fog.ld` (DRAM base `0x4000_0000`,
+      link slot `0x4008_0000`)
+- [x] ARM64 Image header, hand-over capture (`x0` DTB, `CurrentEL`, `SCTLR_EL1`,
+      `MPIDR_EL1`, actual PC) and a fixed-layout `BOOT_PARAMS` record
+- [x] Allocation-free FDT parser plus a memory planner that subtracts
+      `/memory`, `/reserved-memory`, the memreserve map, the loaded image and
+      the DTB
+- [x] Live khaje/SM6225 probe; compile-time addresses are fallbacks, not
+      asserted hardware facts
+- [x] GENI UART TX/polled RX and runtime GICv3/timer/UART INTID selection
+- [x] GICv3 redistributor lookup by `GICR_TYPER` affinity, with no frame-0
+      fallback; the timer is not armed when no redistributor matches
+- [x] Fog scheduler path: idle, Scout and Howl; Howl falls back to `SYS_READ`
+- [x] **Fail-closed relocation by default.** A standard `fog` build never
+      copies the image. If ABL enters it at anything other than the link
+      address, it records `pc`/`link`/`delta` in `BOOT_PARAMS` and parks.
+- [x] Opt-in `fog-reloc` feature for controlled experiments. It validates the
+      ARM64 header, image size, both source and destination span ends,
+      overflow and every overlap before copying.
+- [x] RAM-only boot image v3 builder (builds only; never flashes or runs a
+      device command)
+- [ ] Real-device boot and `howl>` on the Redmi 10C — **not yet verified**
+
+The default fog image is intentionally conservative: it will not write outside
+its own loaded image when the placement is unexpected. `fog-reloc` is not a
+hardware-ready default because the destination still needs a pre-copy live-FDT
+proof that the bytes are free.
+
+```bash
+# Kernel (default, fail-closed)
+cargo build --release --target aarch64-unknown-none \
+    --no-default-features --features no_std,fog
+
+# Explicit relocation experiment (only after proving the destination)
+cargo build --release --target aarch64-unknown-none \
+    --no-default-features --features no_std,fog,fog-reloc
+
+# QEMU integration: relocation, at-link boot and fail-closed park
+redmi10c_poc/test_fog_qemu.sh
+
+# Boot image v3 (build only, no device operation)
+redmi10c_poc/build_boot_image.sh
+```
+
+QEMU validates only the Silver-side logic (FDT, planner, relocation policy,
+GICv3/timer and the Howl path). It does **not** prove GENI, khaje GIC/timer,
+the live memory map or the ABL load address on a real unit.
 
 ## Phase 4: Network — complete
 
@@ -207,6 +267,10 @@ sudo pacman -S qemu-system-aarch64 rustup
 rustup target add aarch64-unknown-none
 ```
 
+For the fog QEMU test and RAM-only image build, also install `dtc`,
+`llvm-objcopy` (or `aarch64-linux-gnu-objcopy`) and AOSP `mkbootimg`
+(`android-tools`). The boot-image script only builds; it never flashes.
+
 ## Build and run
 
 Windows (Git Bash), interactive shell:
@@ -299,8 +363,10 @@ keep running.
 Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
-`Cargo.toml` has `std` (default host stub), `no_std` (bare metal) and
-`demo-tasks` (opt-in regression programs). Normal bare-metal boot starts only
+`Cargo.toml` has `std` (default host stub), `no_std` (bare metal),
+`demo-tasks` (opt-in regression programs), `tablet` (SM8650), `fog` (SM6225
+RAM-only bring-up) and `fog-reloc` (explicit opt-in for the fog self-relocation
+copy). Normal bare-metal boot starts only
 silverd, which then starts Scout, the block driver, the network driver, the SFS
 server, the network server, the graphics and input drivers, Howl and Howler in
 that order. No component depends
@@ -364,13 +430,22 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | File | Purpose |
 | --- | --- |
 | `build.rs` | Builds and embeds the userspace ELFs; also copies `hello.elf` for the VFS seed |
-| `src/main.rs` | Physical boot entry, high-half transition, exception trampolines |
+| `src/main.rs` | Physical boot entry, hand-over capture, fog placement policy, high-half transition, exception trampolines |
+| `src/boot.rs` | `BOOT_PARAMS` / `BOOT_CLAIM` layout shared with the assembly stub |
 | `src/exceptions.rs` | EL0 fault register dump, switch trace and the kernel exit path |
 | `src/pl011.rs` | Kernel UART diagnostics and bounded RX fallback |
-| `src/memory.rs` | Physical memory map and high-half address conversion |
+| `src/memory.rs` | Physical memory map and high-half address conversion; fog DRAM window |
+| `src/fdt.rs` | Allocation-free FDT parser and fog boot-memory planner |
+| `src/fog.rs` | khaje/SM6225 probe, live FDT policy, memory window and banner |
+| `src/geni_uart.rs` | Qualcomm GENI SE UART TX/polled RX driver |
+| `src/gicv3.rs` | Runtime GICv3 distributor/redistributor setup and IRQ dispatch |
+| `src/gicv3_policy.rs` | Host-tested GICR_TYPER affinity matching |
+| `src/reloc.rs` | Host-tested fail-closed self-relocation boundary policy |
+| `src/platform.rs` | Runtime `Kind::{Qemu,Sm8650,Fog,Unknown}` identity |
+| `linker_fog.ld` | Fog high-half VMA and `0x4008_0000` link slot |
 | `src/frame_allocator.rs` | Physical page frame allocator (bitmap) |
 | `src/allocator.rs` | Kernel heap, `#[global_allocator]` |
-| `src/gic.rs` | GICv2 timer/UART IRQ setup, EOI and userspace IRQ dispatch |
+| `src/gic.rs` | GICv2 setup plus runtime dispatch to GICv3; timer availability gate |
 | `src/timer.rs` | ARM Generic Timer, tick counter |
 | `src/interrupts.rs` | IRQ control: masking/restoring DAIF |
 | `src/capability.rs` | Capability tables, rights, delegation and revocation |
@@ -401,6 +476,9 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `userspace/src/bin/hello.rs` | Test program loaded dynamically via `run bin/hello` |
 | `userspace/src/bin/crash.rs` | Fault-containment test: writes to `0x0`, run via `run bin/crash` |
 | `userspace/` | Separate demo, nameserver, shell and utility EL0 programs |
+| `redmi10c_poc/README.md` | Authoritative Redmi 10C (fog) bring-up document |
+| `redmi10c_poc/test_fog_qemu.sh` | Fog QEMU relocation/at-link/fail-closed regression |
+| `redmi10c_poc/build_boot_image.sh` | RAM-only Android boot image v3 builder (no device operation) |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
 ## Memory model
@@ -413,6 +491,13 @@ the MMU, branches to the high PC, and removes the kernel's low identity map.
 TTBR1 (EL1 only):  0xFFFF000000000000 + PA -> kernel image, heap, stacks, MMIO
 TTBR0 (per task): own ELF + sparse heap + own fixed-VA stack + private page
 ```
+
+The fog build links against `linker_fog.ld` (`__dram_base = 0x4000_0000`,
+`__kernel_link_pa = 0x4008_0000`). Its first PoC maps exactly the first DRAM
+gigabyte (`0x4000_0000..0x8000_0000`); a larger live bank is clipped out of the
+allocator window rather than assumed safe. The standalone `fog` build does not
+self-relocate: a non-link entry publishes the measured placement and parks. The
+`fog-reloc` feature enables the checked copy path for controlled experiments.
 
 The scheduler changes only TTBR0_EL1 and flushes stale TLB entries. Its EL1
 code and SP_EL1 stack remain mapped through TTBR1_EL1. Every user task gets
@@ -502,7 +587,18 @@ subset of the caller's rights, and task death revokes or downgrades affected
 capabilities. Spawn, heap, DMA, VFS and wait-queue resource quotas are still
 limited or absent, so denial-of-service resistance remains incomplete.
 
-Architecture details, invariants and the roadmap: [handoff.md](handoff.md).
+## Documentation
+
+| Document | Contents |
+| --- | --- |
+| [redmi10c_poc/README.md](redmi10c_poc/README.md) | Authoritative Redmi 10C / fog bring-up: design, live-FDT policy, fail-closed relocation, QEMU tests, unconfirmed hardware parameters |
+| [SMP_STATUS.md](SMP_STATUS.md) | SMP investigation status; `-smp 2` is still not verified |
+| [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
+
+Current verification snapshot (2026-11-03): 67 host tests pass; the fog QEMU
+suite covers relocation, at-link boot and fail-closed park; normal QEMU reaches
+`howl>`; the demo regression reports 66 PASS / 0 PANIC; the tablet build and
+fog boot image v3 build succeed. Real-device status remains **not verified**.
 
 ## License
 
