@@ -42,6 +42,10 @@ pub const ROLE_DMA_READER: u64 = 42;
 pub const ROLE_ZOMBIE_PROBE: u64 = 43;
 pub const ROLE_EXIT_IMMEDIATE: u64 = 44;
 pub const ROLE_ELF_LIFECYCLE_PROBE: u64 = 45;
+pub const ROLE_NAMESERVER_PROBE: u64 = 46;
+pub const ROLE_NAMESERVER_FILLER: u64 = 47;
+pub const ROLE_FS_READ_PROBE: u64 = 48;
+pub const ROLE_MMAP_WX_PROBE: u64 = 49;
 
 /// The kernel passes one argument in x0. Demo selection no longer depends on
 /// task ID: dynamically spawned copies can choose any role independently.
@@ -92,6 +96,10 @@ pub extern "C" fn _start(argument: u64) -> ! {
         ROLE_ZOMBIE_PROBE => demos::zombie_probe(),
         ROLE_EXIT_IMMEDIATE => demos::exit_immediate(),
         ROLE_ELF_LIFECYCLE_PROBE => demos::elf_lifecycle_probe(),
+        ROLE_NAMESERVER_PROBE => demos::nameserver_probe(),
+        ROLE_NAMESERVER_FILLER => demos::nameserver_filler(),
+        ROLE_FS_READ_PROBE => demos::fs_read_probe(),
+        ROLE_MMAP_WX_PROBE => demos::mmap_wx_probe(),
         _ => demos::unknown_task(),
     }
 }

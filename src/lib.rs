@@ -8,6 +8,9 @@
 
 extern crate alloc;
 
+pub mod fdt;
+pub mod gicv3_policy;
+pub mod reloc;
 pub mod wait_queue;
 
 use alloc::vec::Vec;

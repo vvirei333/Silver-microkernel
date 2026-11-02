@@ -6,19 +6,46 @@ static INTERVAL_TICKS: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
 pub fn init() {
-    let frequency = counter_frequency();
+    let mut frequency = counter_frequency();
+    if frequency == 0 {
+        // CNTFRQ_EL0 is architecturally required to be programmed by the
+        // firmware, but a hand-over bug must not turn every deadline into a
+        // zero-length interval. 19.2 MHz is the khaje/khaje-family crystal
+        // value documented in the platform DTS; log loudly when it is used.
+        frequency = 19_200_000;
+        crate::console::write_str("TIMER: CNTFRQ_EL0=0, assuming 19.2 MHz\r\n");
+    }
     let interval = frequency * TICK_INTERVAL_MS / 1000;
     let interval = if interval == 0 { 1 } else { interval };
 
     INTERVAL_TICKS.store(interval, Ordering::Relaxed);
+
+    if !available() {
+        // No confirmed redistributor: arming CNTP can never produce a tick,
+        // and the PPI is deliberately not enabled. Leave the counter off so
+        // the scheduler does not look healthy while preemption is impossible.
+        #[cfg(feature = "tablet")]
+        crate::ram_log::log("TIMER: DISABLED (no GIC redistributor)");
+        #[cfg(not(feature = "tablet"))]
+        crate::console::write_str("TIMER: DISABLED (no confirmed GIC redistributor)\r\n");
+        return;
+    }
     rearm();
     set_control(1);
 }
 
+/// Whether timer interrupts can actually be delivered on this platform.
+pub fn available() -> bool {
+    crate::gic::timer_available()
+}
+
 /// Per-CPU timer bring-up for APs: the interval is global (set by the boot
 /// CPU in `init`); each AP arms its own physical timer and enables it so its
-/// preemption tick runs.
+/// preemption tick runs. An AP without a confirmed redistributor stays off.
 pub fn cpu_init() {
+    if !available() {
+        return;
+    }
     rearm();
     set_control(1);
 }

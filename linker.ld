@@ -14,6 +14,7 @@ SECTIONS
     __kernel_virt_base = 0xFFFF000000000000;
     __dram_base = 0x40000000;
     . = 0xFFFF000040080000;
+    __kernel_link_pa = 0x40080000;
     __kernel_start = .;
     __text_start = .;
 

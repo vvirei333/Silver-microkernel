@@ -7,6 +7,8 @@ extern crate alloc;
 #[cfg(not(feature = "std"))]
 mod allocator;
 #[cfg(not(feature = "std"))]
+mod boot;
+#[cfg(not(feature = "std"))]
 mod boot_metrics;
 #[cfg(not(feature = "std"))]
 mod capability;
@@ -23,12 +25,17 @@ mod elf_loader;
 #[cfg(not(feature = "std"))]
 mod exceptions;
 #[cfg(not(feature = "std"))]
+mod fdt;
+#[cfg(not(feature = "std"))]
+mod fog;
+#[cfg(not(feature = "std"))]
 mod frame_allocator;
 #[cfg(not(feature = "std"))]
 mod geni_uart;
 #[cfg(not(feature = "std"))]
 mod gic;
 mod gicv3;
+mod gicv3_policy;
 #[cfg(not(feature = "std"))]
 mod interrupts;
 #[cfg(not(feature = "std"))]
@@ -44,6 +51,10 @@ mod pl011;
 #[cfg(not(feature = "std"))]
 mod platform;
 mod ram_log;
+// The boot stub mirrors this policy in assembly; the Rust copy exists for
+// host boundary tests, so the binary itself does not call these items.
+#[allow(dead_code)]
+mod reloc;
 #[cfg(not(feature = "std"))]
 mod scheduler;
 #[cfg(not(feature = "std"))]
@@ -82,6 +93,18 @@ compile_error!("The bare-metal kernel currently supports only AArch64");
 core::arch::global_asm!(".set RAM_LOG_MARKS, 1");
 #[cfg(not(feature = "tablet"))]
 core::arch::global_asm!(".set RAM_LOG_MARKS, 0");
+// Fog images are linked for one physical address. Standard fog builds do not
+// move the image: if ABL placed it elsewhere the stub publishes the measured
+// pc/link/delta and parks, because only the live FDT can prove a destination
+// free. `fog-reloc` is the explicit opt-in for the copy path.
+#[cfg(feature = "fog")]
+core::arch::global_asm!(".set FOG_BUILD, 1");
+#[cfg(not(feature = "fog"))]
+core::arch::global_asm!(".set FOG_BUILD, 0");
+#[cfg(feature = "fog-reloc")]
+core::arch::global_asm!(".set FOG_RELOC, 1");
+#[cfg(not(feature = "fog-reloc"))]
+core::arch::global_asm!(".set FOG_RELOC, 0");
 
 core::arch::global_asm!(
     r#"
@@ -91,9 +114,10 @@ core::arch::global_asm!(
     // 0x38 and image_size at 0x10 before it will decompress/jump. Without it
     // a raw objcopy binary is not recognized and the device lands in the
     // Qualcomm crashdump. code0 branches over the 64-byte header into _start.
-    // NOTE: the kernel is NOT self-relocating (linked at 0xA8000000); the boot
-    // marker records the actual load PC into the pmsg ramoops zone so a wrong
-    // load address can be read back from Android and the kernel relinked.
+    // The tablet/QEMU images are not self-relocating (they are linked at
+    // 0xA8000000 / 0x4008_0000). The fog stub records the observed hand-over
+    // PC in BOOT_PARAMS and, by default, parks on a mismatch; the explicit
+    // `fog-reloc` feature enables the checked copy to __kernel_link_pa.
     _head:
         b       1f                          // 0x00 code0: jump past header
         .word   0                           // 0x04 code1
@@ -113,14 +137,30 @@ _start:
     // leave pending exceptions that would fire into a not-yet-set VBAR.
     msr daifset, #0xf
 
-    // Secondary cores park FIRST: on the tablet eight cores may come out of
-    // ABL running, and QEMU starts only one. Any secondary executing this
-    // stub would zero .bss twice and scribble over the page tables; a wfe
-    // loop waits for the (never yet implemented) PSCI_CPU_ON wake-up.
-    mrs x10, mpidr_el1
-    ubfx x10, x10, #0, #24    // Aff0/Aff1/Aff2: CPU0 is 0x0 in the device tree
-    cmp x10, #0
-    b.ne 6f
+    // Preserve the two values the C/Rust side can never recover once the
+    // stub starts using x0: the bootloader's DTB pointer and the address the
+    // image was actually loaded at (PC-relative, so it works at any LMA).
+    mov x22, x0
+    adr x23, _head
+
+    // Claim the boot path. The bootloader normally starts a single CPU, but
+    // its MPIDR affinity is not guaranteed to be zero (an unconfirmed
+    // parameter on fog). Whichever core arrives first claims the image; every
+    // other core that sees the claim parks instead of zeroing .bss and the
+    // page tables twice.
+    //
+    // Plain LDR/STR, not LDAXR/STXR: with the MMU off the access is Device
+    // memory on real hardware, where exclusive monitors are not available.
+    // The claim is therefore best-effort and the hand-over is expected to
+    // start one core.
+    adrp x10, {boot_claim}
+    add x10, x10, :lo12:{boot_claim}
+    mov w11, #0x4F54
+    movk w11, #0x424F, lsl #16      // "BOOT"
+    ldr w12, [x10]
+    cmp w12, w11
+    b.eq 6f
+    str w11, [x10]
 
     // --- K0: PAINT — the very first observable action ----------------------
     // Fill the top 64 lines of all three 16 MiB frame slots inside the
@@ -189,6 +229,153 @@ _start:
     dsb sy
     isb
 
+    // --- FOG: check the placement, relocate only when explicitly enabled --
+    // ABL chooses the placement; the linker chooses the address all absolute
+    // references were built for. The default fog build does NOT copy: a
+    // destination in DRAM is not proof that the bytes are free, and only the
+    // live FDT could prove it. On a mismatch the stub publishes pc/link/delta
+    // and parks before touching anything outside its own image.
+    //
+    // With `fog-reloc` the copy is still fail-closed: header magic, image
+    // size, both span ends, overflow and every overlap are checked first.
+.if FOG_BUILD
+.if FOG_RELOC == 0
+    mov x24, #0                     // 1 = entered at a non-link address
+.endif
+    ldr x13, =__kernel_link_pa
+    cmp x23, x13
+    b.eq .Lfog_at_link
+.if FOG_RELOC
+    // Recognise the ARM64 Image header before trusting any field in it. A
+    // stripped payload, a wrong entry point or a corrupted image must not turn
+    // into a wild copy of an arbitrary length.
+    ldr w15, [x23, #0x38]           // magic at _head + 0x38
+    ldr w16, =0x644D5241            // "ARM\x64" in little-endian memory
+    cmp w15, w16
+    b.ne .Lfog_park
+
+    ldr x14, [x23, #0x10]           // image_size from the ARM64 header
+    cmp x14, #0x1000
+    b.lo .Lfog_park                 // smaller than one page: refuse
+    mov x15, #0x4000000             // 64 MiB upper bound
+    cmp x14, x15
+    b.hs .Lfog_park
+    tst x14, #7
+    b.ne .Lfog_park                 // the copy loop moves 8 bytes at a time
+
+    // The destination is a build-time constant, not a measured fact. Reject
+    // a wild value before the write: page-aligned and inside the mapped first
+    // DRAM gigabyte.
+    tst x13, #0xFFF
+    b.ne .Lfog_park
+
+    // Overflow checks for both spans before any range comparison, so a
+    // wrapped end can never look plausible.
+    adds x15, x23, x14              // x15 = src_end
+    b.cs .Lfog_park
+    adds x16, x13, x14              // x16 = dst_end
+    b.cs .Lfog_park
+
+    // Check BOTH ends of the destination: a valid start whose end leaves the
+    // mapped gigabyte is refused.
+    ldr x17, =0x40000000
+    cmp x13, x17
+    b.lo .Lfog_park
+    ldr x17, =0x80000000
+    cmp x13, x17
+    b.hs .Lfog_park
+    cmp x16, x17
+    b.hi .Lfog_park
+
+    // The source must fit the same mapped window.
+    ldr x17, =0x40000000
+    cmp x23, x17
+    b.lo .Lfog_park
+    ldr x17, =0x80000000
+    cmp x23, x17
+    b.hs .Lfog_park
+    cmp x15, x17
+    b.hi .Lfog_park
+
+    // Only a completely non-overlapping move is allowed. Any overlap can
+    // overwrite the running loop or bytes between the spans that this stub
+    // cannot prove dead. Adjacent spans are accepted.
+    cmp x13, x23
+    b.hs 47f                        // dest > src
+    // dest < src: require dest_end <= src.
+    cmp x16, x23
+    b.hi .Lfog_park
+    b .Lfog_copy
+47: // dest > src: require dest >= src_end.
+    cmp x13, x15
+    b.lo .Lfog_park
+
+.Lfog_copy:
+    // Non-overlapping forward copy. Both directions are covered above.
+    mov x15, #0
+.Lfog_copy_loop:
+    ldr x16, [x23, x15]
+    str x16, [x13, x15]
+    add x15, x15, #8
+    cmp x15, x14
+    b.lo .Lfog_copy_loop
+    // Continue at the same offset inside the copy.
+    adr x15, .Lfog_at_link
+    sub x15, x15, x23
+    add x15, x13, x15
+    br x15
+
+.Lfog_park:
+    wfe
+    b .Lfog_park                   // unsafe relocation: refuse to corrupt memory
+.else
+    mov x24, #1                     // diagnosed and parked after the record
+.endif
+.Lfog_at_link:
+.endif
+
+    // --- Publish the hand-over record for `boot::get()`. -------------------
+    // After relocation the PC is at the link address, so an ordinary
+    // PC-relative symbol reference names the mapped physical address.
+    adrp x3, {boot_params}
+    add x3, x3, :lo12:{boot_params}
+    ldr x4, =0x30315245564C4953     // "SILVER10"
+    str x4, [x3, #0x00]
+    str x23, [x3, #0x08]            // actual_pc
+    str x10, [x3, #0x10]            // CurrentEL at entry
+    str x11, [x3, #0x18]            // SCTLR_EL1 at entry
+    mrs x4, mpidr_el1
+    str x4, [x3, #0x20]
+    str x22, [x3, #0x28]            // dtb_pa from x0
+    ldr x4, =__kernel_link_pa
+    str x4, [x3, #0x30]             // image_base
+    cbz x22, 47f
+    ldr w5, [x22, #4]               // DTB totalsize (big-endian)
+    rev w5, w5
+    str x5, [x3, #0x38]
+    b 48f
+47: str xzr, [x3, #0x38]
+48:
+    adr x5, _head
+    ldr x5, [x5, #0x10]             // image_size (relocated header)
+    str x5, [x3, #0x40]
+    sub x5, x23, x4
+    str x5, [x3, #0x48]             // load_delta (i64)
+
+    // Default fog build, non-link placement: the diagnostics above are now
+    // stored inside this image's own .data, so park before any further memory
+    // is touched. Absolute references would address the link slot, not this
+    // copy, so continuing would execute against the wrong bytes.
+.if FOG_BUILD
+.if FOG_RELOC == 0
+    cbz x24, .Lfog_diag_done
+.Lfog_diag_park:
+    wfe
+    b .Lfog_diag_park
+.Lfog_diag_done:
+.endif
+.endif
+
     // --- K3: RECORD the measurement into both ramoops zones ---------------
     // Live layout (module params + the 4 MiB hole in /proc/iomem):
     // console 0xA2000000..0xA2200000, pmsg 0xA2200000..0xA2400000. Both get a
@@ -217,16 +404,17 @@ _start:
     PROBE 0xA2200000
 .endif
 
-    // --- Kimi steps 2-4: temp stack, image_size, full-image cache flush ----
-    // PC-relative so it survives a load address != link address. The temp
-    // stack sits 2 MiB past _start: beyond the ~1.6 MiB image, inside free
-    // DRAM, away from bss/page tables that get zeroed right after.
+    // --- Kimi steps 2-4: stack, image_size, full-image cache flush ---------
+    // The final kernel stack lives in the image's NOLOAD .stack section,
+    // after .bss; the zeroing loop below therefore never touches it. Reach it
+    // through the low physical alias (the MMU is still off here).
+    ldr x0, =__stack_top
+    ldr x1, =__kernel_virt_base
+    sub x0, x0, x1
+    mov sp, x0
+
     adr x12, _start
-    mov sp, x12
-    movz x13, #0x200
-    lsl x13, x13, #12           // 0x200000
-    add sp, sp, x13
-    ldr x13, [x12, #-0x20]      // image_size @ _head+0x10 = _start-0x20
+    ldr x13, [x12, #-0x30]      // image_size @ _head+0x10 = _start-0x30
     mrs x15, ctr_el0
     ubfx x15, x15, #16, #4
     mov x14, #4
@@ -503,6 +691,10 @@ mini_vectors:
     .endr
 
 mini_handler:
+    // The ramoops marker is only safe on the tablet, where 0xA2040000 is a
+    // known reserved DRAM zone. On fog/QEMU that address is not proven to be
+    // RAM at all, so an early abort must park without touching memory.
+.if RAM_LOG_MARKS
     mrs x8, CurrentEL
     mrs x9, esr_el1
     mrs x10, far_el1
@@ -521,11 +713,14 @@ mini_handler:
     str x11, [x12, #0x60]       // ELR_EL1
     dc cvac, x12
     dsb sy
+.endif
 9:
     wfe
     b 9b
     .size _start, . - _start
-"#
+"#,
+    boot_params = sym crate::boot::BOOT_PARAMS,
+    boot_claim = sym crate::boot::BOOT_CLAIM
 );
 
 #[cfg(all(not(feature = "std"), target_arch = "aarch64"))]
@@ -768,11 +963,28 @@ pub extern "C" fn kernel_main() -> ! {
     // Per-CPU identity first: every scheduler/lock path reads TPIDR_EL1.
     smp::init_cpu(0);
 
+    // Fog: prove the machine from the live FDT before any device is touched.
+    // `probe` only reads; it publishes the platform identity, the UART base
+    // and one FDT-derived frame-allocator window. If the tree is missing or
+    // not a khaje/SM6225 board, nothing is forced and the boot path fails
+    // closed instead of inventing a map.
+    #[cfg(feature = "fog")]
+    let boot_params = boot::get().unwrap_or(boot::BootParams::zero());
+    #[cfg(feature = "fog")]
+    let fog_info = fog::probe(&boot_params);
+    #[cfg(feature = "fog")]
+    if fog_info.valid {
+        memory::set_fog_available(
+            fog_info.memory.start as usize,
+            fog_info.memory.end as usize,
+        );
+    }
+
     // The tablet has no readable UART, so EVERY console/boot_metrics call is
     // compiled out there: a stray write to a QEMU address (PL011 0x09000000,
     // GICv2 0x08000000) would be a bus abort -> QCDUMP before any log. On the
     // tablet the only output channel is the ramoops RAM log.
-    #[cfg(not(feature = "tablet"))]
+    #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     boot_metrics::mark_boot_start();
 
     // The ramoops console zone lives in reserved DRAM; on the tablet it is the
@@ -783,20 +995,36 @@ pub extern "C" fn kernel_main() -> ! {
     mmu::init();
     ram_log::fb_progress(); // entry bar — after mmu::init so the fb is mapped
 
-    let memory_map = memory::current();
-    let available_pages = frame_allocator::init(memory_map.available);
-
-    #[cfg(not(feature = "tablet"))]
+    // Console first: a bad memory map must be *reported* before the
+    // allocator asserts on an empty window.
+    console::init();
+    #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     {
-        console::init();
         console::write_str("PLATFORM=QEMU\r\n");
         console::write_str("MMU=OK\r\n");
         boot_metrics::log_milestone("MMU init");
     }
-    #[cfg(feature = "tablet")]
-    console::init(); // GENI UART at 0x89C000, inside the mapped low gigabyte
+    #[cfg(feature = "fog")]
+    {
+        fog::log_banner(&boot_params, &fog_info);
+        console::write_str("SILVER MMU OK\r\n");
+        if !fog_info.valid || fog_info.memory.is_empty() {
+            console::write_str("SILVER FOG HALT: no proven frame-allocator window\r\n");
+            loop {
+                core::hint::spin_loop();
+            }
+        }
+    }
     ram_log::log("MMU OK");
     ram_log::fb_progress();
+
+    let memory_map = memory::current();
+    if !memory_map.is_valid() || memory_map.available.is_empty() {
+        #[cfg(feature = "fog")]
+        console::write_str("SILVER FOG HALT: invalid memory map\r\n");
+        exceptions::silver_handle_exception(6, 0, 0, 0);
+    }
+    let available_pages = frame_allocator::init(memory_map.available);
 
     if !memory_map.is_valid() || available_pages == 0 || !frame_allocator::run_self_test() {
         exceptions::silver_handle_exception(6, 0, 0, 0);
@@ -809,7 +1037,7 @@ pub extern "C" fn kernel_main() -> ! {
     };
 
     let value = alloc::boxed::Box::new(42_u64);
-    #[cfg(not(feature = "tablet"))]
+    #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     {
         let value_address = (&*value as *const u64) as usize;
         console::write_str("HEAP=OK BASE=");
@@ -825,14 +1053,22 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::fb_progress();
 
     drop(value);
+    #[cfg(feature = "fog")]
+    {
+        console::write_str("SILVER FRAME ALLOCATOR OK\r\nSILVER HEAP OK base=0x");
+        console::write_hex_u64(heap_base as u64);
+        console::write_str("\r\n");
+    }
 
-    // The tablet path shares the QEMU boot sequence from here on: gic::init
-    // dispatches to gicv3, the timer PPI is INTID 30 on both platforms, and
-    // scheduler::init unconditionally unmasks IRQs (daifclr #2).
+    // The tablet/fog path shares the QEMU boot sequence from here on: gic::init
+    // dispatches to gicv3, and the timer PPI is selected per platform (INTID
+    // 30 on SM8650, 18 on SM6225/khaje).
     gic::init();
     timer::init();
-    // BISECT: isolated timer test — unmask IRQs in kernel context, wait for 3 ticks.
-    {
+    // BISECT: isolated timer test — unmask IRQs in kernel context, wait for
+    // ticks only when a redistributor was confirmed. Without one, spinning
+    // for an interrupt that cannot be delivered would just hide the failure.
+    if timer::available() {
         let saved = interrupts::save_and_disable_irq();
         interrupts::enable_irq();
         let mut spin: u32 = 0;
@@ -846,29 +1082,42 @@ pub extern "C" fn kernel_main() -> ! {
         console::write_str(" spins=");
         console::write_dec_u64(spin as u64);
         console::write_str("\r\n");
+    } else {
+        console::write_str("TIMER TEST: SKIP (no confirmed GIC redistributor)\r\n");
     }
     ram_log::log("GICv3+TIMER OK");
     ram_log::fb_progress();
     vfs::init();
     seed::seed();
-    #[cfg(not(feature = "tablet"))]
+    #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     vfs::run_self_test();
     ram_log::log("VFS+SEED OK");
     ram_log::fb_progress();
-    scheduler::init();
 
-    #[cfg(not(feature = "tablet"))]
+    #[cfg(feature = "fog")]
     {
-        console::write_str("IRQ READY\r\n");
-        for &byte in b"HELLO, WORLD!\r\n" {
-            console::write_byte(byte);
-        }
-        boot_metrics::log_milestone("Scheduler start");
-        console::write_str("SCHEDULER START\r\n");
+        console::write_str("SILVER PLATFORM READY\r\n");
+        scheduler::init_fog();
+        console::write_str("SILVER SCHEDULER START\r\n");
+        scheduler::start();
     }
-    ram_log::log("SCHEDULER START - BOOT COMPLETE");
-    ram_log::fb_fill(0, 120, 0); // full green = fully booted
-    scheduler::start();
+    #[cfg(not(feature = "fog"))]
+    {
+        scheduler::init();
+
+        #[cfg(not(feature = "tablet"))]
+        {
+            console::write_str("IRQ READY\r\n");
+            for &byte in b"HELLO, WORLD!\r\n" {
+                console::write_byte(byte);
+            }
+            boot_metrics::log_milestone("Scheduler start");
+            console::write_str("SCHEDULER START\r\n");
+        }
+        ram_log::log("SCHEDULER START - BOOT COMPLETE");
+        ram_log::fb_fill(0, 120, 0); // full green = fully booted
+        scheduler::start();
+    }
 }
 
 #[cfg(not(feature = "std"))]

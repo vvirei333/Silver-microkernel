@@ -663,26 +663,39 @@ pub fn process_api_probe() -> ! {
         syscall::print("SECURITY SPAWN HANDLE DMA DENY=FAIL\r\n");
     }
 
-    // T15-02: the request is all-or-nothing. The handle covers CAP_KILL and
-    // CAP_MMIO, but the parent owns no self-CAP_MMIO, so the mixed delegation
-    // must be rejected as a whole (no partial CAP_MMIO on the recipient).
+    // T15-02: the request is all-or-nothing. Use a long-lived child so the
+    // spawn handle's CAP_KILL cannot be retired by an early exit before these
+    // grants run. The handle covers CAP_KILL and CAP_MMIO, but the parent owns
+    // no self-CAP_MMIO, so the mixed delegation must be rejected as a whole.
     let own = syscall::task_id();
-    let mixed = syscall::cap_grant(cap, own, syscall::CAP_KILL | syscall::CAP_MMIO);
-    if !mixed && syscall::alloc_dma(4096).is_none() {
-        syscall::print("SECURITY MIXED GRANT DENY=PASS\r\n");
+    if let Some(stable_cap) =
+        syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_SLEEP_OVERFLOW)
+    {
+        let mixed = syscall::cap_grant(stable_cap, own, syscall::CAP_KILL | syscall::CAP_MMIO);
+        if !mixed && syscall::alloc_dma(4096).is_none() {
+            syscall::print("SECURITY MIXED GRANT DENY=PASS\r\n");
+        } else {
+            syscall::print("SECURITY MIXED GRANT DENY=FAIL\r\n");
+        }
+        // Same handle, target-scoped bit only: delegation still works.
+        if syscall::cap_grant(stable_cap, own, syscall::CAP_KILL) {
+            syscall::print("SECURITY SCOPED GRANT=PASS\r\n");
+        } else {
+            syscall::print("SECURITY SCOPED GRANT=FAIL\r\n");
+        }
+        // Same handle, global bit only: still denied (handle is not ownership).
+        if !syscall::cap_grant(stable_cap, own, syscall::CAP_MMIO) {
+            syscall::print("SECURITY GLOBAL GRANT DENY=PASS\r\n");
+        } else {
+            syscall::print("SECURITY GLOBAL GRANT DENY=FAIL\r\n");
+        }
+        if let Some(stable) = syscall::cap_get_task_id(stable_cap) {
+            let _ = syscall::kill(stable_cap);
+            let _ = syscall::waitpid(stable);
+        }
     } else {
         syscall::print("SECURITY MIXED GRANT DENY=FAIL\r\n");
-    }
-    // Same handle, target-scoped bit only: delegation still works.
-    if syscall::cap_grant(cap, own, syscall::CAP_KILL) {
-        syscall::print("SECURITY SCOPED GRANT=PASS\r\n");
-    } else {
         syscall::print("SECURITY SCOPED GRANT=FAIL\r\n");
-    }
-    // Same handle, global bit only: still denied (handle is not ownership).
-    if !syscall::cap_grant(cap, own, syscall::CAP_MMIO) {
-        syscall::print("SECURITY GLOBAL GRANT DENY=PASS\r\n");
-    } else {
         syscall::print("SECURITY GLOBAL GRANT DENY=FAIL\r\n");
     }
 
@@ -1206,11 +1219,24 @@ fn vfs_budget_probe() -> bool {
 
 const DMA_TEST_BYTES: usize = 16 * 4096;
 
+/// The parent grants CAP_MMIO just after `SYS_SPAWN`; a timer wakeup can let
+/// the child run before that grant. Retry briefly so the DMA probe tests
+/// zeroing rather than a scheduling race.
+fn dma_alloc_with_retry() -> Option<(u64, u64)> {
+    for _ in 0..100 {
+        if let Some(buffer) = syscall::alloc_dma(DMA_TEST_BYTES as u64) {
+            return Some(buffer);
+        }
+        syscall::sleep(10);
+    }
+    None
+}
+
 /// T17-02 writer: dirties every byte of a freshly allocated DMA run, then
 /// exits so the frames go back to the allocator with the pattern still in
 /// them.
 pub fn dma_writer() -> ! {
-    let Some((virtual_address, _)) = syscall::alloc_dma(DMA_TEST_BYTES as u64) else {
+    let Some((virtual_address, _)) = dma_alloc_with_retry() else {
         syscall::exit_with_status(1)
     };
     let pointer = virtual_address as *mut u8;
@@ -1224,7 +1250,7 @@ pub fn dma_writer() -> ! {
 /// T17-02 reader: whatever DMA run the allocator returns must be zero. Used
 /// after `dma_writer`, so a reused range would expose the pattern.
 pub fn dma_reader() -> ! {
-    let Some((virtual_address, _)) = syscall::alloc_dma(DMA_TEST_BYTES as u64) else {
+    let Some((virtual_address, _)) = dma_alloc_with_retry() else {
         syscall::exit_with_status(1)
     };
     let pointer = virtual_address as *const u8;
@@ -1417,6 +1443,243 @@ pub fn elf_lifecycle_probe() -> ! {
         syscall::print("ELF REAP FRAMES=FAIL\r\n");
     }
 
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+/// Finds a capability slot that targets `task`. Demo-only: the harness
+/// provisions the Scout handle without extending the syscall ABI.
+fn find_cap_for_target(task: u64) -> Option<u64> {
+    for id in 1..64 {
+        if syscall::cap_get_task_id(id) == Some(task) {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// FIX 1: the nameserver probe validates a live round trip, then forces a
+/// controlled Scout death while a lookup is blocked. A full mailbox keeps
+/// Scout blocked in its reply, so the waiter is genuinely inside
+/// `receive_from(Scout)` when the death notification arrives.
+pub fn nameserver_probe() -> ! {
+    // After every normal IPC/permission probe has finished using Scout.
+    syscall::sleep(9_000);
+    const SCOUT_ID: u64 = 1;
+
+    let alive = syscall::register("ns-alive")
+        && syscall::lookup("ns-alive") == Some(syscall::task_id())
+        && syscall::unregister("ns-alive");
+    if alive {
+        syscall::print("NAMESERVER ALIVE=PASS\r\n");
+    } else {
+        syscall::print("NAMESERVER ALIVE=FAIL\r\n");
+    }
+
+    let mut death_ok = false;
+    if let Some(scout_cap) = find_cap_for_target(SCOUT_ID) {
+        if let Some(helper_cap) =
+            syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_NAMESERVER_FILLER)
+        {
+            if let Some(helper) = syscall::cap_get_task_id(helper_cap) {
+                if syscall::cap_grant(scout_cap, helper, syscall::CAP_KILL) {
+                    // The helper fills our 16-slot mailbox, then waits long
+                    // enough for this lookup to block on Scout's reply.
+                    syscall::sleep(300);
+                    let reply = syscall::lookup("ns-during");
+                    death_ok = reply.is_none();
+                }
+                let _ = syscall::waitpid(helper);
+            }
+        }
+    }
+    if death_ok {
+        syscall::print("NAMESERVER WAIT DEATH=PASS\r\n");
+    } else {
+        syscall::print("NAMESERVER WAIT DEATH=FAIL\r\n");
+    }
+
+    syscall::sleep(50);
+    let dead_ok = !syscall::task_alive(SCOUT_ID)
+        && syscall::lookup("ns-after").is_none()
+        && !syscall::register("ns-after");
+    if dead_ok {
+        syscall::print("NAMESERVER DEAD REQUEST=PASS\r\n");
+    } else {
+        syscall::print("NAMESERVER DEAD REQUEST=FAIL\r\n");
+    }
+
+    let mut repeat_ok = true;
+    for _ in 0..3 {
+        if syscall::lookup("ns-after").is_some() {
+            repeat_ok = false;
+        }
+    }
+    if repeat_ok {
+        syscall::print("NAMESERVER REPEAT=PASS\r\n");
+    } else {
+        syscall::print("NAMESERVER REPEAT=FAIL\r\n");
+    }
+
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+/// Fills the parent's mailbox (blocking Scout's reply), then kills Scout via
+/// the capability delegated by the probe.
+pub fn nameserver_filler() -> ! {
+    let parent = syscall::getppid();
+    if parent == 0 {
+        syscall::exit_with_status(1);
+    }
+    for _ in 0..16 {
+        if !syscall::send(parent, &ipc::Message::new(syscall::task_id(), b"FILL")) {
+            syscall::exit_with_status(2);
+        }
+    }
+    syscall::sleep(1_200);
+    let Some(scout_cap) = find_cap_for_target(1) else {
+        syscall::exit_with_status(3)
+    };
+    if !syscall::kill(scout_cap) {
+        syscall::exit_with_status(4);
+    }
+    syscall::exit_with_status(0)
+}
+
+/// FIX 2: W^X for anonymous mappings. RW/RX/R must work; RWX must fail before
+/// any frame or `mmap_regions` entry is created, and the free-frame count must
+/// not drop across the rejected request.
+pub fn mmap_wx_probe() -> ! {
+    syscall::sleep(5_000);
+    const SIZE: usize = 2 * 4096;
+
+    let probe = |prot: u64| -> bool {
+        match syscall::mmap(0, SIZE, prot) {
+            Some(address) => syscall::munmap(address, SIZE),
+            None => false,
+        }
+    };
+    let rw = probe(syscall::PROT_READ | syscall::PROT_WRITE);
+    let rx = probe(syscall::PROT_READ | syscall::PROT_EXEC);
+    let ro = probe(syscall::PROT_READ);
+
+    let before = syscall::memory_info().map(|info| info.free_bytes);
+    let rwx = syscall::mmap(
+        0,
+        SIZE,
+        syscall::PROT_READ | syscall::PROT_WRITE | syscall::PROT_EXEC,
+    );
+    let after = syscall::memory_info().map(|info| info.free_bytes);
+    let rwx_denied = rwx.is_none();
+    let frames_stable = match (before, after) {
+        (Some(before), Some(after)) => after >= before,
+        _ => false,
+    };
+
+    if rw {
+        syscall::print("MMAP RW=PASS\r\n");
+    } else {
+        syscall::print("MMAP RW=FAIL\r\n");
+    }
+    if rx {
+        syscall::print("MMAP RX=PASS\r\n");
+    } else {
+        syscall::print("MMAP RX=FAIL\r\n");
+    }
+    if ro {
+        syscall::print("MMAP R=PASS\r\n");
+    } else {
+        syscall::print("MMAP R=FAIL\r\n");
+    }
+    if rwx_denied {
+        syscall::print("MMAP RWX DENY=PASS\r\n");
+    } else {
+        syscall::print("MMAP RWX DENY=FAIL\r\n");
+    }
+    if rwx_denied && frames_stable {
+        syscall::print("MMAP RWX CLEAN=PASS\r\n");
+    } else {
+        syscall::print("MMAP RWX CLEAN=FAIL\r\n");
+    }
+
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+/// FIX 3: `SYS_FS_READ` must advance the offset only after a successful
+/// copyout. The probe checks normal progress, EFAULT retry, EOF and zero-byte
+/// reads on the same descriptor.
+pub fn fs_read_probe() -> ! {
+    const PATH: &str = "/tmp/fs-read-probe";
+    const CONTENT: &[u8; 16] = b"ABCDEFGHIJKLMNOP";
+
+    syscall::sleep(1_000);
+    let _ = syscall::fs_unlink(PATH);
+    if !syscall::fs_create(PATH) {
+        syscall::print("FS_READ SETUP=FAIL\r\n");
+        loop {
+            syscall::sleep(1000);
+        }
+    }
+    if let Some(fd) = syscall::fs_open(PATH, syscall::OPEN_WRITE) {
+        let wrote = syscall::fs_write(fd, CONTENT).is_some();
+        let _ = syscall::fs_close(fd);
+        if !wrote {
+            syscall::print("FS_READ SETUP=FAIL\r\n");
+        }
+    } else {
+        syscall::print("FS_READ SETUP=FAIL\r\n");
+    }
+
+    // Zero-byte read must not advance the offset.
+    let mut zero_ok = false;
+    if let Some(fd) = syscall::fs_open(PATH, syscall::OPEN_READ) {
+        let mut empty = [0_u8; 0];
+        let mut first = [0_u8; 4];
+        zero_ok = syscall::fs_read(fd, &mut empty) == Some(0)
+            && syscall::fs_read(fd, &mut first) == Some(4)
+            && &first == b"ABCD";
+        let _ = syscall::fs_close(fd);
+    }
+    if zero_ok {
+        syscall::print("FS_READ ZERO=PASS\r\n");
+    } else {
+        syscall::print("FS_READ ZERO=FAIL\r\n");
+    }
+
+    let mut offset_ok = false;
+    let mut eof_ok = false;
+    if let Some(fd) = syscall::fs_open(PATH, syscall::OPEN_READ) {
+        let mut first = [0_u8; 4];
+        let mut retry = [0_u8; 4];
+        let read_first = syscall::fs_read(fd, &mut first) == Some(4) && &first == b"ABCD";
+        // Null pointer: copy_to_user must fail and leave offset at 4.
+        let faulted = syscall::fs_read_raw(fd, 0, 4).is_none();
+        let retried = syscall::fs_read(fd, &mut retry) == Some(4) && &retry == b"EFGH";
+        offset_ok = read_first && faulted && retried;
+
+        let mut rest = [0_u8; 8];
+        let read_rest = syscall::fs_read(fd, &mut rest) == Some(8) && &rest == b"IJKLMNOP";
+        let eof = syscall::fs_read(fd, &mut retry) == Some(0);
+        eof_ok = read_rest && eof;
+        let _ = syscall::fs_close(fd);
+    }
+    if offset_ok {
+        syscall::print("FS_READ OFFSET=PASS\r\n");
+    } else {
+        syscall::print("FS_READ OFFSET=FAIL\r\n");
+    }
+    if eof_ok {
+        syscall::print("FS_READ EOF=PASS\r\n");
+    } else {
+        syscall::print("FS_READ EOF=FAIL\r\n");
+    }
+
+    let _ = syscall::fs_unlink(PATH);
     loop {
         syscall::sleep(1000);
     }

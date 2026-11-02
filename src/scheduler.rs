@@ -331,6 +331,19 @@ pub fn init() {
         }
         let _zombie_probe = spawn_user(user_program::DEMO, 43);
         let _elf_lifecycle_probe = spawn_user(user_program::DEMO, 45);
+        // Nameserver liveness probe: provision a CAP_KILL handle on Scout so a
+        // controlled death can be induced. The probe itself runs after all
+        // normal nameserver users have resolved their peers.
+        if let Some(id) = spawn_user(user_program::DEMO, 46) {
+            if let Some(task) = scheduler_manager()
+                .and_then(|manager| manager.tasks.iter_mut().find(|task| task.id == id))
+            {
+                task.cap_table
+                    .insert(crate::syscall::SCOUT_ID, capability::CAP_KILL);
+            }
+        }
+        let _fs_read_probe = spawn_user(user_program::DEMO, 48);
+        let _mmap_wx_probe = spawn_user(user_program::DEMO, 49);
         // Demo harness: the only task allowed to power the VM off receives
         // CAP_POWER explicitly, matching the trusted graphics driver in a
         // normal boot. Every other demo task stays unprivileged.
@@ -343,7 +356,32 @@ pub fn init() {
         }
     }
 
-    let first_id = 0; // BISECT: boot into idle (EL1 kernel task) first
+    finish_init(0);
+}
+
+/// Fog PoC boot: idle, the nameserver and Howl. No virtio drivers, no
+/// silverd, no disk/network/GPU probes — none of them exist on a bare phone
+/// first boot, and each failed probe would only add delay before the prompt.
+/// Scout must start before Howl because `SYS_REGISTER` resolves the name
+/// through the nameserver.
+#[cfg(feature = "fog")]
+pub fn init_fog() {
+    let slot = scheduler_slot();
+    *slot = Some(TaskManager {
+        tasks: Vec::new(),
+        next_id: 0,
+        console_parent: None,
+    });
+
+    let _idle_id = spawn_kernel(idle_task);
+    let _scout_id = spawn_user(user_program::SCOUT, 0).expect("scout must start on fog");
+    let howl_id = spawn_user(user_program::HOWL, 0).expect("howl must start on fog");
+    let _ = set_console_owner(howl_id);
+
+    finish_init(0);
+}
+
+fn finish_init(first_id: u64) {
     let manager = scheduler_manager().unwrap();
     // Per-CPU "current": the boot CPU starts on the first spawned task; APs
     // begin at no-task and pick one in their own first `schedule`.
@@ -451,7 +489,7 @@ pub fn console_sink_task() -> Option<u64> {
             .tasks
             .iter()
             .find(|task| {
-                !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(crate::gic::UART_IRQ)
+                !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(crate::gic::uart_irq())
             })
             .map(|task| task.id)
     });
@@ -1666,7 +1704,7 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
 }
 
 pub fn bind_irq(intid: u32) -> bool {
-    if intid >= 1020 || intid == crate::gic::TIMER_IRQ {
+    if intid >= 1020 || intid == crate::gic::timer_irq() {
         return false;
     }
     let saved_daif = interrupts::save_and_disable_irq();
@@ -2294,6 +2332,13 @@ impl Task {
     /// Allocates and maps `length` bytes of anonymous memory into a free virtual
     /// range in the task's TTBR0, returning the chosen address.
     fn mmap_anonymous(&mut self, length: usize, prot: u64) -> Option<usize> {
+        // W^X: a single anonymous mapping must never be writable and
+        // executable at the same time. Validate before placement, frame
+        // allocation, PTE publication or `mmap_regions` bookkeeping, so a
+        // rejected request leaves no state behind.
+        if prot & mmu::PROT_WRITE != 0 && prot & mmu::PROT_EXEC != 0 {
+            return None;
+        }
         if self.mmap_regions.len() >= MAX_MMAP_REGIONS {
             return None;
         }

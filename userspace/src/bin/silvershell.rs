@@ -139,7 +139,12 @@ impl HowlerLink {
 }
 
 fn read_input(howler: &mut HowlerLink) -> Option<u8> {
-    let howler_id = howler.resolve()?;
+    let Some(howler_id) = howler.resolve() else {
+        // No userspace UART driver (for example the first Redmi 10C boot,
+        // where only Scout and Howl exist). Howl owns the console, so the
+        // kernel console is a legal non-blocking input source.
+        return syscall::read();
+    };
 
     let mut message = ipc::Message::new(0, &[]);
     while syscall::receive_timeout(&mut message, 0).is_ok() {

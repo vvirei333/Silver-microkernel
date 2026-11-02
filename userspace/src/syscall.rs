@@ -587,14 +587,13 @@ pub fn fs_close(fd: u64) -> bool {
 }
 
 pub fn fs_read(fd: u64, buffer: &mut [u8]) -> Option<usize> {
-    match unsafe {
-        syscall3(
-            SYS_FS_READ,
-            fd,
-            buffer.as_mut_ptr() as u64,
-            buffer.len() as u64,
-        )
-    } {
+    fs_read_raw(fd, buffer.as_mut_ptr() as u64, buffer.len() as u64)
+}
+
+/// Raw `SYS_FS_READ` with an arbitrary user pointer. Test-only: lets a probe
+/// exercise the EFAULT path without creating an invalid Rust slice.
+pub fn fs_read_raw(fd: u64, buffer_ptr: u64, len: u64) -> Option<usize> {
+    match unsafe { syscall3(SYS_FS_READ, fd, buffer_ptr, len) } {
         SYSCALL_ERROR => None,
         count => Some(count as usize),
     }

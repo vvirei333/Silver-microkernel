@@ -10,7 +10,9 @@ fn main() {
     // Link the kernel at the platform's load address: QEMU `virt` places DRAM
     // at 0x4000_0000, the tablet's ABL loads the Image at 0xA800_0000. The
     // linker script also defines `__dram_base` for the boot stub and `mmu.rs`.
-    let linker = if env::var_os("CARGO_FEATURE_TABLET").is_some() {
+    let linker = if env::var_os("CARGO_FEATURE_FOG").is_some() {
+        "linker_fog.ld"
+    } else if env::var_os("CARGO_FEATURE_TABLET").is_some() {
         "linker_tablet.ld"
     } else {
         "linker.ld"

@@ -2,8 +2,17 @@ use core::ptr;
 
 use crate::{exceptions, memory, console, scheduler, timer, platform, gicv3};
 
+/// Non-secure physical timer PPI. QEMU virt and SM8650 use PPI 14 (INTID 30);
+/// SM6225/khaje wires the ARMv8 timer as PPI 2 (INTID 18).
+#[cfg(feature = "fog")]
+pub const TIMER_IRQ: u32 = 18;
+#[cfg(not(feature = "fog"))]
 pub const TIMER_IRQ: u32 = 30;
 /// QEMU virt DTB: PL011 is SPI 1, so its GIC interrupt ID is 32 + 1.
+/// SM6225 SE4 debug UART is SPI 331, so INTID 32 + 331 = 363.
+#[cfg(feature = "fog")]
+pub const UART_IRQ: u32 = 363;
+#[cfg(not(feature = "fog"))]
 pub const UART_IRQ: u32 = 33;
 const SPURIOUS_IRQ: u32 = 1023;
 /// Reschedule inter-processor interrupt (SGI 0). Any CPU that makes a task
@@ -29,9 +38,44 @@ const GICC_IAR: usize = 0x00C;
 const GICC_EOIR: usize = 0x010;
 
 /// Shared distributor setup: runs once on the boot CPU.
+/// INTID of the non-secure physical timer for the active controller.
+pub fn timer_irq() -> u32 {
+    if platform::detect().uses_gicv3() {
+        gicv3::timer_irq()
+    } else {
+        TIMER_IRQ
+    }
+}
+
+/// INTID of the console UART for the active controller.
+pub fn uart_irq() -> u32 {
+    if platform::detect().uses_gicv3() {
+        gicv3::uart_irq()
+    } else {
+        UART_IRQ
+    }
+}
+
+/// Whether the active interrupt controller can actually deliver the timer
+/// PPI. GICv2 is memory-mapped and always usable here; GICv3 depends on
+/// finding this CPU's redistributor by affinity.
+pub fn timer_available() -> bool {
+    if platform::detect().uses_gicv3() {
+        gicv3::timer_available()
+    } else {
+        platform::detect() != platform::Kind::Unknown
+    }
+}
+
 pub fn init() {
-    if platform::detect().is_tablet() {
+    if platform::detect().uses_gicv3() {
         gicv3::init();
+        return;
+    }
+    if platform::detect() == platform::Kind::Unknown {
+        // No proven interrupt controller: leave interrupts masked. The boot
+        // path still reaches its diagnostic halt instead of writing to an
+        // unverified distributor address.
         return;
     }
 
@@ -82,7 +126,7 @@ pub fn init() {
 /// 0-31 are per-CPU in GICv2) and the private CPU interface. Runs on every
 /// CPU, including APs.
 pub fn cpu_init() {
-    if platform::detect().is_tablet() {
+    if platform::detect().uses_gicv3() {
         gicv3::cpu_init();
         return;
     }
@@ -110,7 +154,7 @@ pub fn diag_timer_snapshot() {
     }
     crate::smp::DIAG_SNAP.store_volatile(0, isr as u32);
     crate::smp::DIAG_SNAP.store_volatile(1, cntp_ctl as u32);
-    if platform::detect().is_tablet() {
+    if platform::detect().uses_gicv3() {
         // GICv3 with affinity routing: PPI pending/enable live in the
         // banked GICR of THIS PE (SGI frame), located via GICR_TYPER.
         let (pend, en, ctlr, pmr) = gicv3::diag_redistributor_snapshot();
@@ -139,7 +183,7 @@ pub fn diag_timer_snapshot() {
 /// Signals `intid` (an SGI) to every CPU except the caller.
 /// GICD_SGIR filter 0b01 = "all CPUs except the writer".
 pub fn send_sgi_all_but_self(intid: u32) {
-    if platform::detect().is_tablet() {
+    if platform::detect().uses_gicv3() {
         gicv3::send_sgi_all_but_self(intid);
         return;
     }
@@ -147,7 +191,7 @@ pub fn send_sgi_all_but_self(intid: u32) {
 }
 
 pub fn enable_irq(irq: u32) {
-    if platform::detect().is_tablet() {
+    if platform::detect().uses_gicv3() {
         gicv3::enable_irq(irq);
         return;
     }
@@ -156,7 +200,7 @@ pub fn enable_irq(irq: u32) {
 }
 
 pub fn disable_irq(irq: u32) {
-    if platform::detect().is_tablet() {
+    if platform::detect().uses_gicv3() {
         gicv3::disable_irq(irq);
         return;
     }
@@ -165,14 +209,14 @@ pub fn disable_irq(irq: u32) {
 }
 
 pub fn acknowledge() -> u32 {
-    if platform::detect().is_tablet() {
+    if platform::detect().uses_gicv3() {
         return gicv3::acknowledge();
     }
     read32(CPU_INTERFACE_BASE + GICC_IAR)
 }
 
 pub fn end_interrupt(acknowledge_register: u32) {
-    if platform::detect().is_tablet() {
+    if platform::detect().uses_gicv3() {
         gicv3::end_interrupt(acknowledge_register);
         return;
     }
@@ -181,7 +225,7 @@ pub fn end_interrupt(acknowledge_register: u32) {
 
 #[no_mangle]
 pub extern "C" fn silver_handle_irq() {
-    if platform::detect().is_tablet() {
+    if platform::detect().uses_gicv3() {
         return gicv3::handle_irq();
     }
 

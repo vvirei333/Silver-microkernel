@@ -90,7 +90,9 @@ static CPUS: [PerCpu; MAX_CPUS] = [
 /// single-core for now (its ABL already parks secondaries in the boot stub);
 /// QEMU runs with `-smp 2`.
 pub fn cpu_count() -> usize {
-    if platform::detect().is_tablet() {
+    // Both real-hardware profiles stay single-core for now: the boot stub
+    // parks secondaries and AP bring-up is not implemented. QEMU runs 2.
+    if platform::detect().is_tablet() || platform::detect().is_fog() {
         1
     } else {
         2

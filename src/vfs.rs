@@ -746,7 +746,20 @@ impl Vfs {
         self.open_files.retain(|file| file.owner != owner);
     }
 
-    fn read(&mut self, owner: u64, fd: u64, limit: usize) -> Result<Vec<u8>, ()> {
+    /// Reads at the descriptor's current offset and commits the new offset
+    /// only after `consume` succeeded. A copyout fault or a short/error path
+    /// therefore leaves the descriptor unchanged, so the caller can retry the
+    /// exact same bytes.
+    fn read_with<F>(
+        &mut self,
+        owner: u64,
+        fd: u64,
+        limit: usize,
+        consume: F,
+    ) -> Result<usize, ()>
+    where
+        F: FnOnce(&[u8]) -> Result<(), ()>,
+    {
         let index = self
             .open_files
             .iter()
@@ -756,8 +769,12 @@ impl Vfs {
         let offset = self.open_files[index].offset;
         let (mount, relative) = self.resolve(&path);
         let data = self.mounts[mount].fs.read_at(&relative, offset, limit)?;
-        self.open_files[index].offset = offset + data.len();
-        Ok(data)
+        // The visible side effect (copy_to_user) is part of the transaction:
+        // any failure returns before the offset is touched.
+        consume(&data)?;
+        let new_offset = offset.checked_add(data.len()).ok_or(())?;
+        self.open_files[index].offset = new_offset;
+        Ok(data.len())
     }
 
     fn write(&mut self, owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
@@ -966,8 +983,15 @@ pub fn close_task(owner: u64) {
     interrupts::restore_irq(saved);
 }
 
-pub fn read(owner: u64, fd: u64, limit: usize) -> Result<Vec<u8>, ()> {
-    with_vfs(|vfs| vfs.read(owner, fd, limit))
+/// Transactional read: `consume` (the copyout) runs under the VFS lock and the
+/// descriptor offset advances only when it returns `Ok`. Keeping the check,
+/// copy and offset update in one critical section removes the read/advance
+/// race as well as the EFAULT offset loss.
+pub fn read_with<F>(owner: u64, fd: u64, limit: usize, consume: F) -> Result<usize, ()>
+where
+    F: FnOnce(&[u8]) -> Result<(), ()>,
+{
+    with_vfs(|vfs| vfs.read_with(owner, fd, limit, consume))
 }
 
 pub fn write(owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {

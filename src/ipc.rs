@@ -42,6 +42,9 @@ pub enum SendError {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum ReceiveError {
     Timeout,
+    /// The task whose reply was awaited exited before sending it. Waiting
+    /// forever would hang the caller after the mailbox was destroyed.
+    TargetDead,
 }
 
 struct Mailbox {
@@ -122,11 +125,13 @@ pub fn receive_timeout(timeout_ticks: u64) -> Result<Message, ReceiveError> {
 }
 
 /// Receives only a message from `sender`, preserving unrelated queued messages.
-pub fn receive_from(sender: u64) -> Message {
-    match receive_matching(Some(sender), INFINITE_TIMEOUT) {
-        Ok(message) => message,
-        Err(_) => unreachable!(),
-    }
+///
+/// Returns [`ReceiveError::TargetDead`] when the awaited task is gone. The
+/// check runs before every wait and after every wakeup; `remove_task`
+/// broadcasts on all mailbox queues, so a death cannot be missed between the
+/// liveness check and the actual sleep.
+pub fn receive_from(sender: u64) -> Result<Message, ReceiveError> {
+    receive_matching(Some(sender), INFINITE_TIMEOUT)
 }
 
 fn receive_matching(sender: Option<u64>, timeout_ticks: u64) -> Result<Message, ReceiveError> {
@@ -159,6 +164,15 @@ fn receive_matching(sender: Option<u64>, timeout_ticks: u64) -> Result<Message, 
             return Ok(message);
         }
 
+        // A reply that was already queued above wins over the sender's death.
+        // With no reply pending, a dead awaited sender must fail the operation
+        // instead of sleeping on a mailbox notification it will never get.
+        if let Some(expected) = sender {
+            if !scheduler::task_alive(expected) {
+                return Err(ReceiveError::TargetDead);
+            }
+        }
+
         crate::console::write_str("M5 q=");
         crate::console::write_dec_u64(mailbox.queue.len() as u64);
         crate::console::write_str("\r\n");
@@ -178,14 +192,17 @@ fn receive_matching(sender: Option<u64>, timeout_ticks: u64) -> Result<Message, 
 /// Clears queued messages and wakes every waiter before freeing their queues.
 /// A killed receiver may still be blocked (or stopped) on `not_empty`, so both
 /// sides must detach from the mailbox before it is removed.
+///
+/// Every mailbox is notified, not only the dead owner's: a task blocked in
+/// `receive_from(dead_id)` waits on *its own* mailbox, and this broadcast is
+/// what lets it re-check `task_alive(dead_id)` and return instead of sleeping
+/// forever. Spurious wakeups simply re-check the queue and block again.
 pub fn remove_task(owner: u64) {
     let mut state = IPC.lock();
-    for mailbox in state
-        .mailboxes
-        .iter_mut()
-        .filter(|mailbox| mailbox.owner == owner)
-    {
-        mailbox.queue.clear();
+    for mailbox in &mut state.mailboxes {
+        if mailbox.owner == owner {
+            mailbox.queue.clear();
+        }
         mailbox.not_empty.notify_all();
         mailbox.not_full.notify_all();
     }

@@ -87,11 +87,14 @@ const EXEC_FILE_LIMIT: usize = vfs::MAX_FILE_BYTES;
 /// Upper bound on a versioned spawn-arguments block copied from userspace.
 const SPAWN_ARGS_LIMIT: usize = 4096;
 
-/// Well-known Scout task ID. Demo boot starts Scout directly after idle;
-/// normal boot starts silverd first and lets silverd create Scout second.
-#[cfg(feature = "demo-tasks")]
+/// Well-known Scout task ID.
+///
+/// * demo boot and the fog PoC start Scout directly after idle, so it is 1;
+/// * the normal QEMU boot starts silverd first (id 1) and lets it create
+///   Scout second, so Scout is 2.
+#[cfg(any(feature = "demo-tasks", feature = "fog"))]
 pub const SCOUT_ID: u64 = 1;
-#[cfg(not(feature = "demo-tasks"))]
+#[cfg(all(not(feature = "demo-tasks"), not(feature = "fog")))]
 pub const SCOUT_ID: u64 = 2;
 
 /// Longest name the nameserver protocol carries: payload is 32 bytes, two go
@@ -659,13 +662,23 @@ fn sys_fs_read(fd: u64, buffer_ptr: u64, len: u64) -> u64 {
     if len == 0 {
         return 0;
     }
-    let Ok(bytes) = vfs::read(scheduler::current_task_id(), fd, len as usize) else {
-        return SYSCALL_ERROR;
-    };
-    if !bytes.is_empty() && user_memory::copy_to_user(&bytes, buffer_ptr).is_err() {
-        return SYSCALL_ERROR;
+    // Copyout and offset commit are one VFS transaction: an EFAULT leaves the
+    // descriptor exactly where it was, so the next read retries the same bytes.
+    match vfs::read_with(
+        scheduler::current_task_id(),
+        fd,
+        len as usize,
+        |bytes| {
+            if bytes.is_empty() {
+                Ok(())
+            } else {
+                user_memory::copy_to_user(bytes, buffer_ptr).map_err(|_| ())
+            }
+        },
+    ) {
+        Ok(count) => count as u64,
+        Err(()) => SYSCALL_ERROR,
     }
-    bytes.len() as u64
 }
 
 fn sys_fs_write(fd: u64, buffer_ptr: u64, len: u64) -> u64 {
@@ -903,6 +916,7 @@ fn sys_receive(buffer_ptr: u64, timeout_ticks: u64) -> u64 {
     let message = match ipc::receive_timeout(timeout_ticks) {
         Ok(message) => message,
         Err(ipc::ReceiveError::Timeout) => return SYSCALL_TIMEOUT,
+        Err(ipc::ReceiveError::TargetDead) => return SYSCALL_ERROR,
     };
     let bytes = unsafe {
         core::slice::from_raw_parts(
@@ -931,7 +945,9 @@ fn sys_register_name(name_ptr: u64) -> u64 {
     if ipc::send(SCOUT_ID, request).is_err() {
         return SYSCALL_ERROR;
     }
-    let reply = ipc::receive_from(SCOUT_ID);
+    let Ok(reply) = ipc::receive_from(SCOUT_ID) else {
+        return SYSCALL_ERROR;
+    };
     if reply.text() == &b"OK"[..] {
         0
     } else {
@@ -950,7 +966,9 @@ fn sys_unregister_name(name_ptr: u64) -> u64 {
     if ipc::send(SCOUT_ID, request).is_err() {
         return SYSCALL_ERROR;
     }
-    let reply = ipc::receive_from(SCOUT_ID);
+    let Ok(reply) = ipc::receive_from(SCOUT_ID) else {
+        return SYSCALL_ERROR;
+    };
     if reply.text() == &b"OK"[..] {
         0
     } else {
@@ -969,7 +987,9 @@ fn sys_lookup_name(name_ptr: u64) -> u64 {
     if ipc::send(SCOUT_ID, request).is_err() {
         return SYSCALL_ERROR;
     }
-    let reply = ipc::receive_from(SCOUT_ID);
+    let Ok(reply) = ipc::receive_from(SCOUT_ID) else {
+        return SYSCALL_ERROR;
+    };
     match parse_id_reply(&reply) {
         Some(id) => id,
         None => 0,

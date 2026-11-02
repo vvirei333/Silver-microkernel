@@ -1,31 +1,31 @@
-//! GICv3 interrupt controller for the SM8650 tablet (Lenovo Y700).
+//! GICv3 interrupt controller for the SM8650 tablet and SM6225 Redmi 10C.
 //!
-//! Addresses from the device's live FDT (`tablet/tablet.dts`):
-//! GICD @ 0x1710_0000 (64 KiB), GICR @ 0x1718_0000 with a 0x4_0000 stride per
-//! core. Unlike GICv2 there is no memory-mapped CPU interface: the kernel uses
-//! the `ICC_*` system registers directly. The kernel runs single-core at EL1,
-//! so only the first redistributor (core 0) is touched.
+//! The two SoCs share the architecture but not the addresses:
 //!
-//! Timer: the non-secure physical timer PPI is DTB interrupt 14 → INTID 30.
-//! UART: GENI debug UART SPI 462 → INTID 494. The interrupt is *configured*
-//! (group, priority, level trigger) but not enabled: `geni_uart` is TX-only
-//! polling today, so an enabled line would just raise unhandled IRQs.
+//! | | SM8650 (Y700) | SM6225 (khaje) |
+//! |---|---|---|
+//! | GICD | 0x1710_0000 | 0x0F20_0000 |
+//! | GICR | 0x1718_0000 | 0x0F30_0000 |
+//! | GICR stride | 0x4_0000 | 0x2_0000 |
+//! | timer PPI | 14 → INTID 30 | 2 → INTID 18 |
+//! | UART SPI | 462 → INTID 494 | 331 → INTID 363 |
+//!
+//! Unlike GICv2 there is no memory-mapped CPU interface: the kernel uses the
+//! `ICC_*` system registers directly. The kernel runs single-core at EL1, so
+//! only the boot CPU's redistributor is touched. The UART interrupt is
+//! *configured* but not enabled: the GENI driver polls RX/TX.
 
 use core::ptr;
+use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::{exceptions, memory, scheduler, timer};
+use crate::gicv3_policy::{find_redistributor_index, mpidr_affinity};
+use crate::{exceptions, scheduler, timer};
 
-/// Non-secure physical timer PPI (DTB 14) → GIC INTID 16 + 14.
-pub const TIMER_IRQ: u32 = 30;
-/// GENI SE15 debug UART SPI 462 → GIC INTID 32 + 462.
-pub const UART_IRQ: u32 = 494;
 /// Reschedule SGI, mirrors `gic::RESCHEDULE_IRQ` (the tablet is single-core
 /// today, but the mechanism must stay symmetric).
 pub const RESCHEDULE_IRQ: u32 = 0;
 const SPURIOUS_IRQ: u32 = 1023;
 
-const GICD_BASE: usize = memory::phys_to_virt(0x1710_0000);
-const GICR_BASE: usize = memory::phys_to_virt(0x1718_0000);
 /// The SGI/PPI register frame is the second 64 KiB page of the redistributor
 /// (the first 64 KiB is the RD control frame holding WAKER). The kernel is
 /// single-core, so only the core-0 redistributor (stride 0x40000, core 0) is used.
@@ -43,13 +43,90 @@ const GICR_WAKER: usize = 0x014;
 /// SGI/PPI frame: ISPENDR0 (+0x200) / ISENABLER0 (+0x100) hold the banked
 /// pending/enable state of SGIs and PPIs of the owning PE.
 const GICR_ISPENDR0: usize = 0x200;
-/// Redistributor type register: Aff0 [7:0], Aff1 [15:8], Aff2 [23:16],
-/// Aff3 [39:32]. Redistributor frames are matched to CPUs through this
-/// register, never through the frame index — the frame order does not have
-/// to follow the MPIDR affinity values.
+/// Redistributor type register: the packed affinity (Aff3..Aff0) is in bits
+/// [63:32]; bits [31:0] hold Processor_Number, Last and DirectLPI flags.
+/// Frames are matched to CPUs through this register, never through the frame
+/// index — the frame order does not have to follow the MPIDR values.
 const GICR_TYPER: usize = 0x008;
-const GICR_STRIDE: usize = 0x4_0000;
 const GICR_MAX_PE: usize = 8;
+
+// Runtime configuration. The live FDT is authoritative; these defaults are
+// only used when no tree described a GIC (or for the existing tablet path).
+static GICD_BASE_PA: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static GICR_BASE_PA: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static GICR_STRIDE_RT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0x2_0000);
+static GICR_MAX_PE_RT: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(GICR_MAX_PE);
+static TIMER_IRQ_RT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+static UART_IRQ_RT: core::sync::atomic::AtomicU32 =
+    core::sync::atomic::AtomicU32::new(0);
+/// True only after this boot CPU located its own redistributor and enabled
+/// the timer PPI on it. When false the timer must not arm: an unmatched
+/// distributor cannot deliver the tick, and writing frame 0 would target
+/// another PE's banked state.
+static TIMER_READY: AtomicBool = AtomicBool::new(false);
+
+/// Installs the addresses and INTIDs proved by the live FDT. `stride` is the
+/// `redistributor-stride` property (0x20000 when absent).
+pub fn configure(
+    distributor_pa: usize,
+    redistributor_pa: usize,
+    stride: usize,
+    redistributor_size: usize,
+    timer: u32,
+    uart: u32,
+) {
+    use core::sync::atomic::Ordering;
+    let stride = if stride == 0 { 0x2_0000 } else { stride };
+    GICD_BASE_PA.store(distributor_pa, Ordering::Relaxed);
+    GICR_BASE_PA.store(redistributor_pa, Ordering::Relaxed);
+    GICR_STRIDE_RT.store(stride, Ordering::Relaxed);
+    let frames = if redistributor_size == 0 {
+        GICR_MAX_PE
+    } else {
+        (redistributor_size / stride).min(GICR_MAX_PE)
+    };
+    GICR_MAX_PE_RT.store(frames.max(1), Ordering::Relaxed);
+    TIMER_IRQ_RT.store(timer, Ordering::Relaxed);
+    UART_IRQ_RT.store(uart, Ordering::Relaxed);
+}
+
+fn ensure_configured() {
+    use core::sync::atomic::Ordering;
+    if GICD_BASE_PA.load(Ordering::Relaxed) != 0 {
+        return;
+    }
+    #[cfg(feature = "fog")]
+    configure(0x0F20_0000, 0x0F30_0000, 0x2_0000, 0, 18, 363);
+    #[cfg(not(feature = "fog"))]
+    configure(0x1710_0000, 0x1718_0000, 0x4_0000, 0, 30, 494);
+}
+
+pub fn timer_irq() -> u32 {
+    ensure_configured();
+    TIMER_IRQ_RT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+pub fn uart_irq() -> u32 {
+    ensure_configured();
+    UART_IRQ_RT.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+fn gicd() -> usize {
+    crate::memory::phys_to_virt(GICD_BASE_PA.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+fn gicr() -> usize {
+    crate::memory::phys_to_virt(GICR_BASE_PA.load(core::sync::atomic::Ordering::Relaxed))
+}
+
+fn gicr_stride() -> usize {
+    GICR_STRIDE_RT.load(core::sync::atomic::Ordering::Relaxed)
+}
 const GICR_IGROUPR0: usize = 0x080;
 const GICR_ISENABLER0: usize = 0x100;
 const GICR_IPRIORITYR: usize = 0x400;
@@ -64,16 +141,43 @@ const GICD_CTLR_RWP: u32 = 1 << 31;
 
 /// Shared distributor setup: runs once on the boot CPU.
 pub fn init() {
+    ensure_configured();
+    TIMER_READY.store(false, Ordering::Relaxed);
     configure_uart_spi();
     start_distributor();
     // The boot CPU brings up its own redistributor + interface right away.
-    cpu_init();
+    let ready = cpu_init_inner();
+    TIMER_READY.store(ready, Ordering::Relaxed);
+    if !ready {
+        // The tablet has no accessible UART, so its diagnostic goes to the
+        // ramoops zone. Fog/QEMU have a live console by this point.
+        #[cfg(feature = "tablet")]
+        crate::ram_log::log("GICV3: no redistributor matches this CPU");
+        #[cfg(not(feature = "tablet"))]
+        crate::console::write_str(
+            "GICV3: no redistributor matches this CPU; timer PPI left disabled\r\n",
+        );
+    }
+}
+
+/// Whether the boot CPU's timer PPI was enabled on its own redistributor.
+pub fn timer_available() -> bool {
+    TIMER_READY.load(Ordering::Relaxed)
+}
+
+/// Per-CPU GICv3 bring-up for APs. The boot CPU's global timer state is set
+/// by [`init`]; an AP that cannot find its own frame simply stays without
+/// private interrupts instead of touching frame 0.
+pub fn cpu_init() {
+    let _ = cpu_init_inner();
 }
 
 /// Per-CPU GICv3 bring-up: system-register interface, own redistributor
 /// (located by affinity via GICR_TYPER), banked SGI/PPI enables and the CPU
-/// interface registers. Runs on every CPU, including APs.
-pub fn cpu_init() {
+/// interface registers. Returns false when no redistributor matches, in
+/// which case no redistributor or PPI is touched at all.
+fn cpu_init_inner() -> bool {
+    ensure_configured();
     // System-register interface for the CPU side (ICC_*_EL1), not the
     // legacy MMIO one. `isb` right after, as the spec requires.
     let sre: u64;
@@ -91,8 +195,11 @@ pub fn cpu_init() {
         }
     }
 
-    wake_redistributor();
-    configure_ppi();
+    let Some(redistributor) = redistributor_for_self() else {
+        return false;
+    };
+    wake_redistributor(redistributor);
+    configure_ppi(redistributor);
 
     // CPU interface: full priority mask, EOImode 0 (one write completes the
     // interrupt), Group 1 NS signalling enabled.
@@ -108,35 +215,36 @@ pub fn cpu_init() {
             options(nomem, nostack),
         );
     }
+    true
 }
 
 /// Locates this CPU's redistributor control frame by matching the MPIDR
 /// affinity against GICR_TYPER. The frame index is deliberately not used:
 /// redistributor order does not have to follow MPIDR affinity values.
-fn redistributor_for_self() -> usize {
+///
+/// Returns `None` when no frame matches; there is no frame-0 fallback,
+/// because that frame may belong to another PE and PPI enables are banked.
+fn redistributor_for_self() -> Option<usize> {
     let mpidr: u64;
     unsafe {
         core::arch::asm!("mrs {mpidr}, mpidr_el1", mpidr = out(reg) mpidr, options(nostack));
     }
-    let affinity = mpidr & 0xFF_FF_FF; // Aff0 | Aff1<<8 | Aff2<<16
+    let affinity = mpidr_affinity(mpidr);
 
-    for pe in 0..GICR_MAX_PE {
-        let rd = GICR_BASE + pe * GICR_STRIDE;
-        let typer = read32(rd + GICR_TYPER) as u64 | ((read32(rd + GICR_TYPER + 4) as u64) << 32);
-        if typer & 0xFF_FF_FF == affinity {
-            return rd;
-        }
-    }
-    // No matching redistributor: fall back to frame 0 rather than writing
-    // through a null mapping — the caller's PPI enables then behave exactly
-    // like the pre-SMP single-core code.
-    GICR_BASE
+    let max_pe = GICR_MAX_PE_RT.load(core::sync::atomic::Ordering::Relaxed);
+    let base = gicr();
+    let stride = gicr_stride();
+    find_redistributor_index(affinity, max_pe, |pe| {
+        // GICR_TYPER.LAST stops the search inside the policy helper: reading
+        // past it is an external abort where frames are not populated.
+        read64(base + pe * stride + GICR_TYPER)
+    })
+    .map(|pe| base + pe * stride)
 }
 
 /// Clears GICR_WAKER.ProcessorSleep and waits for the redistributor to come up.
 /// A sleeping redistributor silently drops every interrupt, including the timer.
-fn wake_redistributor() {
-    let rd = redistributor_for_self();
+fn wake_redistributor(rd: usize) {
     let waker = read32(rd + GICR_WAKER);
     write32(rd + GICR_WAKER, waker & !WAKER_PROCESSOR_SLEEP);
     while read32(rd + GICR_WAKER) & WAKER_CHILDREN_ASLEEP != 0 {
@@ -146,9 +254,9 @@ fn wake_redistributor() {
 
 /// SGI/PPI frame of THIS CPU (matched by GICR_TYPER): group 1 non-secure, low
 /// priority for the timer, then enable the timer PPI and the reschedule SGI.
-fn configure_ppi() {
-    let sgi = redistributor_for_self() + GICR_SGI_OFFSET;
-    let timer_bit = 1_u32 << (TIMER_IRQ % 32);
+fn configure_ppi(redistributor: usize) {
+    let sgi = redistributor + GICR_SGI_OFFSET;
+    let timer_bit = 1_u32 << (timer_irq() % 32);
     let sgi_bit = 1_u32 << (RESCHEDULE_IRQ % 32);
 
     let groupr = read32(sgi + GICR_IGROUPR0) | timer_bit | sgi_bit;
@@ -158,7 +266,7 @@ fn configure_ppi() {
     // The NS physical timer asserts its line level-style while
     // CNTP_CTL.IStatus is set, which is what the reset ICFGR0 value
     // describes — no config change needed for a PPI.
-    write8(sgi + GICR_IPRIORITYR + TIMER_IRQ as usize, 0xA0);
+    write8(sgi + GICR_IPRIORITYR + timer_irq() as usize, 0xA0);
     write32(sgi + GICR_ISENABLER0, timer_bit | sgi_bit);
 }
 
@@ -167,10 +275,19 @@ fn configure_ppi() {
 /// Returns (GICR_ISPENDR0 & ppi_bit, GICR_ISENABLER0 & ppi_bit,
 /// ICC_CTLR_EL1, ICC_PMR_EL1).
 pub fn diag_redistributor_snapshot() -> (u32, u32, u32, u32) {
-    let sgi = redistributor_for_self() + GICR_SGI_OFFSET;
-    let ppi_bit = 1_u32 << (TIMER_IRQ % 32);
-    let pend = read32(sgi + GICR_ISPENDR0) & ppi_bit;
-    let en = read32(sgi + GICR_ISENABLER0) & ppi_bit;
+    let ppi_bit = 1_u32 << (timer_irq() % 32);
+    let (pend, en) = match redistributor_for_self() {
+        Some(redistributor) => {
+            let sgi = redistributor + GICR_SGI_OFFSET;
+            (
+                read32(sgi + GICR_ISPENDR0) & ppi_bit,
+                read32(sgi + GICR_ISENABLER0) & ppi_bit,
+            )
+        }
+        // No proven frame: report "not pending, not enabled" without reading
+        // or writing an address that belongs to someone else.
+        None => (0, 0),
+    };
     let ctlr: u64;
     let pmr: u64;
     unsafe {
@@ -198,32 +315,36 @@ pub fn send_sgi_all_but_self(intid: u32) {
 /// Routes and classifies the UART SPI in GICD but does not enable it (see the
 /// module doc): geni_uart is polling TX-only, RX IRQ support comes later.
 fn configure_uart_spi() {
-    let irq = UART_IRQ;
+    let irq = uart_irq();
     let word = 1_u32 << (irq % 32);
     let offset = (irq as usize / 32) * 4;
 
-    write32(GICD_BASE + GICD_IGROUPR + offset, read32(GICD_BASE + GICD_IGROUPR + offset) | word);
-    write32(GICD_BASE + GICD_IGRPMODR + offset, read32(GICD_BASE + GICD_IGRPMODR + offset) & !word);
+    write32(gicd() + GICD_IGROUPR + offset, read32(gicd() + GICD_IGROUPR + offset) | word);
+    write32(gicd() + GICD_IGRPMODR + offset, read32(gicd() + GICD_IGRPMODR + offset) & !word);
     // Level-triggered: clear the two config bits for SPI 462.
     let config_offset = GICD_ICFGR + (irq as usize / 16) * 4;
     let config_shift = (irq as usize % 16) * 2;
     write32(
-        GICD_BASE + config_offset,
-        read32(GICD_BASE + config_offset) & !(0b11_u32 << config_shift),
+        gicd() + config_offset,
+        read32(gicd() + config_offset) & !(0b11_u32 << config_shift),
     );
     let priority_offset = GICD_IPRIORITYR + (irq as usize / 4) * 4;
     let priority_shift = (irq as usize % 4) * 8;
     write32(
-        GICD_BASE + priority_offset,
-        (read32(GICD_BASE + priority_offset) & !(0xFF_u32 << priority_shift))
+        gicd() + priority_offset,
+        (read32(gicd() + priority_offset) & !(0xFF_u32 << priority_shift))
             | (0x80_u32 << priority_shift),
     );
     // Not enabled: the GICD_ICENABLER reset state already has this bit clear.
 }
 
 fn start_distributor() {
-    write32(GICD_BASE + GICD_CTLR, GICD_CTLR_ENABLE_GRP1NS);
-    while read32(GICD_BASE + GICD_CTLR) & GICD_CTLR_RWP != 0 {
+    // Preserve the bits the bootloader programmed (notably ARE_NS, bit 4):
+    // clearing affinity routing by writing a bare 1<<1 makes SPIs undeliverable
+    // on some ABL revisions. Only force EnableGrp1NS on.
+    let control = read32(gicd() + GICD_CTLR);
+    write32(gicd() + GICD_CTLR, control | GICD_CTLR_ENABLE_GRP1NS);
+    while read32(gicd() + GICD_CTLR) & GICD_CTLR_RWP != 0 {
         core::hint::spin_loop();
     }
 }
@@ -231,27 +352,33 @@ fn start_distributor() {
 pub fn enable_irq(irq: u32) {
     if irq < 32 {
         // SGI/PPI frame of THIS CPU (matched via GICR_TYPER): group routing
-        // was set at init, only the enable bit changes per interrupt.
-        let offset = redistributor_for_self() + GICR_SGI_OFFSET + GICD_ISENABLER;
-        write32(offset, 1_u32 << (irq % 32));
+        // was set at init, only the enable bit changes per interrupt. Without
+        // a matching frame, do nothing rather than enable it on frame 0.
+        if let Some(redistributor) = redistributor_for_self() {
+            let offset = redistributor + GICR_SGI_OFFSET + GICD_ISENABLER;
+            write32(offset, 1_u32 << (irq % 32));
+        }
         return;
     }
     let offset = GICD_ISENABLER + (irq as usize / 32) * 4;
-    write32(GICD_BASE + offset, 1_u32 << (irq % 32));
+    write32(gicd() + offset, 1_u32 << (irq % 32));
     // A dynamically enabled SPI also needs Group 1 routing; drivers that bind
     // IRQs at runtime (scheduler::bind_irq) call this after the device is set up.
     let group_offset = GICD_IGROUPR + (irq as usize / 32) * 4;
     write32(
-        GICD_BASE + group_offset,
-        read32(GICD_BASE + group_offset) | 1_u32 << (irq % 32),
+        gicd() + group_offset,
+        read32(gicd() + group_offset) | 1_u32 << (irq % 32),
     );
 }
 
 pub fn disable_irq(irq: u32) {
     let base = if irq < 32 {
-        redistributor_for_self() + GICR_SGI_OFFSET + GICD_ICENABLER
+        match redistributor_for_self() {
+            Some(redistributor) => redistributor + GICR_SGI_OFFSET + GICD_ICENABLER,
+            None => return, // no proven banked frame: nothing to disable
+        }
     } else {
-        GICD_BASE + GICD_ICENABLER
+        gicd() + GICD_ICENABLER
     };
     let offset = base + (irq as usize / 32) * 4;
     write32(offset, 1_u32 << (irq % 32));
@@ -288,12 +415,12 @@ pub fn handle_irq() {
             end_interrupt(acknowledge_register);
             scheduler::schedule();
         }
-        TIMER_IRQ => {
+        SPURIOUS_IRQ => {}
+        _ if irq == timer_irq() => {
             timer::handle_irq();
             end_interrupt(acknowledge_register);
             scheduler::schedule();
         }
-        SPURIOUS_IRQ => {}
         _ => {
             // Probe and wake are one kernel-lock-protected step (see gic.rs).
             let bound = {
@@ -315,6 +442,10 @@ pub fn handle_irq() {
 
 fn read32(address: usize) -> u32 {
     unsafe { ptr::read_volatile(address as *const u32) }
+}
+
+fn read64(address: usize) -> u64 {
+    unsafe { ptr::read_volatile(address as *const u64) }
 }
 
 fn write32(address: usize, value: u32) {

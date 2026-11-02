@@ -577,6 +577,11 @@ pub fn map_user_pages_at(
     if page_count == 0 || virtual_address % GRANULE != 0 || physical_start % GRANULE != 0 {
         return false;
     }
+    // Defense in depth for W^X: reject before any table mutation even if a
+    // future caller forgets the scheduler-level validation.
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return false;
+    }
     // checked_mul: `page_count` is bounded by the callers, but this function
     // must not depend on that for overflow safety.
     let Some(span) = page_count.checked_mul(GRANULE) else {
@@ -1289,7 +1294,9 @@ fn user_data_page(output_address: usize) -> u64 {
 
 /// Anonymous `mmap` page: always readable, writable/executable per `prot`, and
 /// never executable from EL1. Write-only combinations fall back to read-only
-/// (read permission is assumed present for every mapping).
+/// (read permission is assumed present for every mapping). Callers must reject
+/// `PROT_WRITE | PROT_EXEC` before reaching this helper; `map_user_pages_at`
+/// also enforces that W^X rule defensively.
 fn user_anonymous_page(output_address: usize, prot: u64) -> u64 {
     let mut descriptor = descriptor_address(output_address as u64)
         | DESC_PAGE

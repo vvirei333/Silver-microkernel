@@ -23,10 +23,25 @@ impl MemoryRegion {
 }
 
 pub const PAGE_SIZE: usize = 4096;
-#[cfg(not(feature = "tablet"))]
+
+#[cfg(all(feature = "tablet", feature = "fog"))]
+compile_error!("Features 'tablet' and 'fog' are mutually exclusive");
+
+/// QEMU `virt`: one 128 MiB DRAM bank at 0x4000_0000.
+#[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
 pub const DRAM_BASE: usize = 0x4000_0000;
-#[cfg(not(feature = "tablet"))]
+#[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
 pub const DRAM_SIZE: usize = 128 * 1024 * 1024;
+
+/// Redmi 10C (SM6225 "khaje"): DRAM starts at 0x4000_0000. The boot-page
+/// tables map exactly one gigabyte there, which covers the complete first DDR
+/// bank on every fog-family variant (the bank is ~991 MiB). The actual live
+/// map and every reservation are read from the FDT at boot; this constant is
+/// only the *mapped* window, never a claim about free memory.
+#[cfg(feature = "fog")]
+pub const DRAM_BASE: usize = 0x4000_0000;
+#[cfg(feature = "fog")]
+pub const DRAM_SIZE: usize = 0x4000_0000;
 /// Tablet (SM8650): ABL loads the kernel at 0xA800_0000 inside a fragmented
 /// 12 GiB LPDDR5X map. The first DDR region is 2 GiB starting at 0x8000_0000,
 /// so that is what the MMU covers and what DRAM spans here.
@@ -51,6 +66,26 @@ pub const FRAME_ALLOC_START: usize = 0xD620_0000;
 pub const FRAME_ALLOC_END: usize = 0xD800_0000;
 pub const DRAM_END: usize = DRAM_BASE + DRAM_SIZE;
 pub const DRAM: MemoryRegion = MemoryRegion::new(DRAM_BASE, DRAM_END);
+
+/// The frame-allocator window selected from the live FDT. Fog starts with an
+/// empty window: `current()` then reports an invalid map and the boot path
+/// stops instead of handing out an unverified range. `fog::probe` sets it
+/// only after proving the range is RAM and intersects no reservation.
+#[cfg(feature = "fog")]
+static mut FOG_AVAILABLE: (usize, usize) = (0, 0);
+
+#[cfg(feature = "fog")]
+pub fn set_fog_available(start: usize, end: usize) {
+    unsafe {
+        FOG_AVAILABLE = (start, end);
+    }
+}
+
+#[cfg(feature = "fog")]
+pub fn fog_available() -> MemoryRegion {
+    let (start, end) = unsafe { FOG_AVAILABLE };
+    MemoryRegion::new(start, end)
+}
 
 /// Link-time base of the kernel's high-half alias. Physical address `p` is
 /// available to EL1 at `KERNEL_VIRT_BASE + p` through TTBR1_EL1.
@@ -97,7 +132,9 @@ pub fn current() -> MemoryMap {
     // allocator takes the clean System RAM chunk after it instead.
     #[cfg(feature = "tablet")]
     let available = MemoryRegion::new(FRAME_ALLOC_START, FRAME_ALLOC_END);
-    #[cfg(not(feature = "tablet"))]
+    #[cfg(feature = "fog")]
+    let available = fog_available();
+    #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     let available = MemoryRegion::new(kernel_image.end, DRAM.end);
     MemoryMap {
         dram: DRAM,
@@ -111,6 +148,7 @@ impl MemoryMap {
     pub fn is_valid(&self) -> bool {
         !self.kernel_image.is_empty()
             && !self.kernel_stack.is_empty()
+            && !self.available.is_empty()
             && self.dram.contains(self.kernel_image.start)
             && self.kernel_image.end <= self.dram.end
             && self.kernel_stack.start >= self.kernel_image.start
