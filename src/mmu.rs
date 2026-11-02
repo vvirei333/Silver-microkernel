@@ -489,14 +489,17 @@ pub fn create_task_space(
         if user_stack_start != 0 {
             write_entry(l2_user, USER_STACK_L2_INDEX, l3_stack as u64 | DESC_TABLE);
             for index in 0..USER_STACK_PAGES {
-                write_entry(
-                    l3_stack,
-                    index,
-                    user_data_page(user_stack_start + index * GRANULE),
-                );
+                let physical = user_stack_start + index * GRANULE;
+                // The stack is EL0-visible: never expose a recycled frame that
+                // still contains another task's or the kernel's data.
+                zero_page(physical);
+                write_entry(l3_stack, index, user_data_page(physical));
             }
         }
 
+        // The private 4 KiB window is writable and readable from EL0, so it
+        // gets the same guarantee as the stack and heap.
+        zero_page(private_page);
         write_entry(l1_priv, 0, l2_priv as u64 | DESC_TABLE);
         write_entry(l2_priv, 0, l3_priv as u64 | DESC_TABLE);
         write_entry(l3_priv, 0, user_data_page(private_page));
@@ -552,6 +555,10 @@ pub fn unmap_user_heap_page(ttbr0: usize, index: usize) -> Option<usize> {
 /// frames must already be allocated contiguously at `physical_start`; each page
 /// is described with the `prot`-derived permissions (read always, write/execute
 /// per the flags).
+///
+/// Every data frame is cleared **before** its descriptor is published, so a
+/// recycled frame can never leak another task's or the kernel's contents to
+/// EL0. Page-table frames are zeroed separately when allocated.
 ///
 /// All-or-nothing contract: on any failure every partially installed mapping
 /// is unrolled (including page-table frames allocated for this call) before
@@ -628,6 +635,12 @@ pub fn map_user_pages_at(
                 unmap_user_pages_at(ttbr0, virtual_address, done);
                 return false;
             }
+            // Zero before publication: the frame is recycled allocator memory
+            // and becomes EL0-readable the moment the descriptor is written.
+            // A concurrent walk (or the returning task itself) must never be
+            // able to observe leftover data, so the PTE is installed only
+            // after the whole granule has been cleared.
+            zero_page(physical_start + index * GRANULE);
             write_entry(
                 l3,
                 l3_index,

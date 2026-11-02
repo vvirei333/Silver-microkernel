@@ -1,6 +1,9 @@
 use crate::{allocator, ipc, syscall};
 
 const PRIVATE_WINDOW_VA: usize = 0x0000_0080_0000_0000;
+const DEMO_USER_STACK_VA: usize = 0x7FE0_0000;
+const DEMO_MMAP_SIZE: usize = 2 * 1024 * 1024;
+const SECRET_PATTERN: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
 const HIGH_HALF_DRAM: usize = 0xFFFF_0000_4000_0000;
 
 pub fn mutex_holder() -> ! {
@@ -858,6 +861,562 @@ pub fn mount_allowed_probe() -> ! {
     } else {
         syscall::print("MOUNT ALLOW=FAIL\r\n");
     }
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+fn write_secret(pointer: *mut u8, length: usize) {
+    let mut offset = 0;
+    while offset + SECRET_PATTERN.len() <= length {
+        for (index, byte) in SECRET_PATTERN.iter().copied().enumerate() {
+            unsafe { core::ptr::write_volatile(pointer.add(offset + index), byte) };
+        }
+        offset += 64;
+    }
+}
+
+fn contains_secret(pointer: *const u8, length: usize) -> bool {
+    if length < SECRET_PATTERN.len() {
+        return false;
+    }
+    let mut offset = 0;
+    while offset + SECRET_PATTERN.len() <= length {
+        let mut matches = true;
+        for (index, expected) in SECRET_PATTERN.iter().copied().enumerate() {
+            if unsafe { core::ptr::read_volatile(pointer.add(offset + index)) } != expected {
+                matches = false;
+                break;
+            }
+        }
+        if matches {
+            return true;
+        }
+        offset += 1;
+    }
+    false
+}
+
+fn is_zero(pointer: *const u8, length: usize) -> bool {
+    (0..length).all(|index| unsafe { core::ptr::read_volatile(pointer.add(index)) } == 0)
+}
+
+/// Writes a recognizable pattern into every user-visible surface, then exits.
+/// The next task spawned by the supervisor should never see this pattern.
+pub fn secret_writer() -> ! {
+    write_secret(DEMO_USER_STACK_VA as *mut u8, 0x1000);
+    write_secret(PRIVATE_WINDOW_VA as *mut u8, 4096);
+    let Some(mapping) = syscall::mmap(0, DEMO_MMAP_SIZE, syscall::PROT_READ | syscall::PROT_WRITE)
+    else {
+        syscall::exit_with_status(1)
+    };
+    write_secret(mapping as *mut u8, DEMO_MMAP_SIZE);
+    syscall::exit_with_status(7)
+}
+
+/// Freshly spawned after `secret_writer`: verifies zeroed stack/private/mmap
+/// and that no writer pattern survived in recycled frames.
+pub fn secret_reader() -> ! {
+    let mut status = 0u32;
+    if !is_zero(DEMO_USER_STACK_VA as *const u8, 64) {
+        status |= 1 << 0;
+    }
+    if !is_zero(PRIVATE_WINDOW_VA as *const u8, 64) {
+        status |= 1 << 1;
+    }
+    match syscall::mmap(0, DEMO_MMAP_SIZE, syscall::PROT_READ | syscall::PROT_WRITE) {
+        Some(mapping) => {
+            if !is_zero(mapping as *const u8, 64) {
+                status |= 1 << 2;
+            }
+            if contains_secret(mapping as *const u8, DEMO_MMAP_SIZE) {
+                status |= 1 << 5;
+            }
+        }
+        None => status |= (1 << 2) | (1 << 5),
+    }
+    if contains_secret(DEMO_USER_STACK_VA as *const u8, 0x2000) {
+        status |= 1 << 3;
+    }
+    if contains_secret(PRIVATE_WINDOW_VA as *const u8, 4096) {
+        status |= 1 << 4;
+    }
+    syscall::exit_with_status(u64::from(status))
+}
+
+/// C-01 supervisor: runs writer/reader pairs so the reader reuses frames the
+/// writer dirtied, then reports one aggregate result per surface.
+pub fn memory_probe() -> ! {
+    syscall::sleep(600);
+    let mut failures = 0u32;
+    let mut harness_ok = true;
+    for _ in 0..3 {
+        let Some(writer_cap) = syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_SECRET_WRITER)
+        else {
+            harness_ok = false;
+            break;
+        };
+        let Some(writer) = syscall::cap_get_task_id(writer_cap) else {
+            harness_ok = false;
+            break;
+        };
+        if syscall::waitpid(writer) != Some(7) {
+            harness_ok = false;
+        }
+
+        let Some(reader_cap) = syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_SECRET_READER)
+        else {
+            harness_ok = false;
+            break;
+        };
+        let Some(reader) = syscall::cap_get_task_id(reader_cap) else {
+            harness_ok = false;
+            break;
+        };
+        match syscall::waitpid(reader) {
+            Some(status) => failures |= status as u32,
+            None => harness_ok = false,
+        }
+    }
+    if !harness_ok {
+        failures |= 0x3F;
+    }
+    if failures & (1 << 0) == 0 {
+        syscall::print("MEM STACK ZERO=PASS\r\n");
+    } else {
+        syscall::print("MEM STACK ZERO=FAIL\r\n");
+    }
+    if failures & (1 << 1) == 0 {
+        syscall::print("MEM PRIVATE ZERO=PASS\r\n");
+    } else {
+        syscall::print("MEM PRIVATE ZERO=FAIL\r\n");
+    }
+    if failures & (1 << 2) == 0 {
+        syscall::print("MEM MMAP ZERO=PASS\r\n");
+    } else {
+        syscall::print("MEM MMAP ZERO=FAIL\r\n");
+    }
+    if failures & (1 << 3) == 0 {
+        syscall::print("MEM SECRET STACK=PASS\r\n");
+    } else {
+        syscall::print("MEM SECRET STACK=FAIL\r\n");
+    }
+    if failures & (1 << 4) == 0 {
+        syscall::print("MEM SECRET PRIVATE=PASS\r\n");
+    } else {
+        syscall::print("MEM SECRET PRIVATE=FAIL\r\n");
+    }
+    if failures & (1 << 5) == 0 {
+        syscall::print("MEM SECRET MMAP=PASS\r\n");
+    } else {
+        syscall::print("MEM SECRET MMAP=FAIL\r\n");
+    }
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+/// Unprivileged power probe: `SYS_POWER_OFF` must be rejected before PSCI.
+pub fn power_denied_probe() -> ! {
+    syscall::sleep(700);
+    if syscall::power_off_raw() != 0 {
+        syscall::print("POWER DENY=PASS\r\n");
+    } else {
+        syscall::print("POWER DENY=FAIL\r\n");
+    }
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+/// Trusted power probe (CAP_POWER provisioned by the demo harness). A
+/// successful PSCI SYSTEM_OFF does not return, so the attempt line is the
+/// marker and QEMU's clean "Power down" exit is the pass condition.
+pub fn power_trusted_probe() -> ! {
+    syscall::sleep(30_000);
+    syscall::print("POWER ALLOW=ATTEMPT\r\n");
+    let _ = syscall::power_off_raw();
+    syscall::print("POWER ALLOW=FAIL\r\n");
+    syscall::exit_with_status(1)
+}
+
+/// H-02 probe: a file write must fail at the VFS file cap, not exhaust the
+/// 2 MiB kernel heap. The file is removed afterwards.
+pub fn resource_probe() -> ! {
+    syscall::sleep(800);
+    const CHUNK: usize = 1024;
+    const EXPECTED_LIMIT: usize = 512 * 1024;
+    let path = "/tmp/resource-limit";
+    let _ = syscall::fs_unlink(path);
+    if !syscall::fs_create(path) {
+        syscall::print("RESOURCE FILE LIMIT=FAIL\r\n");
+        loop {
+            syscall::sleep(1000);
+        }
+    }
+    let Some(fd) = syscall::fs_open(path, syscall::OPEN_WRITE) else {
+        syscall::print("RESOURCE FILE LIMIT=FAIL\r\n");
+        loop {
+            syscall::sleep(1000);
+        }
+    };
+    let chunk = [0x5A_u8; CHUNK];
+    let mut written = 0usize;
+    let mut limited = false;
+    for _ in 0..600 {
+        match syscall::fs_write(fd, &chunk) {
+            Some(CHUNK) => written += CHUNK,
+            Some(count) => written += count,
+            None => {
+                limited = true;
+                break;
+            }
+        }
+    }
+    let _ = syscall::fs_close(fd);
+    let _ = syscall::fs_unlink(path);
+    if limited && written >= EXPECTED_LIMIT {
+        syscall::print("RESOURCE FILE LIMIT=PASS\r\n");
+    } else {
+        syscall::print("RESOURCE FILE LIMIT=FAIL\r\n");
+    }
+    if vfs_budget_probe() {
+        syscall::print("VFS BUDGET=PASS\r\n");
+    } else {
+        syscall::print("VFS BUDGET=FAIL\r\n");
+    }
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+const VFS_CHUNK: usize = 1024;
+
+/// Writes exactly `total` bytes to a freshly truncated file. Returns false on
+/// any short write, so a budget rejection also fails the setup phase.
+fn write_file_exact(path: &str, total: usize) -> bool {
+    let Some(fd) = syscall::fs_open(path, syscall::OPEN_WRITE) else {
+        return false;
+    };
+    let chunk = [0x5A_u8; VFS_CHUNK];
+    let mut written = 0;
+    while written < total {
+        let count = (total - written).min(VFS_CHUNK);
+        match syscall::fs_write(fd, &chunk[..count]) {
+            Some(done) if done > 0 => written += done,
+            _ => {
+                let _ = syscall::fs_close(fd);
+                return false;
+            }
+        }
+    }
+    let _ = syscall::fs_close(fd);
+    true
+}
+
+/// Continues a file from its current offset until the VFS rejects a write or
+/// `limit` additional bytes were accepted. The fd offset is preserved, so the
+/// caller can free budget and call this again.
+fn append_until_failure(fd: u64, limit: usize) -> usize {
+    let chunk = [0x6B_u8; VFS_CHUNK];
+    let mut written = 0;
+    while written < limit {
+        let count = (limit - written).min(VFS_CHUNK);
+        match syscall::fs_write(fd, &chunk[..count]) {
+            Some(done) if done > 0 => written += done,
+            _ => break,
+        }
+    }
+    written
+}
+
+/// T17-03/T17-04: actual `Vec` capacity is charged to one system-wide budget,
+/// not one budget per mount. A filler plus a full 512 KiB file leaves no room
+/// for the second mount, but removing the first files lets the same fd finish
+/// its 512 KiB file. That proves both the shared limit and that truncate /
+/// unlink return capacity to the budget.
+fn vfs_budget_probe() -> bool {
+    // Filler and A are deliberately not the same logical and physical size:
+    // A is 300 KiB logical but needs a 512 KiB `Vec` allocation. A length-only
+    // accountant would let mount B reach its 512 KiB file cap; charging real
+    // capacity leaves B short until A and the filler are removed.
+    const FILLER_BYTES: usize = 64 * 1024;
+    const FILE_A_BYTES: usize = 300 * 1024;
+    const FILE_B_BYTES: usize = 512 * 1024;
+
+    let filler = "/tmp/vfs-filler";
+    let dir_a = "/tmp/vfs-budget-a";
+    let file_a = "/tmp/vfs-budget-a/file";
+    let dir_b = "/tmp/vfs-budget-b";
+    let file_b = "/tmp/vfs-budget-b/file";
+
+    let _ = syscall::fs_unlink(filler);
+    let _ = syscall::fs_unlink(file_a);
+    let _ = syscall::fs_unlink(file_b);
+    let _ = syscall::fs_umount(dir_a, 0);
+    let _ = syscall::fs_umount(dir_b, 0);
+    let _ = syscall::fs_rmdir(dir_a);
+    let _ = syscall::fs_rmdir(dir_b);
+
+    let mut fd_b = None;
+    let result = (|| -> bool {
+        if !syscall::fs_create(filler) || !write_file_exact(filler, FILLER_BYTES) {
+            return false;
+        }
+        if !syscall::fs_mkdir(dir_a) || !syscall::fs_mount("/", dir_a, "ramfs", 0) {
+            return false;
+        }
+        if !syscall::fs_create(file_a) || !write_file_exact(file_a, FILE_A_BYTES) {
+            return false;
+        }
+        if !syscall::fs_mkdir(dir_b) || !syscall::fs_mount("/", dir_b, "ramfs", 0) {
+            return false;
+        }
+        if !syscall::fs_create(file_b) {
+            return false;
+        }
+        let Some(fd) = syscall::fs_open(file_b, syscall::OPEN_WRITE) else {
+            return false;
+        };
+        fd_b = Some(fd);
+        // The second backend must hit the *shared* budget well before its own
+        // 512 KiB file cap.
+        let before = append_until_failure(fd, FILE_B_BYTES);
+        if before >= FILE_B_BYTES {
+            return false;
+        }
+        if !syscall::fs_unlink(filler) || !syscall::fs_unlink(file_a) {
+            return false;
+        }
+        let after = append_until_failure(fd, FILE_B_BYTES - before);
+        after == FILE_B_BYTES - before
+    })();
+
+    if let Some(fd) = fd_b {
+        let _ = syscall::fs_close(fd);
+    }
+    let _ = syscall::fs_unlink(file_b);
+    let _ = syscall::fs_umount(dir_b, 0);
+    let _ = syscall::fs_umount(dir_a, 0);
+    let _ = syscall::fs_rmdir(dir_b);
+    let _ = syscall::fs_rmdir(dir_a);
+    let _ = syscall::fs_unlink(filler);
+    result
+}
+
+const DMA_TEST_BYTES: usize = 16 * 4096;
+
+/// T17-02 writer: dirties every byte of a freshly allocated DMA run, then
+/// exits so the frames go back to the allocator with the pattern still in
+/// them.
+pub fn dma_writer() -> ! {
+    let Some((virtual_address, _)) = syscall::alloc_dma(DMA_TEST_BYTES as u64) else {
+        syscall::exit_with_status(1)
+    };
+    let pointer = virtual_address as *mut u8;
+    write_secret(pointer, DMA_TEST_BYTES);
+    if !contains_secret(pointer as *const u8, DMA_TEST_BYTES) {
+        syscall::exit_with_status(2)
+    }
+    syscall::exit_with_status(0)
+}
+
+/// T17-02 reader: whatever DMA run the allocator returns must be zero. Used
+/// after `dma_writer`, so a reused range would expose the pattern.
+pub fn dma_reader() -> ! {
+    let Some((virtual_address, _)) = syscall::alloc_dma(DMA_TEST_BYTES as u64) else {
+        syscall::exit_with_status(1)
+    };
+    let pointer = virtual_address as *const u8;
+    if is_zero(pointer, DMA_TEST_BYTES) && !contains_secret(pointer, DMA_TEST_BYTES) {
+        syscall::exit_with_status(0)
+    } else {
+        syscall::exit_with_status(3)
+    }
+}
+
+fn run_dma_child(role: u64) -> Option<u64> {
+    let cap = syscall::spawn(syscall::PROGRAM_DEMO, role)?;
+    let id = syscall::cap_get_task_id(cap)?;
+    if !syscall::cap_grant(cap, id, syscall::CAP_MMIO) {
+        return None;
+    }
+    syscall::waitpid(id)
+}
+
+/// T17-02 and T17-06 probe. The harness grants CAP_MMIO:
+/// * writer/reader pairs exercise recycled DMA frames (zero before mapping);
+/// * then the CapTable is filled to the limit and `map_phys` must fail closed
+///   instead of creating an unbookkept MMIO mapping.
+pub fn mmio_dma_probe() -> ! {
+    syscall::sleep(1400);
+
+    let mut dma_failures = 0u32;
+    for _ in 0..3 {
+        if run_dma_child(crate::ROLE_DMA_WRITER) != Some(0) {
+            dma_failures |= 1;
+        }
+        if run_dma_child(crate::ROLE_DMA_READER) != Some(0) {
+            dma_failures |= 2;
+        }
+    }
+    if dma_failures == 0 {
+        syscall::print("DMA RECYCLED ZERO=PASS\r\n");
+    } else {
+        syscall::print("DMA RECYCLED ZERO=FAIL\r\n");
+    }
+
+    let own = syscall::task_id();
+    let mut filled = 0u32;
+    let mut mapping_denied = false;
+    // A long-lived child keeps the spawn handle's CAP_ALL rights valid while
+    // the parent fills its own table (an immediately exiting child could be
+    // reaped first and the handle reduced to CAP_WAIT).
+    if let Some(child_cap) = syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_SLEEP_OVERFLOW) {
+        for _ in 0..256 {
+            if syscall::cap_grant(child_cap, own, syscall::CAP_KILL) {
+                filled += 1;
+            } else {
+                break;
+            }
+        }
+        // 0x0010_0000 is outside DRAM, so it is a valid MMIO target. With the
+        // table full the syscall must return an error and create no mapping.
+        mapping_denied = syscall::map_phys(0x0010_0000, 0x1000).is_none();
+        if let Some(child) = syscall::cap_get_task_id(child_cap) {
+            let _ = syscall::kill(child_cap);
+            let _ = syscall::waitpid(child);
+        }
+    }
+    syscall::print("MMIO FILLED=");
+    syscall::print_dec_u64(filled as u64);
+    syscall::print("\r\n");
+    if filled > 0 && mapping_denied {
+        syscall::print("MMIO CAPACITY DENY=PASS\r\n");
+    } else {
+        syscall::print("MMIO CAPACITY DENY=FAIL\r\n");
+    }
+
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+pub fn exit_immediate() -> ! {
+    syscall::exit_with_status(0)
+}
+
+/// T17-05 probe: spawn many short-lived children without waiting. Zombie
+/// records are capped independently of active-task slots, so spawning keeps
+/// working; a final child can still be waited for and reports its status.
+pub fn zombie_probe() -> ! {
+    syscall::sleep(1200);
+    const CHILDREN: usize = 70;
+    let mut spawned = 0usize;
+    for index in 0..CHILDREN {
+        if syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_EXIT_IMMEDIATE).is_none() {
+            break;
+        }
+        spawned += 1;
+        // Yield periodically so the children actually run, exit and become
+        // zombies instead of filling the active-task limit.
+        if index % 5 == 4 {
+            syscall::sleep(10);
+        }
+    }
+    syscall::sleep(200);
+
+    let mut final_status = None;
+    if let Some(cap) = syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_EXIT_IMMEDIATE) {
+        if let Some(child) = syscall::cap_get_task_id(cap) {
+            final_status = syscall::waitpid(child);
+        }
+    }
+    if spawned == CHILDREN {
+        syscall::print("ZOMBIE SPAWN=PASS\r\n");
+    } else {
+        syscall::print("ZOMBIE SPAWN=FAIL\r\n");
+    }
+    if final_status == Some(0) {
+        syscall::print("ZOMBIE WAIT=PASS\r\n");
+    } else {
+        syscall::print("ZOMBIE WAIT=FAIL\r\n");
+    }
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+/// T17-07: dynamic ELF ownership. A full parent CapTable makes `spawn_elf`
+/// refuse *after* the image is loaded; the RAII release must return every
+/// image/staging frame. The successful spawn/wait loop then checks that a
+/// normal teardown also returns its frames (free-page count does not drop).
+pub fn elf_lifecycle_probe() -> ! {
+    // Run after the noisy boot probes settle; frame counts are only meaningful
+    // when unrelated spawns are not in flight.
+    syscall::sleep(8_000);
+
+    let mut refusal_ok = false;
+    if let Some(sleeper_cap) =
+        syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_SLEEP_OVERFLOW)
+    {
+        if let Some(sleeper) = syscall::cap_get_task_id(sleeper_cap) {
+            let own = syscall::task_id();
+            for _ in 0..256 {
+                if !syscall::cap_grant(sleeper_cap, own, syscall::CAP_KILL) {
+                    break;
+                }
+            }
+            let free_before = syscall::memory_info().map(|info| info.free_bytes);
+            let denied = syscall::spawn_path("/bin/hello").is_none();
+            let free_after = syscall::memory_info().map(|info| info.free_bytes);
+            refusal_ok = denied
+                && match (free_before, free_after) {
+                    (Some(before), Some(after)) => after >= before,
+                    _ => false,
+                };
+            let _ = syscall::kill(sleeper_cap);
+            let _ = syscall::waitpid(sleeper);
+            // Give reap a chance to retire the CAP_KILL records so the table
+            // has room for the successful spawns below.
+            syscall::sleep(100);
+        }
+    }
+    if refusal_ok {
+        syscall::print("ELF REFUSAL RELEASE=PASS\r\n");
+    } else {
+        syscall::print("ELF REFUSAL RELEASE=FAIL\r\n");
+    }
+
+    let before = syscall::memory_info().map(|info| info.free_bytes);
+    let mut launched = 0u32;
+    for _ in 0..3 {
+        let Some(cap) = syscall::spawn_path("/bin/hello") else {
+            break;
+        };
+        let Some(child) = syscall::cap_get_task_id(cap) else {
+            break;
+        };
+        // `hello` is a long-lived program; kill it so the dynamic image,
+        // stacks and page tables go through the normal teardown/reap path.
+        syscall::sleep(50);
+        if !syscall::kill(cap) || syscall::waitpid(child).is_none() {
+            break;
+        }
+        launched += 1;
+    }
+    syscall::sleep(100);
+    let after = syscall::memory_info().map(|info| info.free_bytes);
+    let frames_stable = match (before, after) {
+        (Some(before), Some(after)) => after >= before,
+        _ => false,
+    };
+    if launched == 3 && frames_stable {
+        syscall::print("ELF REAP FRAMES=PASS\r\n");
+    } else {
+        syscall::print("ELF REAP FRAMES=FAIL\r\n");
+    }
+
     loop {
         syscall::sleep(1000);
     }

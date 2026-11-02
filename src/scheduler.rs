@@ -308,6 +308,39 @@ pub fn init() {
                 task.cap_table.insert(id, capability::CAP_MOUNT);
             }
         }
+        let _memory_probe = spawn_user(user_program::DEMO, 34);
+        let _power_denied_probe = spawn_user(user_program::DEMO, 37);
+        // The resource probe also checks the shared VFS budget, so it needs the
+        // trusted mount right in addition to the normal demo capabilities.
+        if let Some(id) = spawn_user(user_program::DEMO, 39) {
+            if let Some(task) = scheduler_manager()
+                .and_then(|manager| manager.tasks.iter_mut().find(|task| task.id == id))
+            {
+                task.cap_table.insert(id, capability::CAP_MOUNT);
+            }
+        }
+        // MMIO/DMA probe: trusted CAP_MMIO is granted exactly like a device
+        // driver would receive it; the probe delegates it only to its own
+        // short-lived DMA writer/reader children.
+        if let Some(id) = spawn_user(user_program::DEMO, 40) {
+            if let Some(task) = scheduler_manager()
+                .and_then(|manager| manager.tasks.iter_mut().find(|task| task.id == id))
+            {
+                task.cap_table.insert(id, capability::CAP_MMIO);
+            }
+        }
+        let _zombie_probe = spawn_user(user_program::DEMO, 43);
+        let _elf_lifecycle_probe = spawn_user(user_program::DEMO, 45);
+        // Demo harness: the only task allowed to power the VM off receives
+        // CAP_POWER explicitly, matching the trusted graphics driver in a
+        // normal boot. Every other demo task stays unprivileged.
+        if let Some(id) = spawn_user(user_program::DEMO, 38) {
+            if let Some(task) = scheduler_manager()
+                .and_then(|manager| manager.tasks.iter_mut().find(|task| task.id == id))
+            {
+                task.cap_table.insert(id, capability::CAP_POWER);
+            }
+        }
     }
 
     let first_id = 0; // BISECT: boot into idle (EL1 kernel task) first
@@ -524,6 +557,37 @@ pub fn unregister_mutex(state: *mut mutex::MutexState) {
 /// dropped (its status is lost), bounding metadata growth for a parent that
 /// never waits. Executable resources are already released at this point.
 const ZOMBIE_LIMIT: usize = 64;
+
+/// Upper bound on *active* task records (everything except a `Zombie`): a
+/// `Dead` task still owns its stacks and address space until reap, so it
+/// counts. Counting zombies here used to starve spawning permanently: with
+/// `ZOMBIE_LIMIT == MAX_TASKS`, a parent that never waits could fill every
+/// slot with metadata-only zombies and no new task could start.
+pub const MAX_TASKS: usize = 64;
+
+/// Hard bound on the task table, including zombie records. Zombies are capped
+/// separately by [`ZOMBIE_LIMIT`], so this is the worst-case metadata bound
+/// that keeps the kernel heap finite.
+const MAX_TASK_RECORDS: usize = MAX_TASKS + ZOMBIE_LIMIT;
+
+/// True when the scheduler may add another task record: an active slot is
+/// free and the zombie/record metadata budget is not exhausted.
+fn has_task_capacity(manager: &TaskManager) -> bool {
+    if manager.tasks.len() >= MAX_TASK_RECORDS {
+        return false;
+    }
+    manager
+        .tasks
+        .iter()
+        .filter(|task| task.state != TaskState::Zombie)
+        .count()
+        < MAX_TASKS
+}
+
+/// Upper bound on a task's anonymous mappings. The virtual window allows far
+/// more entries than the 128 MiB DRAM can back; this cap bounds the metadata
+/// Vec itself, not just the frames.
+const MAX_MMAP_REGIONS: usize = 128;
 
 pub fn exit_current() -> ! {
     exit_current_with_status(0)
@@ -1358,6 +1422,11 @@ pub fn spawn_user(program: u64, argument: u64) -> Option<u64> {
 }
 
 pub fn spawn_user_with_cap(program: u64, argument: u64) -> Option<capability::CapId> {
+    // The spawn handle needs one CapTable slot. Check before creating the task
+    // so a full table cannot leak a running child without a handle.
+    if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
+        return None;
+    }
     let task_id = spawn_user(program, argument)?;
     let parent = current_task_mut()?;
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
@@ -1370,6 +1439,16 @@ pub fn spawn_user_with_cap(program: u64, argument: u64) -> Option<capability::Ca
 /// dynamically loaded task receives no kernel-granted capabilities by default
 /// — any device rights must be delegated by its parent.
 pub fn spawn_elf(image: LoadedImage, argument: u64) -> Option<capability::CapId> {
+    if scheduler_manager().map_or(true, |manager| !has_task_capacity(manager)) {
+        // Dropping `image` releases its frames (RAII).
+        return None;
+    }
+    // Reserve the parent's handle slot before the child exists; otherwise the
+    // task would run without a capability and the insert would break the
+    // CapTable bound.
+    if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
+        return None;
+    }
     let task_id = spawn_elf_task(image, argument)?;
     let parent = current_task_mut()?;
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
@@ -1377,6 +1456,9 @@ pub fn spawn_elf(image: LoadedImage, argument: u64) -> Option<capability::CapId>
 
 fn spawn_elf_task(image: LoadedImage, argument: u64) -> Option<u64> {
     let manager = scheduler_manager()?;
+    if !has_task_capacity(manager) {
+        return None;
+    }
     let id = manager.next_id;
     let cwd = manager
         .tasks
@@ -1430,7 +1512,7 @@ pub fn capability_task_id_with_rights(cap_id: capability::CapId, rights: u32) ->
 /// Global rights become the recipient's own self-capability; target-scoped
 /// rights stay bound to the original capability's target.
 pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, rights: u32) -> bool {
-    let known = capability::CAP_ALL | capability::CAP_MOUNT;
+    let known = capability::CAP_ALL | capability::CAP_MOUNT | capability::CAP_POWER;
     if rights == 0 || rights & !known != 0 {
         return false;
     }
@@ -1456,15 +1538,21 @@ pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, right
                     task.id == recipient_task_id
                         && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
                 }) {
-                    // Global rights become the recipient's own self-capability;
-                    // target-scoped rights stay bound to the original target.
-                    if global != 0 {
-                        recipient.cap_table.insert(recipient_task_id, global);
+                    // A repeated grant must not grow one task's table without
+                    // limit; the whole request fails if there is no room.
+                    let needed = usize::from(global != 0) + usize::from(scoped != 0);
+                    if recipient.cap_table.has_capacity_for(needed) {
+                        // Global rights become the recipient's own
+                        // self-capability; target-scoped rights stay bound to
+                        // the original target.
+                        if global != 0 {
+                            recipient.cap_table.insert(recipient_task_id, global);
+                        }
+                        if scoped != 0 {
+                            recipient.cap_table.insert(source_target, scoped);
+                        }
+                        granted = true;
                     }
-                    if scoped != 0 {
-                        recipient.cap_table.insert(source_target, scoped);
-                    }
-                    granted = true;
                 }
             }
         }
@@ -1499,6 +1587,13 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
         let task = manager.tasks.get_mut(smp::current_index())?;
         let task_id = task.id;
         if !task.cap_table.has_self_rights(task_id, capability::CAP_MMIO) {
+            return None;
+        }
+        // Capacity is checked before the PTE is installed. The operation is
+        // all-or-nothing: a failed bookkeeping step must not leave an MMIO
+        // mapping that no capability authorises (the old order mapped first
+        // and silently skipped the insert when the table was full).
+        if !task.cap_table.has_capacity() {
             return None;
         }
         let virtual_address = if shared_dma {
@@ -1543,6 +1638,11 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
                 return None;
             }
         };
+        // Every frame in the newly allocated run is recycled allocator memory.
+        // Clear the whole range through the cacheable kernel alias *before*
+        // `map_dma_to_user` publishes it to EL0, then push those lines to the
+        // point of coherency (the mapping helper does the clean) so the device
+        // cannot observe stale bytes either.
         unsafe { core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, mapped_size) };
         console::write_str("DMA: virt addr = ");
         console::write_hex_u64(phys_to_virt(physical) as u64);
@@ -1607,6 +1707,9 @@ pub fn spawn_user_with_args_and_cap(
     argument: u64,
     arguments: Vec<u8>,
 ) -> Option<capability::CapId> {
+    if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
+        return None;
+    }
     let task_id = spawn_user_with_args(program, argument, arguments)?;
     let parent = current_task_mut()?;
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
@@ -1631,6 +1734,9 @@ pub fn spawn_user_with_argv_envp_and_cap(
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
 ) -> Option<capability::CapId> {
+    if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
+        return None;
+    }
     let task_id = spawn_inner(None, Some((program, argument)), Vec::new(), argv, envp)?;
     let parent = current_task_mut()?;
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
@@ -1653,6 +1759,9 @@ fn spawn_inner(
     envp: Vec<Vec<u8>>,
 ) -> Option<u64> {
     let manager = scheduler_manager()?;
+    if !has_task_capacity(manager) {
+        return None;
+    }
     let id = manager.next_id;
     console::write_str("SPAWN: start id=");
     console::write_dec_u64(id);
@@ -2065,9 +2174,12 @@ impl Task {
         match user.map(|(program, _)| program) {
             Some(user_program::SILVERD) => {
                 // System manager: full task/device rights plus the global
-                // mount right. CAP_MOUNT is deliberately NOT part of CAP_ALL,
-                // so spawn handles can never carry it.
-                cap_table.insert(id, capability::CAP_ALL | capability::CAP_MOUNT);
+                // mount and power rights. CAP_MOUNT/CAP_POWER are deliberately
+                // NOT part of CAP_ALL, so spawn handles can never carry them.
+                cap_table.insert(
+                    id,
+                    capability::CAP_ALL | capability::CAP_MOUNT | capability::CAP_POWER,
+                );
             }
             Some(user_program::HOWLER) => {
                 cap_table.insert(id, capability::CAP_MMIO | capability::CAP_IRQ);
@@ -2095,6 +2207,11 @@ impl Task {
             // delegation from the shell would fail.
             Some(user_program::HOWL) => {
                 cap_table.insert(id, capability::CAP_MMIO);
+            }
+            // The graphics driver owns the on-screen Power button; only this
+            // trusted component receives the power privilege.
+            Some(user_program::GPU_DRIVER) => {
+                cap_table.insert(id, capability::CAP_MMIO | capability::CAP_POWER);
             }
             _ => {}
         }
@@ -2177,6 +2294,9 @@ impl Task {
     /// Allocates and maps `length` bytes of anonymous memory into a free virtual
     /// range in the task's TTBR0, returning the chosen address.
     fn mmap_anonymous(&mut self, length: usize, prot: u64) -> Option<usize> {
+        if self.mmap_regions.len() >= MAX_MMAP_REGIONS {
+            return None;
+        }
         // `length` is user-controlled: the pure placement helper bounds the
         // page count against the window and uses checked arithmetic, so an
         // absurd request (e.g. `usize::MAX`) returns None instead of

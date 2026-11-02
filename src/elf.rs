@@ -27,6 +27,7 @@
 
 use alloc::vec;
 use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::{
     frame_allocator,
@@ -197,15 +198,34 @@ pub struct LoadedImage {
     pub page_count: usize,
     /// Per-page permission class, index `0` is `USER_IMAGE_VA`.
     pub kinds: Vec<PageKind>,
+    /// Set by the first [`LoadedImage::release`]; makes teardown idempotent so
+    /// an explicit release plus the RAII `Drop` can never double-free.
+    released: AtomicBool,
 }
 
 impl LoadedImage {
-    /// Returns the physical frames to the allocator. Called by the scheduler
-    /// on task teardown or when a later `create_task_space` step fails.
+    /// Returns the physical frames to the allocator.
+    ///
+    /// Safe to call more than once: only the first call frees the run. The
+    /// scheduler keeps explicit calls for the early `Task::new` failure paths;
+    /// `Drop` is the backstop for any path that simply returns `None` while an
+    /// image is still owned. Once the image is moved into a `Task`, the task's
+    /// teardown owns that single release.
     pub fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
         for index in 0..self.page_count {
             frame_allocator::free_page(self.physical_start + index * PAGE_SIZE);
         }
+    }
+}
+
+impl Drop for LoadedImage {
+    fn drop(&mut self) {
+        // Never leaves the frames behind when a constructor fails early or a
+        // spawn is rejected before ownership reaches a `Task`.
+        self.release();
     }
 }
 
@@ -361,6 +381,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedImage, ElfError> {
         physical_start,
         page_count,
         kinds,
+        released: AtomicBool::new(false),
     })
 }
 

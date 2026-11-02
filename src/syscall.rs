@@ -81,8 +81,9 @@ const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
 const IO_LIMIT: usize = 4096;
 /// Upper bound on a file loaded for execution, so a huge VFS blob cannot be
-/// cloned into kernel memory before `elf::load_elf` rejects its segments.
-const EXEC_FILE_LIMIT: usize = 4 * 1024 * 1024;
+/// cloned into kernel memory before `elf::load_elf` rejects its segments. This
+/// matches the VFS file cap: the heap is only 2 MiB.
+const EXEC_FILE_LIMIT: usize = vfs::MAX_FILE_BYTES;
 /// Upper bound on a versioned spawn-arguments block copied from userspace.
 const SPAWN_ARGS_LIMIT: usize = 4096;
 
@@ -437,6 +438,12 @@ fn sys_spawn_with_argsv(program: u64, argument: u64, block_ptr: u64, block_len: 
 fn sys_spawn_path(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
+        // Length first: `read_file` would otherwise allocate the whole blob
+        // before the limit below could reject it.
+        match vfs::file_len(&cwd, path) {
+            Ok(length) if length <= EXEC_FILE_LIMIT => {}
+            _ => return SYSCALL_ERROR,
+        }
         let Ok(bytes) = vfs::read_file(&cwd, path) else {
             return SYSCALL_ERROR;
         };
@@ -460,6 +467,9 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
 /// and exits; the call never returns. The write is a raw console poke (visible
 /// regardless of console ownership) so the shutdown is observable first.
 fn sys_power_off() -> u64 {
+    if !scheduler::current_task_has_rights(capability::CAP_POWER) {
+        return SYSCALL_ERROR;
+    }
     console::write_str("POWER OFF: PSCI SYSTEM_OFF\r\n");
     #[cfg(feature = "tablet")]
     unsafe {

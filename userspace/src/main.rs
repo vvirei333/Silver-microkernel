@@ -30,6 +30,18 @@ pub const ROLE_PROCESS_API_CHILD: u64 = 30;
 pub const ROLE_MOUNT_DENIED_PROBE: u64 = 31;
 pub const ROLE_MOUNT_ALLOWED_PROBE: u64 = 32;
 pub const ROLE_CONCURRENT_WAITER: u64 = 33;
+pub const ROLE_MEMORY_PROBE: u64 = 34;
+pub const ROLE_SECRET_WRITER: u64 = 35;
+pub const ROLE_SECRET_READER: u64 = 36;
+pub const ROLE_POWER_DENIED_PROBE: u64 = 37;
+pub const ROLE_POWER_TRUSTED_PROBE: u64 = 38;
+pub const ROLE_RESOURCE_PROBE: u64 = 39;
+pub const ROLE_MMIO_DMA_PROBE: u64 = 40;
+pub const ROLE_DMA_WRITER: u64 = 41;
+pub const ROLE_DMA_READER: u64 = 42;
+pub const ROLE_ZOMBIE_PROBE: u64 = 43;
+pub const ROLE_EXIT_IMMEDIATE: u64 = 44;
+pub const ROLE_ELF_LIFECYCLE_PROBE: u64 = 45;
 
 /// The kernel passes one argument in x0. Demo selection no longer depends on
 /// task ID: dynamically spawned copies can choose any role independently.
@@ -68,6 +80,18 @@ pub extern "C" fn _start(argument: u64) -> ! {
         ROLE_MOUNT_DENIED_PROBE => demos::mount_denied_probe(),
         ROLE_MOUNT_ALLOWED_PROBE => demos::mount_allowed_probe(),
         ROLE_CONCURRENT_WAITER => demos::concurrent_waiter(argument),
+        ROLE_MEMORY_PROBE => demos::memory_probe(),
+        ROLE_SECRET_WRITER => demos::secret_writer(),
+        ROLE_SECRET_READER => demos::secret_reader(),
+        ROLE_POWER_DENIED_PROBE => demos::power_denied_probe(),
+        ROLE_POWER_TRUSTED_PROBE => demos::power_trusted_probe(),
+        ROLE_RESOURCE_PROBE => demos::resource_probe(),
+        ROLE_MMIO_DMA_PROBE => demos::mmio_dma_probe(),
+        ROLE_DMA_WRITER => demos::dma_writer(),
+        ROLE_DMA_READER => demos::dma_reader(),
+        ROLE_ZOMBIE_PROBE => demos::zombie_probe(),
+        ROLE_EXIT_IMMEDIATE => demos::exit_immediate(),
+        ROLE_ELF_LIFECYCLE_PROBE => demos::elf_lifecycle_probe(),
         _ => demos::unknown_task(),
     }
 }

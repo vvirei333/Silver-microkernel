@@ -94,6 +94,7 @@ pub const CAP_MMIO: u32 = 1 << 4;
 pub const CAP_IRQ: u32 = 1 << 5;
 pub const CAP_PCI: u32 = 1 << 6;
 pub const CAP_MOUNT: u32 = 1 << 7;
+pub const CAP_POWER: u32 = 1 << 8;
 pub const CAP_KILL: u32 = 1 << 0;
 pub const CAP_WAIT: u32 = 1 << 1;
 pub const OPEN_READ: u64 = 0;
@@ -321,7 +322,13 @@ pub fn stop_console() {
 /// Powers the machine down via PSCI `SYSTEM_OFF`. Does not return on QEMU
 /// `virt`; the kernel issues `smc #0` and QEMU exits ("Power down").
 pub fn power_off() {
-    unsafe { syscall0(SYS_POWER_OFF) };
+    let _ = power_off_raw();
+}
+
+/// Raw `SYS_POWER_OFF` result. Unprivileged callers get `SYSCALL_ERROR`;
+/// a successful call does not return. Test-only helper.
+pub fn power_off_raw() -> u64 {
+    unsafe { syscall0(SYS_POWER_OFF) }
 }
 
 /// Maps `length` bytes of anonymous memory. When `addr` is 0 the kernel chooses

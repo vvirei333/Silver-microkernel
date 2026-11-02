@@ -15,6 +15,7 @@
 
 use alloc::{boxed::Box, string::String, vec::Vec};
 use core::cell::UnsafeCell;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{console, interrupts};
 
@@ -22,6 +23,109 @@ pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_PATH_LEN: usize = 191;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_APPEND: u64 = 2;
+
+/// Hard cap for a single file in the in-memory VFS. The kernel heap is only
+/// 2 MiB; a user-controlled file must never be able to consume an unbounded
+/// share of it. 512 KiB leaves room for the read buffer, ELF image setup and
+/// other kernel allocations.
+pub const MAX_FILE_BYTES: usize = 512 * 1024;
+/// System-wide budget for file payload **capacity**, summed over every RamFs
+/// backend. Accounting the logical length was not enough: `Vec` growth keeps
+/// spare capacity, so several backends could hold far more memory than
+/// `MAX_VFS_BYTES` while all lengths summed below it.
+pub const MAX_VFS_BYTES: usize = 1024 * 1024;
+/// Payload capacity reserved by all live RamFs backends. Kept in one place so
+/// a second mount cannot get a fresh per-backend allowance.
+static VFS_PAYLOAD_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+fn payload_used() -> usize {
+    VFS_PAYLOAD_BYTES.load(Ordering::Acquire)
+}
+
+/// Reserves `delta` more payload bytes if the system-wide budget allows it.
+fn payload_try_grow(delta: usize) -> bool {
+    if delta == 0 {
+        return true;
+    }
+    let mut used = payload_used();
+    loop {
+        let Some(next) = used.checked_add(delta) else {
+            return false;
+        };
+        if next > MAX_VFS_BYTES {
+            return false;
+        }
+        match VFS_PAYLOAD_BYTES.compare_exchange_weak(
+            used,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => used = actual,
+        }
+    }
+}
+
+/// Releases `delta` payload bytes after a file is truncated, removed, or its
+/// backend is dropped.
+fn payload_shrink(delta: usize) {
+    if delta == 0 {
+        return;
+    }
+    let mut used = payload_used();
+    loop {
+        let next = used.saturating_sub(delta);
+        match VFS_PAYLOAD_BYTES.compare_exchange_weak(
+            used,
+            next,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => return,
+            Err(actual) => used = actual,
+        }
+    }
+}
+
+/// Applies a capacity change to the shared budget. Shrinking always succeeds;
+/// growing fails before any caller state is modified when the budget is full.
+fn payload_resize(old_capacity: usize, new_capacity: usize) -> bool {
+    if new_capacity >= old_capacity {
+        payload_try_grow(new_capacity - old_capacity)
+    } else {
+        payload_shrink(old_capacity - new_capacity);
+        true
+    }
+}
+
+/// Capacity to allocate when a file grows to `new_len`. A bounded
+/// power-of-two target keeps reallocation logarithmic while still accounting
+/// the real allocation rather than the logical length.
+fn capacity_target(new_len: usize) -> Option<usize> {
+    if new_len == 0 {
+        return Some(0);
+    }
+    let target = new_len.next_power_of_two().min(MAX_FILE_BYTES);
+    if target < new_len {
+        None
+    } else {
+        Some(target)
+    }
+}
+/// Upper bound on directory entries, so `read_dir` and directory growth stay
+/// bounded regardless of how many files a task creates.
+pub const MAX_DIR_ENTRIES: usize = 256;
+/// Upper bound on nodes in one RamFs backend (files + directories).
+pub const MAX_VFS_NODES: usize = 2048;
+/// Per-task open-handle limit.
+pub const MAX_OPEN_FILES_PER_TASK: usize = 32;
+/// Global open-handle limit across all tasks; each handle also owns a path
+/// String, so per-task limits alone are not enough to bound kernel memory.
+pub const MAX_OPEN_FILES: usize = 128;
+/// Upper bound on the global mount table (SILVERD is the only writer, but the
+/// table itself is kernel memory and should still be finite).
+pub const MAX_MOUNTS: usize = 16;
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -87,6 +191,10 @@ impl Node {
 /// The original in-memory tree, now one backend among potentially many.
 pub struct RamFs {
     root: Node,
+    /// Number of non-root nodes in this backend, used to cap total metadata.
+    nodes: usize,
+    /// Sum of `Vec` capacities of this backend's files (actual payload).
+    bytes: usize,
 }
 
 impl RamFs {
@@ -94,6 +202,8 @@ impl RamFs {
     fn empty() -> Self {
         Self {
             root: Node::directory("/"),
+            nodes: 0,
+            bytes: 0,
         }
     }
 
@@ -105,7 +215,17 @@ impl RamFs {
             children.push(Node::directory("etc"));
             children.push(Node::directory("tmp"));
         }
+        fs.nodes = 3;
         fs
+    }
+}
+
+impl Drop for RamFs {
+    fn drop(&mut self) {
+        // Unmounting drops the backend; its bytes must not stay reserved in
+        // the system-wide budget. `self.bytes` is the sum of capacities that
+        // were actually committed.
+        payload_shrink(self.bytes);
     }
 }
 
@@ -118,14 +238,26 @@ impl FileSystem for RamFs {
         if let Some(existing) = children.iter_mut().find(|node| node.name == name) {
             return match &mut existing.kind {
                 NodeKind::File(data) => {
-                    data.clear();
+                    let old_capacity = data.capacity();
+                    // Drop the allocation, not just the length: retained
+                    // capacity is heap memory and is accounted as payload.
+                    *data = Vec::new();
+                    payload_shrink(old_capacity);
+                    self.bytes = self.bytes.saturating_sub(old_capacity);
                     Ok(())
                 }
                 NodeKind::Directory(_) => Err(()),
             };
         }
 
+        if self.nodes >= MAX_VFS_NODES || children.len() >= MAX_DIR_ENTRIES {
+            return Err(());
+        }
+        if children.try_reserve(1).is_err() {
+            return Err(());
+        }
         children.push(Node::file(name));
+        self.nodes += 1;
         Ok(())
     }
 
@@ -136,7 +268,14 @@ impl FileSystem for RamFs {
         if children.iter().any(|node| node.name == name) {
             return Err(());
         }
+        if self.nodes >= MAX_VFS_NODES || children.len() >= MAX_DIR_ENTRIES {
+            return Err(());
+        }
+        if children.try_reserve(1).is_err() {
+            return Err(());
+        }
         children.push(Node::directory(name));
+        self.nodes += 1;
         Ok(())
     }
 
@@ -151,7 +290,13 @@ impl FileSystem for RamFs {
         if !matches!(children[index].kind, NodeKind::File(_)) {
             return Err(());
         }
-        children.remove(index);
+        let removed = children.remove(index);
+        if let NodeKind::File(data) = removed.kind {
+            let capacity = data.capacity();
+            payload_shrink(capacity);
+            self.bytes = self.bytes.saturating_sub(capacity);
+        }
+        self.nodes = self.nodes.saturating_sub(1);
         Ok(())
     }
 
@@ -168,6 +313,7 @@ impl FileSystem for RamFs {
             _ => return Err(()),
         }
         children.remove(index);
+        self.nodes = self.nodes.saturating_sub(1);
         Ok(())
     }
 
@@ -191,7 +337,14 @@ impl FileSystem for RamFs {
         // every expected error leaves the tree unchanged.
         {
             let children = directory_mut(&mut self.root, destination_parent)?;
-            if children.iter().any(|node| node.name == destination_name) {
+            if children.iter().any(|node| node.name == destination_name)
+                || children.len() >= MAX_DIR_ENTRIES
+            {
+                return Err(());
+            }
+            // Reserve before detaching the source: a failed push after the
+            // removal would lose the node.
+            if children.try_reserve(1).is_err() {
                 return Err(());
             }
         }
@@ -227,6 +380,7 @@ impl FileSystem for RamFs {
         };
         Ok(children
             .iter()
+            .take(MAX_DIR_ENTRIES)
             .map(|node| {
                 let mut entry = DirEntry {
                     name: [0; MAX_NAME_LEN],
@@ -271,14 +425,56 @@ impl FileSystem for RamFs {
         if offset > data.len() {
             return Err(());
         }
-        let remaining = data.len() - offset;
-        if bytes.len() <= remaining {
-            data[offset..offset + bytes.len()].copy_from_slice(bytes);
-        } else {
-            if remaining != 0 {
-                data[offset..].copy_from_slice(&bytes[..remaining]);
+        let Some(new_len) = offset.checked_add(bytes.len()) else {
+            return Err(());
+        };
+        if new_len > MAX_FILE_BYTES {
+            return Err(());
+        }
+        let old_len = data.len();
+        let old_capacity = data.capacity();
+        if new_len > old_capacity {
+            // Growing: build the replacement allocation first, validate the
+            // *actual* capacity against the shared budget, and only then swap.
+            // A full budget leaves the file and both counters untouched.
+            let Some(target) = capacity_target(new_len) else {
+                return Err(());
+            };
+            let mut grown = Vec::new();
+            if grown.try_reserve_exact(target).is_err() {
+                return Err(());
             }
-            data.extend_from_slice(&bytes[remaining..]);
+            let new_capacity = grown.capacity();
+            if !payload_resize(old_capacity, new_capacity) {
+                return Err(());
+            }
+            grown.extend_from_slice(&data[..old_len]);
+            let remaining = old_len - offset;
+            if bytes.len() <= remaining {
+                grown[offset..offset + bytes.len()].copy_from_slice(bytes);
+            } else {
+                if remaining != 0 {
+                    grown[offset..].copy_from_slice(&bytes[..remaining]);
+                }
+                grown.extend_from_slice(&bytes[remaining..]);
+            }
+            *data = grown;
+            self.bytes = self
+                .bytes
+                .saturating_sub(old_capacity)
+                .saturating_add(new_capacity);
+        } else {
+            // The write fits in already-accounted capacity: no allocation and
+            // therefore no budget change.
+            let remaining = old_len - offset;
+            if bytes.len() <= remaining {
+                data[offset..offset + bytes.len()].copy_from_slice(bytes);
+            } else {
+                if remaining != 0 {
+                    data[offset..].copy_from_slice(&bytes[..remaining]);
+                }
+                data.extend_from_slice(&bytes[remaining..]);
+            }
         }
         Ok((bytes.len(), offset + bytes.len()))
     }
@@ -292,24 +488,59 @@ impl FileSystem for RamFs {
     }
 
     fn seed_file(&mut self, path: &str, contents: &[u8]) -> Result<(), ()> {
+        if contents.len() > MAX_FILE_BYTES {
+            return Err(());
+        }
         let components = rel_components(path)?;
         let (&name, parent) = components.split_last().ok_or(())?;
         let children = directory_mut(&mut self.root, parent)?;
         if let Some(existing) = children.iter_mut().find(|node| node.name == name) {
             return match &mut existing.kind {
                 NodeKind::File(data) => {
-                    data.clear();
-                    data.extend_from_slice(contents);
+                    let old_capacity = data.capacity();
+                    let mut replacement = Vec::new();
+                    if !contents.is_empty()
+                        && replacement.try_reserve_exact(contents.len()).is_err()
+                    {
+                        return Err(());
+                    }
+                    let new_capacity = replacement.capacity();
+                    if !payload_resize(old_capacity, new_capacity) {
+                        return Err(());
+                    }
+                    replacement.extend_from_slice(contents);
+                    *data = replacement;
+                    self.bytes = self
+                        .bytes
+                        .saturating_sub(old_capacity)
+                        .saturating_add(new_capacity);
                     Ok(())
                 }
                 NodeKind::Directory(_) => Err(()),
             };
         }
+        if self.nodes >= MAX_VFS_NODES || children.len() >= MAX_DIR_ENTRIES {
+            return Err(());
+        }
+        if children.try_reserve(1).is_err() {
+            return Err(());
+        }
         let mut node = Node::file(name);
-        if let NodeKind::File(data) = &mut node.kind {
-            data.extend_from_slice(contents);
+        let mut data = Vec::new();
+        if !contents.is_empty() && data.try_reserve_exact(contents.len()).is_err() {
+            return Err(());
+        }
+        let capacity = data.capacity();
+        if !payload_resize(0, capacity) {
+            return Err(());
+        }
+        data.extend_from_slice(contents);
+        if let NodeKind::File(slot) = &mut node.kind {
+            *slot = data;
         }
         children.push(node);
+        self.nodes += 1;
+        self.bytes = self.bytes.saturating_add(capacity);
         Ok(())
     }
 }
@@ -471,6 +702,17 @@ impl Vfs {
             0
         };
 
+        if self
+            .open_files
+            .iter()
+            .filter(|file| file.owner == owner)
+            .count()
+            >= MAX_OPEN_FILES_PER_TASK
+            || self.open_files.len() >= MAX_OPEN_FILES
+        {
+            return Err(());
+        }
+
         let mut fd = 3_u64;
         while self
             .open_files
@@ -555,11 +797,26 @@ impl Vfs {
     }
 
     /// Returns the entire contents of a file, resolved by path. Used by the
-    /// dynamic ELF loader, which needs the whole image in one buffer.
+    /// dynamic ELF loader, which needs the whole image in one buffer. The
+    /// length is checked before the read so an oversized file cannot force an
+    /// unbounded allocation.
     fn read_file(&self, cwd: &str, path: &str) -> Result<Vec<u8>, ()> {
         let resolved = resolve_path(cwd, path)?;
         let (mount, relative) = self.resolve(&resolved);
-        self.mounts[mount].fs.read_at(&relative, 0, usize::MAX)
+        if self.mounts[mount].fs.len(&relative)? > MAX_FILE_BYTES {
+            return Err(());
+        }
+        self.mounts[mount]
+            .fs
+            .read_at(&relative, 0, MAX_FILE_BYTES)
+    }
+
+    /// Length lookup used by the syscall layer to reject an oversized `run`
+    /// target before any file data is copied into kernel memory.
+    fn file_len(&self, cwd: &str, path: &str) -> Result<usize, ()> {
+        let resolved = resolve_path(cwd, path)?;
+        let (mount, relative) = self.resolve(&resolved);
+        self.mounts[mount].fs.len(&relative)
     }
 
     /// Creates (or overwrites) a file at `path` with `contents`. Bootstrap-only:
@@ -586,6 +843,9 @@ impl Vfs {
         in_use: impl FnOnce(&str) -> bool,
     ) -> Result<(), ()> {
         if flags != 0 || fstype != "ramfs" {
+            return Err(());
+        }
+        if self.mounts.len() >= MAX_MOUNTS {
             return Err(());
         }
         let point = resolve_path(cwd, target)?;
@@ -718,9 +978,16 @@ pub fn read_dir(cwd: &str, path: &str) -> Result<Vec<DirEntry>, ()> {
     with_vfs(|vfs| vfs.read_dir(cwd, path))
 }
 
-/// Reads a whole file by path (dynamic ELF loader).
+/// Reads a whole file by path (dynamic ELF loader). Rejects files larger than
+/// [`MAX_FILE_BYTES`] before allocating the read buffer.
 pub fn read_file(cwd: &str, path: &str) -> Result<Vec<u8>, ()> {
     with_vfs(|vfs| vfs.read_file(cwd, path))
+}
+
+/// Returns a file's length without reading it. Used to reject an oversized
+/// `SYS_SPAWN_PATH` target before kernel memory is allocated.
+pub fn file_len(cwd: &str, path: &str) -> Result<usize, ()> {
+    with_vfs(|vfs| vfs.file_len(cwd, path))
 }
 
 /// Seeds a bootstrap file into the tree (initramfs-style, boot-time only).

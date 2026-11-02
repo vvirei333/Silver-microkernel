@@ -13,6 +13,10 @@ pub const CAP_PCI: u32 = 1 << 6;
 /// `SYS_UMOUNT`). Deliberately kept out of [`CAP_ALL`]: spawn handles carry
 /// `CAP_ALL`, and a handle over a child must never become an own privilege.
 pub const CAP_MOUNT: u32 = 1 << 7;
+/// Global system privilege: power the machine off via PSCI `SYSTEM_OFF`.
+/// Deliberately kept out of [`CAP_ALL`]; only trusted components (SILVERD,
+/// the graphics driver and explicitly provisioned probes) hold it.
+pub const CAP_POWER: u32 = 1 << 8;
 
 /// Rights that describe authority over a specific `target_task`. They are
 /// only meaningful together with a target and are checked with
@@ -22,10 +26,15 @@ pub const CAP_TARGET_BITS: u32 = CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_R
 /// Rights that describe a process-wide/system privilege of the holder. Such a
 /// right is held only by a self-capability (`target_task == own id`), never by
 /// a handle on another task.
-pub const CAP_GLOBAL_BITS: u32 = CAP_MMIO | CAP_IRQ | CAP_PCI | CAP_MOUNT;
+pub const CAP_GLOBAL_BITS: u32 = CAP_MMIO | CAP_IRQ | CAP_PCI | CAP_MOUNT | CAP_POWER;
 
 pub const CAP_ALL: u32 =
     CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME | CAP_MMIO | CAP_IRQ | CAP_PCI;
+
+/// Upper bound on capability records in one task. Spawn handles alone need up
+/// to `MAX_TASKS` entries in a parent; repeated `SYS_CAP_GRANT` must not grow
+/// the table without limit.
+pub const MAX_CAPS_PER_TASK: usize = 96;
 
 pub struct Cap {
     pub id: CapId,
@@ -55,6 +64,18 @@ impl CapTable {
             rights,
         });
         id
+    }
+
+    /// True while the table can accept another record. Callers that can be
+    /// driven by an EL0 loop (`SYS_CAP_GRANT`) must check this first.
+    pub fn has_capacity(&self) -> bool {
+        self.caps.len() < MAX_CAPS_PER_TASK
+    }
+
+    /// True when `count` more records fit. A mixed global|scoped grant adds
+    /// two records, so a single-slot check is not enough.
+    pub fn has_capacity_for(&self, count: usize) -> bool {
+        self.caps.len().saturating_add(count) <= MAX_CAPS_PER_TASK
     }
 
     pub fn get(&self, id: CapId) -> Option<&Cap> {
