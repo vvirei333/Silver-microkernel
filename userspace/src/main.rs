@@ -27,6 +27,9 @@ pub const ROLE_SECURITY_PROBE: u64 = 27;
 pub const ROLE_SLEEP_OVERFLOW: u64 = 28;
 pub const ROLE_PROCESS_API_PROBE: u64 = 29;
 pub const ROLE_PROCESS_API_CHILD: u64 = 30;
+pub const ROLE_MOUNT_DENIED_PROBE: u64 = 31;
+pub const ROLE_MOUNT_ALLOWED_PROBE: u64 = 32;
+pub const ROLE_CONCURRENT_WAITER: u64 = 33;
 
 /// The kernel passes one argument in x0. Demo selection no longer depends on
 /// task ID: dynamically spawned copies can choose any role independently.
@@ -62,6 +65,9 @@ pub extern "C" fn _start(argument: u64) -> ! {
         ROLE_SLEEP_OVERFLOW => demos::sleep_overflow(),
         ROLE_PROCESS_API_PROBE => demos::process_api_probe(),
         ROLE_PROCESS_API_CHILD => demos::process_api_child(),
+        ROLE_MOUNT_DENIED_PROBE => demos::mount_denied_probe(),
+        ROLE_MOUNT_ALLOWED_PROBE => demos::mount_allowed_probe(),
+        ROLE_CONCURRENT_WAITER => demos::concurrent_waiter(argument),
         _ => demos::unknown_task(),
     }
 }

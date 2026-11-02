@@ -9,6 +9,21 @@ pub const CAP_RESUME: u32 = 1 << 3;
 pub const CAP_MMIO: u32 = 1 << 4;
 pub const CAP_IRQ: u32 = 1 << 5;
 pub const CAP_PCI: u32 = 1 << 6;
+/// Global system privilege: change the kernel mount table (`SYS_MOUNT` /
+/// `SYS_UMOUNT`). Deliberately kept out of [`CAP_ALL`]: spawn handles carry
+/// `CAP_ALL`, and a handle over a child must never become an own privilege.
+pub const CAP_MOUNT: u32 = 1 << 7;
+
+/// Rights that describe authority over a specific `target_task`. They are
+/// only meaningful together with a target and are checked with
+/// [`CapTable::has_target_rights`] / [`CapTable::grant`].
+pub const CAP_TARGET_BITS: u32 = CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME;
+
+/// Rights that describe a process-wide/system privilege of the holder. Such a
+/// right is held only by a self-capability (`target_task == own id`), never by
+/// a handle on another task.
+pub const CAP_GLOBAL_BITS: u32 = CAP_MMIO | CAP_IRQ | CAP_PCI | CAP_MOUNT;
+
 pub const CAP_ALL: u32 =
     CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME | CAP_MMIO | CAP_IRQ | CAP_PCI;
 
@@ -54,10 +69,14 @@ impl CapTable {
         Some((cap.target_task, rights_mask))
     }
 
-    pub fn has_rights(&self, rights_mask: u32) -> bool {
-        self.caps
-            .iter()
-            .any(|cap| cap.rights & rights_mask == rights_mask)
+    /// Own privileges of `owner`: only capabilities whose target is the task
+    /// itself count. A spawn handle (`target_task == child`) or a delegated
+    /// handle on some other task is authority *over that target*, not a
+    /// process-wide privilege of the holder.
+    pub fn has_self_rights(&self, owner: u64, rights_mask: u32) -> bool {
+        self.caps.iter().any(|cap| {
+            cap.target_task == owner && cap.rights & rights_mask == rights_mask
+        })
     }
 
     /// True when a capability for `target_task` carries at least `rights_mask`.

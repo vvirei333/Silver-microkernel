@@ -297,6 +297,17 @@ pub fn init() {
         }
         let _security_probe = spawn_user(user_program::DEMO, 27);
         let _process_api_probe = spawn_user(user_program::DEMO, 29);
+        let _mount_denied_probe = spawn_user(user_program::DEMO, 31);
+        // Demo harness: provision the privileged mount probe exactly like the
+        // system manager in a normal boot. Only this probe receives CAP_MOUNT;
+        // every other demo task stays unprivileged.
+        if let Some(id) = spawn_user(user_program::DEMO, 32) {
+            if let Some(task) = scheduler_manager()
+                .and_then(|manager| manager.tasks.iter_mut().find(|task| task.id == id))
+            {
+                task.cap_table.insert(id, capability::CAP_MOUNT);
+            }
+        }
     }
 
     let first_id = 0; // BISECT: boot into idle (EL1 kernel task) first
@@ -631,25 +642,61 @@ pub enum WaitEvent {
 }
 
 pub fn wait_for_task(id: u64) -> Option<u64> {
-    match wait_inner(id, false) {
+    match wait_inner(id, false, true) {
         Some(WaitEvent::Exited(status)) => Some(status),
         _ => None,
     }
 }
 
 pub fn wait_for_task_event(id: u64) -> Option<WaitEvent> {
-    wait_inner(id, true)
+    wait_inner(id, true, true)
 }
 
-/// PID-based wait (`SYS_WAITPID`). The target must be a child of the caller
-/// or covered by a `CAP_WAIT` capability; a foreign PID is reported as ECHILD
-/// by the syscall layer exactly like a consumed zombie, so existence does not
-/// leak.
-pub fn wait_for_pid(id: u64) -> Option<u64> {
+/// First phase of a transactional `SYS_WAITPID`: block until `id` is a zombie
+/// and return its exit status **without consuming the record**.
+///
+/// The target must be a child of the caller or covered by a target-scoped
+/// `CAP_WAIT`; a foreign PID is reported as ECHILD exactly like a consumed
+/// zombie, so existence does not leak.
+///
+/// The caller (the syscall layer) must hold the kernel lock on return, copy the
+/// status to user memory, and then call [`consume_zombie`] in the same
+/// non-blocking critical section. No `schedule`/BKL release may happen in
+/// between; otherwise another waiter could consume the same zombie.
+pub fn wait_status_for_pid(id: u64) -> Option<u64> {
     if id == IDLE_TASK_ID || id == current_task_id() || !current_task_can_wait(id) {
         return None;
     }
-    wait_for_task(id)
+    match wait_inner(id, false, false) {
+        Some(WaitEvent::Exited(status)) => Some(status),
+        _ => None,
+    }
+}
+
+/// Second phase of a transactional `SYS_WAITPID`: consume the zombie that was
+/// peeked by [`wait_status_for_pid`].
+///
+/// Re-validates pid, state and status so a stale peek can never remove a
+/// different task or report a mismatched status. Runs with interrupts masked and
+/// the kernel lock held; it never blocks.
+pub fn consume_zombie(id: u64, expected_status: u64) -> bool {
+    // The transaction contract: peek and consume must be one BKL-protected
+    // step so no other waiter can slip in between. This is a no-op in release.
+    smp::bkl_assert_held();
+    let saved_daif = interrupts::save_and_disable_irq();
+    let consumed = scheduler_manager()
+        .and_then(|manager| {
+            let index = manager.tasks.iter().position(|task| {
+                task.id == id
+                    && task.state == TaskState::Zombie
+                    && task.exit_status.unwrap_or(0) == expected_status
+            })?;
+            take_zombie(manager, index);
+            Some(())
+        })
+        .is_some();
+    interrupts::restore_irq(saved_daif);
+    consumed
 }
 
 fn current_task_can_wait(id: u64) -> bool {
@@ -675,7 +722,7 @@ fn current_task_can_wait(id: u64) -> bool {
         .unwrap_or(false)
 }
 
-fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
+fn wait_inner(id: u64, report_stopped: bool, consume: bool) -> Option<WaitEvent> {
     if id == IDLE_TASK_ID || id == current_task_id() {
         return None;
     }
@@ -694,16 +741,14 @@ fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
         };
         match manager.tasks[index].state {
             TaskState::Zombie => {
-                let status = manager.tasks[index].exit_status.unwrap_or(0);
-                // Removing the zombie shifts every index after it; snapshot
-                // the CPU current-task IDs first and remap afterwards.
-                let cpu_ids = snapshot_current_ids(manager);
-                let live_id = manager.tasks.get(smp::current_index()).map(|task| task.id);
-                manager.tasks.remove(index);
-                remap_current_indices(manager, &cpu_ids, live_id);
-                if let Some(current) = manager.tasks.get_mut(smp::current_index()) {
-                    current.cap_table.remove_for_target(id);
+                if !consume {
+                    // Transactional peek: report the status but keep the
+                    // zombie available until the caller has copied it out.
+                    let status = manager.tasks[index].exit_status.unwrap_or(0);
+                    interrupts::restore_irq(saved_daif);
+                    return Some(WaitEvent::Exited(status));
                 }
+                let status = take_zombie(manager, index);
                 interrupts::restore_irq(saved_daif);
                 return Some(WaitEvent::Exited(status));
             }
@@ -726,6 +771,28 @@ fn wait_inner(id: u64, report_stopped: bool) -> Option<WaitEvent> {
             task.waiting_on = None;
         }
     }
+}
+
+/// Removes the zombie at `index` from the task table and returns its status.
+///
+/// Removal shifts every later index, so the current-task IDs of all online
+/// CPUs are snapshotted first and remapped afterwards. Capability records that
+/// target the dead task are dropped from the caller's table.
+fn take_zombie(manager: &mut TaskManager, index: usize) -> u64 {
+    let id = manager.tasks[index].id;
+    debug_assert!(
+        manager.tasks[index].running_on.is_none(),
+        "removing a zombie that is still running on a CPU"
+    );
+    let status = manager.tasks[index].exit_status.unwrap_or(0);
+    let cpu_ids = snapshot_current_ids(manager);
+    let live_id = manager.tasks.get(smp::current_index()).map(|task| task.id);
+    manager.tasks.remove(index);
+    remap_current_indices(manager, &cpu_ids, live_id);
+    if let Some(current) = manager.tasks.get_mut(smp::current_index()) {
+        current.cap_table.remove_for_target(id);
+    }
+    status
 }
 
 /// Moves every child of `dead_id` to the live reaper. Safe at any point: the
@@ -1351,23 +1418,54 @@ pub fn capability_task_id_with_rights(cap_id: capability::CapId, rights: u32) ->
     Some(cap.target_task)
 }
 
+/// Delegates `rights` from the caller's `cap_id` to `recipient_task_id`.
+///
+/// The request is all-or-nothing. The source capability must cover every
+/// requested bit, and a request that mixes global bits (`CAP_MMIO`, `CAP_IRQ`,
+/// `CAP_PCI`, `CAP_MOUNT`) with target-scoped bits is rejected entirely when
+/// the caller does not own *all* of the requested global bits itself. Nothing
+/// is partially applied: a spawn handle over a child can pass on `CAP_KILL`,
+/// but a `CAP_KILL | CAP_MMIO` request through that handle grants neither.
+///
+/// Global rights become the recipient's own self-capability; target-scoped
+/// rights stay bound to the original capability's target.
 pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, rights: u32) -> bool {
+    let known = capability::CAP_ALL | capability::CAP_MOUNT;
+    if rights == 0 || rights & !known != 0 {
+        return false;
+    }
+    let caller_id = current_task_id();
     let saved_daif = interrupts::save_and_disable_irq();
     let mut granted = false;
-    if let Some((target_task, rights)) =
+    if let Some((source_target, _)) =
         current_task_mut().and_then(|task| task.cap_table.grant(cap_id, rights))
     {
-        if let Some(manager) = scheduler_manager() {
-            if let Some(recipient) = manager
-                .tasks
-                .iter_mut()
-                .find(|task| {
+        let global = rights & capability::CAP_GLOBAL_BITS;
+        let scoped = rights & capability::CAP_TARGET_BITS;
+        // A process-wide right may only be delegated by a task that owns it
+        // itself. A spawn handle over a child covers CAP_ALL bits but is not
+        // an own privilege of the parent, so it cannot pass device/mount
+        // rights on.
+        let owns_global = global == 0
+            || current_task_mut()
+                .map(|task| task.cap_table.has_self_rights(caller_id, global))
+                .unwrap_or(false);
+        if owns_global {
+            if let Some(manager) = scheduler_manager() {
+                if let Some(recipient) = manager.tasks.iter_mut().find(|task| {
                     task.id == recipient_task_id
                         && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
-                })
-            {
-                recipient.cap_table.insert(target_task, rights);
-                granted = true;
+                }) {
+                    // Global rights become the recipient's own self-capability;
+                    // target-scoped rights stay bound to the original target.
+                    if global != 0 {
+                        recipient.cap_table.insert(recipient_task_id, global);
+                    }
+                    if scoped != 0 {
+                        recipient.cap_table.insert(source_target, scoped);
+                    }
+                    granted = true;
+                }
             }
         }
     }
@@ -1377,7 +1475,10 @@ pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, right
 
 pub fn current_task_has_rights(rights: u32) -> bool {
     current_task_mut()
-        .map(|task| task.cap_table.has_rights(rights))
+        .map(|task| {
+            let id = task.id;
+            task.cap_table.has_self_rights(id, rights)
+        })
         .unwrap_or(false)
 }
 
@@ -1396,7 +1497,8 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
             })
         });
         let task = manager.tasks.get_mut(smp::current_index())?;
-        if !task.cap_table.has_rights(capability::CAP_MMIO) {
+        let task_id = task.id;
+        if !task.cap_table.has_self_rights(task_id, capability::CAP_MMIO) {
             return None;
         }
         let virtual_address = if shared_dma {
@@ -1421,7 +1523,8 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
     let saved_daif = interrupts::save_and_disable_irq();
     let result = scheduler_manager().and_then(|manager| {
         let task = manager.tasks.get_mut(smp::current_index())?;
-        if !task.cap_table.has_rights(capability::CAP_MMIO) {
+        let task_id = task.id;
+        if !task.cap_table.has_self_rights(task_id, capability::CAP_MMIO) {
             console::write_str("DMA: FAIL - no CAP_MMIO rights\r\n");
             return None;
         }
@@ -1473,7 +1576,10 @@ pub fn bind_irq(intid: u32) -> bool {
             let Some(current) = manager.tasks.get(current_index) else {
                 return false;
             };
-            if !current.cap_table.has_rights(capability::CAP_IRQ) {
+            if !current
+                .cap_table
+                .has_self_rights(current.id, capability::CAP_IRQ)
+            {
                 return false;
             }
             if manager.tasks.iter().enumerate().any(|(index, task)| {
@@ -1958,7 +2064,10 @@ impl Task {
         let mut cap_table = capability::CapTable::new();
         match user.map(|(program, _)| program) {
             Some(user_program::SILVERD) => {
-                cap_table.insert(id, capability::CAP_ALL); // <--- ДОБАВЛЕНО
+                // System manager: full task/device rights plus the global
+                // mount right. CAP_MOUNT is deliberately NOT part of CAP_ALL,
+                // so spawn handles can never carry it.
+                cap_table.insert(id, capability::CAP_ALL | capability::CAP_MOUNT);
             }
             Some(user_program::HOWLER) => {
                 cap_table.insert(id, capability::CAP_MMIO | capability::CAP_IRQ);

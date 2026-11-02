@@ -283,6 +283,11 @@ static READ_ONLY_MESSAGE: ipc::Message = ipc::Message {
     payload: [0; ipc::PAYLOAD_SIZE],
 };
 
+/// Marker written into a waitpid status buffer before the call. A waiter that
+/// loses the race must still see this value afterwards, proving ECHILD did not
+/// leak a status into its memory.
+const WAIT_SENTINEL: u64 = 0xA5A5_A5A5_A5A5_A5A5;
+
 pub fn copyout_probe() -> ! {
     let read_only = &READ_ONLY_MESSAGE as *const ipc::Message as *mut ipc::Message;
     if unsafe { syscall::receive_raw(read_only) } {
@@ -639,6 +644,57 @@ pub fn process_api_probe() -> ! {
         }
     };
 
+    // The CAP_ALL spawn handle authorises operations *on the child*; it must
+    // not become an own device/mount privilege of the parent.
+    let _ = syscall::fs_mkdir("/tmp/proc-handle");
+    let mount_leak = syscall::fs_mount("/", "/tmp/proc-handle", "ramfs", 0);
+    let _ = syscall::fs_rmdir("/tmp/proc-handle");
+    if mount_leak {
+        syscall::print("SECURITY SPAWN HANDLE MOUNT DENY=FAIL\r\n");
+    } else {
+        syscall::print("SECURITY SPAWN HANDLE MOUNT DENY=PASS\r\n");
+    }
+    if syscall::alloc_dma(4096).is_none() {
+        syscall::print("SECURITY SPAWN HANDLE DMA DENY=PASS\r\n");
+    } else {
+        syscall::print("SECURITY SPAWN HANDLE DMA DENY=FAIL\r\n");
+    }
+
+    // T15-02: the request is all-or-nothing. The handle covers CAP_KILL and
+    // CAP_MMIO, but the parent owns no self-CAP_MMIO, so the mixed delegation
+    // must be rejected as a whole (no partial CAP_MMIO on the recipient).
+    let own = syscall::task_id();
+    let mixed = syscall::cap_grant(cap, own, syscall::CAP_KILL | syscall::CAP_MMIO);
+    if !mixed && syscall::alloc_dma(4096).is_none() {
+        syscall::print("SECURITY MIXED GRANT DENY=PASS\r\n");
+    } else {
+        syscall::print("SECURITY MIXED GRANT DENY=FAIL\r\n");
+    }
+    // Same handle, target-scoped bit only: delegation still works.
+    if syscall::cap_grant(cap, own, syscall::CAP_KILL) {
+        syscall::print("SECURITY SCOPED GRANT=PASS\r\n");
+    } else {
+        syscall::print("SECURITY SCOPED GRANT=FAIL\r\n");
+    }
+    // Same handle, global bit only: still denied (handle is not ownership).
+    if !syscall::cap_grant(cap, own, syscall::CAP_MMIO) {
+        syscall::print("SECURITY GLOBAL GRANT DENY=PASS\r\n");
+    } else {
+        syscall::print("SECURITY GLOBAL GRANT DENY=FAIL\r\n");
+    }
+
+    // A failing copyout must leave the zombie available for a retry.
+    if syscall::waitpid_raw(child, 0x40) != 0 {
+        syscall::print("PROC WAITPID EFAULT=PASS\r\n");
+    } else {
+        syscall::print("PROC WAITPID EFAULT=FAIL\r\n");
+    }
+    let read_only = &READ_ONLY_MESSAGE as *const ipc::Message as u64;
+    if syscall::waitpid_raw(child, read_only) != 0 {
+        syscall::print("PROC WAITPID READONLY=PASS\r\n");
+    } else {
+        syscall::print("PROC WAITPID READONLY=FAIL\r\n");
+    }
     match syscall::waitpid(child) {
         Some(7) => syscall::print("PROC WAITPID STATUS=PASS\r\n"),
         _ => syscall::print("PROC WAITPID STATUS=FAIL\r\n"),
@@ -647,12 +703,110 @@ pub fn process_api_probe() -> ! {
         None => syscall::print("PROC REPEAT ECHILD=PASS\r\n"),
         Some(_) => syscall::print("PROC REPEAT ECHILD=FAIL\r\n"),
     }
+
+    // status_ptr == 0 keeps the "consume without copyout" semantics.
+    if let Some(cap2) = syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_PROCESS_API_CHILD) {
+        if let Some(child2) = syscall::cap_get_task_id(cap2) {
+            if syscall::waitpid_raw(child2, 0) == 0 {
+                syscall::print("PROC WAITPID NULL=PASS\r\n");
+            } else {
+                syscall::print("PROC WAITPID NULL=FAIL\r\n");
+            }
+            match syscall::waitpid(child2) {
+                None => syscall::print("PROC WAITPID NULL ECHILD=PASS\r\n"),
+                Some(_) => syscall::print("PROC WAITPID NULL ECHILD=FAIL\r\n"),
+            }
+        }
+    }
+
+    concurrent_wait_probe();
+
     // PID 1 (Scout in demo boot) is neither our child nor covered by a
     // capability; a foreign wait must be denied without blocking.
     match syscall::waitpid(1) {
         None => syscall::print("PROC FOREIGN DENY=PASS\r\n"),
         Some(_) => syscall::print("PROC FOREIGN DENY=FAIL\r\n"),
     }
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+/// Two waiters race for one zombie: exactly one must get the status, the
+/// other must see ECHILD *and* keep its status buffer untouched. The second
+/// waiter is authorised through an explicit CAP_WAIT delegation on the target
+/// child (target-scoped capability). Both sides use a sentinel-initialised
+/// buffer so a failed consume cannot silently write a status.
+fn concurrent_wait_probe() {
+    let Some(waiter_cap) = syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_CONCURRENT_WAITER) else {
+        syscall::print("PROC CONCURRENT WAIT=FAIL\r\n");
+        return;
+    };
+    let Some(waiter) = syscall::cap_get_task_id(waiter_cap) else {
+        syscall::print("PROC CONCURRENT WAIT=FAIL\r\n");
+        return;
+    };
+    let Some(child_cap) = syscall::spawn(syscall::PROGRAM_DEMO, crate::ROLE_PROCESS_API_CHILD) else {
+        syscall::print("PROC CONCURRENT WAIT=FAIL\r\n");
+        return;
+    };
+    let Some(child) = syscall::cap_get_task_id(child_cap) else {
+        syscall::print("PROC CONCURRENT WAIT=FAIL\r\n");
+        return;
+    };
+    if !syscall::cap_grant(child_cap, waiter, syscall::CAP_WAIT) {
+        syscall::print("PROC CONCURRENT WAIT=FAIL\r\n");
+        return;
+    }
+    // Hand the target PID to the waiter; it blocks in receive until now, so
+    // the CAP_WAIT grant above is already in place when it starts waiting.
+    let mut go = ipc::Message::new(0, b"");
+    go.payload[..8].copy_from_slice(&child.to_le_bytes());
+    if !syscall::send(waiter, &go) {
+        syscall::print("PROC CONCURRENT WAIT=FAIL\r\n");
+        return;
+    }
+    let mut parent_status = WAIT_SENTINEL;
+    let parent_result = syscall::waitpid_raw(child, &mut parent_status as *mut u64 as u64);
+    let mut reply = ipc::Message::new(0, b"");
+    let (waiter_won, waiter_lost_clean) = match syscall::receive_timeout(&mut reply, 500) {
+        Ok(()) if reply.sender == waiter => (reply.payload[0] == 1, reply.payload[1] == 1),
+        _ => {
+            syscall::print("PROC CONCURRENT WAIT=FAIL\r\n");
+            return;
+        }
+    };
+    let parent_won = parent_result == 0 && parent_status == 7;
+    let parent_lost_clean = parent_result != 0 && parent_status == WAIT_SENTINEL;
+    let exactly_one_won = parent_won ^ waiter_won;
+    let loser_buffer_clean = if parent_won {
+        waiter_lost_clean
+    } else {
+        parent_lost_clean
+    };
+    if exactly_one_won && loser_buffer_clean {
+        syscall::print("PROC CONCURRENT WAIT=PASS\r\n");
+    } else {
+        syscall::print("PROC CONCURRENT WAIT=FAIL\r\n");
+    }
+}
+
+pub fn concurrent_waiter(_argument: u64) -> ! {
+    let parent = syscall::getppid();
+    let mut request = ipc::Message::new(0, b"");
+    if !syscall::receive(&mut request) || request.sender != parent {
+        syscall::exit();
+    }
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&request.payload[..8]);
+    let target = u64::from_le_bytes(bytes);
+    let mut status = WAIT_SENTINEL;
+    let result = syscall::waitpid_raw(target, &mut status as *mut u64 as u64);
+    let mut reply = ipc::Message::new(0, b"");
+    reply.payload[0] = u8::from(result == 0 && status == 7);
+    // Losing must leave the buffer as it was: ECHILD is not a status.
+    reply.payload[1] = u8::from(result != 0 && status == WAIT_SENTINEL);
+    let _ = syscall::send(parent, &reply);
     loop {
         syscall::sleep(1000);
     }
@@ -667,6 +821,46 @@ pub fn process_api_child() -> ! {
         syscall::print("PROC CHILD PPID=FAIL\r\n");
     }
     syscall::exit_with_status(7)
+}
+
+/// Unprivileged mount probe: both mount and umount must be denied.
+pub fn mount_denied_probe() -> ! {
+    syscall::sleep(900);
+    let dir = "/tmp/mnt-denied";
+    let _ = syscall::fs_mkdir(dir);
+    let mounted = syscall::fs_mount("/", dir, "ramfs", 0);
+    let unmounted = syscall::fs_umount(dir, 0);
+    let _ = syscall::fs_rmdir(dir);
+    if mounted || unmounted {
+        syscall::print("MOUNT DENY=FAIL\r\n");
+    } else {
+        syscall::print("MOUNT DENY=PASS\r\n");
+    }
+    loop {
+        syscall::sleep(1000);
+    }
+}
+
+/// Privileged mount probe (CAP_MOUNT provisioned by the demo harness):
+/// mount, file creation inside the new backend, unmount.
+pub fn mount_allowed_probe() -> ! {
+    syscall::sleep(900);
+    let dir = "/tmp/mnt-allowed";
+    let file = "/tmp/mnt-allowed/file";
+    let directory = syscall::fs_mkdir(dir);
+    let mounted = directory && syscall::fs_mount("/", dir, "ramfs", 0);
+    let created = mounted && syscall::fs_create(file);
+    let removed = created && syscall::fs_unlink(file);
+    let unmounted = mounted && syscall::fs_umount(dir, 0);
+    let _ = syscall::fs_rmdir(dir);
+    if mounted && created && removed && unmounted {
+        syscall::print("MOUNT ALLOW=PASS\r\n");
+    } else {
+        syscall::print("MOUNT ALLOW=FAIL\r\n");
+    }
+    loop {
+        syscall::sleep(1000);
+    }
 }
 
 pub fn unknown_task() -> ! {

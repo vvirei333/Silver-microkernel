@@ -366,19 +366,48 @@ fn sys_spawn_with_args(program: u64, argument: u64, ptr: u64, len: u64) -> u64 {
 /// or `CAP_WAIT` holder) and consumes its zombie record. `status_ptr == 0`
 /// skips the copyout. A consumed/absent/foreign target returns
 /// `SYSCALL_ECHILD`; a bad status pointer returns `SYSCALL_ERROR`.
+///
+/// Transaction order is peek -> validate destination -> consume -> write.
+///
+/// The blocking wait releases the kernel lock, but the moment it returns a
+/// zombie is only peeked. The destination is then checked for EL0 write access
+/// without touching it, so a waiter that loses the race (another task consumes
+/// the zombie first) returns ECHILD with an unmodified user buffer. Consume
+/// still revalidates pid/state/status before removing the record.
+///
+/// The check and the final `copy_to_user` run in the same BKL-protected,
+/// non-blocking critical section: no `schedule`/BKL release/allocation happens
+/// in between, and only the current task can change its own TTBR0 mappings, so
+/// the validated pointer stays writable for the write. `copy_to_user` repeats
+/// the validation, which is why the post-consume write cannot fault in this
+/// memory model.
 fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
-    match scheduler::wait_for_pid(pid) {
-        Some(status) => {
-            if status_ptr != 0 {
-                let bytes = status.to_le_bytes();
-                if user_memory::copy_to_user(&bytes[..], status_ptr).is_err() {
-                    return SYSCALL_ERROR;
-                }
-            }
-            0
-        }
-        None => SYSCALL_ECHILD,
+    let Some(status) = scheduler::wait_status_for_pid(pid) else {
+        return SYSCALL_ECHILD;
+    };
+    if status_ptr != 0
+        && !mmu::valid_user_slice_mut(status_ptr, core::mem::size_of::<u64>() as u64)
+    {
+        // Nothing was written and the zombie is untouched: a retry with a
+        // valid destination reports the same status exactly once.
+        return SYSCALL_ERROR;
     }
+    if !scheduler::consume_zombie(pid, status) {
+        // Lost the race: another waiter consumed the zombie between the peek
+        // and here. The user buffer is still untouched because the copyout
+        // happens only after a successful consume.
+        return SYSCALL_ECHILD;
+    }
+    if status_ptr != 0 {
+        let bytes = status.to_le_bytes();
+        if user_memory::copy_to_user(&bytes[..], status_ptr).is_err() {
+            // Unreachable: the same pointer was validated above and no mapping
+            // change can occur while the BKL is held. Kept as a defensive
+            // error path rather than an unchecked store.
+            return SYSCALL_ERROR;
+        }
+    }
+    0
 }
 
 /// `SYS_SPAWN_ARGSV(program, argument, block_ptr, block_len)`: validates the
@@ -543,6 +572,9 @@ fn sys_fs_rename(source_ptr: u64, destination_ptr: u64) -> u64 {
 /// backend at `target`. The point must already be a directory and must not
 /// already carry a mount. The ABI is additive; old call numbers are untouched.
 fn sys_fs_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64) -> u64 {
+    if !scheduler::current_task_has_rights(capability::CAP_MOUNT) {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(source_ptr, |source| {
         with_path(target_ptr, |target| {
@@ -560,6 +592,9 @@ fn sys_fs_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64) -
 /// `SYS_UMOUNT(target, flags)`: refuses while the mount has child mounts,
 /// open files or a task cwd underneath it.
 fn sys_fs_umount(target_ptr: u64, flags: u64) -> u64 {
+    if !scheduler::current_task_has_rights(capability::CAP_MOUNT) {
+        return SYSCALL_ERROR;
+    }
     if flags != 0 {
         return SYSCALL_ERROR;
     }

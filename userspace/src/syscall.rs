@@ -93,6 +93,9 @@ pub const PROGRAM_DYNAMIC: u64 = u64::MAX - 1;
 pub const CAP_MMIO: u32 = 1 << 4;
 pub const CAP_IRQ: u32 = 1 << 5;
 pub const CAP_PCI: u32 = 1 << 6;
+pub const CAP_MOUNT: u32 = 1 << 7;
+pub const CAP_KILL: u32 = 1 << 0;
+pub const CAP_WAIT: u32 = 1 << 1;
 pub const OPEN_READ: u64 = 0;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_APPEND: u64 = 2;
@@ -365,13 +368,19 @@ pub fn getppid() -> u64 {
     unsafe { syscall0(SYS_GETPPID) }
 }
 
+/// Raw `SYS_WAITPID` returning the kernel result code (0 = success,
+/// `SYSCALL_ERROR` = EFAULT/error, `SYSCALL_ECHILD` = absent/consumed).
+/// Test-only helper used to exercise the transactional status pointer.
+pub fn waitpid_raw(pid: u64, status_ptr: u64) -> u64 {
+    unsafe { syscall2(SYS_WAITPID, pid, status_ptr) }
+}
+
 /// Waits for an authorized child (direct child or `CAP_WAIT` holder) and
 /// consumes its zombie record. Returns the exit status, or `None` for an
 /// absent / already-consumed / foreign PID (`ECHILD`).
 pub fn waitpid(pid: u64) -> Option<u64> {
     let mut status = 0_u64;
-    let result = unsafe { syscall2(SYS_WAITPID, pid, &mut status as *mut u64 as u64) };
-    match result {
+    match waitpid_raw(pid, &mut status as *mut u64 as u64) {
         0 => Some(status),
         SYSCALL_ECHILD => None,
         _ => None,
