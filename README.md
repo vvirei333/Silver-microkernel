@@ -78,7 +78,7 @@ mailbox, and a `ping <ip>` command with strict IPv4 validation and a timeout.
 
 ```text
 howl> ping 8.8.8.8
-PING 8.8.8.8: OK
+PING 8.8.8.8:  OK
 ```
 
 The reply has crossed the NIC, both virtio queues, the DMA mailbox in both
