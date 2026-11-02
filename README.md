@@ -7,6 +7,10 @@ code — only the build commands and toolchain setup differ.
 
 Target platform: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 
+## Community
+
+🐺 Developer Telegram: [Сильвер не кодит](https://t.me/rustdev_rs)
+
 ## Screenshot
 
 ![WerewolfOS fastfetch](assets/silver-fastfetch.png)
@@ -499,10 +503,6 @@ capabilities. Spawn, heap, DMA, VFS and wait-queue resource quotas are still
 limited or absent, so denial-of-service resistance remains incomplete.
 
 Architecture details, invariants and the roadmap: [handoff.md](handoff.md).
-
-## Community
-
-🐺 Developer Telegram: [Сильвер не кодит](https://t.me/rustdev_rs)
 
 ## License
 
