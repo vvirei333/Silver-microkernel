@@ -75,7 +75,7 @@ the same addresses or devices exist on the phone.
 
 | Check | Result |
 | --- | --- |
-| Host unit tests | 77 passed / 0 failed |
+| Host unit tests | 138 passed / 0 failed |
 | Fog QEMU, `fog-reloc` at `0x4040_0000` | PASS: FDT-validated relocation, `TIMER TEST: ticks=30`, `howl>` |
 | Fog QEMU, default at `0x4008_0000` | PASS: no relocation, `howl>` |
 | Fog QEMU, default at `0x4040_0000` | PASS fail-closed: no serial output, no `howl>`; `BOOT_PARAMS` holds pc/link/delta |
@@ -84,8 +84,13 @@ the same addresses or devices exist on the phone.
 | Demo regression | 66 PASS / 0 unexpected FAIL / 0 PANIC |
 | Tablet build | PASS |
 | Fog boot image v3 | PASS: `ANDROID!`, header v3 |
-| **Real Redmi 10C (`rain`), RAM-only `fastboot boot`** | **PASS: boot stub, relocation/FDT proof, MMU, heap, GICv3, timer, scheduler, Howl task** |
-| **GICv3 PPI 18 delivery on hardware** | **PASS: `GICD_CTLR=0x12`, `GICR_ISENABLER0=0x40001`, IRQ count > 1000** |
+| **Real Redmi 10C (`rain`), RAM-only `fastboot boot`** | **PASS (pre-E2): boot stub, relocation/FDT proof, MMU, heap, GICv3, timer, scheduler, Howl task** |
+| **GICv3 PPI 18 delivery on hardware** | **PASS (pre-E2): `GICD_CTLR=0x12`, `GICR_ISENABLER0=0x40001`, IRQ count > 1000** |
+
+The hardware rows were measured before Packages A2–E2. The current image adds
+owner-aware page-table walks, DRAM bounds, the `CTR_EL0` cache-line helper and
+fail-closed DMA reclamation; it has **not** been re-run on the unit. QEMU does
+not validate TLB/cache maintenance or DMA quiescence on Qualcomm hardware.
 
 GICv3 now matches the boot CPU's redistributor by `GICR_TYPER` affinity and has
 **no frame-0 fallback**. `ARE_NS`/`EnableGrp1NS` and the timer PPI enable bit

@@ -2444,6 +2444,12 @@ impl Task {
     /// frames are deliberately leaked (see `DMA_LEAKED_FRAMES`) rather than
     /// handed back while a foreign mapping might still reference them.
     ///
+    /// Quiescence precondition: `safe_to_free` is a CPU-mapping proof. It does
+    /// not prove that the device stopped DMA. Automatic reclamation here is
+    /// sound only while the platform has no IOMMU and no driver can outlive
+    /// its task with an armed queue; a driver that owns a device must stop the
+    /// queue (or reset it and observe completion) before it exits.
+    ///
     /// Guarded by `resources_released`/`ttbr0`: a zombie has already run this
     /// once, and calling it again with `ttbr0 == 0` would dereference zero.
     fn release_space(&mut self, dma_revokes: &[(usize, usize, mmu::RevokeResult)]) {

@@ -515,6 +515,30 @@ an independently loaded ELF image at `0x40000000`, an 8 KB stack at
 in different tasks have different physical backing. VM A/B verify the private
 page, ELF BSS and heap by reading back only their own values.
 
+Page tables are owned by the address space that created them. Each table frame
+is registered with its allocation generation and root owner; every walk checks
+the owner of the root and of each level before reading or editing a descriptor.
+A descriptor that points at another space's table is a hard refusal, not a
+dereference. Teardown drains a space by its root token and validates the token
+before removing anything, so a stale token leaks rather than freeing a recycled
+frame.
+
+Unmap and reclamation are fail-closed. A partial `munmap` is refused without
+touching the mapped part; if a backing run cannot be proven fully unmapped it is
+leaked (`MMAP_LEAKED_FRAMES`) instead of being handed to a new owner. DMA frames
+are freed only after every live address space has been scanned and
+`safe_to_free` is true; otherwise they are leaked (`DMA_LEAKED_FRAMES`).
+`safe_to_free` covers CPU mappings only: without an IOMMU it does not prove that
+a device has stopped DMA. A driver must stop or reset its queue and observe
+completion before it exits.
+
+DMA buffers are mapped Normal Non-Cacheable. The initial publication cleans the
+cacheable kernel alias to the point of coherency before user or device access;
+afterwards every participant must use only the Non-Cacheable alias. Shared-DMA
+physical addresses are bearer capabilities, and the IPC protocol that hands one
+out is responsible for granting it. Cache maintenance ranges use
+`CTR_EL0.DminLine`, not a fixed 64-byte assumption.
+
 `SYS_BRK` manages a byte-granular program break in a reserved 2 MB heap window
 at `0x40200000`. Growth maps zeroed RW-NX pages on demand; shrinking unmaps and
 frees whole pages; failed growth rolls back partial mappings. Reaping frees
@@ -593,8 +617,12 @@ paths alongside the existing MMU, copyout, lifecycle and IPC checks.
 This is not yet a complete security model. Kill, wait, console, resume, MMIO,
 IRQ and PCI operations check capability rights; `SYS_CAP_GRANT` delegates only a
 subset of the caller's rights, and task death revokes or downgrades affected
-capabilities. Spawn, heap, DMA, VFS and wait-queue resource quotas are still
-limited or absent, so denial-of-service resistance remains incomplete.
+capabilities. Page-table walks are owner-checked and DMA revocation is bounded
+to DRAM, so a corrupted descriptor cannot redirect a walk into a foreign table
+or below `DRAM_BASE`. Spawn, heap, DMA, VFS and wait-queue resource quotas are
+still limited or absent, so denial-of-service resistance remains incomplete.
+A shared-DMA physical address is a bearer capability, and `safe_to_free` does
+not prove device quiescence; both remain driver/IPC-protocol responsibilities.
 
 ## Documentation
 
@@ -604,13 +632,16 @@ limited or absent, so denial-of-service resistance remains incomplete.
 | [SMP_STATUS.md](SMP_STATUS.md) | SMP investigation status; `-smp 2` is still not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 
-Current verification snapshot (2026-11-03): 77 host tests pass; the fog QEMU
-suite covers relocation, at-link boot, default fail-closed park and an
-FDT-reserved-destination rejection; normal QEMU reaches `howl>`; the demo
-regression reports 66 PASS / 0 PANIC; the tablet build and fog boot image v3
-build succeed. A physical Redmi 10C `rain` unit boots the RAM-only image to
-the scheduler and the Howl task, with live GICv3 timer interrupts confirmed by
-the `fog-ui` panel (`TICKS` > 1000).
+Current verification snapshot (2026-11-03): **138 host tests** pass; the fog
+QEMU suite covers relocation, at-link boot, default fail-closed park and an
+FDT-reserved-destination rejection; normal QEMU release and debug builds reach
+`howl>`; the demo regression reports 66 PASS / 0 PANIC; all four release
+feature sets (`no_std`, `fog`, `fog-reloc`, `tablet`) build. A physical Redmi
+10C `rain` unit previously booted the RAM-only image to the scheduler and the
+Howl task, with live GICv3 timer interrupts confirmed by the `fog-ui` panel
+(`TICKS` > 1000). That hardware evidence predates Packages A2–E2; the current
+owner-aware walk, CRM/cache-line and DMA-reclamation changes have **not** been
+re-run on the unit.
 
 ## License
 

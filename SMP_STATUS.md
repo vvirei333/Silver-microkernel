@@ -3,8 +3,14 @@
 > **Current project status (2026-11-03):** this file remains the authoritative
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
-> test suite is now **77/77**; the 13/13 figure below is the checkpoint from
+> test suite is now **138/138**; the 13/13 figure below is the checkpoint from
 > this SMP session. `-smp 2` is still **not verified**.
+>
+> Package E2 (owner-aware page-table walks, DRAM-bounded revoke, `CTR_EL0`
+> cache-line helper) is a single-CPU change. It does **not** enable SMP and does
+> not change the SMP blockers: the ownership/quiescence argument still assumes
+> one table editor under the BKL and one PE per address space. Revalidate the
+> walk/quiescence proof before enabling APs.
 
 ## CHECKPOINT (финальные проверки)
 

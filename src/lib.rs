@@ -12,6 +12,7 @@ pub mod fdt;
 pub mod fog_validate;
 pub mod gicv3_policy;
 pub mod irq_policy;
+pub mod phys_range;
 pub mod reloc;
 pub mod table_registry;
 pub mod wait_queue;

@@ -134,7 +134,18 @@ impl TableRegistry {
     }
 
     pub fn contains(&self, frame: usize) -> bool {
-        self.records.iter().any(|record| record.token.frame == frame)
+        self.owner(frame).is_some()
+    }
+
+    /// Address-space root that owns the live registration of `frame`, or
+    /// `None` when the frame is not registered. Read-only: unlike
+    /// [`Self::retire_owned`], this never changes the registry, so a table
+    /// walker can validate a whole chain before its first mutation.
+    pub fn owner(&self, frame: usize) -> Option<usize> {
+        self.records
+            .iter()
+            .find(|record| record.token.frame == frame)
+            .map(|record| record.owner)
     }
 
     /// Current token for `frame`, for tests only. Production code must keep
@@ -267,6 +278,35 @@ mod tests {
         assert_eq!(registry.register(FRAME, 8, ROOT), None);
         assert_eq!(registry.len(), 1);
         assert_eq!(registry.token(FRAME), Some(token));
+    }
+
+    #[test]
+    fn owner_query_reports_the_registered_space() {
+        let mut registry = TableRegistry::new();
+        assert_eq!(registry.owner(FRAME), None);
+
+        let token = registry.register(FRAME, 7, ROOT).expect("registration");
+        assert_eq!(registry.owner(FRAME), Some(ROOT));
+        assert_eq!(registry.owner(FRAME_B), None);
+
+        // A space root is registered as its own owner.
+        registry
+            .register(OTHER_ROOT, 8, OTHER_ROOT)
+            .expect("root registration");
+        assert_eq!(registry.owner(OTHER_ROOT), Some(OTHER_ROOT));
+
+        assert_eq!(
+            registry.retire(token),
+            RetireResult::Retired { generation: 7 }
+        );
+        assert_eq!(registry.owner(FRAME), None);
+
+        // A recycled frame reports its new owner, so an old walk of ROOT can
+        // no longer mistake it for its own table.
+        registry
+            .register(FRAME, 9, OTHER_ROOT)
+            .expect("re-registration");
+        assert_eq!(registry.owner(FRAME), Some(OTHER_ROOT));
     }
 
     #[test]

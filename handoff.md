@@ -5,9 +5,17 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## CURRENT STATUS (2026-11-03, TASK №23)
 
-Checkpoint: commit `82294d2` (`feat(fog): bring up Redmi 10C RAM-only boot with
-fail-closed relocation`).
+Checkpoint: Package E2 on top of `266a789` (`Package E1: make retire_space
+atomic and seal the token API`): owner-aware page-table walks, explicit DRAM
+bounds and a portable cache-line helper.
 
+- **Page-table ownership and DMA reclamation (Packages E/E1/E2).** Every page
+  table is registered with `(frame, generation, owner)`; walks validate the
+  owner of the root and of every level before touching a descriptor. A
+  foreign or unverifiable table fails closed. `revoke_phys_range` accepts only
+  `[DRAM_BASE, DRAM_END)`, and DMA frames are freed only when the CPU-mapping
+  scan proves `safe_to_free`. `safe_to_free` says nothing about device
+  quiescence; see the DMA contract below.
 - **Redmi 10C / fog RAM-only bring-up is implemented but not hardware-verified.**
   Authoritative document: [`redmi10c_poc/README.md`](redmi10c_poc/README.md).
 - The default `fog` build is **fail-closed**: relocation is disabled, and a
@@ -23,9 +31,13 @@ fail-closed relocation`).
 - GICv3 no longer falls back to redistributor frame 0. The boot CPU's frame is
   matched by `GICR_TYPER` affinity in bits `[63:32]`; if no frame matches, the
   timer PPI is left disabled and timer-dependent scheduling does not start.
-- Verified in this snapshot: **77 host tests**, fog QEMU relocation/at-link/
+- Verified in this snapshot: **138 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC**, tablet build, and fog boot image v3.
+- **The post-E2 image has not been re-run on physical `rain`.** The hardware
+  evidence in this file and in `redmi10c_poc/README.md` predates Packages
+  A2–E2; QEMU is not evidence for TLB/cache maintenance, GIC or DMA
+  quiescence on the device.
 - **Hardware readiness: NOT READY — NEEDS DEVICE DATA.** The ABL load address,
   live memory/reserved map, UART clock/pins, GIC/timer wiring and boot CPU
   affinity of the specific unit are still unconfirmed.
@@ -52,7 +64,7 @@ Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
   defined `unregister_mutex` not-found path, ipc receive bisect bypass
   removed).
 - **Verified working at that checkpoint:** single-CPU boot unchanged;
-  `cargo test --lib` 13/13 (the current suite is 77/77); debug and release
+  `cargo test --lib` 13/13 (the current suite is 138/138); debug and release
   builds pass.
 - **NOT working: `-smp 2`** dies at silverd's first blocking IPC receive.
   Two independent failure layers, both new relative to pre-SMP:
@@ -953,7 +965,11 @@ zeroed contiguous frames, rounded to whole pages and limited to 2 MB total per
 call. They share the first-fit mapping window at `0x80000000` with MMIO, never
 the heap, and are mapped Normal Non-Cacheable (MAIR index 2, value `0x44`) rather
 than Device memory. The kernel cleans the cacheable aliases before exposing the
-buffer and releases tracked frames during task reaping. No DMA-free syscall or
+buffer. During reaping it scans every live address space with
+`mmu::revoke_phys_range`; tracked frames are released only when the scan proves
+`safe_to_free`, otherwise they are leaked (`DMA_LEAKED_FRAMES`). That proof
+covers CPU mappings only: a driver must stop/reset its queue and observe
+completion before exit, because there is no IOMMU. No DMA-free syscall or
 per-allocation quota exists yet.
 
 `SYS_PCI_READ = 68` and `SYS_PCI_WRITE = 69` require CAP_PCI. Their offset is a
@@ -1289,9 +1305,13 @@ read back only their own values.
   `0x40200000..0x40400000`; invalid requests and allocation failures return
   `SYSCALL_ERROR` without changing the previous break or mappings.
 - `SYS_MAP_PHYS(phys, size)` rejects empty, overflowing and DRAM ranges. Its
-  lazily allocated L2/L3 tables are freed with the task address space, while the
-  referenced device frames are never freed. Each mapping records a `CAP_MMIO`
-  region token and returns the user VA including the original page offset.
+  lazily allocated L2/L3 tables are owner-registered and freed with the task
+  address space; existing descriptors are revalidated against the walker's
+  owner before they are followed, while referenced device frames are never
+  freed. Each mapping records a `CAP_MMIO` region token and returns the user VA
+  including the original page offset. A shared-DMA range is accepted when it
+  lies inside some task's tracked allocation; the physical address is a bearer
+  capability, so the IPC protocol that transmits it is the grant boundary.
 - A bound IRQ bypasses the kernel device handler: the GIC distributor masks it
   before EOI, then a pending flag and wakeup go to its live owner. `bind_irq`
   and `SYS_WAIT_IRQ` unmask it only when EL0 is ready for another event.
@@ -1485,7 +1505,9 @@ read back only their own values.
 12. **TLB/cache ritual for any future table edit.** After modifying tables,
     clean lines to the point of coherency (`dc cvac` + `dsb`), invalidate
     stale TLB entries (`tlbi` + `dsb` + `isb`). Template:
-    `mmu::flush_after_table_change`. Address-space switches load TTBR0_EL1
+    `mmu::flush_after_table_change`. Cache ranges are aligned and stepped from
+    `CTR_EL0.DminLine` (`4 << DminLine`), not a hardcoded 64 bytes; keep start
+    rounded down and end rounded up. Address-space switches load TTBR0_EL1
     and issue `tlbi vmalle1; dsb ish; isb` before the context switch.
 13. **UART FIFO waits preserve DAIF.** `pl011::write_byte()` may unmask IRQs
     while waiting for TXFF, but restores the caller's saved DAIF before
@@ -1510,6 +1532,28 @@ read back only their own values.
     server replaces its initial hardware address before sending; otherwise ARP
     advertises the wrong source. Resolve both network tasks by program ID, not
     by fixed task numbers.
+19. **Page tables are registry-owned, not address-owned.** A registered table
+    carries `(frame, generation, owner)` via `table_registry::TableToken`; only
+    the registry issues tokens. A raw descriptor is never trusted: a walk first
+    proves that the target frame is live and that its owner is the space being
+    walked. A recycled frame owned by another space is a hard refusal, never a
+    free. `retire_space` validates the root and reserves the result before it
+    removes any record, so an OOM refusal leaves the registry untouched.
+20. **Reclamation is fail-closed.** User unmaps are all-or-nothing; if a range
+    cannot be fully proven mapped, the caller leaks its backing run instead of
+    freeing frames with live PTEs (`MMAP_LEAKED_FRAMES`). DMA frames are freed
+    only after every live address space was scanned and `safe_to_free` is true;
+    any doubt leaks (`DMA_LEAKED_FRAMES`). A leak is always preferable to
+    handing live memory to a new owner. `unmap_user_pages_at` returning `true`
+    means "range unmapped", not "all page-table frames returned".
+21. **`safe_to_free` is a CPU-mapping result, not device quiescence.** Without
+    an IOMMU or a device-reset proof, a device can still write to a range after
+    every PTE is gone. Automatic DMA reclamation is valid only as a
+    precondition of the current model: the owning driver stops/reset its queue
+    and observes completion before exiting. A shared-DMA physical address is a
+    bearer capability; the IPC protocol that distributes it is responsible for
+    granting it. Cache maintenance for shared DMA works only while all
+    participants use Normal Non-Cacheable aliases after the initial clean.
 
 ## Why IPC uses Mutex + Condvar
 
@@ -1576,9 +1620,16 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   resistance.
 - The user heap is limited to one 2 MB L3 window. The allocator supports only
   alignments up to 16 bytes and has no explicit C-style `realloc`/`calloc`,
-  thread safety or double-free detection. There is no general `mmap`/`munmap`
-  or growable stack; the user stack remains fixed at 8 KB and the private
-  window at one page.
+  thread safety or double-free detection. `SYS_MMAP`/`SYS_MUNMAP` exist, but
+  only for anonymous, fixed-placement private pages; there is no file-backed
+  `mmap` and the user stack remains fixed at 8 KB. The private window is one
+  page.
+- DMA quiescence is a driver contract, not a kernel guarantee. `safe_to_free`
+  proves only that CPU mappings in the MMIO window are gone; there is no
+  IOMMU, no device reset on task death and no proof that an armed queue has
+  stopped. A shared-DMA physical address is a bearer capability, and cache
+  coherence for shared DMA relies on all participants using Normal
+  Non-Cacheable aliases after the initial clean.
 - Interactive mode prevents ordinary background/foreground output interleaving,
   but `demo-tasks` intentionally shares UART. Kernel diagnostics bypass ownership,
   and an IRQ may schedule another task during a FIFO wait. UART RX is interrupt-
@@ -1637,15 +1688,19 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 5. **SFS write path and persistence:** block-path interrupts, write support,
    file-size quotas and overwrite/rename options; then keep the image across
    reboot.
-6. **Generalize per-task VM:** sparse multi-window ELF images, `mmap`/`munmap`,
-   growable stacks and demand paging later. Add over-aligned user allocations
-   and explicit `realloc`/`calloc` when their use cases appear.
+6. **Generalize per-task VM:** file-backed and sparse multi-window mappings,
+   growable stacks and demand paging on top of the existing anonymous
+   `SYS_MMAP`/`SYS_MUNMAP`. Add over-aligned user allocations and explicit
+   `realloc`/`calloc` when their use cases appear.
 7. **Dynamic loader follow-ups:** pass argv/`char*` to `run`'d programs, stream
    segments instead of slurping the whole file, load from the on-disk SFS once
    it can read files, and add PIE/dynamic linking later. A program-credential
    model should gate both `spawn` and `run` (see step 2).
 8. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
-   `mmu::flush_after_table_change` becomes mandatory, not ceremonial.
+   `mmu::flush_after_table_change` becomes mandatory, not ceremonial. The
+   maintenance loops already read `CTR_EL0.DminLine`; re-verify on physical
+   `rain` that `dc cvac`/`tlbi` ordering is correct and that the reported line
+   size matches the maintenance behaviour.
 
 Nameserver watch notifications are explicitly deferred. Later IPC control-plane
 work should also address nonblocking/priority replies, send timeouts/cancellation

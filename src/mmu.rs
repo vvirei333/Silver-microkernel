@@ -7,6 +7,9 @@
 //! explicitly authorized Device-nGnRnE MMIO and Normal Non-Cacheable DMA.
 //! No kernel image or kernel data is shared with EL0.
 
+use silver_microkernel::phys_range::{
+    aligned_page_span, checked_range_end, page_range_within,
+};
 use silver_microkernel::table_registry::{
     RetireResult, SpaceRetire, TableRegistry, TableToken,
 };
@@ -89,8 +92,20 @@ fn page_table_register(frame: usize, generation: u32, owner: usize) -> Option<Ta
     }
 }
 
-fn page_table_registered(frame: usize) -> bool {
-    PAGE_TABLE_FRAMES.lock().contains(frame)
+/// True only when `frame` is currently registered as a page table owned by
+/// `owner`. Read-only, so it can validate an entire walk before the first
+/// table mutation.
+fn page_table_owned_by(frame: usize, owner: usize) -> bool {
+    PAGE_TABLE_FRAMES.lock().owner(frame) == Some(owner)
+}
+
+/// A space root is a live frame whose registry owner is itself: that is the
+/// same invariant `retire_space` checks, so a walker cannot treat another
+/// space's child table as a root.
+fn space_root_valid(ttbr0: usize) -> bool {
+    ttbr0 % GRANULE == 0
+        && frame_allocator::frame_in_use(ttbr0)
+        && page_table_owned_by(ttbr0, ttbr0)
 }
 
 /// Frees a page-table frame only when `token` is the live registration.
@@ -441,19 +456,48 @@ pub fn set_kernel_stack_pages(
     true
 }
 
-fn clean_tables_to_point_of_coherency() {
-    let start = core::ptr::addr_of!(TABLES) as usize;
-    let end = start + TABLE_COUNT * TABLE_BYTES;
+/// Data-cache line size in bytes, from `CTR_EL0.DminLine`.
+///
+/// AArch64 encodes the minimum D-cache line as `4 << DminLine` bytes. Reading
+/// it avoids baking a 64-byte assumption into the maintenance loops: every
+/// range below is aligned and stepped with the value this CPU reports.
+fn data_cache_line_size() -> usize {
+    let ctr: u64;
     unsafe {
-        let mut line = start;
+        core::arch::asm!(
+            "mrs {}, ctr_el0",
+            out(reg) ctr,
+            options(nostack, preserves_flags),
+        );
+    }
+    4usize << ((ctr >> 16) & 0xF)
+}
+
+/// Cleans (write-back, no invalidate) every data-cache line overlapping
+/// `[start, end)`. The caller follows this with the barrier its protocol
+/// requires (`dsb ishst` for table publication, `dsb sy` for boot tables).
+fn clean_cache_range(start: usize, end: usize) {
+    let line_size = data_cache_line_size();
+    let mask = line_size - 1;
+    let mut line = start & !mask;
+    let end = end.saturating_add(mask) & !mask;
+    unsafe {
         while line < end {
             core::arch::asm!(
                 "dc cvac, {line}",
                 line = in(reg) line,
                 options(nostack, preserves_flags),
             );
-            line += 64;
+            line += line_size;
         }
+    }
+}
+
+fn clean_tables_to_point_of_coherency() {
+    let start = core::ptr::addr_of!(TABLES) as usize;
+    let end = start + TABLE_COUNT * TABLE_BYTES;
+    clean_cache_range(start, end);
+    unsafe {
         core::arch::asm!("dsb sy", options(nostack, preserves_flags));
     }
 }
@@ -532,18 +576,9 @@ pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
 /// Only the *table* is cleaned here: without it the table walker may fetch a
 /// stale descriptor from memory even though the invalidating `tlbi` follows.
 fn clean_table_lines(table_start: usize, table_bytes: usize) {
-    let start = phys_to_virt(table_start) & !63;
-    let end = (phys_to_virt(table_start) + table_bytes + 63) & !63;
+    let start = phys_to_virt(table_start);
+    clean_cache_range(start, start.saturating_add(table_bytes));
     unsafe {
-        let mut line = start;
-        while line < end {
-            core::arch::asm!(
-                "dc cvac, {line}",
-                line = in(reg) line,
-                options(nostack, preserves_flags),
-            );
-            line += 64;
-        }
         core::arch::asm!("dsb ishst", options(nostack));
     }
 }
@@ -830,6 +865,13 @@ pub fn map_user_pages_at(
 /// cleared. A range with one unmapped hole returns `false` with every mapping
 /// still in place, so a caller that reacts by freeing the backing run cannot
 /// leave a live PTE pointing at a recycled frame.
+///
+/// `true` means **the range is no longer mapped**, not that every page-table
+/// frame used by the range was returned to the allocator. An L3 is released
+/// only when it became empty and its registry owner still matches; a refused
+/// table free leaks that table rather than risking a foreign frame. Callers
+/// must therefore treat `true` as permission to release the data frames, not
+/// as a page-table accounting result.
 pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usize) -> bool {
     if page_count == 0 || virtual_address % GRANULE != 0 || virtual_address < DRAM_BASE {
         return false;
@@ -899,10 +941,17 @@ fn table_empty(table: usize) -> bool {
 pub struct RevokeResult {
     /// Number of page mappings removed from this address space.
     pub unmapped: usize,
-    /// `true` only when the whole address space was verified: every
-    /// intermediate descriptor was a valid table descriptor and every
+    /// `true` only when the whole address space was verified: the root and
+    /// every intermediate table were registered to this space, and every
     /// non-empty L3 entry was a valid page descriptor. Any unverifiable
-    /// structure forces `false`, and the caller must not free the frames.
+    /// structure or foreign owner forces `false`, and the caller must not free
+    /// the frames.
+    ///
+    /// This is a **CPU-mapping** result only. It does not prove that a device
+    /// has stopped touching the range: without an IOMMU or a device-reset
+    /// contract, DMA can still be in flight after every PTE is gone. Callers
+    /// may release the frames only when the device-quiescence precondition
+    /// documented on [`map_dma_to_user`] is satisfied by the driver teardown.
     pub safe_to_free: bool,
 }
 
@@ -913,20 +962,24 @@ pub struct RevokeResult {
 /// corrupted memory can name any location, and `read_entry` through it would
 /// be a physical read of arbitrary memory. The address must therefore be a
 /// page-aligned, currently allocated frame **and a member of the page-table
-/// registry** (see [`PAGE_TABLE_FRAMES`]) — i.e. a frame this kernel itself
-/// created as a page table. Contents-based validation is impossible: data can
-/// mimic a valid table chain, so membership is checked, not inferred.
+/// registry owned by `expected_owner`** (see [`PAGE_TABLE_FRAMES`]) — i.e. a
+/// frame this kernel itself created as a table for the space being walked.
+/// Contents-based validation is impossible: data can mimic a valid table
+/// chain, so membership and ownership are checked, not inferred. Foreign
+/// ownership is a hard refusal: an address space that points at another
+/// space's table must never be modified, even if that table is otherwise
+/// valid.
 ///
 /// `None` means the address cannot be trusted: the caller must report the
 /// address space as unverifiable (`safe_to_free = false`) without reading it.
-fn follow_validated_table(descriptor: u64) -> Option<usize> {
+fn follow_validated_table(descriptor: u64, expected_owner: usize) -> Option<usize> {
     if descriptor & DESC_TABLE != DESC_TABLE {
         return None;
     }
     let physical = descriptor_address(descriptor) as usize;
     if physical % GRANULE != 0
         || !frame_allocator::frame_in_use(physical)
-        || !page_table_registered(physical)
+        || !page_table_owned_by(physical, expected_owner)
     {
         return None;
     }
@@ -936,25 +989,27 @@ fn follow_validated_table(descriptor: u64) -> Option<usize> {
 /// Revokes every page mapping whose physical address lies in the half-open
 /// range `[phys_base, phys_end)` from the MMIO window of one address space.
 ///
-/// Read-only until a matching mapping is found: every intermediate level is
-/// validated before use (the descriptor must be a table **and** the table's
-/// physical address must be a page-aligned, currently allocated frame that
-/// the kernel itself registered as a page table — `ttbr0` itself included; a
+/// Read-only until a matching mapping is found: the root must be a registered
+/// space root and every intermediate level is validated before use (the
+/// descriptor must be a table **and** the table's physical address must be a
+/// page-aligned, currently allocated frame registered to **this** space; a
 /// zero entry means the level is absent and the task is trivially clean) and
 /// no table is ever allocated. Only valid page descriptors (`DESC_PAGE`)
 /// whose physical address falls inside the range are removed; anything
-/// non-empty but not a valid page makes the whole window unverifiable
-/// (`safe_to_free = false`). Foreign mappings outside the range are kept.
+/// non-empty but not a valid page, or a table owned by another space, makes
+/// the whole window unverifiable (`safe_to_free = false`). Foreign mappings
+/// outside the range are kept.
+///
+/// The range must lie inside `[DRAM_BASE, DRAM_END)`; addresses outside DRAM
+/// are refused before any walk. `safe_to_free` covers CPU mappings only — see
+/// [`RevokeResult::safe_to_free`] and the device-quiescence precondition on
+/// [`map_dma_to_user`].
 ///
 /// Never allocates and never frees physical frames. Clearing a descriptor is
 /// followed by table cache maintenance and a full TLB invalidation before
 /// the caller may free the data frames.
 pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> RevokeResult {
-    if phys_base > phys_end
-        || phys_base % GRANULE != 0
-        || phys_end % GRANULE != 0
-        || phys_end > DRAM_END
-    {
+    if !page_range_within(phys_base, phys_end, GRANULE, DRAM_BASE, DRAM_END) {
         return RevokeResult {
             unmapped: 0,
             safe_to_free: false,
@@ -968,14 +1023,11 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
     }
 
     unsafe {
-        // The root table named by `ttbr0` gets the same validation as every
-        // other level, registry included (`create_task_space` registers it).
-        // A `ttbr0` that fails any check means corrupted task state:
-        // unverifiable, and not read.
-        if ttbr0 % GRANULE != 0
-            || !frame_allocator::frame_in_use(ttbr0)
-            || !page_table_registered(ttbr0)
-        {
+        // The root table named by `ttbr0` must be a registered space root:
+        // `create_task_space` registers it with itself as owner. A `ttbr0`
+        // that fails any check means corrupted task state (or another
+        // space's child table): unverifiable, and not read.
+        if !space_root_valid(ttbr0) {
             return RevokeResult {
                 unmapped: 0,
                 safe_to_free: false,
@@ -991,7 +1043,7 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
                 safe_to_free: true,
             };
         }
-        let Some(l1_user) = follow_validated_table(root_entry) else {
+        let Some(l1_user) = follow_validated_table(root_entry, ttbr0) else {
             return RevokeResult {
                 unmapped: 0,
                 safe_to_free: false,
@@ -1006,7 +1058,7 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
                 safe_to_free: true,
             };
         }
-        let Some(l2_mmio) = follow_validated_table(l1_entry) else {
+        let Some(l2_mmio) = follow_validated_table(l1_entry, ttbr0) else {
             return RevokeResult {
                 unmapped: 0,
                 safe_to_free: false,
@@ -1020,7 +1072,7 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
                 safe_to_free: true,
             };
         }
-        let Some(l3_mmio) = follow_validated_table(l2_entry) else {
+        let Some(l3_mmio) = follow_validated_table(l2_entry, ttbr0) else {
             return RevokeResult {
                 unmapped: 0,
                 safe_to_free: false,
@@ -1070,11 +1122,9 @@ pub fn map_phys_to_user(
         return None;
     }
 
-    let physical_start = phys_addr & !(GRANULE - 1);
-    let physical_offset = phys_addr - physical_start;
-    let mapped_size = physical_offset.checked_add(size)?;
-    let page_count = mapped_size.div_ceil(GRANULE);
-    if page_count == 0 || page_count > ENTRIES {
+    let (physical_start, physical_offset, page_count) =
+        aligned_page_span(phys_addr, size, GRANULE)?;
+    if page_count > ENTRIES {
         return None;
     }
     map_user_pages(
@@ -1088,18 +1138,27 @@ pub fn map_phys_to_user(
 
 /// Maps newly allocated DMA frames as Normal Non-Cacheable, never as Device or
 /// cacheable RAM. The range must be page-aligned and wholly inside known DRAM.
+///
+/// Cache protocol: the allocator/owner initialises the buffer through the
+/// cacheable kernel alias, so this function cleans the range to the point of
+/// coherency *before* the user (and therefore the device) can observe it.
+/// Afterwards the buffer must be touched only through Normal Non-Cacheable
+/// aliases; if any cacheable alias is written again, the owner must clean it
+/// before the next ownership handover.
+///
+/// Device-quiescence precondition: freeing a DMA range requires that the
+/// device can no longer issue DMA to it (queue stopped or device reset, with
+/// completion observed). `revoke_phys_range` proves only that CPU mappings are
+/// gone; without an IOMMU it cannot stop a device that is still running.
 pub fn map_dma_to_user(
     task: &crate::scheduler::Task,
     phys_addr: usize,
     size: usize,
 ) -> Option<usize> {
-    if size == 0 || phys_addr % GRANULE != 0 || size % GRANULE != 0 {
+    if phys_addr % GRANULE != 0 || size % GRANULE != 0 {
         return None;
     }
-    let physical_end = phys_addr.checked_add(size)?;
-    if phys_addr < DRAM_BASE || physical_end > DRAM_END {
-        return None;
-    }
+    checked_range_end(phys_addr, size, DRAM_BASE, DRAM_END)?;
     let page_count = size / GRANULE;
     if page_count > ENTRIES {
         return None;
@@ -1108,31 +1167,34 @@ pub fn map_dma_to_user(
     // The allocator and zeroing path use the cacheable kernel alias. Push those
     // lines to the point of coherency before the device can observe the buffer.
     clean_dma_range(phys_addr, size);
-    let virtual_address = map_user_pages(task, phys_addr, page_count, 0, user_dma_page)?;
-    invalidate_user_page(virtual_address);
-    Some(virtual_address)
+    map_user_pages(task, phys_addr, page_count, 0, user_dma_page)
 }
 
 /// Maps a registered DMA allocation shared by another task. The scheduler
-/// validates ownership of the physical range before calling this function.
+/// validates that the physical range lies inside some task's `dma_pages` run
+/// before calling this function.
+///
+/// Cache protocol: this path assumes the buffer was already published by
+/// [`map_dma_to_user`] (which cleaned the initialising writes) and that every
+/// participant accesses it exclusively through its Normal Non-Cacheable
+/// alias. No clean is needed while that holds; if a cacheable alias is written
+/// again, the writer must clean/invalidate around the ownership handover.
+///
+/// The physical address is a bearer capability: any task with `CAP_MMIO` that
+/// learns it can map the window. Grant checks belong to the IPC protocol that
+/// distributes the address, not to this function.
+///
+/// Device-quiescence precondition: same as [`map_dma_to_user`] — a CPU
+/// mapping being gone does not mean the device has stopped.
 pub fn map_shared_dma_to_user(
     task: &crate::scheduler::Task,
     phys_addr: usize,
     size: usize,
 ) -> Option<usize> {
-    if size == 0 {
-        return None;
-    }
-    let physical_end = phys_addr.checked_add(size)?;
-    if phys_addr < DRAM_BASE || physical_end > DRAM_END {
-        return None;
-    }
-
-    let physical_start = phys_addr & !(GRANULE - 1);
-    let physical_offset = phys_addr - physical_start;
-    let mapped_size = physical_offset.checked_add(size)?;
-    let page_count = mapped_size.div_ceil(GRANULE);
-    if page_count == 0 || page_count > ENTRIES {
+    checked_range_end(phys_addr, size, DRAM_BASE, DRAM_END)?;
+    let (physical_start, physical_offset, page_count) =
+        aligned_page_span(phys_addr, size, GRANULE)?;
+    if page_count > ENTRIES {
         return None;
     }
     map_user_pages(
@@ -1155,12 +1217,7 @@ fn map_user_pages(
         let l3_mmio = user_mmio_table(task.ttbr0)?;
         let mut first = ENTRIES;
         let mut run_length = 0;
-        let mut iter_count = 0;
         for index in 0..ENTRIES {
-            iter_count += 1;
-            if iter_count > 1000 {
-                panic!("MMU: infinite loop!");
-            }
             if read_entry(l3_mmio, index) == 0 {
                 if run_length == 0 {
                     first = index;
@@ -1177,12 +1234,7 @@ fn map_user_pages(
             return None;
         }
 
-        let mut iter_count2 = 0;
         for page_index in 0..page_count {
-            iter_count2 += 1;
-            if iter_count2 > 1000 {
-                panic!("MMU: infinite loop!");
-            }
             write_entry(
                 l3_mmio,
                 first + page_index,
@@ -1195,12 +1247,7 @@ fn map_user_pages(
         // the previous mapping of this window.
         clean_table_lines(l3_mmio, GRANULE);
         let virtual_address = USER_MMIO_VA + first * GRANULE;
-        let mut iter_count3 = 0;
         for page_index in 0..page_count {
-            iter_count3 += 1;
-            if iter_count3 > 1000 {
-                panic!("MMU: infinite loop!");
-            }
             invalidate_user_page(virtual_address + page_index * GRANULE);
         }
         Some(virtual_address + physical_offset)
@@ -1208,29 +1255,30 @@ fn map_user_pages(
 }
 
 fn clean_dma_range(physical: usize, size: usize) {
-    let start = phys_to_virt(physical) & !63;
-    let end = (phys_to_virt(physical) + size + 63) & !63;
+    let start = phys_to_virt(physical);
+    clean_cache_range(start, start.saturating_add(size));
     unsafe {
-        let mut line = start;
-        while line < end {
-            core::arch::asm!("dc cvac, {}", in(reg) line, options(nostack));
-            line += 64;
-        }
         core::arch::asm!("dsb ishst", options(nostack));
     }
 }
 
+/// Returns (allocating on first use) the L3 table behind the task's device
+/// window. The root and every existing level are validated with the same
+/// owner-aware checks as [`revoke_phys_range`]: a foreign or corrupted
+/// descriptor is refused before it is dereferenced or modified, and the
+/// mapping path never writes into another space's table.
 fn user_mmio_table(ttbr0: usize) -> Option<usize> {
     unsafe {
-        let l1_user = follow_table(ttbr0, 0);
+        if !space_root_valid(ttbr0) {
+            return None;
+        }
+        let root_entry = read_entry(ttbr0, 0);
+        let l1_user = follow_validated_table(root_entry, ttbr0)?;
         let existing = read_entry(l1_user, USER_MMIO_L1_INDEX);
         if existing & DESC_TABLE == DESC_TABLE {
-            let l2_mmio = descriptor_address(existing) as usize;
+            let l2_mmio = follow_validated_table(existing, ttbr0)?;
             let l3_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
-            if l3_entry & DESC_TABLE != DESC_TABLE {
-                return None;
-            }
-            return Some(descriptor_address(l3_entry) as usize);
+            return follow_validated_table(l3_entry, ttbr0);
         }
         if existing != 0 {
             return None;
@@ -1409,14 +1457,8 @@ pub fn run_self_test() -> bool {
 /// address to the point of coherency. Used to publish AP boot parameters to
 /// a CPU that starts with cold caches.
 pub fn clean_range_to_poc(start: usize, size: usize) {
-    let start = start & !63;
-    let end = (start + size + 63) & !63;
+    clean_cache_range(start, start.saturating_add(size));
     unsafe {
-        let mut line = start;
-        while line < end {
-            core::arch::asm!("dc cvac, {}", in(reg) line, options(nostack));
-            line += 64;
-        }
         core::arch::asm!("dsb ish", options(nostack));
     }
 }
