@@ -6,18 +6,19 @@
 > test suite is now **138/138**; the 13/13 figure below is the checkpoint from
 > the earlier SMP session.
 >
-> **Phase 1 is implemented as the opt-in `smp` feature (QEMU only).** Default
-> builds remain single-core. With `no_std,smp` and QEMU `-smp 2`, CPU1 is
-> brought online through a physical AP trampoline, its GICv3/GICv2 PPI and
-> timer are initialized, and it receives IPIs — but **AP task scheduling is
-> deliberately parked** (`AP_TASK_SCHEDULING = false`). Concurrent task
-> migration still hangs after drivers start, so the AP remains in
-> `wait_for_irq` until the scheduler/quiescence work below is finished.
+> **Phases 1–2 are implemented as the opt-in `smp` feature (QEMU only).**
+> Default builds remain single-core. With `no_std,smp` and QEMU `-smp 2`,
+> CPU1 is brought online through a physical AP trampoline, its GICv3/GICv2
+> PPI and timer are initialized, it receives IPIs, and it executes tasks. The
+> scheduler keeps one idle context per CPU; AP idle ids live above the user id
+> space so `SCOUT_ID` and spawn-order identities do not move.
 >
 > Package E2 (owner-aware page-table walks, DRAM-bounded revoke, `CTR_EL0`
-> cache-line helper) remains a single-CPU proof. The ownership/quiescence
-> argument still assumes one table editor under the BKL and one PE per address
-> space; do not enable AP task execution before revalidating it.
+> cache-line helper) was written for the single-CPU model. AP task execution
+> now works on QEMU, but the space-quiescence argument is still open: teardown
+> and DMA revoke have not yet proven that no CPU can hold a translation for a
+> space being freed. Keep kill/reap-under-load and physical SMP in the
+> unproven column.
 
 ## CHECKPOINT (финальные проверки)
 
@@ -74,38 +75,36 @@ Landed behind `--features no_std,smp`; default builds keep `cpu_count() == 1`.
   transiently Ready while still executing on another CPU between
   `schedule_released` and its context switch), and self-continuation restores
   `Running` instead of leaving the current task Ready.
-- **AP task execution is parked.** With AP scheduling enabled, QEMU reaches
-  driver startup and then hangs; the AP itself is healthy (timer/IPI continue).
-  `AP_TASK_SCHEDULING` stays false so Phase 1 is a stable checkpoint.
+- **Phase 1 checkpoint:** APs were brought online with task execution parked
+  (`AP_TASK_SCHEDULING=false`). Phase 2 below enables task execution and fixes
+  the idle-context problem that blocked it.
 
 Verified: `cargo test --lib` 138/138; default `no_std` on QEMU `-smp 2` stays
 single-core and reaches `howl>`; `no_std,smp` on QEMU `-smp 2` shows
 `SMP: CPU1 online` and reaches `howl>`; 60 s run has no panic/BKL-stuck;
 fog QEMU integration remains PASS. No physical hardware SMP.
 
-### Phase 2 attempt: AP task execution is still blocked
+### Phase 2: AP task execution (working on QEMU)
 
-Setting `AP_TASK_SCHEDULING = true` lets the AP run tasks (idle, silverd,
-drivers, shell), but QEMU does not reach a usable prompt. Two separate issues
-were found:
+`AP_TASK_SCHEDULING` is now true in `smp` builds and the AP executes tasks.
 
-1. **Shared-idle livelock.** With one global idle task, a blocked CPU0 could
-   not switch away when CPU1 owned that idle context; it spun through
-   `receive_matching`/`schedule_released` with IRQs masked. A per-CPU idle
-   experiment (one idle task per CPU, ids `0..cpu_count()`) was tried, but it
-   made the shell block even with AP scheduling still parked, so it was
-   reverted. The scheduler keeps the single idle task for now.
-2. **Open: task blocks after the shell banner.** With AP scheduling enabled,
-   the shell (`HOWL`, program 3) prints the fastfetch banner, then its task is
-   `Blocked`; `HOWLER`, several drivers and Scout are also blocked, SFS is a
-   zombie, and both CPUs sit in idle. No panic and no `BKL STUCK`. The shell
-   never reaches `howl ready`/prompt. The likely area is the IPC/console path
-   (`receive_matching` → `drop_glue(MutexGuard<IpcState>)` / console sink
-   mailbox) under concurrent task execution, matching the historical layer-A
-   aliasing/self-loop class rather than a run-queue problem.
+- **Shared-idle livelock fixed.** With one global idle task, a blocked CPU0
+  could not switch away when CPU1 owned that idle context; it spun through
+  `receive_matching`/`schedule_released` with IRQs masked. There is now one
+  idle context per CPU.
+- **The first per-CPU-idle attempt broke the shell for a different reason:**
+  spawning AP idle tasks sequentially shifted `SCOUT_ID` from 2 to 3, so the
+  shell's nameserver RPC waited forever. AP idle tasks are now spawned with
+  ids above the user space (`1 << 40 + cpu`) and an explicit `Task.is_idle`
+  flag; boot-task ids and `SCOUT_ID` stay unchanged.
+- `SYS_TASK_LIST` hides AP idle tasks; boot idle 0 remains visible for
+  compatibility.
 
-The gate stays false. Do **not** enable AP task execution until the blocked
-shell/IPC path is fixed and the space-quiescence work is done.
+Verified on QEMU `-smp 2`: CPU1 online, both CPUs schedule tasks, `howl ready`
+and the prompt appear, `ps` works, and a 60 s run has no panic/BKL-stuck.
+Remaining before calling SMP production-ready: space quiescence for
+teardown/DMA revoke, TLB shootdown under load, kill/reap stress, physical
+hardware validation.
 
 ## Что сделано (фазы 1–6 задания TASK №6)
 
@@ -117,7 +116,7 @@ shell/IPC path is fixed and the space-quiescence work is done.
 | 4. Синхро-примитивы | Mutex/WaitQueue под kernel lock, `bkl_assert_held()` в точках мутации, дока обновлена | написано |
 | 5. IRQ/таймер | gic: `init`/`cpu_init` разделены (banked SGI0+PPI30 в `cpu_init`), `send_sgi_all_but_self` (GICD_SGIR); gicv3: **поиск redistributor по `GICR_TYPER`**, ICC_SGI1R; таймер per-CPU (`cpu_init`), глобальный `TICKS` инкрементирует только CPU0 | написано |
 | 6. TLB | `tlbi vmalle1is` + `dsb ish` в `flush_after_table_change`/`switch_address_space`/`configure_and_enable`; протокол задокументирован в доке | написано |
-| 7. AP-boot | PSCI `CPU_ON` (hvc, 0x84020002), `ap_entry` asm (VBAR, sp), `smp_ap_main` (`mmu::ap_enable` + `kernel_ttbr1()`), `boot_secondary_cpus()` one-shot из первого `schedule()` | написано, **не тестировалось** (заблокировано freeze) |
+| 7. AP-boot | PSCI `CPU_ON` (HVC, `0xC4000003`), physical trampoline, `ApBootParams`, FP/SIMD + MMU enable, `boot_secondary_cpus()` from the first `schedule()` | работает на QEMU `-smp 2` |
 | 8. Shared DMA | под BKL: создание маппингов (syscall) и revoke/teardown взаимоисключены; fail-safe leak сохранён | написано |
 | 9. Тесты | — | **не начинались** |
 
@@ -192,23 +191,19 @@ shell/IPC path is fixed and the space-quiescence work is done.
   __bss_end) для выросшего с SMP образа; (в) build_task_space: не попадает ли
   кадр таблицы задачи в диапазон kernel image при новых размерах.**
 
-## Что дальше (Phase 2)
+## Что дальше (Phase 3)
 
-1. **AP task execution.** Reproduce the post-driver hang with
-   `AP_TASK_SCHEDULING = true`, then decide between per-CPU run queues or a
-   global queue with explicit migration/ownership; the current global vector
-   plus `running_on` checks is not sufficient for sustained AP scheduling.
-2. **Space quiescence.** `destroy_task_space`/`retire_space` and
+1. **Space quiescence.** `destroy_task_space`/`retire_space` and
    `revoke_phys_range` must prove that no CPU can still execute or walk the
    space before freeing tables/frames. BKL serializes editors, not user-mode
    execution or an in-flight TLB translation; add a stop-the-world/IPI
    handshake or a per-space generation quiescence protocol.
-3. **TLB/DMA under SMP.** Re-audit `flush_after_table_change`,
+2. **TLB/DMA under SMP.** Re-audit `flush_after_table_change`,
    `switch_address_space` and `revoke_phys_range` against a second PE holding a
    stale translation; keep `safe_to_free` CPU-only and retain the leak policy.
-4. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
+3. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
    DMA revoke while a client runs, and page-table teardown under load.
-5. **Hardware.** Fog/tablet stay single-core; physical SMP remains unproven.
+4. **Hardware.** Fog/tablet stay single-core; physical SMP remains unproven.
 
 
 ## БЛОКЕР: boot-freeze на `-smp 2` (историческая часть)
@@ -242,15 +237,15 @@ shell/IPC path is fixed and the space-quiescence work is done.
 - `src/scheduler.rs`: `B1/B2` в `block_current_on`, `R1–R4` в
   `schedule_released`, `SCHED_SEEN` в `schedule`.
 - `src/smp.rs`: `BKL STUCK`-детектор в `bkl_acquire`; `BKL_DISABLED`-свитч
-  (оставить механизм, значение `false`); `AP_TASK_SCHEDULING` — Phase 1 gate,
-  сейчас `false`.
+  (оставить механизм, значение `false`); `AP_TASK_SCHEDULING` — runtime gate,
+  в `smp`-сборке `true`.
 - `src/allocator.rs`: `HEAP_PAGES` 512 (бисект) — вернуть 256.
 
 ## Проверки на текущем состоянии
 
 - `cargo test --lib`: **138/138**.
 - Default `no_std` build, QEMU `-smp 2`: single-core, reaches `howl>`.
-- `no_std,smp` build, QEMU `-smp 2`: CPU1 online (GIC/timer/IPI), reaches
-  `howl>`; 60 s without panic/BKL-stuck. AP task execution parked.
+- `no_std,smp` build, QEMU `-smp 2`: CPU1 online (GIC/timer/IPI), both CPUs
+  execute tasks, `howl ready`/prompt and `ps` work; 60 s without panic/BKL-stuck.
 - `no_std,fog` / `no_std,tablet`: build; fog QEMU integration PASS.
 - Physical SMP: **not verified**; fog/tablet remain single-core.

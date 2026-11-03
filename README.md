@@ -128,7 +128,7 @@ device has been booted with it yet.
 cargo build --release --target aarch64-unknown-none \
     --no-default-features --features no_std,fog
 
-# QEMU-only SMP Phase 1: AP online for GIC/timer/IPI, task execution parked
+# QEMU-only SMP: AP online, GIC/timer/IPI and task execution
 cargo build --release --target aarch64-unknown-none \
     --no-default-features --features no_std,smp
 
@@ -633,7 +633,7 @@ not prove device quiescence; both remain driver/IPC-protocol responsibilities.
 | Document | Contents |
 | --- | --- |
 | [redmi10c_poc/README.md](redmi10c_poc/README.md) | Authoritative Redmi 10C / fog bring-up: design, live-FDT policy, fail-closed relocation, QEMU tests, unconfirmed hardware parameters |
-| [SMP_STATUS.md](SMP_STATUS.md) | SMP Phase 1: QEMU AP bring-up behind the `smp` feature; AP task execution and physical SMP are not verified |
+| [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU AP bring-up and task execution behind the `smp` feature; quiescence stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 
 Current verification snapshot (2026-11-03): **138 host tests** pass; the fog
@@ -641,9 +641,10 @@ QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 `howl>`; the demo regression reports 66 PASS / 0 PANIC; all four release
 feature sets (`no_std`, `fog`, `fog-reloc`, `tablet`) build. The opt-in
-`no_std,smp` build on QEMU `-smp 2` brings CPU1 online (GIC/timer/IPI) and
-still reaches `howl>`, but AP task execution is deliberately parked pending
-the scheduler/quiescence work in [SMP_STATUS.md](SMP_STATUS.md). A physical Redmi
+`no_std,smp` build on QEMU `-smp 2` brings CPU1 online, runs tasks on both
+CPUs, and reaches a working `howl>` prompt. Space quiescence for teardown/DMA
+revoke, TLB shootdown under load and physical SMP remain open; see
+[SMP_STATUS.md](SMP_STATUS.md). A physical Redmi
 10C `rain` unit boots the post-E2 RAM-only image to the `fog-ui` panel with
 `GICV3 ONLINE`, `TIMER ONLINE` and growing `TICKS`. The GIC gate deliberately
 does not use `GICR_IGROUPR0`: on Rain it reads zero for timer PPI 18 even

@@ -31,14 +31,12 @@ bounds and a portable cache-line helper.
   `no_std,smp` with QEMU `-smp 2` brings CPU1 online through a physical AP
   trampoline (correct PSCI `0xC4000003` HVC call, physical entry/params,
   `CPACR_EL1` FP/SIMD enable, high-half jump), initializes its GIC/timer and
-  accepts IPIs. **AP task scheduling is parked** (`AP_TASK_SCHEDULING=false`):
-  enabling it makes the shell block after printing the fastfetch banner, before
-  `howl ready`; drivers/Howler are blocked and both CPUs idle. The likely area
-  is the IPC/console path around `drop_glue(MutexGuard<IpcState>)`; a per-CPU
-  idle experiment did not fix it and was reverted. That is the historical
-  layer-A aliasing/self-loop class, not a trivial run-queue bug. Fog/tablet
-  force one CPU; physical SMP is unproven. Details and the Phase 2 list are in
-  [`SMP_STATUS.md`](SMP_STATUS.md).
+  accepts IPIs **and executes tasks**. Per-CPU idle contexts plus AP idle ids
+  above the user id space fixed the shared-idle livelock without shifting
+  `SCOUT_ID`; QEMU `-smp 2` reaches `howl ready`, commands work and a 60 s run
+  is clean. Fog/tablet still force one CPU. Space quiescence for teardown/DMA
+  revoke, TLB shootdown under load and physical SMP remain unproven; details
+  and the Phase 3 list are in [`SMP_STATUS.md`](SMP_STATUS.md).
 - **Redmi 10C / fog RAM-only bring-up is implemented but not hardware-verified.**
   Authoritative document: [`redmi10c_poc/README.md`](redmi10c_poc/README.md).
 - The default `fog` build is **fail-closed**: relocation is disabled, and a

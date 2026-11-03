@@ -23,6 +23,10 @@ const TASK_USER_STACK_PAGES: usize = mmu::USER_STACK_PAGES;
 const TASK_USER_STACK_SIZE: usize = mmu::USER_STACK_SIZE;
 const IDLE_TASK_ID: u64 = 0;
 
+/// AP idle-task ids live above the user id space so spawning them cannot
+/// shift SCOUT_ID or any other spawn-order identity.
+const AP_IDLE_ID_BASE: u64 = 1 << 40;
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaskState {
     Ready,
@@ -98,6 +102,10 @@ pub struct Task {
     envp: Vec<Vec<u8>>,
     cwd: String,
     owns_console: bool,
+    /// True only for per-CPU idle tasks. Kept explicit because AP idle tasks
+    /// are spawned after the boot tasks to preserve SCOUT_ID and the other
+    /// spawn-order identities.
+    is_idle: bool,
     pub context: TaskContext,
     pub stack: MemoryRegion,
     pub user_stack: MemoryRegion,
@@ -288,7 +296,7 @@ pub fn init() {
         console_parent: None,
     });
 
-    let _idle_id = spawn_kernel(idle_task);
+    let _idle_id = spawn_idle(None);
 
     #[cfg(not(feature = "demo-tasks"))]
     {
@@ -390,7 +398,7 @@ pub fn init_fog() {
         console_parent: None,
     });
 
-    let _idle_id = spawn_kernel(idle_task);
+    let _idle_id = spawn_idle(None);
     let _scout_id = spawn_user(user_program::SCOUT, 0).expect("scout must start on fog");
     let howl_id = spawn_user(user_program::HOWL, 0).expect("howl must start on fog");
     let _ = set_console_owner(howl_id);
@@ -399,6 +407,11 @@ pub fn init_fog() {
 }
 
 fn finish_init(first_id: u64) {
+    // AP idle tasks are appended after every boot task, preserving SCOUT_ID
+    // and the other spawn-order identities.
+    for cpu in 1..smp::cpu_count() {
+        let _ = spawn_idle(Some(AP_IDLE_ID_BASE + cpu as u64));
+    }
     let manager = scheduler_manager().unwrap();
     // Per-CPU "current": the boot CPU starts on the first spawned task; APs
     // begin at no-task and pick one in their own first `schedule`.
@@ -1179,6 +1192,7 @@ pub fn task_infos() -> Vec<TaskInfo> {
             manager
                 .tasks
                 .iter()
+                .filter(|task| task.id == IDLE_TASK_ID || !task.is_idle)
                 .map(|task| TaskInfo {
                     id: task.id,
                     state: state_code(task.state),
@@ -1477,6 +1491,32 @@ pub fn schedule() {
 
 fn spawn_kernel(entry: extern "C" fn() -> !) -> Option<u64> {
     spawn_inner(Some(entry), None, Vec::new(), Vec::new(), Vec::new())
+}
+
+/// Spawns one idle task and marks it explicitly. Boot idle is id 0; AP idle
+/// tasks are spawned from `finish_init` so they cannot shift SCOUT_ID or any
+/// other spawn-order identity.
+fn spawn_idle(explicit_id: Option<u64>) -> Option<u64> {
+    let saved_next = {
+        let manager = scheduler_manager()?;
+        let saved = manager.next_id;
+        if let Some(id) = explicit_id {
+            manager.next_id = id;
+        }
+        saved
+    };
+    let result = spawn_kernel(idle_task);
+    if let Some(manager) = scheduler_manager() {
+        if explicit_id.is_some() {
+            manager.next_id = saved_next;
+        }
+        if let Some(id) = result {
+            if let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) {
+                task.is_idle = true;
+            }
+        }
+    }
+    result
 }
 
 pub fn spawn_user(program: u64, argument: u64) -> Option<u64> {
@@ -1843,7 +1883,7 @@ fn find_next_task(manager: &TaskManager, scan_base: usize) -> Option<usize> {
     for offset in 1..=task_count {
         let index = (scan_base + offset) % task_count;
         let task = &manager.tasks[index];
-        if task.id != IDLE_TASK_ID
+        if !task.is_idle
             && task.state == TaskState::Ready
             && task.running_on.is_none()
         {
@@ -2253,6 +2293,7 @@ impl Task {
             id,
             state: TaskState::Ready,
             resume_state: None,
+            is_idle: false,
             program: user.map_or(u64::MAX, |(program, _)| program),
             argument: user.map_or(0, |(_, argument)| argument),
             cap_table,

@@ -218,11 +218,10 @@ static KERNEL_LOCK: KernelLock = KernelLock {
 /// BISECT switch: 1 = kernel lock disabled entirely.
 pub static BKL_DISABLED: AtomicBool = AtomicBool::new(false);
 
-/// Phase-1 gate: APs are online (GIC, timer, IPI) but do not take tasks yet.
-/// Concurrent task execution still needs the per-CPU run-queue/quiescence
-/// work; keep APs parked in `wait_for_irq` until that lands.
+/// Enables AP task execution once the per-CPU idle contexts exist. Kept as a
+/// runtime switch for bisect/rollback; `smp` builds default to true.
 #[cfg(feature = "smp")]
-pub static AP_TASK_SCHEDULING: AtomicBool = AtomicBool::new(false);
+pub static AP_TASK_SCHEDULING: AtomicBool = AtomicBool::new(true);
 
 /// Debug probe chain (read via QEMU monitor `xp` at its physical address,
 /// which equals the identity-mapped VA). Stages: 1=wait entered, 2=irq saved,
