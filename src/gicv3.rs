@@ -32,6 +32,9 @@ const SPURIOUS_IRQ: u32 = 1023;
 const GICR_SGI_OFFSET: usize = 0x1_0000;
 
 const GICD_CTLR: usize = 0x000;
+const GICD_TYPER: usize = 0x004;
+const GICD_IIDR: usize = 0x008;
+const GICD_STATUSR: usize = 0x010;
 const GICD_ISENABLER: usize = 0x100;
 const GICD_ICENABLER: usize = 0x180;
 const GICD_IPRIORITYR: usize = 0x400;
@@ -131,12 +134,22 @@ const GICR_IGROUPR0: usize = 0x080;
 const GICR_ISENABLER0: usize = 0x100;
 const GICR_IPRIORITYR: usize = 0x400;
 const GICR_IGRPMODR0: usize = 0xD00;
+// Read-only diagnostic offsets (no driver writes these).
+const GICR_CTLR: usize = 0x000;
+const GICR_IIDR: usize = 0x004;
+const GICR_ICFGR0: usize = 0xC00;
+const GICR_ICFGR1: usize = 0xC04;
 
 const WAKER_PROCESSOR_SLEEP: u32 = 1 << 1;
 const WAKER_CHILDREN_ASLEEP: u32 = 1 << 2;
 /// GICD_CTLR: Enable Group 1 (Non-secure). bit 0 (Group 0) stays off; this
 /// kernel has no secure-world interrupts.
 const GICD_CTLR_ENABLE_GRP1NS: u32 = 1 << 1;
+/// Affinity routing enable (non-secure). A GICv3 left in legacy mode
+/// (`ARE_NS = 0`) does not route through the redistributor: its SGI/PPI frame
+/// reads as zero and PPI enables are ignored. The live Rain unit was measured
+/// with `GICD_CTLR = 0`, so this bit must be set by the kernel.
+const GICD_CTLR_ARE_NS: u32 = 1 << 4;
 const GICD_CTLR_RWP: u32 = 1 << 31;
 
 /// Shared distributor setup: runs once on the boot CPU.
@@ -297,6 +310,105 @@ pub fn diag_redistributor_snapshot() -> (u32, u32, u32, u32) {
     (pend, en, ctlr as u32, pmr as u32)
 }
 
+/// Read-only GICv3 state used by the framebuffer diagnostic.
+///
+/// Nothing here writes a register, changes a group/security bit, enables a
+/// PPI or acknowledges an interrupt. When no redistributor matches this CPU,
+/// the redistributor-side fields stay zero rather than reading a frame that
+/// could belong to another PE.
+#[derive(Clone, Copy)]
+pub struct DiagGic {
+    pub distributor: usize,
+    pub redistributor: usize,
+    pub stride: usize,
+    pub frames: usize,
+    /// `u32::MAX` when no frame matched this CPU.
+    pub frame_index: u32,
+    pub gicd_ctlr: u32,
+    pub gicd_typer: u32,
+    pub gicd_iidr: u32,
+    pub gicd_statusr: u32,
+    pub gicr_typer: u64,
+    pub gicr_waker: u32,
+    pub gicr_ctlr: u32,
+    pub gicr_iidr: u32,
+    pub gicr_igroupr0: u32,
+    pub gicr_igrpmodr0: u32,
+    pub gicr_isenabler0: u32,
+    pub gicr_ispendr0: u32,
+    pub gicr_icfgr0: u32,
+    pub gicr_icfgr1: u32,
+    /// `GICR_IPRIORITYR[16..20]`: the four PPIs 16-19, including both timer
+    /// PPIs. Read-only and never written by the diagnostic.
+    pub gicr_ipriorityr0: u32,
+    /// `GICR_IPRIORITYR[0..4]`: the first four SGIs.
+    pub gicr_sgi_priorityr: u32,
+}
+
+impl DiagGic {
+    pub const fn empty() -> Self {
+        Self {
+            distributor: 0,
+            redistributor: 0,
+            stride: 0,
+            frames: 0,
+            frame_index: u32::MAX,
+            gicd_ctlr: 0,
+            gicd_typer: 0,
+            gicd_iidr: 0,
+            gicd_statusr: 0,
+            gicr_typer: 0,
+            gicr_waker: 0,
+            gicr_ctlr: 0,
+            gicr_iidr: 0,
+            gicr_igroupr0: 0,
+            gicr_igrpmodr0: 0,
+            gicr_isenabler0: 0,
+            gicr_ispendr0: 0,
+            gicr_icfgr0: 0,
+            gicr_icfgr1: 0,
+            gicr_ipriorityr0: 0,
+            gicr_sgi_priorityr: 0,
+        }
+    }
+}
+
+/// Snapshot of the distributor, the affinity-matched redistributor and the
+/// per-PE SGI/PPI frame. Read-only; see [`DiagGic`].
+pub fn diag_gic() -> DiagGic {
+    ensure_configured();
+    let mut state = DiagGic::empty();
+    state.distributor = gicd();
+    state.redistributor = gicr();
+    state.stride = gicr_stride();
+    state.frames = GICR_MAX_PE_RT.load(Ordering::Relaxed);
+    state.gicd_ctlr = read32(gicd() + GICD_CTLR);
+    state.gicd_typer = read32(gicd() + GICD_TYPER);
+    state.gicd_iidr = read32(gicd() + GICD_IIDR);
+    state.gicd_statusr = read32(gicd() + GICD_STATUSR);
+
+    let Some(redistributor) = redistributor_for_self() else {
+        return state;
+    };
+    if gicr_stride() != 0 {
+        state.frame_index = ((redistributor - gicr()) / gicr_stride()) as u32;
+    }
+    state.gicr_typer = read64(redistributor + GICR_TYPER);
+    state.gicr_waker = read32(redistributor + GICR_WAKER);
+    state.gicr_ctlr = read32(redistributor + GICR_CTLR);
+    state.gicr_iidr = read32(redistributor + GICR_IIDR);
+    let sgi = redistributor + GICR_SGI_OFFSET;
+    state.gicr_igroupr0 = read32(sgi + GICR_IGROUPR0);
+    state.gicr_igrpmodr0 = read32(sgi + GICR_IGRPMODR0);
+    state.gicr_isenabler0 = read32(sgi + GICR_ISENABLER0);
+    state.gicr_ispendr0 = read32(sgi + GICR_ISPENDR0);
+    state.gicr_icfgr0 = read32(sgi + GICR_ICFGR0);
+    state.gicr_icfgr1 = read32(sgi + GICR_ICFGR1);
+    state.gicr_ipriorityr0 = read32(sgi + GICR_IPRIORITYR + 16);
+    state.gicr_sgi_priorityr = read32(sgi + GICR_IPRIORITYR);
+    state
+}
+
 /// Signals `intid` (an SGI) to every CPU in the inner-shareability domain.
 /// ICC_SGI1R_EL1 with IRM=1 broadcasts to all PEs in the domain; a
 /// self-directed SGI is harmless (the handler just re-evaluates the run
@@ -338,15 +450,26 @@ fn configure_uart_spi() {
     // Not enabled: the GICD_ICENABLER reset state already has this bit clear.
 }
 
-fn start_distributor() {
-    // Preserve the bits the bootloader programmed (notably ARE_NS, bit 4):
-    // clearing affinity routing by writing a bare 1<<1 makes SPIs undeliverable
-    // on some ABL revisions. Only force EnableGrp1NS on.
-    let control = read32(gicd() + GICD_CTLR);
-    write32(gicd() + GICD_CTLR, control | GICD_CTLR_ENABLE_GRP1NS);
+fn wait_rwp() {
     while read32(gicd() + GICD_CTLR) & GICD_CTLR_RWP != 0 {
         core::hint::spin_loop();
     }
+}
+
+fn start_distributor() {
+    // The live unit reports GICD_CTLR = 0 after the bootloader, so ARE_NS is
+    // clear and the distributor is still in legacy mode. Affinity routing must
+    // be enabled first, with RWP drained, before EnableGrp1NS is accepted: a
+    // combined write was ignored on this unit and left the redistributor PPI
+    // frame reading all zeroes.
+    let mut control = read32(gicd() + GICD_CTLR);
+    if control & GICD_CTLR_ARE_NS == 0 {
+        write32(gicd() + GICD_CTLR, control | GICD_CTLR_ARE_NS);
+        wait_rwp();
+        control = read32(gicd() + GICD_CTLR);
+    }
+    write32(gicd() + GICD_CTLR, control | GICD_CTLR_ENABLE_GRP1NS);
+    wait_rwp();
 }
 
 pub fn enable_irq(irq: u32) {
