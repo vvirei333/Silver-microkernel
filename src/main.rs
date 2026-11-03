@@ -28,6 +28,7 @@ mod exceptions;
 mod fdt;
 #[cfg(not(feature = "std"))]
 mod fog;
+mod fog_validate;
 #[cfg(not(feature = "std"))]
 mod frame_allocator;
 #[cfg(not(feature = "std"))]
@@ -77,6 +78,21 @@ mod wait_queue;
 
 #[cfg(not(feature = "std"))]
 use core::panic::PanicInfo;
+
+/// C-ABI entry point called from the pre-relocation boot stub. Kept in the
+/// binary (not the shared library) so the host-testable module does not emit
+/// a second global symbol when Cargo links both crates.
+#[no_mangle]
+#[inline(never)]
+pub unsafe extern "C" fn fog_validate_relocation(
+    dtb: *const u8,
+    dst_start: u64,
+    dst_end: u64,
+    src_start: u64,
+    src_end: u64,
+) -> u64 {
+    fog_validate::validate_relocation(dtb, dst_start, dst_end, src_start, src_end)
+}
 
 #[cfg(all(feature = "std", feature = "no_std"))]
 compile_error!("Features 'std' and 'no_std' are mutually exclusive");
@@ -305,10 +321,47 @@ _start:
     // dest < src: require dest_end <= src.
     cmp x16, x23
     b.hi .Lfog_park
-    b .Lfog_copy
+    b .Lfog_fdt_check
 47: // dest > src: require dest >= src_end.
     cmp x13, x15
     b.lo .Lfog_park
+
+.Lfog_fdt_check:
+    // The arithmetic checks above prove only that the copy loop cannot
+    // clobber itself. They do not prove that the destination bytes are free.
+    // Read the live FDT now, while the image is still at the address ABL
+    // chose: the validator accepts only a span inside /memory and outside
+    // every reservation, the DTB and the running source image.
+    //
+    // The call needs a stack, so point SP at this image's own stack through
+    // the actual (pre-relocation) load address. x9/x10/x11 are the measured
+    // hand-over values and must survive the C call.
+    ldr x0, =__stack_top
+    ldr x1, =__kernel_virt_base
+    sub x0, x0, x1                  // link-time physical stack top
+    ldr x1, =__kernel_link_pa
+    sub x1, x23, x1                 // actual - link
+    add x0, x0, x1                  // actual physical stack top
+    mov sp, x0
+
+    stp x9, x10, [sp, #-16]!
+    str x11, [sp, #-16]!
+    mov x0, x22                     // live DTB pointer from x0
+    mov x1, x13                     // destination start
+    mov x2, x16                     // destination end
+    mov x3, x23                     // source start
+    mov x4, x15                     // source end
+    bl fog_validate_relocation
+    ldr x11, [sp], #16
+    ldp x9, x10, [sp], #16
+    cbnz x0, .Lfog_fdt_ok
+    b .Lfog_park
+
+.Lfog_fdt_ok:
+    // The call clobbered the caller-saved range checks; reload the two
+    // values the copy loop itself needs.
+    ldr x13, =__kernel_link_pa
+    ldr x14, [x23, #0x10]
 
 .Lfog_copy:
     // Non-overlapping forward copy. Both directions are covered above.

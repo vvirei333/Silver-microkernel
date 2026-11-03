@@ -15,17 +15,24 @@ fail-closed relocation`).
   never copies into `0x4008_0000` by default.
 - `fog-reloc` is an explicit opt-in. It validates the ARM64 header, image size,
   both source and destination span ends, overflow and every overlap before
-  copying, but still lacks a pre-copy live-FDT proof that the destination is
-  free. It is not the hardware-ready default.
+  copying, **and** runs a pre-copy live-FDT proof (`src/fog_validate.rs`): the
+  destination must be inside `/memory` and outside every reservation,
+  memreserve, the DTB and the running source image. It is still not the
+  hardware-ready default; unknown cell layouts, non-empty `/reserved-memory`
+  `ranges` and malformed trees park.
 - GICv3 no longer falls back to redistributor frame 0. The boot CPU's frame is
   matched by `GICR_TYPER` affinity in bits `[63:32]`; if no frame matches, the
   timer PPI is left disabled and timer-dependent scheduling does not start.
-- Verified in this snapshot: **67 host tests**, fog QEMU relocation/at-link/
-  fail-closed-park cases, normal QEMU boot to `howl>`, demo regression
-  **66 PASS / 0 PANIC**, tablet build, and fog boot image v3.
+- Verified in this snapshot: **77 host tests**, fog QEMU relocation/at-link/
+  fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
+  demo regression **66 PASS / 0 PANIC**, tablet build, and fog boot image v3.
 - **Hardware readiness: NOT READY — NEEDS DEVICE DATA.** The ABL load address,
   live memory/reserved map, UART clock/pins, GIC/timer wiring and boot CPU
   affinity of the specific unit are still unconfirmed.
+- A connected unit was identified as Redmi 10C NFC **`rain`** (`220333QNY`),
+  same `KHAJE`/SM6225 platform but not the non-NFC `fog` codename. Its
+  bootloader is locked (`ro.boot.flash.locked=1`), so no RAM-only boot was
+  attempted. ADB without root cannot read `/proc/iomem` or FDT properties.
 - The obsolete `tablet/` tree (including `tablet/HANDOFF.md`) was removed in
   TASK №20.2. References to it below are historical; the current hardware port
   is `fog`.
@@ -45,7 +52,7 @@ Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
   defined `unregister_mutex` not-found path, ipc receive bisect bypass
   removed).
 - **Verified working at that checkpoint:** single-CPU boot unchanged;
-  `cargo test --lib` 13/13 (the current suite is 67/67); debug and release
+  `cargo test --lib` 13/13 (the current suite is 77/77); debug and release
   builds pass.
 - **NOT working: `-smp 2`** dies at silverd's first blocking IPC receive.
   Two independent failure layers, both new relative to pre-SMP:

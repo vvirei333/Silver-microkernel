@@ -3,7 +3,7 @@
 > **Current project status (2026-11-03):** this file remains the authoritative
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
-> test suite is now **67/67**; the 13/13 figure below is the checkpoint from
+> test suite is now **77/77**; the 13/13 figure below is the checkpoint from
 > this SMP session. `-smp 2` is still **not verified**.
 
 ## CHECKPOINT (финальные проверки)

@@ -75,7 +75,7 @@ userspace.
 - [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh EL0 task with its own W^X address space
 - [x] EL0 fault containment: a crashed EL0 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
 - [x] Power off: the GPU "Power" button shuts QEMU down via PSCI `SYSTEM_OFF`
-- [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation (QEMU-verified only; see below)
+- [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation with pre-copy FDT destination validation (QEMU-verified only; see below)
 - [ ] Real Redmi 10C boot to `howl>` — **not yet verified on hardware**
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
 - [ ] SMP (`-smp 2`): **in progress, not working yet** — see `SMP_STATUS.md`. Single-CPU boot is the verified configuration; under `-smp 2` the kernel does not survive silverd's first blocking IPC receive. Known open issues: compiler-generated self-loops on reachable paths in O3+LTO builds (absent pre-SMP, root cause not established), and an O1-run infinite Prefetch Abort (ESR `0x86000006`, FAR `0x40081a00`) pointing at kernel translation-table damage still under investigation. CPU1 stays offline (PSCI `CPU_ON` returns `-1`). Do not boot on hardware expecting SMP.
@@ -103,17 +103,21 @@ Implemented:
 - [x] **Fail-closed relocation by default.** A standard `fog` build never
       copies the image. If ABL enters it at anything other than the link
       address, it records `pc`/`link`/`delta` in `BOOT_PARAMS` and parks.
-- [x] Opt-in `fog-reloc` feature for controlled experiments. It validates the
-      ARM64 header, image size, both source and destination span ends,
-      overflow and every overlap before copying.
+- [x] Opt-in `fog-reloc` feature for controlled experiments. Before copying it
+      validates the ARM64 header, image size, both source and destination span
+      ends, overflow and every overlap, **and** reads the live FDT to prove the
+      destination is inside `/memory` and outside every reservation,
+      memreserve, the DTB and the running source image. Unknown cell layouts,
+      non-empty `/reserved-memory` `ranges` and malformed trees fail closed.
 - [x] RAM-only boot image v3 builder (builds only; never flashes or runs a
       device command)
 - [ ] Real-device boot and `howl>` on the Redmi 10C — **not yet verified**
 
 The default fog image is intentionally conservative: it will not write outside
-its own loaded image when the placement is unexpected. `fog-reloc` is not a
-hardware-ready default because the destination still needs a pre-copy live-FDT
-proof that the bytes are free.
+its own loaded image when the placement is unexpected. `fog-reloc` now performs
+the pre-copy live-FDT proof, but it remains an opt-in experiment: the check is
+deliberately conservative (2/2 cells, no `ranges` translation), and no real
+device has been booted with it yet.
 
 ```bash
 # Kernel (default, fail-closed)
@@ -437,6 +441,7 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `src/memory.rs` | Physical memory map and high-half address conversion; fog DRAM window |
 | `src/fdt.rs` | Allocation-free FDT parser and fog boot-memory planner |
 | `src/fog.rs` | khaje/SM6225 probe, live FDT policy, memory window and banner |
+| `src/fog_validate.rs` | Pre-relocation live-FDT destination proof (no allocation, no statics) |
 | `src/geni_uart.rs` | Qualcomm GENI SE UART TX/polled RX driver |
 | `src/gicv3.rs` | Runtime GICv3 distributor/redistributor setup and IRQ dispatch |
 | `src/gicv3_policy.rs` | Host-tested GICR_TYPER affinity matching |
@@ -595,10 +600,11 @@ limited or absent, so denial-of-service resistance remains incomplete.
 | [SMP_STATUS.md](SMP_STATUS.md) | SMP investigation status; `-smp 2` is still not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 
-Current verification snapshot (2026-11-03): 67 host tests pass; the fog QEMU
-suite covers relocation, at-link boot and fail-closed park; normal QEMU reaches
-`howl>`; the demo regression reports 66 PASS / 0 PANIC; the tablet build and
-fog boot image v3 build succeed. Real-device status remains **not verified**.
+Current verification snapshot (2026-11-03): 77 host tests pass; the fog QEMU
+suite covers relocation, at-link boot, default fail-closed park and an
+FDT-reserved-destination rejection; normal QEMU reaches `howl>`; the demo
+regression reports 66 PASS / 0 PANIC; the tablet build and fog boot image v3
+build succeed. Real-device status remains **not verified**.
 
 ## License
 

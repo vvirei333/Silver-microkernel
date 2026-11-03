@@ -11,6 +11,8 @@
 #   3. standard `fog` build entered 4 MiB above the link address: relocation
 #      is disabled by default, so the stub must publish diagnostics and park
 #      without booting.
+#   4. `fog-reloc` with a DTB whose /reserved-memory covers the destination:
+#      the pre-copy live-FDT validator must reject it and park before copying.
 #
 # Requirements: cargo (aarch64-unknown-none target), qemu-system-aarch64,
 # dtc, and llvm-objcopy or aarch64-linux-gnu-objcopy.
@@ -135,14 +137,33 @@ DTS
 
 dtc -I dts -O dtb -o "$TMP/fog_test.dtb" "$TMP/fog_test.dts" 2>/dev/null
 
+# Same tree, but the relocation destination is covered by /reserved-memory.
+# The stub's arithmetic checks still pass; only the pre-copy FDT validation
+# can reject this, so this case proves that the validator is actually used.
+python3 - "$TMP/fog_test.dts" "$TMP/fog_test_blocked.dts" <<'PY'
+import sys
+from pathlib import Path
+source = Path(sys.argv[1]).read_text()
+insert = """        blocked@40080000 {
+            reg = <0x0 0x40080000 0x0 0x00180000>;
+            no-map;
+        };
+"""
+marker = "        probe_reserved: probe@47f00000 {"
+if marker not in source:
+    raise SystemExit("test DTS marker not found")
+Path(sys.argv[2]).write_text(source.replace(marker, insert + marker))
+PY
+dtc -I dts -O dtb -o "$TMP/fog_test_blocked.dtb" "$TMP/fog_test_blocked.dts" 2>/dev/null
+
 run_qemu() {
-    local image="$1" log="$2" seconds="$3"
+    local image="$1" log="$2" seconds="$3" dtb="${4:-$TMP/fog_test.dtb}"
     set +e
     timeout "$seconds" qemu-system-aarch64 \
         -machine virt,gic-version=3 \
         -cpu cortex-a72 -smp 2 -m 128M \
         -kernel "$image" \
-        -dtb "$TMP/fog_test.dtb" \
+        -dtb "$dtb" \
         -display none -serial stdio -monitor none -no-reboot \
         >"$log" 2>&1
     set -e
@@ -200,11 +221,24 @@ else
     echo "PASS (fail-closed): no console output, no howl>"
 fi
 
+echo "== fog-reloc: destination covered by /reserved-memory =="
+run_qemu "$TMP/Image.reloc.high" "$TMP/fdt_reject.log" 5 "$TMP/fog_test_blocked.dtb"
+if grep -aqF "howl>" "$TMP/fdt_reject.log"; then
+    echo "FAIL (FDT validation): relocation copied into a reserved destination"
+    fail=1
+elif grep -aqF "SILVER BOOT PARAMS OK" "$TMP/fdt_reject.log"; then
+    echo "FAIL (FDT validation): boot continued after the FDT rejected the destination"
+    fail=1
+else
+    echo "PASS (FDT validation): rejected before copy, no console output, no howl>"
+fi
+
 if [ "$fail" -ne 0 ]; then
     echo "FOG QEMU TEST: FAIL"
     exit 1
 fi
 
 echo "FOG QEMU TEST: PASS"
-echo "relocation: explicit fog-reloc 0x40400000 -> 0x40080000"
+echo "relocation: explicit fog-reloc 0x40400000 -> 0x40080000 (FDT-validated)"
 echo "default fog: boots at 0x40080000; parks at 0x40400000 without howl>"
+echo "FDT reject: reserved destination parks before copy"

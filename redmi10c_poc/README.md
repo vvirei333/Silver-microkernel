@@ -29,6 +29,11 @@ desktop boot are out of scope for the first hardware milestone.
   address differs from the link address it writes `pc`/`link`/`delta` into
   `BOOT_PARAMS` and parks. The self-relocation copy is an explicit
   `fog-reloc` build feature.
+- `fog-reloc` now performs a **pre-copy live-FDT check**: the destination span
+  must be inside `/memory` and outside every `/reserved-memory` child, the
+  memreserve map, the DTB and the running source image. The validator uses no
+  allocation or statics and fails closed on unknown cell layouts, non-empty
+  `ranges` or malformed trees.
 - Platform identity, memory, reservations, UART, GICv3 and the timer INTID are
   read from the live FDT. Nothing is inferred from "unknown CPU means tablet".
 - A full fog-path integration test runs on QEMU `virt` with a synthetic
@@ -45,10 +50,11 @@ the same addresses or devices exist on the phone.
 
 | Check | Result |
 | --- | --- |
-| Host unit tests | 67 passed / 0 failed |
-| Fog QEMU, `fog-reloc` at `0x4040_0000` | PASS: relocation, `TIMER TEST: ticks=30`, `howl>` |
+| Host unit tests | 77 passed / 0 failed |
+| Fog QEMU, `fog-reloc` at `0x4040_0000` | PASS: FDT-validated relocation, `TIMER TEST: ticks=30`, `howl>` |
 | Fog QEMU, default at `0x4008_0000` | PASS: no relocation, `howl>` |
 | Fog QEMU, default at `0x4040_0000` | PASS fail-closed: no serial output, no `howl>`; `BOOT_PARAMS` holds pc/link/delta |
+| Fog QEMU, `fog-reloc` into a reserved destination | PASS fail-closed: FDT rejects before copy, no serial output, no `howl>` |
 | Normal QEMU | PASS: `PLATFORM=QEMU`, timer ticks, `howl>` |
 | Demo regression | 66 PASS / 0 unexpected FAIL / 0 PANIC |
 | Tablet build | PASS |
@@ -60,6 +66,33 @@ disabled, `TIMER TEST` is skipped and the scheduler does not pretend that
 preemption works.
 
 Hardware readiness remains **NOT READY — NEEDS DEVICE DATA**.
+
+### Connected-unit note (2026-11-03)
+
+A unit was reachable over ADB: Xiaomi `220333QNY`, codename **`rain`** (Redmi
+10C NFC), `ro.product.name=rain_global`, `ro.board.platform=bengal`,
+`ro.soc.model=SM6225`, `/sys/devices/soc0/machine=KHAJE`, 4 GB RAM. It is the
+same khaje/SM6225 family as `fog`, but it is not the non-NFC `fog` codename.
+
+The bootloader is **locked** (`ro.boot.flash.locked=1`,
+`ro.boot.verifiedbootstate=green`, `user`/`release-keys`), so a RAM-only
+`fastboot boot` is not possible without unlocking. No unlock, flash or boot
+was attempted. ADB without root cannot read `/proc/iomem` or the FDT
+properties; only directory names and some `/sys` files were available.
+
+Useful read-only observations from `rain`:
+
+- `/sys/devices/soc0/machine = KHAJE`, `soc_id = 518`, family Snapdragon;
+- `/sys/firmware/devicetree/base/reserved-memory` includes `hyp_region@45700000`,
+  `sec_apps_region@45fff000`, `xbl_aop_region@45e00000`,
+  `smem_region@46000000`, `modem_region@4ab00000`, `adsp`/`cdsp` regions around
+  `0x51..0x53`, `cont_splash_region@5c000000`, `ramoops@5D000000` and
+  `removed_region@60000000`;
+- 4 GB RAM (`MemTotal` ≈ 3.75 GB), dtbo overlay index 58.
+
+These are `rain` observations, not proof for a `fog` unit. They do support the
+assumption that the low region around `0x4008_0000` is free, but that must be
+confirmed from the live `fog` FDT before any hardware boot.
 
 ## Architecture decision
 
@@ -92,8 +125,14 @@ diagnostics. `--features no_std,fog,fog-reloc` enables the copy path, which
 still fails closed on a bad ARM64 header, a wild image size, an unaligned or
 out-of-range source/destination span (both ends), an overflowing span, or any
 overlap. Address match alone is never treated as proof of the hardware map.
-The remaining architectural requirement is a pre-copy live-FDT validation of
-the destination; until then `fog-reloc` is for controlled experiments only.
+
+The pre-copy live-FDT validation is now implemented in `src/fog_validate.rs`:
+the destination must be inside a `/memory` region and outside every
+reservation, memreserve, the DTB and the source image. It is deliberately
+conservative (2/2 address/size cells, no `ranges` translation) and returns
+"park" on anything it cannot prove. `fog-reloc` therefore remains an opt-in
+experiment until it has been exercised on a real unit; the default build still
+never copies.
 
 ## Boot flow
 
@@ -107,7 +146,8 @@ the destination; until then `fog-reloc` is for controlled experiments only.
    - if the actual base differs from `__kernel_link_pa`:
      - standard build: publish `BOOT_PARAMS` and park (no copy);
      - `fog-reloc` build: validate magic, size, both span ends, overflow and
-       non-overlap, then copy the whole image and continue inside the copy;
+       non-overlap, then run the pre-copy live-FDT destination proof, then copy
+       the whole image and continue inside the copy;
    - publish `BOOT_PARAMS` in `.data`;
    - set `SP_EL1` to the image's own stack;
    - zero `.bss`, build boot page tables, enable the MMU, jump to the high
@@ -240,14 +280,16 @@ command but does not run it.
 redmi10c_poc/test_fog_qemu.sh
 ```
 
-The test builds two kernels and runs three cases:
+The test builds two kernels and runs four cases:
 
 - `fog-reloc` entered at `0x4040_0000` while linked at `0x4008_0000`: the
   explicit copy path must relocate and reach the full banner plus `howl>`;
 - standard `fog` entered exactly at `0x4008_0000`: no copy is needed and the
   default build must boot normally;
 - standard `fog` entered at `0x4040_0000`: relocation is disabled, so the stub
-  must park without printing the banner or reaching `howl>`.
+  must park without printing the banner or reaching `howl>`;
+- `fog-reloc` with a DTB whose `/reserved-memory` covers `0x4008_0000`: the
+  pre-copy FDT validation must reject the destination and park before copying.
 
 All cases boot QEMU `virt` with `gic-version=3` and a synthetic khaje-like DTB.
 The GICv3 redistributor is located by `GICR_TYPER` affinity; a missing match is
@@ -285,6 +327,11 @@ These are **not** established facts for this unit and must be measured:
 - whether `0x4008_0000` is free when ABL loads elsewhere;
 - UART availability, pins, pin mux and SE clock state;
 - the exact live DRAM banks and reserved-memory carve-outs of this unit;
+- the live FDT cell layout (`#address-cells`/`#size-cells`) and whether
+  `/reserved-memory` uses non-empty `ranges`; the validator parks if either is
+  outside its conservative 2/2, absolute-reg support;
+- whether the target is a `fog` unit or the NFC `rain` sibling; the connected
+  `rain` unit is the same KHAJE/SM6225 platform but is not a `fog` measurement;
 - the boot CPU identity beyond the `MPIDR_EL1` value in the log;
 - the boot CPU's redistributor affinity in the live `GICR_TYPER` map;
 - the boot image format/AVB requirements of the installed bootloader;
@@ -324,6 +371,8 @@ log says so.
 - `src/fdt.rs` — allocation-free DTB parser and boot-memory planner (host
   tested).
 - `src/reloc.rs` — host-tested relocation boundary policy mirrored by the stub.
+- `src/fog_validate.rs` — pre-relocation live-FDT destination proof (host
+  tested; called from the assembly stub before any copy).
 - `src/fog.rs` — khaje probe, FDT-derived memory window, banner.
 - `src/memory.rs` — fog DRAM window and the FDT-selected allocator window.
 - `src/platform.rs` — `Kind::{Qemu,Sm8650,Fog,Unknown}`.

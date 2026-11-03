@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod fdt;
+pub mod fog_validate;
 pub mod gicv3_policy;
 pub mod reloc;
 pub mod wait_queue;
