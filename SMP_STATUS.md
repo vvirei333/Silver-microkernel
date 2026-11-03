@@ -106,6 +106,26 @@ Remaining before calling SMP production-ready: space quiescence for
 teardown/DMA revoke, TLB shootdown under load, kill/reap stress, physical
 hardware validation.
 
+### Phase 3: conservative space-quiescence gate
+
+The first quiescence step is implemented without a stop-the-world protocol:
+
+- `scheduler::space_is_running(ttbr0)` scans every online CPU's current task;
+  `destroy_task_space` refuses and leaks a space whose root is still current on
+  a CPU.
+- `mmu::range_mapped_by(ttbr0, base, end)` performs a read-only, owner-checked
+  walk of the MMIO window. It returns `true` for a mapping or for any
+  malformed/foreign table (fail-closed).
+- DMA reclamation checks all running tasks before clearing the first PTE. If a
+  running CPU still maps the range, the whole range is deferred and its frames
+  are leaked (`DMA_LEAKED_FRAMES`); otherwise the existing per-space revoke
+  proceeds.
+
+This closes the obvious "revoke underneath a running user context" hole, but
+it is a **conservative leak policy**, not a full quiescence proof. In-flight
+user accesses, a stop-the-world/IPI handshake and TLB shootdown stress remain
+Phase 4 work.
+
 ## Что сделано (фазы 1–6 задания TASK №6)
 
 | Фаза | Содержание | Состояние |
@@ -191,13 +211,12 @@ hardware validation.
   __bss_end) для выросшего с SMP образа; (в) build_task_space: не попадает ли
   кадр таблицы задачи в диапазон kernel image при новых размерах.**
 
-## Что дальше (Phase 3)
+## Что дальше (Phase 4)
 
-1. **Space quiescence.** `destroy_task_space`/`retire_space` and
-   `revoke_phys_range` must prove that no CPU can still execute or walk the
-   space before freeing tables/frames. BKL serializes editors, not user-mode
-   execution or an in-flight TLB translation; add a stop-the-world/IPI
-   handshake or a per-space generation quiescence protocol.
+1. **Stop-the-world / real quiescence.** The current `space_is_running` +
+   `range_mapped_by` gate leaks on a live mapping. Replace it with an
+   IPI/stop-the-world handshake or a per-space generation protocol that can
+   prove no CPU holds a translation before freeing.
 2. **TLB/DMA under SMP.** Re-audit `flush_after_table_change`,
    `switch_address_space` and `revoke_phys_range` against a second PE holding a
    stale translation; keep `safe_to_free` CPU-only and retain the leak policy.

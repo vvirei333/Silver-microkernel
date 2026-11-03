@@ -642,8 +642,10 @@ FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 `howl>`; the demo regression reports 66 PASS / 0 PANIC; all four release
 feature sets (`no_std`, `fog`, `fog-reloc`, `tablet`) build. The opt-in
 `no_std,smp` build on QEMU `-smp 2` brings CPU1 online, runs tasks on both
-CPUs, and reaches a working `howl>` prompt. Space quiescence for teardown/DMA
-revoke, TLB shootdown under load and physical SMP remain open; see
+CPUs, and reaches a working `howl>` prompt. Teardown now has a conservative
+quiescence gate: a space still current on a CPU is not destroyed, and a DMA
+range mapped by a running task is deferred and leaked instead of revoked.
+Stop-the-world, TLB shootdown under load and physical SMP remain open; see
 [SMP_STATUS.md](SMP_STATUS.md). A physical Redmi
 10C `rain` unit boots the post-E2 RAM-only image to the `fog-ui` panel with
 `GICV3 ONLINE`, `TIMER ONLINE` and growing `TICKS`. The GIC gate deliberately

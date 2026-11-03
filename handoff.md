@@ -36,7 +36,10 @@ bounds and a portable cache-line helper.
   `SCOUT_ID`; QEMU `-smp 2` reaches `howl ready`, commands work and a 60 s run
   is clean. Fog/tablet still force one CPU. Space quiescence for teardown/DMA
   revoke, TLB shootdown under load and physical SMP remain unproven; details
-  and the Phase 3 list are in [`SMP_STATUS.md`](SMP_STATUS.md).
+  and the Phase 4 list are in [`SMP_STATUS.md`](SMP_STATUS.md). A conservative
+  quiescence gate now refuses to destroy a space still current on a CPU and
+  defers/leaks DMA ranges mapped by a running task (`range_mapped_by` /
+  `space_is_running`).
 - **Redmi 10C / fog RAM-only bring-up is implemented but not hardware-verified.**
   Authoritative document: [`redmi10c_poc/README.md`](redmi10c_poc/README.md).
 - The default `fog` build is **fail-closed**: relocation is disabled, and a

@@ -1029,6 +1029,58 @@ fn follow_validated_table(descriptor: u64, expected_owner: usize) -> Option<usiz
     Some(physical)
 }
 
+/// Read-only quiescence check: does `ttbr0` currently map any page whose
+/// physical address lies in `[phys_base, phys_end)`?
+///
+/// `true` is conservative: a malformed or foreign table also returns `true`,
+/// because the caller must not revoke/free a range it cannot prove absent
+/// from a running CPU's address space. A missing level or an empty L3 means
+/// the range is not mapped and returns `false`.
+pub fn range_mapped_by(ttbr0: usize, phys_base: usize, phys_end: usize) -> bool {
+    if !page_range_within(phys_base, phys_end, GRANULE, DRAM_BASE, DRAM_END)
+        || !space_root_valid(ttbr0)
+    {
+        return true;
+    }
+    unsafe {
+        let root_entry = read_entry(ttbr0, 0);
+        if root_entry == 0 {
+            return false;
+        }
+        let Some(l1_user) = follow_validated_table(root_entry, ttbr0) else {
+            return true;
+        };
+        let l1_entry = read_entry(l1_user, USER_MMIO_L1_INDEX);
+        if l1_entry == 0 {
+            return false;
+        }
+        let Some(l2_mmio) = follow_validated_table(l1_entry, ttbr0) else {
+            return true;
+        };
+        let l2_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
+        if l2_entry == 0 {
+            return false;
+        }
+        let Some(l3_mmio) = follow_validated_table(l2_entry, ttbr0) else {
+            return true;
+        };
+        for index in 0..ENTRIES {
+            let entry = read_entry(l3_mmio, index);
+            if entry == 0 {
+                continue;
+            }
+            if entry & DESC_PAGE != DESC_PAGE {
+                return true;
+            }
+            let physical = descriptor_address(entry) as usize;
+            if physical >= phys_base && physical < phys_end {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Revokes every page mapping whose physical address lies in the half-open
 /// range `[phys_base, phys_end)` from the MMIO window of one address space.
 ///
@@ -1380,6 +1432,17 @@ fn destroy_task_space_inner(
     private_page_generation: u32,
     diagnose: bool,
 ) -> bool {
+    // Quiescence proof: a space still current on an online CPU may have live
+    // translations and a walker inside its tables. Refuse and leak rather
+    // than retire it underneath that CPU.
+    if crate::scheduler::space_is_running(space.frame()) {
+        if diagnose {
+            crate::console::write_str("MMU: destroy refused, space still running on a CPU 0x");
+            crate::console::write_hex_u64(space.frame() as u64);
+            crate::console::write_str(" - leaked\r\n");
+        }
+        return false;
+    }
     let retired = PAGE_TABLE_FRAMES.lock().retire_space(space);
     let tokens = match retired {
         SpaceRetire::Retired(tokens) => tokens,

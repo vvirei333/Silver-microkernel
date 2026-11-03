@@ -1042,6 +1042,34 @@ pub fn current_task_id() -> u64 {
         .unwrap_or(0)
 }
 
+/// True when an online CPU is currently executing a task in `ttbr0`'s
+/// address space. The kernel lock must be held. `ttbr0 == 0` is the kernel
+/// context and never owns user tables.
+pub fn space_is_running(ttbr0: usize) -> bool {
+    if ttbr0 == 0 {
+        return false;
+    }
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    for cpu in 0..smp::cpu_count() {
+        if !smp::cpu_online(cpu) {
+            continue;
+        }
+        let index = smp::current_index_of(cpu);
+        let Some(task) = manager.tasks.get(index) else {
+            continue;
+        };
+        if task.state == TaskState::Running
+            && task.running_on == Some(cpu)
+            && task.ttbr0 == ttbr0
+        {
+            return true;
+        }
+    }
+    false
+}
+
 /// Parent PID of the calling task, or `None` for boot-spawned tasks.
 pub fn current_task_ppid() -> Option<u64> {
     current_task_mut().and_then(|task| task.ppid)
@@ -2005,6 +2033,24 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
                 dma_revokes.push((physical, page_count, fail));
                 continue;
             };
+            // Quiescence: a range mapped by a task currently executing on
+            // another CPU must not be revoked or freed underneath it. Abort
+            // the whole range before the first PTE is cleared; the caller
+            // leaks the frames. Non-running spaces are still safe to scan.
+            let running_mapping = manager.tasks.iter().any(|task| {
+                task.running_on.is_some()
+                    && task.ttbr0 != 0
+                    && mmu::range_mapped_by(task.ttbr0, physical, phys_end)
+            });
+            if running_mapping {
+                console::write_str("DMA revoke: range 0x");
+                console::write_hex_u64(physical as u64);
+                console::write_str("-0x");
+                console::write_hex_u64(phys_end as u64);
+                console::write_str(": deferred, live CPU mapping - leaked\r\n");
+                dma_revokes.push((physical, page_count, fail));
+                continue;
+            }
             let mut aggregated = mmu::RevokeResult {
                 unmapped: 0,
                 safe_to_free: true,
