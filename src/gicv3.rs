@@ -360,16 +360,18 @@ fn configure_ppi(redistributor: usize) -> bool {
     let sgi = redistributor + GICR_SGI_OFFSET;
     let timer_bit = 1_u32 << (timer_irq() % 32);
     let sgi_bit = 1_u32 << (RESCHEDULE_IRQ % 32);
+    let quiesce_bit = 1_u32 << (crate::gic::QUIESCE_IRQ % 32);
+    let ipi_bits = sgi_bit | quiesce_bit;
 
-    let groupr = read32(sgi + GICR_IGROUPR0) | timer_bit | sgi_bit;
+    let groupr = read32(sgi + GICR_IGROUPR0) | timer_bit | ipi_bits;
     write32(sgi + GICR_IGROUPR0, groupr);
-    let grpmodr = read32(sgi + GICR_IGRPMODR0) & !(timer_bit | sgi_bit);
+    let grpmodr = read32(sgi + GICR_IGRPMODR0) & !(timer_bit | ipi_bits);
     write32(sgi + GICR_IGRPMODR0, grpmodr);
     // The NS physical timer asserts its line level-style while
     // CNTP_CTL.IStatus is set, which is what the reset ICFGR0 value
     // describes — no config change needed for a PPI.
     write8(sgi + GICR_IPRIORITYR + timer_irq() as usize, 0xA0);
-    write32(sgi + GICR_ISENABLER0, timer_bit | sgi_bit);
+    write32(sgi + GICR_ISENABLER0, timer_bit | ipi_bits);
 
     // The live unit has been seen with the enable bit silently clear even
     // though the write completed. Treat the readback as the only proof.
@@ -673,6 +675,10 @@ pub fn handle_irq() {
         RESCHEDULE_IRQ => {
             end_interrupt(acknowledge_register);
             scheduler::schedule();
+        }
+        crate::gic::QUIESCE_IRQ => {
+            end_interrupt(acknowledge_register);
+            crate::smp::quiesce_ack_and_wait();
         }
         SPURIOUS_IRQ => {}
         _ if irq == timer_irq() => {

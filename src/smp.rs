@@ -313,12 +313,24 @@ pub fn bkl_acquire() {
         *depth += 1;
         return;
     }
+    if QUIESCE_ACTIVE.load(Ordering::Acquire)
+        && KERNEL_LOCK.owner.load(Ordering::Relaxed) != cpu.cpu_id as isize
+    {
+        // The quiescing CPU owns the BKL. Kernel code cannot take SGI1 with
+        // IRQs masked, so acknowledge from the BKL wait loop instead.
+        quiesce_ack_and_wait();
+    }
     // The retry loop must be opaque to the optimizer: an empty-body
     // `while cmpxchg { spin_loop() }` was lowered by LLVM to a bare `b .`
     // (the atomic retry got deleted with the loop), hanging the kernel on
     // the first contended acquire. The asm `yield` makes the loop real.
     let mut spins: u32 = 0;
     loop {
+        if QUIESCE_ACTIVE.load(Ordering::Acquire)
+            && KERNEL_LOCK.owner.load(Ordering::Relaxed) != cpu.cpu_id as isize
+        {
+            quiesce_ack_and_wait();
+        }
         let matched = KERNEL_LOCK
             .owner
             .compare_exchange_weak(
@@ -477,6 +489,99 @@ pub fn ipi_reschedule_others() {
     if cpu_count() > 1 {
         crate::gic::send_sgi_all_but_self(crate::gic::RESCHEDULE_IRQ);
     }
+}
+
+// ---------------------------------------------------------------------------
+// Stop-the-world quiescence
+// ---------------------------------------------------------------------------
+
+static QUIESCE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static QUIESCE_RELEASE: AtomicBool = AtomicBool::new(false);
+static QUIESCE_ACK: [AtomicBool; MAX_CPUS] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+
+/// Parks the calling CPU until the quiescing CPU releases the world. Called
+/// from the SGI1 handler and from `bkl_acquire` waiters (which cannot take an
+/// IRQ because kernel code runs with IRQs masked). The caller must not hold
+/// the BKL: the quiescing CPU owns it while the world is stopped.
+pub fn quiesce_ack_and_wait() {
+    // Complete every memory access issued before the stop request before
+    // telling the reaper that this CPU is quiescent.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack));
+    }
+    let cpu = this_cpu_id();
+    if cpu < MAX_CPUS {
+        QUIESCE_ACK[cpu].store(true, Ordering::Release);
+    }
+    while !QUIESCE_RELEASE.load(Ordering::Acquire) {
+        unsafe {
+            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Stops every other online CPU at a safe point. Must be called with the BKL
+/// held; returns false (and releases everyone) on timeout, in which case the
+/// caller must fail closed and leak. The caller must pair a `true` with
+/// [`quiesce_end`].
+pub fn quiesce_begin() -> bool {
+    if cpu_count() <= 1 {
+        return true;
+    }
+    for ack in &QUIESCE_ACK {
+        ack.store(false, Ordering::Relaxed);
+    }
+    QUIESCE_RELEASE.store(false, Ordering::Release);
+    QUIESCE_ACTIVE.store(true, Ordering::SeqCst);
+    crate::gic::send_sgi_all_but_self(crate::gic::QUIESCE_IRQ);
+
+    let me = this_cpu_id();
+    let mut spins: u32 = 0;
+    loop {
+        let mut all = true;
+        for cpu in 0..cpu_count() {
+            if cpu == me || !cpu_online(cpu) {
+                continue;
+            }
+            if !QUIESCE_ACK[cpu].load(Ordering::Acquire) {
+                all = false;
+                // Re-send periodically in case an SGI was coalesced while
+                // the target was still in a masked kernel section.
+                if spins % 100_000 == 0 && spins != 0 {
+                    crate::gic::send_sgi_all_but_self(crate::gic::QUIESCE_IRQ);
+                }
+                break;
+            }
+        }
+        if all {
+            return true;
+        }
+        spins += 1;
+        if spins >= 20_000_000 {
+            QUIESCE_RELEASE.store(true, Ordering::Release);
+            QUIESCE_ACTIVE.store(false, Ordering::Release);
+            return false;
+        }
+        unsafe {
+            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Releases CPUs parked by [`quiesce_begin`].
+pub fn quiesce_end() {
+    QUIESCE_RELEASE.store(true, Ordering::Release);
+    QUIESCE_ACTIVE.store(false, Ordering::Release);
+}
+
+/// True while a stop-the-world request is active.
+pub fn quiesce_active() -> bool {
+    QUIESCE_ACTIVE.load(Ordering::Acquire)
 }
 
 /// Kernel-lock depth on this CPU (0 = not held). Used by kernel-task entry

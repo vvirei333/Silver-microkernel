@@ -43,6 +43,9 @@ const SPURIOUS_IRQ: u32 = 1023;
 /// Reschedule inter-processor interrupt (SGI 0). Any CPU that makes a task
 /// Ready kicks every other CPU so it re-evaluates its run queue.
 pub const RESCHEDULE_IRQ: u32 = 0;
+/// Stop-the-world acknowledgement SGI. A CPU receiving this parks at EL1
+/// until the quiescing CPU releases the world.
+pub const QUIESCE_IRQ: u32 = 1;
 
 /// Consecutive unknown INTIDs that could not be masked in a proven scope.
 /// Reset by a successful mask. See `irq_policy::UNMASKABLE_HALT_LIMIT`.
@@ -147,6 +150,10 @@ pub fn init() {
     );
     enable_irq(UART_IRQ);
 
+    // Boot CPU's banked SGIs: reschedule and quiesce. APs get the same set
+    // from `cpu_init`.
+    enable_irq(RESCHEDULE_IRQ);
+    enable_irq(QUIESCE_IRQ);
     // BISECT: monolithic original ordering (timer enable before GICD/GICC enable)
     enable_irq(TIMER_IRQ);
     write32(CPU_INTERFACE_BASE + GICC_PMR, 0xFF);
@@ -164,8 +171,9 @@ pub fn cpu_init() {
         return;
     }
 
-    // Banked enable: SGI0 (reschedule) and this CPU's timer PPI.
+    // Banked enable: SGI0 (reschedule), SGI1 (quiesce) and this CPU's timer PPI.
     enable_irq(RESCHEDULE_IRQ);
+    enable_irq(QUIESCE_IRQ);
     enable_irq(TIMER_IRQ);
 
     write32(CPU_INTERFACE_BASE + GICC_PMR, 0xFF);
@@ -329,7 +337,11 @@ pub extern "C" fn silver_handle_irq() {
     let acknowledge_register = acknowledge();
     let irq = acknowledge_register & 0x3FF;
 
-    if irq != TIMER_IRQ && irq != RESCHEDULE_IRQ && irq != SPURIOUS_IRQ {
+    if irq != TIMER_IRQ
+        && irq != RESCHEDULE_IRQ
+        && irq != QUIESCE_IRQ
+        && irq != SPURIOUS_IRQ
+    {
         // The probe and the wake must be one kernel-lock-protected step:
         // another CPU could otherwise change the binding in between.
         let _bkl = crate::smp::BklGuard::new();
@@ -348,6 +360,10 @@ pub extern "C" fn silver_handle_irq() {
             // re-raised while we schedule.
             end_interrupt(acknowledge_register);
             scheduler::schedule();
+        }
+        QUIESCE_IRQ => {
+            end_interrupt(acknowledge_register);
+            crate::smp::quiesce_ack_and_wait();
         }
         TIMER_IRQ => {
             crate::smp::probe(20);

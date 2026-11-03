@@ -126,6 +126,24 @@ it is a **conservative leak policy**, not a full quiescence proof. In-flight
 user accesses, a stop-the-world/IPI handshake and TLB shootdown stress remain
 Phase 4 work.
 
+### Phase 4: stop-the-world IPI quiescence
+
+The conservative gate now has a real stop-the-world fast path:
+
+- SGI1 (`QUIESCE_IRQ`) is enabled on every CPU. Its handler issues `dsb sy`,
+  sets a per-CPU acknowledgement and parks until the reaper releases it.
+- Kernel code runs with IRQs masked, so `bkl_acquire` waiters cannot take
+  SGI1; their retry loop checks the same request and parks/acknowledges there.
+- `smp::quiesce_begin()` (called with the BKL held) sends SGI1, waits for every
+  online CPU to acknowledge, and times out fail-closed. `quiesce_end()` releases
+  the parked CPUs and kicks rescheduling.
+- `reap_dead_tasks` stops the world only when a dead task actually owns DMA
+  frames; on timeout it falls back to the conservative per-range leak gate.
+
+This gives a real no-user/no-kernel window on all other PEs before PTE edits
+and frame frees. TLB shootdown stress, in-flight-device DMA and physical SMP
+remain open.
+
 ## Что сделано (фазы 1–6 задания TASK №6)
 
 | Фаза | Содержание | Состояние |
@@ -211,17 +229,15 @@ Phase 4 work.
   __bss_end) для выросшего с SMP образа; (в) build_task_space: не попадает ли
   кадр таблицы задачи в диапазон kernel image при новых размерах.**
 
-## Что дальше (Phase 4)
+## Что дальше (Phase 5)
 
-1. **Stop-the-world / real quiescence.** The current `space_is_running` +
-   `range_mapped_by` gate leaks on a live mapping. Replace it with an
-   IPI/stop-the-world handshake or a per-space generation protocol that can
-   prove no CPU holds a translation before freeing.
-2. **TLB/DMA under SMP.** Re-audit `flush_after_table_change`,
+1. **TLB/DMA under SMP.** Re-audit `flush_after_table_change`,
    `switch_address_space` and `revoke_phys_range` against a second PE holding a
    stale translation; keep `safe_to_free` CPU-only and retain the leak policy.
-3. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
+2. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
    DMA revoke while a client runs, and page-table teardown under load.
+3. **Device DMA quiescence.** The stop-the-world window covers CPUs, not a
+   device with an armed queue; retain the driver stop/reset contract.
 4. **Hardware.** Fog/tablet stay single-core; physical SMP remains unproven.
 
 

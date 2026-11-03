@@ -2014,6 +2014,16 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     // any teardown. At this point every non-zombie address space in
     // `manager.tasks` still has intact page tables. Zombies keep no address
     // space (`ttbr0 == 0`) and are skipped rather than dereferenced.
+    // Stop the other PEs only when a dead task actually owns DMA frames to
+    // revoke; ordinary schedule passes must not pay for a world stop. If the
+    // handshake times out, fall back to the conservative per-range gate and
+    // leak rather than tearing a live space down.
+    let needs_quiesce = manager.tasks.iter().any(|task| {
+        task.state == TaskState::Dead
+            && task.running_on.is_none()
+            && !task.dma_pages.is_empty()
+    });
+    let quiesced = needs_quiesce && smp::quiesce_begin();
     let mut dma_revokes: Vec<(usize, usize, mmu::RevokeResult)> = Vec::new();
     for dead in manager
         .tasks
@@ -2037,11 +2047,12 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
             // another CPU must not be revoked or freed underneath it. Abort
             // the whole range before the first PTE is cleared; the caller
             // leaks the frames. Non-running spaces are still safe to scan.
-            let running_mapping = manager.tasks.iter().any(|task| {
-                task.running_on.is_some()
-                    && task.ttbr0 != 0
-                    && mmu::range_mapped_by(task.ttbr0, physical, phys_end)
-            });
+            let running_mapping = !quiesced
+                && manager.tasks.iter().any(|task| {
+                    task.running_on.is_some()
+                        && task.ttbr0 != 0
+                        && mmu::range_mapped_by(task.ttbr0, physical, phys_end)
+                });
             if running_mapping {
                 console::write_str("DMA revoke: range 0x");
                 console::write_hex_u64(physical as u64);
@@ -2108,6 +2119,13 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         task.clear_resources();
         task.state = TaskState::Zombie;
         became_zombie.push(task.id);
+    }
+    if quiesced {
+        smp::quiesce_end();
+        // Parked CPUs resume in their SGI/BKL wait; kick them once so a task
+        // made Ready during teardown is picked up even if its CPU returns to
+        // user mode instead of scheduling immediately.
+        smp::ipi_reschedule_others();
     }
 
     // Orphans must point at a live reaper, never at a dead PID.
