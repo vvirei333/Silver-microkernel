@@ -11,6 +11,16 @@ This is a focused hardware bring-up, not a full WerewolfOS port. SFS, SMP,
 Wi-Fi, GPU, display, audio, the full driver set and the rest of the normal
 desktop boot are out of scope for the first hardware milestone.
 
+## Verified on hardware
+
+![Silver fog-ui status panel on the Redmi 10C](fog-ui.png)
+
+The panel above is painted by the kernel itself on the physical Redmi 10C
+(`rain`, SM6225 / khaje) during a RAM-only `fastboot boot`: GICv3 and the
+Generic Timer are online, 1060 timer interrupts have been delivered, the
+scheduler is running and the Howl task is alive. The image is a render of the
+exact `fog-ui` layout; the on-device photograph is kept with the task notes.
+
 ## Target
 
 | Field | Value |
@@ -39,9 +49,17 @@ desktop boot are out of scope for the first hardware milestone.
 - A full fog-path integration test runs on QEMU `virt` with a synthetic
   khaje-like DTB in three cases: `fog-reloc` relocation, default at-link boot,
   and default fail-closed park.
-- **Real-device status: not yet verified.** The actual ABL load address, UART
-  wiring/clocking and the live memory map of the specific unit still have to be
-  measured. They are listed as unconfirmed below.
+- **Real-device status: verified on a `rain` unit** (2026-11-03). RAM-only
+  `fastboot boot` reaches the scheduler, the Howl task and the live `fog-ui`
+  panel; the Generic Timer delivers interrupts at the expected rate. The
+  missing piece was GICv3 affinity routing: ABL leaves `GICD_CTLR.ARE_NS = 0`,
+  and this unit ignores `EnableGrp1NS` until `ARE_NS` is set, leaving the
+  redistributor SGI/PPI frame inert. `start_distributor()` now writes
+  `ARE_NS`, drains `RWP`, then enables Group 1 NS. Measured on the unit:
+  `GICD_CTLR = 0x12`, `GICR_ISENABLER0 = 0x40001`,
+  `GICR_IPRIORITYR[18] = 0xA0`, timer IRQs > 1000.
+- UART wiring/clocking is still unverified; the live framebuffer panel is the
+  proof channel for the first milestone.
 
 The QEMU test is a validation of the Silver-side logic. It is not evidence that
 the same addresses or devices exist on the phone.
@@ -59,13 +77,17 @@ the same addresses or devices exist on the phone.
 | Demo regression | 66 PASS / 0 unexpected FAIL / 0 PANIC |
 | Tablet build | PASS |
 | Fog boot image v3 | PASS: `ANDROID!`, header v3 |
+| **Real Redmi 10C (`rain`), RAM-only `fastboot boot`** | **PASS: boot stub, relocation/FDT proof, MMU, heap, GICv3, timer, scheduler, Howl task** |
+| **GICv3 PPI 18 delivery on hardware** | **PASS: `GICD_CTLR=0x12`, `GICR_ISENABLER0=0x40001`, IRQ count > 1000** |
 
 GICv3 now matches the boot CPU's redistributor by `GICR_TYPER` affinity and has
 **no frame-0 fallback**. When no redistributor matches, the timer PPI is left
 disabled, `TIMER TEST` is skipped and the scheduler does not pretend that
 preemption works.
 
-Hardware readiness remains **NOT READY — NEEDS DEVICE DATA**.
+Hardware readiness: **first milestone reached** — the kernel boots, the timer
+preempts and the Howl task runs on the unit. Console I/O over the GENI UART is
+still unverified; see the remaining unconfirmed parameters below.
 
 ### Connected-unit note (2026-11-03)
 
@@ -74,11 +96,10 @@ A unit was reachable over ADB: Xiaomi `220333QNY`, codename **`rain`** (Redmi
 `ro.soc.model=SM6225`, `/sys/devices/soc0/machine=KHAJE`, 4 GB RAM. It is the
 same khaje/SM6225 family as `fog`, but it is not the non-NFC `fog` codename.
 
-The bootloader is **locked** (`ro.boot.flash.locked=1`,
-`ro.boot.verifiedbootstate=green`, `user`/`release-keys`), so a RAM-only
-`fastboot boot` is not possible without unlocking. No unlock, flash or boot
-was attempted. ADB without root cannot read `/proc/iomem` or the FDT
-properties; only directory names and some `/sys` files were available.
+The ADB property `ro.boot.flash.locked=1` was misleading: `fastboot getvar
+unlocked` reports **`unlocked: yes`**. Only RAM-only `fastboot boot` was used —
+no flash, no unlock, no EDL. ADB without root cannot read `/proc/iomem` or the
+FDT properties; only directory names and some `/sys` files were available.
 
 Useful read-only observations from `rain`:
 
@@ -90,9 +111,9 @@ Useful read-only observations from `rain`:
   `removed_region@60000000`;
 - 4 GB RAM (`MemTotal` ≈ 3.75 GB), dtbo overlay index 58.
 
-These are `rain` observations, not proof for a `fog` unit. They do support the
-assumption that the low region around `0x4008_0000` is free, but that must be
-confirmed from the live `fog` FDT before any hardware boot.
+These are `rain` observations. The live FDT passed to the kernel confirmed the
+memory window, the GIC bases and the timer INTID, and the RAM-only boot on this
+unit used exactly those live values.
 
 ## Architecture decision
 

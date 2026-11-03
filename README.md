@@ -7,8 +7,11 @@ code — only the build commands and toolchain setup differ.
 
 Primary target: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 Hardware bring-up target: Xiaomi Redmi 10C (`fog`, Qualcomm SM6225 / khaje),
-RAM-only boot. The hardware path is implemented but not yet verified on a
-physical unit; see [redmi10c_poc/README.md](redmi10c_poc/README.md).
+RAM-only boot. The path is verified on a physical `rain` unit (same
+khaje/SM6225 family) up to the scheduler and the Howl task; see
+[redmi10c_poc/README.md](redmi10c_poc/README.md).
+
+![Silver fog-ui status panel on the Redmi 10C](redmi10c_poc/fog-ui.png)
 
 ## Community
 
@@ -75,8 +78,8 @@ userspace.
 - [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh EL0 task with its own W^X address space
 - [x] EL0 fault containment: a crashed EL0 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
 - [x] Power off: the GPU "Power" button shuts QEMU down via PSCI `SYSTEM_OFF`
-- [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation with pre-copy FDT destination validation (QEMU-verified only; see below)
-- [ ] Real Redmi 10C boot to `howl>` — **not yet verified on hardware**
+- [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation with pre-copy FDT destination validation (QEMU-verified, and booted on a physical `rain` unit)
+- [x] Real Redmi 10C boot: RAM-only `fastboot boot` reaches the scheduler and the Howl task, with live GICv3 timer interrupts (verified on a `rain` unit)
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
 - [ ] SMP (`-smp 2`): **in progress, not working yet** — see `SMP_STATUS.md`. Single-CPU boot is the verified configuration; under `-smp 2` the kernel does not survive silverd's first blocking IPC receive. Known open issues: compiler-generated self-loops on reachable paths in O3+LTO builds (absent pre-SMP, root cause not established), and an O1-run infinite Prefetch Abort (ESR `0x86000006`, FAR `0x40081a00`) pointing at kernel translation-table damage still under investigation. CPU1 stays offline (PSCI `CPU_ON` returns `-1`). Do not boot on hardware expecting SMP.
 
@@ -111,7 +114,8 @@ Implemented:
       non-empty `/reserved-memory` `ranges` and malformed trees fail closed.
 - [x] RAM-only boot image v3 builder (builds only; never flashes or runs a
       device command)
-- [ ] Real-device boot and `howl>` on the Redmi 10C — **not yet verified**
+- [x] Real-device boot on a Redmi 10C `rain` unit: `fastboot boot` reaches the
+      scheduler and the Howl task, with live GICv3 timer interrupts
 
 The default fog image is intentionally conservative: it will not write outside
 its own loaded image when the placement is unexpected. `fog-reloc` now performs
@@ -604,7 +608,9 @@ Current verification snapshot (2026-11-03): 77 host tests pass; the fog QEMU
 suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU reaches `howl>`; the demo
 regression reports 66 PASS / 0 PANIC; the tablet build and fog boot image v3
-build succeed. Real-device status remains **not verified**.
+build succeed. A physical Redmi 10C `rain` unit boots the RAM-only image to
+the scheduler and the Howl task, with live GICv3 timer interrupts confirmed by
+the `fog-ui` panel (`TICKS` > 1000).
 
 ## License
 
