@@ -17,6 +17,9 @@ fog = []
 # from the link address; enabling this requires an independently proven free
 # destination and the live FDT check tracked in the bring-up notes.
 fog-reloc = ["fog"]
+# Debug-only visual evidence on the cont_splash framebuffer. Not part of the
+# normal fog build: it assumes the Rain/Fog splash buffer at 0x5C00_0000.
+fog-paint = ["fog"]
 
 [dependencies]
 linked_list_allocator = "0.10.6"

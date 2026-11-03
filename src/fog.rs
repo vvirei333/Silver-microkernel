@@ -8,6 +8,28 @@
 use crate::boot::BootParams;
 use crate::fdt::{self, Fdt, Region};
 
+/// Debug-only colour ladder on the Rain/Fog cont_splash framebuffer.
+/// `fog-paint` is not part of a normal build; it assumes the live Rain
+/// reserved-memory base at 0x5C00_0000 and exists only to make a UART-less
+/// unit observable. The boot stub paints green at entry and blue after the
+/// placement decision; this function paints later kernel milestones.
+#[cfg(feature = "fog-paint")]
+pub fn paint(color: u32) {
+    const BASE: usize = 0x5C00_0000;
+    const SIZE: usize = 0x0080_0000;
+    let pointer = crate::memory::phys_to_virt(BASE) as *mut u32;
+    let words = SIZE / 4;
+    let mut index = 0;
+    while index < words {
+        unsafe { core::ptr::write_volatile(pointer.add(index), color) };
+        index += 1;
+    }
+}
+
+#[cfg(not(feature = "fog-paint"))]
+#[inline(always)]
+pub fn paint(_color: u32) {}
+
 pub const FOG_COMPATIBLE: [&str; 2] = ["qcom,khaje", "qcom,sm6225"];
 
 /// Everything the kernel learned from the live tree. Zeroed fields mean "not

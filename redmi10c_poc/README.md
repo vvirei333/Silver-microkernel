@@ -297,6 +297,33 @@ reported and the timer is left disabled instead of using frame 0.
 
 It is a simulation and does not prove anything about the phone's hardware.
 
+### Visual debug ladder (`fog-paint`)
+
+A UART-less unit has no console. For a controlled diagnostic boot only, build
+with the opt-in `fog-paint` feature:
+
+```sh
+cargo build --release --target aarch64-unknown-none \
+    --no-default-features --features no_std,fog,fog-reloc,fog-paint
+```
+
+It fills the Rain/Fog `cont_splash` framebuffer at `0x5C00_0000` with a colour
+at each milestone:
+
+| Colour | Milestone |
+| --- | --- |
+| green | payload executed at least to the boot claim |
+| blue | placement policy passed (at-link or checked copy) |
+| cyan | MMU is on |
+| yellow | console/probe path is alive |
+| magenta | frame allocator + kernel heap are alive |
+| orange | GIC/timer path completed |
+| white | scheduler is about to start |
+
+This is a diagnostic aid, not a normal build: it assumes the `rain`
+reserved-memory base and is outside the QEMU test's 128 MB RAM. The normal fog
+image does not touch the framebuffer.
+
 ## Hardware bring-up plan
 
 1. **Measure, do not assume.** On the unit, capture the hand-over PC, `CurrentEL`,

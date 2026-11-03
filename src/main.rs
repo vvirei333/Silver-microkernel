@@ -121,9 +121,30 @@ core::arch::global_asm!(".set FOG_BUILD, 0");
 core::arch::global_asm!(".set FOG_RELOC, 1");
 #[cfg(not(feature = "fog-reloc"))]
 core::arch::global_asm!(".set FOG_RELOC, 0");
+// Debug-only visual evidence on the Rain/Fog cont_splash framebuffer. The
+// address comes from the live Rain reserved-memory tree, not from a generic
+// fog fact; only enable it for a controlled diagnostic boot.
+#[cfg(feature = "fog-paint")]
+core::arch::global_asm!(".set FOG_PAINT, 1");
+#[cfg(not(feature = "fog-paint"))]
+core::arch::global_asm!(".set FOG_PAINT, 0");
 
 core::arch::global_asm!(
     r#"
+    // Debug-only full-buffer fill. MMU is off, so this is a physical store
+    // into the Rain/Fog cont_splash region. It is never enabled in a normal
+    // build; the color ladder is the only output channel on a UART-less unit.
+    .macro FOG_FILL start, end, lo, hi
+    ldr x18, =\start
+    ldr x19, =\end
+    mov w20, #\lo
+    movk w20, #\hi, lsl #16
+.Lfog_fill_loop\@:
+    str w20, [x18], #4
+    cmp x18, x19
+    b.lo .Lfog_fill_loop\@
+    .endm
+
     .section .text.boot, "ax"
     .global _head
     // arm64 Image header: ABL (UEFI-style) looks for the "ARM\\x64" magic at
@@ -177,6 +198,11 @@ _start:
     cmp w12, w11
     b.eq 6f
     str w11, [x10]
+
+.if FOG_PAINT
+    // Green: the payload executed at least to the claimed boot path.
+    FOG_FILL 0x5C000000, 0x5C800000, 0xFF00, 0xFF00
+.endif
 
     // --- K0: PAINT — the very first observable action ----------------------
     // Fill the top 64 lines of all three 16 MiB frame slots inside the
@@ -385,6 +411,10 @@ _start:
     mov x24, #1                     // diagnosed and parked after the record
 .endif
 .Lfog_at_link:
+.if FOG_PAINT
+    // Blue: the placement policy passed (at-link or the checked copy ran).
+    FOG_FILL 0x5C000000, 0x5C800000, 0x00FF, 0xFF00
+.endif
 .endif
 
     // --- Publish the hand-over record for `boot::get()`. -------------------
@@ -1046,11 +1076,15 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::log("KERNEL ENTRY");
 
     mmu::init();
+    #[cfg(feature = "fog-paint")]
+    fog::paint(0xFF00_FFFF); // cyan: MMU is on
     ram_log::fb_progress(); // entry bar — after mmu::init so the fb is mapped
 
     // Console first: a bad memory map must be *reported* before the
     // allocator asserts on an empty window.
     console::init();
+    #[cfg(feature = "fog-paint")]
+    fog::paint(0xFFFF_FF00); // yellow: console/probe path is alive
     #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     {
         console::write_str("PLATFORM=QEMU\r\n");
@@ -1112,6 +1146,8 @@ pub extern "C" fn kernel_main() -> ! {
         console::write_hex_u64(heap_base as u64);
         console::write_str("\r\n");
     }
+    #[cfg(feature = "fog-paint")]
+    fog::paint(0xFFFF_00FF); // magenta: frame allocator + heap are alive
 
     // The tablet/fog path shares the QEMU boot sequence from here on: gic::init
     // dispatches to gicv3, and the timer PPI is selected per platform (INTID
@@ -1138,6 +1174,8 @@ pub extern "C" fn kernel_main() -> ! {
     } else {
         console::write_str("TIMER TEST: SKIP (no confirmed GIC redistributor)\r\n");
     }
+    #[cfg(feature = "fog-paint")]
+    fog::paint(0xFFFF_8000); // orange: GIC/timer path completed
     ram_log::log("GICv3+TIMER OK");
     ram_log::fb_progress();
     vfs::init();
@@ -1152,6 +1190,8 @@ pub extern "C" fn kernel_main() -> ! {
         console::write_str("SILVER PLATFORM READY\r\n");
         scheduler::init_fog();
         console::write_str("SILVER SCHEDULER START\r\n");
+        #[cfg(feature = "fog-paint")]
+        fog::paint(0xFFFF_FFFF); // white: scheduler is about to start
         scheduler::start();
     }
     #[cfg(not(feature = "fog"))]
