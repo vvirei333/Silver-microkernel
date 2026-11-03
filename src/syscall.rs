@@ -271,10 +271,14 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             }
         }
         SYS_STOP_CONSOLE => {
-            if scheduler::stop_console_owner() {
-                scheduler::schedule_released();
+            if !scheduler::current_task_has_rights(capability::CAP_CONSOLE_GRANT) {
+                SYSCALL_ERROR
+            } else {
+                if scheduler::stop_console_owner() {
+                    scheduler::schedule_released();
+                }
+                0
             }
-            0
         }
         SYS_ALLOC_DMA => match scheduler::alloc_dma_for_current(frame[0] as usize) {
             Some((virtual_address, physical_address)) => {
@@ -707,12 +711,24 @@ fn sys_fs_read_dir(path_ptr: u64, buffer_ptr: u64, capacity: u64) -> u64 {
     })
 }
 
+/// Copies a NUL-terminated string byte-by-byte so a valid string ending just
+/// before a page boundary does not fail because the full buffer crosses it.
+fn copy_cstring(pointer: u64, out: &mut [u8]) -> Option<usize> {
+    for (index, slot) in out.iter_mut().enumerate() {
+        let address = pointer.checked_add(index as u64)?;
+        let mut byte = [0_u8; 1];
+        user_memory::copy_from_user(address, &mut byte).ok()?;
+        *slot = byte[0];
+        if byte[0] == 0 {
+            return Some(index);
+        }
+    }
+    None
+}
+
 fn with_path(path_ptr: u64, call: impl FnOnce(&str) -> u64) -> u64 {
     let mut bytes = [0_u8; PATH_LIMIT + 1];
-    if user_memory::copy_from_user(path_ptr, &mut bytes).is_err() {
-        return SYSCALL_ERROR;
-    }
-    let Some(end) = bytes.iter().position(|byte| *byte == 0) else {
+    let Some(end) = copy_cstring(path_ptr, &mut bytes) else {
         return SYSCALL_ERROR;
     };
     let Ok(path) = core::str::from_utf8(&bytes[..end]) else {
@@ -984,8 +1000,7 @@ fn sys_lookup_name(name_ptr: u64) -> u64 {
 /// Copies a bounded NUL-terminated name from task memory.
 fn read_name(ptr: u64) -> Option<Vec<u8>> {
     let mut bytes = [0_u8; NAME_LIMIT + 1];
-    user_memory::copy_from_user(ptr, &mut bytes).ok()?;
-    let end = bytes.iter().position(|byte| *byte == 0)?;
+    let end = copy_cstring(ptr, &mut bytes)?;
     Some(bytes[..end].to_vec())
 }
 

@@ -53,6 +53,8 @@ const BKL_FREE: isize = -1;
 /// this CPU — the former global `TaskManager.current_index`, split per CPU so
 /// two CPUs never share one "current task". `usize::MAX` means "none yet".
 pub struct PerCpu {
+    /// Exclusive claim bit: protects field publication before `online`.
+    claimed: AtomicBool,
     /// Slot claimed during CPU bring-up; `false` = offline.
     pub online: AtomicBool,
     /// Slot index in [`CPUS`] (also the IPI/log identity).
@@ -70,6 +72,7 @@ unsafe impl Sync for PerCpu {}
 impl PerCpu {
     const fn empty() -> Self {
         Self {
+            claimed: AtomicBool::new(false),
             online: AtomicBool::new(false),
             cpu_id: 0,
             mpidr: 0,
@@ -162,6 +165,7 @@ pub fn set_current_index_for(cpu: usize, index: usize) {
 /// the CPU id and MPIDR for later IPI/GICR use.
 pub fn init_cpu(slot: usize) {
     let cpu = &CPUS[slot];
+    cpu.claimed.store(true, Ordering::Release);
     // Writes race with nothing: the slot is not yet published (`online` is
     // set below with Release), and no other CPU reads this slot's fields.
     unsafe {
@@ -188,14 +192,16 @@ fn read_mpidr() -> u64 {
 /// [`MAX_CPUS`] slots are taken.
 pub fn claim_cpu_slot() -> Option<usize> {
     for (slot, cpu) in CPUS.iter().enumerate() {
-        if !cpu.online.swap(true, Ordering::AcqRel) {
-            // Slot claimed exclusively (the swap above is the handoff); no
-            // other CPU touches its fields until it publishes its state.
+        if !cpu.claimed.swap(true, Ordering::AcqRel) {
+            // Claim first, then publish all fields, and only then set
+            // `online` with Release. A reader that sees online==true is
+            // guaranteed to see cpu_id/mpidr.
             unsafe {
                 let cpu = cpu as *const PerCpu as *mut PerCpu;
                 (*cpu).cpu_id = slot;
                 (*cpu).mpidr = read_mpidr();
             }
+            cpu.online.store(true, Ordering::Release);
             return Some(slot);
         }
     }

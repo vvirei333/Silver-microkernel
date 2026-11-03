@@ -253,7 +253,10 @@ pub fn read_byte() -> Option<u8> {
         if fifo_status & RX_LAST != 0 {
             let valid = (fifo_status & RX_LAST_BYTE_VALID_MSK) >> 28;
             if valid != 0 {
-                count = valid;
+                // The field is 3 bits but a FIFO word is four bytes; values
+                // 5..7 are reserved/undefined. Clamp instead of emitting
+                // bytes from beyond the word.
+                count = valid.min(4);
             }
         }
         RX_COUNT.store(count, Ordering::Relaxed);

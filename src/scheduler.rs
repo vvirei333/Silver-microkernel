@@ -659,7 +659,10 @@ pub fn exit_current() -> ! {
     exit_current_with_status(0)
 }
 
-pub fn exit_current_with_status(status: u64) -> ! {
+pub fn exit_current_with_status(raw_status: u64) -> ! {
+    // Reserve the top three u64 values for SYS_WAIT_EVENT sentinels
+    // (ERROR/STOPPED/ECHILD). A user exit status must never alias them.
+    let status = raw_status.min(u64::MAX - 4);
     // The syscall path already holds the kernel lock; the EL0 fault vector
     // enters without it. Acquire only when missing so the teardown below
     // (`ipc::remove_task` takes the IPC mutex, which asserts the BKL) is valid
@@ -711,8 +714,6 @@ pub fn kill_task(id: u64) -> bool {
     if id == IDLE_TASK_ID || id == current_task_id() {
         return false;
     }
-    crate::ipc::remove_task(id);
-    vfs::close_task(id);
     let saved_daif = interrupts::save_and_disable_irq();
     let Some(manager) = scheduler_manager() else {
         interrupts::restore_irq(saved_daif);
@@ -729,6 +730,10 @@ pub fn kill_task(id: u64) -> bool {
         interrupts::restore_irq(saved_daif);
         return false;
     }
+    // Side effects only after the target is proven live: a bogus CAP_KILL
+    // target must not broadcast mailbox/console wakeups across the system.
+    crate::ipc::remove_task(id);
+    vfs::close_task(id);
     manager.tasks[index].state = TaskState::Dead;
     manager.tasks[index].bound_irq = None;
     manager.tasks[index].exit_status = Some(1);
@@ -984,15 +989,18 @@ fn remap_current_indices(manager: &TaskManager, snapshot: &[Option<u64>], live_i
         .filter(|&cpu| smp::cpu_online(cpu))
         .zip(snapshot)
     {
+        // Preserve the "no current task" sentinel: an AP that has not picked
+        // a task yet must not be remapped to idle after an unrelated task is
+        // removed. A removed current id also leaves the CPU with no task.
         let index = current_id
             .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
-            .unwrap_or(0);
+            .unwrap_or(usize::MAX);
         smp::set_current_index_for(cpu, index);
     }
     smp::set_current_index(
         live_id
             .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
-            .unwrap_or(0),
+            .unwrap_or(usize::MAX),
     );
 }
 
@@ -1761,11 +1769,9 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
                 }
             };
         // Every frame in the newly allocated run is recycled allocator memory.
-        // Clear the whole range through the cacheable kernel alias *before*
-        // `map_dma_to_user` publishes it to EL0, then push those lines to the
-        // point of coherency (the mapping helper does the clean) so the device
-        // cannot observe stale bytes either.
-        unsafe { core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, mapped_size) };
+        // `map_dma_to_user` clears the whole range through the cacheable
+        // kernel alias and pushes it to the point of coherency before it
+        // publishes the mapping to EL0 or the device.
         let Some(virtual_address) = mmu::map_dma_to_user(task, physical, mapped_size) else {
             console::write_str("DMA: FAIL - mmu::map_dma_to_user returned None\r\n");
             frame_allocator::free_contiguous_pages_tagged(physical, page_count, generation);

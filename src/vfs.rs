@@ -653,16 +653,18 @@ impl Vfs {
         if source_mount != destination_mount {
             return Err(());
         }
-        // Never rename a mount point itself.
-        if self
-            .mounts
-            .iter()
-            .any(|mount| mount.point == source || mount.point == destination)
-        {
+        let is_directory = self.mounts[source_mount].fs.is_directory(&source_relative)?;
+        // Never rename a mount point itself, and never move a directory that
+        // contains a mount point: otherwise the mount stays registered under
+        // the old path and becomes unreachable (or aliases the new tree).
+        if self.mounts.iter().any(|mount| {
+            mount.point == source
+                || mount.point == destination
+                || (is_directory && crate::vfs::path_is_under(&mount.point, &source))
+                || (is_directory && crate::vfs::path_is_under(&mount.point, &destination))
+        }) {
             return Err(());
         }
-
-        let is_directory = self.mounts[source_mount].fs.is_directory(&source_relative)?;
         if is_directory && crate::vfs::path_is_under(&destination, &source) {
             return Err(());
         }

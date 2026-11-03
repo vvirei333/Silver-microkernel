@@ -160,8 +160,13 @@ pub fn fb_fill(r: u32, g: u32, b: u32) {
 
 fn fb_rect(x: usize, y: usize, w: usize, h: usize, color: u32) {
     let info = fb_info();
+    if x >= info.width || y >= info.height {
+        return;
+    }
     let base = phys_to_virt(info.base) as *mut u32;
     let stride_px = info.stride;
+    let w = w.min(info.width - x);
+    let h = h.min(info.height - y);
     for row in 0..h {
         let line = y + row;
         if line >= info.height {

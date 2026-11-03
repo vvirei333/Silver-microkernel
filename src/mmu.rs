@@ -629,6 +629,9 @@ pub fn create_task_space(
     user_stack_start: usize,
     image: Option<&crate::elf::LoadedImage>,
 ) -> Option<(usize, TableToken)> {
+    if image.is_some_and(|image| image.page_count == 0 || image.page_count > ENTRIES) {
+        return None;
+    }
     let mut pages = [0_usize; 9];
     let mut generations = [0_u32; 9];
     for index in 0..pages.len() {
@@ -763,7 +766,7 @@ pub fn map_user_heap_page(ttbr0: usize, index: usize, physical: usize) -> bool {
         let l1_user = follow_table(ttbr0, 0);
         let l2_user = follow_table(l1_user, 1);
         let l3_heap = follow_table(l2_user, USER_HEAP_L2_INDEX);
-        if read_entry(l3_heap, index) != 0 {
+        if l3_heap == 0 || read_entry(l3_heap, index) != 0 {
             return false;
         }
         zero_page(physical);
@@ -782,6 +785,9 @@ pub fn unmap_user_heap_page(ttbr0: usize, index: usize) -> Option<usize> {
         let l1_user = follow_table(ttbr0, 0);
         let l2_user = follow_table(l1_user, 1);
         let l3_heap = follow_table(l2_user, USER_HEAP_L2_INDEX);
+        if l3_heap == 0 {
+            return None;
+        }
         let entry = read_entry(l3_heap, index);
         if entry & DESC_PAGE != DESC_PAGE {
             return None;
@@ -832,7 +838,7 @@ pub fn map_user_pages_at(
     let Some(end) = virtual_address.checked_add(span) else {
         return false;
     };
-    if virtual_address < DRAM_BASE || end > DRAM_BASE + 0x4000_0000 {
+    if virtual_address < USER_MMAP_VA || end > USER_MMAP_MAX_VA {
         return false;
     }
 
@@ -957,7 +963,13 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
             let l3 = descriptor_address(read_entry(l2_user, l2_index)) as usize;
             write_entry(l3, l3_index, 0);
             flush_after_table_change(l3, GRANULE);
-            if table_empty(l3) {
+            // The heap and stack L3 tables are persistent: `brk` and the
+            // fixed stack window reuse them after an unmap empties the last
+            // page. Freeing them would leave map/unmap_user_heap_page
+            // following a now-zero L2 descriptor into physical address 0.
+            let persistent = l2_index == USER_HEAP_L2_INDEX
+                || l2_index == USER_STACK_L2_INDEX;
+            if !persistent && table_empty(l3) {
                 write_entry(l2_user, l2_index, 0);
                 flush_after_table_change(l2_user, GRANULE);
                 free_table_frame_owned(l3, ttbr0);
@@ -1259,8 +1271,13 @@ pub fn map_dma_to_user(
         return None;
     }
 
-    // The allocator and zeroing path use the cacheable kernel alias. Push those
-    // lines to the point of coherency before the device can observe the buffer.
+    // Every DMA frame is recycled allocator memory. Clear it through the
+    // cacheable kernel alias before it becomes EL0/device-visible, then push
+    // those lines to the point of coherency. Clean is not a substitute for
+    // zeroing: stale bytes must never cross a task boundary.
+    unsafe {
+        core::ptr::write_bytes(phys_to_virt(phys_addr) as *mut u8, 0, size);
+    }
     clean_dma_range(phys_addr, size);
     map_user_pages(task, phys_addr, page_count, 0, user_dma_page)
 }
@@ -1353,7 +1370,9 @@ fn clean_dma_range(physical: usize, size: usize) {
     let start = phys_to_virt(physical);
     clean_cache_range(start, start.saturating_add(size));
     unsafe {
-        core::arch::asm!("dsb ishst", options(nostack));
+        // Device-visible publication needs full-system ordering, not only
+        // inner-shareable store completion.
+        core::arch::asm!("dsb sy", options(nostack));
     }
 }
 

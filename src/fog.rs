@@ -52,22 +52,6 @@ pub fn paint_band(color: u32) {
 #[inline(always)]
 pub fn paint_band(_color: u32) {}
 
-#[cfg(feature = "fog-paint")]
-pub fn paint_region(offset: usize, size: usize, color: u32) {
-    const BASE: usize = 0x5C00_0000;
-    let pointer = crate::memory::phys_to_virt(BASE + offset) as *mut u32;
-    let words = size / 4;
-    let mut index = 0;
-    while index < words {
-        unsafe { core::ptr::write_volatile(pointer.add(index), color) };
-        index += 1;
-    }
-}
-
-#[cfg(not(feature = "fog-paint"))]
-#[inline(always)]
-pub fn paint_region(_offset: usize, _size: usize, _color: u32) {}
-
 pub const FOG_COMPATIBLE: [&str; 2] = ["qcom,khaje", "qcom,sm6225"];
 
 /// Everything the kernel learned from the live tree. Zeroed fields mean "not

@@ -1,5 +1,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
+use crate::smp::SpinLock;
+
 const BASE: usize = crate::memory::phys_to_virt(0x0900_0000);
 const DR: *mut u32 = BASE as *mut u32;
 const FR: *const u32 = (BASE + 0x18) as *const u32;
@@ -22,6 +24,9 @@ static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
 static mut RX_QUEUE: [u8; RX_CAPACITY] = [0; RX_CAPACITY];
 static mut RX_HEAD: usize = 0;
 static mut RX_LEN: usize = 0;
+/// Cross-CPU lock: the IRQ path fills the ring while `SYS_READ` drains it.
+/// IRQ masking alone is not a cross-CPU exclusion.
+static RX_LOCK: SpinLock<()> = SpinLock::new(());
 
 pub fn init() {
     unsafe {
@@ -78,6 +83,7 @@ fn read_hardware() -> Option<u8> {
 }
 
 fn push_rx(byte: u8) {
+    let _guard = RX_LOCK.lock();
     unsafe {
         let len = core::ptr::addr_of_mut!(RX_LEN).read();
         if len == RX_CAPACITY {
@@ -94,6 +100,7 @@ fn push_rx(byte: u8) {
 }
 
 fn pop_rx() -> Option<u8> {
+    let _guard = RX_LOCK.lock();
     unsafe {
         let len = core::ptr::addr_of_mut!(RX_LEN).read();
         if len == 0 {

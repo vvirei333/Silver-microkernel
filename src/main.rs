@@ -744,6 +744,14 @@ _start:
     cbz x0, 27f                 // no DTB (QEMU -kernel): skip
     ldr w13, [x0, #4]
     rev w13, w13                // DTB totalsize: big-endian u32 at +4
+    // A zero, tiny or unaligned totalsize would make the copy below wrap or
+    // read past the source. This is device-controlled input before any FDT
+    // validation, so fail closed (skip the copy) instead of trusting it.
+    cbz x13, 27f
+    cmp x13, #8
+    b.lo 27f
+    tst x13, #3
+    b.ne 27f
     mov x14, #0xA400
     lsl x14, x14, #16           // dst = 0xA4000000 (free DRAM, nobody's)
     mov x15, x0                 // src

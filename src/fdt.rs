@@ -289,8 +289,9 @@ impl<'a> Fdt<'a> {
             count: 0,
             address_cells: 2,
             size_cells: 2,
+            malformed: false,
         };
-        if self.walk(&mut visitor).is_none() {
+        if self.walk(&mut visitor).is_none() || visitor.malformed {
             return 0;
         }
         visitor.count
@@ -305,8 +306,9 @@ impl<'a> Fdt<'a> {
             size_cells: 2,
             in_reserved: false,
             depth: 0,
+            malformed: false,
         };
-        if self.walk(&mut visitor).is_none() {
+        if self.walk(&mut visitor).is_none() || visitor.malformed {
             return 0;
         }
         visitor.count
@@ -590,6 +592,7 @@ struct MemoryRegions<'o> {
     count: usize,
     address_cells: u32,
     size_cells: u32,
+    malformed: bool,
 }
 
 impl<'a, 'o> Visitor<'a> for MemoryRegions<'o> {
@@ -625,7 +628,15 @@ impl<'a, 'o> Visitor<'a> for MemoryRegions<'o> {
         if !memory_node {
             return;
         }
-        parse_regions(value, self.address_cells, self.size_cells, self.regions, &mut self.count);
+        if !parse_regions(
+            value,
+            self.address_cells,
+            self.size_cells,
+            self.regions,
+            &mut self.count,
+        ) {
+            self.malformed = true;
+        }
     }
 
     fn end(&mut self, _path: &str) {}
@@ -638,6 +649,7 @@ struct ReservedRegions<'o> {
     size_cells: u32,
     in_reserved: bool,
     depth: usize,
+    malformed: bool,
 }
 
 impl<'a, 'o> Visitor<'a> for ReservedRegions<'o> {
@@ -674,9 +686,18 @@ impl<'a, 'o> Visitor<'a> for ReservedRegions<'o> {
             }
             return;
         }
-        // Only direct children carry the actual carve-out ranges.
-        if name == "reg" && self.depth == 1 {
-            parse_regions(value, self.address_cells, self.size_cells, self.regions, &mut self.count);
+        // Match the pre-reloc validator: every `reg` under /reserved-memory,
+        // including nested children, is a carve-out.
+        if name == "reg" {
+            if !parse_regions(
+            value,
+            self.address_cells,
+            self.size_cells,
+            self.regions,
+            &mut self.count,
+        ) {
+            self.malformed = true;
+        }
         }
     }
 
@@ -1112,31 +1133,38 @@ fn parse_regions(
     size_cells: u32,
     out: &mut [Region],
     count: &mut usize,
-) {
+) -> bool {
     if address_cells == 0 || address_cells > MAX_CELLS || size_cells > MAX_CELLS {
-        return;
+        return false;
     }
     let address_bytes = (address_cells as usize) * 4;
     let size_bytes = (size_cells as usize) * 4;
     let entry = address_bytes + size_bytes;
     if entry == 0 {
-        return;
+        return false;
     }
 
     let mut offset = 0usize;
     while offset + entry <= value.len() {
         let Some(start) = read_cells(&value[offset..], address_cells) else {
-            return;
+            return false;
         };
         let Some(size) = read_cells(&value[offset + address_bytes..], size_cells) else {
-            return;
+            return false;
         };
-        if size != 0 && start.checked_add(size).is_some() && *count < out.len() {
-            out[*count] = Region::new(start, start + size);
+        if size != 0 {
+            let Some(end) = start.checked_add(size) else {
+                return false;
+            };
+            if *count >= out.len() {
+                return false;
+            }
+            out[*count] = Region::new(start, end);
             *count += 1;
         }
         offset += entry;
     }
+    true
 }
 
 // ---------------------------------------------------------------------------
@@ -1259,7 +1287,9 @@ const fn align_down_u64(value: u64, alignment: u64) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{select_allocator_window, Fdt, GicKind, Region, UartKind, FDT_MAGIC};
+    use super::{
+        parse_regions, select_allocator_window, Fdt, GicKind, Region, UartKind, FDT_MAGIC,
+    };
 
     // --- a tiny DTB writer used only by the tests -------------------------
 
@@ -1744,6 +1774,17 @@ mod tests {
             select_allocator_window(&memory, &mut excluded, PAGE, 1),
             None
         );
+    }
+
+    #[test]
+    fn region_parser_rejects_address_plus_size_overflow() {
+        let mut value = [0u8; 16];
+        value[..8].fill(0xFF);
+        value[15] = 1;
+        let mut regions = [Region::default(); 2];
+        let mut count = 0;
+        assert!(!parse_regions(&value, 2, 2, &mut regions, &mut count));
+        assert_eq!(count, 0);
     }
 }
 
