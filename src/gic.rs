@@ -164,11 +164,11 @@ pub fn init() {
 
 /// Per-CPU interrupt controller setup: the banked SGI/PPI enables (INTIDs
 /// 0-31 are per-CPU in GICv2) and the private CPU interface. Runs on every
-/// CPU, including APs.
-pub fn cpu_init() {
+/// CPU, including APs. Returns false when the CPU cannot receive SGIs and
+/// therefore must not be published as online.
+pub fn cpu_init() -> bool {
     if platform::detect().uses_gicv3() {
-        gicv3::cpu_init();
-        return;
+        return gicv3::cpu_init();
     }
 
     // Banked enable: SGI0 (reschedule), SGI1 (quiesce) and this CPU's timer PPI.
@@ -179,6 +179,11 @@ pub fn cpu_init() {
     write32(CPU_INTERFACE_BASE + GICC_PMR, 0xFF);
     write32(CPU_INTERFACE_BASE + GICC_BPR, 0);
     write32(CPU_INTERFACE_BASE + GICC_CTLR, 1);
+
+    // Banked SGI enables must read back on this PE before it is published:
+    // an AP without SGI0/SGI1 cannot take part in rescheduling or quiescence.
+    let expected = (1_u32 << RESCHEDULE_IRQ) | (1_u32 << QUIESCE_IRQ);
+    read32(DISTRIBUTOR_BASE + GICD_ISENABLER) & expected == expected
 }
 
 /// P3 diagnostic: one coherent snapshot of the physical-timer PPI delivery

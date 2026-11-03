@@ -1,9 +1,9 @@
 # SMP Status — TASK №6/№7 (2026-11-01, сессия 3)
 
-> **Current project status (2026-11-03):** this file remains the authoritative
+> **Current project status (2026-11-04):** this file remains the authoritative
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
-> test suite is now **138/138**; the 13/13 figure below is the checkpoint from
+> test suite is now **139/139**; the 13/13 figure below is the checkpoint from
 > the earlier SMP session.
 >
 > **Phases 1–2 are implemented as the opt-in `smp` feature (QEMU only).**
@@ -144,6 +144,31 @@ This gives a real no-user/no-kernel window on all other PEs before PTE edits
 and frame frees. TLB shootdown stress, in-flight-device DMA and physical SMP
 remain open.
 
+### Phase 4.1: audit hardening (2026-11-04)
+
+The external audit's SMP-adjacent findings and the remaining INFERRED items
+were closed:
+
+- `remap_current_indices` preserves `usize::MAX` ("no current task") instead
+  of mapping a vanished task to idle index 0, so an AP cannot get stuck in the
+  guard path after a task dies during bring-up.
+- An AP is published online only after `gic::cpu_init()` proves a usable
+  redistributor/CPU interface and readback of its banked SGI0/SGI1 enables.
+  If that fails, the AP parks with IRQs masked and stays offline: it can never
+  make quiescence wait for an SGI it cannot receive.
+- Late `boot_secondary_cpus` failures (`install_ap_identity`, `CPU_ON`) now
+  release the freshly built task space, private page and stack instead of
+  leaking them.
+- GICv3 bound-IRQ dispatch probes and wakes inside **one** BKL window, matching
+  GICv2; an unbind can no longer land between the probe and the wake and make
+  the interrupt disappear.
+
+Verified with the `demo-tasks` regression on QEMU `-smp 2`: **66 PASS /
+0 PANIC**, including concurrent spawn/kill/reap and DMA revoke while both CPUs
+schedule. A forced `gic::cpu_init()` failure parks CPU1 offline and still
+reaches `howl>`, proving the failure branch cannot hang quiescence. This is
+functional stress coverage, not a TLB-shootdown proof.
+
 ## Что сделано (фазы 1–6 задания TASK №6)
 
 | Фаза | Содержание | Состояние |
@@ -235,7 +260,9 @@ remain open.
    `switch_address_space` and `revoke_phys_range` against a second PE holding a
    stale translation; keep `safe_to_free` CPU-only and retain the leak policy.
 2. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
-   DMA revoke while a client runs, and page-table teardown under load.
+   DMA revoke while a client runs, and page-table teardown under load. The
+   `demo-tasks` suite now passes on `-smp 2` (66 PASS, 0 PANIC); a dedicated
+   TLB-shootdown/in-flight-MMAP stress is still missing.
 3. **Device DMA quiescence.** The stop-the-world window covers CPUs, not a
    device with an armed queue; retain the driver stop/reset contract.
 4. **Hardware.** Fog/tablet stay single-core; physical SMP remains unproven.
@@ -278,9 +305,13 @@ remain open.
 
 ## Проверки на текущем состоянии
 
-- `cargo test --lib`: **138/138**.
+- `cargo test --lib`: **139/139**.
 - Default `no_std` build, QEMU `-smp 2`: single-core, reaches `howl>`.
 - `no_std,smp` build, QEMU `-smp 2`: CPU1 online (GIC/timer/IPI), both CPUs
   execute tasks, `howl ready`/prompt and `ps` work; 60 s without panic/BKL-stuck.
+- `no_std,smp,demo-tasks`, QEMU `-smp 2`: **66 PASS / 0 PANIC**, clean exit;
+  spawn/kill/reap and DMA revoke ran while both CPUs were scheduling.
+- Forced AP GIC failure (temporary build-only patch): CPU1 stays offline,
+  prints `AP GIC unavailable`, and the system still reaches `howl>`.
 - `no_std,fog` / `no_std,tablet`: build; fog QEMU integration PASS.
 - Physical SMP: **not verified**; fog/tablet remain single-core.

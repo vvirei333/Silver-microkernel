@@ -3,11 +3,13 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## CURRENT STATUS (2026-11-03, TASK №23)
+## CURRENT STATUS (2026-11-04, TASK №23)
 
-Checkpoint: Package E2 on top of `266a789` (`Package E1: make retire_space
-atomic and seal the token API`): owner-aware page-table walks, explicit DRAM
-bounds and a portable cache-line helper.
+Checkpoint: package E2 plus the external audit fixes (`b22e3a0`) and the
+follow-up SMP hardening: owner-aware page-table walks, explicit DRAM bounds
+and a portable cache-line helper; fail-closed FDT/region parsing; zeroed DMA
+publication; serialized PL011 RX; GICv3 single-window bound-IRQ dispatch; and
+AP publication gated on a usable banked GIC.
 
 - **Page-table ownership and DMA reclamation (Packages E/E1/E2).** Every page
   table is registered with `(frame, generation, owner)`; walks validate the
@@ -39,7 +41,10 @@ bounds and a portable cache-line helper.
   and the Phase 5 list are in [`SMP_STATUS.md`](SMP_STATUS.md). A stop-the-world
   SGI1 handshake now parks every other CPU (including BKL waiters) around DMA
   teardown, with a `dsb sy` before acknowledgement; a timeout falls back to the
-  conservative `space_is_running` / `range_mapped_by` leak gate.
+  conservative `space_is_running` / `range_mapped_by` leak gate. An AP is
+  published online only after its banked GIC bring-up succeeds; a failed AP
+  parks offline, and late `boot_secondary_cpus` failures release the stack,
+  private page and task space instead of leaking them.
 - **Redmi 10C / fog RAM-only bring-up is implemented but not hardware-verified.**
   Authoritative document: [`redmi10c_poc/README.md`](redmi10c_poc/README.md).
 - The default `fog` build is **fail-closed**: relocation is disabled, and a
@@ -55,9 +60,10 @@ bounds and a portable cache-line helper.
 - GICv3 no longer falls back to redistributor frame 0. The boot CPU's frame is
   matched by `GICR_TYPER` affinity in bits `[63:32]`; if no frame matches, the
   timer PPI is left disabled and timer-dependent scheduling does not start.
-- Verified in this snapshot: **138 host tests**, fog QEMU relocation/at-link/
+- Verified in this snapshot: **139 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
-  demo regression **66 PASS / 0 PANIC**, tablet build, and fog boot image v3.
+  demo regression **66 PASS / 0 PANIC** on both the default build and
+  `no_std,smp` with QEMU `-smp 2`, tablet build, and fog boot image v3.
 - **Hardware coverage after E2 is a smoke test, not a proof.** The post-E2
   image boots on physical `rain` and the GIC/timer panel is live, but QEMU and
   a single boot are not evidence for TLB/cache maintenance under load or for

@@ -225,11 +225,25 @@ pub fn timer_available() -> bool {
     TIMER_READY.load(Ordering::Relaxed)
 }
 
-/// Per-CPU GICv3 bring-up for APs. The boot CPU's global timer state is set
-/// by [`init`]; an AP that cannot find its own frame simply stays without
-/// private interrupts instead of touching frame 0.
-pub fn cpu_init() {
-    let _ = cpu_init_inner();
+/// Per-CPU GICv3 bring-up. Returns false when the CPU cannot be given a
+/// usable redistributor/CPU interface; the caller must keep it offline since
+/// an AP without banked SGIs is invisible to IPI and quiescence.
+pub fn cpu_init() -> bool {
+    if !cpu_init_inner() {
+        return false;
+    }
+    // `configure_ppi` gates on the timer PPI. An AP additionally needs its
+    // banked SGIs; re-read the same frame so a silently dropped SGI enable
+    // cannot publish a CPU that is invisible to IPI and quiescence.
+    let Some(redistributor) = redistributor_for_self() else {
+        return false;
+    };
+    let expected = (1_u32 << (RESCHEDULE_IRQ % 32))
+        | (1_u32 << (crate::gic::QUIESCE_IRQ % 32));
+    required_bits_set(
+        read32(redistributor + GICR_SGI_OFFSET + GICR_ISENABLER0),
+        expected,
+    )
 }
 
 /// Per-CPU GICv3 bring-up: system-register interface, own redistributor
@@ -688,16 +702,17 @@ pub fn handle_irq() {
         }
         _ => {
             // Probe and wake are one kernel-lock-protected step (see gic.rs).
-            let bound = {
+            // Splitting them into two windows lets another CPU unbind the
+            // INTID in between, after which this path masks the line and
+            // wakes nobody: the interrupt is silently lost.
+            {
                 let _bkl = crate::smp::BklGuard::new();
-                scheduler::irq_is_bound(irq)
-            };
-            if bound {
-                let _bkl = crate::smp::BklGuard::new();
-                disable_irq(irq);
-                end_interrupt(acknowledge_register);
-                scheduler::wake_bound_irq(irq);
-                return;
+                if scheduler::irq_is_bound(irq) {
+                    disable_irq(irq);
+                    end_interrupt(acknowledge_register);
+                    scheduler::wake_bound_irq(irq);
+                    return;
+                }
             }
             // No driver owns this INTID. Mask it before EOI so a level
             // source cannot re-enter immediately. If no proven scope exists,

@@ -636,10 +636,11 @@ not prove device quiescence; both remain driver/IPC-protocol responsibilities.
 | [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU AP bring-up and task execution behind the `smp` feature; quiescence stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 
-Current verification snapshot (2026-11-03): **138 host tests** pass; the fog
+Current verification snapshot (2026-11-04): **139 host tests** pass; the fog
 QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
-`howl>`; the demo regression reports 66 PASS / 0 PANIC; all four release
+`howl>`; the demo regression reports 66 PASS / 0 PANIC and also passes under
+`no_std,smp` with QEMU `-smp 2`; all four release
 feature sets (`no_std`, `fog`, `fog-reloc`, `tablet`) build. The opt-in
 `no_std,smp` build on QEMU `-smp 2` brings CPU1 online, runs tasks on both
 CPUs, and reaches a working `howl>` prompt. DMA teardown stops the other CPUs

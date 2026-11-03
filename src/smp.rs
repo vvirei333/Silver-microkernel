@@ -164,10 +164,18 @@ pub fn set_current_index_for(cpu: usize, index: usize) {
 /// caller has it (the register write itself needs no mapping). Also stores
 /// the CPU id and MPIDR for later IPI/GICR use.
 pub fn init_cpu(slot: usize) {
+    init_cpu_unpublished(slot);
+    publish_cpu(slot);
+}
+
+/// Installs the per-CPU pointer and writes this CPU's identity, but leaves
+/// the slot offline. APs use this so they are not visible to IPI/quiescence
+/// before their banked GIC state is proven usable.
+pub fn init_cpu_unpublished(slot: usize) {
     let cpu = &CPUS[slot];
     cpu.claimed.store(true, Ordering::Release);
     // Writes race with nothing: the slot is not yet published (`online` is
-    // set below with Release), and no other CPU reads this slot's fields.
+    // set later with Release), and no other CPU reads this slot's fields.
     unsafe {
         let cpu = cpu as *const PerCpu as *mut PerCpu;
         (*cpu).cpu_id = slot;
@@ -176,7 +184,13 @@ pub fn init_cpu(slot: usize) {
     unsafe {
         core::arch::asm!("msr tpidr_el1, {}", in(reg) cpu as *const PerCpu as usize, options(nostack));
     }
-    cpu.online.store(true, Ordering::Release);
+}
+
+/// Publishes a fully initialized slot. Fields written by
+/// [`init_cpu_unpublished`] are visible to any reader that observes this
+/// Release store.
+pub fn publish_cpu(slot: usize) {
+    CPUS[slot].online.store(true, Ordering::Release);
 }
 
 fn read_mpidr() -> u64 {
@@ -193,15 +207,8 @@ fn read_mpidr() -> u64 {
 pub fn claim_cpu_slot() -> Option<usize> {
     for (slot, cpu) in CPUS.iter().enumerate() {
         if !cpu.claimed.swap(true, Ordering::AcqRel) {
-            // Claim first, then publish all fields, and only then set
-            // `online` with Release. A reader that sees online==true is
-            // guaranteed to see cpu_id/mpidr.
-            unsafe {
-                let cpu = cpu as *const PerCpu as *mut PerCpu;
-                (*cpu).cpu_id = slot;
-                (*cpu).mpidr = read_mpidr();
-            }
-            cpu.online.store(true, Ordering::Release);
+            // The swap is the exclusive handoff. The caller must fill the
+            // slot via `init_cpu_unpublished` and only then publish it.
             return Some(slot);
         }
     }
@@ -710,12 +717,23 @@ extern "C" fn smp_ap_main() -> ! {
     let Some(slot) = claim_cpu_slot() else {
         panic!("AP: no free per-CPU slot");
     };
-    init_cpu(slot);
+    init_cpu_unpublished(slot);
     crate::console::write_str("SMP: AP slot claimed\r\n");
-    crate::gic::cpu_init();
+    if !crate::gic::cpu_init() {
+        // No redistributor/CPU interface means no banked SGI0/SGI1. Publishing
+        // this CPU would make quiescence wait forever for an ack it can never
+        // receive, so park it offline instead.
+        crate::console::write_str("SMP: AP GIC unavailable, CPU left offline\r\n");
+        loop {
+            unsafe {
+                core::arch::asm!("wfe", options(nomem, nostack, preserves_flags));
+            }
+        }
+    }
     crate::console::write_str("SMP: AP gic ok\r\n");
     crate::timer::cpu_init();
     crate::console::write_str("SMP: AP timer ok\r\n");
+    publish_cpu(slot);
 
     crate::console::write_str("SMP: CPU");
     crate::console::write_dec_u64(slot as u64);
@@ -760,7 +778,7 @@ pub fn boot_secondary_cpus() {
             crate::console::write_str(", leaving it offline\r\n");
             return;
         };
-        let Some((ttbr0, _space_token)) = crate::mmu::create_task_space(private, 0, None) else {
+        let Some((ttbr0, space_token)) = crate::mmu::create_task_space(private, 0, None) else {
             crate::frame_allocator::free_page_tagged(private, private_generation);
             crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: no task space for CPU");
@@ -769,6 +787,10 @@ pub fn boot_secondary_cpus() {
             return;
         };
         if !crate::mmu::install_ap_identity(ttbr0) {
+            // No AP was started, so the freshly built space is not running
+            // anywhere and can be torn down without the quiescence gate.
+            crate::mmu::destroy_task_space(space_token, private, private_generation);
+            crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: no AP identity map for CPU");
             crate::console::write_dec_u64(cpu as u64);
             crate::console::write_str(", leaving it offline\r\n");
@@ -826,6 +848,11 @@ pub fn boot_secondary_cpus() {
         crate::console::write_dec_u64(result as u64);
         crate::console::write_str("\r\n");
         if result != 0 {
+            // The CPU never entered the trampoline, so nothing references
+            // this stack or address space. Release both instead of leaking
+            // them on every late bring-up failure.
+            crate::mmu::destroy_task_space(space_token, private, private_generation);
+            crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: CPU_ON failed, CPU left offline\r\n");
             return;
         }
