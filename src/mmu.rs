@@ -343,7 +343,9 @@ fn kernel_page_descriptor(output_address: usize) -> u64 {
 ///
 /// The caller must own the entire 2 MiB block. The kernel stack arena is
 /// allocated as one aligned run for exactly this reason; splitting a block
-/// that also contains live kernel data would unmap it.
+/// that also contains live kernel data would unmap it. Concurrent init calls
+/// are serialized in `kernel_stack::init`; the descriptor-type check below is
+/// the second line of defence against splitting the same block twice.
 pub fn install_kernel_stack_arena(arena_pa: usize) -> Option<usize> {
     if arena_pa % BLOCK_2M != 0 {
         return None;
@@ -375,9 +377,13 @@ pub fn install_kernel_stack_arena(arena_pa: usize) -> Option<usize> {
             return None;
         }
         zero_page(l3_pa);
+        // Publish the zeroed L3 contents to the point of coherency *before*
+        // the L2 entry can make the walker read the table. Cleaning only the
+        // L2 entry first would let a real CPU fetch stale L3 lines after the
+        // old block translation is dropped.
+        flush_after_table_change(l3_pa, GRANULE);
         write_entry(l2_pa, l2_index, l3_pa as u64 | DESC_TABLE);
         flush_after_table_change(l2_pa, GRANULE);
-        flush_after_table_change(l3_pa, GRANULE);
         Some(l3_pa)
     }
 }

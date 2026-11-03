@@ -19,6 +19,8 @@
 //! the frame allocator. That is deliberate — the block descriptor is replaced
 //! once and remains a page table for the lifetime of the kernel.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::frame_allocator;
 use crate::memory::PAGE_SIZE;
 use crate::mmu;
@@ -47,13 +49,24 @@ static ARENA: SpinLock<Arena> = SpinLock::new(Arena {
     initialized: false,
 });
 
+/// Serializes the whole init, not just the final publish. Two parallel boot
+/// paths must not both allocate and split a 2 MiB block: the loser would
+/// leave an extra L2 block pointing at an empty table.
+static INIT_CLAIMED: AtomicBool = AtomicBool::new(false);
+
 /// Reserves and splits the kernel stack arena. Runs once, after the frame
 /// allocator is usable. Returns false when no 2 MiB-aligned run exists or the
 /// TTBR1 block cannot be split; the caller must then fail the boot closed.
 pub fn init() -> bool {
-    // init is a boot-time singleton. Check before allocating: a second call
-    // must not split another TTBR1 block and then free the run that block
-    // just stopped mapping.
+    // Claim init atomically before any allocation or TTBR1 mutation. The
+    // ARENA flag alone is only published at the end, so two parallel calls
+    // could otherwise both get past a pre-check and split two blocks.
+    if INIT_CLAIMED
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return false;
+    }
     if ARENA.lock().initialized {
         return false;
     }
