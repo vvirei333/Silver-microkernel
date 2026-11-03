@@ -637,11 +637,11 @@ QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 `howl>`; the demo regression reports 66 PASS / 0 PANIC; all four release
 feature sets (`no_std`, `fog`, `fog-reloc`, `tablet`) build. A physical Redmi
-10C `rain` unit previously booted the RAM-only image to the scheduler and the
-Howl task, with live GICv3 timer interrupts confirmed by the `fog-ui` panel
-(`TICKS` > 1000). That hardware evidence predates Packages A2–E2; the current
-owner-aware walk, CRM/cache-line and DMA-reclamation changes have **not** been
-re-run on the unit.
+10C `rain` unit boots the post-E2 RAM-only image to the `fog-ui` panel with
+`GICV3 ONLINE`, `TIMER ONLINE` and growing `TICKS`. The GIC gate deliberately
+does not use `GICR_IGROUPR0`: on Rain it reads zero for timer PPI 18 even
+though the interrupt is delivered as Group 1 NS. This is a boot/timer smoke
+test, not a DMA-reclamation or TLB/cache stress test.
 
 ## License
 

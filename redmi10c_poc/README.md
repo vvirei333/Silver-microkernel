@@ -84,13 +84,22 @@ the same addresses or devices exist on the phone.
 | Demo regression | 66 PASS / 0 unexpected FAIL / 0 PANIC |
 | Tablet build | PASS |
 | Fog boot image v3 | PASS: `ANDROID!`, header v3 |
-| **Real Redmi 10C (`rain`), RAM-only `fastboot boot`** | **PASS (pre-E2): boot stub, relocation/FDT proof, MMU, heap, GICv3, timer, scheduler, Howl task** |
-| **GICv3 PPI 18 delivery on hardware** | **PASS (pre-E2): `GICD_CTLR=0x12`, `GICR_ISENABLER0=0x40001`, IRQ count > 1000** |
+| **Real Redmi 10C (`rain`), RAM-only `fastboot boot`** | **PASS (post-E2): boot stub, relocation/FDT proof, MMU self-test, heap, GICv3, timer, scheduler, `fog-ui` panel** |
+| **GICv3 PPI 18 delivery on hardware** | **PASS (post-E2): `GICD_CTLR=0x12`, `GICR_ISENABLER0=0x00040001`, `TICKS` grow** |
 
-The hardware rows were measured before Packages A2–E2. The current image adds
-owner-aware page-table walks, DRAM bounds, the `CTR_EL0` cache-line helper and
-fail-closed DMA reclamation; it has **not** been re-run on the unit. QEMU does
-not validate TLB/cache maintenance or DMA quiescence on Qualcomm hardware.
+The post-E2 image includes owner-aware page-table walks, DRAM bounds, the
+`CTR_EL0` cache-line helper and fail-closed DMA reclamation. The hardware run
+is a boot/timer smoke test; it does not stress DMA reclamation, TLB shootdown
+or cache maintenance under load.
+
+One hardware quirk is now explicit: `GICR_IGROUPR0` reads `0` for timer PPI 18
+even though the PPI is delivered as Group 1 NS. The GIC gate therefore uses
+`GICR_ISENABLER0`, `GICR_IGRPMODR0` and the distributor's `ARE_NS`/
+`EnableGrp1NS` readback, with a real tick as delivery proof. Do not reintroduce
+`GICR_IGROUPR0` as a fail-closed check.
+
+QEMU does not validate TLB/cache maintenance or DMA quiescence on Qualcomm
+hardware.
 
 GICv3 now matches the boot CPU's redistributor by `GICR_TYPER` affinity and has
 **no frame-0 fallback**. `ARE_NS`/`EnableGrp1NS` and the timer PPI enable bit

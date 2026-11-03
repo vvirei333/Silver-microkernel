@@ -16,6 +16,17 @@ bounds and a portable cache-line helper.
   `[DRAM_BASE, DRAM_END)`, and DMA frames are freed only when the CPU-mapping
   scan proves `safe_to_free`. `safe_to_free` says nothing about device
   quiescence; see the DMA contract below.
+- **GICv3 readback correction (2026-11-03, after E2).** `ca7fd68` added a
+  fail-closed `GICR_IGROUPR0` check that is a false negative on the Rain unit:
+  the register reads `0` for PPI 18 even though the same PPI is delivered to
+  EL1 as Group 1 NS. The gate now requires `GICR_ISENABLER0` plus
+  `GICR_IGRPMODR0` and the distributor's `ARE_NS`/`EnableGrp1NS` readback; the
+  real timer tick proves delivery. `GICR_IGROUPR0` remains diagnostic only.
+- **Post-E2 hardware smoke test.** `fastboot boot` of the E2 `fog-ui` image
+  with the readback correction reaches the status panel with `GICV3 ONLINE`,
+  `TIMER ONLINE` and growing `TICKS`. This validates the boot path, MMU
+  self-test, GIC/timer and scheduler/Howl start; it does **not** stress DMA
+  reclamation, TLB shootdown or cache maintenance under load.
 - **Redmi 10C / fog RAM-only bring-up is implemented but not hardware-verified.**
   Authoritative document: [`redmi10c_poc/README.md`](redmi10c_poc/README.md).
 - The default `fog` build is **fail-closed**: relocation is disabled, and a
@@ -34,10 +45,10 @@ bounds and a portable cache-line helper.
 - Verified in this snapshot: **138 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC**, tablet build, and fog boot image v3.
-- **The post-E2 image has not been re-run on physical `rain`.** The hardware
-  evidence in this file and in `redmi10c_poc/README.md` predates Packages
-  A2–E2; QEMU is not evidence for TLB/cache maintenance, GIC or DMA
-  quiescence on the device.
+- **Hardware coverage after E2 is a smoke test, not a proof.** The post-E2
+  image boots on physical `rain` and the GIC/timer panel is live, but QEMU and
+  a single boot are not evidence for TLB/cache maintenance under load or for
+  device quiescence during DMA reclamation.
 - **Hardware readiness: NOT READY — NEEDS DEVICE DATA.** The ABL load address,
   live memory/reserved map, UART clock/pins, GIC/timer wiring and boot CPU
   affinity of the specific unit are still unconfirmed.
@@ -1554,6 +1565,12 @@ read back only their own values.
     bearer capability; the IPC protocol that distributes it is responsible for
     granting it. Cache maintenance for shared DMA works only while all
     participants use Normal Non-Cacheable aliases after the initial clean.
+22. **`GICR_IGROUPR0` is not a usable GICv3 gate on Rain.** It reads `0` for
+    timer PPI 18 even when the interrupt is delivered as Group 1 NS. Do not
+    reintroduce it as a fail-closed check. The usable gate is
+    `GICR_ISENABLER0` + `GICR_IGRPMODR0` + `GICD_CTLR.ARE_NS`/
+    `EnableGrp1NS`; an actual timer tick is the delivery proof. Keep the
+    group register in diagnostics only.
 
 ## Why IPC uses Mutex + Condvar
 

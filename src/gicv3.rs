@@ -346,9 +346,16 @@ fn wake_redistributor(rd: usize) -> bool {
 /// priority for the timer, then enable the timer PPI and the reschedule SGI.
 ///
 /// Returns true only when the timer PPI bit is readable back in
-/// `GICR_ISENABLER0`, is routed to Group 1 NS and is not Group 0. Enabling a
-/// PPI is a banked per-PE operation; the readback is on the same frame that
-/// was just written.
+/// `GICR_ISENABLER0` and is not configured as Group 1 Secure
+/// (`GICR_IGRPMODR0`). Enabling a PPI is a banked per-PE operation; the
+/// readback is on the same frame that was just written.
+///
+/// `GICR_IGROUPR0` is deliberately **not** part of the gate. The live Rain
+/// unit reads it as zero for PPI 18 even though the same PPI is delivered to
+/// EL1 as Group 1 NS: the pre-readback image armed the timer and ticked with
+/// the identical writes. On this implementation the register is not a
+/// reliable readback, so the distributor's `ARE_NS`/`EnableGrp1NS` state plus
+/// a real tick are the proof; failing here would reject working hardware.
 fn configure_ppi(redistributor: usize) -> bool {
     let sgi = redistributor + GICR_SGI_OFFSET;
     let timer_bit = 1_u32 << (timer_irq() % 32);
@@ -367,11 +374,11 @@ fn configure_ppi(redistributor: usize) -> bool {
     // The live unit has been seen with the enable bit silently clear even
     // though the write completed. Treat the readback as the only proof.
     let enabled = read32(sgi + GICR_ISENABLER0);
-    let group = read32(sgi + GICR_IGROUPR0);
+    let _group = read32(sgi + GICR_IGROUPR0);
     let group_modifier = read32(sgi + GICR_IGRPMODR0);
-    required_bits_set(enabled, timer_bit)
-        && required_bits_set(group, timer_bit)
-        && group_modifier & timer_bit == 0
+    // `_group` is read for the diagnostic path only; see the function comment
+    // for why it cannot be part of the fail-closed gate on Rain.
+    required_bits_set(enabled, timer_bit) && group_modifier & timer_bit == 0
 }
 
 /// P3 diagnostic (READ-ONLY): pending/enable of the physical-timer PPI in
