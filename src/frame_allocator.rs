@@ -128,7 +128,9 @@ pub fn alloc_page_tagged() -> Option<(usize, u32)> {
             return None;
         }
 
-        let tag = next_generation(&mut state);
+        let Some(tag) = next_generation(&mut state) else {
+            return None;
+        };
         mark_used(&mut state, page_index);
         state.generation[page_index] = tag;
         state.free_pages -= 1;
@@ -176,7 +178,9 @@ pub fn alloc_contiguous_pages_tagged(page_count: usize) -> Option<(usize, u32)> 
         run_length += 1;
 
         if run_length == page_count {
-            let tag = next_generation(&mut state);
+            let Some(tag) = next_generation(&mut state) else {
+                return None;
+            };
             for index in run_start..run_start + page_count {
                 mark_used(&mut state, index);
                 state.generation[index] = tag;
@@ -239,7 +243,9 @@ pub fn alloc_contiguous_pages_aligned_tagged(
             continue;
         }
 
-        let tag = next_generation(&mut state);
+        let Some(tag) = next_generation(&mut state) else {
+            return None;
+        };
         for index in run_start..run_start + page_count {
             mark_used(&mut state, index);
             state.generation[index] = tag;
@@ -440,12 +446,16 @@ fn run_contiguous_self_test() -> bool {
         && first == second
 }
 
-fn next_generation(state: &mut FrameAllocatorState) -> u32 {
-    state.next_generation = state.next_generation.wrapping_add(1);
-    if state.next_generation == 0 {
-        state.next_generation = 1;
+/// Advances the global tag. At `u32::MAX` allocation fails closed instead of
+/// wrapping to an old tag and reopening the ABA window. The limit is 2^32-1
+/// successful allocations; exhausting it stops new frame allocations rather
+/// than silently reusing a generation.
+fn next_generation(state: &mut FrameAllocatorState) -> Option<u32> {
+    if state.next_generation == u32::MAX {
+        return None;
     }
-    state.next_generation
+    state.next_generation += 1;
+    Some(state.next_generation)
 }
 
 fn mark_used(state: &mut FrameAllocatorState, page_index: usize) {

@@ -51,6 +51,13 @@ static ARENA: SpinLock<Arena> = SpinLock::new(Arena {
 /// allocator is usable. Returns false when no 2 MiB-aligned run exists or the
 /// TTBR1 block cannot be split; the caller must then fail the boot closed.
 pub fn init() -> bool {
+    // init is a boot-time singleton. Check before allocating: a second call
+    // must not split another TTBR1 block and then free the run that block
+    // just stopped mapping.
+    if ARENA.lock().initialized {
+        return false;
+    }
+
     let Some((base, generation)) =
         frame_allocator::alloc_contiguous_pages_aligned_tagged(ARENA_PAGES, ARENA_PAGES)
     else {
@@ -64,10 +71,9 @@ pub fn init() -> bool {
 
     let mut arena = ARENA.lock();
     if arena.initialized {
-        // init is a boot-time singleton; a second call must not leak the run
-        // or replace the live table.
-        drop(arena);
-        frame_allocator::free_contiguous_pages_tagged(base, ARENA_PAGES, generation);
+        // Only reachable if two boot paths raced. The block is already
+        // split; leaking this run is safer than freeing pages that the new
+        // page table no longer maps.
         return false;
     }
     arena.base = base;

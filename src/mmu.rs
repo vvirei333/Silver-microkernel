@@ -382,13 +382,13 @@ pub fn install_kernel_stack_arena(arena_pa: usize) -> Option<usize> {
     }
 }
 
-/// Maps or unmaps `page_count` consecutive 4 KiB pages in a kernel stack
-/// arena table. One table clean + TLB flush covers the whole run.
 /// Read-only check used by the kernel-stack arena self-test.
 pub fn kernel_page_is_mapped(table_pa: usize, index: usize) -> bool {
     index < ENTRIES && (unsafe { read_entry(table_pa, index) } & 0b11) == DESC_PAGE
 }
 
+/// Maps or unmaps `page_count` consecutive 4 KiB pages in a kernel stack
+/// arena table. One table clean + TLB flush covers the whole run.
 pub fn set_kernel_stack_pages(
     table_pa: usize,
     first_index: usize,
