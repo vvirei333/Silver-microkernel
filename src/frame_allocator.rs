@@ -1,3 +1,5 @@
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 use crate::memory::{MemoryRegion, PAGE_SIZE};
 use crate::smp::SpinLock;
 
@@ -25,19 +27,29 @@ static STATE: SpinLock<FrameAllocatorState> = SpinLock::new(FrameAllocatorState 
     free_pages: 0,
 });
 
+/// Release-mode counter for refused double frees. The page is already free,
+/// so returning it instead of counting could hand a live frame to a second
+/// owner; the counter keeps the event observable without corrupting state.
+static DOUBLE_FREES: AtomicUsize = AtomicUsize::new(0);
+
+#[allow(dead_code)]
+pub fn double_frees() -> usize {
+    DOUBLE_FREES.load(Ordering::Relaxed)
+}
+
 /// Initializes the allocator from page-aligned part of the available memory region.
 ///
 /// Returns the number of usable physical pages. The bitmap itself lives in the
 /// kernel's `.bss`, so it does not consume frames from `available`.
 pub fn init(available: MemoryRegion) -> usize {
-    let start = align_up(available.start, PAGE_SIZE);
-    let end = align_down(available.end, PAGE_SIZE);
-    assert!(end > start, "Available memory region is empty: start >= end");
-    let requested_pages = if end > start {
-        (end - start) / PAGE_SIZE
-    } else {
-        0
+    // A malformed or truncated live-FDT window must fail closed, not abort:
+    // the caller already turns a zero return into an exception-6 boot stop.
+    let Some((start, end)) =
+        silver_microkernel::align_range(available.start, available.end, PAGE_SIZE)
+    else {
+        return 0;
     };
+    let requested_pages = (end - start) / PAGE_SIZE;
     let total_pages = requested_pages.min(MAX_PHYSICAL_PAGES);
     let usable_end = start + total_pages * PAGE_SIZE;
 
@@ -179,14 +191,20 @@ pub fn free_page(address: usize) {
 
     let word_index = page_index / BITS_PER_WORD;
     let bit_index = page_index % BITS_PER_WORD;
-    let bit_mask = 1_u64 << bit_index;
-    let was_used = state.bitmap[word_index] & bit_mask != 0;
-    debug_assert!(was_used, "double free of a physical page");
+    let Some(cleared) =
+        silver_microkernel::clear_frame_bit(state.bitmap[word_index], bit_index as u32)
+    else {
+        // Already free. Refuse to touch the bitmap; in release builds the
+        // counter is the only safe diagnostic (the page may even have been
+        // reallocated to another owner, which this allocator cannot detect
+        // without per-frame generation metadata).
+        DOUBLE_FREES.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(false, "double free of a physical page");
+        return;
+    };
 
-    if was_used {
-        state.bitmap[word_index] &= !bit_mask;
-        state.free_pages += 1;
-    }
+    state.bitmap[word_index] = cleared;
+    state.free_pages += 1;
 }
 
 /// Verifies allocation, contiguity and reuse without changing the final state.
@@ -237,14 +255,6 @@ fn run_contiguous_self_test() -> bool {
     }
 
     first % PAGE_SIZE == 0 && first == second
-}
-
-const fn align_up(address: usize, alignment: usize) -> usize {
-    (address + alignment - 1) & !(alignment - 1)
-}
-
-const fn align_down(address: usize, alignment: usize) -> usize {
-    address & !(alignment - 1)
 }
 
 fn mark_used(state: &mut FrameAllocatorState, page_index: usize) {

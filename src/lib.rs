@@ -11,6 +11,7 @@ extern crate alloc;
 pub mod fdt;
 pub mod fog_validate;
 pub mod gicv3_policy;
+pub mod irq_policy;
 pub mod reloc;
 pub mod wait_queue;
 
@@ -195,6 +196,45 @@ where
     Some((virtual_address, page_count))
 }
 
+/// Aligns a half-open physical interval inward to `alignment`.
+///
+/// The frame allocator must never hand out a partial page, and a malformed
+/// live-FDT window must fail closed instead of aborting the kernel. Returns
+/// `None` for a zero or non-power-of-two alignment, an overflow while
+/// rounding the start, or an interval that contains no whole aligned unit.
+pub fn align_range(start: usize, end: usize, alignment: usize) -> Option<(usize, usize)> {
+    if alignment == 0 || !alignment.is_power_of_two() {
+        return None;
+    }
+    let mask = alignment - 1;
+    let start = start.checked_add(mask)? & !mask;
+    let end = end & !mask;
+    if end <= start {
+        None
+    } else {
+        Some((start, end))
+    }
+}
+
+/// Clears `bit` in a frame-bitmap word.
+///
+/// `None` means the bit was already clear: the caller attempted to free a
+/// frame that the allocator believes is not allocated. Treating that as a
+/// successful free could hand the same frame to two owners, so the caller
+/// must refuse it. (Detecting a double free after the frame was reallocated
+/// needs per-frame generation metadata; this helper only classifies the bit.)
+pub fn clear_frame_bit(word: u64, bit: u32) -> Option<u64> {
+    if bit >= 64 {
+        return None;
+    }
+    let mask = 1_u64 << bit;
+    if word & mask == 0 {
+        None
+    } else {
+        Some(word & !mask)
+    }
+}
+
 /// Component-aware `path` under `base` (or equal to it).
 ///
 /// `/mnt` is *not* under `/mntx`, and `/` contains every absolute path.
@@ -250,8 +290,8 @@ pub fn mount_match<'m, 'p>(mounts: &[&'m str], path: &'p str) -> Option<(usize, 
 #[cfg(test)]
 mod tests {
     use super::{
-        build_argv_envp, mmap_place, mount_match, parse_spawn_args, path_is_under, MAX_SPAWN_ARGS,
-        SPAWN_ARGS_VERSION,
+        align_range, build_argv_envp, clear_frame_bit, mmap_place, mount_match, parse_spawn_args,
+        path_is_under, MAX_SPAWN_ARGS, SPAWN_ARGS_VERSION,
     };
 
     const PAGE: usize = 4096;
@@ -479,5 +519,33 @@ mod tests {
     fn argv_envp_rejects_too_many_entries() {
         let many: Vec<Vec<u8>> = (0..=MAX_SPAWN_ARGS).map(|_| b"x".to_vec()).collect();
         assert!(build_argv_envp(&many, &[], 0x10000, 8192).is_none());
+    }
+
+    #[test]
+    fn align_range_rounds_inward() {
+        assert_eq!(align_range(0x1003, 0x3fff, 0x1000), Some((0x2000, 0x3000)));
+        assert_eq!(align_range(0x1000, 0x2fff, 0x1000), Some((0x1000, 0x2000)));
+        assert_eq!(align_range(0x1000, 0x2000, 0x1000), Some((0x1000, 0x2000)));
+    }
+
+    #[test]
+    fn align_range_rejects_sub_page_and_bad_alignment() {
+        assert_eq!(align_range(0x1000, 0x1800, 0x1000), None);
+        assert_eq!(align_range(0x1000, 0x1000, 0x1000), None);
+        assert_eq!(align_range(0, 0x1000, 0), None);
+        assert_eq!(align_range(0, 0x1000, 3), None);
+    }
+
+    #[test]
+    fn align_range_rejects_overflow() {
+        assert_eq!(align_range(usize::MAX - 1, usize::MAX, 0x1000), None);
+    }
+
+    #[test]
+    fn clear_frame_bit_classifies_double_free() {
+        assert_eq!(clear_frame_bit(0b1010, 1), Some(0b1000));
+        assert_eq!(clear_frame_bit(0b1010, 0), None);
+        assert_eq!(clear_frame_bit(0, 0), None);
+        assert_eq!(clear_frame_bit(u64::MAX, 64), None);
     }
 }

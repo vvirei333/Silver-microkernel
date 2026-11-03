@@ -1,5 +1,30 @@
-use core::ptr;
+//! Interrupt dispatch for the memory-mapped GICv2 path.
+//!
+//! ## Acknowledge, dispatch, EOI and DIR order (GICv2)
+//!
+//! 1. Read `GICC_IAR`. The returned 32-bit acknowledge register carries the
+//!    INTID in bits [9:0] and the source CPU in bits [12:10].
+//! 2. INTID 1023 is spurious: return without writing `GICC_EOIR`. The
+//!    architecture forbids EOI for a spurious acknowledge.
+//! 3. Classify the INTID: SGI (0-15), PPI (16-31), SPI (32-1019),
+//!    spurious/reserved. SGI 0 is the reschedule IPI, the timer is a PPI,
+//!    and the console UART is an SPI.
+//! 4. For a bound or unknown interrupt, mask the *specific* INTID before EOI:
+//!    `GICD_ICENABLER0` for SGIs/PPIs (banked per CPU) and the matching
+//!    `GICD_ICENABLER<n>` word for SPIs. There is no universal mask write.
+//! 5. Write the full acknowledge register (not just the INTID) to
+//!    `GICC_EOIR`.
+//! 6. `GICC_DIR` is unused here because `GICC_CTLR.EOImode` is 0. With split
+//!    priority drop/deactivation disabled, the EOIR write both drops the
+//!    active priority and deactivates the interrupt in one step.
+//!
+//! A bound driver normally runs with its INTID disabled and re-enables it
+//! from `wait_irq`, so the kernel wakes the task after masking.
 
+use core::ptr;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::irq_policy::{self, MaskScope, UnmaskableAction};
 use crate::{exceptions, memory, console, scheduler, timer, platform, gicv3};
 
 /// Non-secure physical timer PPI. QEMU virt and SM8650 use PPI 14 (INTID 30);
@@ -18,6 +43,14 @@ const SPURIOUS_IRQ: u32 = 1023;
 /// Reschedule inter-processor interrupt (SGI 0). Any CPU that makes a task
 /// Ready kicks every other CPU so it re-evaluates its run queue.
 pub const RESCHEDULE_IRQ: u32 = 0;
+
+/// Consecutive unknown INTIDs that could not be masked in a proven scope.
+/// Reset by a successful mask. See `irq_policy::UNMASKABLE_HALT_LIMIT`.
+static UNMASKABLE_STREAK: AtomicU32 = AtomicU32::new(0);
+/// Diagnostic counter: log only the first few masked unknown INTIDs so a
+/// broken device cannot flood the console from the IRQ path.
+static UNKNOWN_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+const UNKNOWN_LOG_LIMIT: u32 = 4;
 
 const DISTRIBUTOR_BASE: usize = memory::phys_to_virt(0x0800_0000);
 const CPU_INTERFACE_BASE: usize = memory::phys_to_virt(0x0801_0000);
@@ -208,6 +241,69 @@ pub fn disable_irq(irq: u32) {
     write32(DISTRIBUTOR_BASE + offset, 1_u32 << (irq % 32));
 }
 
+/// Masks one INTID in the register scope that owns it and confirms the
+/// enable bit is clear. Returns false when no proven scope exists, in which
+/// case the caller must use the bounded unmaskable fallback.
+pub fn mask_irq(intid: u32) -> bool {
+    if platform::detect().uses_gicv3() {
+        return gicv3::mask_irq(intid);
+    }
+    if irq_policy::mask_scope(intid) == MaskScope::Unavailable {
+        return false;
+    }
+    let bit = 1_u32 << (intid % 32);
+    let offset = (intid as usize / 32) * 4;
+    // SGI/PPI enables are banked per CPU in word 0; SPIs live in the
+    // distributor's shared words. Both use ISENABLER/ICENABLER at the same
+    // offsets, but the write must go to the matching scope.
+    write32(DISTRIBUTOR_BASE + GICD_ICENABLER + offset, bit);
+    read32(DISTRIBUTOR_BASE + GICD_ISENABLER + offset) & bit == 0
+}
+
+/// Diagnostic + bounded fallback for an unknown, unbound INTID.
+///
+/// Returns true when the kernel may continue. `masked` says whether
+/// [`mask_irq`] proved the INTID disabled; when it did, the storm is stopped
+/// and the streak resets. When it did not, the caller is about to take the
+/// same interrupt again, so only a finite number of attempts is permitted
+/// before the exception path halts the machine.
+pub fn note_unknown_irq(intid: u32, masked: bool) -> bool {
+    // The tablet diagnostic path logs a fixed string without the numeric ID.
+    #[cfg(feature = "tablet")]
+    let _ = intid;
+    if masked {
+        UNMASKABLE_STREAK.store(0, Ordering::Relaxed);
+        let seen = UNKNOWN_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+        if seen < UNKNOWN_LOG_LIMIT {
+            #[cfg(feature = "tablet")]
+            crate::ram_log::log("IRQ: masked unbound INTID");
+            #[cfg(not(feature = "tablet"))]
+            {
+                console::write_str("IRQ: masked unbound INTID ");
+                console::write_hex_u64(u64::from(intid));
+                console::write_str("\r\n");
+            }
+        }
+        return true;
+    }
+
+    let streak = UNMASKABLE_STREAK.fetch_add(1, Ordering::Relaxed) + 1;
+    let halt = irq_policy::unmaskable_streak_action(streak) == UnmaskableAction::Halt;
+    // Log the first failure and the final one; the middle attempts would
+    // otherwise produce a short but pointless burst.
+    if streak == 1 || halt {
+        #[cfg(feature = "tablet")]
+        crate::ram_log::log("IRQ: unbound INTID cannot be masked");
+        #[cfg(not(feature = "tablet"))]
+        {
+            console::write_str("IRQ: unbound INTID cannot be masked ");
+            console::write_hex_u64(u64::from(intid));
+            console::write_str("\r\n");
+        }
+    }
+    !halt
+}
+
 pub fn acknowledge() -> u32 {
     if platform::detect().uses_gicv3() {
         return gicv3::acknowledge();
@@ -271,8 +367,15 @@ pub extern "C" fn silver_handle_irq() {
         }
         SPURIOUS_IRQ => {}
         _ => {
+            // No driver owns this INTID. Mask the specific line in its own
+            // scope first, then EOI so the active state is released. If the
+            // mask cannot be proven, the bounded fallback below halts
+            // instead of accepting an endless storm.
+            let masked = mask_irq(irq);
             end_interrupt(acknowledge_register);
-            exceptions::silver_handle_exception(8, u64::from(irq), 0, 0);
+            if !note_unknown_irq(irq, masked) {
+                exceptions::silver_handle_exception(8, u64::from(irq), 0, 0);
+            }
         }
     }
 }

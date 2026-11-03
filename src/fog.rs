@@ -374,6 +374,42 @@ pub fn log_banner(params: &BootParams, info: &FogInfo) {
         console("MISSING\r\n");
     }
 
+    // The relocation record is written before the copy, so this line only
+    // appears when relocation was actually attempted. On a refused attempt
+    // the kernel never reaches this code; the source-image copy of the record
+    // is then the only evidence (debugger/ramdump, not a user-visible channel).
+    if let Some(record) = crate::boot::relocation_record() {
+        if record.flags & crate::boot::RELOC_FLAG_ATTEMPTED != 0 {
+            console("SILVER RELOC reason=");
+            crate::console::write_dec_u64(u64::from(record.reason));
+            console(" el=");
+            crate::console::write_dec_u64(u64::from(record.entry_el));
+            console(" dest=0x");
+            crate::console::write_hex_u64(record.dest_start);
+            console(" end=0x");
+            crate::console::write_hex_u64(record.dest_end);
+            console(" size=0x");
+            crate::console::write_hex_u64(record.image_size);
+            console(" flags=0x");
+            crate::console::write_hex_u64(u64::from(record.flags));
+            console(" checks=0x");
+            crate::console::write_hex_u64(u64::from(record.checks));
+            console(" ctr=0x");
+            crate::console::write_hex_u64(if record.flags & crate::boot::RELOC_FLAG_CTR_READ != 0 {
+                record.ctr_el0
+            } else {
+                0
+            });
+            console(" hcr=0x");
+            crate::console::write_hex_u64(if record.flags & crate::boot::RELOC_FLAG_HCR_READ != 0 {
+                record.hcr_el2
+            } else {
+                0
+            });
+            console("\r\n");
+        }
+    }
+
     console("SILVER FDT ");
     if info.have_fdt {
         console("OK size=0x");

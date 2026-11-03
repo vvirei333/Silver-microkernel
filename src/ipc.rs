@@ -79,11 +79,6 @@ static IPC: Mutex<IpcState> = Mutex::new(IpcState {
 /// Blocks while the target queue is full. Mailbox destruction wakes all such
 /// senders; the liveness check then prevents recreating a dead task's mailbox.
 pub fn send(target: u64, message: Message) -> Result<(), SendError> {
-    crate::console::write_str("SEND from=");
-    crate::console::write_dec_u64(scheduler::current_task_id());
-    crate::console::write_str(" to=");
-    crate::console::write_dec_u64(target);
-    crate::console::write_str("\r\n");
     let mut guard = IPC.lock();
     loop {
         if !scheduler::task_alive(target) {
@@ -135,24 +130,16 @@ pub fn receive_from(sender: u64) -> Result<Message, ReceiveError> {
 }
 
 fn receive_matching(sender: Option<u64>, timeout_ticks: u64) -> Result<Message, ReceiveError> {
-    let sp_now: usize;
-    unsafe { core::arch::asm!("mov {}, sp", out(reg) sp_now, options(nostack)) };
-    crate::console::write_str("M1 sp=");
-    crate::console::write_hex_u64(sp_now as u64);
-    crate::console::write_str("\r\n");
     let id = scheduler::current_task_id();
     let deadline = if timeout_ticks == INFINITE_TIMEOUT {
         None
     } else {
         Some(timer::ticks().saturating_add(timeout_ticks))
     };
-    crate::console::write_str("M2\r\n");
     let mut guard = IPC.lock();
-    crate::console::write_str("M3\r\n");
 
     loop {
         let index = mailbox_index(&mut guard, id);
-        crate::console::write_str("M4\r\n");
         let mailbox = &mut guard.mailboxes[index];
         let position = mailbox.queue.iter().position(|message| {
             sender
@@ -173,9 +160,6 @@ fn receive_matching(sender: Option<u64>, timeout_ticks: u64) -> Result<Message, 
             }
         }
 
-        crate::console::write_str("M5 q=");
-        crate::console::write_dec_u64(mailbox.queue.len() as u64);
-        crate::console::write_str("\r\n");
         if deadline.map(|deadline| timer::ticks() >= deadline) == Some(true) {
             return Err(ReceiveError::Timeout);
         }

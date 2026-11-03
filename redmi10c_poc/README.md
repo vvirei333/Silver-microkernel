@@ -40,10 +40,17 @@ exact `fog-ui` layout; the on-device photograph is kept with the task notes.
   `BOOT_PARAMS` and parks. The self-relocation copy is an explicit
   `fog-reloc` build feature.
 - `fog-reloc` now performs a **pre-copy live-FDT check**: the destination span
-  must be inside `/memory` and outside every `/reserved-memory` child, the
-  memreserve map, the DTB and the running source image. The validator uses no
-  allocation or statics and fails closed on unknown cell layouts, non-empty
-  `ranges` or malformed trees.
+  must be inside an available `/memory` region (disabled/unknown `status` does
+  not count) and outside every `/reserved-memory` descendant, the memreserve
+  map, the DTB, the running source image and a `/chosen` initrd range. The
+  validator uses no allocation or statics and fails closed on unknown cell
+  layouts, non-empty `ranges`, `size`/`alloc-ranges`/`memory-region` forms it
+  cannot resolve, a half-specified initrd, or a malformed tree.
+- **Ownership caveat:** FDT validation is necessary but not sufficient. The
+  fixed `0x4008_0000` link slot is safe only under a platform boot contract
+  that says ABL/firmware/DMA do not use it, the initrd is described in the
+  memreserve map (or absent), and the live DTB is complete. A destination
+  inside `/memory` is not, by itself, proof that the bytes are free.
 - Platform identity, memory, reservations, UART, GICv3 and the timer INTID are
   read from the live FDT. Nothing is inferred from "unknown CPU means tablet".
 - A full fog-path integration test runs on QEMU `virt` with a synthetic
@@ -81,9 +88,11 @@ the same addresses or devices exist on the phone.
 | **GICv3 PPI 18 delivery on hardware** | **PASS: `GICD_CTLR=0x12`, `GICR_ISENABLER0=0x40001`, IRQ count > 1000** |
 
 GICv3 now matches the boot CPU's redistributor by `GICR_TYPER` affinity and has
-**no frame-0 fallback**. When no redistributor matches, the timer PPI is left
-disabled, `TIMER TEST` is skipped and the scheduler does not pretend that
-preemption works.
+**no frame-0 fallback**. `ARE_NS`/`EnableGrp1NS` and the timer PPI enable bit
+are read back before `TIMER_READY` is set, and WAKER/RWP waits are bounded.
+When the distributor, the affinity match or the PPI readback fails, the timer
+PPI is left disabled, `TIMER TEST` is skipped and the scheduler does not
+pretend that preemption works.
 
 Hardware readiness: **first milestone reached** — the kernel boots, the timer
 preempts and the Howl task runs on the unit. Console I/O over the GENI UART is
@@ -149,11 +158,14 @@ overlap. Address match alone is never treated as proof of the hardware map.
 
 The pre-copy live-FDT validation is now implemented in `src/fog_validate.rs`:
 the destination must be inside a `/memory` region and outside every
-reservation, memreserve, the DTB and the source image. It is deliberately
-conservative (2/2 address/size cells, no `ranges` translation) and returns
-"park" on anything it cannot prove. `fog-reloc` therefore remains an opt-in
-experiment until it has been exercised on a real unit; the default build still
-never copies.
+reservation, memreserve, the DTB and the source image. Cell layouts are read
+from the node that owns the `reg`: the root declares the layout used by
+`/memory`, and `/reserved-memory` declares the layout used by its children.
+Both 1/1 and 2/2 are supported; unrelated `reg` properties (for example a
+`/cpus` 1/0 node) are not interpreted. There is no `ranges` translation, and
+anything else it cannot prove returns "park". `fog-reloc` therefore remains an
+opt-in experiment until it has been exercised on a real unit; the default
+build still never copies.
 
 ## Boot flow
 
@@ -229,6 +241,12 @@ Configured (documented assumptions, not hardware facts):
   asserts.
 - Reserved DRAM is still mapped in the kernel high half (the page tables cover
   the mapped gigabyte), but no allocator frame is ever taken from it.
+- Each user address space leaves `USER_STACK_GUARD_VA` unmapped and starts the
+  stack one page above it; the anonymous-mmap window ends below the guard, so a
+  downward stack overflow faults instead of reaching mapped user memory.
+- Scheduler, IPC, syscall and DMA success paths do not print. They previously
+  emitted `R1..R4`, `B1/B2`, `SEND/M1..M5`, `SYS`, `S1/S2` and DMA address
+  lines on every call, including with the kernel lock held.
 
 ## Diagnostic log
 
@@ -244,15 +262,17 @@ SILVER UART OK base=... debug=... kind=geni|pl011
 SILVER MMU OK
 SILVER FRAME ALLOCATOR OK
 SILVER HEAP OK base=...
-TIMER TEST: ticks=30 ...          # or: SKIP (no confirmed GIC redistributor)
+TIMER TEST: ticks=30 ...          # or: SKIP (no confirmed GICv3 timer PPI)
 SILVER PLATFORM READY
 SILVER SCHEDULER START
 howl>
 ```
 
-If the GICv3 redistributor cannot be matched, the banner also contains
-`GICV3: no redistributor matches this CPU; timer PPI left disabled`, and the
-timer is not armed.
+If the distributor does not accept `ARE_NS`/`EnableGrp1NS`, if no
+redistributor matches this CPU, or if `GICR_ISENABLER0` does not read back the
+timer PPI bit, the banner also contains
+`GICV3: init failed (distributor or timer PPI readback); timer left disabled`,
+and the timer is not armed.
 
 `pc` is the address ABL actually used; `delta` is `pc - 0x4008_0000`. If those
 two disagree with expectations, the log already contains the measurement needed
@@ -375,9 +395,10 @@ These are **not** established facts for this unit and must be measured:
 - whether `0x4008_0000` is free when ABL loads elsewhere;
 - UART availability, pins, pin mux and SE clock state;
 - the exact live DRAM banks and reserved-memory carve-outs of this unit;
-- the live FDT cell layout (`#address-cells`/`#size-cells`) and whether
-  `/reserved-memory` uses non-empty `ranges`; the validator parks if either is
-  outside its conservative 2/2, absolute-reg support;
+- the live FDT cell layout (`#address-cells`/`#size-cells`) on the root and on
+  `/reserved-memory`, and whether `/reserved-memory` uses non-empty `ranges`;
+  the validator understands 1/1 and 2/2 absolute `reg` layouts but parks on
+  anything else or on untranslated `ranges`;
 - whether the target is a `fog` unit or the NFC `rain` sibling; the connected
   `rain` unit is the same KHAJE/SM6225 platform but is not a `fog` measurement;
 - the boot CPU identity beyond the `MPIDR_EL1` value in the log;

@@ -137,11 +137,23 @@ pub const USER_HEAP_MAX_PAGES: usize = 512;
 pub const USER_HEAP_MAX_SIZE: usize = USER_HEAP_MAX_PAGES * GRANULE;
 const USER_HEAP_L2_INDEX: usize = (USER_HEAP_VA - DRAM_BASE) / BLOCK_2M;
 
+/// The lowest stack VA page is deliberately left unmapped as a guard. The
+/// stack itself starts one page above it, so a downward overflow faults
+/// instead of silently landing in the mmap window below.
+pub const USER_STACK_GUARD_VA: usize = USER_IMAGE_VA + 0x3FE0_0000;
 /// Every task's own stack appears at this user VA, backed by different PAs.
-pub const USER_STACK_VA: usize = USER_IMAGE_VA + 0x3FE0_0000;
+pub const USER_STACK_VA: usize = USER_STACK_GUARD_VA + GRANULE;
 pub const USER_STACK_PAGES: usize = 2;
 pub const USER_STACK_SIZE: usize = USER_STACK_PAGES * GRANULE;
 const USER_STACK_L2_INDEX: usize = (USER_STACK_VA - DRAM_BASE) / BLOCK_2M;
+/// L3 slot of the first mapped stack page. Slot 0 is the guard page; the
+/// stack table is zeroed on allocation, so the guard entry stays invalid.
+const USER_STACK_L3_INDEX: usize = (USER_STACK_VA >> 12) & 0x1FF;
+const _: () = assert!(USER_STACK_L3_INDEX == 1);
+const _: () = assert!((USER_STACK_GUARD_VA >> 12) + 1 == (USER_STACK_VA >> 12));
+const _: () = assert!(USER_STACK_L3_INDEX + USER_STACK_PAGES <= ENTRIES);
+const _: () = assert!(USER_STACK_VA % GRANULE == 0);
+const _: () = assert!(USER_STACK_GUARD_VA % GRANULE == 0);
 
 /// A 2 MB first-fit window for explicitly authorized user MMIO and DMA mappings.
 pub const USER_MMIO_VA: usize = USER_IMAGE_VA + 0x4000_0000;
@@ -159,7 +171,9 @@ const PCI_ECAM_L2_BLOCKS: usize = PCI_ECAM_SIZE / BLOCK_2M;
 /// stack where `SYS_MMAP` places kernel-chosen mappings. It spans the free
 /// `l2_user` slots, so page tables are only allocated once a mapping is placed.
 pub const USER_MMAP_VA: usize = USER_IMAGE_VA + 0x40_0000;
-pub const USER_MMAP_MAX_VA: usize = USER_STACK_VA; // == USER_STACK_VA
+/// Anonymous mappings stop below the stack guard page, so they can never
+/// fill the hole that makes a stack overflow fault.
+pub const USER_MMAP_MAX_VA: usize = USER_STACK_GUARD_VA;
 
 /// Upper bound on the page count of a single anonymous mapping. User-supplied
 /// lengths are rejected against this before any span arithmetic.
@@ -488,13 +502,23 @@ pub fn create_task_space(
 
         if user_stack_start != 0 {
             write_entry(l2_user, USER_STACK_L2_INDEX, l3_stack as u64 | DESC_TABLE);
+            // Slot 0 remains zero: that is the guard page below the stack.
             for index in 0..USER_STACK_PAGES {
                 let physical = user_stack_start + index * GRANULE;
                 // The stack is EL0-visible: never expose a recycled frame that
                 // still contains another task's or the kernel's data.
                 zero_page(physical);
-                write_entry(l3_stack, index, user_data_page(physical));
+                write_entry(
+                    l3_stack,
+                    USER_STACK_L3_INDEX + index,
+                    user_data_page(physical),
+                );
             }
+            debug_assert_eq!(
+                read_entry(l3_stack, USER_STACK_L3_INDEX - 1),
+                0,
+                "user stack guard page must stay unmapped"
+            );
         }
 
         // The private 4 KiB window is writable and readable from EL0, so it
@@ -903,7 +927,6 @@ pub fn map_dma_to_user(
     phys_addr: usize,
     size: usize,
 ) -> Option<usize> {
-    crate::console::write_str("MMU: map_dma_to_user called\r\n");
     if size == 0 || phys_addr % GRANULE != 0 || size % GRANULE != 0 {
         return None;
     }

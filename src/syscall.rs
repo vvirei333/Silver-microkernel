@@ -142,20 +142,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
     // P3 diagnostic: coherent timer/GIC delivery snapshot (read-only).
     crate::gic::diag_timer_snapshot();
     let number = frame[8]; // x8 carries the call number
-    let sp_now: usize;
-    let spsel: u64;
-    unsafe {
-        core::arch::asm!("mov {}, sp", out(reg) sp_now, options(nostack));
-        core::arch::asm!("mrs {}, SPSel", out(reg) spsel, options(nomem, nostack));
-    }
     crate::smp::probe(22);
-    crate::console::write_str("SYS ");
-    crate::console::write_dec_u64(number);
-    crate::console::write_str(" sp=");
-    crate::console::write_hex_u64(sp_now as u64);
-    crate::console::write_str(" spsel=");
-    crate::console::write_dec_u64(spsel);
-    crate::console::write_str("\r\n");
 
     let result = match number {
         SYS_SLEEP => {
@@ -906,13 +893,11 @@ fn sys_send_impl(target: u64, message_ptr: u64, nonblocking: bool) -> u64 {
 }
 
 fn sys_receive(buffer_ptr: u64, timeout_ticks: u64) -> u64 {
-    crate::console::write_str("S1\r\n");
     let size = core::mem::size_of::<ipc::Message>() as u64;
     // Reject before blocking; copy_to_user checks again after the wakeup.
     if !mmu::valid_user_slice_mut(buffer_ptr, size) {
         return SYSCALL_ERROR;
     }
-    crate::console::write_str("S2\r\n");
     let message = match ipc::receive_timeout(timeout_ticks) {
         Ok(message) => message,
         Err(ipc::ReceiveError::Timeout) => return SYSCALL_TIMEOUT,

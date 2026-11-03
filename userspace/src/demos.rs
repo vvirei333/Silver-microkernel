@@ -1,7 +1,9 @@
 use crate::{allocator, ipc, syscall};
 
 const PRIVATE_WINDOW_VA: usize = 0x0000_0080_0000_0000;
-const DEMO_USER_STACK_VA: usize = 0x7FE0_0000;
+// The page below the stack is an unmapped guard; the stack itself starts at
+// 0x7FE0_1000. Reading the old 0x7FE0_0000 address would fault.
+const DEMO_USER_STACK_VA: usize = 0x7FE0_1000;
 const DEMO_MMAP_SIZE: usize = 2 * 1024 * 1024;
 const SECRET_PATTERN: [u8; 8] = [0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE];
 const HIGH_HALF_DRAM: usize = 0xFFFF_0000_4000_0000;

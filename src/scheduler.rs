@@ -519,12 +519,10 @@ pub fn notify_bound_task(id: u64) -> bool {
 }
 
 pub fn block_current_on(queue: &WaitQueue, link: WaitLink) {
-    crate::console::write_str("B1\r\n");
     crate::smp::probe(4);
     let saved_daif = interrupts::save_and_disable_irq();
     let id = current_task_id();
     queue.enqueue(id);
-    crate::console::write_str("B2\r\n");
     if let Some(task) = current_task_mut() {
         task.waiting_on = Some(link);
         task.state = TaskState::Blocked;
@@ -1257,13 +1255,9 @@ pub fn start() -> ! {
 /// able to wake tasks), runs the pass, and re-acquires before returning so
 /// the caller keeps executing with the lock held.
 pub fn schedule_released() {
-    crate::console::write_str("R1\r\n");
     smp::bkl_release();
-    crate::console::write_str("R2\r\n");
     schedule();
-    crate::console::write_str("R3\r\n");
     smp::bkl_acquire();
-    crate::console::write_str("R4\r\n");
 }
 
 pub fn schedule() {
@@ -1511,8 +1505,6 @@ fn spawn_elf_task(image: LoadedImage, argument: u64) -> Option<u64> {
         .get(smp::current_index())
         .map(|task| task.cwd.clone())
         .unwrap_or_else(|| String::from("/"));
-    let entry = image.entry;
-    let stack_va = mmu::USER_STACK_VA;
     let mut task = Task::new(
         id,
         None,
@@ -1526,11 +1518,6 @@ fn spawn_elf_task(image: LoadedImage, argument: u64) -> Option<u64> {
     task.cwd = cwd;
     manager.tasks.push(task);
     manager.next_id += 1;
-    console::write_str("Spawning ELF at 0x");
-    console::write_hex_u64(entry as u64);
-    console::write_str(" with stack at 0x");
-    console::write_hex_u64(stack_va as u64);
-    console::write_str("\r\n");
     Some(id)
 }
 
@@ -1669,16 +1656,8 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
             console::write_str("DMA: FAIL - no CAP_MMIO rights\r\n");
             return None;
         }
-        console::write_str("DMA: has CAP_MMIO, allocating ");
-        console::write_hex_u64(page_count as u64);
-        console::write_str(" pages\r\n");
         let physical = match frame_allocator::alloc_contiguous_pages(page_count) {
-            Some(p) => {
-                console::write_str("DMA: alloc_contiguous_pages OK, physical= ");
-                console::write_hex_u64(p as u64);
-                console::write_str("\r\n");
-                p
-            }
+            Some(p) => p,
             None => {
                 console::write_str("DMA: FAIL - alloc_contiguous_pages returned None\r\n");
                 return None;
@@ -1690,20 +1669,11 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
         // point of coherency (the mapping helper does the clean) so the device
         // cannot observe stale bytes either.
         unsafe { core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, mapped_size) };
-        console::write_str("DMA: virt addr = ");
-        console::write_hex_u64(phys_to_virt(physical) as u64);
-        console::write_str("\r\n");
-        console::write_str("DMA: zeroing...\r\n");
-        console::write_str("DMA: zeroing OK\r\n");
-        console::write_str("DMA: mapping to user...\r\n");
         let Some(virtual_address) = mmu::map_dma_to_user(task, physical, mapped_size) else {
             console::write_str("DMA: FAIL - mmu::map_dma_to_user returned None\r\n");
             release_pages(physical, page_count);
             return None;
         };
-        console::write_str("DMA: mapped va=");
-        console::write_hex_u64(virtual_address as u64);
-        console::write_str("\r\n");
         task.dma_pages.push((physical, page_count));
         Some((virtual_address, physical))
     });
@@ -1712,7 +1682,10 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
 }
 
 pub fn bind_irq(intid: u32) -> bool {
-    if intid >= 1020 || intid == crate::gic::timer_irq() {
+    // Only SPIs are handed to userspace. SGIs/PPIs are banked per PE and
+    // include the kernel's reschedule SGI and timer PPI; the capability
+    // check below is necessary but not sufficient on its own.
+    if !crate::irq_policy::is_user_bindable(intid, crate::gic::timer_irq()) {
         return false;
     }
     let saved_daif = interrupts::save_and_disable_irq();
@@ -1809,11 +1782,6 @@ fn spawn_inner(
         return None;
     }
     let id = manager.next_id;
-    console::write_str("SPAWN: start id=");
-    console::write_dec_u64(id);
-    console::write_str(" program=");
-    console::write_dec_u64(user.map_or(u64::MAX, |(program, _)| program));
-    console::write_str("\r\n");
 
     // Resolve the embedded image before `Task::new`: a lookup or load failure
     // then needs no cleanup, because no frame has been allocated yet. The
@@ -1837,9 +1805,6 @@ fn spawn_inner(
 
     manager.tasks.push(task);
     manager.next_id += 1;
-    console::write_str("SPAWN: success id=");
-    console::write_dec_u64(id);
-    console::write_str("\r\n");
     Some(id)
 }
 
@@ -2102,7 +2067,6 @@ impl Task {
         envp: Vec<Vec<u8>>,
         ppid: Option<u64>,
     ) -> Option<Self> {
-        let program_label = user.map_or(u64::MAX, |(program, _)| program);
         // Build the argv/envp stack image before allocating anything: a
         // malformed or oversized argument list must fail without leaking.
         let argv_block = if argv.is_empty() && envp.is_empty() {
@@ -2118,36 +2082,22 @@ impl Task {
                 mmu::USER_STACK_SIZE - 1024,
             )?)
         };
-        console::write_str("SPAWN: alloc stack (");
-        console::write_dec_u64(TASK_STACK_PAGES as u64);
-        console::write_str(" pages)...\r\n");
         let Some(stack_start) = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES) else {
-            console::write_str("SPAWN: FAIL - no contiguous kernel stack run\r\n");
             return None;
         };
-        console::write_str("SPAWN: kernel stack at ");
-        console::write_hex_u64(stack_start as u64);
-        console::write_str("\r\n");
 
         let user_stack = if user.is_some() {
-            console::write_str("SPAWN: alloc user stack...\r\n");
             let Some(user_start) = frame_allocator::alloc_contiguous_pages(TASK_USER_STACK_PAGES)
             else {
-                console::write_str("SPAWN: FAIL - no contiguous user stack run\r\n");
                 release_pages(stack_start, TASK_STACK_PAGES);
                 return None;
             };
-            console::write_str("SPAWN: user stack at ");
-            console::write_hex_u64(user_start as u64);
-            console::write_str("\r\n");
             MemoryRegion::new(user_start, user_start + TASK_USER_STACK_SIZE)
         } else {
             MemoryRegion::new(0, 0)
         };
 
-        console::write_str("SPAWN: alloc private page...\r\n");
         let Some(private_page) = frame_allocator::alloc_page() else {
-            console::write_str("SPAWN: FAIL - no frame for the private window\r\n");
             if !user_stack.is_empty() {
                 release_pages(user_stack.start, TASK_USER_STACK_PAGES);
             }
@@ -2157,11 +2107,9 @@ impl Task {
 
         let user_image = image;
 
-        console::write_str("SPAWN: build task space (9 tables)...\r\n");
         let Some(ttbr0) =
             mmu::create_task_space(private_page, user_stack.start, user_image.as_ref())
         else {
-            console::write_str("SPAWN: FAIL - mmu::create_task_space returned None\r\n");
             if let Some(image) = &user_image {
                 image.release();
             }
@@ -2172,9 +2120,6 @@ impl Task {
             release_pages(stack_start, TASK_STACK_PAGES);
             return None;
         };
-        console::write_str("SPAWN: task space ttbr0=");
-        console::write_hex_u64(ttbr0 as u64);
-        console::write_str("\r\n");
 
         // Publish the argv/envp block on the freshly mapped user stack before
         // the task can run. The stack VA range is backed by `user_stack`, so
@@ -2211,10 +2156,6 @@ impl Task {
         };
         context.stack_pointer = phys_to_virt(stack.end) as u64;
         context.user_stack_pointer = user_stack_pointer;
-
-        console::write_str("SPAWN: registers set program=");
-        console::write_dec_u64(program_label);
-        console::write_str("\r\n");
 
         let mut cap_table = capability::CapTable::new();
         match user.map(|(program, _)| program) {

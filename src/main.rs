@@ -41,6 +41,7 @@ mod geni_uart;
 mod gic;
 mod gicv3;
 mod gicv3_policy;
+mod irq_policy;
 #[cfg(not(feature = "std"))]
 mod interrupts;
 #[cfg(not(feature = "std"))]
@@ -278,9 +279,12 @@ _start:
     // --- FOG: check the placement, relocate only when explicitly enabled --
     // ABL chooses the placement; the linker chooses the address all absolute
     // references were built for. The default fog build does NOT copy: a
-    // destination in DRAM is not proof that the bytes are free, and only the
-    // live FDT could prove it. On a mismatch the stub publishes pc/link/delta
-    // and parks before touching anything outside its own image.
+    // destination in DRAM is not proof that the bytes are free. The live FDT
+    // can reject the reservations it describes, but it is not a complete
+    // ownership proof: the fixed 0x40080000 slot is safe only under a platform
+    // boot contract that says ABL/firmware/DMA do not use it. On a mismatch
+    // the stub publishes pc/link/delta and parks before touching anything
+    // outside its own image.
     //
     // With `fog-reloc` the copy is still fail-closed: header magic, image
     // size, both span ends, overflow and every overlap are checked first.
@@ -292,15 +296,84 @@ _start:
     cmp x23, x13
     b.eq .Lfog_at_link
 .if FOG_RELOC
+    // image_size is read from the running image's own header. The read is
+    // safe even before the magic check: the source image is owned by us.
+    ldr x14, [x23, #0x10]
+
+    // Diagnostic record in the running source image's .data, written before
+    // any destination access. A refused relocation therefore still leaves
+    // evidence in DRAM; a successful copy carries the same record with it.
+    // x25 = record, w24 = passed checks, w27 = reason, w28 = flags.
+    // x24/x25/x27/x28 are callee-saved and survive the FDT validator call.
+    ldr x25, ={reloc_record}
+    ldr x26, =__kernel_virt_base
+    sub x25, x25, x26               // link-time physical address
+    ldr x26, =__kernel_link_pa
+    sub x26, x23, x26               // actual - link
+    add x25, x25, x26               // record in the source image
+    mov w24, #0
+    mov w27, #0
+    mov w28, #1                     // RELOC_FLAG_ATTEMPTED
+    ldr w26, =0x32524C53            // "SLR2"
+    str w26, [x25, #0x00]
+    mov w26, #2
+    strb w26, [x25, #0x04]
+    lsr w26, w10, #2
+    strb w26, [x25, #0x05]
+    strh w28, [x25, #0x06]
+    strh w27, [x25, #0x08]
+    strh w24, [x25, #0x0A]
+    str wzr, [x25, #0x0C]
+    str x23, [x25, #0x10]
+    str x13, [x25, #0x18]
+    str xzr, [x25, #0x20]           // dest_end unknown until the span check
+    str x14, [x25, #0x28]
+    str x22, [x25, #0x30]
+    str xzr, [x25, #0x38]
+    // x11 is the K1 entry read. Reaching this point means that read already
+    // completed, so at EL1 it also proves HCR_EL2.TRVM=0 for this boot.
+    str x11, [x25, #0x40]
+    orr w28, w28, #(1 << 2)         // SCTLR_EL1 read completed at K1
+    mrs x26, mpidr_el1
+    str x26, [x25, #0x58]
+    // HCR_EL2/CTR_EL0 reads are only unconditional at EL2. At EL1 they are
+    // TID2/TRVM-dependent; leave the flags clear instead of adding a new trap.
+    lsr w26, w10, #2
+    cmp w26, #2
+    b.ne 41f
+    mrs x26, hcr_el2
+    str x26, [x25, #0x50]
+    orr w28, w28, #(1 << 4)         // HCR_READ
+    mrs x26, ctr_el0
+    str x26, [x25, #0x48]
+    orr w28, w28, #(1 << 3)         // CTR_READ
+41:
+    // DTB size: bounded check first; a wild x0 must not fault.
+    cbz x22, 42f
+    ldr x26, =0x40000000
+    cmp x22, x26
+    b.lo 42f
+    ldr x26, =0x7FFFFFD8            // DRAM_END - 40-byte FDT header
+    cmp x22, x26
+    b.hi 42f
+    ldr w26, [x22, #4]
+    rev w26, w26
+    str x26, [x25, #0x38]
+    orr w28, w28, #(1 << 5)         // DTB_PRESENT
+42:
+    strh w28, [x25, #0x06]
+
     // Recognise the ARM64 Image header before trusting any field in it. A
     // stripped payload, a wrong entry point or a corrupted image must not turn
     // into a wild copy of an arbitrary length.
+    mov w27, #2                     // RELOC_REASON_BAD_MAGIC
     ldr w15, [x23, #0x38]           // magic at _head + 0x38
     ldr w16, =0x644D5241            // "ARM\x64" in little-endian memory
     cmp w15, w16
     b.ne .Lfog_park
+    orr w24, w24, #(1 << 0)         // RELOC_CHECK_MAGIC
 
-    ldr x14, [x23, #0x10]           // image_size from the ARM64 header
+    mov w27, #3                     // RELOC_REASON_BAD_SIZE
     cmp x14, #0x1000
     b.lo .Lfog_park                 // smaller than one page: refuse
     mov x15, #0x4000000             // 64 MiB upper bound
@@ -308,19 +381,24 @@ _start:
     b.hs .Lfog_park
     tst x14, #7
     b.ne .Lfog_park                 // the copy loop moves 8 bytes at a time
+    orr w24, w24, #(1 << 1)         // RELOC_CHECK_SIZE
 
     // The destination is a build-time constant, not a measured fact. Reject
     // a wild value before the write: page-aligned and inside the mapped first
     // DRAM gigabyte.
+    mov w27, #4                     // RELOC_REASON_BAD_ALIGN
     tst x13, #0xFFF
     b.ne .Lfog_park
+    orr w24, w24, #(1 << 2)         // RELOC_CHECK_ALIGN
 
     // Overflow checks for both spans before any range comparison, so a
     // wrapped end can never look plausible.
+    mov w27, #5                     // RELOC_REASON_BOUNDS
     adds x15, x23, x14              // x15 = src_end
     b.cs .Lfog_park
     adds x16, x13, x14              // x16 = dst_end
     b.cs .Lfog_park
+    str x16, [x25, #0x20]           // dest_end is now known
 
     // Check BOTH ends of the destination: a valid start whose end leaves the
     // mapped gigabyte is refused.
@@ -342,10 +420,12 @@ _start:
     b.hs .Lfog_park
     cmp x15, x17
     b.hi .Lfog_park
+    orr w24, w24, #(1 << 3)         // RELOC_CHECK_BOUNDS
 
     // Only a completely non-overlapping move is allowed. Any overlap can
     // overwrite the running loop or bytes between the spans that this stub
     // cannot prove dead. Adjacent spans are accepted.
+    mov w27, #6                     // RELOC_REASON_OVERLAP
     cmp x13, x23
     b.hs 47f                        // dest > src
     // dest < src: require dest_end <= src.
@@ -357,6 +437,7 @@ _start:
     b.lo .Lfog_park
 
 .Lfog_fdt_check:
+    orr w24, w24, #(1 << 4)         // RELOC_CHECK_OVERLAP
     // The arithmetic checks above prove only that the copy loop cannot
     // clobber itself. They do not prove that the destination bytes are free.
     // Read the live FDT now, while the image is still at the address ABL
@@ -381,6 +462,7 @@ _start:
     mov x2, x16                     // destination end
     mov x3, x23                     // source start
     mov x4, x15                     // source end
+    mov w27, #7                     // RELOC_REASON_FDT_REJECT
     bl fog_validate_relocation
     ldr x11, [sp], #16
     ldp x9, x10, [sp], #16
@@ -388,10 +470,64 @@ _start:
     b .Lfog_park
 
 .Lfog_fdt_ok:
+    orr w24, w24, #(1 << 5)         // RELOC_CHECK_FDT
     // The call clobbered the caller-saved range checks; reload the two
     // values the copy loop itself needs.
     ldr x13, =__kernel_link_pa
     ldr x14, [x23, #0x10]
+
+    // Cache-maintenance contract for this copy:
+    //
+    // * With SCTLR_EL1.M=0, data accesses are Device-nGnRnE unless the code
+    //   runs at EL1/EL0 with HCR_EL2.DC=1; then they are Normal, Non-shareable,
+    //   Write-Back Write-Allocate. SCTLR_EL1.C=0 alone is NOT the reason for
+    //   the memory type. The copy may therefore be non-cacheable (EL2, or
+    //   EL1 with DC=0) or cacheable (EL1 with DC=1).
+    // * DC IVAC at EL1 is a pure invalidate only when HCR_EL2.VM=0. With
+    //   VM=1 it behaves as DC CIVAC (clean+invalidate); at EL2 it is a pure
+    //   invalidate. The pre-copy pass is safe for an owned destination in
+    //   both cases: stale lines are removed before the new bytes are written.
+    // * The post-copy DC CVAC is kept because it is required when the copy
+    //   stores are cacheable (EL1 with HCR_EL2.DC=1, or a future cacheable
+    //   mapping). When the stores are non-cacheable it is a no-op.
+    // * IC IALLU is per-PE. This boot path is single-core: APs are parked and
+    //   SMP is disabled. A future SMP path needs IC IALLUIS/broadcast and a
+    //   DSB ISH before another PE fetches the copy.
+    //
+    // EL1 prerequisites: HCR_EL2.TPC (DC IVAC/CVAC), TPU (IC IALLU) and
+    // TID2 (CTR_EL0) must be 0. The K1 entry SCTLR read additionally needs
+    // HCR_EL2.TRVM=0; K2's SCTLR write needs TVM=0. F6 clears these only on
+    // an EL2 hand-over and only later; an EL1 hand-over relies on the
+    // platform boot contract. On FEAT_FGT implementations the equivalent
+    // HFGITR_EL2/HFGRTR_EL2 bits can trap the same operations even with the
+    // HCR bits clear.
+    //
+    // Ownership: the FDT validator is necessary but not sufficient. The fixed
+    // 0x40080000 slot additionally requires the platform boot contract.
+    //
+    // The line size comes from CTR_EL0.DminLine (bits [19:16]); the
+    // architectural maximum is 2 KiB (CTR_EL0.CWG max 512 words), so page
+    // alignment is sufficient for the line-aligned start invariant.
+    //
+    // This CTR_EL0 read is required by the cache loop, not added for
+    // diagnostics. At EL1 it completes only when HCR_EL2.TID2=0; the record
+    // stores the raw value and sets CTR_READ only after the read returned.
+    mrs x16, ctr_el0
+    str x16, [x25, #0x48]           // raw CTR_EL0 for the diagnostic record
+    orr w28, w28, #(1 << 3)         // RELOC_FLAG_CTR_READ
+    strh w28, [x25, #0x06]
+    ubfx x16, x16, #16, #4
+    mov x17, #4
+    lsl x17, x17, x16           // D-cache line size in bytes
+    sub x18, x17, #1
+    add x16, x13, x14           // destination end
+    bic x15, x13, x18           // line-aligned start (page-aligned here)
+49:
+    dc ivac, x15
+    add x15, x15, x17
+    cmp x15, x16
+    b.lo 49b
+    dsb sy
 
 .Lfog_copy:
     // Non-overlapping forward copy. Both directions are covered above.
@@ -402,6 +538,35 @@ _start:
     add x15, x15, #8
     cmp x15, x14
     b.lo .Lfog_copy_loop
+    // Publish success into the destination copy of the record. This code is
+    // still executing from the source image, so compute the link address
+    // explicitly instead of using a PC-relative reference.
+    ldr x26, ={reloc_record}
+    ldr x21, =__kernel_virt_base
+    sub x26, x26, x21
+    mov w27, #0                     // RELOC_REASON_NONE
+    orr w28, w28, #(1 << 1)         // RELOC_FLAG_DONE
+    strh w27, [x26, #0x08]
+    strh w24, [x26, #0x0A]
+    strh w28, [x26, #0x06]
+    // The copy has written a new instruction stream. Complete those stores,
+    // then clean to the point of coherency: a no-op while they are
+    // non-cacheable (EL2, or EL1 with HCR_EL2.DC=0), but required when they
+    // are cacheable (EL1 with DC=1, or a future cacheable mapping). Then
+    // invalidate the I-cache before fetching from the copy. Both loops use
+    // the same line size and range.
+    dsb sy
+    add x16, x13, x14           // destination end
+    bic x15, x13, x18
+50:
+    dc cvac, x15
+    add x15, x15, x17
+    cmp x15, x16
+    b.lo 50b
+    dsb sy
+    ic iallu
+    dsb sy
+    isb
     // Continue at the same offset inside the copy.
     adr x15, .Lfog_at_link
     sub x15, x15, x23
@@ -409,6 +574,9 @@ _start:
     br x15
 
 .Lfog_park:
+    strh w27, [x25, #0x08]         // reason
+    strh w24, [x25, #0x0A]         // checks passed
+    strh w28, [x25, #0x06]         // flags
     wfe
     b .Lfog_park                   // unsafe relocation: refuse to corrupt memory
 .else
@@ -607,12 +775,30 @@ _start:
     // EL1, route timer control to EL1, then drop to EL1h with the mini
     // vectors installed so any abort before mmu::init lands in the ramoops
     // log instead of going to EL3 as an anonymous QCDUMP.
-    msr cptr_el2, xzr
+    //
+    // CPTR_EL2: clear only the traps that would break this EL1 kernel:
+    //   TCPAC (31) traps EL1 CPACR_EL1 writes,
+    //   TTA   (20) traps trace accesses,
+    //   TFP   (10) traps FP/SIMD.
+    // Every other CPA/CPTR control the firmware set is preserved.
+    mrs x2, cptr_el2
+    ldr x3, =0x80100400        // TCPAC | TTA | TFP
+    bic x2, x2, x3
+    msr cptr_el2, x2
     mov x2, #0x300000
     msr cpacr_el1, x2
+    // HCR_EL2 is deliberately owned by the kernel, not merged. EL1&0 needs
+    // E2H=0, TGE=0, virtual interrupt routing off and every EL1 trap bit
+    // clear (WFI/WFE, TLBI, cache maintenance, TTBR/TCR/SCTLR, ID registers,
+    // CPACR, SMC). Preserving an ABL trap bit here would trap those
+    // operations to EL2 and hang the kernel; a safe "preserve unrelated
+    // bits" merge needs an explicit architecture-level allow-list first.
     mov x2, #(1 << 31)      // HCR_EL2.RW: EL1 is AArch64
     msr hcr_el2, x2
-    mov x2, #3              // CNTHCTL_EL2: EL1PCVEN|EL1PCTEN
+    // CNTHCTL_EL2: allow EL1 access to the physical timer and counter, but
+    // keep event-stream and other unrelated bits the firmware programmed.
+    mrs x2, cnthctl_el2
+    orr x2, x2, #3              // EL1PCEN | EL1PCTEN
     msr cnthctl_el2, x2
     ldr x2, =0x30C50838     // initial SCTLR_EL1 (MMU off, caches per spec)
     msr sctlr_el1, x2
@@ -807,7 +993,8 @@ mini_handler:
     .size _start, . - _start
 "#,
     boot_params = sym crate::boot::BOOT_PARAMS,
-    boot_claim = sym crate::boot::BOOT_CLAIM
+    boot_claim = sym crate::boot::BOOT_CLAIM,
+    reloc_record = sym crate::boot::RELOC_RECORD
 );
 
 #[cfg(all(not(feature = "std"), target_arch = "aarch64"))]
@@ -1184,7 +1371,7 @@ pub extern "C" fn kernel_main() -> ! {
             console::write_dec_u64(spin as u64);
             console::write_str("\r\n");
         } else {
-            console::write_str("TIMER TEST: SKIP (no confirmed GIC redistributor)\r\n");
+            console::write_str("TIMER TEST: SKIP (no confirmed GICv3 timer PPI)\r\n");
         }
     }
     #[cfg(all(feature = "fog", not(feature = "fog-timer-test")))]

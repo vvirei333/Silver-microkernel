@@ -1,9 +1,11 @@
-//! Pure policy for locating this CPU's GICv3 redistributor.
+//! Pure policy for locating this CPU's GICv3 redistributor and for the
+//! bounded readback checks used during init.
 //!
 //! The MMIO access stays in `src/gicv3.rs`; this module only owns the
-//! affinity-matching rule so it can be host-tested. The runtime must never
-//! guess "frame 0" when no `GICR_TYPER` matches the CPU: enabling a PPI on
-//! another PE's redistributor silently drops the timer interrupt.
+//! affinity-matching and wait/readback decisions so they can be host-tested.
+//! The runtime must never guess "frame 0" when no `GICR_TYPER` matches the
+//! CPU: enabling a PPI on another PE's redistributor silently drops the timer
+//! interrupt.
 
 /// Packed Aff3 << 24 | Aff2 << 16 | Aff1 << 8 | Aff0. In `GICR_TYPER` this
 /// value lives in bits [63:32], not in the low word: an implementation puts
@@ -57,6 +59,35 @@ where
         }
     }
     None
+}
+
+/// Returns true when every bit in `required` is set in `value`.
+///
+/// `required == 0` is rejected: an empty requirement would otherwise report
+/// success without proving anything about the register.
+pub fn required_bits_set(value: u32, required: u32) -> bool {
+    required != 0 && value & required == required
+}
+
+/// Polls `ready` until it returns true, at most `limit` retries after the
+/// first read. Returns false on timeout.
+///
+/// This bounds `GICR_WAKER.ChildrenAsleep` and `GICD_CTLR.RWP`: a missing
+/// clock or an unpopulated frame must end the boot with `TIMER_READY=false`
+/// instead of hanging forever in a spin loop.
+pub fn bounded_wait<F>(mut ready: F, limit: u32) -> bool
+where
+    F: FnMut() -> bool,
+{
+    let mut retries = 0;
+    while !ready() {
+        if retries >= limit {
+            return false;
+        }
+        retries += 1;
+        core::hint::spin_loop();
+    }
+    true
 }
 
 #[cfg(test)]
@@ -136,5 +167,71 @@ mod tests {
             typer_affinity(0x0102_0304_0000_0000),
             0x0102_0304
         );
+    }
+
+    #[test]
+    fn required_bits_must_all_be_present() {
+        let required = 0b1010;
+        assert!(required_bits_set(0b1010, required));
+        assert!(required_bits_set(0b1111, required));
+        assert!(!required_bits_set(0b0010, required));
+        assert!(!required_bits_set(0, required));
+        // An empty requirement is not proof of readiness.
+        assert!(!required_bits_set(0, 0));
+    }
+
+    #[test]
+    fn bounded_wait_returns_immediately_when_already_ready() {
+        let mut calls = 0;
+        assert!(bounded_wait(
+            || {
+                calls += 1;
+                true
+            },
+            4
+        ));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn bounded_wait_succeeds_before_the_limit() {
+        let mut calls = 0;
+        let ready = bounded_wait(
+            || {
+                calls += 1;
+                calls == 3
+            },
+            4,
+        );
+        assert!(ready);
+        assert_eq!(calls, 3);
+    }
+
+    #[test]
+    fn bounded_wait_fails_after_the_limit() {
+        let mut calls = 0;
+        let ready = bounded_wait(
+            || {
+                calls += 1;
+                false
+            },
+            4,
+        );
+        assert!(!ready);
+        // One initial read plus `limit` retries, then fail closed.
+        assert_eq!(calls, 5);
+    }
+
+    #[test]
+    fn bounded_wait_zero_limit_still_reads_once() {
+        let mut calls = 0;
+        assert!(!bounded_wait(
+            || {
+                calls += 1;
+                false
+            },
+            0
+        ));
+        assert_eq!(calls, 1);
     }
 }

@@ -409,7 +409,7 @@ impl<'a> Fdt<'a> {
             offset += 4;
             match token {
                 FDT_BEGIN_NODE => {
-                    let name = self.read_cstr(offset)?;
+                    let name = self.read_cstr(offset, end)?;
                     offset += align4(name.len() + 1);
 
                     let previous = path_len;
@@ -466,7 +466,8 @@ impl<'a> Fdt<'a> {
                         return None;
                     }
                     let name_start = self.off_strings.checked_add(name_offset)?;
-                    let name = self.read_cstr(name_start)?;
+                    let strings_end = self.off_strings.checked_add(self.size_strings)?;
+                    let name = self.read_cstr(name_start, strings_end)?;
                     let path_str = str::from_utf8(&path[..path_len]).ok()?;
                     visitor.property(path_str, name, value);
                 }
@@ -478,11 +479,15 @@ impl<'a> Fdt<'a> {
         None
     }
 
-    fn read_cstr(&self, offset: usize) -> Option<&'a str> {
-        if offset >= self.totalsize {
+    fn read_cstr(&self, offset: usize, limit: usize) -> Option<&'a str> {
+        // `limit` is the end of the block that owns the string: the struct
+        // block for node names, the strings block for property names. Reading
+        // past it could pick up a NUL from unrelated data and accept a name
+        // that the tree does not actually contain.
+        if offset >= limit || limit > self.totalsize {
             return None;
         }
-        let remaining = &self.data[offset..];
+        let remaining = self.data.get(offset..limit)?;
         let end = remaining.iter().position(|&byte| byte == 0)?;
         // Device-tree names are ASCII; reject anything that is not valid UTF-8
         // rather than silently mangling a path.
@@ -1470,6 +1475,23 @@ mod tests {
         assert_eq!(fdt.root_model(), Some("Xiaomi Redmi 10C"));
         assert_eq!(fdt.root_compatible(), Some("qcom,khaje-idp"));
         assert_eq!(fdt.root_cells(), (2, 2));
+    }
+
+    #[test]
+    fn read_cstr_stays_inside_the_strings_block() {
+        let blob = sample_dtb().build();
+        let fdt = Fdt::new(&blob).expect("valid dtb");
+        let strings_end = fdt.off_strings + fdt.size_strings;
+        assert!(fdt.read_cstr(fdt.off_strings, strings_end).is_some());
+
+        // Put a non-NUL byte at the very end of the strings block. The next
+        // byte belongs to the struct block and is zero, so an unbounded
+        // reader would accept a name that crosses the boundary; the bounded
+        // reader must reject it.
+        let mut broken = blob.clone();
+        broken[strings_end - 1] = b'X';
+        let fdt = Fdt::new(&broken).expect("sizes still valid");
+        assert_eq!(fdt.read_cstr(strings_end - 1, strings_end), None);
     }
 
     #[test]

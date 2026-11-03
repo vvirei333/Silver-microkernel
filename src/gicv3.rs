@@ -14,11 +14,39 @@
 //! `ICC_*` system registers directly. The kernel runs single-core at EL1, so
 //! only the boot CPU's redistributor is touched. The UART interrupt is
 //! *configured* but not enabled: the GENI driver polls RX/TX.
+//!
+//! ## Acknowledge, dispatch, EOI and DIR order (GICv3)
+//!
+//! 1. Read `ICC_IAR1_EL1`. The acknowledge register carries the INTID in bits
+//!    [23:0] (the mask below keeps bits [9:0], which covers every INTID this
+//!    kernel handles).
+//! 2. INTID 1023 is spurious: return without writing `ICC_EOIR1_EL1`.
+//! 3. Classify the INTID: SGI (0-15), PPI (16-31), SPI (32-1019),
+//!    spurious/reserved. SGI/PPI state is banked in *this PE's* GICR frame;
+//!    SPIs are routed by the distributor.
+//! 4. For a bound or unknown interrupt, mask the specific INTID before EOI:
+//!    `GICR_ICENABLER0` on the affinity-matched redistributor for SGIs/PPIs,
+//!    and the matching `GICD_ICENABLER<n>` word for SPIs. Never write a
+//!    redistributor register until `GICR_TYPER` has proven the frame belongs
+//!    to this CPU.
+//! 5. Write the acknowledge register to `ICC_EOIR1_EL1`.
+//! 6. `ICC_DIR_EL1` is unused because `ICC_CTLR_EL1.EOImode` is 0 (set in
+//!    `cpu_init_inner`). With split priority drop/deactivation disabled, the
+//!    EOIR1 write both drops the active priority and deactivates the
+//!    interrupt in one step.
+//!
+//! Readback during init proves register state only. It does not prove that a
+//! device asserts its line, that the distributor routes it, or that the
+//! exception vector is reached; only a real interrupt (the timer tick on
+//! hardware) shows that.
 
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use crate::gicv3_policy::{find_redistributor_index, mpidr_affinity};
+use crate::gicv3_policy::{
+    bounded_wait, find_redistributor_index, mpidr_affinity, required_bits_set,
+};
+use crate::irq_policy::{self, MaskScope};
 use crate::{exceptions, scheduler, timer};
 
 /// Reschedule SGI, mirrors `gic::RESCHEDULE_IRQ` (the tablet is single-core
@@ -72,6 +100,17 @@ static UART_IRQ_RT: core::sync::atomic::AtomicU32 =
 /// distributor cannot deliver the tick, and writing frame 0 would target
 /// another PE's banked state.
 static TIMER_READY: AtomicBool = AtomicBool::new(false);
+/// True only after the distributor accepted `ARE_NS` and `EnableGrp1NS` and
+/// both bits read back. A per-CPU init must not enable a PPI through a
+/// distributor that is still in legacy mode.
+static DISTRIBUTOR_READY: AtomicBool = AtomicBool::new(false);
+
+/// Bounded spins for redistributor wake-up and distributor RWP drain. These
+/// are deliberately generous (milliseconds of CPU time) but finite: a
+/// missing clock or an unpopulated frame must end in a fail-closed boot, not
+/// a hang that hides the failure.
+const WAKER_SPIN_LIMIT: u32 = 1_000_000;
+const RWP_SPIN_LIMIT: u32 = 1_000_000;
 
 /// Installs the addresses and INTIDs proved by the live FDT. `stride` is the
 /// `redistributor-stride` property (0x20000 when absent).
@@ -156,19 +195,27 @@ const GICD_CTLR_RWP: u32 = 1 << 31;
 pub fn init() {
     ensure_configured();
     TIMER_READY.store(false, Ordering::Relaxed);
-    configure_uart_spi();
-    start_distributor();
+
+    // ARE_NS must be proven before any SPI configuration: this GIC ignored
+    // group/config writes while it was still in legacy mode. The distributor
+    // readback also gates the per-CPU PPI path.
+    let distributor_ready = start_distributor();
+    DISTRIBUTOR_READY.store(distributor_ready, Ordering::Relaxed);
+    if distributor_ready {
+        configure_uart_spi();
+    }
+
     // The boot CPU brings up its own redistributor + interface right away.
-    let ready = cpu_init_inner();
+    let ready = distributor_ready && cpu_init_inner();
     TIMER_READY.store(ready, Ordering::Relaxed);
     if !ready {
         // The tablet has no accessible UART, so its diagnostic goes to the
         // ramoops zone. Fog/QEMU have a live console by this point.
         #[cfg(feature = "tablet")]
-        crate::ram_log::log("GICV3: no redistributor matches this CPU");
+        crate::ram_log::log("GICV3: init failed; timer PPI left disabled");
         #[cfg(not(feature = "tablet"))]
         crate::console::write_str(
-            "GICV3: no redistributor matches this CPU; timer PPI left disabled\r\n",
+            "GICV3: init failed (distributor or timer PPI readback); timer left disabled\r\n",
         );
     }
 }
@@ -191,6 +238,9 @@ pub fn cpu_init() {
 /// which case no redistributor or PPI is touched at all.
 fn cpu_init_inner() -> bool {
     ensure_configured();
+    if !DISTRIBUTOR_READY.load(Ordering::Relaxed) {
+        return false;
+    }
     // System-register interface for the CPU side (ICC_*_EL1), not the
     // legacy MMIO one. `isb` right after, as the spec requires.
     let sre: u64;
@@ -211,8 +261,12 @@ fn cpu_init_inner() -> bool {
     let Some(redistributor) = redistributor_for_self() else {
         return false;
     };
-    wake_redistributor(redistributor);
-    configure_ppi(redistributor);
+    if !wake_redistributor(redistributor) {
+        return false;
+    }
+    if !configure_ppi(redistributor) {
+        return false;
+    }
 
     // CPU interface: full priority mask, EOImode 0 (one write completes the
     // interrupt), Group 1 NS signalling enabled.
@@ -228,7 +282,21 @@ fn cpu_init_inner() -> bool {
             options(nomem, nostack),
         );
     }
-    true
+
+    // Read back the two architectural gates that make the CPU interface
+    // usable. This proves register state only, not that a device is asserting
+    // its line or that the distributor routes it.
+    let sre_after: u64;
+    let grp1_after: u64;
+    unsafe {
+        core::arch::asm!("mrs {sre}, icc_sre_el1", sre = out(reg) sre_after, options(nomem, nostack));
+        core::arch::asm!(
+            "mrs {grp1}, icc_igrpen1_el1",
+            grp1 = out(reg) grp1_after,
+            options(nomem, nostack),
+        );
+    }
+    sre_after & 1 != 0 && grp1_after & 1 != 0
 }
 
 /// Locates this CPU's redistributor control frame by matching the MPIDR
@@ -255,19 +323,33 @@ fn redistributor_for_self() -> Option<usize> {
     .map(|pe| base + pe * stride)
 }
 
-/// Clears GICR_WAKER.ProcessorSleep and waits for the redistributor to come up.
-/// A sleeping redistributor silently drops every interrupt, including the timer.
-fn wake_redistributor(rd: usize) {
+/// Clears GICR_WAKER.ProcessorSleep and waits, with a bound, for the
+/// redistributor to come up. A sleeping redistributor silently drops every
+/// interrupt, including the timer; a redistributor that never reports awake
+/// must leave `TIMER_READY=false` instead of spinning forever.
+fn wake_redistributor(rd: usize) -> bool {
     let waker = read32(rd + GICR_WAKER);
     write32(rd + GICR_WAKER, waker & !WAKER_PROCESSOR_SLEEP);
-    while read32(rd + GICR_WAKER) & WAKER_CHILDREN_ASLEEP != 0 {
-        core::hint::spin_loop();
-    }
+    let awake = bounded_wait(
+        || read32(rd + GICR_WAKER) & WAKER_CHILDREN_ASLEEP == 0,
+        WAKER_SPIN_LIMIT,
+    );
+    // Both bits matter: ProcessorSleep must read back as zero and
+    // ChildrenAsleep must have drained. Reading only one can accept a
+    // half-woken frame.
+    awake
+        && read32(rd + GICR_WAKER) & WAKER_PROCESSOR_SLEEP == 0
+        && read32(rd + GICR_WAKER) & WAKER_CHILDREN_ASLEEP == 0
 }
 
 /// SGI/PPI frame of THIS CPU (matched by GICR_TYPER): group 1 non-secure, low
 /// priority for the timer, then enable the timer PPI and the reschedule SGI.
-fn configure_ppi(redistributor: usize) {
+///
+/// Returns true only when the timer PPI bit is readable back in
+/// `GICR_ISENABLER0`, is routed to Group 1 NS and is not Group 0. Enabling a
+/// PPI is a banked per-PE operation; the readback is on the same frame that
+/// was just written.
+fn configure_ppi(redistributor: usize) -> bool {
     let sgi = redistributor + GICR_SGI_OFFSET;
     let timer_bit = 1_u32 << (timer_irq() % 32);
     let sgi_bit = 1_u32 << (RESCHEDULE_IRQ % 32);
@@ -281,6 +363,15 @@ fn configure_ppi(redistributor: usize) {
     // describes — no config change needed for a PPI.
     write8(sgi + GICR_IPRIORITYR + timer_irq() as usize, 0xA0);
     write32(sgi + GICR_ISENABLER0, timer_bit | sgi_bit);
+
+    // The live unit has been seen with the enable bit silently clear even
+    // though the write completed. Treat the readback as the only proof.
+    let enabled = read32(sgi + GICR_ISENABLER0);
+    let group = read32(sgi + GICR_IGROUPR0);
+    let group_modifier = read32(sgi + GICR_IGRPMODR0);
+    required_bits_set(enabled, timer_bit)
+        && required_bits_set(group, timer_bit)
+        && group_modifier & timer_bit == 0
 }
 
 /// P3 diagnostic (READ-ONLY): pending/enable of the physical-timer PPI in
@@ -450,13 +541,14 @@ fn configure_uart_spi() {
     // Not enabled: the GICD_ICENABLER reset state already has this bit clear.
 }
 
-fn wait_rwp() {
-    while read32(gicd() + GICD_CTLR) & GICD_CTLR_RWP != 0 {
-        core::hint::spin_loop();
-    }
+fn wait_rwp() -> bool {
+    bounded_wait(
+        || read32(gicd() + GICD_CTLR) & GICD_CTLR_RWP == 0,
+        RWP_SPIN_LIMIT,
+    )
 }
 
-fn start_distributor() {
+fn start_distributor() -> bool {
     // The live unit reports GICD_CTLR = 0 after the bootloader, so ARE_NS is
     // clear and the distributor is still in legacy mode. Affinity routing must
     // be enabled first, with RWP drained, before EnableGrp1NS is accepted: a
@@ -465,11 +557,26 @@ fn start_distributor() {
     let mut control = read32(gicd() + GICD_CTLR);
     if control & GICD_CTLR_ARE_NS == 0 {
         write32(gicd() + GICD_CTLR, control | GICD_CTLR_ARE_NS);
-        wait_rwp();
+        if !wait_rwp() {
+            return false;
+        }
         control = read32(gicd() + GICD_CTLR);
     }
+    if control & GICD_CTLR_ARE_NS == 0 {
+        return false;
+    }
+
     write32(gicd() + GICD_CTLR, control | GICD_CTLR_ENABLE_GRP1NS);
-    wait_rwp();
+    if !wait_rwp() {
+        return false;
+    }
+
+    // A write completing is not proof that the distributor accepted it.
+    // Both required bits must read back before any SPI/PPI is enabled.
+    required_bits_set(
+        read32(gicd() + GICD_CTLR),
+        GICD_CTLR_ARE_NS | GICD_CTLR_ENABLE_GRP1NS,
+    )
 }
 
 pub fn enable_irq(irq: u32) {
@@ -507,6 +614,26 @@ pub fn disable_irq(irq: u32) {
     write32(offset, 1_u32 << (irq % 32));
 }
 
+/// Masks one INTID in the register scope that owns it and confirms the
+/// enable bit is clear. Returns false when no proven scope exists (reserved
+/// INTID, or an SGI/PPI with no affinity-matched redistributor).
+pub fn mask_irq(irq: u32) -> bool {
+    let bit = 1_u32 << (irq % 32);
+    let offset = (irq as usize / 32) * 4;
+    let base = match irq_policy::mask_scope(irq) {
+        MaskScope::Private => match redistributor_for_self() {
+            Some(redistributor) => redistributor + GICR_SGI_OFFSET,
+            // A banked line that cannot be tied to this PE must not be
+            // written anywhere: report the failure to the caller.
+            None => return false,
+        },
+        MaskScope::Shared => gicd(),
+        MaskScope::Unavailable => return false,
+    };
+    write32(base + GICD_ICENABLER + offset, bit);
+    read32(base + GICD_ISENABLER + offset) & bit == 0
+}
+
 /// Group 1 NS acknowledge: ICC_IAR1_EL1 returns the INTID in bits [23:0].
 pub fn acknowledge() -> u32 {
     let value: u64;
@@ -528,7 +655,9 @@ pub fn end_interrupt(acknowledge_register: u32) {
 
 /// Top-level IRQ path from `exception_vectors` on the tablet. Mirrors the GICv2
 /// dispatch in `gic.rs`: the timer reschedules, everything else bound to a task
-/// wakes it, unknown INTIDs panic through the exception handler.
+/// wakes it, and an unknown INTID is masked in its proven scope. Only an
+/// unknown INTID that cannot be masked reaches the exception handler, after a
+/// bounded number of attempts.
 pub fn handle_irq() {
     let acknowledge_register = acknowledge();
     let irq = acknowledge_register & 0x3FF;
@@ -557,8 +686,15 @@ pub fn handle_irq() {
                 scheduler::wake_bound_irq(irq);
                 return;
             }
+            // No driver owns this INTID. Mask it before EOI so a level
+            // source cannot re-enter immediately. If no proven scope exists,
+            // `note_unknown_irq` allows only a bounded streak before the
+            // exception path stops the machine.
+            let masked = crate::gic::mask_irq(irq);
             end_interrupt(acknowledge_register);
-            exceptions::silver_handle_exception(8, u64::from(irq), 0, 0);
+            if !crate::gic::note_unknown_irq(irq, masked) {
+                exceptions::silver_handle_exception(8, u64::from(irq), 0, 0);
+            }
         }
     }
 }

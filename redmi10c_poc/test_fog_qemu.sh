@@ -13,6 +13,11 @@
 #      without booting.
 #   4. `fog-reloc` with a DTB whose /reserved-memory covers the destination:
 #      the pre-copy live-FDT validator must reject it and park before copying.
+#   5. `fog-timer-test`: the GICv3 distributor/PPI readback must succeed and
+#      the timer IRQ must actually increment the tick counter.
+#
+# The synthetic tree also carries a normal /cpus 1/0 node while the root and
+# memory nodes use 2/2, so the FDT cell-layout regression is exercised here.
 #
 # Requirements: cargo (aarch64-unknown-none target), qemu-system-aarch64,
 # dtc, and llvm-objcopy or aarch64-linux-gnu-objcopy.
@@ -69,11 +74,13 @@ PY
 
 build "no_std,fog" "$TMP/Image.std"
 build "no_std,fog,fog-reloc" "$TMP/Image.reloc"
+build "no_std,fog,fog-timer-test" "$TMP/Image.timer"
 
 # Link address 0x4008_0000, RAM base 0x4000_0000.
 set_text_offset "$TMP/Image.std" "$TMP/Image.std.at-link" 0x80000
 set_text_offset "$TMP/Image.std" "$TMP/Image.std.high" 0x400000
 set_text_offset "$TMP/Image.reloc" "$TMP/Image.reloc.high" 0x400000
+set_text_offset "$TMP/Image.timer" "$TMP/Image.timer.at-link" 0x80000
 
 cat > "$TMP/fog_test.dts" <<'DTS'
 /dts-v1/;
@@ -83,6 +90,16 @@ cat > "$TMP/fog_test.dts" <<'DTS'
     #size-cells = <2>;
     model = "Synthetic khaje test tree (QEMU virt)";
     compatible = "qcom,khaje-idp", "qcom,sm6225";
+
+    /* A normal /cpus layout: root cells are 2/2, /cpus is 1/0. The
+       pre-copy validator must not interpret the cpu reg. */
+    cpus {
+        #address-cells = <1>;
+        #size-cells = <0>;
+        cpu@0 {
+            reg = <0x0>;
+        };
+    };
 
     memory@40000000 {
         device_type = "memory";
@@ -200,7 +217,11 @@ fail=0
 echo "== fog-reloc: entered at 0x40400000, linked at 0x40080000 =="
 run_qemu "$TMP/Image.reloc.high" "$TMP/reloc.log" 40
 require_boot "$TMP/reloc.log" "fog-reloc" || fail=1
-grep -aE "SILVER BOOT PARAMS|SILVER MEMORY MAP|SILVER PLATFORM READY|GICV3:|TIMER TEST|howl>" \
+if ! grep -aqF "SILVER RELOC reason=0" "$TMP/reloc.log"; then
+    echo "FAIL (reloc record): missing success record"
+    fail=1
+fi
+grep -aE "SILVER BOOT PARAMS|SILVER RELOC|SILVER MEMORY MAP|SILVER PLATFORM READY|GICV3:|TIMER TEST|howl>" \
     "$TMP/reloc.log" | head -10 || true
 
 echo "== fog default: entered at the link address 0x40080000 =="
@@ -232,6 +253,15 @@ elif grep -aqF "SILVER BOOT PARAMS OK" "$TMP/fdt_reject.log"; then
 else
     echo "PASS (FDT validation): rejected before copy, no console output, no howl>"
 fi
+
+echo "== fog-timer-test: GICv3 readback + timer IRQ delivery =="
+run_qemu "$TMP/Image.timer.at-link" "$TMP/timer.log" 60
+require_boot "$TMP/timer.log" "fog-timer-test" || fail=1
+if ! grep -aqE "TIMER TEST: ticks=([1-9][0-9]*)" "$TMP/timer.log"; then
+    echo "FAIL (GICv3 timer): no non-zero tick count"
+    fail=1
+fi
+grep -aE "GICV3:|TIMER TEST|howl>" "$TMP/timer.log" | head -5 || true
 
 if [ "$fail" -ne 0 ]; then
     echo "FOG QEMU TEST: FAIL"
