@@ -268,6 +268,15 @@ const TCR_VALUE: u64 = 16 // T0SZ
     | (0b01 << 8) // IRGN0
     | (0b010 << 32); // IPS
 
+/// AP trampoline copies of the boot CPU's translation-control registers.
+pub(crate) fn ap_boot_mair() -> u64 {
+    MAIR_VALUE
+}
+
+pub(crate) fn ap_boot_tcr() -> u64 {
+    TCR_VALUE
+}
+
 #[repr(C, align(4096))]
 struct Table {
     entries: [u64; ENTRIES],
@@ -708,6 +717,40 @@ pub fn create_task_space(
         flush_after_table_change(page, GRANULE);
     }
     Some((l0, tokens[0]))
+}
+
+/// Replaces the AP space's empty user-image L3 with one EL1-only 2 MiB
+/// identity block covering `[DRAM_BASE, DRAM_BASE + 2 MiB)`. QEMU-only
+/// (`smp` feature).
+#[cfg(feature = "smp")]
+///
+/// PSCI starts an AP with the MMU off at its physical entry address. The AP
+/// trampoline must keep fetching at that low address until it has enabled the
+/// MMU, so its page has to be mapped in the AP's TTBR0. The block is EL1-only
+/// (`AP_EL1_RW`, `UXN`) and the AP space is kernel-only (`image == None`), so
+/// this does not expose the kernel image to EL0. The replaced L3 table stays
+/// registered and is reclaimed with the space.
+pub fn install_ap_identity(ttbr0: usize) -> bool {
+    if !space_root_valid(ttbr0) {
+        return false;
+    }
+    unsafe {
+        let root_entry = read_entry(ttbr0, 0);
+        let Some(l1_user) = follow_validated_table(root_entry, ttbr0) else {
+            return false;
+        };
+        let l2_entry = read_entry(l1_user, 1);
+        let Some(l2_user) = follow_validated_table(l2_entry, ttbr0) else {
+            return false;
+        };
+        write_entry(
+            l2_user,
+            0,
+            block_descriptor(DRAM_BASE, ATTR_NORMAL, SH_INNER),
+        );
+        flush_after_table_change(l2_user, GRANULE);
+    }
+    true
 }
 
 /// Maps one zeroed, writable and non-executable heap page. The task records

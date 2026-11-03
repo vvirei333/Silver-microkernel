@@ -91,11 +91,20 @@ static CPUS: [PerCpu; MAX_CPUS] = [
 /// QEMU runs with `-smp 2`.
 pub fn cpu_count() -> usize {
     // Both real-hardware profiles stay single-core for now: the boot stub
-    // parks secondaries and AP bring-up is not implemented. QEMU runs 2.
-    if platform::detect().is_tablet() || platform::detect().is_fog() {
+    // parks secondaries and AP bring-up is QEMU-only. Without the opt-in
+    // `smp` feature even QEMU stays on one CPU.
+    #[cfg(feature = "smp")]
+    {
+        if platform::detect().is_tablet() || platform::detect().is_fog() {
+            1
+        } else {
+            2
+        }
+    }
+    #[cfg(not(feature = "smp"))]
+    {
+        let _ = platform::detect();
         1
-    } else {
-        2
     }
 }
 
@@ -208,6 +217,12 @@ static KERNEL_LOCK: KernelLock = KernelLock {
 
 /// BISECT switch: 1 = kernel lock disabled entirely.
 pub static BKL_DISABLED: AtomicBool = AtomicBool::new(false);
+
+/// Phase-1 gate: APs are online (GIC, timer, IPI) but do not take tasks yet.
+/// Concurrent task execution still needs the per-CPU run-queue/quiescence
+/// work; keep APs parked in `wait_for_irq` until that lands.
+#[cfg(feature = "smp")]
+pub static AP_TASK_SCHEDULING: AtomicBool = AtomicBool::new(false);
 
 /// Debug probe chain (read via QEMU monitor `xp` at its physical address,
 /// which equals the identity-mapped VA). Stages: 1=wait entered, 2=irq saved,
@@ -460,8 +475,7 @@ impl<T> Drop for SpinLockGuard<'_, T> {
 /// have become Ready on this CPU). Implemented by `gic::send_sgi_all_but_self`
 /// (SGI0); a no-op while only one CPU is online.
 pub fn ipi_reschedule_others() {
-    // BISECT: disabled
-    if false {
+    if cpu_count() > 1 {
         crate::gic::send_sgi_all_but_self(crate::gic::RESCHEDULE_IRQ);
     }
 }
@@ -471,6 +485,7 @@ pub fn ipi_reschedule_others() {
 pub fn bkl_depth() -> u32 {
     unsafe { *this_cpu().bkl_depth.get() }
 }
+
 
 /// Non-inline wrapper for asm callers (`silver_user_bootstrap` drops the
 /// inherited kernel lock before `eret`-ing into user mode).
@@ -482,15 +497,53 @@ pub extern "C" fn bkl_release_asm() {
 // AP bring-up
 // ---------------------------------------------------------------------------
 
+#[cfg(feature = "smp")]
 use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
-/// Boot parameters handed to the next AP. Published (and cleaned to the
-/// point of coherency) by the boot CPU before PSCI CPU_ON.
-static AP_TTBR0: AtomicUsize = AtomicUsize::new(0);
+/// Boot parameters consumed by the physical AP trampoline. Fields are
+/// atomics so the boot CPU can publish them with Release stores; the
+/// trampoline reads them through its physical address after PSCI `CPU_ON`.
+#[cfg(feature = "smp")]
+#[repr(C)]
+struct ApBootParams {
+    ttbr0: AtomicUsize,
+    ttbr1: AtomicUsize,
+    mair: AtomicUsize,
+    tcr: AtomicUsize,
+    stack_top: AtomicUsize,
+    entry: AtomicUsize,
+}
 
-// Entry stub for APs: PSCI CPU_ON starts the CPU here with the MMU off,
-// x0 = kernel stack pointer (a physical address; the kernel's low half is
-// identity-mapped, so it is valid with and without the MMU).
+#[cfg(feature = "smp")]
+impl ApBootParams {
+    const fn empty() -> Self {
+        Self {
+            ttbr0: AtomicUsize::new(0),
+            ttbr1: AtomicUsize::new(0),
+            mair: AtomicUsize::new(0),
+            tcr: AtomicUsize::new(0),
+            stack_top: AtomicUsize::new(0),
+            entry: AtomicUsize::new(0),
+        }
+    }
+}
+
+/// One parameter block per CPU, so bringing up a second AP cannot overwrite
+/// the block a first AP is still reading.
+#[cfg(feature = "smp")]
+static AP_PARAMS: [ApBootParams; MAX_CPUS] = [
+    ApBootParams::empty(),
+    ApBootParams::empty(),
+    ApBootParams::empty(),
+    ApBootParams::empty(),
+];
+
+// Physical AP trampoline. PSCI CPU_ON enters this at its physical address
+// with the MMU off and x0 = context_id (the physical address of the
+// `ApBootParams` block). Every instruction before the SCTLR write is
+// position-independent and uses only x0-relative loads, so it executes at
+// the load address even though the linked symbols are high-half addresses.
+#[cfg(feature = "smp")]
 core::arch::global_asm!(
     r#"
     .section .text.ap_entry, "ax"
@@ -498,23 +551,50 @@ core::arch::global_asm!(
     .type ap_entry, %function
 ap_entry:
     msr daifset, #0xf
-    mov sp, x0
-    // VBAR first: any exception taken before this would vector to 0x0.
+    // AArch64 reset leaves FP/SIMD disabled. The Rust AP path contains
+    // compiler-generated NEON (Vec zeroing/`swap_remove`), so enable it at
+    // EL1 exactly like the boot CPU did.
+    mov x1, #0x300000
+    msr cpacr_el1, x1
+    isb
+    mov x19, x0                  // x0 = physical ApBootParams
+    ldr x1, [x19, #0]            // TTBR0
+    msr ttbr0_el1, x1
+    ldr x1, [x19, #8]            // TTBR1
+    msr ttbr1_el1, x1
+    ldr x1, [x19, #16]           // MAIR_EL1
+    msr mair_el1, x1
+    ldr x1, [x19, #24]           // TCR_EL1
+    msr tcr_el1, x1
+    ldr x1, [x19, #32]           // stack top (high alias)
+    mov sp, x1
+    ldr x2, [x19, #40]           // high-half Rust entry
+    isb
+    mrs x1, sctlr_el1
+    orr x1, x1, #1               // M
+    orr x1, x1, #(1 << 22)       // EIS
+    msr sctlr_el1, x1
+    isb
+    tlbi vmalle1
+    dsb ish
+    isb
+    // MMU is on now; the literal pool and the entry are high-half addresses.
     ldr x1, =exception_vectors
     msr vbar_el1, x1
-    bl {ap_main}
+    isb
+    br x2
     "#,
-    ap_main = sym smp_ap_main
 );
 
+#[cfg(feature = "smp")]
 extern "C" {
     fn ap_entry();
 }
 
-/// Rust body of the AP boot path. Runs with the MMU off until `ap_enable`.
+/// Rust body of the AP boot path. The trampoline above has already installed
+/// TTBR0/TTBR1, enabled the MMU and switched SP to the high alias.
+#[cfg(feature = "smp")]
 extern "C" fn smp_ap_main() -> ! {
-    let ttbr0 = AP_TTBR0.load(AtomicOrdering::Acquire);
-    crate::mmu::ap_enable(ttbr0);
     crate::console::write_str("SMP: AP MMU on\r\n");
 
     let Some(slot) = claim_cpu_slot() else {
@@ -547,6 +627,7 @@ extern "C" fn smp_ap_main() -> ! {
 /// Called once, from the first scheduling pass, with the kernel lock held —
 /// after the boot CPU has already entered its first task, so no AP can race
 /// the boot-time context switch.
+#[cfg(feature = "smp")]
 pub fn boot_secondary_cpus() {
     if cpu_count() <= 1 {
         return;
@@ -577,18 +658,58 @@ pub fn boot_secondary_cpus() {
             crate::console::write_str(", leaving it offline\r\n");
             return;
         };
+        if !crate::mmu::install_ap_identity(ttbr0) {
+            crate::console::write_str("SMP: no AP identity map for CPU");
+            crate::console::write_dec_u64(cpu as u64);
+            crate::console::write_str(", leaving it offline\r\n");
+            return;
+        }
 
-        AP_TTBR0.store(ttbr0, AtomicOrdering::Release);
-        // The AP starts with cold caches: push the boot parameter and the
-        // freshly written page-table pages to the point of coherency.
-        let ap_ttbr0_addr = &AP_TTBR0 as *const AtomicUsize as usize;
-        crate::mmu::clean_range_to_poc(ap_ttbr0_addr, 8);
-        crate::mmu::clean_range_to_poc(ttbr0, crate::memory::PAGE_SIZE);
+        // The AP's bootstrap stack must not inherit another owner's bytes.
+        unsafe {
+            core::ptr::write_bytes(
+                crate::memory::phys_to_virt(stack) as *mut u8,
+                0,
+                2 * crate::memory::PAGE_SIZE,
+            );
+        }
+
+        // The AP starts with cold caches. Publish its parameter block and
+        // page-table root through the high alias (the boot CPU has no low
+        // identity map left), then pass the block's physical address as the
+        // PSCI context id. `_space_token` is deliberately kept alive by the
+        // registry: an AP idle space is never retired in Phase 1.
+        let params = &AP_PARAMS[cpu];
+        params.ttbr0.store(ttbr0, AtomicOrdering::Release);
+        params
+            .ttbr1
+            .store(crate::mmu::kernel_ttbr1(), AtomicOrdering::Release);
+        params
+            .mair
+            .store(crate::mmu::ap_boot_mair() as usize, AtomicOrdering::Release);
+        params
+            .tcr
+            .store(crate::mmu::ap_boot_tcr() as usize, AtomicOrdering::Release);
+        params.stack_top.store(
+            crate::memory::phys_to_virt(stack + 2 * crate::memory::PAGE_SIZE),
+            AtomicOrdering::Release,
+        );
+        params
+            .entry
+            .store(smp_ap_main as *const () as usize, AtomicOrdering::Release);
+
+        let params_va = params as *const ApBootParams as usize;
+        let params_pa = crate::memory::virt_to_phys(params_va);
+        crate::mmu::clean_range_to_poc(params_va, core::mem::size_of::<ApBootParams>());
+        crate::mmu::clean_range_to_poc(
+            crate::memory::phys_to_virt(ttbr0),
+            crate::memory::PAGE_SIZE,
+        );
 
         // QEMU virt numbers CPUs by Aff0: cpu index == affinity value.
         let target_mpidr = cpu as u64;
-        let entry = ap_entry as *const () as usize;
-        let result = psci_cpu_on(target_mpidr, entry);
+        let entry_physical = crate::memory::virt_to_phys(ap_entry as *const () as usize);
+        let result = psci_cpu_on(target_mpidr, entry_physical, params_pa);
         crate::console::write_str("SMP: CPU_ON cpu=");
         crate::console::write_dec_u64(cpu as u64);
         crate::console::write_str(" -> ");
@@ -601,17 +722,19 @@ pub fn boot_secondary_cpus() {
     }
 }
 
-/// PSCI CPU_ON (SMC32 function id 0x84020002) over the HVC conduit.
-/// Returns the PSCI status: 0 = SUCCESS.
-fn psci_cpu_on(target_mpidr: u64, entry_physical: usize) -> u64 {
+/// PSCI CPU_ON (SMC64 function id 0xC4000003) over QEMU `virt`'s HVC
+/// conduit. Returns the PSCI status: 0 = SUCCESS. `context_id` is delivered
+/// to the entry point in x0.
+#[cfg(feature = "smp")]
+fn psci_cpu_on(target_mpidr: u64, entry_physical: usize, context_id: usize) -> u64 {
     let ret: u64;
     unsafe {
         core::arch::asm!(
             "hvc #0",
-            inlateout("x0") 0x8402_0002_u64 => ret,
+            inlateout("x0") 0xC400_0003_u64 => ret,
             in("x1") target_mpidr,
             in("x2") entry_physical as u64,
-            in("x3") 0_u64,
+            in("x3") context_id as u64,
             options(nostack),
         );
     }

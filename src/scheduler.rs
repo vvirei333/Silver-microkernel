@@ -1289,6 +1289,14 @@ pub fn schedule() {
         return;
     }
 
+    #[cfg(feature = "smp")]
+    if smp::this_cpu_id() != 0
+        && !smp::AP_TASK_SCHEDULING.load(core::sync::atomic::Ordering::Acquire)
+    {
+        // Phase 1: APs stay parked in `wait_for_irq` after GIC/timer bring-up.
+        return;
+    }
+
     // The kernel lock is held for the whole pass. If this call switches
     // away, the outgoing task is suspended before the matching release and
     // the incoming task resumes inside its own suspended `schedule`, so the
@@ -1318,13 +1326,8 @@ pub fn schedule() {
     wake_expired_tasks(manager, timer::ticks());
 
     if AP_BOOT_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
-        // BISECT: AP boot disabled
-        // smp::boot_secondary_cpus();
-        crate::console::write_str("SMP: first schedule reached\r\n");
-    }
-
-    if smp::current_index() >= manager.tasks.len() {
-        smp::set_current_index(0);
+        #[cfg(feature = "smp")]
+        smp::boot_secondary_cpus();
     }
 
     let current_index = smp::current_index();
@@ -1333,8 +1336,8 @@ pub fn schedule() {
     // still on the boot stack (a timer IRQ during `scheduler::init`). Saving
     // that SP into idle's context corrupts it. `start()` performs the real
     // first switch; until then `schedule` must not switch at all. An AP's
-    // first pass has no current task (`had_current == false`) and is handled
-    // by the dummy-context path below.
+    // first pass has no current task (`current_index == usize::MAX`) and is
+    // handled by the dummy-context path below.
     if !live_is_dead && had_current {
         let sp_now: usize;
         unsafe {
@@ -1347,30 +1350,38 @@ pub fn schedule() {
             return;
         }
     }
-    if manager.tasks[current_index].state == TaskState::Running {
+    if had_current && manager.tasks[current_index].state == TaskState::Running {
         manager.tasks[current_index].state = TaskState::Ready;
     }
 
-    let Some(next_index) = find_next_task(manager) else {
+    let scan_base = if had_current { current_index } else { 0 };
+    let Some(next_index) = find_next_task(manager, scan_base) else {
+        if had_current && manager.tasks[current_index].state == TaskState::Ready {
+            manager.tasks[current_index].state = TaskState::Running;
+        }
         smp::bkl_release();
         return;
     };
-    if next_index == current_index && !live_is_dead {
+    if had_current && next_index == current_index && !live_is_dead {
         // Self-continuation: this CPU keeps running the same task and keeps
-        // holding the kernel lock for it.
+        // holding the kernel lock for it. The probe above marked it Ready so
+        // `find_next_task` could consider it; restore Running before another
+        // CPU can mistake it for runnable.
+        manager.tasks[current_index].state = TaskState::Running;
         smp::bkl_release();
         return;
     }
 
-    // Switching away: the outgoing task stops running on this CPU. Bounds-
-    // checked write: current_index was clamped above, but this is the one
-    // site where a stale index would silently corrupt memory.
-    match manager.tasks.get_mut(current_index) {
-        Some(outgoing) => outgoing.running_on = None,
-        None => {
-            console::write_str("SCHEDULE: current_index out of range: ");
-            console::write_dec_u64(current_index as u64);
-            console::write_str("\r\n");
+    // Switching away: the outgoing task stops running on this CPU. An AP's
+    // first pass has no outgoing task, so there is no state to clear.
+    if had_current {
+        match manager.tasks.get_mut(current_index) {
+            Some(outgoing) => outgoing.running_on = None,
+            None => {
+                console::write_str("SCHEDULE: current_index out of range: ");
+                console::write_dec_u64(current_index as u64);
+                console::write_str("\r\n");
+            }
         }
     }
 
@@ -1427,7 +1438,7 @@ pub fn schedule() {
         // stack frame is abandoned once it switches into a real task).
         unsafe { &mut AP_DUMMY_CONTEXTS[smp::this_cpu_id()] }
     };
-    let from_id = if live_is_dead {
+    let from_id = if live_is_dead || !has_current {
         live_task_id
     } else {
         unsafe { (*tasks.add(current_index)).id }
@@ -1826,20 +1837,24 @@ fn spawn_inner(
     Some(id)
 }
 
-fn find_next_task(manager: &TaskManager) -> Option<usize> {
+fn find_next_task(manager: &TaskManager, scan_base: usize) -> Option<usize> {
     let task_count = manager.tasks.len();
 
     for offset in 1..=task_count {
-        let index = (smp::current_index() + offset) % task_count;
+        let index = (scan_base + offset) % task_count;
         let task = &manager.tasks[index];
-        if task.id != IDLE_TASK_ID && task.state == TaskState::Ready {
+        if task.id != IDLE_TASK_ID
+            && task.state == TaskState::Ready
+            && task.running_on.is_none()
+        {
             return Some(index);
         }
     }
 
     for offset in 1..=task_count {
-        let index = (smp::current_index() + offset) % task_count;
-        if manager.tasks[index].state == TaskState::Ready {
+        let index = (scan_base + offset) % task_count;
+        let task = &manager.tasks[index];
+        if task.state == TaskState::Ready && task.running_on.is_none() {
             return Some(index);
         }
     }

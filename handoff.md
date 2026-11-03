@@ -27,6 +27,18 @@ bounds and a portable cache-line helper.
   `TIMER ONLINE` and growing `TICKS`. This validates the boot path, MMU
   self-test, GIC/timer and scheduler/Howl start; it does **not** stress DMA
   reclamation, TLB shootdown or cache maintenance under load.
+- **SMP Phase 1 (opt-in `smp`, QEMU only).** Default builds stay single-core.
+  `no_std,smp` with QEMU `-smp 2` brings CPU1 online through a physical AP
+  trampoline (correct PSCI `0xC4000003` HVC call, physical entry/params,
+  `CPACR_EL1` FP/SIMD enable, high-half jump), initializes its GIC/timer and
+  accepts IPIs. **AP task scheduling is parked** (`AP_TASK_SCHEDULING=false`):
+  enabling it makes the shell block after printing the fastfetch banner, before
+  `howl ready`; drivers/Howler are blocked and both CPUs idle. The likely area
+  is the IPC/console path around `drop_glue(MutexGuard<IpcState>)`; a per-CPU
+  idle experiment did not fix it and was reverted. That is the historical
+  layer-A aliasing/self-loop class, not a trivial run-queue bug. Fog/tablet
+  force one CPU; physical SMP is unproven. Details and the Phase 2 list are in
+  [`SMP_STATUS.md`](SMP_STATUS.md).
 - **Redmi 10C / fog RAM-only bring-up is implemented but not hardware-verified.**
   Authoritative document: [`redmi10c_poc/README.md`](redmi10c_poc/README.md).
 - The default `fog` build is **fail-closed**: relocation is disabled, and a
@@ -1464,9 +1476,12 @@ read back only their own values.
 
 ## Architectural invariants (do not break!)
 
-1. **Single-CPU.** Every `unsafe impl Sync` on an UnsafeCell wrapper
-   (`TaskManager`, `IpcState`) rests on a single CPU core. Real spinlocks
-   come before SMP.
+1. **Single-CPU by default; QEMU SMP is an opt-in experiment.** Default
+   builds keep `cpu_count() == 1`; fog and tablet force one CPU. The `smp`
+   feature brings QEMU APs online (GIC/timer/IPI), but AP task scheduling is
+   parked and the single-CPU ownership/quiescence proofs still apply. Every
+   `unsafe impl Sync` on an UnsafeCell wrapper (`TaskManager`, `IpcState`)
+   must be re-proven before APs execute tasks; real spinlocks come first.
 2. **Critical sections via DAIF.** Global kernel state (scheduler, IPC) is
    mutated only under `save_and_disable_irq` / `restore_irq`. That is the
    only mutual-exclusion mechanism besides Mutex + Condvar.

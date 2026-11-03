@@ -4,13 +4,20 @@
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
 > test suite is now **138/138**; the 13/13 figure below is the checkpoint from
-> this SMP session. `-smp 2` is still **not verified**.
+> the earlier SMP session.
+>
+> **Phase 1 is implemented as the opt-in `smp` feature (QEMU only).** Default
+> builds remain single-core. With `no_std,smp` and QEMU `-smp 2`, CPU1 is
+> brought online through a physical AP trampoline, its GICv3/GICv2 PPI and
+> timer are initialized, and it receives IPIs — but **AP task scheduling is
+> deliberately parked** (`AP_TASK_SCHEDULING = false`). Concurrent task
+> migration still hangs after drivers start, so the AP remains in
+> `wait_for_irq` until the scheduler/quiescence work below is finished.
 >
 > Package E2 (owner-aware page-table walks, DRAM-bounded revoke, `CTR_EL0`
-> cache-line helper) is a single-CPU change. It does **not** enable SMP and does
-> not change the SMP blockers: the ownership/quiescence argument still assumes
-> one table editor under the BKL and one PE per address space. Revalidate the
-> walk/quiescence proof before enabling APs.
+> cache-line helper) remains a single-CPU proof. The ownership/quiescence
+> argument still assumes one table editor under the BKL and one PE per address
+> space; do not enable AP task execution before revalidating it.
 
 ## CHECKPOINT (финальные проверки)
 
@@ -41,6 +48,64 @@
 IPC-приём silverd. Диагностические RAM-пробы и serial-принты (M1–M5, S1/S2,
 SYS sp=, C1–C3) СОХРАНЕНЫ сознательно — они нужны для охоты на писателя кадра
 0x40081000 (слой B).**
+
+## PHASE 1 (2026-11-03): AP bring-up, QEMU opt-in
+
+Landed behind `--features no_std,smp`; default builds keep `cpu_count() == 1`.
+
+- **PSCI CPU_ON was wrong twice.** The old call used `hvc #0` with function ID
+  `0x84020002` (not a PSCI ID) and returned `-1`. QEMU `virt` at EL1 uses the
+  HVC conduit with the SMC64 CPU_ON ID `0xC4000003`; it now returns `0`.
+- **AP entry is a physical trampoline.** PSCI starts the AP with the MMU off
+  at a physical address. The old `ap_entry` branched to a high-half Rust
+  symbol and never passed a stack. The new trampoline is position-independent,
+  takes a physical `ApBootParams` block in PSCI context-id (x0), loads
+  TTBR0/TTBR1/MAIR/TCR, enables FP/SIMD (`CPACR_EL1 = 0x300000`; the Rust path
+  contains compiler-generated NEON), enables the MMU and jumps to the
+  high-half Rust entry.
+- **AP stack and identity page.** CPU bring-up allocates a zeroed 8 KiB stack,
+  publishes its high alias, and replaces the AP space's empty user-image L3
+  with one EL1-only 2 MiB identity block so the trampoline can execute at its
+  physical PC until the branch to high memory.
+- **IPIs re-enabled.** `ipi_reschedule_others()` issues SGI0 when more than one
+  CPU is online; AP GIC init enables the banked SGI/PPI.
+- **Scheduler safety fixes that remain valid for Phase 2:**
+  `find_next_task()` skips tasks with `running_on.is_some()` (a task can be
+  transiently Ready while still executing on another CPU between
+  `schedule_released` and its context switch), and self-continuation restores
+  `Running` instead of leaving the current task Ready.
+- **AP task execution is parked.** With AP scheduling enabled, QEMU reaches
+  driver startup and then hangs; the AP itself is healthy (timer/IPI continue).
+  `AP_TASK_SCHEDULING` stays false so Phase 1 is a stable checkpoint.
+
+Verified: `cargo test --lib` 138/138; default `no_std` on QEMU `-smp 2` stays
+single-core and reaches `howl>`; `no_std,smp` on QEMU `-smp 2` shows
+`SMP: CPU1 online` and reaches `howl>`; 60 s run has no panic/BKL-stuck;
+fog QEMU integration remains PASS. No physical hardware SMP.
+
+### Phase 2 attempt: AP task execution is still blocked
+
+Setting `AP_TASK_SCHEDULING = true` lets the AP run tasks (idle, silverd,
+drivers, shell), but QEMU does not reach a usable prompt. Two separate issues
+were found:
+
+1. **Shared-idle livelock.** With one global idle task, a blocked CPU0 could
+   not switch away when CPU1 owned that idle context; it spun through
+   `receive_matching`/`schedule_released` with IRQs masked. A per-CPU idle
+   experiment (one idle task per CPU, ids `0..cpu_count()`) was tried, but it
+   made the shell block even with AP scheduling still parked, so it was
+   reverted. The scheduler keeps the single idle task for now.
+2. **Open: task blocks after the shell banner.** With AP scheduling enabled,
+   the shell (`HOWL`, program 3) prints the fastfetch banner, then its task is
+   `Blocked`; `HOWLER`, several drivers and Scout are also blocked, SFS is a
+   zombie, and both CPUs sit in idle. No panic and no `BKL STUCK`. The shell
+   never reaches `howl ready`/prompt. The likely area is the IPC/console path
+   (`receive_matching` → `drop_glue(MutexGuard<IpcState>)` / console sink
+   mailbox) under concurrent task execution, matching the historical layer-A
+   aliasing/self-loop class rather than a run-queue problem.
+
+The gate stays false. Do **not** enable AP task execution until the blocked
+shell/IPC path is fixed and the space-quiescence work is done.
 
 ## Что сделано (фазы 1–6 задания TASK №6)
 
@@ -127,13 +192,23 @@ SYS sp=, C1–C3) СОХРАНЕНЫ сознательно — они нужн�
   __bss_end) для выросшего с SMP образа; (в) build_task_space: не попадает ли
   кадр таблицы задачи в диапазон kernel image при новых размерах.**
 
-## Что дальше (по разрешению ревьюера)
-1. Ловить писателя кадра 0x40081000 (gdb watchpoint на L2-дескриптор
-   0x40000000-блока в TTBR1 — таблицы kernel в .bss — адреса из nm).
-2. Восстановить симметрию pre-SMP: `git diff ca84fc9 -- src/mmu.rs` по блокам
-   (revoke/registry — TASK №5 — сверить, что SMP-правки не задели пути №5).
-3. Если слой B чинится — слой A может исчезнуть (повреждённые данные
-   делают пути «невозможными» с точки зрения LLVM-модели).
+## Что дальше (Phase 2)
+
+1. **AP task execution.** Reproduce the post-driver hang with
+   `AP_TASK_SCHEDULING = true`, then decide between per-CPU run queues or a
+   global queue with explicit migration/ownership; the current global vector
+   plus `running_on` checks is not sufficient for sustained AP scheduling.
+2. **Space quiescence.** `destroy_task_space`/`retire_space` and
+   `revoke_phys_range` must prove that no CPU can still execute or walk the
+   space before freeing tables/frames. BKL serializes editors, not user-mode
+   execution or an in-flight TLB translation; add a stop-the-world/IPI
+   handshake or a per-space generation quiescence protocol.
+3. **TLB/DMA under SMP.** Re-audit `flush_after_table_change`,
+   `switch_address_space` and `revoke_phys_range` against a second PE holding a
+   stale translation; keep `safe_to_free` CPU-only and retain the leak policy.
+4. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
+   DMA revoke while a client runs, and page-table teardown under load.
+5. **Hardware.** Fog/tablet stay single-core; physical SMP remains unproven.
 
 
 ## БЛОКЕР: boot-freeze на `-smp 2` (историческая часть)
@@ -167,13 +242,15 @@ SYS sp=, C1–C3) СОХРАНЕНЫ сознательно — они нужн�
 - `src/scheduler.rs`: `B1/B2` в `block_current_on`, `R1–R4` в
   `schedule_released`, `SCHED_SEEN` в `schedule`.
 - `src/smp.rs`: `BKL STUCK`-детектор в `bkl_acquire`; `BKL_DISABLED`-свитч
-  (оставить механизм, значение `false`); **`ipi_reschedule_others` выключен
-  (`if false`) — ВЕРНУТЬ**.
+  (оставить механизм, значение `false`); `AP_TASK_SCHEDULING` — Phase 1 gate,
+  сейчас `false`.
 - `src/allocator.rs`: `HEAP_PAGES` 512 (бисект) — вернуть 256.
 
 ## Проверки на текущем состоянии
 
-- `cargo kernel` / `cargo kernel-release`: OK (3 warnings: capability dead_code
-  пре-существующий + 2 never-used заготовки SMP).
-- `cargo test --lib`: 13/13.
-- QEMU `-smp 2`: **FREEZE** (см. выше). Коммит не делать.
+- `cargo test --lib`: **138/138**.
+- Default `no_std` build, QEMU `-smp 2`: single-core, reaches `howl>`.
+- `no_std,smp` build, QEMU `-smp 2`: CPU1 online (GIC/timer/IPI), reaches
+  `howl>`; 60 s without panic/BKL-stuck. AP task execution parked.
+- `no_std,fog` / `no_std,tablet`: build; fog QEMU integration PASS.
+- Physical SMP: **not verified**; fog/tablet remain single-core.
