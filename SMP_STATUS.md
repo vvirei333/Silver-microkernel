@@ -166,8 +166,12 @@ were closed:
 Verified with the `demo-tasks` regression on QEMU `-smp 2`: **66 PASS /
 0 PANIC**, including concurrent spawn/kill/reap and DMA revoke while both CPUs
 schedule. A forced `gic::cpu_init()` failure parks CPU1 offline and still
-reaches `howl>`, proving the failure branch cannot hang quiescence. This is
-functional stress coverage, not a TLB-shootdown proof.
+reaches `howl>`, proving the failure branch cannot hang quiescence.
+
+The opt-in `smp-selftest` feature runs one real SGI1 stop-the-world round once
+a secondary is published and logs `SMP SELFTEST: quiesce PASS`; it exercises
+the same acknowledgement path (including BKL waiters) that DMA teardown uses.
+This is functional stress coverage, not a TLB-shootdown proof.
 
 ## Что сделано (фазы 1–6 задания TASK №6)
 
@@ -311,6 +315,8 @@ functional stress coverage, not a TLB-shootdown proof.
   execute tasks, `howl ready`/prompt and `ps` work; 60 s without panic/BKL-stuck.
 - `no_std,smp,demo-tasks`, QEMU `-smp 2`: **66 PASS / 0 PANIC**, clean exit;
   spawn/kill/reap and DMA revoke ran while both CPUs were scheduling.
+- `no_std,smp-selftest`, QEMU `-smp 2`: `SMP SELFTEST: quiesce PASS` during
+  boot, then `howl>`.
 - Forced AP GIC failure (temporary build-only patch): CPU1 stays offline,
   prints `AP GIC unavailable`, and the system still reaches `howl>`.
 - `no_std,fog` / `no_std,tablet`: build; fog QEMU integration PASS.

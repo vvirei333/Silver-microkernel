@@ -2199,6 +2199,39 @@ fn current_task_mut() -> Option<&'static mut Task> {
     manager.tasks.get_mut(smp::current_index())
 }
 
+/// Self-capabilities a freshly spawned embedded program receives. Dynamic
+/// ELF tasks start with none and must be delegated rights by their parent.
+/// `CAP_MOUNT`/`CAP_POWER` are deliberately outside `CAP_ALL`, so a spawn
+/// handle can never carry them.
+fn initial_self_rights(program: u64) -> Option<u32> {
+    let rights = match program {
+        user_program::SILVERD => {
+            capability::CAP_ALL | capability::CAP_MOUNT | capability::CAP_POWER
+        }
+        // The UART driver owns the input path, including the Ctrl-Z console
+        // stop request; without this right SYS_STOP_CONSOLE is denied.
+        user_program::HOWLER => {
+            capability::CAP_MMIO | capability::CAP_IRQ | capability::CAP_CONSOLE_GRANT
+        }
+        user_program::BLOCK_DRIVER | user_program::NET_DRIVER => {
+            capability::CAP_MMIO | capability::CAP_PCI
+        }
+        // The filesystem server only needs MMIO to map the shared DMA window
+        // the block driver hands back; without this a server spawned by hand
+        // from the shell could never mount.
+        user_program::SFS_SERVER | user_program::NET_SERVER => capability::CAP_MMIO,
+        // The shell hands device rights to the tasks it spawns by hand
+        // (`spawn block_driver`), and `CapTable::grant` only allows a task to
+        // pass on a right it already holds.
+        user_program::HOWL => capability::CAP_MMIO,
+        // The graphics driver owns the on-screen Power button; only this
+        // trusted component receives the power privilege.
+        user_program::GPU_DRIVER => capability::CAP_MMIO | capability::CAP_POWER,
+        _ => return None,
+    };
+    Some(rights)
+}
+
 impl Task {
     fn new(
         id: u64,
@@ -2314,49 +2347,11 @@ impl Task {
         context.user_stack_pointer = user_stack_pointer;
 
         let mut cap_table = capability::CapTable::new();
-        match user.map(|(program, _)| program) {
-            Some(user_program::SILVERD) => {
-                // System manager: full task/device rights plus the global
-                // mount and power rights. CAP_MOUNT/CAP_POWER are deliberately
-                // NOT part of CAP_ALL, so spawn handles can never carry them.
-                cap_table.insert(
-                    id,
-                    capability::CAP_ALL | capability::CAP_MOUNT | capability::CAP_POWER,
-                );
-            }
-            Some(user_program::HOWLER) => {
-                cap_table.insert(id, capability::CAP_MMIO | capability::CAP_IRQ);
-            }
-            Some(user_program::BLOCK_DRIVER) => {
-                cap_table.insert(id, capability::CAP_MMIO | capability::CAP_PCI);
-            }
-            Some(user_program::NET_DRIVER) => {
-                cap_table.insert(id, capability::CAP_MMIO | capability::CAP_PCI);
-            }
-            // The filesystem server only needs MMIO to map the shared DMA
-            // window the block driver hands back; without this a server spawned
-            // by hand from the shell could never mount.
-            Some(user_program::SFS_SERVER) => {
-                cap_table.insert(id, capability::CAP_MMIO);
-            }
-            // The network server allocates its own DMA window and may map the
-            // driver's buffers as the protocol grows.
-            Some(user_program::NET_SERVER) => {
-                cap_table.insert(id, capability::CAP_MMIO);
-            }
-            // The shell hands device rights to the tasks it spawns by hand
-            // (`spawn block_driver`), and `CapTable::grant` only allows a task
-            // to pass on a right it already holds. Without this entry every
-            // delegation from the shell would fail.
-            Some(user_program::HOWL) => {
-                cap_table.insert(id, capability::CAP_MMIO);
-            }
-            // The graphics driver owns the on-screen Power button; only this
-            // trusted component receives the power privilege.
-            Some(user_program::GPU_DRIVER) => {
-                cap_table.insert(id, capability::CAP_MMIO | capability::CAP_POWER);
-            }
-            _ => {}
+        if let Some(rights) = user
+            .map(|(program, _)| program)
+            .and_then(initial_self_rights)
+        {
+            cap_table.insert(id, rights);
         }
 
         Some(Self {

@@ -81,7 +81,7 @@ userspace.
 - [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation with pre-copy FDT destination validation (QEMU-verified, and booted on a physical `rain` unit)
 - [x] Real Redmi 10C boot: RAM-only `fastboot boot` reaches the scheduler and the Howl task, with live GICv3 timer interrupts (verified on a `rain` unit)
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
-- [ ] SMP (`-smp 2`): **in progress, not working yet** — see `SMP_STATUS.md`. Single-CPU boot is the verified configuration; under `-smp 2` the kernel does not survive silverd's first blocking IPC receive. Known open issues: compiler-generated self-loops on reachable paths in O3+LTO builds (absent pre-SMP, root cause not established), and an O1-run infinite Prefetch Abort (ESR `0x86000006`, FAR `0x40081a00`) pointing at kernel translation-table damage still under investigation. CPU1 stays offline (PSCI `CPU_ON` returns `-1`). Do not boot on hardware expecting SMP.
+- [ ] SMP (`-smp 2`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings CPU1 online, runs tasks on both CPUs and passes the `demo-tasks` regression (66 PASS / 0 PANIC). `no_std,smp-selftest` additionally runs one SGI1 stop-the-world round at boot. Physical SMP, TLB-shootdown stress and device-DMA quiescence remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
 
 ## Redmi 10C (`fog`, SM6225) — RAM-only bring-up
 
@@ -131,6 +131,10 @@ cargo build --release --target aarch64-unknown-none \
 # QEMU-only SMP: AP online, GIC/timer/IPI and task execution
 cargo build --release --target aarch64-unknown-none \
     --no-default-features --features no_std,smp
+
+# Same, plus one boot-time SGI1 stop-the-world round (PASS/FAIL log)
+cargo build --release --target aarch64-unknown-none \
+    --no-default-features --features no_std,smp-selftest
 
 # Explicit relocation experiment (only after proving the destination)
 cargo build --release --target aarch64-unknown-none \
@@ -375,10 +379,11 @@ keep running.
 Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
-`Cargo.toml` has `std` (default host stub), `no_std` (bare metal),
-`demo-tasks` (opt-in regression programs), `tablet` (SM8650), `fog` (SM6225
-RAM-only bring-up) and `fog-reloc` (explicit opt-in for the fog self-relocation
-copy). Normal bare-metal boot starts only
+`Cargo.toml` has `std` (default host stub), `no_std` (bare metal), `smp`
+(opt-in QEMU SMP), `smp-selftest` (SMP plus one boot-time SGI1 quiescence
+round), `demo-tasks` (opt-in regression programs), `tablet` (SM8650), `fog`
+(SM6225 RAM-only bring-up) and `fog-reloc` (explicit opt-in for the fog
+self-relocation copy). Normal bare-metal boot starts only
 silverd, which then starts Scout, the block driver, the network driver, the SFS
 server, the network server, the graphics and input drivers, Howl and Howler in
 that order. No component depends

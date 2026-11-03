@@ -44,7 +44,14 @@ AP publication gated on a usable banked GIC.
   conservative `space_is_running` / `range_mapped_by` leak gate. An AP is
   published online only after its banked GIC bring-up succeeds; a failed AP
   parks offline, and late `boot_secondary_cpus` failures release the stack,
-  private page and task space instead of leaking them.
+  private page and task space instead of leaking them. The opt-in
+  `smp-selftest` feature exercises one real SGI1 stop-the-world round at boot.
+- **Ctrl-Z regression fixed after S-01.** The audit added a
+  `CAP_CONSOLE_GRANT` gate to `SYS_STOP_CONSOLE`, but Howler's initial
+  self-capabilities did not include it, so the userspace UART driver could no
+  longer stop the console owner. `initial_self_rights` now grants Howler
+  `CAP_MMIO | CAP_IRQ | CAP_CONSOLE_GRANT`; the other embedded programs keep
+  their existing minimal sets.
 - **Redmi 10C / fog RAM-only bring-up is implemented but not hardware-verified.**
   Authoritative document: [`redmi10c_poc/README.md`](redmi10c_poc/README.md).
 - The default `fog` build is **fail-closed**: relocation is disabled, and a

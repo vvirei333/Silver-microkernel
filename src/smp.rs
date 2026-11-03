@@ -857,6 +857,40 @@ pub fn boot_secondary_cpus() {
             return;
         }
     }
+
+    #[cfg(feature = "smp-selftest")]
+    run_quiesce_selftest();
+}
+
+/// Opt-in boot self-test: wait for a published secondary, then run one real
+/// SGI1 stop-the-world round. This exercises the same handshake DMA teardown
+/// uses, including the BKL-waiter acknowledgement path.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+fn run_quiesce_selftest() {
+    if cpu_count() <= 1 {
+        return;
+    }
+    let me = this_cpu_id();
+    let mut spins: u32 = 0;
+    while !(0..cpu_count()).any(|cpu| cpu != me && cpu_online(cpu)) {
+        spins += 1;
+        if spins >= 5_000_000 {
+            crate::console::write_str("SMP SELFTEST: skipped, no secondary online\r\n");
+            return;
+        }
+        unsafe {
+            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+        }
+    }
+
+    // The peer may have published but not yet unmasked IRQs. `quiesce_begin`
+    // re-sends SGI1 and the BKL retry loop acknowledges once IRQs are enabled.
+    if quiesce_begin() {
+        quiesce_end();
+        crate::console::write_str("SMP SELFTEST: quiesce PASS\r\n");
+    } else {
+        crate::console::write_str("SMP SELFTEST: quiesce FAIL (timeout)\r\n");
+    }
 }
 
 /// PSCI CPU_ON (SMC64 function id 0xC4000003) over QEMU `virt`'s HVC
