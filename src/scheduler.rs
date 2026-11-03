@@ -11,7 +11,7 @@ use crate::{
     elf_loader,
     frame_allocator, interrupts, smp,
     memory::{phys_to_virt, virt_to_phys, MemoryRegion, PAGE_SIZE},
-    mmu, mutex, console, timer, user_program, vfs,
+    mmu, mutex, console, timer, user_program, vfs, kernel_stack,
     wait_queue::WaitQueue,
 };
 
@@ -69,6 +69,7 @@ struct MmapRegion {
     virtual_address: usize,
     page_count: usize,
     physical_start: usize,
+    generation: u32,
 }
 
 pub struct Task {
@@ -100,8 +101,13 @@ pub struct Task {
     pub user_stack: MemoryRegion,
     pub ttbr0: usize,
     user_image: Option<LoadedImage>,
-    heap_pages: Vec<usize>,
-    dma_pages: Vec<(usize, usize)>,
+    /// `(physical page, allocation generation)` for every `brk` page. The
+    /// tag makes a stale teardown free fail instead of releasing a frame that
+    /// was already recycled.
+    heap_pages: Vec<(usize, u32)>,
+    user_stack_generation: u32,
+    private_page_generation: u32,
+    dma_pages: Vec<(usize, usize, u32)>,
     mmap_regions: Vec<MmapRegion>,
     program_break: usize,
     waiting_on: Option<WaitLink>,
@@ -1607,7 +1613,7 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
     let saved_daif = interrupts::save_and_disable_irq();
     let result = scheduler_manager().and_then(|manager| {
         let shared_dma = manager.tasks.iter().any(|owner| {
-            owner.dma_pages.iter().any(|&(base, page_count)| {
+            owner.dma_pages.iter().any(|&(base, page_count, _)| {
                 base.checked_add(page_count * PAGE_SIZE)
                     .is_some_and(|dma_end| {
                         phys_addr >= base
@@ -1656,13 +1662,14 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
             console::write_str("DMA: FAIL - no CAP_MMIO rights\r\n");
             return None;
         }
-        let physical = match frame_allocator::alloc_contiguous_pages(page_count) {
-            Some(p) => p,
-            None => {
-                console::write_str("DMA: FAIL - alloc_contiguous_pages returned None\r\n");
-                return None;
-            }
-        };
+        let (physical, generation) =
+            match frame_allocator::alloc_contiguous_pages_tagged(page_count) {
+                Some(pair) => pair,
+                None => {
+                    console::write_str("DMA: FAIL - alloc_contiguous_pages returned None\r\n");
+                    return None;
+                }
+            };
         // Every frame in the newly allocated run is recycled allocator memory.
         // Clear the whole range through the cacheable kernel alias *before*
         // `map_dma_to_user` publishes it to EL0, then push those lines to the
@@ -1671,10 +1678,10 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
         unsafe { core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, mapped_size) };
         let Some(virtual_address) = mmu::map_dma_to_user(task, physical, mapped_size) else {
             console::write_str("DMA: FAIL - mmu::map_dma_to_user returned None\r\n");
-            release_pages(physical, page_count);
+            frame_allocator::free_contiguous_pages_tagged(physical, page_count, generation);
             return None;
         };
-        task.dma_pages.push((physical, page_count));
+        task.dma_pages.push((physical, page_count, generation));
         Some((virtual_address, physical))
     });
     interrupts::restore_irq(saved_daif);
@@ -1919,7 +1926,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         .iter()
         .filter(|task| task.state == TaskState::Dead && task.running_on.is_none())
     {
-        for &(physical, page_count) in &dead.dma_pages {
+        for &(physical, page_count, _) in &dead.dma_pages {
             let fail = mmu::RevokeResult {
                 unmapped: 0,
                 safe_to_free: false,
@@ -2082,26 +2089,35 @@ impl Task {
                 mmu::USER_STACK_SIZE - 1024,
             )?)
         };
-        let Some(stack_start) = frame_allocator::alloc_contiguous_pages(TASK_STACK_PAGES) else {
+        let Some(stack_start) = kernel_stack::alloc() else {
             return None;
         };
 
-        let user_stack = if user.is_some() {
-            let Some(user_start) = frame_allocator::alloc_contiguous_pages(TASK_USER_STACK_PAGES)
+        let (user_stack, user_stack_generation) = if user.is_some() {
+            let Some((user_start, generation)) =
+                frame_allocator::alloc_contiguous_pages_tagged(TASK_USER_STACK_PAGES)
             else {
-                release_pages(stack_start, TASK_STACK_PAGES);
+                kernel_stack::free(stack_start);
                 return None;
             };
-            MemoryRegion::new(user_start, user_start + TASK_USER_STACK_SIZE)
+            (
+                MemoryRegion::new(user_start, user_start + TASK_USER_STACK_SIZE),
+                generation,
+            )
         } else {
-            MemoryRegion::new(0, 0)
+            (MemoryRegion::new(0, 0), 0)
         };
 
-        let Some(private_page) = frame_allocator::alloc_page() else {
+        let Some((private_page, private_page_generation)) = frame_allocator::alloc_page_tagged()
+        else {
             if !user_stack.is_empty() {
-                release_pages(user_stack.start, TASK_USER_STACK_PAGES);
+                frame_allocator::free_contiguous_pages_tagged(
+                    user_stack.start,
+                    TASK_USER_STACK_PAGES,
+                    user_stack_generation,
+                );
             }
-            release_pages(stack_start, TASK_STACK_PAGES);
+            kernel_stack::free(stack_start);
             return None;
         };
 
@@ -2113,11 +2129,15 @@ impl Task {
             if let Some(image) = &user_image {
                 image.release();
             }
-            frame_allocator::free_page(private_page);
+            frame_allocator::free_page_tagged(private_page, private_page_generation);
             if !user_stack.is_empty() {
-                release_pages(user_stack.start, TASK_USER_STACK_PAGES);
+                frame_allocator::free_contiguous_pages_tagged(
+                    user_stack.start,
+                    TASK_USER_STACK_PAGES,
+                    user_stack_generation,
+                );
             }
-            release_pages(stack_start, TASK_STACK_PAGES);
+            kernel_stack::free(stack_start);
             return None;
         };
 
@@ -2223,6 +2243,8 @@ impl Task {
             context,
             stack,
             user_stack,
+            user_stack_generation,
+            private_page_generation,
             ttbr0,
             user_image,
             heap_pages: Vec::new(),
@@ -2250,16 +2272,16 @@ impl Task {
         let original_pages = self.heap_pages.len();
         while self.heap_pages.len() < target_pages {
             let index = self.heap_pages.len();
-            let Some(frame) = frame_allocator::alloc_page() else {
+            let Some((frame, generation)) = frame_allocator::alloc_page_tagged() else {
                 self.truncate_heap(original_pages);
                 return None;
             };
             if !mmu::map_user_heap_page(self.ttbr0, index, frame) {
-                frame_allocator::free_page(frame);
+                frame_allocator::free_page_tagged(frame, generation);
                 self.truncate_heap(original_pages);
                 return None;
             }
-            self.heap_pages.push(frame);
+            self.heap_pages.push((frame, generation));
         }
 
         self.truncate_heap(target_pages);
@@ -2273,8 +2295,8 @@ impl Task {
             let mapped = mmu::unmap_user_heap_page(self.ttbr0, index)
                 .expect("tracked user heap mapping is missing");
             let tracked = self.heap_pages.pop().unwrap();
-            debug_assert_eq!(mapped, tracked);
-            frame_allocator::free_page(mapped);
+            debug_assert_eq!(mapped, tracked.0);
+            frame_allocator::free_page_tagged(mapped, tracked.1);
         }
     }
 
@@ -2305,9 +2327,14 @@ impl Task {
                 .map(|region| (region.virtual_address, region.page_count)),
         )?;
 
-        let physical_start = frame_allocator::alloc_contiguous_pages(page_count)?;
+        let (physical_start, generation) =
+            frame_allocator::alloc_contiguous_pages_tagged(page_count)?;
         if !mmu::map_user_pages_at(self.ttbr0, virtual_address, physical_start, page_count, prot) {
-            release_pages(physical_start, page_count);
+            frame_allocator::free_contiguous_pages_tagged(
+                physical_start,
+                page_count,
+                generation,
+            );
             return None;
         }
 
@@ -2315,6 +2342,7 @@ impl Task {
             virtual_address,
             page_count,
             physical_start,
+            generation,
         };
         let position = self
             .mmap_regions
@@ -2340,7 +2368,11 @@ impl Task {
         };
         let region = self.mmap_regions.remove(position);
         mmu::unmap_user_pages_at(self.ttbr0, region.virtual_address, region.page_count);
-        release_pages(region.physical_start, region.page_count);
+        frame_allocator::free_contiguous_pages_tagged(
+            region.physical_start,
+            region.page_count,
+            region.generation,
+        );
         true
     }
 
@@ -2358,9 +2390,13 @@ impl Task {
         if self.resources_released {
             return;
         }
-        release_pages(self.stack.start, TASK_STACK_PAGES);
+        kernel_stack::free(self.stack.start);
         if !self.user_stack.is_empty() {
-            release_pages(self.user_stack.start, TASK_USER_STACK_PAGES);
+            frame_allocator::free_contiguous_pages_tagged(
+                self.user_stack.start,
+                TASK_USER_STACK_PAGES,
+                self.user_stack_generation,
+            );
         }
     }
 
@@ -2372,16 +2408,25 @@ impl Task {
     ///
     /// Guarded by `resources_released`/`ttbr0`: a zombie has already run this
     /// once, and calling it again with `ttbr0 == 0` would dereference zero.
-    fn release_space(&self, dma_revokes: &[(usize, usize, mmu::RevokeResult)]) {
+    fn release_space(&mut self, dma_revokes: &[(usize, usize, mmu::RevokeResult)]) {
         if self.resources_released || self.ttbr0 == 0 {
             return;
         }
         for region in &self.mmap_regions {
             mmu::unmap_user_pages_at(self.ttbr0, region.virtual_address, region.page_count);
-            release_pages(region.physical_start, region.page_count);
+            frame_allocator::free_contiguous_pages_tagged(
+                region.physical_start,
+                region.page_count,
+                region.generation,
+            );
         }
-        mmu::destroy_task_space(self.ttbr0);
-        for &(physical, page_count) in &self.dma_pages {
+        // Heap data pages carry their own tags; the address-space teardown
+        // frees only the page tables and the private page.
+        for (page, generation) in self.heap_pages.drain(..) {
+            frame_allocator::free_page_tagged(page, generation);
+        }
+        mmu::destroy_task_space(self.ttbr0, self.private_page_generation);
+        for &(physical, page_count, generation) in &self.dma_pages {
             // Exact (physical, page_count) match: allocator ranges never
             // overlap, so a dead task's own range cannot be confused with
             // another dead task's range in the same reap pass.
@@ -2390,7 +2435,11 @@ impl Task {
                 .find(|(base, pages, _)| *base == physical && *pages == page_count);
             match record {
                 Some((_, _, result)) if result.safe_to_free => {
-                    release_pages(physical, page_count);
+                    frame_allocator::free_contiguous_pages_tagged(
+                        physical,
+                        page_count,
+                        generation,
+                    );
                 }
                 _ => {
                     DMA_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
@@ -2415,6 +2464,8 @@ impl Task {
     fn clear_resources(&mut self) {
         self.stack = MemoryRegion::new(0, 0);
         self.user_stack = MemoryRegion::new(0, 0);
+        self.user_stack_generation = 0;
+        self.private_page_generation = 0;
         self.ttbr0 = 0;
         self.user_image = None;
         self.heap_pages.clear();
@@ -2428,12 +2479,6 @@ impl Task {
         self.waiting_on = None;
         self.context = TaskContext::zero();
         self.resources_released = true;
-    }
-}
-
-fn release_pages(start: usize, page_count: usize) {
-    for index in 0..page_count {
-        frame_allocator::free_page(start + index * PAGE_SIZE);
     }
 }
 

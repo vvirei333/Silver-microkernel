@@ -196,6 +196,9 @@ pub struct LoadedImage {
     pub physical_start: usize,
     /// Number of pages in the image run.
     pub page_count: usize,
+    /// Allocation tag for the whole run; a stale release cannot free a frame
+    /// that was recycled to another owner.
+    generation: u32,
     /// Per-page permission class, index `0` is `USER_IMAGE_VA`.
     pub kinds: Vec<PageKind>,
     /// Set by the first [`LoadedImage::release`]; makes teardown idempotent so
@@ -215,9 +218,11 @@ impl LoadedImage {
         if self.released.swap(true, Ordering::AcqRel) {
             return;
         }
-        for index in 0..self.page_count {
-            frame_allocator::free_page(self.physical_start + index * PAGE_SIZE);
-        }
+        frame_allocator::free_contiguous_pages_tagged(
+            self.physical_start,
+            self.page_count,
+            self.generation,
+        );
     }
 }
 
@@ -355,7 +360,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedImage, ElfError> {
         return Err(ElfError::HoleInImage);
     }
 
-    let physical_start = frame_allocator::alloc_contiguous_pages(page_count)
+    let (physical_start, generation) = frame_allocator::alloc_contiguous_pages_tagged(page_count)
         .ok_or(ElfError::OutOfMemory)?;
 
     // Zero the whole run (BSS is the tail of `data` that `p_filesz` does not
@@ -380,6 +385,7 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedImage, ElfError> {
         upper_bound: image_end,
         physical_start,
         page_count,
+        generation,
         kinds,
         released: AtomicBool::new(false),
     })

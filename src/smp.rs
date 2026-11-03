@@ -553,22 +553,25 @@ pub fn boot_secondary_cpus() {
     }
     crate::console::write_str("SMP: powering on secondary CPUs\r\n");
     for cpu in 1..cpu_count() {
-        let Some(stack) = crate::frame_allocator::alloc_contiguous_pages(2) else {
+        let Some((stack, stack_generation)) =
+            crate::frame_allocator::alloc_contiguous_pages_tagged(2)
+        else {
             crate::console::write_str("SMP: no stack for CPU");
             crate::console::write_dec_u64(cpu as u64);
             crate::console::write_str(", leaving it offline\r\n");
             return;
         };
-        let Some(private) = crate::frame_allocator::alloc_page() else {
-            crate::frame_allocator::free_page(stack);
+        let Some((private, private_generation)) = crate::frame_allocator::alloc_page_tagged()
+        else {
+            crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: no private page for CPU");
             crate::console::write_dec_u64(cpu as u64);
             crate::console::write_str(", leaving it offline\r\n");
             return;
         };
         let Some(ttbr0) = crate::mmu::create_task_space(private, 0, None) else {
-            crate::frame_allocator::free_page(private);
-            crate::frame_allocator::free_page(stack);
+            crate::frame_allocator::free_page_tagged(private, private_generation);
+            crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: no task space for CPU");
             crate::console::write_dec_u64(cpu as u64);
             crate::console::write_str(", leaving it offline\r\n");

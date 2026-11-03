@@ -10,6 +10,11 @@ const ALL_PAGES_USED: u64 = u64::MAX;
 
 struct FrameAllocatorState {
     bitmap: [u64; BITMAP_WORDS],
+    /// One tag per frame, rewritten on every allocation. A free must present
+    /// the tag it received from that allocation; a stale free after the frame
+    /// was recycled fails instead of returning a live frame.
+    generation: [u32; MAX_PHYSICAL_PAGES],
+    next_generation: u32,
     available: MemoryRegion,
     total_pages: usize,
     free_pages: usize,
@@ -22,19 +27,22 @@ struct FrameAllocatorState {
 /// bounded by another CPU's short critical section.
 static STATE: SpinLock<FrameAllocatorState> = SpinLock::new(FrameAllocatorState {
     bitmap: [0; BITMAP_WORDS],
+    generation: [0; MAX_PHYSICAL_PAGES],
+    next_generation: 1,
     available: MemoryRegion::new(0, 0),
     total_pages: 0,
     free_pages: 0,
 });
 
-/// Release-mode counter for refused double frees. The page is already free,
-/// so returning it instead of counting could hand a live frame to a second
-/// owner; the counter keeps the event observable without corrupting state.
-static DOUBLE_FREES: AtomicUsize = AtomicUsize::new(0);
+/// Release-mode counter for refused stale/double frees. The page is already
+/// free or belongs to a newer allocation, so returning it instead of counting
+/// could hand a live frame to a second owner; the counter keeps the event
+/// observable without corrupting state.
+static STALE_FREES: AtomicUsize = AtomicUsize::new(0);
 
 #[allow(dead_code)]
 pub fn double_frees() -> usize {
-    DOUBLE_FREES.load(Ordering::Relaxed)
+    STALE_FREES.load(Ordering::Relaxed)
 }
 
 /// Initializes the allocator from page-aligned part of the available memory region.
@@ -55,6 +63,8 @@ pub fn init(available: MemoryRegion) -> usize {
 
     let mut state = STATE.lock();
     state.bitmap.fill(ALL_PAGES_USED);
+    state.generation.fill(0);
+    state.next_generation = 1;
     state.available = MemoryRegion::new(start, usable_end);
     state.total_pages = total_pages;
     state.free_pages = total_pages;
@@ -101,8 +111,8 @@ pub fn frame_in_use(address: usize) -> bool {
     state.bitmap[page_index / BITS_PER_WORD] & (1_u64 << (page_index % BITS_PER_WORD)) != 0
 }
 
-/// Allocates one physical page using first-fit search.
-pub fn alloc_page() -> Option<usize> {
+/// Allocates one physical page and returns `(address, generation)`.
+pub fn alloc_page_tagged() -> Option<(usize, u32)> {
     let mut state = STATE.lock();
     let word_count = state.total_pages.div_ceil(BITS_PER_WORD);
 
@@ -118,9 +128,11 @@ pub fn alloc_page() -> Option<usize> {
             return None;
         }
 
+        let tag = next_generation(&mut state);
         mark_used(&mut state, page_index);
+        state.generation[page_index] = tag;
         state.free_pages -= 1;
-        return Some(state.available.start + page_index * PAGE_SIZE);
+        return Some((state.available.start + page_index * PAGE_SIZE, tag));
     }
 
     None
@@ -134,9 +146,9 @@ pub fn alloc_page() -> Option<usize> {
 /// run is reported as `None` instead of being spread across the bitmap.
 ///
 /// The state is borrowed exactly once per call. The helpers used below take a
-/// `&mut FrameAllocatorState` instead of going back through `alloc_page` or
-/// `free_page`, which would borrow the same state a second time.
-pub fn alloc_contiguous_pages(page_count: usize) -> Option<usize> {
+/// `&mut FrameAllocatorState` instead of going back through the public
+/// allocation/free entry points, which would borrow the same state twice.
+pub fn alloc_contiguous_pages_tagged(page_count: usize) -> Option<(usize, u32)> {
     if page_count == 0 || page_count > MAX_PHYSICAL_PAGES {
         return None;
     }
@@ -164,74 +176,247 @@ pub fn alloc_contiguous_pages(page_count: usize) -> Option<usize> {
         run_length += 1;
 
         if run_length == page_count {
+            let tag = next_generation(&mut state);
             for index in run_start..run_start + page_count {
                 mark_used(&mut state, index);
+                state.generation[index] = tag;
             }
             state.free_pages -= page_count;
-            return Some(state.available.start + run_start * PAGE_SIZE);
+            return Some((state.available.start + run_start * PAGE_SIZE, tag));
         }
     }
 
     None
 }
 
-/// Returns a previously allocated page to the allocator.
+/// Contiguous allocation whose tag is discarded. Only for runs that are never
+/// freed (the kernel heap and the permanent stack arena).
+pub fn alloc_contiguous_pages(page_count: usize) -> Option<usize> {
+    alloc_contiguous_pages_tagged(page_count).map(|(address, _)| address)
+}
+
+/// Allocates a run of `page_count` free pages whose physical base is aligned
+/// to `alignment_pages` pages.
 ///
-/// Invalid and unaligned addresses are ignored; double-free is checked in debug builds.
-pub fn free_page(address: usize) {
+/// The kernel stack arena needs one 2 MiB-aligned block so it can replace a
+/// single TTBR1 block descriptor with a 4 KiB table. Scanning the bitmap
+/// directly keeps the ordinary [`alloc_contiguous_pages`] fast path
+/// unchanged.
+pub fn alloc_contiguous_pages_aligned_tagged(
+    page_count: usize,
+    alignment_pages: usize,
+) -> Option<(usize, u32)> {
+    if page_count == 0
+        || alignment_pages == 0
+        || !alignment_pages.is_power_of_two()
+        || page_count > MAX_PHYSICAL_PAGES
+    {
+        return None;
+    }
+
+    let mut state = STATE.lock();
+    if page_count > state.free_pages {
+        return None;
+    }
+
+    let alignment_bytes = alignment_pages * PAGE_SIZE;
+    let last_start = state.total_pages.checked_sub(page_count)?;
+    for run_start in 0..=last_start {
+        let address = state.available.start + run_start * PAGE_SIZE;
+        if address % alignment_bytes != 0 {
+            continue;
+        }
+
+        let mut free = true;
+        for index in run_start..run_start + page_count {
+            let word = state.bitmap[index / BITS_PER_WORD];
+            if word & (1_u64 << (index % BITS_PER_WORD)) != 0 {
+                free = false;
+                break;
+            }
+        }
+        if !free {
+            continue;
+        }
+
+        let tag = next_generation(&mut state);
+        for index in run_start..run_start + page_count {
+            mark_used(&mut state, index);
+            state.generation[index] = tag;
+        }
+        state.free_pages -= page_count;
+        return Some((address, tag));
+    }
+
+    None
+}
+
+/// Returns a previously allocated page to the allocator, but only when
+/// `generation` matches the tag handed out by the allocation that owns it.
+///
+/// A stale free after the frame was recycled fails without touching the
+/// bitmap: the page may already belong to another owner. `false` is a
+/// kernel bug and must be treated as such by the caller.
+pub fn free_page_tagged(address: usize, generation: u32) -> bool {
+    free_page_tagged_inner(address, generation, true)
+}
+
+/// `diagnose = false` is used only by the boot self-test for its intentional
+/// stale free; production callers always take the diagnostic path.
+fn free_page_tagged_inner(address: usize, generation: u32, diagnose: bool) -> bool {
     let mut state = STATE.lock();
     if address % PAGE_SIZE != 0 || !state.available.contains(address) {
-        return;
+        if diagnose {
+            STALE_FREES.fetch_add(1, Ordering::Relaxed);
+            debug_assert!(false, "free of an invalid physical page");
+        }
+        return false;
     }
 
     let page_index = (address - state.available.start) / PAGE_SIZE;
     if page_index >= state.total_pages {
-        return;
+        if diagnose {
+            STALE_FREES.fetch_add(1, Ordering::Relaxed);
+            debug_assert!(false, "free outside the managed page range");
+        }
+        return false;
     }
 
     let word_index = page_index / BITS_PER_WORD;
     let bit_index = page_index % BITS_PER_WORD;
-    let Some(cleared) =
-        silver_microkernel::clear_frame_bit(state.bitmap[word_index], bit_index as u32)
-    else {
-        // Already free. Refuse to touch the bitmap; in release builds the
-        // counter is the only safe diagnostic (the page may even have been
-        // reallocated to another owner, which this allocator cannot detect
-        // without per-frame generation metadata).
-        DOUBLE_FREES.fetch_add(1, Ordering::Relaxed);
-        debug_assert!(false, "double free of a physical page");
-        return;
-    };
+    let mask = 1_u64 << bit_index;
+    if state.bitmap[word_index] & mask == 0 || state.generation[page_index] != generation {
+        // Already free, or reallocated since the caller's tag was issued.
+        if diagnose {
+            STALE_FREES.fetch_add(1, Ordering::Relaxed);
+            debug_assert!(false, "stale or double free of a physical page");
+        }
+        return false;
+    }
 
-    state.bitmap[word_index] = cleared;
+    state.bitmap[word_index] &= !mask;
+    state.generation[page_index] = 0;
     state.free_pages += 1;
+    true
 }
 
-/// Verifies allocation, contiguity and reuse without changing the final state.
-pub fn run_self_test() -> bool {
-    let Some(first) = alloc_page() else {
+/// Releases a contiguous run only when every page still carries the tag from
+/// the owning allocation. Checks the whole run before modifying anything, so
+/// a partially stale run is left entirely untouched.
+pub fn free_contiguous_pages_tagged(start: usize, page_count: usize, generation: u32) -> bool {
+    if page_count == 0 {
+        STALE_FREES.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(false, "free of an empty page run");
+        return false;
+    }
+    let mut state = STATE.lock();
+    if start % PAGE_SIZE != 0 || !state.available.contains(start) {
+        STALE_FREES.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(false, "free of an invalid page run");
+        return false;
+    }
+    let first = (start - state.available.start) / PAGE_SIZE;
+    let Some(last) = first.checked_add(page_count) else {
+        STALE_FREES.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(false, "free of an overflowing page run");
         return false;
     };
-    let Some(second) = alloc_page() else {
-        free_page(first);
+    if last > state.total_pages {
+        STALE_FREES.fetch_add(1, Ordering::Relaxed);
+        debug_assert!(false, "free run outside the managed page range");
+        return false;
+    }
+
+    for page_index in first..last {
+        let mask = 1_u64 << (page_index % BITS_PER_WORD);
+        if state.bitmap[page_index / BITS_PER_WORD] & mask == 0
+            || state.generation[page_index] != generation
+        {
+            STALE_FREES.fetch_add(page_count, Ordering::Relaxed);
+            debug_assert!(false, "stale or double free of a page run");
+            return false;
+        }
+    }
+
+    for page_index in first..last {
+        state.bitmap[page_index / BITS_PER_WORD] &= !(1_u64 << (page_index % BITS_PER_WORD));
+        state.generation[page_index] = 0;
+    }
+    state.free_pages += page_count;
+    true
+}
+
+/// Current tag for a live frame, for diagnostics and the allocator self-test.
+pub fn frame_generation(address: usize) -> Option<u32> {
+    let state = STATE.lock();
+    if address % PAGE_SIZE != 0 || !state.available.contains(address) {
+        return None;
+    }
+    let page_index = (address - state.available.start) / PAGE_SIZE;
+    if page_index >= state.total_pages
+        || state.bitmap[page_index / BITS_PER_WORD] & (1_u64 << (page_index % BITS_PER_WORD)) == 0
+    {
+        return None;
+    }
+    Some(state.generation[page_index])
+}
+
+/// Verifies allocation, contiguity, reuse and stale-free refusal without
+/// changing the final state.
+pub fn run_self_test() -> bool {
+    let Some((first, first_tag)) = alloc_page_tagged() else {
+        return false;
+    };
+    let Some((second, second_tag)) = alloc_page_tagged() else {
+        free_page_tagged(first, first_tag);
         return false;
     };
 
     let sequential = second == first + PAGE_SIZE;
 
-    free_page(first);
-    let Some(reused) = alloc_page() else {
-        free_page(second);
+    if !free_page_tagged(first, first_tag) {
+        free_page_tagged(second, second_tag);
+        return false;
+    }
+    let Some((reused, reused_tag)) = alloc_page_tagged() else {
+        free_page_tagged(second, second_tag);
         return false;
     };
     let reuse_ok = reused == first;
 
-    if reused != second {
-        free_page(second);
+    // The old tag belongs to a frame that may now be reused. It must be
+    // refused and must not disturb the new owner.
+    let stale_refused = !free_page_tagged_inner(first, first_tag, false);
+    if !stale_refused {
+        free_page_tagged(reused, reused_tag);
+        free_page_tagged(second, second_tag);
+        return false;
     }
-    free_page(reused);
 
-    sequential && reuse_ok && run_contiguous_self_test()
+    if reused != second {
+        free_page_tagged(second, second_tag);
+    }
+    free_page_tagged(reused, reused_tag);
+
+    sequential && reuse_ok && stale_refused && run_contiguous_self_test() && run_aligned_self_test()
+}
+
+/// Allocates a short run with a 4-page alignment, checks the base, and
+/// releases it. This is the same search the kernel stack arena uses.
+fn run_aligned_self_test() -> bool {
+    const PROBE_PAGES: usize = 4;
+    const ALIGNMENT_PAGES: usize = 4;
+
+    let Some((first, generation)) =
+        alloc_contiguous_pages_aligned_tagged(PROBE_PAGES, ALIGNMENT_PAGES)
+    else {
+        return false;
+    };
+    if first % (ALIGNMENT_PAGES * PAGE_SIZE) != 0 {
+        free_contiguous_pages_tagged(first, PROBE_PAGES, generation);
+        return false;
+    }
+    free_contiguous_pages_tagged(first, PROBE_PAGES, generation)
 }
 
 /// Allocates the same short run twice. The first run is released before the
@@ -240,21 +425,27 @@ pub fn run_self_test() -> bool {
 fn run_contiguous_self_test() -> bool {
     const PROBE_PAGES: usize = 3;
 
-    let Some(first) = alloc_contiguous_pages(PROBE_PAGES) else {
+    let Some((first, first_tag)) = alloc_contiguous_pages_tagged(PROBE_PAGES) else {
         return false;
     };
-    for index in 0..PROBE_PAGES {
-        free_page(first + index * PAGE_SIZE);
+    if !free_contiguous_pages_tagged(first, PROBE_PAGES, first_tag) {
+        return false;
     }
 
-    let Some(second) = alloc_contiguous_pages(PROBE_PAGES) else {
+    let Some((second, second_tag)) = alloc_contiguous_pages_tagged(PROBE_PAGES) else {
         return false;
     };
-    for index in 0..PROBE_PAGES {
-        free_page(second + index * PAGE_SIZE);
-    }
+    free_contiguous_pages_tagged(second, PROBE_PAGES, second_tag)
+        && first % PAGE_SIZE == 0
+        && first == second
+}
 
-    first % PAGE_SIZE == 0 && first == second
+fn next_generation(state: &mut FrameAllocatorState) -> u32 {
+    state.next_generation = state.next_generation.wrapping_add(1);
+    if state.next_generation == 0 {
+        state.next_generation = 1;
+    }
+    state.next_generation
 }
 
 fn mark_used(state: &mut FrameAllocatorState, page_index: usize) {

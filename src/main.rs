@@ -47,6 +47,8 @@ mod interrupts;
 #[cfg(not(feature = "std"))]
 mod ipc;
 #[cfg(not(feature = "std"))]
+mod kernel_stack;
+#[cfg(not(feature = "std"))]
 mod memory;
 #[cfg(not(feature = "std"))]
 mod mmu;
@@ -1328,6 +1330,15 @@ pub extern "C" fn kernel_main() -> ! {
         boot_metrics::log_milestone("Heap init");
     }
     ram_log::log("HEAP OK");
+    ram_log::fb_progress();
+
+    // One 2 MiB-aligned arena, split into 4 KiB pages with one unmapped
+    // guard page below every task stack. A failure here would make task
+    // spawns silently unsafe, so it stops the boot.
+    if !kernel_stack::init() || !kernel_stack::run_self_test() {
+        exceptions::silver_handle_exception(6, 0, 0, 0);
+    }
+    ram_log::log("KERNEL STACK OK");
     ram_log::fb_progress();
 
     drop(value);

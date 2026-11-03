@@ -198,7 +198,7 @@ build still never copies.
 3. **Core bring-up** (`kernel_main`)
    - initialise the MMU and the platform console;
    - print the hand-over evidence and halt if the memory map is unproven;
-   - init the frame allocator and the kernel heap;
+   - init the frame allocator, the guarded kernel-stack arena and the kernel heap;
    - init GICv3 and the ARM generic timer;
    - init the VFS and seed the small bootstrap files.
 
@@ -244,6 +244,14 @@ Configured (documented assumptions, not hardware facts):
 - Each user address space leaves `USER_STACK_GUARD_VA` unmapped and starts the
   stack one page above it; the anonymous-mmap window ends below the guard, so a
   downward stack overflow faults instead of reaching mapped user memory.
+- Task kernel stacks come from one permanent 2 MiB arena split into 4 KiB
+  pages. Every slot has an unmapped guard page below its four stack pages;
+  freeing a slot unmaps the stack pages again, so a stale kernel stack pointer
+  faults instead of touching a recycled frame.
+- Every frame allocation carries a generation tag. Teardown paths free with
+  the tag they received; a stale free after the frame was reallocated is
+  refused instead of releasing another owner's page. Page-table frames keep
+  their tags in the page-table registry.
 - Scheduler, IPC, syscall and DMA success paths do not print. They previously
   emitted `R1..R4`, `B1/B2`, `SEND/M1..M5`, `SYS`, `S1/S2` and DMA address
   lines on every call, including with the kernel lock held.
