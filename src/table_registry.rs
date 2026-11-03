@@ -24,9 +24,10 @@ use alloc::vec::Vec;
 
 /// A registered page-table frame plus the generation of its allocation.
 ///
-/// Only [`TableRegistry::register`] produces these. Keeping the generation
-/// inside the token is what makes a stale owner distinguishable from the
-/// current one after the frame has been recycled.
+/// Tokens are issued by [`TableRegistry::register`]. There is deliberately no
+/// public constructor: constructing a token manually does not establish
+/// ownership, and only the registry can produce the exact `(frame, generation)`
+/// pair that [`TableRegistry::retire`] accepts.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TableToken {
     frame: usize,
@@ -34,7 +35,7 @@ pub struct TableToken {
 }
 
 impl TableToken {
-    pub const fn new(frame: usize, generation: u32) -> Self {
+    const fn new(frame: usize, generation: u32) -> Self {
         Self { frame, generation }
     }
 
@@ -46,8 +47,9 @@ impl TableToken {
         self.generation
     }
 
-    /// A placeholder that can never match a registered record: frame 0 is
-    /// never a table, and live allocations never carry generation 0.
+    /// A placeholder that can never match a registered record: `register`
+    /// refuses frame 0 and generation 0, and a live allocation never carries
+    /// generation 0.
     pub const fn empty() -> Self {
         Self::new(0, 0)
     }
@@ -76,6 +78,9 @@ pub enum SpaceRetire {
     /// The record exists but is not registered as a space root (its owner is
     /// another space), so draining it would free foreign tables.
     NotSpaceRoot,
+    /// The result vector could not be reserved before any record was removed;
+    /// the registry is unchanged.
+    OutOfMemory,
 }
 
 struct TableRecord {
@@ -104,14 +109,21 @@ impl TableRegistry {
     }
 
     /// Registers a freshly allocated table frame. Returns `None` for a
-    /// duplicate frame or when the record vector cannot grow; in both cases
-    /// the registry is untouched and the caller still owns the raw allocation.
+    /// duplicate frame, a frame/generation that cannot belong to a live page
+    /// table (frame 0 or generation 0), or when the record vector cannot grow.
+    /// In every refusal case the registry is untouched and the caller still
+    /// owns the raw allocation.
     pub fn register(
         &mut self,
         frame: usize,
         generation: u32,
         owner: usize,
     ) -> Option<TableToken> {
+        // Frame 0 and generation 0 are reserved sentinels: the allocator never
+        // issues them, and `TableToken::empty()` relies on that.
+        if frame == 0 || generation == 0 {
+            return None;
+        }
         if self.records.iter().any(|record| record.token.frame == frame) {
             return None;
         }
@@ -125,9 +137,10 @@ impl TableRegistry {
         self.records.iter().any(|record| record.token.frame == frame)
     }
 
-    /// Current token for `frame`, for diagnostics only. A caller that needs
-    /// stale-token protection must keep the token it received at registration
-    /// instead of asking for the current one.
+    /// Current token for `frame`, for tests only. Production code must keep
+    /// the token it received at registration: asking for the current one
+    /// would defeat the stale-token check.
+    #[cfg(test)]
     pub fn token(&self, frame: usize) -> Option<TableToken> {
         self.records
             .iter()
@@ -176,9 +189,21 @@ impl TableRegistry {
 
     /// Drains every record owned by the space whose root token is `root`.
     ///
-    /// Fails closed: a missing root, a stale root token, or a root record that
-    /// is not itself a space root leaves the registry completely untouched.
+    /// Fails closed: a missing root, a stale root token, a root record that is
+    /// not itself a space root, or a failed result allocation leaves the
+    /// registry completely untouched.
     pub fn retire_space(&mut self, root: TableToken) -> SpaceRetire {
+        self.retire_space_with(root, |retired, count| {
+            retired.try_reserve(count).is_ok()
+        })
+    }
+
+    /// `retire_space` with the result reservation injected, so the refusal
+    /// path can be exercised on the host without a real allocator failure.
+    fn retire_space_with<F>(&mut self, root: TableToken, reserve: F) -> SpaceRetire
+    where
+        F: FnOnce(&mut Vec<TableToken>, usize) -> bool,
+    {
         let Some(position) = self
             .records
             .iter()
@@ -193,7 +218,20 @@ impl TableRegistry {
             return SpaceRetire::NotSpaceRoot;
         }
 
+        // The root record has `owner == root.frame`, so it is part of this
+        // count; no separate "root will be collected" check is needed.
+        let count = self
+            .records
+            .iter()
+            .filter(|record| record.owner == root.frame)
+            .count();
         let mut retired = Vec::new();
+        if !reserve(&mut retired, count) {
+            return SpaceRetire::OutOfMemory;
+        }
+
+        // Every fallible step is done: this loop only moves already-reserved
+        // tokens out of the registry.
         let mut index = 0;
         while index < self.records.len() {
             if self.records[index].owner == root.frame {
@@ -203,13 +241,8 @@ impl TableRegistry {
                 index += 1;
             }
         }
-        // The root record itself is registered with `owner == frame`, so the
-        // loop above always collects it; guard the invariant anyway.
-        if retired.iter().any(|token| *token == root) {
-            SpaceRetire::Retired(retired)
-        } else {
-            SpaceRetire::NotSpaceRoot
-        }
+        debug_assert!(retired.iter().any(|token| *token == root));
+        SpaceRetire::Retired(retired)
     }
 }
 
@@ -342,5 +375,36 @@ mod tests {
         let child = registry.token(ROOT).expect("token");
         assert_eq!(registry.retire_space(child), SpaceRetire::NotSpaceRoot);
         assert!(registry.contains(ROOT));
+    }
+
+    #[test]
+    fn register_rejects_zero_frame_and_zero_generation() {
+        let mut registry = TableRegistry::new();
+        assert_eq!(registry.register(0, 5, ROOT), None);
+        assert_eq!(registry.register(FRAME, 0, ROOT), None);
+        assert!(registry.is_empty());
+    }
+
+    #[test]
+    fn space_retire_reservation_failure_changes_nothing() {
+        let mut registry = TableRegistry::new();
+        let root = registry.register(ROOT, 1, ROOT).expect("root");
+        registry.register(FRAME, 2, ROOT).expect("child");
+        registry.register(OTHER_ROOT, 3, OTHER_ROOT).expect("foreign");
+
+        assert_eq!(
+            registry.retire_space_with(root, |_, _| false),
+            SpaceRetire::OutOfMemory
+        );
+        // No record may have been removed before the reservation succeeded.
+        assert_eq!(registry.len(), 3);
+        assert!(registry.contains(ROOT));
+        assert!(registry.contains(FRAME));
+        assert!(registry.contains(OTHER_ROOT));
+
+        // The real path still drains exactly this space.
+        assert!(matches!(registry.retire_space(root), SpaceRetire::Retired(_)));
+        assert_eq!(registry.len(), 1);
+        assert!(registry.contains(OTHER_ROOT));
     }
 }

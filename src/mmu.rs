@@ -79,7 +79,9 @@ fn page_table_register(frame: usize, generation: u32, owner: usize) -> Option<Ta
     match frames.register(frame, generation, owner) {
         Some(token) => Some(token),
         None => {
-            crate::console::write_str("PAGE TABLE REGISTRY: duplicate frame or out of memory, frame 0x");
+            crate::console::write_str(
+                "PAGE TABLE REGISTRY: duplicate frame, invalid token, or out of memory; frame 0x",
+            );
             crate::console::write_hex_u64(frame as u64);
             crate::console::write_str(" not registered\r\n");
             None
@@ -1311,6 +1313,12 @@ fn destroy_task_space_inner(
                 crate::console::write_str("MMU: destroy refused, frame 0x");
                 crate::console::write_hex_u64(space.frame() as u64);
                 crate::console::write_str(" is not a space root - leaked\r\n");
+            }
+            return false;
+        }
+        SpaceRetire::OutOfMemory => {
+            if diagnose {
+                crate::console::write_str("MMU: destroy refused, registry out of memory - leaked\r\n");
             }
             return false;
         }
