@@ -42,6 +42,28 @@ pub extern "C" fn silver_handle_task_fault(esr: u64, elr: u64, far: u64) -> ! {
 }
 #[no_mangle]
 pub extern "C" fn silver_handle_exception(kind: u64, esr: u64, elr: u64, far: u64) -> ! {
+    #[cfg(feature = "fog-paint")]
+    {
+        // Final colour identifies the failure class. For kind 8 (`unknown
+        // IRQ`) `esr` carries the INTID, so the common timer/UART IDs get
+        // distinct colours; anything else is white.
+        let colour = match kind {
+            0 => 0xFFFF_0000, // red: synchronous EL1 fault
+            4 => 0xFF00_FF00, // green: boot/panic hand-off
+            5 => 0xFF00_00FF, // blue
+            6 => 0xFFFF_FF00, // yellow: invalid memory map / frames
+            7 => 0xFFFF_00FF, // magenta: heap failure
+            8 => match esr {
+                18 => 0xFF00_FF00,  // green: PPI 2 / INTID 18
+                30 => 0xFF00_00FF,  // blue: PPI 14 / INTID 30
+                33 => 0xFFFF_FF00,  // yellow: QEMU PL011
+                363 => 0xFFFF_00FF, // magenta: khaje GENI UART
+                _ => 0xFFFF_FFFF,   // white: other INTID
+            },
+            _ => 0xFFFF_FFFF,
+        };
+        crate::fog::paint_band(colour);
+    }
     // EL1 / kernel path: an exception taken from EL1 (or a boot/allocator/IRQ
     // failure reported through kind 4..8) is a kernel bug that cannot be
     // survived — resuming risks corrupting kernel state. Dump the registers,

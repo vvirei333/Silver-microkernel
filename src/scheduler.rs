@@ -1208,6 +1208,8 @@ pub fn munmap(address: usize, length: usize) -> bool {
 }
 
 pub fn start() -> ! {
+    #[cfg(feature = "fog-paint")]
+    crate::fog::paint(0xFFFF_0000); // red: scheduler::start entered
     let saved_daif = interrupts::save_and_disable_irq();
     let manager = scheduler_manager().unwrap();
     let current_index = smp::current_index();
@@ -1221,6 +1223,8 @@ pub fn start() -> ! {
     // drops it again right before `eret`-ing into the first user task, so
     // the acquire/release pair stays balanced.
     smp::bkl_acquire();
+    #[cfg(feature = "fog-paint")]
+    crate::fog::paint(0xFFFF_8000); // orange: BKL acquired
     first_task.state = TaskState::Running;
     first_task.running_on = Some(0);
     trace_switch(
@@ -1233,6 +1237,10 @@ pub fn start() -> ! {
     let boot_context = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CONTEXT) };
 
     mmu::switch_address_space(first_task.ttbr0);
+    #[cfg(feature = "fog-paint")]
+    crate::fog::paint(0xFFFF_FF00); // yellow: TTBR0 switched
+    #[cfg(feature = "fog-paint")]
+    crate::fog::paint(0xFF00_FFFF); // cyan: about to context-switch
 
     unsafe {
         silver_context_switch(boot_context, first_context);
@@ -2497,6 +2505,27 @@ fn scheduler_manager() -> Option<&'static mut TaskManager> {
 }
 
 extern "C" fn idle_task() -> ! {
+    #[cfg(feature = "fog-paint")]
+    unsafe {
+        // No stack, no Rust call: paint brown as the very first idle
+        // instruction. If SP from the context is bad, this still tells us
+        // that the context switch reached the idle entry point.
+        core::arch::asm!(
+            // MMU is on here: use the high-half alias, not the physical
+            // address. `phys_to_virt(0x5C00_0000)` is 0xFFFF_0000_5C00_0000.
+            "mov x9, #0x5C000000",
+            "movk x9, #0xFFFF, lsl #48",
+            "mov x10, #0x5C800000",
+            "movk x10, #0xFFFF, lsl #48",
+            "mov w11, #0x4000",
+            "movk w11, #0x8040, lsl #16",
+            "1:",
+            "str w11, [x9], #4",
+            "cmp x9, x10",
+            "b.lo 1b",
+            options(nostack),
+        );
+    }
     // First dispatch on a CPU enters here with the kernel lock held by the
     // dispatching `schedule` (user-mode bootstrap drops it in asm; kernel
     // entries do it here). Idle never holds the lock again: it sleeps in
@@ -2504,7 +2533,26 @@ extern "C" fn idle_task() -> ! {
     if smp::bkl_depth() > 0 {
         smp::bkl_release();
     }
+    #[cfg(feature = "fog-paint")]
+    crate::fog::paint(0xFF00_FF00); // green: idle task entered
     interrupts::enable_irq();
+    #[cfg(feature = "fog-paint")]
+    crate::fog::paint(0xFF00_00FF); // blue: idle waiting for an IRQ
+    #[cfg(feature = "fog-ui")]
+    {
+        // Live status panel. IRQs are enabled above, so the 100 Hz tick keeps
+        // preempting this loop and the scheduler keeps running underneath.
+        crate::fog_ui::run()
+    }
+    #[cfg(all(not(feature = "fog-ui"), feature = "fog-diag"))]
+    {
+        // "Immediately before the idle wait": IRQs unmasked, timer armed,
+        // scheduler has not dispatched anything yet. The paged display then
+        // runs instead of `WFI` so the operator can photograph every page.
+        crate::gic_diag::capture(2);
+        crate::gic_diag::run_display()
+    }
+    #[cfg(all(not(feature = "fog-ui"), not(feature = "fog-diag")))]
     loop {
         interrupts::wait_for_irq();
     }

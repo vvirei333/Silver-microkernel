@@ -28,6 +28,10 @@ mod exceptions;
 mod fdt;
 #[cfg(not(feature = "std"))]
 mod fog;
+#[cfg(all(not(feature = "std"), feature = "fog-diag"))]
+mod gic_diag;
+#[cfg(all(not(feature = "std"), feature = "fog-ui"))]
+mod fog_ui;
 mod fog_validate;
 #[cfg(not(feature = "std"))]
 mod frame_allocator;
@@ -1153,29 +1157,45 @@ pub extern "C" fn kernel_main() -> ! {
     // dispatches to gicv3, and the timer PPI is selected per platform (INTID
     // 30 on SM8650, 18 on SM6225/khaje).
     gic::init();
+    #[cfg(feature = "fog-diag")]
+    crate::gic_diag::capture(0); // before the timer is armed
     timer::init();
+    #[cfg(feature = "fog-diag")]
+    crate::gic_diag::capture(1); // after the timer is armed
     // BISECT: isolated timer test — unmask IRQs in kernel context, wait for
     // ticks only when a redistributor was confirmed. Without one, spinning
     // for an interrupt that cannot be delivered would just hide the failure.
-    if timer::available() {
-        let saved = interrupts::save_and_disable_irq();
-        interrupts::enable_irq();
-        let mut spin: u32 = 0;
-        while timer::ticks() < 30 && spin < 800_000_000 {
-            spin += 1;
-            core::hint::spin_loop();
+    #[cfg(any(not(feature = "fog"), feature = "fog-timer-test"))]
+    {
+        #[cfg(feature = "fog-paint")]
+        fog::paint(0xFFFF_FF80); // pale yellow: entering the timer test
+        if timer::available() {
+            let saved = interrupts::save_and_disable_irq();
+            interrupts::enable_irq();
+            let mut spin: u32 = 0;
+            while timer::ticks() < 30 && spin < 800_000_000 {
+                spin += 1;
+                core::hint::spin_loop();
+            }
+            interrupts::restore_irq(saved);
+            console::write_str("TIMER TEST: ticks=");
+            console::write_dec_u64(timer::ticks());
+            console::write_str(" spins=");
+            console::write_dec_u64(spin as u64);
+            console::write_str("\r\n");
+        } else {
+            console::write_str("TIMER TEST: SKIP (no confirmed GIC redistributor)\r\n");
         }
-        interrupts::restore_irq(saved);
-        console::write_str("TIMER TEST: ticks=");
-        console::write_dec_u64(timer::ticks());
-        console::write_str(" spins=");
-        console::write_dec_u64(spin as u64);
-        console::write_str("\r\n");
-    } else {
-        console::write_str("TIMER TEST: SKIP (no confirmed GIC redistributor)\r\n");
+    }
+    #[cfg(all(feature = "fog", not(feature = "fog-timer-test")))]
+    {
+        // The first hardware boot must not deliver a timer IRQ before
+        // scheduler::init_fog(): gicv3::handle_irq calls schedule() on every
+        // tick, and the scheduler state is not ready yet.
+        console::write_str("TIMER TEST: SKIP (fog hardware default)\r\n");
     }
     #[cfg(feature = "fog-paint")]
-    fog::paint(0xFFFF_8000); // orange: GIC/timer path completed
+    fog::paint(0xFF00_FF80); // spring green: timer test finished/skipped
     ram_log::log("GICv3+TIMER OK");
     ram_log::fb_progress();
     vfs::init();

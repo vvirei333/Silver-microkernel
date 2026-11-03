@@ -122,6 +122,31 @@ pub struct GicInfo {
     pub stride: u64,
 }
 
+/// Raw device-tree cells of one node property, captured for diagnostics.
+///
+/// The bring-up must not assume that the timer INTID or the GIC bases are the
+/// ones the vendor DTS suggests: this type keeps the exact big-endian cells so
+/// they can be displayed and compared with the parsed values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawFacts {
+    pub found: bool,
+    /// Number of cells stored (the property may be longer than `cells`).
+    pub len: usize,
+    pub cells: [u32; RAW_CELLS],
+}
+
+impl Default for RawFacts {
+    fn default() -> Self {
+        Self {
+            found: false,
+            len: 0,
+            cells: [0; RAW_CELLS],
+        }
+    }
+}
+
+pub const RAW_CELLS: usize = 12;
+
 /// A borrowed view of one validated DTB blob.
 pub struct Fdt<'a> {
     data: &'a [u8],
@@ -335,6 +360,21 @@ impl<'a> Fdt<'a> {
         let mut visitor = TimerFinder::default();
         self.walk(&mut visitor)?;
         visitor.irq
+    }
+
+    /// Raw `interrupts` cells of the `arm,armv8-timer` node, in tree order.
+    /// Display-only: the parser above remains the single source of truth.
+    pub fn timer_raw(&self) -> RawFacts {
+        let mut visitor = TimerRawFinder::default();
+        let _ = self.walk(&mut visitor);
+        visitor.facts
+    }
+
+    /// Raw `reg` cells of the GICv3 node, in tree order. Display-only.
+    pub fn gic_raw(&self) -> RawFacts {
+        let mut visitor = GicRawFinder::default();
+        let _ = self.walk(&mut visitor);
+        visitor.facts
     }
 
     /// Resolves a `/chosen/stdout-path` value (with optional `:options`
@@ -847,6 +887,86 @@ impl<'a> Visitor<'a> for TimerFinder {
                             }
                         }
                     }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, _path: &str) {}
+}
+
+#[derive(Default)]
+struct TimerRawFinder {
+    current_timer: bool,
+    have_interrupts: bool,
+    facts: RawFacts,
+}
+
+impl<'a> Visitor<'a> for TimerRawFinder {
+    fn begin(&mut self, _path: &str, _name: &str) {
+        self.current_timer = false;
+    }
+
+    fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        match name {
+            "compatible" => {
+                let mut rest = value;
+                while let Some(text) = next_string(&mut rest) {
+                    if text == "arm,armv8-timer" {
+                        self.current_timer = true;
+                        self.facts.found = true;
+                    }
+                }
+            }
+            "interrupts" if self.current_timer && !self.have_interrupts => {
+                self.have_interrupts = true;
+                let cells = core::cmp::min(value.len() / 4, RAW_CELLS);
+                self.facts.len = cells;
+                let mut index = 0;
+                while index < cells {
+                    self.facts.cells[index] = read_be32(value, index * 4).unwrap_or(0);
+                    index += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, _path: &str) {}
+}
+
+#[derive(Default)]
+struct GicRawFinder {
+    current_gic: bool,
+    have_reg: bool,
+    facts: RawFacts,
+}
+
+impl<'a> Visitor<'a> for GicRawFinder {
+    fn begin(&mut self, _path: &str, _name: &str) {
+        self.current_gic = false;
+    }
+
+    fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        match name {
+            "compatible" => {
+                let mut rest = value;
+                while let Some(text) = next_string(&mut rest) {
+                    if text == "arm,gic-v3" {
+                        self.current_gic = true;
+                        self.facts.found = true;
+                    }
+                }
+            }
+            "reg" if self.current_gic && !self.have_reg => {
+                self.have_reg = true;
+                let cells = core::cmp::min(value.len() / 4, RAW_CELLS);
+                self.facts.len = cells;
+                let mut index = 0;
+                while index < cells {
+                    self.facts.cells[index] = read_be32(value, index * 4).unwrap_or(0);
+                    index += 1;
                 }
             }
             _ => {}

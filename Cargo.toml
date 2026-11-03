@@ -19,7 +19,19 @@ fog = []
 fog-reloc = ["fog"]
 # Debug-only visual evidence on the cont_splash framebuffer. Not part of the
 # normal fog build: it assumes the Rain/Fog splash buffer at 0x5C00_0000.
-fog-paint = ["fog"]
+fog-paint = ["fog", "no_std"]
+# Read-only framebuffer register dump for the GICv3 / Generic Timer
+# bring-up. It reads architectural state and paints it on the cont_splash
+# buffer; it never writes a GIC, timer or security register.
+fog-diag = ["fog", "fog-paint"]
+# Live framebuffer status panel: proves GICv3, the Generic Timer, the
+# scheduler and the Howl task are running on a UART-less unit. Presentation
+# only; it reads state and never touches a device register.
+fog-ui = ["fog", "fog-paint"]
+# Opt-in bisect test: unmask IRQs and wait for 30 timer ticks before the
+# scheduler is initialised. Useful on QEMU; on the first hardware boot it can
+# deliver a timer IRQ into a not-yet-initialised scheduler, so fog defaults off.
+fog-timer-test = ["fog"]
 
 [dependencies]
 linked_list_allocator = "0.10.6"
