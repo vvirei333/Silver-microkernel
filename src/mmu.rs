@@ -7,11 +7,14 @@
 //! explicitly authorized Device-nGnRnE MMIO and Normal Non-Cacheable DMA.
 //! No kernel image or kernel data is shared with EL0.
 
-use alloc::vec::Vec;
+use silver_microkernel::table_registry::{
+    RetireResult, SpaceRetire, TableRegistry, TableToken,
+};
 
 use crate::{
     frame_allocator,
     memory::{phys_to_virt, virt_to_phys, DRAM_BASE, DRAM_END},
+    smp::SpinLock,
 };
 
 const ENTRIES: usize = 512;
@@ -31,107 +34,124 @@ const DESC_PAGE: u64 = 0b11;
 /// Registry of physical frames whose contents are page tables.
 ///
 /// There is no allocator-level notion of "page-table frame": every table is a
-/// tagged `alloc_page_tagged()` result; the registry stores both the frame and
-/// its generation so teardown can free it safely. This registry is the ground
-/// truth for revoke's
-/// table validation: a frame is registered exactly where a table is created
-/// (`create_task_space`, `map_user_pages_at`, `user_mmio_table`) and retired
-/// exactly where it is freed (`free_table_frame`). A descriptor naming any
-/// frame outside the registry — freed, data, or corrupted — cannot be
-/// distinguished from a table by its contents alone, so validation fails
-/// closed (`safe_to_free = false`, frames leak) instead of reading attacker-
-/// or corruption-controlled data as a page table.
+/// tagged `alloc_page_tagged()` result. The registry stores the frame, its
+/// generation and the owning address space (the physical root frame), and
+/// hands out a [`TableToken`] at registration. Freeing a table requires the
+/// token, so a stale caller that only remembers the old address cannot free a
+/// frame that was recycled as another table: the generation in its token no
+/// longer matches the live record and the release is refused (the frame leaks,
+/// which is the safe failure).
+///
+/// This registry is also the ground truth for revoke's table validation: a
+/// frame is registered exactly where a table is created (`create_task_space`,
+/// `map_user_pages_at`, `user_mmio_table`, `install_kernel_stack_arena`) and
+/// retired exactly where it is freed. A descriptor naming any frame outside
+/// the registry — freed, data, or corrupted — cannot be distinguished from a
+/// table by its contents alone, so validation fails closed
+/// (`safe_to_free = false`, frames leak) instead of reading attacker- or
+/// corruption-controlled data as a page table.
 ///
 /// The registry lives behind a spinlock: two CPUs create tables (and retire
 /// them) concurrently, and a torn push/swap_remove here would defeat the
 /// revoke validation. All registry sites run with the kernel lock held, so
 /// the spin is bounded.
 ///
-/// Invariants, both enforced loudly rather than silently:
+/// Invariants, all enforced loudly rather than silently:
 /// - at most one registry record per frame: registration happens on fresh
 ///   `alloc_page_tagged()` results only (a registered frame is used, so the
 ///   allocator cannot hand it out again), and the registration path refuses
 ///   a duplicate with a diagnostic and a debug assertion;
 /// - a frame is linked into a page table only after a successful
 ///   registration: every creation site registers before its `write_entry`,
-///   and on registration failure frees the still-unlinked frame directly.
-static PAGE_TABLE_FRAMES: crate::smp::SpinLock<Vec<(usize, u32)>> =
-    crate::smp::SpinLock::new(Vec::new());
+///   and on registration failure frees the still-unlinked frame directly;
+/// - a table is freed only through a token (exact generation match) or a
+///   walk of the owning space (`retire_owned`); neither path can free a
+///   record whose generation/owner does not match.
+static PAGE_TABLE_FRAMES: SpinLock<TableRegistry> = SpinLock::new(TableRegistry::new());
 
 /// Registers a freshly created table frame with the generation tag from its
-/// allocation. Returns `false` — leaving the frame unregistered — on duplicate
-/// registration (kernel bug) or when the registry cannot grow (out of memory).
-/// The caller must then not link the frame into any table and release it with
-/// the tagged allocation handle.
-fn page_table_register(frame: usize, generation: u32) -> bool {
+/// allocation and the owning space root. Returns `None` — leaving the frame
+/// unregistered — on duplicate registration (kernel bug) or when the registry
+/// cannot grow (out of memory). The caller must then not link the frame into
+/// any table and release it with the tagged allocation handle.
+fn page_table_register(frame: usize, generation: u32, owner: usize) -> Option<TableToken> {
     let mut frames = PAGE_TABLE_FRAMES.lock();
-    if frames.iter().any(|&(registered, _)| registered == frame) {
-        crate::console::write_str("PAGE TABLE REGISTRY: duplicate registration of frame 0x");
-        crate::console::write_hex_u64(frame as u64);
-        crate::console::write_str(" - refused\r\n");
-        return false;
-    }
-    // Capacity is reserved explicitly: `push` after a successful
-    // `try_reserve(1)` cannot allocate, so registration cannot fail past
-    // this point and a link that follows it is always covered by a record.
-    if frames.try_reserve(1).is_err() {
-        crate::console::write_str("PAGE TABLE REGISTRY: out of memory, frame 0x");
-        crate::console::write_hex_u64(frame as u64);
-        crate::console::write_str(" not registered\r\n");
-        return false;
-    }
-    frames.push((frame, generation));
-    true
-}
-
-/// Removes the record for `frame` and returns its generation tag. Returns
-/// `None` when zero or multiple records matched; the registry is untouched.
-fn page_table_unregister(frame: usize) -> Option<u32> {
-    let mut frames = PAGE_TABLE_FRAMES.lock();
-    let mut match_count = 0usize;
-    let mut match_position = 0usize;
-    let mut generation = 0u32;
-    for (position, &(registered, tag)) in frames.iter().enumerate() {
-        if registered == frame {
-            match_count += 1;
-            match_position = position;
-            generation = tag;
+    match frames.register(frame, generation, owner) {
+        Some(token) => Some(token),
+        None => {
+            crate::console::write_str("PAGE TABLE REGISTRY: duplicate frame or out of memory, frame 0x");
+            crate::console::write_hex_u64(frame as u64);
+            crate::console::write_str(" not registered\r\n");
+            None
         }
     }
-    if match_count == 1 {
-        frames.swap_remove(match_position);
-        return Some(generation);
-    }
-    None
 }
 
 fn page_table_registered(frame: usize) -> bool {
-    PAGE_TABLE_FRAMES
-        .lock()
-        .iter()
-        .any(|&(registered, _)| registered == frame)
+    PAGE_TABLE_FRAMES.lock().contains(frame)
 }
 
-/// Frees a page-table frame and retires it from the registry in the same
-/// step. The only sanctioned way to release a table frame. Fail-closed: the
-/// frame is freed only when the registry confirmed exactly one record; an
-/// unregistered or multiply-registered frame is leaked with a diagnostic
-/// instead — a leaked frame can never be reallocated as data, so a stale
-/// record can never bless a foreign mapping.
-fn free_table_frame(frame: usize) -> bool {
-    let Some(generation) = page_table_unregister(frame) else {
-        crate::console::write_str("PAGE TABLE REGISTRY: frame 0x");
-        crate::console::write_hex_u64(frame as u64);
-        crate::console::write_str(" is not uniquely registered - leaked, not freed\r\n");
-        return false;
-    };
-    if !frame_allocator::free_page_tagged(frame, generation) {
-        crate::console::write_str("PAGE TABLE REGISTRY: stale tag for frame 0x");
-        crate::console::write_hex_u64(frame as u64);
-        crate::console::write_str(" - refused\r\n");
-        return false;
+/// Frees a page-table frame only when `token` is the live registration.
+///
+/// Fail-closed on every refusal: a stale token, an already-retired frame or a
+/// mis-owned record leaves the frame allocated and registered, so a leaked
+/// frame can never be reallocated as data while a table still references it.
+fn free_table_frame(token: TableToken) -> bool {
+    let result = PAGE_TABLE_FRAMES.lock().retire(token);
+    match result {
+        RetireResult::Retired { generation } => {
+            if frame_allocator::free_page_tagged(token.frame(), generation) {
+                true
+            } else {
+                crate::console::write_str("PAGE TABLE REGISTRY: allocator refused frame 0x");
+                crate::console::write_hex_u64(token.frame() as u64);
+                crate::console::write_str(" - leaked\r\n");
+                false
+            }
+        }
+        RetireResult::NotRegistered => {
+            crate::console::write_str("PAGE TABLE REGISTRY: frame 0x");
+            crate::console::write_hex_u64(token.frame() as u64);
+            crate::console::write_str(" is not registered - leaked, not freed\r\n");
+            false
+        }
+        RetireResult::StaleToken => {
+            crate::console::write_str("PAGE TABLE REGISTRY: stale token for frame 0x");
+            crate::console::write_hex_u64(token.frame() as u64);
+            crate::console::write_str(" - leaked, not freed\r\n");
+            false
+        }
+        RetireResult::WrongOwner => {
+            crate::console::write_str("PAGE TABLE REGISTRY: owner mismatch for frame 0x");
+            crate::console::write_hex_u64(token.frame() as u64);
+            crate::console::write_str(" - leaked, not freed\r\n");
+            false
+        }
     }
-    true
+}
+
+/// Frees a table frame reached by walking `owner`'s page tables. The owner
+/// check refuses a frame that a different (recycled) address space owns.
+fn free_table_frame_owned(frame: usize, owner: usize) -> bool {
+    let result = PAGE_TABLE_FRAMES.lock().retire_owned(frame, owner);
+    match result {
+        RetireResult::Retired { generation } => {
+            frame_allocator::free_page_tagged(frame, generation)
+        }
+        RetireResult::NotRegistered => {
+            crate::console::write_str("PAGE TABLE REGISTRY: walked frame 0x");
+            crate::console::write_hex_u64(frame as u64);
+            crate::console::write_str(" is not registered - leaked\r\n");
+            false
+        }
+        RetireResult::WrongOwner => {
+            crate::console::write_str("PAGE TABLE REGISTRY: walked frame 0x");
+            crate::console::write_hex_u64(frame as u64);
+            crate::console::write_str(" belongs to another space - leaked\r\n");
+            false
+        }
+        RetireResult::StaleToken => false,
+    }
 }
 
 /// Private 4 KB data window: L0 index 1, then L1/L2/L3 index 0.
@@ -372,7 +392,9 @@ pub fn install_kernel_stack_arena(arena_pa: usize) -> Option<usize> {
         }
 
         let (l3_pa, l3_generation) = frame_allocator::alloc_page_tagged()?;
-        if !page_table_register(l3_pa, l3_generation) {
+        // Owner 0: the kernel stack arena table is permanent and never
+        // retired, but it is still a table for revoke validation.
+        if page_table_register(l3_pa, l3_generation, 0).is_none() {
             frame_allocator::free_page_tagged(l3_pa, l3_generation);
             return None;
         }
@@ -552,31 +574,44 @@ fn invalidate_user_page(virtual_address: usize) {
 /// (used for the EL1 idle task). A loaded ELF supplies independently owned
 /// image pages instead of the old shared kernel text/rodata alias. The heap
 /// starts empty: its L3 table exists, but data frames are added by `brk`.
+///
+/// Returns the root frame (the TTBR0 value) together with its [`TableToken`].
+/// The token is the only proof that a later teardown still owns this address
+/// space: after the root frame is recycled, the stale token is refused.
 pub fn create_task_space(
     private_page: usize,
     user_stack_start: usize,
     image: Option<&crate::elf::LoadedImage>,
-) -> Option<usize> {
+) -> Option<(usize, TableToken)> {
     let mut pages = [0_usize; 9];
-    for (index, slot) in pages.iter_mut().enumerate() {
+    let mut generations = [0_u32; 9];
+    for index in 0..pages.len() {
         let Some((page, generation)) = frame_allocator::alloc_page_tagged() else {
-            // Rollback: every prior frame is a registered table; retire and
-            // free it through the sanctioned helper.
-            for &prior in &pages[..index] {
-                free_table_frame(prior);
+            // Nothing is registered or linked yet: release the raw runs.
+            for prior in 0..index {
+                frame_allocator::free_page_tagged(pages[prior], generations[prior]);
             }
             return None;
         };
-        if !page_table_register(page, generation) {
-            // Registration refused: the frame is still unlinked (tables are
-            // written only after this loop), so its own tag is correct.
-            frame_allocator::free_page_tagged(page, generation);
-            for &prior in &pages[..index] {
-                free_table_frame(prior);
+        pages[index] = page;
+        generations[index] = generation;
+    }
+
+    // All nine frames are allocated before any is linked. Register them with
+    // the root frame as owner; the root itself is registered as its own
+    // space root, which is what `retire_space` validates.
+    let mut tokens = [TableToken::empty(); 9];
+    for index in 0..pages.len() {
+        let Some(token) = page_table_register(pages[index], generations[index], pages[0]) else {
+            // The refused frame is still unlinked; prior frames are
+            // registered but also still unlinked.
+            frame_allocator::free_page_tagged(pages[index], generations[index]);
+            for prior in &tokens[..index] {
+                free_table_frame(*prior);
             }
             return None;
-        }
-        *slot = page;
+        };
+        tokens[index] = token;
     }
     let [l0, l1_user, l2_user, l3_image, l3_heap, l3_stack, l1_priv, l2_priv, l3_priv] = pages;
 
@@ -635,7 +670,7 @@ pub fn create_task_space(
     for page in pages {
         flush_after_table_change(page, GRANULE);
     }
-    Some(l0)
+    Some((l0, tokens[0]))
 }
 
 /// Maps one zeroed, writable and non-executable heap page. The task records
@@ -741,7 +776,7 @@ pub fn map_user_pages_at(
                     return false;
                 };
                 zero_page(page);
-                if !page_table_register(page, generation) {
+                if page_table_register(page, generation, ttbr0).is_none() {
                     // Registration refused: the L2 entry below is only written
                     // after a successful registration, so the frame is still
                     // unlinked and its own tag is correct.
@@ -750,8 +785,8 @@ pub fn map_user_pages_at(
                     return false;
                 }
                 // Registered before the first link; the rollback paths below
-                // free it through `unmap_user_pages_at`, which retires it via
-                // `free_table_frame`.
+                // free it through `unmap_user_pages_at`, which retires it as a
+                // table owned by this space.
                 write_entry(l2_user, l2_index, page as u64 | DESC_TABLE);
                 flush_after_table_change(l2_user, GRANULE);
                 page
@@ -788,13 +823,30 @@ pub fn map_user_pages_at(
 /// Removes `page_count` pages starting at `virtual_address`, freeing an L3 table
 /// once its last entry is gone. The physical frames are returned to the caller
 /// by address (tracked separately by the scheduler), so this only edits tables.
+///
+/// All-or-nothing: the whole range is validated before the first entry is
+/// cleared. A range with one unmapped hole returns `false` with every mapping
+/// still in place, so a caller that reacts by freeing the backing run cannot
+/// leave a live PTE pointing at a recycled frame.
 pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usize) -> bool {
-    if page_count == 0 || virtual_address % GRANULE != 0 {
+    if page_count == 0 || virtual_address % GRANULE != 0 || virtual_address < DRAM_BASE {
+        return false;
+    }
+    let Some(span) = page_count.checked_mul(GRANULE) else {
+        return false;
+    };
+    let Some(end) = virtual_address.checked_add(span) else {
+        return false;
+    };
+    if end > DRAM_BASE + 0x4000_0000 {
         return false;
     }
     unsafe {
         let l1_user = follow_table(ttbr0, 0);
         let l2_user = follow_table(l1_user, 1);
+
+        // Pre-scan: no mutation until every page in the range is proven to be
+        // a live 4 KiB mapping in this address space.
         for index in 0..page_count {
             let va = virtual_address + index * GRANULE;
             let l2_index = (va - DRAM_BASE) / BLOCK_2M;
@@ -807,12 +859,21 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
             if read_entry(l3, l3_index) & DESC_PAGE != DESC_PAGE {
                 return false;
             }
+        }
+
+        // Apply. State cannot change between the passes: every caller runs
+        // with the kernel lock held and the task is not executing.
+        for index in 0..page_count {
+            let va = virtual_address + index * GRANULE;
+            let l2_index = (va - DRAM_BASE) / BLOCK_2M;
+            let l3_index = (va >> 12) & 0x1FF;
+            let l3 = descriptor_address(read_entry(l2_user, l2_index)) as usize;
             write_entry(l3, l3_index, 0);
             flush_after_table_change(l3, GRANULE);
             if table_empty(l3) {
                 write_entry(l2_user, l2_index, 0);
                 flush_after_table_change(l2_user, GRANULE);
-                free_table_frame(l3);
+                free_table_frame_owned(l3, ttbr0);
             }
         }
     }
@@ -1175,22 +1236,22 @@ fn user_mmio_table(ttbr0: usize) -> Option<usize> {
 
         let (l2_mmio, l2_generation) = frame_allocator::alloc_page_tagged()?;
         zero_page(l2_mmio);
-        if !page_table_register(l2_mmio, l2_generation) {
+        let Some(l2_token) = page_table_register(l2_mmio, l2_generation, ttbr0) else {
             // Registration refused: `l1_user` is only linked after both
             // registrations succeed, so the frame is still unlinked.
             frame_allocator::free_page_tagged(l2_mmio, l2_generation);
             return None;
-        }
+        };
         let Some((l3_mmio, l3_generation)) = frame_allocator::alloc_page_tagged() else {
-            free_table_frame(l2_mmio);
+            free_table_frame(l2_token);
             return None;
         };
         zero_page(l3_mmio);
-        if !page_table_register(l3_mmio, l3_generation) {
+        if page_table_register(l3_mmio, l3_generation, ttbr0).is_none() {
             // `l3_mmio` was never linked (its L2 entry is written below);
             // `l2_mmio` is registered but not yet linked into `l1_user`.
             frame_allocator::free_page_tagged(l3_mmio, l3_generation);
-            free_table_frame(l2_mmio);
+            free_table_frame(l2_token);
             return None;
         }
         write_entry(l2_mmio, USER_MMIO_L2_INDEX, l3_mmio as u64 | DESC_TABLE);
@@ -1202,48 +1263,138 @@ fn user_mmio_table(ttbr0: usize) -> Option<usize> {
     }
 }
 
-pub fn destroy_task_space(ttbr0: usize, private_page_generation: u32) {
-    // Every table frame below is released through `free_table_frame`, which
-    // retires it from the page-table registry in the same step. Heap data
-    // pages are released by the task before this call, because only the task
-    // owns their generation tags.
+/// Tears down a whole address space. `space` is the root token returned by
+/// [`create_task_space`]; a stale token is refused before anything is freed,
+/// so a recycled root frame can never destroy the new owner's tables.
+///
+/// All tables are drained from the registry by owner in one step, then each
+/// frame is released with the generation stored at its registration. Heap
+/// data pages are released by the task before this call, because only the task
+/// owns their generation tags.
+pub fn destroy_task_space(
+    space: TableToken,
+    private_page: usize,
+    private_page_generation: u32,
+) -> bool {
+    destroy_task_space_inner(space, private_page, private_page_generation, true)
+}
+
+/// `diagnose = false` is used only by the boot self-test for its intentional
+/// stale teardown; production callers always take the diagnostic path.
+fn destroy_task_space_inner(
+    space: TableToken,
+    private_page: usize,
+    private_page_generation: u32,
+    diagnose: bool,
+) -> bool {
+    let retired = PAGE_TABLE_FRAMES.lock().retire_space(space);
+    let tokens = match retired {
+        SpaceRetire::Retired(tokens) => tokens,
+        SpaceRetire::NotRegistered => {
+            if diagnose {
+                crate::console::write_str("MMU: destroy refused, root frame 0x");
+                crate::console::write_hex_u64(space.frame() as u64);
+                crate::console::write_str(" is not a live table space - leaked\r\n");
+            }
+            return false;
+        }
+        SpaceRetire::StaleToken => {
+            if diagnose {
+                crate::console::write_str("MMU: destroy refused, stale root token for frame 0x");
+                crate::console::write_hex_u64(space.frame() as u64);
+                crate::console::write_str(" - leaked\r\n");
+            }
+            return false;
+        }
+        SpaceRetire::NotSpaceRoot => {
+            if diagnose {
+                crate::console::write_str("MMU: destroy refused, frame 0x");
+                crate::console::write_hex_u64(space.frame() as u64);
+                crate::console::write_str(" is not a space root - leaked\r\n");
+            }
+            return false;
+        }
+    };
+
+    let mut complete = true;
+    for token in tokens {
+        if !frame_allocator::free_page_tagged(token.frame(), token.generation()) {
+            if diagnose {
+                crate::console::write_str("MMU: table frame 0x");
+                crate::console::write_hex_u64(token.frame() as u64);
+                crate::console::write_str(" was already free - leaked\r\n");
+            }
+            complete = false;
+        }
+    }
+    if !frame_allocator::free_page_tagged(private_page, private_page_generation) {
+        if diagnose {
+            crate::console::write_str("MMU: private page 0x");
+            crate::console::write_hex_u64(private_page as u64);
+            crate::console::write_str(" was already free - leaked\r\n");
+        }
+        complete = false;
+    }
+    complete
+}
+
+/// Read-only check used by the address-space self-test: is the 4 KiB page at
+/// `virtual_address` present in `ttbr0`?
+pub fn user_page_is_mapped(ttbr0: usize, virtual_address: usize) -> bool {
+    if virtual_address % GRANULE != 0 || virtual_address < DRAM_BASE {
+        return false;
+    }
+    let l2_index = (virtual_address - DRAM_BASE) / BLOCK_2M;
+    if l2_index >= ENTRIES {
+        return false;
+    }
     unsafe {
         let l1_user = follow_table(ttbr0, 0);
         let l2_user = follow_table(l1_user, 1);
-        let image_table_entry = read_entry(l2_user, 0);
-        if image_table_entry & DESC_TABLE == DESC_TABLE {
-            free_table_frame(descriptor_address(image_table_entry) as usize);
+        let l2_entry = read_entry(l2_user, l2_index);
+        if l2_entry & DESC_TABLE != DESC_TABLE {
+            return false;
         }
-        let heap_table_entry = read_entry(l2_user, USER_HEAP_L2_INDEX);
-        if heap_table_entry & DESC_TABLE == DESC_TABLE {
-            free_table_frame(descriptor_address(heap_table_entry) as usize);
-        }
-        let stack_table_entry = read_entry(l2_user, USER_STACK_L2_INDEX);
-        if stack_table_entry & DESC_TABLE == DESC_TABLE {
-            free_table_frame(descriptor_address(stack_table_entry) as usize);
-        }
-        let mmio_table_entry = read_entry(l1_user, USER_MMIO_L1_INDEX);
-        if mmio_table_entry & DESC_TABLE == DESC_TABLE {
-            let l2_mmio = descriptor_address(mmio_table_entry) as usize;
-            let l3_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
-            if l3_entry & DESC_TABLE == DESC_TABLE {
-                free_table_frame(descriptor_address(l3_entry) as usize);
-            }
-            free_table_frame(l2_mmio);
-        }
-
-        let l1_priv = follow_table(ttbr0, 1);
-        let l2_priv = follow_table(l1_priv, 0);
-        let l3_priv = follow_table(l2_priv, 0);
-        let private_page = descriptor_address(read_entry(l3_priv, 0));
-        frame_allocator::free_page_tagged(private_page as usize, private_page_generation);
-        free_table_frame(l3_priv);
-        free_table_frame(l2_priv);
-        free_table_frame(l1_priv);
-        free_table_frame(l2_user);
-        free_table_frame(l1_user);
-        free_table_frame(ttbr0);
+        let l3 = descriptor_address(l2_entry) as usize;
+        read_entry(l3, (virtual_address >> 12) & 0x1FF) & DESC_PAGE == DESC_PAGE
     }
+}
+
+/// Boot-time proof of the reclamation invariants that do not need a running
+/// task: a partial unmap is refused without touching the mapped page, the full
+/// unmap succeeds, teardown releases the address space exactly once, and a
+/// second teardown with the same root token is refused.
+pub fn run_self_test() -> bool {
+    let Some((private, private_generation)) = frame_allocator::alloc_page_tagged() else {
+        return false;
+    };
+    let Some((data, data_generation)) = frame_allocator::alloc_page_tagged() else {
+        frame_allocator::free_page_tagged(private, private_generation);
+        return false;
+    };
+    let Some((root, space)) = create_task_space(private, 0, None) else {
+        frame_allocator::free_page_tagged(data, data_generation);
+        frame_allocator::free_page_tagged(private, private_generation);
+        return false;
+    };
+
+    let va = USER_MMAP_VA;
+    let mapped = map_user_pages_at(root, va, data, 1, PROT_WRITE);
+    // A two-page unmap reaches an unmapped page: the whole request must be
+    // refused and the first page must still be mapped.
+    let partial_refused = mapped && !unmap_user_pages_at(root, va, 2);
+    let still_mapped = mapped && user_page_is_mapped(root, va);
+    let unmapped = mapped && unmap_user_pages_at(root, va, 1);
+    let gone = mapped && !user_page_is_mapped(root, va);
+
+    frame_allocator::free_page_tagged(data, data_generation);
+    let space_released = destroy_task_space(space, private, private_generation);
+    // Stale/double teardown: the registry record is gone, so this must fail
+    // without freeing anything else. Quiet: this refusal is the expected
+    // result, not a fault.
+    let stale_refused = !destroy_task_space_inner(space, 0, 0, false);
+
+    mapped && partial_refused && still_mapped && unmapped && gone && space_released && stale_refused
 }
 
 /// Pushes `size` bytes at a kernel virtual (== physical, low identity)

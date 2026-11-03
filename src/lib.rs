@@ -13,6 +13,7 @@ pub mod fog_validate;
 pub mod gicv3_policy;
 pub mod irq_policy;
 pub mod reloc;
+pub mod table_registry;
 pub mod wait_queue;
 
 use alloc::vec::Vec;

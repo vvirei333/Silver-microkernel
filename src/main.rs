@@ -1341,6 +1341,15 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::log("KERNEL STACK OK");
     ram_log::fb_progress();
 
+    // Address-space reclamation invariants: partial unmap is refused without
+    // touching the mapped page, teardown retires the root token once, and a
+    // second teardown with the same token is refused.
+    if !mmu::run_self_test() {
+        exceptions::silver_handle_exception(9, 0, 0, 0);
+    }
+    ram_log::log("MMU RECLAIM OK");
+    ram_log::fb_progress();
+
     drop(value);
     #[cfg(feature = "fog")]
     {

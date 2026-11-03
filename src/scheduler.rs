@@ -4,6 +4,8 @@ use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
 
+use silver_microkernel::table_registry::TableToken;
+
 use crate::{
     capability,
     condvar::Condvar,
@@ -106,7 +108,11 @@ pub struct Task {
     /// was already recycled.
     heap_pages: Vec<(usize, u32)>,
     user_stack_generation: u32,
+    private_page: usize,
     private_page_generation: u32,
+    /// Root token for `ttbr0`: the only proof that teardown still owns this
+    /// address space. A stale token is refused by the page-table registry.
+    space_token: TableToken,
     dma_pages: Vec<(usize, usize, u32)>,
     mmap_regions: Vec<MmapRegion>,
     program_break: usize,
@@ -212,6 +218,11 @@ static SCHEDULER_READY: AtomicBool = AtomicBool::new(false);
 /// absence of foreign mappings (see `reap_dead_tasks`): deliberately leaked
 /// instead of risking a use-after-free through a live foreign mapping.
 static DMA_LEAKED_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// mmap runs that could not be unmapped completely: the backing frames are
+/// leaked instead of freed, because a still-live PTE must never point at a
+/// frame the allocator can hand out again.
+static MMAP_LEAKED_FRAMES: AtomicUsize = AtomicUsize::new(0);
 
 core::arch::global_asm!(
     r#"
@@ -2123,7 +2134,7 @@ impl Task {
 
         let user_image = image;
 
-        let Some(ttbr0) =
+        let Some((ttbr0, space_token)) =
             mmu::create_task_space(private_page, user_stack.start, user_image.as_ref())
         else {
             if let Some(image) = &user_image {
@@ -2244,7 +2255,9 @@ impl Task {
             stack,
             user_stack,
             user_stack_generation,
+            private_page,
             private_page_generation,
+            space_token,
             ttbr0,
             user_image,
             heap_pages: Vec::new(),
@@ -2366,13 +2379,30 @@ impl Task {
         }) else {
             return false;
         };
-        let region = self.mmap_regions.remove(position);
-        mmu::unmap_user_pages_at(self.ttbr0, region.virtual_address, region.page_count);
-        frame_allocator::free_contiguous_pages_tagged(
+        let region = &self.mmap_regions[position];
+        let (virtual_address, physical_start, generation) = (
+            region.virtual_address,
             region.physical_start,
-            region.page_count,
             region.generation,
         );
+        // Fail closed: `unmap_user_pages_at` is all-or-nothing, so on failure
+        // nothing was unmapped and the region stays tracked. Freeing the run
+        // here would leave live PTEs pointing at reclaimed frames.
+        if !mmu::unmap_user_pages_at(self.ttbr0, virtual_address, page_count) {
+            MMAP_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
+            console::write_str("MMAP LEAK: range 0x");
+            console::write_hex_u64(physical_start as u64);
+            console::write_str(" left mapped after refused unmap (");
+            console::write_dec_u64(page_count as u64);
+            console::write_str(" pages)\r\n");
+            return false;
+        }
+        self.mmap_regions.remove(position);
+        if !frame_allocator::free_contiguous_pages_tagged(physical_start, page_count, generation) {
+            console::write_str("MMAP: allocator refused run 0x");
+            console::write_hex_u64(physical_start as u64);
+            console::write_str(" - leaked\r\n");
+        }
         true
     }
 
@@ -2390,13 +2420,21 @@ impl Task {
         if self.resources_released {
             return;
         }
-        kernel_stack::free(self.stack.start);
-        if !self.user_stack.is_empty() {
-            frame_allocator::free_contiguous_pages_tagged(
+        if !kernel_stack::free(self.stack.start) {
+            console::write_str("STACK: kernel stack release refused for 0x");
+            console::write_hex_u64(self.stack.start as u64);
+            console::write_str(" - leaked\r\n");
+        }
+        if !self.user_stack.is_empty()
+            && !frame_allocator::free_contiguous_pages_tagged(
                 self.user_stack.start,
                 TASK_USER_STACK_PAGES,
                 self.user_stack_generation,
-            );
+            )
+        {
+            console::write_str("STACK: user stack release refused for 0x");
+            console::write_hex_u64(self.user_stack.start as u64);
+            console::write_str(" - leaked\r\n");
         }
     }
 
@@ -2413,19 +2451,39 @@ impl Task {
             return;
         }
         for region in &self.mmap_regions {
-            mmu::unmap_user_pages_at(self.ttbr0, region.virtual_address, region.page_count);
-            frame_allocator::free_contiguous_pages_tagged(
-                region.physical_start,
-                region.page_count,
-                region.generation,
-            );
+            if mmu::unmap_user_pages_at(self.ttbr0, region.virtual_address, region.page_count) {
+                frame_allocator::free_contiguous_pages_tagged(
+                    region.physical_start,
+                    region.page_count,
+                    region.generation,
+                );
+            } else {
+                // A live PTE still references these frames; leaking is the
+                // only safe outcome.
+                MMAP_LEAKED_FRAMES.fetch_add(region.page_count, Ordering::Relaxed);
+                console::write_str("MMAP LEAK: teardown could not unmap range 0x");
+                console::write_hex_u64(region.physical_start as u64);
+                console::write_str(" (");
+                console::write_dec_u64(region.page_count as u64);
+                console::write_str(" pages)\r\n");
+            }
         }
         // Heap data pages carry their own tags; the address-space teardown
         // frees only the page tables and the private page.
         for (page, generation) in self.heap_pages.drain(..) {
-            frame_allocator::free_page_tagged(page, generation);
+            if !frame_allocator::free_page_tagged(page, generation) {
+                console::write_str("HEAP: release refused for page 0x");
+                console::write_hex_u64(page as u64);
+                console::write_str(" - leaked\r\n");
+            }
         }
-        mmu::destroy_task_space(self.ttbr0, self.private_page_generation);
+        if !mmu::destroy_task_space(
+            self.space_token,
+            self.private_page,
+            self.private_page_generation,
+        ) {
+            console::write_str("MMU: address space teardown was refused\r\n");
+        }
         for &(physical, page_count, generation) in &self.dma_pages {
             // Exact (physical, page_count) match: allocator ranges never
             // overlap, so a dead task's own range cannot be confused with
@@ -2465,7 +2523,9 @@ impl Task {
         self.stack = MemoryRegion::new(0, 0);
         self.user_stack = MemoryRegion::new(0, 0);
         self.user_stack_generation = 0;
+        self.private_page = 0;
         self.private_page_generation = 0;
+        self.space_token = TableToken::empty();
         self.ttbr0 = 0;
         self.user_image = None;
         self.heap_pages.clear();

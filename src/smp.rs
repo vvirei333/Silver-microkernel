@@ -569,7 +569,7 @@ pub fn boot_secondary_cpus() {
             crate::console::write_str(", leaving it offline\r\n");
             return;
         };
-        let Some(ttbr0) = crate::mmu::create_task_space(private, 0, None) else {
+        let Some((ttbr0, _space_token)) = crate::mmu::create_task_space(private, 0, None) else {
             crate::frame_allocator::free_page_tagged(private, private_generation);
             crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: no task space for CPU");
