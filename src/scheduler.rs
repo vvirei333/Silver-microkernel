@@ -2541,18 +2541,32 @@ impl Task {
 
         let target_pages = (requested - mmu::USER_HEAP_VA).div_ceil(PAGE_SIZE);
         let original_pages = self.heap_pages.len();
-        while self.heap_pages.len() < target_pages {
-            let index = self.heap_pages.len();
-            let Some((frame, generation)) = frame_allocator::alloc_page_tagged() else {
-                self.truncate_heap(original_pages);
-                return None;
-            };
-            if !mmu::map_user_heap_page(self.ttbr0, index, frame) {
-                frame_allocator::free_page_tagged(frame, generation);
-                self.truncate_heap(original_pages);
+        if target_pages > original_pages {
+            // Allocate the whole growth first and publish it as one batch:
+            // hundreds of pages used to pay a full table clean plus
+            // `dsb`/`tlbi` each. On any failure every freshly allocated frame
+            // is returned and the address space is untouched.
+            let growth = target_pages - original_pages;
+            let mut frames: Vec<usize> = Vec::with_capacity(growth);
+            let mut generations: Vec<u32> = Vec::with_capacity(growth);
+            for _ in 0..growth {
+                let Some((frame, generation)) = frame_allocator::alloc_page_tagged() else {
+                    for (&frame, &generation) in frames.iter().zip(generations.iter()) {
+                        frame_allocator::free_page_tagged(frame, generation);
+                    }
+                    return None;
+                };
+                frames.push(frame);
+                generations.push(generation);
+            }
+            if !mmu::map_user_heap_pages(self.ttbr0, original_pages, &frames) {
+                for (&frame, &generation) in frames.iter().zip(generations.iter()) {
+                    frame_allocator::free_page_tagged(frame, generation);
+                }
                 return None;
             }
-            self.heap_pages.push((frame, generation));
+            self.heap_pages
+                .extend(frames.into_iter().zip(generations.into_iter()));
         }
 
         self.truncate_heap(target_pages);

@@ -103,6 +103,14 @@ per-CPU timer liveness.
     a scratch space, reads a value, repoints the same VA at another frame and
     reads again. Removing the `tlbi ...is` from `flush_after_table_change` makes
     this boot test stop with exception 9, so the test is proven sensitive.
+- **Batched table publication (2026-11-04, XNU `pmap`-style).** `map_user_pages_at`
+  and the new `map_user_heap_pages` clean each touched descriptor line as they
+  write it and issue one `dsb ishst` + broadcast `tlbi vmalle1is` + `dsb ish`
+  per call instead of a full table clean and shootdown per page. `SYS_BRK`
+  growth now allocates its pages first and publishes them as one all-or-nothing
+  batch, so a several-hundred-page grow pays one shootdown. The boot TLB test
+  exercises the batched path; removing the `tlbi` from `finish_table_changes`
+  still fails the boot with exception 9.
 - Verified in this snapshot: **142 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and

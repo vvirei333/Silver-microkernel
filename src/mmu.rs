@@ -570,14 +570,36 @@ fn configure_and_enable() {
 /// can hold or re-create a translation for a removed entry past this call.
 pub fn flush_after_table_change(table_start: usize, table_bytes: usize) {
     clean_table_lines(table_start, table_bytes);
+    finish_table_changes();
+}
+
+/// Completes a batch of table edits made since the last call: makes every
+/// cleaned descriptor visible (`dsb ishst`) and performs one broadcast
+/// invalidation for the whole batch.
+///
+/// This is the "edit the range, flush once" order: a caller that publishes
+/// many PTEs cleans each touched cache line as it writes (see
+/// [`clean_entry_line`]) and calls this once at the end, instead of paying a
+/// full `dsb`/`tlbi`/`dsb` per page.
+fn finish_table_changes() {
     unsafe {
         core::arch::asm!(
+            "dsb ishst",
             "tlbi vmalle1is",
             "dsb ish",
             "isb",
             options(nostack),
         );
     }
+}
+
+/// Cleans the cache line holding one 8-byte table entry, without a barrier.
+/// Paired with [`finish_table_changes`] for batched publication.
+fn clean_entry_line(table_start: usize, entry_index: usize) {
+    let line_size = data_cache_line_size();
+    let address = phys_to_virt(table_start) + entry_index * 8;
+    let line = address & !(line_size - 1);
+    clean_cache_range(line, line + line_size);
 }
 
 /// Pushes the dirty translation-table lines to the point of coherency.
@@ -756,23 +778,46 @@ pub fn install_ap_identity(ttbr0: usize) -> bool {
     true
 }
 
-/// Maps one zeroed, writable and non-executable heap page. The task records
-/// the frame and its generation for `brk` rollback, shrink and teardown.
-pub fn map_user_heap_page(ttbr0: usize, index: usize, physical: usize) -> bool {
-    if index >= USER_HEAP_MAX_PAGES || physical % GRANULE != 0 {
+/// Maps a run of zeroed, writable and non-executable heap pages starting at
+/// heap index `first_index`. `physical_pages[i]` backs index `first_index + i`.
+///
+/// All-or-nothing: every index is bounds-checked and every target slot is
+/// proven free before the first page is zeroed or published, so a rejected
+/// batch leaves the address space unchanged and the caller owns all frames.
+/// The whole run shares one barrier and one broadcast invalidation instead of
+/// paying a full table clean plus `dsb`/`tlbi` per page — `brk` can grow the
+/// heap by hundreds of pages at a time.
+pub fn map_user_heap_pages(ttbr0: usize, first_index: usize, physical_pages: &[usize]) -> bool {
+    let count = physical_pages.len();
+    let Some(last) = first_index.checked_add(count) else {
+        return false;
+    };
+    if count == 0
+        || last > USER_HEAP_MAX_PAGES
+        || physical_pages.iter().any(|physical| physical % GRANULE != 0)
+    {
         return false;
     }
     unsafe {
         let l1_user = follow_table(ttbr0, 0);
         let l2_user = follow_table(l1_user, 1);
         let l3_heap = follow_table(l2_user, USER_HEAP_L2_INDEX);
-        if l3_heap == 0 || read_entry(l3_heap, index) != 0 {
+        if l3_heap == 0 {
             return false;
         }
-        zero_page(physical);
-        write_entry(l3_heap, index, user_data_page(physical));
-        flush_after_table_change(l3_heap, GRANULE);
+        for index in first_index..last {
+            if read_entry(l3_heap, index) != 0 {
+                return false;
+            }
+        }
+        for (offset, &physical) in physical_pages.iter().enumerate() {
+            let index = first_index + offset;
+            zero_page(physical);
+            write_entry(l3_heap, index, user_data_page(physical));
+            clean_entry_line(l3_heap, index);
+        }
     }
+    finish_table_changes();
     true
 }
 
@@ -859,6 +904,7 @@ pub fn map_user_pages_at(
                 let Some((page, generation)) = frame_allocator::alloc_page_tagged() else {
                     // F1: no frame left for a new L3 table.
                     unmap_user_pages_at(ttbr0, virtual_address, done);
+                    finish_table_changes();
                     return false;
                 };
                 zero_page(page);
@@ -868,24 +914,29 @@ pub fn map_user_pages_at(
                     // unlinked and its own tag is correct.
                     frame_allocator::free_page_tagged(page, generation);
                     unmap_user_pages_at(ttbr0, virtual_address, done);
+                    finish_table_changes();
                     return false;
                 }
                 // Registered before the first link; the rollback paths below
                 // free it through `unmap_user_pages_at`, which retires it as a
-                // table owned by this space.
+                // table owned by this space. The barrier is deferred: the
+                // single `finish_table_changes` at the end (or before an error
+                // return) publishes every line this call cleaned.
                 write_entry(l2_user, l2_index, page as u64 | DESC_TABLE);
-                flush_after_table_change(l2_user, GRANULE);
+                clean_entry_line(l2_user, l2_index);
                 page
             } else if l2_entry & DESC_TABLE == DESC_TABLE {
                 descriptor_address(l2_entry) as usize
             } else {
                 // F2: unexpected descriptor kind in the user L2.
                 unmap_user_pages_at(ttbr0, virtual_address, done);
+                finish_table_changes();
                 return false;
             };
             if read_entry(l3, l3_index) != 0 {
                 // F3: target slot already mapped.
                 unmap_user_pages_at(ttbr0, virtual_address, done);
+                finish_table_changes();
                 return false;
             }
             // Zero before publication: the frame is recycled allocator memory
@@ -899,10 +950,14 @@ pub fn map_user_pages_at(
                 l3_index,
                 user_anonymous_page(physical_start + index * GRANULE, prot),
             );
-            flush_after_table_change(l3, GRANULE);
+            clean_entry_line(l3, l3_index);
             done += 1;
         }
     }
+    // One barrier + broadcast for the whole range. The caller runs under the
+    // kernel lock and the target space is not executing on another CPU, so no
+    // translation can be observed between the individual entry writes.
+    finish_table_changes();
     true
 }
 

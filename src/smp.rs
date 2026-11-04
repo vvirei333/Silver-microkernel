@@ -37,7 +37,7 @@
 //! belt-and-braces; it is explicitly NOT a cross-CPU synchronization.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
 use crate::{interrupts, platform};
 
@@ -238,6 +238,9 @@ pub static AP_TASK_SCHEDULING: AtomicBool = AtomicBool::new(true);
 /// CPUs PSCI accepted (`CPU_ON` returned success) plus the boot CPU. The
 /// self-test waits for exactly this many CPUs, so a `-smp 2` machine does not
 /// block on slots the firmware rejected while `-smp 4` waits for all three APs.
+#[cfg(feature = "smp")]
+use core::sync::atomic::AtomicUsize;
+
 #[cfg(feature = "smp")]
 static EXPECTED_CPUS: AtomicUsize = AtomicUsize::new(1);
 

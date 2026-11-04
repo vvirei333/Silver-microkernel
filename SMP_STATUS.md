@@ -330,6 +330,8 @@ DMA leak, and `-smp 2` still reports one peer.
    fails the boot if the `tlbi ...is` in `flush_after_table_change` is removed
    (verified by a negative build: exception 9). This proves the flush on the
    executing PE; a second PE holding the *same* space is still untested.
+   Table publication is now batched (`finish_table_changes`, one shootdown per
+   map/heap-growth call) in the XNU `pmap` "edit the range, flush once" style.
 2. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
    DMA revoke while a client runs, and page-table teardown under load. The
    `demo-tasks` suite passes on `-smp 2` and `-smp 4` (66 PASS, 0 PANIC);

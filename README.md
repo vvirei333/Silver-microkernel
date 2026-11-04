@@ -85,6 +85,21 @@ userspace.
 - [ ] SFS write path, block-path interrupts, remaining resource quotas and persistent storage
 - [ ] SMP (`-smp 4`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to three APs online (CPU1–CPU3), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` (66 PASS / 0 PANIC). `no_std,smp-selftest` additionally runs 64 back-to-back SGI1 stop-the-world rounds, verifies cross-CPU visibility, and checks that every online CPU advances its own timer tick. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Physical SMP, true cross-PE TLB-shootdown stress and device-DMA quiescence remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
 
+## Design references
+
+This kernel is not a port of another OS. Two systems are used as **conceptual**
+references, not as source:
+
+- **XNU (aarch64)** — `pmap`-style batched page-table publication with a single
+  shootdown, quiescence before frame reclamation, per-CPU scheduler state and a
+  global lock where the fast path is not yet split.
+- **Redox (Rust)** — ownership-based lifetimes for wait queues (`Arc`), typed
+  capability tables, and explicit lock-scope/ordering documentation.
+
+Where a reference design conflicts with this kernel's microkernel boundaries,
+capability model or hardware profiles, the kernel's own invariants and tests
+win. No XNU or Redox code is copied.
+
 ## Redmi 10C (`fog`, SM6225) — RAM-only bring-up
 
 Status as of 2026-11-03 (TASK №19–№23). The authoritative port document is
@@ -535,6 +550,13 @@ A descriptor that points at another space's table is a hard refusal, not a
 dereference. Teardown drains a space by its root token and validates the token
 before removing anything, so a stale token leaks rather than freeing a recycled
 frame.
+
+Mapping and `SYS_BRK` growth publish a whole range before one barrier: each
+touched descriptor's cache line is cleaned as it is written, then a single
+`dsb ishst` + broadcast `tlbi vmalle1is` + `dsb ish` completes the batch. A
+16-page DMA map or a several-hundred-page heap growth therefore pays one
+shootdown, not one per page. The boot TLB self-test reads through a remapped
+TTBR0 VA, so a missing invalidation fails the boot.
 
 Unmap and reclamation are fail-closed. A partial `munmap` is refused without
 touching the mapped part; if a backing run cannot be proven fully unmapped it is
