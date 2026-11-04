@@ -17,7 +17,8 @@ smp = []
 # (each AP reads a VA, the boot CPU re-points the same PTE, each AP must see
 # the new frame), then 64 back-to-back SGI1 stop-the-world rounds, verify
 # cross-CPU visibility, check that every online CPU advances its own timer
-# tick, and report PASS/FAIL. Kernel-only; no userspace protocol is involved.
+# tick, verify the running_on/current_index pairing on every scheduling pass,
+# and report PASS/FAIL. Kernel-only; no userspace protocol is involved.
 smp-selftest = ["smp"]
 demo-tasks = []
 tablet = []

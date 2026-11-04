@@ -123,14 +123,34 @@ per-CPU timer liveness.
   test is sensitive to a non-broadcast flush. The peers run with IRQs masked
   and no kernel lock, so the boot CPU can drive them while holding the BKL
   without a lock-ordering deadlock.
+- **Scheduler invariant audit under `smp-selftest` (2026-11-04).** Every
+  scheduling pass, after `reap_dead_tasks` (the one place that shifts task
+  indices), `verify_scheduling_invariants()` checks the cross-CPU pairing:
+  each online CPU's `current_index` either is `usize::MAX` or names a task whose
+  `running_on` is that same CPU; every `running_on = Some(cpu)` names an online
+  CPU whose current index is that task; a `Running` task names a CPU; no two
+  CPUs name the same task. A violation prints the exact reason and panics
+  instead of letting a task resume with another task's address space. The
+  check is a no-op outside `smp-selftest`.
+- **Tick-liveness selftest window (2026-11-04).** The timer check used to run
+  while the boot CPU held the BKL. With real tasks present (the new
+  `demo-tasks,smp-selftest` profile) an AP that entered `schedule` from a timer
+  IRQ spins in `bkl_acquire` with IRQs masked, so it could not take another
+  PPI and a healthy system reported `ticks FAIL`. The observation window now
+  releases the BKL (the boot task stays `Running`, so no other CPU can claim
+  it) and reacquires it afterwards.
 - Verified in this snapshot: **142 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
   `no_std,smp` with QEMU `-smp 2` and `-smp 4`, `no_std,smp-selftest` logging
   `tlb cross-PE PASS (3 peer CPU(s) saw the remap)`,
   `quiesce PASS (64 rounds, 3 peer CPU(s))` and `ticks PASS (3 peer CPU(s))`
-  on `-smp 4` (one peer on `-smp 2`), tablet build, and fog boot image v3.
-  The boot self-tests log
+  on `-smp 4` (one peer on `-smp 2`), and the combined
+  `no_std,smp,demo-tasks,smp-selftest` profile at **69 PASS / 0 FAIL / 0 PANIC**
+  with zero invariant failures. A negative build that drops the
+  `running_on` claim makes the invariant check fire on the next pass
+  (`sched invariant FAIL (a CPU's current task is not marked running on it)`).
+  Tablet build, and fog boot image v3. The boot self-tests log
   `MMU TLB OK` and `DMA QUARANTINE OK`.
 - **Hardware coverage after E2 is a smoke test, not a proof.** The post-E2
   image boots on physical `rain` and the GIC/timer panel is live, but QEMU and

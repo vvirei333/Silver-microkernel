@@ -1361,32 +1361,45 @@ fn run_quiesce_selftest() {
     // SGI from the BKL retry loop, which does not require IRQs. Check each
     // published CPU's own PPI counter as well, so an online-but-deaf core is
     // reported instead of looking healthy until a deadline stops expiring.
-    let mut baseline = [0_u64; MAX_CPUS];
-    for (cpu, value) in baseline.iter_mut().enumerate() {
-        *value = crate::timer::cpu_ticks(cpu);
-    }
-    let mut spins: u32 = 0;
-    loop {
-        let mut all = true;
-        for cpu in 0..cpu_count() {
-            if cpu == me || !cpu_online(cpu) {
-                continue;
+    //
+    // The observation window must not hold the BKL. Once real tasks are
+    // running (the demo+selftest profile), an AP that entered `schedule` from
+    // a timer IRQ spins in `bkl_acquire` with IRQs masked; if this CPU kept
+    // the lock, that peer could never take another PPI and a healthy system
+    // would report a false failure.
+    bkl_release();
+    let ticks_ok = {
+        let mut baseline = [0_u64; MAX_CPUS];
+        for (cpu, value) in baseline.iter_mut().enumerate() {
+            *value = crate::timer::cpu_ticks(cpu);
+        }
+        let mut spins: u32 = 0;
+        loop {
+            let mut all = true;
+            for cpu in 0..cpu_count() {
+                if cpu == me || !cpu_online(cpu) {
+                    continue;
+                }
+                if crate::timer::cpu_ticks(cpu) <= baseline[cpu] {
+                    all = false;
+                }
             }
-            if crate::timer::cpu_ticks(cpu) <= baseline[cpu] {
-                all = false;
+            if all {
+                break true;
+            }
+            spins += 1;
+            if spins >= 50_000_000 {
+                break false;
+            }
+            unsafe {
+                core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
             }
         }
-        if all {
-            break;
-        }
-        spins += 1;
-        if spins >= 50_000_000 {
-            crate::console::write_str("SMP SELFTEST: ticks FAIL (a CPU missed its timer PPI)\r\n");
-            return;
-        }
-        unsafe {
-            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
-        }
+    };
+    bkl_acquire();
+    if !ticks_ok {
+        crate::console::write_str("SMP SELFTEST: ticks FAIL (a CPU missed its timer PPI)\r\n");
+        return;
     }
     crate::console::write_str("SMP SELFTEST: ticks PASS (");
     crate::console::write_dec_u64(peers as u64);

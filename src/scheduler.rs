@@ -1135,6 +1135,70 @@ fn remap_current_indices(manager: &TaskManager, snapshot: &[Option<u64>], live_i
     );
 }
 
+/// Read-only cross-CPU scheduling invariant snapshot, taken with the kernel
+/// lock held. Every `running_on`/`current_index` transition happens inside a
+/// BKL-protected scheduling pass, so the lock makes this a consistent cut.
+///
+/// A task may legitimately be `Ready` while still recorded as running on its
+/// CPU: `block_current_on` releases the lock before its own next pass, and a
+/// wake (or timeout) can move it back to `Ready` in that window. The owning CPU
+/// then either resumes it or switches away. What must never drift is the
+/// *pairing*: `running_on` and the CPU's `current_index` name each other
+/// exactly.
+///
+/// Returns the first violated invariant for a precise selftest failure.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+fn verify_scheduling_invariants(manager: &TaskManager) -> Result<(), &'static str> {
+    let tasks = &manager.tasks;
+    let mut current = [usize::MAX; smp::MAX_CPUS];
+    let mut online = [false; smp::MAX_CPUS];
+
+    for cpu in 0..smp::MAX_CPUS {
+        if !smp::cpu_online(cpu) {
+            continue;
+        }
+        online[cpu] = true;
+        let index = smp::current_index_of(cpu);
+        current[cpu] = index;
+        if index == usize::MAX {
+            // An AP that has not dispatched a task yet.
+            continue;
+        }
+        let Some(task) = tasks.get(index) else {
+            return Err("a CPU's current_index is out of range");
+        };
+        if task.running_on != Some(cpu) {
+            return Err("a CPU's current task is not marked running on it");
+        }
+    }
+
+    for (index, task) in tasks.iter().enumerate() {
+        if task.state == TaskState::Running && task.running_on.is_none() {
+            return Err("a Running task names no CPU");
+        }
+        if let Some(cpu) = task.running_on {
+            if cpu >= smp::MAX_CPUS || !online[cpu] {
+                return Err("running_on names an offline CPU");
+            }
+            if current[cpu] != index {
+                return Err("running_on does not match the CPU's current task");
+            }
+        }
+    }
+
+    for a in 0..smp::MAX_CPUS {
+        if current[a] == usize::MAX {
+            continue;
+        }
+        for b in (a + 1)..smp::MAX_CPUS {
+            if current[b] == current[a] {
+                return Err("two CPUs name the same current task");
+            }
+        }
+    }
+    Ok(())
+}
+
 fn wake_process_waiters(manager: &mut TaskManager) {
     let mut woke_any = false;
     while let Some(waiter) = PROCESS_WAIT_QUEUE.pop() {
@@ -1504,6 +1568,18 @@ pub fn schedule() {
         .unwrap_or(false);
 
     reap_dead_tasks(manager);
+    // The reap path removes tasks (shifting indices) and remaps every CPU's
+    // current index. Verify the state machine immediately afterwards: this is
+    // the riskiest mutation in the scheduler, and `smp-selftest` turns a silent
+    // `running_on`/`current_index` drift into a loud boot failure instead of a
+    // task resuming with another task's address space.
+    #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+    if let Err(reason) = verify_scheduling_invariants(manager) {
+        console::write_str("SMP SELFTEST: sched invariant FAIL (");
+        console::write_str(reason);
+        console::write_str(")\r\n");
+        panic!("scheduling invariant violated");
+    }
     wake_expired_tasks(manager, timer::ticks());
 
     if AP_BOOT_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
