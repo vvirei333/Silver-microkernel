@@ -114,6 +114,48 @@ fn pop_rx() -> Option<u8> {
     }
 }
 
+/// Sequential ring-invariant test (wraparound, full-drop, head/tail reuse).
+/// The cross-CPU exclusion itself is `RX_LOCK`; this proves the index
+/// arithmetic around it cannot lose, duplicate or reorder a byte.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn run_ring_self_test() -> bool {
+    while pop_rx().is_some() {}
+    let mut ok = pop_rx().is_none();
+
+    // Fill to capacity; the overflowing byte must be dropped.
+    for index in 0..RX_CAPACITY {
+        push_rx(index as u8);
+    }
+    push_rx(0xEE);
+    let mut count = 0usize;
+    while let Some(byte) = pop_rx() {
+        if byte != count as u8 {
+            ok = false;
+        }
+        count += 1;
+    }
+    ok &= count == RX_CAPACITY;
+
+    // Partial drain then refill moves head and tail past the end.
+    for byte in 0..100u8 {
+        push_rx(byte);
+    }
+    for byte in 0..40u8 {
+        if pop_rx() != Some(byte) {
+            ok = false;
+        }
+    }
+    for byte in 100..160u8 {
+        push_rx(byte);
+    }
+    for byte in 40..160u8 {
+        if pop_rx() != Some(byte) {
+            ok = false;
+        }
+    }
+    ok && pop_rx().is_none()
+}
+
 pub fn write_byte(byte: u8) {
     // Wait for TX FIFO space with IRQs unmasked — but restore the caller's
     // DAIF afterwards so this stays transparent in any context (syscall

@@ -268,7 +268,10 @@ pub fn probe(params: &BootParams) -> FogInfo {
         result.reserved_first = reserved[0];
     }
     let reserved_slots = reserved.len().saturating_sub(reserved_count);
-    let memreserve_count = tree.memreserve_regions(&mut reserved[reserved_count..]);
+    // A malformed or overflowing memreserve map must fail the boot closed:
+    // dropping an entry would let the planner hand out reserved memory.
+    let memreserve = tree.memreserve_regions(&mut reserved[reserved_count..]);
+    let memreserve_count = memreserve.unwrap_or(0);
     if memreserve_count > 0 {
         result.memreserve_first = reserved[reserved_count];
     }
@@ -280,7 +283,8 @@ pub fn probe(params: &BootParams) -> FogInfo {
     // instead of handing out a range that might be reserved.
     let truncated = memory_count == memory.len()
         || reserved_count == reserved.len()
-        || memreserve_count == reserved_slots;
+        || memreserve_count == reserved_slots
+        || memreserve.is_none();
 
     // Exclusions: reservations, the loaded image (including its BSS and
     // stack), and the DTB itself. `image_size` is the span ABL was told to
@@ -463,7 +467,7 @@ fn copy_str(destination: &mut [u8; 64], length: &mut usize, source: &str) {
     *length = count;
 }
 
-fn dtb_slice<'a>(params: &BootParams) -> Option<&'a [u8]> {
+pub(crate) fn dtb_slice<'a>(params: &BootParams) -> Option<&'a [u8]> {
     let start = params.dtb_pa;
     let size = params.dtb_size;
     if start == 0 || size == 0 {

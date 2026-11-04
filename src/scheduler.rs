@@ -636,8 +636,10 @@ pub fn run_smp_churn_selftest() -> bool {
         .filter(|&cpu| CHURN_ON_CPU[cpu].load(Ordering::Relaxed) > 0)
         .count();
     // With only one AP available the boot CPU cannot take part (it is the
-    // waiter), so require one peer; with three APs require at least two.
-    let min_cpus = if smp::cpu_count() >= 3 { 2 } else { 1 };
+    // waiter), so require one peer; with three APs require at least two. Use
+    // the online count, not the possible-slot count: `-smp 2` must not be
+    // judged against a four-slot policy.
+    let min_cpus = if smp::online_cpu_count() >= 3 { 2 } else { 1 };
     let ok = exited == total && pending == 0 && ran_cpus >= min_cpus;
     if ok {
         console::write_str("SMP SELFTEST: churn PASS (");
@@ -892,6 +894,20 @@ fn finish_init(first_id: u64) {
     );
     // From here on `schedule` may run: the current index names a real task.
     SCHEDULER_READY.store(true, Ordering::Release);
+}
+
+/// Asserts the SYS_STOP_CONSOLE policy: the syscall requires
+/// `CAP_CONSOLE_GRANT` on the caller. The console owner (HOWLER) receives it
+/// at spawn, while a plain driver does not, so a driver is denied and the
+/// owner is allowed. This guards the grant map; the syscall branch itself is
+/// `current_task_has_rights(CAP_CONSOLE_GRANT)`.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn run_console_cap_selftest() -> bool {
+    let allowed = initial_self_rights(user_program::HOWLER)
+        .is_some_and(|rights| rights & capability::CAP_CONSOLE_GRANT != 0);
+    let denied = initial_self_rights(user_program::BLOCK_DRIVER)
+        .is_some_and(|rights| rights & capability::CAP_CONSOLE_GRANT == 0);
+    allowed && denied
 }
 
 /// Runs one blocking scheduling step for a caller that does not necessarily
@@ -1477,36 +1493,131 @@ fn reaper_pid(manager: &TaskManager, excluded: u64) -> u64 {
     IDLE_TASK_ID
 }
 
-fn snapshot_current_ids(manager: &TaskManager) -> Vec<Option<u64>> {
-    (0..smp::MAX_CPUS)
-        .filter(|&cpu| smp::cpu_online(cpu))
-        .map(|cpu| {
-            manager
+/// Per-CPU snapshot keyed by CPU id, not by position in the online set.
+///
+/// A compact `Vec` of the online CPUs plus `zip` in the remap was racy: APs
+/// publish `online` from their own trampoline without the kernel lock, so a
+/// CPU that came online between the snapshot and the remap shifted every
+/// later entry by one. Keying the array by CPU id makes the snapshot immune to
+/// that, and `None` keeps its literal meaning: "this CPU had no current task".
+fn snapshot_current_ids(manager: &TaskManager) -> [Option<u64>; smp::MAX_CPUS] {
+    let mut snapshot = [None; smp::MAX_CPUS];
+    for cpu in 0..smp::MAX_CPUS {
+        if smp::cpu_online(cpu) {
+            snapshot[cpu] = manager
                 .tasks
                 .get(smp::current_index_of(cpu))
-                .map(|task| task.id)
-        })
-        .collect()
+                .map(|task| task.id);
+        }
+    }
+    snapshot
 }
 
-fn remap_current_indices(manager: &TaskManager, snapshot: &[Option<u64>], live_id: Option<u64>) {
-    for (cpu, current_id) in (0..smp::MAX_CPUS)
-        .filter(|&cpu| smp::cpu_online(cpu))
-        .zip(snapshot)
-    {
-        // Preserve the "no current task" sentinel: an AP that has not picked
-        // a task yet must not be remapped to idle after an unrelated task is
-        // removed. A removed current id also leaves the CPU with no task.
-        let index = current_id
-            .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
+fn remap_current_indices(
+    manager: &TaskManager,
+    snapshot: &[Option<u64>; smp::MAX_CPUS],
+    live_id: Option<u64>,
+) {
+    for (cpu, current_id) in snapshot.iter().enumerate() {
+        if !smp::cpu_online(cpu) {
+            continue;
+        }
+        let Some(current_id) = current_id else {
+            // No current task when the snapshot was taken: an AP parked before
+            // its first pick, or a CPU that already had no task. Leave the
+            // sentinel alone. Writing an index here would hand the CPU another
+            // task; the SP guard would then reject its genuine boot stack and
+            // pin it in `wait_for_irq` forever.
+            continue;
+        };
+        // A current task that no longer exists (removed while dead) leaves the
+        // CPU with no task, which is `usize::MAX` by contract.
+        let index = manager
+            .tasks
+            .iter()
+            .position(|task| task.id == *current_id)
             .unwrap_or(usize::MAX);
         smp::set_current_index_for(cpu, index);
     }
-    smp::set_current_index(
-        live_id
-            .and_then(|id| manager.tasks.iter().position(|task| task.id == id))
-            .unwrap_or(usize::MAX),
-    );
+    // The caller's own CPU may be missing from the snapshot only if it is not
+    // `online`; `live_id` remains the authoritative value for it. A `None`
+    // live id is the "no current task" sentinel and must not be turned into an
+    // index.
+    if let Some(id) = live_id {
+        let index = manager
+            .tasks
+            .iter()
+            .position(|task| task.id == id)
+            .unwrap_or(usize::MAX);
+        smp::set_current_index(index);
+    }
+}
+
+/// Proves that a reap/removal which remaps every CPU's current index preserves
+/// the "no current task" sentinel of an online AP that has not made its first
+/// pick. Runs before the APs are released from `ap_tlb_probe_wait`, when their
+/// `current_index` is still `usize::MAX`.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+extern "C" fn remap_probe_task() -> ! {
+    exit_current()
+}
+
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn run_remap_sentinel_selftest() -> bool {
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    let Some(cpu) = (1..smp::MAX_CPUS)
+        .find(|&cpu| smp::cpu_online(cpu) && smp::current_index_of(cpu) == usize::MAX)
+    else {
+        // Single CPU, or every AP already picked: nothing to prove here.
+        return true;
+    };
+
+    // The probe must not shift `next_id`: user-space spawn logic assumes a
+    // task id and its per-task cap-handle id advance in lockstep. Give the
+    // probe an explicit id above the user space, like the churn tasks.
+    const REMAP_PROBE_ID: u64 = 1 << 42;
+    let saved_next = manager.next_id;
+    manager.next_id = REMAP_PROBE_ID;
+    let probe = spawn_kernel(remap_probe_task);
+    manager.next_id = saved_next;
+    let Some(id) = probe else {
+        return false;
+    };
+    let Some(index) = manager.tasks.iter().position(|task| task.id == id) else {
+        return false;
+    };
+    // Kill the probe before it can run, exactly like a task that died while
+    // the AP was still parked, then force both remap paths: reap (no index
+    // shift) and zombie removal (indices shift).
+    manager.tasks[index].state = TaskState::Dead;
+    manager.tasks[index].running_on = None;
+    reap_dead_tasks(manager);
+    let after_reap = smp::current_index_of(cpu);
+    if let Some(zombie) = manager
+        .tasks
+        .iter()
+        .position(|task| task.id == id && task.state == TaskState::Zombie)
+    {
+        take_zombie(manager, zombie);
+    }
+    let after_remove = smp::current_index_of(cpu);
+    let ok = after_reap == usize::MAX && after_remove == usize::MAX;
+    if ok {
+        console::write_str("SMP SELFTEST: remap sentinel PASS (AP");
+        console::write_dec_u64(cpu as u64);
+        console::write_str(" kept no-current-task)\r\n");
+    } else {
+        console::write_str("SMP SELFTEST: remap sentinel FAIL (cpu=");
+        console::write_dec_u64(cpu as u64);
+        console::write_str(" after_reap=");
+        console::write_dec_u64(after_reap as u64);
+        console::write_str(" after_remove=");
+        console::write_dec_u64(after_remove as u64);
+        console::write_str(")\r\n");
+    }
+    ok
 }
 
 /// Read-only cross-CPU scheduling invariant snapshot, taken with the kernel

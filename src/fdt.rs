@@ -316,29 +316,46 @@ impl<'a> Fdt<'a> {
 
     /// Copies the DTB header memory-reservation map into `out`. This is where
     /// the bootloader normally records the DTB itself and the ramdisk.
-    pub fn memreserve_regions(&self, out: &mut [Region]) -> usize {
+    ///
+    /// Fails closed (`None`) on a malformed or overflowing entry and when the
+    /// map does not fit in `out`: silently dropping a reservation would let
+    /// the allocator hand out memory the firmware marked as reserved. The
+    /// pre-relocation validator uses the same policy.
+    pub fn memreserve_regions(&self, out: &mut [Region]) -> Option<usize> {
         let mut count = 0usize;
         let mut offset = self.off_rsvmap;
-        while offset + 16 <= self.totalsize {
-            let Some(address) = read_be64(self.data, offset) else {
-                break;
+        loop {
+            let Some(next) = offset.checked_add(16) else {
+                return None;
             };
-            let Some(size) = read_be64(self.data, offset + 8) else {
-                break;
-            };
-            if address == 0 && size == 0 {
-                break;
+            if next > self.totalsize {
+                return Some(count);
             }
-            if size != 0
-                && address.checked_add(size).is_some()
-                && count < out.len()
-            {
-                out[count] = Region::new(address, address + size);
+            let address = read_be64(self.data, offset)?;
+            let size = read_be64(self.data, offset + 8)?;
+            if address == 0 && size == 0 {
+                return Some(count);
+            }
+            if size != 0 {
+                let end = address.checked_add(size)?;
+                if count >= out.len() {
+                    return None;
+                }
+                out[count] = Region::new(address, end);
                 count += 1;
             }
-            offset += 16;
+            offset = next;
         }
-        count
+    }
+
+    /// Number of CPU nodes in the live tree, clamped to `limit`. A tree that
+    /// does not describe `/cpus` yields 0 and the caller keeps its default.
+    pub fn cpu_count(&self, limit: usize) -> usize {
+        let mut counter = CpuCounter { count: 0, limit };
+        if self.walk(&mut counter).is_none() {
+            return 0;
+        }
+        counter.count
     }
 
     /// Finds the best GENI UART node: a `qcom,geni-debug-uart` wins over a
@@ -708,6 +725,25 @@ impl<'a, 'o> Visitor<'a> for ReservedRegions<'o> {
             self.depth = self.depth.saturating_sub(1);
         }
     }
+}
+
+/// Counts `/cpus` children (`cpu` or `cpu@...`), bounded by the caller's slot
+/// limit. Used to size AP bring-up from the live tree instead of assuming
+/// `MAX_CPUS`; a count of 0 means the tree did not describe CPUs.
+struct CpuCounter {
+    count: usize,
+    limit: usize,
+}
+
+impl<'a> Visitor<'a> for CpuCounter {
+    fn begin(&mut self, _path: &str, name: &str) {
+        let is_cpu = name == "cpu" || name.starts_with("cpu@");
+        if is_cpu && self.count < self.limit {
+            self.count += 1;
+        }
+    }
+    fn property(&mut self, _path: &str, _name: &str, _value: &'a [u8]) {}
+    fn end(&mut self, _path: &str) {}
 }
 
 #[derive(Default)]
@@ -1644,10 +1680,63 @@ mod tests {
         let blob = dtb.build();
         let fdt = Fdt::new(&blob).unwrap();
         let mut regions = [Region::default(); 4];
-        let count = fdt.memreserve_regions(&mut regions);
+        let count = fdt.memreserve_regions(&mut regions).unwrap();
         assert_eq!(count, 2);
         assert_eq!(regions[0], Region::new(0x4008_0000, 0x4028_0000));
         assert_eq!(regions[1], Region::new(0x5c00_0000, 0x5c00_1000));
+    }
+
+    #[test]
+    fn cpu_count_reads_cpus_node() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.prop_str("compatible", "test,board");
+        dtb.begin("cpus");
+        dtb.prop_u32("#address-cells", 1);
+        dtb.prop_u32("#size-cells", 0);
+        for index in 0..3 {
+            dtb.begin(&format!("cpu@{index}"));
+            dtb.prop_str("device_type", "cpu");
+            dtb.end();
+        }
+        dtb.end();
+        let blob = dtb.build();
+        let fdt = Fdt::new(&blob).unwrap();
+        assert_eq!(fdt.cpu_count(4), 3);
+        // The slot limit wins when the tree describes more CPUs than we can
+        // bring up.
+        assert_eq!(fdt.cpu_count(2), 2);
+    }
+
+    #[test]
+    fn cpu_count_absent_is_zero() {
+        let blob = sample_dtb().build();
+        let fdt = Fdt::new(&blob).unwrap();
+        assert_eq!(fdt.cpu_count(4), 0);
+    }
+
+    #[test]
+    fn memreserve_overflow_fails_closed() {
+        let mut dtb = sample_dtb();
+        // address + size wraps: the reservation cannot be represented, so the
+        // parser must refuse instead of dropping it and handing the range to
+        // the allocator.
+        dtb.memreserve.push((u64::MAX - 0x10, 0x100));
+        let blob = dtb.build();
+        let fdt = Fdt::new(&blob).unwrap();
+        let mut regions = [Region::default(); 4];
+        assert_eq!(fdt.memreserve_regions(&mut regions), None);
+    }
+
+    #[test]
+    fn memreserve_out_of_space_fails_closed() {
+        let mut dtb = sample_dtb();
+        dtb.memreserve.push((0x4008_0000, 0x20_0000));
+        dtb.memreserve.push((0x5c00_0000, 0x1000));
+        let blob = dtb.build();
+        let fdt = Fdt::new(&blob).unwrap();
+        let mut regions = [Region::default(); 1];
+        assert_eq!(fdt.memreserve_regions(&mut regions), None);
     }
 
     #[test]

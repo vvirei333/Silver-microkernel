@@ -907,10 +907,16 @@ pub fn map_user_heap_pages(ttbr0: usize, first_index: usize, physical_pages: &[u
     unsafe {
         let l1_user = follow_table(root, 0);
         let l2_user = follow_table(l1_user, 1);
-        let l3_heap = follow_table(l2_user, USER_HEAP_L2_INDEX);
-        if l3_heap == 0 {
+        // F2: the heap L3 is created with the space and is never freed by a
+        // generic unmap, but never trust the descriptor kind. A zero or a
+        // block descriptor here must fail, not be dereferenced as a table
+        // (physical address 0 or an unrelated frame).
+        let l2_entry = read_entry(l2_user, USER_HEAP_L2_INDEX);
+        if l2_entry & DESC_TABLE != DESC_TABLE {
             return false;
         }
+        let l3_heap = descriptor_address(l2_entry) as usize;
+        debug_assert!(l3_heap != 0 && l3_heap % GRANULE == 0);
         for index in first_index..last {
             if read_entry(l3_heap, index) != 0 {
                 return false;
@@ -937,7 +943,11 @@ pub fn unmap_user_heap_page(ttbr0: usize, index: usize) -> Option<usize> {
     unsafe {
         let l1_user = follow_table(root, 0);
         let l2_user = follow_table(l1_user, 1);
-        let l3_heap = follow_table(l2_user, USER_HEAP_L2_INDEX);
+        let l2_entry = read_entry(l2_user, USER_HEAP_L2_INDEX);
+        if l2_entry & DESC_TABLE != DESC_TABLE {
+            return None;
+        }
+        let l3_heap = descriptor_address(l2_entry) as usize;
         if l3_heap == 0 {
             return None;
         }
@@ -1465,7 +1475,7 @@ pub fn map_phys_to_user(
         return None;
     }
     map_user_pages(
-        task,
+        task.ttbr0,
         physical_start,
         page_count,
         physical_offset,
@@ -1495,6 +1505,13 @@ pub fn map_dma_to_user(
     phys_addr: usize,
     size: usize,
 ) -> Option<usize> {
+    map_dma_to_user_space(task.ttbr0, phys_addr, size)
+}
+
+/// [`map_dma_to_user`] for a raw address space. Exposed so the boot self-test
+/// exercises the same zero -> clean -> publish sequence without constructing a
+/// scheduler task.
+pub fn map_dma_to_user_space(ttbr0: usize, phys_addr: usize, size: usize) -> Option<usize> {
     if phys_addr % GRANULE != 0 || size % GRANULE != 0 {
         return None;
     }
@@ -1512,7 +1529,7 @@ pub fn map_dma_to_user(
         core::ptr::write_bytes(phys_to_virt(phys_addr) as *mut u8, 0, size);
     }
     clean_dma_range(phys_addr, size);
-    map_user_pages(task, phys_addr, page_count, 0, user_dma_page)
+    map_user_pages(ttbr0, phys_addr, page_count, 0, user_dma_page)
 }
 
 /// Maps a registered DMA allocation shared by another task. The scheduler
@@ -1543,7 +1560,7 @@ pub fn map_shared_dma_to_user(
         return None;
     }
     map_user_pages(
-        task,
+        task.ttbr0,
         physical_start,
         page_count,
         physical_offset,
@@ -1552,14 +1569,14 @@ pub fn map_shared_dma_to_user(
 }
 
 fn map_user_pages(
-    task: &crate::scheduler::Task,
+    ttbr0: usize,
     physical_start: usize,
     page_count: usize,
     physical_offset: usize,
     descriptor: fn(usize) -> u64,
 ) -> Option<usize> {
     unsafe {
-        let l3_mmio = user_mmio_table(task.ttbr0)?;
+        let l3_mmio = user_mmio_table(ttbr0)?;
         let mut first = ENTRIES;
         let mut run_length = 0;
         for index in 0..ENTRIES {
@@ -1590,7 +1607,7 @@ fn map_user_pages(
         }
         // One ASID-scoped invalidation publishes the whole device window. The
         // caller holds the kernel lock and the target task is not executing.
-        finish_table_changes_for(task.ttbr0);
+        finish_table_changes_for(ttbr0);
         let virtual_address = USER_MMIO_VA + first * GRANULE;
         Some(virtual_address + physical_offset)
     }
@@ -1899,6 +1916,92 @@ pub fn run_tlb_self_test() -> bool {
     let released = destroy_task_space(space, private, private_generation, asid_of(root));
 
     first_read == FIRST_VALUE && second_read == SECOND_VALUE && safe_to_free && released
+}
+
+/// Proves that a recycled DMA frame is zeroed before it is published to EL0.
+/// The frame is poisoned, then mapped through the same `map_dma_to_user_space`
+/// path userspace DMA uses; any stale byte would still be readable afterwards.
+pub fn run_dma_zero_self_test() -> bool {
+    let Some((private, private_generation)) = frame_allocator::alloc_page_tagged() else {
+        return false;
+    };
+    let Some((frame, frame_generation)) = frame_allocator::alloc_page_tagged() else {
+        frame_allocator::free_page_tagged(private, private_generation);
+        return false;
+    };
+    let Some((space, token)) = create_task_space(private, 0, None) else {
+        frame_allocator::free_page_tagged(frame, frame_generation);
+        frame_allocator::free_page_tagged(private, private_generation);
+        return false;
+    };
+
+    unsafe {
+        core::ptr::write_bytes(phys_to_virt(frame) as *mut u8, 0xA5, GRANULE);
+    }
+    clean_range_to_poc(frame, GRANULE);
+
+    let mapped = map_dma_to_user_space(space, frame, GRANULE).is_some();
+    let mut zeroed = true;
+    for index in 0..GRANULE {
+        let byte = unsafe { (phys_to_virt(frame) as *const u8).add(index).read() };
+        if byte != 0 {
+            zeroed = false;
+            break;
+        }
+    }
+
+    destroy_task_space(token, private, private_generation, asid_of(space));
+    frame_allocator::free_page_tagged(frame, frame_generation);
+    mapped && zeroed
+}
+
+/// Proves the heap-L3 persistence contract exercised by `SYS_MUNMAP`/`brk`:
+/// a generic unmap that empties the heap must not free the spawn-time L3
+/// table, and a later heap map must succeed instead of following a freed
+/// descriptor into physical address 0.
+pub fn run_heap_table_self_test() -> bool {
+    let Some((private, private_generation)) = frame_allocator::alloc_page_tagged() else {
+        return false;
+    };
+    let Some((first, first_generation)) = frame_allocator::alloc_page_tagged() else {
+        frame_allocator::free_page_tagged(private, private_generation);
+        return false;
+    };
+    let Some((second, second_generation)) = frame_allocator::alloc_page_tagged() else {
+        frame_allocator::free_page_tagged(first, first_generation);
+        frame_allocator::free_page_tagged(private, private_generation);
+        return false;
+    };
+    let Some((space, token)) = create_task_space(private, 0, None) else {
+        frame_allocator::free_page_tagged(second, second_generation);
+        frame_allocator::free_page_tagged(first, first_generation);
+        frame_allocator::free_page_tagged(private, private_generation);
+        return false;
+    };
+
+    // Poison the first frame so a skipped zeroing step is observable.
+    unsafe {
+        core::ptr::write_bytes(phys_to_virt(first) as *mut u8, 0xA5, GRANULE);
+    }
+    clean_range_to_poc(first, GRANULE);
+
+    let mut ok = map_user_heap_pages(space, 0, &[first]);
+    // Generic unmap empties the heap L3; it belongs to the space and must
+    // survive, otherwise the next map writes through a zero L2 descriptor.
+    if ok {
+        ok = unmap_user_pages_at(space, USER_HEAP_VA, 1);
+    }
+    if ok {
+        ok = map_user_heap_pages(space, 0, &[second]);
+    }
+    if ok {
+        ok = unmap_user_heap_page(space, 0) == Some(second);
+    }
+
+    destroy_task_space(token, private, private_generation, asid_of(space));
+    frame_allocator::free_page_tagged(first, first_generation);
+    frame_allocator::free_page_tagged(second, second_generation);
+    ok
 }
 
 /// Boot-time proof that two address spaces are isolated by their ASID tag:

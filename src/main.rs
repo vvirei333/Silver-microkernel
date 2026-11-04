@@ -1292,6 +1292,30 @@ pub extern "C" fn kernel_main() -> ! {
         console::write_str("MMU=OK\r\n");
         boot_metrics::log_milestone("MMU init");
     }
+
+    // Size AP bring-up from the live tree instead of assuming MAX_CPUS. QEMU
+    // passes a DTB even with `-kernel`; fog/tablet stay single-core by policy
+    // and a missing tree leaves the old default in place.
+    #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
+    {
+        let params = boot::get();
+        let dtb = params.as_ref().and_then(fog::dtb_slice);
+        let mut parsed = 0usize;
+        if let Some(data) = dtb {
+            if let Some(tree) = fdt::Fdt::new(data) {
+                parsed = tree.cpu_count(smp::MAX_CPUS);
+                smp::set_possible_cpus(parsed);
+            }
+        }
+        // QEMU `-kernel` passes no DTB, so this is evidence only when a
+        // bootloader did hand one over (and the count is non-zero).
+        if parsed > 0 && cfg!(feature = "smp-selftest") {
+            console::write_str("SMP: fdt cpus=");
+            console::write_dec_u64(parsed as u64);
+            console::write_str("\r\n");
+        }
+    }
+
     #[cfg(feature = "fog")]
     {
         fog::log_banner(&boot_params, &fog_info);
@@ -1374,6 +1398,45 @@ pub extern "C" fn kernel_main() -> ! {
     console::write_str("MMU ASID OK\r\n");
     ram_log::log("MMU ASID OK");
     ram_log::fb_progress();
+
+    // Heap-L3 persistence: emptying the heap through the generic unmap must
+    // not free the table, and the next heap map must land in the same slot
+    // instead of writing through a zero descriptor.
+    if !mmu::run_heap_table_self_test() {
+        exceptions::silver_handle_exception(9, 0, 0, 0);
+    }
+    console::write_str("MMU HEAP OK\r\n");
+    ram_log::log("MMU HEAP OK");
+    ram_log::fb_progress();
+
+    // Recycled DMA frames must be zero before EL0 can read them.
+    if !mmu::run_dma_zero_self_test() {
+        exceptions::silver_handle_exception(9, 0, 0, 0);
+    }
+    console::write_str("DMA ZERO OK\r\n");
+    ram_log::log("DMA ZERO OK");
+    ram_log::fb_progress();
+
+    // RX ring arithmetic under head/tail wraparound (the cross-CPU exclusion
+    // is the lock around push/pop; this proves the indices themselves).
+    #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+    {
+        if !pl011::run_ring_self_test() {
+            exceptions::silver_handle_exception(9, 0, 0, 0);
+        }
+        console::write_str("UART RING OK\r\n");
+        ram_log::log("UART RING OK");
+        ram_log::fb_progress();
+
+        // SYS_STOP_CONSOLE requires CAP_CONSOLE_GRANT: the owner has it, a
+        // plain driver does not.
+        if !scheduler::run_console_cap_selftest() {
+            exceptions::silver_handle_exception(9, 0, 0, 0);
+        }
+        console::write_str("CONSOLE CAP OK\r\n");
+        ram_log::log("CONSOLE CAP OK");
+        ram_log::fb_progress();
+    }
 
     // DMA quarantine window: a released run must survive the grace passes and
     // then return to the frame allocator.

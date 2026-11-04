@@ -89,18 +89,34 @@ static CPUS: [PerCpu; MAX_CPUS] = [
     PerCpu::empty(),
 ];
 
-/// Number of CPU slots the platform may bring up. QEMU `virt` uses up to
-/// [`MAX_CPUS`] (the profile is tested with `-smp 4`); CPUs the machine does
-/// not expose simply fail `PSCI CPU_ON` and stay offline. Both real-hardware
-/// profiles stay single-core: their boot stub parks secondaries and AP
-/// bring-up is QEMU-only.
+/// CPU slots the machine actually exposes, learned from the live FDT before
+/// the scheduler or AP bring-up runs. Kept at [`MAX_CPUS`] until then, and
+/// clamped again on read, so a missing or malformed tree keeps the old
+/// "try every slot, failed `CPU_ON` leaves it offline" behaviour.
+static POSSIBLE_CPUS: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(MAX_CPUS);
+
+/// Publishes the FDT-discovered CPU count. A zero (no `/cpus` node) is
+/// ignored: the platform default stays in place rather than turning the
+/// machine single-core by accident.
+pub fn set_possible_cpus(count: usize) {
+    if count > 0 {
+        POSSIBLE_CPUS.store(count.min(MAX_CPUS), Ordering::Release);
+    }
+}
+
+/// Number of CPU slots the platform may bring up. QEMU `virt` reports its
+/// actual `-smp` count from the FDT; a machine with fewer cores no longer
+/// pretends to have [`MAX_CPUS`] slots. Both real-hardware profiles stay
+/// single-core: their boot stub parks secondaries and AP bring-up is
+/// QEMU-only.
 pub fn cpu_count() -> usize {
     #[cfg(feature = "smp")]
     {
         if platform::detect().is_tablet() || platform::detect().is_fog() {
             1
         } else {
-            MAX_CPUS
+            POSSIBLE_CPUS.load(Ordering::Acquire).clamp(1, MAX_CPUS)
         }
     }
     #[cfg(not(feature = "smp"))]
@@ -108,6 +124,19 @@ pub fn cpu_count() -> usize {
         let _ = platform::detect();
         1
     }
+}
+
+/// Number of CPUs that have published themselves online. Used by policies
+/// that must reflect the machine that actually came up (for example the churn
+/// harness's "enough CPUs took part" rule) rather than the possible-slot count.
+pub fn online_cpu_count() -> usize {
+    let mut online = 0;
+    for cpu in 0..MAX_CPUS {
+        if cpu_online(cpu) {
+            online += 1;
+        }
+    }
+    online
 }
 
 /// Reads this CPU's [`PerCpu`] from `TPIDR_EL1`. Must only run after
@@ -1011,6 +1040,11 @@ pub fn boot_secondary_cpus() {
 
     #[cfg(feature = "smp-selftest")]
     {
+        // The peers are still parked in `ap_tlb_probe_wait` with no current
+        // task, which is exactly the window the remap sentinel test needs.
+        // Wait for them to publish `online` first (they park right after it).
+        let _ = wait_for_online_peers();
+        crate::scheduler::run_remap_sentinel_selftest();
         // The peers are parked in `ap_tlb_probe_wait` right now, so the
         // cross-PE TLB proof must run before the stop-the-world rounds.
         run_cross_pe_tlb_probe();
