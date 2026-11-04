@@ -337,11 +337,22 @@ pub fn probe(stage: u32) {
 /// path with a non-zero depth.
 #[inline]
 pub fn bkl_acquire() {
-    if crate::smp::BKL_DISABLED.load(Ordering::Relaxed) { return; }
+    if crate::smp::BKL_DISABLED.load(Ordering::Relaxed) {
+        return;
+    }
+    // The ownership store and the depth update must be one step as seen by
+    // this CPU's IRQ handlers: between the CAS that publishes the owner and
+    // `*depth = 1` the lock looks held (`owner == this CPU`) but depth is
+    // still 0. An IRQ taken in that window would see `irq_may_schedule()`
+    // and re-enter `schedule`, whose acquire can never succeed because the
+    // owner is this CPU. Mask IRQs across the acquisition; callers that want
+    // them enabled get their state back on return.
+    let saved_daif = interrupts::save_and_disable_irq();
     let cpu = this_cpu();
     let depth = unsafe { &mut *cpu.bkl_depth.get() };
     if *depth > 0 {
         *depth += 1;
+        interrupts::restore_irq(saved_daif);
         return;
     }
     if quiesce_active() && KERNEL_LOCK.owner.load(Ordering::Relaxed) != cpu.cpu_id as isize {
@@ -372,9 +383,18 @@ pub fn bkl_acquire() {
         }
         spins += 1;
         if spins == 50_000_000 {
+            let owner = KERNEL_LOCK.owner.load(Ordering::Relaxed);
             crate::console::write_str("BKL STUCK: owner=");
-            crate::console::write_hex_u64(KERNEL_LOCK.owner.load(Ordering::Relaxed) as u64);
-            crate::console::write_str(" depth=");
+            crate::console::write_hex_u64(owner as u64);
+            crate::console::write_str(" owner_depth=");
+            if owner >= 0 && (owner as usize) < MAX_CPUS {
+                crate::console::write_dec_u64(
+                    unsafe { *CPUS[owner as usize].bkl_depth.get() } as u64
+                );
+            } else {
+                crate::console::write_str("free");
+            }
+            crate::console::write_str(" self_depth=");
             crate::console::write_dec_u64(*depth as u64);
             crate::console::write_str("\r\n");
         }
@@ -383,15 +403,33 @@ pub fn bkl_acquire() {
         }
     }
     *depth = 1;
+    interrupts::restore_irq(saved_daif);
 }
 
 /// Releases the kernel lock. Must be paired with [`bkl_acquire`].
 #[inline]
 pub fn bkl_release() {
-    if crate::smp::BKL_DISABLED.load(Ordering::Relaxed) { return; }
+    if crate::smp::BKL_DISABLED.load(Ordering::Relaxed) {
+        return;
+    }
     let cpu = this_cpu();
     let depth = unsafe { &mut *cpu.bkl_depth.get() };
     debug_assert!(*depth > 0, "bkl_release without acquire");
+    if *depth == 0 {
+        // A release without a matching acquire is never legitimate: the
+        // per-CPU depth counts this CPU's own holds only. Decrementing here
+        // would wrap to `u32::MAX` and turn every later acquire into a silent
+        // recursive no-op, so the lock would stop protecting anything. Fail
+        // safe: report once and drop the release.
+        static UNDERFLOW_REPORTED: core::sync::atomic::AtomicBool =
+            core::sync::atomic::AtomicBool::new(false);
+        if !UNDERFLOW_REPORTED.swap(true, Ordering::AcqRel) {
+            crate::console::write_str("BKL: release without acquire on cpu=");
+            crate::console::write_dec_u64(cpu.cpu_id as u64);
+            crate::console::write_str("\r\n");
+        }
+        return;
+    }
     *depth -= 1;
     if *depth == 0 {
         KERNEL_LOCK.owner.store(BKL_FREE, Ordering::Release);
@@ -402,7 +440,10 @@ pub fn bkl_release() {
 /// kernel lock (no-op outside debug builds).
 #[inline]
 pub fn bkl_assert_held() {
-    debug_assert!(unsafe { *this_cpu().bkl_depth.get() } > 0, "kernel lock not held");
+    debug_assert!(
+        unsafe { *this_cpu().bkl_depth.get() } > 0,
+        "kernel lock not held"
+    );
 }
 
 /// RAII kernel-lock holder for functions with early returns: acquires on
@@ -682,6 +723,15 @@ pub fn bkl_depth() -> u32 {
     unsafe { *this_cpu().bkl_depth.get() }
 }
 
+/// True when an IRQ handler may run a scheduling pass. The interrupted
+/// context must not already hold the kernel lock: a pass taken on top of a
+/// task that is inside a syscall adds a second hold, and the block of the
+/// next task consumes it, breaking the per-CPU depth accounting that carries
+/// the lock across a context switch. Kernel code is therefore non-preemptible
+/// under the BKL; it schedules at its own blocking points.
+pub fn irq_may_schedule() -> bool {
+    bkl_depth() == 0
+}
 
 /// Non-inline wrapper for asm callers (`silver_user_bootstrap` drops the
 /// inherited kernel lock before `eret`-ing into user mode).
@@ -876,7 +926,12 @@ pub fn boot_secondary_cpus() {
         if !crate::mmu::install_ap_identity(ttbr0) {
             // No AP was started, so the freshly built space is not running
             // anywhere and can be torn down without the quiescence gate.
-            crate::mmu::destroy_task_space(space_token, private, private_generation, crate::mmu::asid_of(ttbr0));
+            crate::mmu::destroy_task_space(
+                space_token,
+                private,
+                private_generation,
+                crate::mmu::asid_of(ttbr0),
+            );
             crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: no AP identity map for CPU");
             crate::console::write_dec_u64(cpu as u64);
@@ -940,7 +995,12 @@ pub fn boot_secondary_cpus() {
             // them, and keep probing the remaining slots: a QEMU machine with
             // fewer CPUs than `MAX_CPUS` simply reports every missing slot as
             // offline instead of aborting the whole bring-up.
-            crate::mmu::destroy_task_space(space_token, private, private_generation, crate::mmu::asid_of(ttbr0));
+            crate::mmu::destroy_task_space(
+                space_token,
+                private,
+                private_generation,
+                crate::mmu::asid_of(ttbr0),
+            );
             crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: CPU_ON failed, CPU left offline\r\n");
             continue;
@@ -1135,7 +1195,12 @@ impl TlbProbeScratch {
         let mut frames = [(0usize, 0u32); 2];
         for slot in &mut frames {
             let Some((frame, generation)) = crate::frame_allocator::alloc_page_tagged() else {
-                crate::mmu::destroy_task_space(token, private, private_generation, crate::mmu::asid_of(ttbr0));
+                crate::mmu::destroy_task_space(
+                    token,
+                    private,
+                    private_generation,
+                    crate::mmu::asid_of(ttbr0),
+                );
                 for &(frame, generation) in frames.iter() {
                     // Generation 0 means "slot never filled".
                     if generation != 0 {
@@ -1161,7 +1226,12 @@ impl Drop for TlbProbeScratch {
     fn drop(&mut self) {
         // Every peer acknowledged phase B only after restoring its own TTBR0,
         // so no online CPU can still be walking these tables.
-        crate::mmu::destroy_task_space(self.token, self.private, self.private_generation, crate::mmu::asid_of(self.ttbr0));
+        crate::mmu::destroy_task_space(
+            self.token,
+            self.private,
+            self.private_generation,
+            crate::mmu::asid_of(self.ttbr0),
+        );
         for &(frame, generation) in self.frames.iter() {
             crate::frame_allocator::free_page_tagged(frame, generation);
         }
@@ -1236,13 +1306,7 @@ fn run_cross_pe_tlb_probe() {
     let (frame_a, _) = scratch.frames[0];
     let (frame_b, _) = scratch.frames[1];
 
-    if !crate::mmu::map_user_pages_at(
-        scratch.ttbr0,
-        va,
-        frame_a,
-        1,
-        crate::mmu::PROT_WRITE,
-    ) {
+    if !crate::mmu::map_user_pages_at(scratch.ttbr0, va, frame_a, 1, crate::mmu::PROT_WRITE) {
         TLB_PROBE_PHASE.store(TLB_PROBE_ABORT, Ordering::Release);
         crate::console::write_str("SMP SELFTEST: tlb cross-PE FAIL (map)\r\n");
         return;

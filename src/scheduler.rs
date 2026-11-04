@@ -9,11 +9,11 @@ use silver_microkernel::table_registry::TableToken;
 use crate::{
     capability,
     condvar::Condvar,
+    console,
     elf::LoadedImage,
-    elf_loader,
-    frame_allocator, interrupts, smp,
+    elf_loader, frame_allocator, interrupts, kernel_stack,
     memory::{phys_to_virt, virt_to_phys, MemoryRegion, PAGE_SIZE},
-    mmu, mutex, console, timer, user_program, vfs, kernel_stack,
+    mmu, mutex, smp, timer, user_program, vfs,
     wait_queue::WaitQueue,
 };
 
@@ -299,6 +299,21 @@ static mut AP_DUMMY_CONTEXTS: [TaskContext; smp::MAX_CPUS] = {
 /// and before any user task can observe a half-initialized scheduler.
 static AP_BOOT_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(true);
 
+/// True while this CPU is executing a scheduling pass *outside* the final
+/// context switch. A pass mutates a snapshot of every CPU's current index and
+/// then republishes it; a timer IRQ that enters `schedule` on the same CPU in
+/// between would run a second pass over a half-applied transition and could
+/// restore a stale index when the outer pass resumes. The AP idle loop is the
+/// one caller that enters `schedule` with IRQs enabled, so the pass both masks
+/// IRQs and refuses a nested entry (the churn harness deliberately re-enables
+/// IRQs while it waits, and that wait must not schedule recursively).
+static SCHED_PASS_ACTIVE: [core::sync::atomic::AtomicBool; smp::MAX_CPUS] = [
+    core::sync::atomic::AtomicBool::new(false),
+    core::sync::atomic::AtomicBool::new(false),
+    core::sync::atomic::AtomicBool::new(false),
+    core::sync::atomic::AtomicBool::new(false),
+];
+
 /// Set once `init` has published the first task and `set_current_index`.
 ///
 /// Until then there is no valid current task: a timer IRQ can fire inside
@@ -518,6 +533,9 @@ extern "C" fn churn_task() -> ! {
     if smp::bkl_depth() > 0 {
         smp::bkl_release();
     }
+    // A first dispatch inherits the dispatcher's masked DAIF (the scheduling
+    // pass keeps IRQs disabled across the context switch).
+    interrupts::enable_irq();
     let cpu = smp::this_cpu_id();
     if cpu < smp::MAX_CPUS {
         CHURN_ON_CPU[cpu].fetch_add(1, Ordering::Relaxed);
@@ -565,8 +583,13 @@ pub fn run_smp_churn_selftest() -> bool {
     let last_id = first_id + total as u64 - 1;
 
     // The boot CPU holds the BKL. Release it so the APs can run the tasks;
-    // the boot task itself stays Running and cannot be claimed.
+    // the boot task itself stays Running and cannot be claimed. Re-enable
+    // IRQs while waiting: global time (`timer::ticks`) advances on CPU 0
+    // only, so a masked wait would freeze every `sleep` deadline. A timer
+    // taken here re-enters `schedule`, which refuses the nested pass and
+    // returns, leaving this CPU's pass untouched.
     smp::bkl_release();
+    interrupts::enable_irq();
     let mut spins: u32 = 0;
     while CHURN_EXITED.load(Ordering::Acquire) < total {
         spins += 1;
@@ -577,6 +600,7 @@ pub fn run_smp_churn_selftest() -> bool {
             core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
         }
     }
+    interrupts::save_and_disable_irq();
     smp::bkl_acquire();
 
     let exited = CHURN_EXITED.load(Ordering::Acquire);
@@ -597,11 +621,13 @@ pub fn run_smp_churn_selftest() -> bool {
             break;
         }
         smp::bkl_release();
+        interrupts::enable_irq();
         for _ in 0..100_000 {
             unsafe {
                 core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
             }
         }
+        interrupts::save_and_disable_irq();
         smp::bkl_acquire();
     }
 
@@ -867,6 +893,23 @@ fn finish_init(first_id: u64) {
     SCHEDULER_READY.store(true, Ordering::Release);
 }
 
+/// Runs one blocking scheduling step for a caller that does not necessarily
+/// hold the kernel lock yet. User tasks reach `yield_current`/`sleep` through
+/// a syscall, which holds the lock; a kernel task entry drops the inherited
+/// hold before it starts running, so it must re-acquire one for the step.
+/// Holding the lock while `schedule_released` releases and re-acquires it
+/// keeps the lock depth balanced in both cases.
+fn schedule_step() {
+    let acquired = smp::bkl_depth() == 0;
+    if acquired {
+        smp::bkl_acquire();
+    }
+    schedule_released();
+    if acquired {
+        smp::bkl_release();
+    }
+}
+
 pub fn yield_current() {
     let saved_daif = interrupts::save_and_disable_irq();
     if let Some(task) = current_task_mut() {
@@ -874,8 +917,8 @@ pub fn yield_current() {
             task.state = TaskState::Ready;
         }
     }
-   
-    schedule_released();
+
+    schedule_step();
     interrupts::restore_irq(saved_daif);
 }
 
@@ -889,7 +932,7 @@ pub fn sleep(milliseconds: u64) {
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Sleeping(wake_at);
     }
-    schedule_released();
+    schedule_step();
     interrupts::restore_irq(saved_daif);
 }
 
@@ -923,10 +966,10 @@ pub fn wait_irq() -> bool {
 pub fn irq_is_bound(intid: u32) -> bool {
     scheduler_manager()
         .map(|manager| {
-            manager
-                .tasks
-                .iter()
-                .any(|task| !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(intid))
+            manager.tasks.iter().any(|task| {
+                !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+                    && task.bound_irq == Some(intid)
+            })
         })
         .unwrap_or(false)
 }
@@ -935,11 +978,9 @@ pub fn wake_bound_irq(intid: u32) -> bool {
     let Some(manager) = scheduler_manager() else {
         return false;
     };
-    let Some(index) = manager
-        .tasks
-        .iter()
-        .position(|task| !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(intid))
-    else {
+    let Some(index) = manager.tasks.iter().position(|task| {
+        !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(intid)
+    }) else {
         return false;
     };
     manager.tasks[index].irq_pending = true;
@@ -960,7 +1001,8 @@ pub fn console_sink_task() -> Option<u64> {
             .tasks
             .iter()
             .find(|task| {
-                !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(crate::gic::uart_irq())
+                !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+                    && task.bound_irq == Some(crate::gic::uart_irq())
             })
             .map(|task| task.id)
     });
@@ -974,7 +1016,9 @@ pub fn notify_bound_task(id: u64) -> bool {
     let notified = scheduler_manager()
         .and_then(|manager| {
             let index = manager.tasks.iter().position(|task| {
-                task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq.is_some()
+                task.id == id
+                    && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+                    && task.bound_irq.is_some()
             })?;
             manager.tasks[index].irq_pending = true;
             wake_blocked_index(manager, index, smp::this_cpu_id());
@@ -1152,6 +1196,15 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
         wake_process_waiters(manager);
     }
     schedule_released();
+    // A dead task must not park while holding the kernel lock. `schedule`
+    // normally switches away here; when every other task is already running
+    // (for example all idle tasks are busy) the pass returns without a switch,
+    // and `schedule_released` has just re-acquired the hold. Drop whatever
+    // remains before waiting for an interrupt, otherwise this CPU pins the
+    // lock while it is parked.
+    while smp::bkl_depth() > 0 {
+        smp::bkl_release();
+    }
     interrupts::restore_irq(saved_daif);
     loop {
         interrupts::wait_for_irq();
@@ -1635,11 +1688,9 @@ pub fn stop_console_owner() -> bool {
     let mut stopped = false;
     if let Some(manager) = scheduler_manager() {
         if manager.console_parent.is_some() {
-            if let Some(task) = manager
-                .tasks
-                .iter_mut()
-                .find(|task| task.owns_console && !matches!(task.state, TaskState::Dead | TaskState::Zombie))
-            {
+            if let Some(task) = manager.tasks.iter_mut().find(|task| {
+                task.owns_console && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+            }) {
                 let id = task.id;
                 let previous = if task.state == TaskState::Running {
                     TaskState::Ready
@@ -1665,11 +1716,9 @@ pub fn resume_task(id: u64) -> bool {
     let saved_daif = interrupts::save_and_disable_irq();
     let result = scheduler_manager()
         .map(|manager| {
-            let Some(index) = manager
-                .tasks
-                .iter()
-                .position(|task| task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie))
-            else {
+            let Some(index) = manager.tasks.iter().position(|task| {
+                task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+            }) else {
                 return false;
             };
             {
@@ -1695,10 +1744,9 @@ pub fn set_console_owner(id: u64) -> bool {
     let result = scheduler_manager()
         .map(|manager| {
             let valid = id != IDLE_TASK_ID
-                && manager
-                    .tasks
-                    .iter()
-                    .any(|task| task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie));
+                && manager.tasks.iter().any(|task| {
+                    task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+                });
             if valid {
                 for task in &mut manager.tasks {
                     task.owns_console = task.id == id;
@@ -1719,10 +1767,9 @@ pub fn set_console_owner(id: u64) -> bool {
 pub fn task_alive(id: u64) -> bool {
     scheduler_manager()
         .map(|manager| {
-            manager
-                .tasks
-                .iter()
-                .any(|task| task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie))
+            manager.tasks.iter().any(|task| {
+                task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+            })
         })
         .unwrap_or(false)
 }
@@ -1892,6 +1939,20 @@ pub fn schedule() {
         return;
     }
 
+    // A pass is not re-entrant on one CPU. The snapshot/remap pair below and
+    // the `running_on = None` -> publish-new-index transition are only
+    // consistent once the pass completes; a timer IRQ that ran a second pass
+    // in between would leave the outer pass publishing a stale index when it
+    // resumes. Mask IRQs for the whole pass and refuse a nested entry (the
+    // churn harness re-enables IRQs on purpose while it waits, so the mask
+    // alone is not a complete guard). The mask is dropped again only after
+    // the kernel lock has been released, right before returning or resuming.
+    let pass_cpu = smp::this_cpu_id();
+    if SCHED_PASS_ACTIVE[pass_cpu].swap(true, Ordering::AcqRel) {
+        return;
+    }
+    let saved_daif = interrupts::save_and_disable_irq();
+
     // The kernel lock is held for the whole pass. If this call switches
     // away, the outgoing task is suspended before the matching release and
     // the incoming task resumes inside its own suspended `schedule`, so the
@@ -1957,7 +2018,9 @@ pub fn schedule() {
         let current = &manager.tasks[current_index];
         let physical = sp_now.wrapping_sub(crate::memory::KERNEL_VIRT_BASE);
         if !current.stack.contains(physical.saturating_sub(1)) {
+            SCHED_PASS_ACTIVE[pass_cpu].store(false, Ordering::Release);
             smp::bkl_release();
+            interrupts::restore_irq(saved_daif);
             return;
         }
     }
@@ -1970,7 +2033,9 @@ pub fn schedule() {
         if had_current && manager.tasks[current_index].state == TaskState::Ready {
             manager.tasks[current_index].state = TaskState::Running;
         }
+        SCHED_PASS_ACTIVE[pass_cpu].store(false, Ordering::Release);
         smp::bkl_release();
+        interrupts::restore_irq(saved_daif);
         return;
     };
     if had_current && next_index == current_index && !live_is_dead {
@@ -1979,7 +2044,9 @@ pub fn schedule() {
         // `find_next_task` could consider it; restore Running before another
         // CPU can mistake it for runnable.
         manager.tasks[current_index].state = TaskState::Running;
+        SCHED_PASS_ACTIVE[pass_cpu].store(false, Ordering::Release);
         smp::bkl_release();
+        interrupts::restore_irq(saved_daif);
         return;
     }
 
@@ -2083,6 +2150,11 @@ pub fn schedule() {
         next_context_elr,
     );
 
+    // The pass is complete: the new `current_index` is published, so a later
+    // pass (including a preemption right after the resume) starts from a
+    // consistent cut. IRQs stay masked across the switch itself; the incoming
+    // task re-enables them from its own saved state.
+    SCHED_PASS_ACTIVE[pass_cpu].store(false, Ordering::Release);
     unsafe {
         silver_context_switch(current_context, &(*tasks.add(next_index)).context);
     }
@@ -2094,6 +2166,7 @@ pub fn schedule() {
     // release for a first dispatch; this line only executes on the resumed
     // path, so the kernel lock never stays pinned while a task sleeps.
     smp::bkl_release();
+    interrupts::restore_irq(saved_daif);
 }
 
 fn spawn_kernel(entry: extern "C" fn() -> !) -> Option<u64> {
@@ -2297,7 +2370,10 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
         });
         let task = manager.tasks.get_mut(smp::current_index())?;
         let task_id = task.id;
-        if !task.cap_table.has_self_rights(task_id, capability::CAP_MMIO) {
+        if !task
+            .cap_table
+            .has_self_rights(task_id, capability::CAP_MMIO)
+        {
             return None;
         }
         // Capacity is checked before the PTE is installed. The operation is
@@ -2330,7 +2406,10 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
     let result = scheduler_manager().and_then(|manager| {
         let task = manager.tasks.get_mut(smp::current_index())?;
         let task_id = task.id;
-        if !task.cap_table.has_self_rights(task_id, capability::CAP_MMIO) {
+        if !task
+            .cap_table
+            .has_self_rights(task_id, capability::CAP_MMIO)
+        {
             console::write_str("DMA: FAIL - no CAP_MMIO rights\r\n");
             return None;
         }
@@ -2493,9 +2572,7 @@ fn spawn_inner(
 /// only ever chosen by the global fallback so real work always wins).
 fn ready_for_queue(manager: &TaskManager, index: usize) -> bool {
     manager.tasks.get(index).is_some_and(|task| {
-        !task.is_idle
-            && task.state == TaskState::Ready
-            && task.running_on.is_none()
+        !task.is_idle && task.state == TaskState::Ready && task.running_on.is_none()
     })
 }
 
@@ -2580,10 +2657,7 @@ fn find_next_task(manager: &mut TaskManager, cpu: usize, scan_base: usize) -> Op
     for offset in 1..=task_count {
         let index = (scan_base + offset) % task_count;
         let task = &manager.tasks[index];
-        if !task.is_idle
-            && task.state == TaskState::Ready
-            && task.running_on.is_none()
-        {
+        if !task.is_idle && task.state == TaskState::Ready && task.running_on.is_none() {
             #[cfg(all(feature = "smp", feature = "smp-selftest"))]
             note_pick(&READY_SCAN_PICKS, cpu);
             return Some(index);
@@ -2702,9 +2776,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     // handshake times out, fall back to the conservative per-range gate and
     // leak rather than tearing a live space down.
     let needs_quiesce = manager.tasks.iter().any(|task| {
-        task.state == TaskState::Dead
-            && task.running_on.is_none()
-            && !task.dma_pages.is_empty()
+        task.state == TaskState::Dead && task.running_on.is_none() && !task.dma_pages.is_empty()
     });
     let quiesced = needs_quiesce && smp::quiesce_begin();
     let mut dma_revokes: Vec<(usize, usize, mmu::RevokeResult)> = Vec::new();
@@ -2784,7 +2856,11 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
             console::write_str(" from ");
             console::write_dec_u64(affected_tasks as u64);
             console::write_str(" task(s), safe_to_free=");
-            console::write_str(if aggregated.safe_to_free { "true" } else { "false" });
+            console::write_str(if aggregated.safe_to_free {
+                "true"
+            } else {
+                "false"
+            });
             console::write_str("\r\n");
             dma_revokes.push((physical, page_count, aggregated));
         }
@@ -2796,10 +2872,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     let mut became_zombie: Vec<u64> = Vec::new();
     let mut wake: Vec<u64> = Vec::new();
     for task in &mut manager.tasks {
-        if task.state != TaskState::Dead
-            || task.running_on.is_some()
-            || task.resources_released
-        {
+        if task.state != TaskState::Dead || task.running_on.is_some() || task.resources_released {
             continue;
         }
         // Backstop unlink: ipc queues were already detached in `remove_task`
@@ -3178,12 +3251,14 @@ impl Task {
 
         let (physical_start, generation) =
             frame_allocator::alloc_contiguous_pages_tagged(page_count)?;
-        if !mmu::map_user_pages_at(self.ttbr0, virtual_address, physical_start, page_count, prot) {
-            frame_allocator::free_contiguous_pages_tagged(
-                physical_start,
-                page_count,
-                generation,
-            );
+        if !mmu::map_user_pages_at(
+            self.ttbr0,
+            virtual_address,
+            physical_start,
+            page_count,
+            prot,
+        ) {
+            frame_allocator::free_contiguous_pages_tagged(physical_start, page_count, generation);
             return None;
         }
 

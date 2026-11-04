@@ -17,9 +17,10 @@ per-CPU timer liveness.
 **SMP feature program (2026-11-04):** four packages, in order —
 (1) per-CPU ready queues **[done]**, (2) ASID-tagged address spaces **[done]**,
 (3) DMA in-flight quiescence contract **[done]**, (4) SMP churn stress
-**[harness done, open scheduler bug]**. Each package is verified on its own
-before the next starts; the churn harness found a real issue and stays opt-in
-until it is fixed.
+**[done]**. Each package is verified on its own before the next starts. The
+churn harness found three scheduler bugs; all are fixed and the harness now
+passes repeatedly on `-smp 4`. It stays opt-in so `smp-selftest` does not
+depend on four online CPUs.
 
 - **Page-table ownership and DMA reclamation (Packages E/E1/E2).** Every page
   table is registered with `(frame, generation, owner)`; walks validate the
@@ -188,15 +189,29 @@ until it is fixed.
   12 short-lived kernel tasks with explicit high ids (`next_id` is saved and
   restored around each spawn so user spawn ids stay in lockstep with per-task
   cap-handle ids), releases the BKL, lets the APs dispatch/yield/sleep/exit
-  them, then reaps with the invariant audit active. It found a real bug: under
-  concurrent kernel-task churn a CPU's `current_index` can be left naming a
-  `Ready` task whose `running_on` is `None`, which trips
-  `sched invariant FAIL (a CPU's current task is not marked running on it)`;
-  some tasks also never reach `CHURN_EXITED`. The harness is therefore **not**
-  part of `smp-selftest` and does not run in any default profile. Kernel tasks
-  also no longer print an `EXIT:` line (`program == u64::MAX`), which was pure
-  console noise from the probes. Root-causing the stale index is the next
-  scheduler task.
+  them, then reaps with the invariant audit active. It found three real bugs,
+  all fixed:
+  - a scheduling pass was preemptible, so a timer IRQ could run a second pass
+    on a half-applied `current_index` snapshot; when the outer pass resumed it
+    republished the stale index. `schedule` now masks IRQs for the whole pass
+    and refuses a nested entry (`SCHED_PASS_ACTIVE`).
+  - kernel-task `yield`/`sleep` release the kernel lock through
+    `schedule_released`, but a kernel entry drops its inherited hold first, so
+    the release had no matching acquire and wrapped `bkl_depth` to
+    `u32::MAX`. Both now go through `schedule_step`, which acquires the lock
+    when the caller holds none.
+  - an IRQ taken between the CAS that publishes the lock owner and the
+    `*depth = 1` store saw `owner == this CPU` with depth 0 and could re-enter
+    `schedule`, whose acquire can never succeed. `bkl_acquire` now masks IRQs
+    across the acquisition, and `bkl_release` fails safe (reports once, does
+    not decrement) if a release has no matching acquire.
+  A dead task also no longer parks holding the lock when `schedule` finds no
+  next task:
+  `exit_current` drains any remaining depth before its `wfi` loop. Kernel
+  tasks no longer print an `EXIT:` line (`program == u64::MAX`). The harness
+  is stable across repeated `-smp 4` runs with the audit active but stays
+  opt-in: `cpu_count()` assumes `MAX_CPUS`, so a machine with fewer online
+  CPUs fails its "N CPUs took part" policy rather than the scheduler.
 - Verified in this snapshot: **146 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
@@ -206,7 +221,9 @@ until it is fixed.
   on `-smp 4` (one peer on `-smp 2`), and the combined
   `no_std,smp,demo-tasks,smp-selftest` profile at **69 PASS / 0 FAIL / 0 PANIC**
   with zero invariant failures and a `ready queues local=.. steal=.. scan=0`
-  dispatch-mix line. A negative build that drops the
+  dispatch-mix line. The opt-in
+  `no_std,smp-selftest,smp-churn` profile passed 28 consecutive `-smp 4` runs
+  (`churn PASS`, audit active, no lock underflow or `BKL STUCK`). A negative build that drops the
   `running_on` claim makes the invariant check fire on the next pass
   (`sched invariant FAIL (a CPU's current task is not marked running on it)`).
   Tablet build, and fog boot image v3. The boot self-tests log

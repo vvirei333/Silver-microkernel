@@ -83,18 +83,14 @@ const GICR_MAX_PE: usize = 8;
 
 // Runtime configuration. The live FDT is authoritative; these defaults are
 // only used when no tree described a GIC (or for the existing tablet path).
-static GICD_BASE_PA: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
-static GICR_BASE_PA: core::sync::atomic::AtomicUsize =
-    core::sync::atomic::AtomicUsize::new(0);
+static GICD_BASE_PA: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+static GICR_BASE_PA: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 static GICR_STRIDE_RT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0x2_0000);
 static GICR_MAX_PE_RT: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(GICR_MAX_PE);
-static TIMER_IRQ_RT: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
-static UART_IRQ_RT: core::sync::atomic::AtomicU32 =
-    core::sync::atomic::AtomicU32::new(0);
+static TIMER_IRQ_RT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+static UART_IRQ_RT: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 /// True only after this boot CPU located its own redistributor and enabled
 /// the timer PPI on it. When false the timer must not arm: an unmatched
 /// distributor cannot deliver the tick, and writing frame 0 would target
@@ -238,8 +234,7 @@ pub fn cpu_init() -> bool {
     let Some(redistributor) = redistributor_for_self() else {
         return false;
     };
-    let expected = (1_u32 << (RESCHEDULE_IRQ % 32))
-        | (1_u32 << (crate::gic::QUIESCE_IRQ % 32));
+    let expected = (1_u32 << (RESCHEDULE_IRQ % 32)) | (1_u32 << (crate::gic::QUIESCE_IRQ % 32));
     required_bits_set(
         read32(redistributor + GICR_SGI_OFFSET + GICR_ISENABLER0),
         expected,
@@ -545,8 +540,14 @@ fn configure_uart_spi() {
     let word = 1_u32 << (irq % 32);
     let offset = (irq as usize / 32) * 4;
 
-    write32(gicd() + GICD_IGROUPR + offset, read32(gicd() + GICD_IGROUPR + offset) | word);
-    write32(gicd() + GICD_IGRPMODR + offset, read32(gicd() + GICD_IGRPMODR + offset) & !word);
+    write32(
+        gicd() + GICD_IGROUPR + offset,
+        read32(gicd() + GICD_IGROUPR + offset) | word,
+    );
+    write32(
+        gicd() + GICD_IGRPMODR + offset,
+        read32(gicd() + GICD_IGRPMODR + offset) & !word,
+    );
     // Level-triggered: clear the two config bits for SPI 462.
     let config_offset = GICD_ICFGR + (irq as usize / 16) * 4;
     let config_shift = (irq as usize % 16) * 2;
@@ -688,7 +689,9 @@ pub fn handle_irq() {
     match irq {
         RESCHEDULE_IRQ => {
             end_interrupt(acknowledge_register);
-            scheduler::schedule();
+            if crate::smp::irq_may_schedule() {
+                scheduler::schedule();
+            }
         }
         crate::gic::QUIESCE_IRQ => {
             end_interrupt(acknowledge_register);
@@ -698,7 +701,9 @@ pub fn handle_irq() {
         _ if irq == timer_irq() => {
             timer::handle_irq();
             end_interrupt(acknowledge_register);
-            scheduler::schedule();
+            if crate::smp::irq_may_schedule() {
+                scheduler::schedule();
+            }
         }
         _ => {
             // Probe and wake are one kernel-lock-protected step (see gic.rs).

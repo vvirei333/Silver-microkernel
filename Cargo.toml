@@ -21,9 +21,10 @@ smp = []
 # and report PASS/FAIL. Kernel-only; no userspace protocol is involved.
 smp-selftest = ["smp"]
 # Opt-in diagnostic stress: spawn short-lived kernel tasks while the APs run
-# and reap them, with the per-pass scheduler invariant audit enabled. It
-# currently exposes an intermittent stale-current_index race, so it is NOT part
-# of smp-selftest and must be requested explicitly.
+# and reap them, with the per-pass scheduler invariant audit enabled. Stable
+# with `-smp 4` (the supported SMP layout); kept out of `smp-selftest` because
+# `cpu_count()` assumes `MAX_CPUS`, so a machine with fewer online CPUs would
+# fail the harness's "N CPUs took part" policy rather than the scheduler.
 smp-churn = ["smp-selftest"]
 demo-tasks = []
 tablet = []

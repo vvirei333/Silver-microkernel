@@ -25,7 +25,7 @@ use core::ptr;
 use core::sync::atomic::{AtomicU32, Ordering};
 
 use crate::irq_policy::{self, MaskScope, UnmaskableAction};
-use crate::{exceptions, memory, console, scheduler, timer, platform, gicv3};
+use crate::{console, exceptions, gicv3, memory, platform, scheduler, timer};
 
 /// Non-secure physical timer PPI. QEMU virt and SM8650 use PPI 14 (INTID 30);
 /// SM6225/khaje wires the ARMv8 timer as PPI 2 (INTID 18).
@@ -233,7 +233,10 @@ pub fn send_sgi_all_but_self(intid: u32) {
         gicv3::send_sgi_all_but_self(intid);
         return;
     }
-    write32(DISTRIBUTOR_BASE + GICD_SGIR, (0b01_u32 << 24) | (intid & 0x0F));
+    write32(
+        DISTRIBUTOR_BASE + GICD_SGIR,
+        (0b01_u32 << 24) | (intid & 0x0F),
+    );
 }
 
 pub fn enable_irq(irq: u32) {
@@ -342,11 +345,7 @@ pub extern "C" fn silver_handle_irq() {
     let acknowledge_register = acknowledge();
     let irq = acknowledge_register & 0x3FF;
 
-    if irq != TIMER_IRQ
-        && irq != RESCHEDULE_IRQ
-        && irq != QUIESCE_IRQ
-        && irq != SPURIOUS_IRQ
-    {
+    if irq != TIMER_IRQ && irq != RESCHEDULE_IRQ && irq != QUIESCE_IRQ && irq != SPURIOUS_IRQ {
         // The probe and the wake must be one kernel-lock-protected step:
         // another CPU could otherwise change the binding in between.
         let _bkl = crate::smp::BklGuard::new();
@@ -362,9 +361,12 @@ pub extern "C" fn silver_handle_irq() {
         RESCHEDULE_IRQ => {
             // Another CPU made a task Ready (or otherwise changed scheduler
             // state): re-evaluate our run queue. EOI first so the SGI can be
-            // re-raised while we schedule.
+            // re-raised while we schedule. A task inside a syscall holds the
+            // kernel lock and schedules at its own blocking point instead.
             end_interrupt(acknowledge_register);
-            scheduler::schedule();
+            if crate::smp::irq_may_schedule() {
+                scheduler::schedule();
+            }
         }
         QUIESCE_IRQ => {
             end_interrupt(acknowledge_register);
@@ -374,15 +376,19 @@ pub extern "C" fn silver_handle_irq() {
             crate::smp::probe(20);
             timer::handle_irq();
             end_interrupt(acknowledge_register);
-            scheduler::schedule();
+            if crate::smp::irq_may_schedule() {
+                scheduler::schedule();
+            }
         }
         UART_IRQ => {
             console::handle_irq();
             let stopped = console::take_stop_request() && scheduler::stop_console_owner();
             end_interrupt(acknowledge_register);
             // Ordinary input only fills the RX queue. Ctrl-Z changes scheduler
-            // state and must switch back to the shell immediately.
-            if stopped {
+            // state and must switch back to the shell immediately; a task
+            // inside a syscall holds the lock and will reach its own
+            // scheduling point.
+            if stopped && crate::smp::irq_may_schedule() {
                 scheduler::schedule();
             }
         }

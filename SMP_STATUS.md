@@ -362,12 +362,20 @@ DMA leak, and `-smp 2` still reports one peer.
    index shift can only discard an entry; the removal paths rebuild every
    queue. The counters report `local`/`steal`/`scan`, and a corrupted-id
    negative build trips the invariant audit.
-   **Open bug found by the opt-in `smp-churn` harness:** with 12 short-lived
-   kernel tasks dispatched/reaped concurrently, a CPU's `current_index` can be
-   left naming a `Ready` task whose `running_on` is `None` (invariant panic),
-   and some tasks never reach their exit counter. The harness is deliberately
-   not part of `smp-selftest`; root-causing the stale index is the next
-   scheduler task.
+   **`smp-churn` harness (opt-in).** 12 short-lived kernel tasks are
+   dispatched, yielded/slept and reaped concurrently while the boot CPU waits
+   with the lock released. It found and now regression-tests three scheduler
+   bugs: (a) a scheduling pass was preemptible, so a timer IRQ could run a
+   second pass on a half-applied index snapshot and an outer pass later
+   republished the stale index; (b) kernel-task `yield`/`sleep` released a
+   kernel lock they never held, wrapping the per-CPU depth to `u32::MAX`;
+   (c) an IRQ between publishing the lock owner and setting the depth could
+   re-enter `schedule` and deadlock. The pass now masks IRQs and refuses a
+   nested entry, `yield`/`sleep` take the lock when needed, the lock
+   acquisition is IRQ-atomic, and a release without an acquire fails safe
+   instead of wrapping. Stable across repeated `-smp 4` runs with the
+   invariant audit active; kept opt-in because `cpu_count()` assumes
+   `MAX_CPUS` and machines with fewer online CPUs fail the harness policy.
 3. **Device DMA quiescence.** The stop-the-world window covers CPUs, not a
    device with an armed queue; the driver stop/reset contract stays
    authoritative. *Done (kernel side):* revoked runs are quarantined for
