@@ -955,6 +955,12 @@ pub fn boot_secondary_cpus() {
         // cross-PE TLB proof must run before the stop-the-world rounds.
         run_cross_pe_tlb_probe();
         run_quiesce_selftest();
+        // Last: spawn short-lived tasks and let the APs run/reap them while
+        // the boot CPU waits with the BKL released. Opt-in `smp-churn`: it
+        // currently exposes an intermittent scheduler-index race, so it must
+        // not run in the normal selftest profile.
+        #[cfg(feature = "smp-churn")]
+        crate::scheduler::run_smp_churn_selftest();
     }
 }
 

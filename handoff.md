@@ -16,8 +16,10 @@ per-CPU timer liveness.
 
 **SMP feature program (2026-11-04):** four packages, in order —
 (1) per-CPU ready queues **[done]**, (2) ASID-tagged address spaces **[done]**,
-(3) DMA in-flight quiescence contract **[done]**, (4) SMP churn stress **[next]**.
-Each package is verified on its own before the next starts.
+(3) DMA in-flight quiescence contract **[done]**, (4) SMP churn stress
+**[harness done, open scheduler bug]**. Each package is verified on its own
+before the next starts; the churn harness found a real issue and stays opt-in
+until it is fixed.
 
 - **Page-table ownership and DMA reclamation (Packages E/E1/E2).** Every page
   table is registered with `(frame, generation, owner)`; walks validate the
@@ -182,6 +184,19 @@ Each package is verified on its own before the next starts.
   exception 9. Userspace drivers cannot arm a lease yet — that needs a syscall —
   so their ranges still rely on the quarantine window alone; the gap is
   explicit in `map_dma_to_user` and `SMP_STATUS.md`.
+- **SMP churn harness (2026-11-04, opt-in `smp-churn`).** The boot CPU spawns
+  12 short-lived kernel tasks with explicit high ids (`next_id` is saved and
+  restored around each spawn so user spawn ids stay in lockstep with per-task
+  cap-handle ids), releases the BKL, lets the APs dispatch/yield/sleep/exit
+  them, then reaps with the invariant audit active. It found a real bug: under
+  concurrent kernel-task churn a CPU's `current_index` can be left naming a
+  `Ready` task whose `running_on` is `None`, which trips
+  `sched invariant FAIL (a CPU's current task is not marked running on it)`;
+  some tasks also never reach `CHURN_EXITED`. The harness is therefore **not**
+  part of `smp-selftest` and does not run in any default profile. Kernel tasks
+  also no longer print an `EXIT:` line (`program == u64::MAX`), which was pure
+  console noise from the probes. Root-causing the stale index is the next
+  scheduler task.
 - Verified in this snapshot: **146 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and

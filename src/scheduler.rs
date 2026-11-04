@@ -469,6 +469,169 @@ pub fn run_dma_lease_self_test() -> bool {
     busy && left_edge && right_edge && disjoint && released && freed
 }
 
+// ---------------------------------------------------------------------------
+// SMP churn stress (selftest)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "smp", feature = "smp-churn"))]
+const CHURN_ROUNDS: usize = 4;
+#[cfg(all(feature = "smp", feature = "smp-churn"))]
+const CHURN_PER_ROUND: usize = 3;
+/// Churn tasks get explicit ids above the user space (like AP idle tasks) and
+/// the global `next_id` is restored around each spawn. User-space spawn logic
+/// assumes task ids advance in lockstep with per-task cap-handle ids, so a
+/// stress task must never shift the ids of a real child (SCOUT, block driver).
+#[cfg(all(feature = "smp", feature = "smp-churn"))]
+const CHURN_ID_BASE: u64 = 1 << 41;
+#[cfg(all(feature = "smp", feature = "smp-churn"))]
+static CHURN_EXITED: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(feature = "smp", feature = "smp-churn"))]
+static CHURN_ON_CPU: [AtomicUsize; smp::MAX_CPUS] = [
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+    AtomicUsize::new(0),
+];
+
+/// Spawns one churn task with an explicit high id, restoring `next_id` so a
+/// real user spawn (SCOUT, block driver) keeps the id its cap handle expects.
+#[cfg(all(feature = "smp", feature = "smp-churn"))]
+fn spawn_churn(explicit_id: u64) -> Option<u64> {
+    let saved_next = {
+        let manager = scheduler_manager()?;
+        let saved = manager.next_id;
+        manager.next_id = explicit_id;
+        saved
+    };
+    let result = spawn_kernel(churn_task);
+    if let Some(manager) = scheduler_manager() {
+        manager.next_id = saved_next;
+    }
+    result
+}
+
+/// Kernel task entry used by the churn stress: exercise a yield (fast path)
+/// or a timed block (timeout wake), count the CPU, then exit so another pass
+/// reaps and tears the space down.
+#[cfg(all(feature = "smp", feature = "smp-churn"))]
+extern "C" fn churn_task() -> ! {
+    if smp::bkl_depth() > 0 {
+        smp::bkl_release();
+    }
+    let cpu = smp::this_cpu_id();
+    if cpu < smp::MAX_CPUS {
+        CHURN_ON_CPU[cpu].fetch_add(1, Ordering::Relaxed);
+    }
+    if current_task_id() & 1 == 0 {
+        yield_current();
+    } else {
+        sleep(1);
+    }
+    CHURN_EXITED.fetch_add(1, Ordering::Release);
+    exit_current();
+}
+
+/// SMP churn: spawn a batch of short-lived kernel tasks from the boot CPU,
+/// release the BKL so the APs actually run them, then reap and require every
+/// one to have left `Running`. Each spawn builds a fresh address space (ASID
+/// allocation + 9 table frames) and each exit tears it down, so a run exercises
+/// ready-queue dispatch, work stealing, ASID recycling and index-shifting
+/// reaping under real concurrency. The per-pass invariant audit fails the boot
+/// if the scheduler state drifts.
+#[cfg(all(feature = "smp", feature = "smp-churn"))]
+pub fn run_smp_churn_selftest() -> bool {
+    if smp::cpu_count() <= 1 {
+        return true;
+    }
+    let total = CHURN_ROUNDS * CHURN_PER_ROUND;
+    CHURN_EXITED.store(0, Ordering::Relaxed);
+    for counter in &CHURN_ON_CPU {
+        counter.store(0, Ordering::Relaxed);
+    }
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    let first_id = CHURN_ID_BASE;
+    for offset in 0..total {
+        let Some(id) = spawn_churn(first_id + offset as u64) else {
+            console::write_str("SMP SELFTEST: churn FAIL (spawn)\r\n");
+            return false;
+        };
+        if let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) {
+            // A kernel probe must never take the demo console.
+            task.owns_console = false;
+        }
+    }
+    let last_id = first_id + total as u64 - 1;
+
+    // The boot CPU holds the BKL. Release it so the APs can run the tasks;
+    // the boot task itself stays Running and cannot be claimed.
+    smp::bkl_release();
+    let mut spins: u32 = 0;
+    while CHURN_EXITED.load(Ordering::Acquire) < total {
+        spins += 1;
+        if spins >= 50_000_000 {
+            break;
+        }
+        unsafe {
+            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+        }
+    }
+    smp::bkl_acquire();
+
+    let exited = CHURN_EXITED.load(Ordering::Acquire);
+
+    // A Dead task still owned by a CPU is skipped by reap until that CPU
+    // switches away, so drain in short windows with the lock released.
+    let mut pending = total;
+    for _ in 0..64 {
+        reap_dead_tasks(manager);
+        pending = manager
+            .tasks
+            .iter()
+            .filter(|task| {
+                task.id >= first_id && task.id <= last_id && task.state != TaskState::Zombie
+            })
+            .count();
+        if pending == 0 {
+            break;
+        }
+        smp::bkl_release();
+        for _ in 0..100_000 {
+            unsafe {
+                core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+            }
+        }
+        smp::bkl_acquire();
+    }
+
+    let ran_cpus = (0..smp::MAX_CPUS)
+        .filter(|&cpu| CHURN_ON_CPU[cpu].load(Ordering::Relaxed) > 0)
+        .count();
+    // With only one AP available the boot CPU cannot take part (it is the
+    // waiter), so require one peer; with three APs require at least two.
+    let min_cpus = if smp::cpu_count() >= 3 { 2 } else { 1 };
+    let ok = exited == total && pending == 0 && ran_cpus >= min_cpus;
+    if ok {
+        console::write_str("SMP SELFTEST: churn PASS (");
+        console::write_dec_u64(total as u64);
+        console::write_str(" tasks, ");
+        console::write_dec_u64(ran_cpus as u64);
+        console::write_str(" CPU(s) ran)\r\n");
+    } else {
+        console::write_str("SMP SELFTEST: churn FAIL (exited=");
+        console::write_dec_u64(exited as u64);
+        console::write_str("/");
+        console::write_dec_u64(total as u64);
+        console::write_str(" pending=");
+        console::write_dec_u64(pending as u64);
+        console::write_str(" cpus=");
+        console::write_dec_u64(ran_cpus as u64);
+        console::write_str(")\r\n");
+    }
+    ok
+}
+
 /// Frees quarantined runs whose grace window has elapsed. Runs with the kernel
 /// lock held from `reap_dead_tasks`; the frame-allocator lock is taken only
 /// after the quarantine lock has been released, so no inner-lock ordering
@@ -956,17 +1119,21 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
     // the console, so a task dying silently leaves no user-visible evidence.
     // console writes here are raw MMIO pokes and stay visible for every task.
     let program = current_task_mut().map_or(u64::MAX, |task| task.program);
-    console::write_str("EXIT: task=");
-    console::write_dec_u64(id);
-    console::write_str(" program=");
-    console::write_dec_u64(program);
-    console::write_str(" status=");
-    console::write_dec_u64(status);
-    // Packed reports (see the filesystem server's mount failure) are unreadable
-    // in decimal, so the same value is repeated in hex on the same line.
-    console::write_str(" (0x");
-    console::write_hex_u64(status);
-    console::write_str(")\r\n");
+    // Kernel tasks (program == u64::MAX) are internal probes; their exit is
+    // not user-visible evidence and would only flood the console.
+    if program != u64::MAX {
+        console::write_str("EXIT: task=");
+        console::write_dec_u64(id);
+        console::write_str(" program=");
+        console::write_dec_u64(program);
+        console::write_str(" status=");
+        console::write_dec_u64(status);
+        // Packed reports (see the filesystem server's mount failure) are
+        // unreadable in decimal, so the same value is repeated in hex.
+        console::write_str(" (0x");
+        console::write_hex_u64(status);
+        console::write_str(")\r\n");
+    }
     crate::ipc::remove_task(id);
     vfs::close_task(id);
     let saved_daif = interrupts::save_and_disable_irq();

@@ -362,6 +362,12 @@ DMA leak, and `-smp 2` still reports one peer.
    index shift can only discard an entry; the removal paths rebuild every
    queue. The counters report `local`/`steal`/`scan`, and a corrupted-id
    negative build trips the invariant audit.
+   **Open bug found by the opt-in `smp-churn` harness:** with 12 short-lived
+   kernel tasks dispatched/reaped concurrently, a CPU's `current_index` can be
+   left naming a `Ready` task whose `running_on` is `None` (invariant panic),
+   and some tasks never reach their exit counter. The harness is deliberately
+   not part of `smp-selftest`; root-causing the stale index is the next
+   scheduler task.
 3. **Device DMA quiescence.** The stop-the-world window covers CPUs, not a
    device with an armed queue; the driver stop/reset contract stays
    authoritative. *Done (kernel side):* revoked runs are quarantined for

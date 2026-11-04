@@ -20,6 +20,11 @@ smp = []
 # tick, verify the running_on/current_index pairing on every scheduling pass,
 # and report PASS/FAIL. Kernel-only; no userspace protocol is involved.
 smp-selftest = ["smp"]
+# Opt-in diagnostic stress: spawn short-lived kernel tasks while the APs run
+# and reap them, with the per-pass scheduler invariant audit enabled. It
+# currently exposes an intermittent stale-current_index race, so it is NOT part
+# of smp-selftest and must be requested explicitly.
+smp-churn = ["smp-selftest"]
 demo-tasks = []
 tablet = []
 fog = []
