@@ -961,6 +961,57 @@ pub fn map_user_pages_at(
     true
 }
 
+/// Re-points one already-mapped user page at a different frame, keeping its
+/// permission bits. Returns `false` (and changes nothing) when the slot is not
+/// a live 4 KiB page mapping inside the anonymous window.
+///
+/// The edit is published exactly like [`map_user_pages_at`]: clean the
+/// descriptor line, then one `dsb ishst` + broadcast `tlbi vmalle1is` +
+/// `dsb ish`. Unlike a production map this deliberately runs **while another
+/// PE may be executing the address space**; the caller must own the
+/// coordination that keeps the peer from touching `virtual_address` until
+/// [`replace_user_page`] returns. [`crate::smp`]'s cross-PE TLB self-test is
+/// the only user and relies on that contract to prove the invalidation really
+/// crosses the inner-shareable domain.
+#[cfg(feature = "smp-selftest")]
+pub fn replace_user_page(
+    ttbr0: usize,
+    virtual_address: usize,
+    physical: usize,
+    prot: u64,
+) -> bool {
+    if virtual_address % GRANULE != 0 || physical % GRANULE != 0 {
+        return false;
+    }
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return false;
+    }
+    let Some(end) = virtual_address.checked_add(GRANULE) else {
+        return false;
+    };
+    if virtual_address < USER_MMAP_VA || end > USER_MMAP_MAX_VA {
+        return false;
+    }
+    unsafe {
+        let l1_user = follow_table(ttbr0, 0);
+        let l2_user = follow_table(l1_user, 1);
+        let l2_index = (virtual_address - DRAM_BASE) / BLOCK_2M;
+        let l3_index = (virtual_address >> 12) & 0x1FF;
+        let l2_entry = read_entry(l2_user, l2_index);
+        if l2_entry & DESC_TABLE != DESC_TABLE {
+            return false;
+        }
+        let l3 = descriptor_address(l2_entry) as usize;
+        if read_entry(l3, l3_index) & DESC_PAGE != DESC_PAGE {
+            return false;
+        }
+        write_entry(l3, l3_index, user_anonymous_page(physical, prot));
+        clean_entry_line(l3, l3_index);
+    }
+    finish_table_changes();
+    true
+}
+
 /// Removes `page_count` pages starting at `virtual_address`, freeing an L3 table
 /// once its last entry is gone. The physical frames are returned to the caller
 /// by address (tracked separately by the scheduler), so this only edits tables.

@@ -83,7 +83,7 @@ userspace.
 - [x] Boot-time MMU TLB proof: read through TTBR0, remap the same VA, read again (fails the boot if the `tlbi` broadcast is missing)
 - [x] Per-task anonymous-mapping quota (16 MiB) and a DMA quarantine window before revoked frames are recycled
 - [ ] SFS write path, block-path interrupts, remaining resource quotas and persistent storage
-- [ ] SMP (`-smp 4`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to three APs online (CPU1–CPU3), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` (66 PASS / 0 PANIC). `no_std,smp-selftest` additionally runs 64 back-to-back SGI1 stop-the-world rounds, verifies cross-CPU visibility, and checks that every online CPU advances its own timer tick. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Physical SMP, true cross-PE TLB-shootdown stress and device-DMA quiescence remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
+- [ ] SMP (`-smp 4`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to three APs online (CPU1–CPU3), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` (66 PASS / 0 PANIC). `no_std,smp-selftest` additionally runs a cross-PE TLB probe (every AP reads a VA, the boot CPU re-points the same PTE, every AP must observe the new frame), 64 back-to-back SGI1 stop-the-world rounds, and a per-CPU timer-tick check. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Physical SMP, in-flight-MMAP stress and device-DMA quiescence remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
 
 ## Design references
 
@@ -556,7 +556,9 @@ touched descriptor's cache line is cleaned as it is written, then a single
 `dsb ishst` + broadcast `tlbi vmalle1is` + `dsb ish` completes the batch. A
 16-page DMA map or a several-hundred-page heap growth therefore pays one
 shootdown, not one per page. The boot TLB self-test reads through a remapped
-TTBR0 VA, so a missing invalidation fails the boot.
+TTBR0 VA, so a missing invalidation fails the boot; the opt-in `smp-selftest`
+cross-PE probe additionally requires a peer CPU to observe the remap through
+the broadcast.
 
 Unmap and reclamation are fail-closed. A partial `munmap` is refused without
 touching the mapped part; if a backing run cannot be proven fully unmapped it is

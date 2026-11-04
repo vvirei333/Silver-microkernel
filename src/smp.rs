@@ -241,6 +241,9 @@ pub static AP_TASK_SCHEDULING: AtomicBool = AtomicBool::new(true);
 #[cfg(feature = "smp")]
 use core::sync::atomic::AtomicUsize;
 
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+use core::sync::atomic::AtomicU64;
+
 #[cfg(feature = "smp")]
 static EXPECTED_CPUS: AtomicUsize = AtomicUsize::new(1);
 
@@ -817,6 +820,13 @@ extern "C" fn smp_ap_main() -> ! {
     crate::console::write_hex_u64(this_cpu().mpidr);
     crate::console::write_str("\r\n");
 
+    // Opt-in cross-PE TLB proof: park here (IRQs still masked, no BKL held)
+    // until the boot CPU publishes a scratch address space. Running the probe
+    // before the scheduler loop means the boot CPU can drive the peer without
+    // the BKL deadlock a reschedule IPI would risk.
+    #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+    ap_tlb_probe_wait();
+
     // Same contract as the boot CPU: kernel tasks run with IRQs enabled and
     // pick up work through the scheduler.
     interrupts::enable_irq();
@@ -940,7 +950,347 @@ pub fn boot_secondary_cpus() {
     }
 
     #[cfg(feature = "smp-selftest")]
-    run_quiesce_selftest();
+    {
+        // The peers are parked in `ap_tlb_probe_wait` right now, so the
+        // cross-PE TLB proof must run before the stop-the-world rounds.
+        run_cross_pe_tlb_probe();
+        run_quiesce_selftest();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-PE TLB shootdown self-test
+// ---------------------------------------------------------------------------
+
+/// Mailbox phases for the opt-in cross-PE TLB proof. `0` means "no test yet";
+/// peers spin on [`TLB_PROBE_ABORT`] or a real phase value.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+const TLB_PROBE_IDLE: u32 = 0;
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+const TLB_PROBE_READ_A: u32 = 1;
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+const TLB_PROBE_READ_B: u32 = 2;
+/// Releases a peer parked in [`ap_tlb_probe_wait`] when the boot CPU could not
+/// run the probe. Must be `>= TLB_PROBE_READ_B` so both spin loops exit.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+const TLB_PROBE_ABORT: u32 = 0xFF;
+/// Bound on every probe wait. A peer that never arrives is reported, not hung.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+const TLB_PROBE_TIMEOUT_SPINS: u32 = 50_000_000;
+
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static TLB_PROBE_PHASE: AtomicU32 = AtomicU32::new(TLB_PROBE_IDLE);
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static TLB_PROBE_TTBR0: AtomicUsize = AtomicUsize::new(0);
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static TLB_PROBE_VA: AtomicUsize = AtomicUsize::new(0);
+/// Last value each peer read through the scratch VA (phase A, then phase B).
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static TLB_PROBE_SEEN: [AtomicU64; MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static TLB_PROBE_ACK: [AtomicU32; MAX_CPUS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Waits until every PSCI-accepted CPU is published, then returns the number of
+/// online peers. `None` means no secondary came up at all. Mirrors the wait the
+/// quiesce self-test used to inline.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+fn wait_for_online_peers() -> Option<usize> {
+    let me = this_cpu_id();
+    let expected = expected_cpus();
+    let mut spins: u32 = 0;
+    loop {
+        let online = (0..cpu_count())
+            .filter(|&cpu| cpu != me && cpu_online(cpu))
+            .count();
+        if online + 1 >= expected {
+            return Some(online);
+        }
+        spins += 1;
+        if spins >= 5_000_000 {
+            if online > 0 {
+                // PSCI accepted more CPUs than published: a GIC failure parks
+                // an AP offline by design. Test the set that is actually up.
+                crate::console::write_str("SMP SELFTEST: waiting for all CPUs gave up\r\n");
+                return Some(online);
+            }
+            crate::console::write_str("SMP SELFTEST: skipped, no secondary online\r\n");
+            return None;
+        }
+        unsafe {
+            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// AP half of the cross-PE TLB proof. Runs on the AP with IRQs masked and no
+/// kernel lock, before the scheduler loop: switch to the boot CPU's scratch
+/// address space, read the probe VA, park until the boot CPU has re-pointed
+/// the PTE, read the *same* VA again, then restore the original TTBR0.
+///
+/// The second read is the whole point: it can only observe the new frame if
+/// the boot CPU's `tlbi vmalle1is` really invalidated this PE's stale entry.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn ap_tlb_probe_wait() {
+    let mut spins: u32 = 0;
+    loop {
+        let phase = TLB_PROBE_PHASE.load(Ordering::Acquire);
+        if phase != TLB_PROBE_IDLE {
+            break;
+        }
+        spins += 1;
+        if spins >= TLB_PROBE_TIMEOUT_SPINS {
+            // No probe was published (single-CPU run or boot gave up).
+            return;
+        }
+        unsafe {
+            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+        }
+    }
+    if TLB_PROBE_PHASE.load(Ordering::Acquire) == TLB_PROBE_ABORT {
+        return;
+    }
+    let cpu = this_cpu_id();
+    if cpu >= MAX_CPUS {
+        return;
+    }
+    let ttbr0 = TLB_PROBE_TTBR0.load(Ordering::Acquire);
+    let va = TLB_PROBE_VA.load(Ordering::Acquire);
+    let saved: usize;
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) saved, options(nostack));
+        // ASID 0 is used by every space, so a switch must drop this PE's whole
+        // EL1&0 TLB. `vmalle1` (local) is enough here; the peer only needs its
+        // own stale entries gone before the first read.
+        core::arch::asm!(
+            "msr ttbr0_el1, {ttbr}",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            ttbr = in(reg) ttbr0 as u64,
+            options(nostack),
+        );
+    }
+    let first = unsafe { core::ptr::read_volatile(va as *const u64) };
+    TLB_PROBE_SEEN[cpu].store(first, Ordering::Release);
+    TLB_PROBE_ACK[cpu].store(TLB_PROBE_READ_A, Ordering::Release);
+
+    while TLB_PROBE_PHASE.load(Ordering::Acquire) < TLB_PROBE_READ_B {
+        unsafe {
+            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+        }
+    }
+    let second = unsafe { core::ptr::read_volatile(va as *const u64) };
+    TLB_PROBE_SEEN[cpu].store(second, Ordering::Release);
+
+    // Restore before acknowledging: the boot CPU retires the scratch space as
+    // soon as every peer reports phase B.
+    unsafe {
+        core::arch::asm!(
+            "msr ttbr0_el1, {ttbr}",
+            "tlbi vmalle1",
+            "dsb ish",
+            "isb",
+            ttbr = in(reg) saved as u64,
+            options(nostack),
+        );
+    }
+    TLB_PROBE_ACK[cpu].store(TLB_PROBE_READ_B, Ordering::Release);
+}
+
+/// A scratch address space plus the two probe frames, torn down on every exit
+/// path (including the early-failure returns) by `Drop`.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+struct TlbProbeScratch {
+    ttbr0: usize,
+    token: silver_microkernel::table_registry::TableToken,
+    private: usize,
+    private_generation: u32,
+    frames: [(usize, u32); 2],
+}
+
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+impl TlbProbeScratch {
+    fn new() -> Option<Self> {
+        let (private, private_generation) = crate::frame_allocator::alloc_page_tagged()?;
+        let Some((ttbr0, token)) = crate::mmu::create_task_space(private, 0, None) else {
+            crate::frame_allocator::free_page_tagged(private, private_generation);
+            return None;
+        };
+        let mut frames = [(0usize, 0u32); 2];
+        for slot in &mut frames {
+            let Some((frame, generation)) = crate::frame_allocator::alloc_page_tagged() else {
+                crate::mmu::destroy_task_space(token, private, private_generation);
+                for &(frame, generation) in frames.iter() {
+                    // Generation 0 means "slot never filled".
+                    if generation != 0 {
+                        crate::frame_allocator::free_page_tagged(frame, generation);
+                    }
+                }
+                return None;
+            };
+            *slot = (frame, generation);
+        }
+        Some(Self {
+            ttbr0,
+            token,
+            private,
+            private_generation,
+            frames,
+        })
+    }
+}
+
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+impl Drop for TlbProbeScratch {
+    fn drop(&mut self) {
+        // Every peer acknowledged phase B only after restoring its own TTBR0,
+        // so no online CPU can still be walking these tables.
+        crate::mmu::destroy_task_space(self.token, self.private, self.private_generation);
+        for &(frame, generation) in self.frames.iter() {
+            crate::frame_allocator::free_page_tagged(frame, generation);
+        }
+    }
+}
+
+/// Blocks until every online peer acknowledges `phase` (`>= peers` of them).
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+fn wait_for_probe_acks(phase: u32, peers: usize) -> bool {
+    let me = this_cpu_id();
+    let mut spins: u32 = 0;
+    loop {
+        let mut online = 0usize;
+        let mut missing = 0usize;
+        for cpu in 0..cpu_count() {
+            if cpu == me || !cpu_online(cpu) {
+                continue;
+            }
+            online += 1;
+            if TLB_PROBE_ACK[cpu].load(Ordering::Acquire) < phase {
+                missing += 1;
+            }
+        }
+        if online >= peers && missing == 0 {
+            return true;
+        }
+        spins += 1;
+        if spins >= TLB_PROBE_TIMEOUT_SPINS {
+            return false;
+        }
+        unsafe {
+            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+        }
+    }
+}
+
+/// Boot-CPU half: publish a scratch mapping, let every peer read it, re-point
+/// the same VA at another frame with a batched broadcast invalidation, and
+/// require every peer to observe the new frame.
+///
+/// This is the cross-PE counterpart to [`crate::mmu::run_tlb_self_test`]: the
+/// boot test catches a missing `tlbi` on the *executing* PE, this one catches a
+/// flush that only invalidates locally. Runs with the kernel lock held; the
+/// peers are parked inside [`ap_tlb_probe_wait`] and never take the BKL, so
+/// there is no lock-ordering deadlock.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+fn run_cross_pe_tlb_probe() {
+    if cpu_count() <= 1 {
+        return;
+    }
+    let Some(peers) = wait_for_online_peers() else {
+        return;
+    };
+    if peers == 0 {
+        TLB_PROBE_PHASE.store(TLB_PROBE_ABORT, Ordering::Release);
+        return;
+    }
+
+    for cpu in 0..MAX_CPUS {
+        TLB_PROBE_SEEN[cpu].store(0, Ordering::Relaxed);
+        TLB_PROBE_ACK[cpu].store(0, Ordering::Relaxed);
+    }
+    let Some(scratch) = TlbProbeScratch::new() else {
+        TLB_PROBE_PHASE.store(TLB_PROBE_ABORT, Ordering::Release);
+        crate::console::write_str("SMP SELFTEST: tlb cross-PE FAIL (no scratch space)\r\n");
+        return;
+    };
+
+    const VALUE_A: u64 = 0xA5A5_5A5A_C3C3_3C3C;
+    const VALUE_B: u64 = 0x5A5A_A5A5_3C3C_C3C3;
+    let va = crate::mmu::USER_MMAP_VA;
+    let (frame_a, _) = scratch.frames[0];
+    let (frame_b, _) = scratch.frames[1];
+
+    if !crate::mmu::map_user_pages_at(
+        scratch.ttbr0,
+        va,
+        frame_a,
+        1,
+        crate::mmu::PROT_WRITE,
+    ) {
+        TLB_PROBE_PHASE.store(TLB_PROBE_ABORT, Ordering::Release);
+        crate::console::write_str("SMP SELFTEST: tlb cross-PE FAIL (map)\r\n");
+        return;
+    }
+    // Values are written after publication. Both the kernel alias and the user
+    // alias are Normal inner-shareable, so a peer's read snoops this store; the
+    // Release store of the phase orders it before the peer's first load.
+    unsafe {
+        core::ptr::write_volatile(crate::memory::phys_to_virt(frame_a) as *mut u64, VALUE_A);
+        core::ptr::write_volatile(crate::memory::phys_to_virt(frame_b) as *mut u64, VALUE_B);
+    }
+
+    TLB_PROBE_TTBR0.store(scratch.ttbr0, Ordering::Release);
+    TLB_PROBE_VA.store(va, Ordering::Release);
+    TLB_PROBE_PHASE.store(TLB_PROBE_READ_A, Ordering::Release);
+
+    let first_ok = wait_for_probe_acks(TLB_PROBE_READ_A, peers);
+    let remapped = first_ok
+        && crate::mmu::replace_user_page(scratch.ttbr0, va, frame_b, crate::mmu::PROT_WRITE);
+    if remapped {
+        // `replace_user_page` returns only after its `dsb ish` completed the
+        // broadcast, so a peer that now reads VA must re-walk the table.
+        TLB_PROBE_PHASE.store(TLB_PROBE_READ_B, Ordering::Release);
+    }
+    let second_ok = remapped && wait_for_probe_acks(TLB_PROBE_READ_B, peers);
+    if !second_ok {
+        // Release any peer still parked; a later peer exits immediately too.
+        TLB_PROBE_PHASE.store(TLB_PROBE_ABORT, Ordering::Release);
+        crate::console::write_str("SMP SELFTEST: tlb cross-PE FAIL (timeout)\r\n");
+        return;
+    }
+
+    let me = this_cpu_id();
+    let mut stale = 0u64;
+    for cpu in 0..cpu_count() {
+        if cpu == me || !cpu_online(cpu) {
+            continue;
+        }
+        if TLB_PROBE_SEEN[cpu].load(Ordering::Acquire) != VALUE_B {
+            stale += 1;
+        }
+    }
+    // Every peer already left the probe; leave ABORT set so a CPU that comes
+    // online late never parks in the idle loop.
+    TLB_PROBE_PHASE.store(TLB_PROBE_ABORT, Ordering::Release);
+    if stale != 0 {
+        crate::console::write_str("SMP SELFTEST: tlb cross-PE FAIL (");
+        crate::console::write_dec_u64(stale);
+        crate::console::write_str(" CPU(s) kept the stale translation)\r\n");
+        return;
+    }
+    crate::console::write_str("SMP SELFTEST: tlb cross-PE PASS (");
+    crate::console::write_dec_u64(peers as u64);
+    crate::console::write_str(" peer CPU(s) saw the remap)\r\n");
 }
 
 /// Number of back-to-back stop-the-world rounds in the opt-in self-test.
@@ -960,31 +1310,11 @@ fn run_quiesce_selftest() {
     if cpu_count() <= 1 {
         return;
     }
-    let me = this_cpu_id();
-    let expected = expected_cpus();
-    let mut spins: u32 = 0;
-    let peers = loop {
-        let online = (0..cpu_count())
-            .filter(|&cpu| cpu != me && cpu_online(cpu))
-            .count();
-        if online + 1 >= expected {
-            break online;
-        }
-        spins += 1;
-        if spins >= 5_000_000 {
-            if online > 0 {
-                // PSCI accepted more CPUs than published: a GIC failure parks
-                // an AP offline by design. Test the set that is actually up.
-                crate::console::write_str("SMP SELFTEST: waiting for all CPUs gave up\r\n");
-                break online;
-            }
-            crate::console::write_str("SMP SELFTEST: skipped, no secondary online\r\n");
-            return;
-        }
-        unsafe {
-            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
-        }
+    let Some(peers) = wait_for_online_peers() else {
+        return;
     };
+
+    let me = this_cpu_id();
 
     // The peer may have published but not yet unmasked IRQs. `quiesce_begin`
     // re-sends SGI1 and the BKL retry loop acknowledges once IRQs are enabled.

@@ -111,10 +111,23 @@ per-CPU timer liveness.
   batch, so a several-hundred-page grow pays one shootdown. The boot TLB test
   exercises the batched path; removing the `tlbi` from `finish_table_changes`
   still fails the boot with exception 9.
+- **Cross-PE TLB shootdown proof (2026-11-04).** The boot TLB test proves the
+  flush on the executing PE only. The opt-in `smp-selftest` build now also runs
+  a cross-PE probe: every AP parks before the scheduler loop
+  (`smp::ap_tlb_probe_wait`), switches to a scratch space built by the boot CPU,
+  reads the probe VA and acknowledges; the boot CPU then re-points the same PTE
+  with the normal batched publication and releases the peers, which read the VA
+  again and must observe the new frame. With the broadcast `tlbi vmalle1is`
+  replaced by a local `tlbi vmalle1`, the probe reports `tlb cross-PE FAIL
+  (3 CPU(s) kept the stale translation)` while quiesce/ticks still pass — the
+  test is sensitive to a non-broadcast flush. The peers run with IRQs masked
+  and no kernel lock, so the boot CPU can drive them while holding the BKL
+  without a lock-ordering deadlock.
 - Verified in this snapshot: **142 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
   `no_std,smp` with QEMU `-smp 2` and `-smp 4`, `no_std,smp-selftest` logging
+  `tlb cross-PE PASS (3 peer CPU(s) saw the remap)`,
   `quiesce PASS (64 rounds, 3 peer CPU(s))` and `ticks PASS (3 peer CPU(s))`
   on `-smp 4` (one peer on `-smp 2`), tablet build, and fog boot image v3.
   The boot self-tests log

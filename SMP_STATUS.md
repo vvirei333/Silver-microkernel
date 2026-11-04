@@ -244,10 +244,10 @@ DMA leak, and `-smp 2` still reports one peer.
 | 3. Аллокаторы | frame allocator `STATE` → `SpinLock`; `PageTableRegistry` → `SpinLock` | написано |
 | 4. Синхро-примитивы | Mutex/WaitQueue под kernel lock, `bkl_assert_held()` в точках мутации, дока обновлена | написано |
 | 5. IRQ/таймер | gic: `init`/`cpu_init` разделены (banked SGI0+PPI30 в `cpu_init`), `send_sgi_all_but_self` (GICD_SGIR); gicv3: **поиск redistributor по `GICR_TYPER`**, ICC_SGI1R; таймер per-CPU (`cpu_init`), глобальный `TICKS` инкрементирует только CPU0 | написано |
-| 6. TLB | `tlbi vmalle1is` + `dsb ish` в `flush_after_table_change`/`switch_address_space`/`configure_and_enable`; протокол задокументирован в доке | написано |
+| 6. TLB | `tlbi vmalle1is` + `dsb ish` в `flush_after_table_change`/`switch_address_space`/`configure_and_enable`; протокол задокументирован в доке; батчевая публикация (`finish_table_changes`, один shootdown на map/heap-growth); cross-PE probe доказывает, что broadcast доходит до второго PE | написано, cross-PE проверено на QEMU `-smp 4` |
 | 7. AP-boot | PSCI `CPU_ON` (HVC, `0xC4000003`), physical trampoline, `ApBootParams`, FP/SIMD + MMU enable, `boot_secondary_cpus()` from the first `schedule()` | работает на QEMU `-smp 2` и `-smp 4` |
 | 8. Shared DMA | под BKL: создание маппингов (syscall) и revoke/teardown взаимоисключены; fail-safe leak сохранён | написано |
-| 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — 64 раунда quiesce + visibility + per-CPU timer; boot-самотесты MMU TLB и DMA quarantine | написано |
+| 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer; boot-самотесты MMU TLB и DMA quarantine | написано, негативные тесты подтверждены |
 
 ## Найдено и исправлено попутно (реальные баги)
 
@@ -328,17 +328,24 @@ DMA leak, and `-smp 2` still reports one peer.
    *Done:* a boot self-test now switches the running PE to a scratch TTBR0,
    reads a value, repoints the same VA at another frame and reads again. It
    fails the boot if the `tlbi ...is` in `flush_after_table_change` is removed
-   (verified by a negative build: exception 9). This proves the flush on the
-   executing PE; a second PE holding the *same* space is still untested.
+   (verified by a negative build: exception 9). A second, **cross-PE** probe
+   covers the gap that test leaves: the APs are parked before the scheduler
+   loop, switch to the boot CPU's scratch space, read the VA, wait while the
+   boot CPU re-points the same PTE, then read it again. With the broadcast
+   `tlbi vmalle1is` replaced by a local `tlbi vmalle1`, all three peers keep the
+   stale translation and the probe reports FAIL, so the test is sensitive to a
+   non-broadcast flush on a *different* PE.
    Table publication is now batched (`finish_table_changes`, one shootdown per
    map/heap-growth call) in the XNU `pmap` "edit the range, flush once" style.
 2. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
    DMA revoke while a client runs, and page-table teardown under load. The
    `demo-tasks` suite passes on `-smp 2` and `-smp 4` (66 PASS, 0 PANIC);
    `smp-selftest` runs 64 back-to-back stop-the-world rounds with a per-round
-   visibility check and a per-CPU timer-liveness check. A true cross-PE
-   stale-translation / in-flight-MMAP stress still needs a task pinned to a
-   shared space.
+   visibility check and a per-CPU timer-liveness check. The cross-PE TLB probe
+   above proves one remap crosses the domain, but an in-flight-MMAP stress
+   (a task actively faulting while its space is edited) still needs a task
+   pinned to a shared space, which the current one-space-per-task model does
+   not provide.
 3. **Device DMA quiescence.** The stop-the-world window covers CPUs, not a
    device with an armed queue; the driver stop/reset contract stays
    authoritative. *Done (kernel side):* revoked runs are quarantined for
@@ -394,9 +401,12 @@ DMA leak, and `-smp 2` still reports one peer.
 - `no_std,smp,demo-tasks`, QEMU `-smp 4`: **66 PASS / 0 FAIL / 0 PANIC**,
   clean exit, no DMA leak; spawn/kill/reap and DMA revoke ran while all four
   CPUs were scheduling. The same suite passes on `-smp 2`.
-- `no_std,smp-selftest`, QEMU `-smp 4`: `SMP SELFTEST: quiesce PASS (64
-  rounds, 3 peer CPU(s))` and `SMP SELFTEST: ticks PASS (3 peer CPU(s))`, then
-  `howl>`; `-smp 2` reports one peer.
+- `no_std,smp-selftest`, QEMU `-smp 4`: `SMP SELFTEST: tlb cross-PE PASS (3
+  peer CPU(s) saw the remap)`, then `quiesce PASS (64 rounds, 3 peer CPU(s))`
+  and `ticks PASS (3 peer CPU(s))`, then `howl>`; `-smp 2` reports one peer.
+  Negative build (broadcast `tlbi vmalle1is` replaced by local `tlbi vmalle1`
+  in `finish_table_changes`): `tlb cross-PE FAIL (3 CPU(s) kept the stale
+  translation)` while quiesce/ticks still pass.
 - Forced AP GIC failure (temporary build-only patch): CPU1 stays offline,
   prints `AP GIC unavailable`, and the system still reaches `howl>`.
 - Boot self-tests: `MMU TLB OK` (TTBR0 remap proof) and `DMA QUARANTINE OK`
