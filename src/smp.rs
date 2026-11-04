@@ -37,7 +37,7 @@
 //! belt-and-braces; it is explicitly NOT a cross-CPU synchronization.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicUsize, Ordering};
 
 use crate::{interrupts, platform};
 
@@ -89,19 +89,18 @@ static CPUS: [PerCpu; MAX_CPUS] = [
     PerCpu::empty(),
 ];
 
-/// Number of CPUs the platform brings up. The tablet profile stays
-/// single-core for now (its ABL already parks secondaries in the boot stub);
-/// QEMU runs with `-smp 2`.
+/// Number of CPU slots the platform may bring up. QEMU `virt` uses up to
+/// [`MAX_CPUS`] (the profile is tested with `-smp 4`); CPUs the machine does
+/// not expose simply fail `PSCI CPU_ON` and stay offline. Both real-hardware
+/// profiles stay single-core: their boot stub parks secondaries and AP
+/// bring-up is QEMU-only.
 pub fn cpu_count() -> usize {
-    // Both real-hardware profiles stay single-core for now: the boot stub
-    // parks secondaries and AP bring-up is QEMU-only. Without the opt-in
-    // `smp` feature even QEMU stays on one CPU.
     #[cfg(feature = "smp")]
     {
         if platform::detect().is_tablet() || platform::detect().is_fog() {
             1
         } else {
-            2
+            MAX_CPUS
         }
     }
     #[cfg(not(feature = "smp"))]
@@ -235,6 +234,19 @@ pub static BKL_DISABLED: AtomicBool = AtomicBool::new(false);
 /// runtime switch for bisect/rollback; `smp` builds default to true.
 #[cfg(feature = "smp")]
 pub static AP_TASK_SCHEDULING: AtomicBool = AtomicBool::new(true);
+
+/// CPUs PSCI accepted (`CPU_ON` returned success) plus the boot CPU. The
+/// self-test waits for exactly this many CPUs, so a `-smp 2` machine does not
+/// block on slots the firmware rejected while `-smp 4` waits for all three APs.
+#[cfg(feature = "smp")]
+static EXPECTED_CPUS: AtomicUsize = AtomicUsize::new(1);
+
+/// Number of CPUs the firmware accepted during bring-up (including the boot
+/// CPU). Never exceeds [`cpu_count`].
+#[cfg(feature = "smp-selftest")]
+pub fn expected_cpus() -> usize {
+    EXPECTED_CPUS.load(Ordering::Acquire)
+}
 
 /// Debug probe chain (read via QEMU monitor `xp` at its physical address,
 /// which equals the identity-mapped VA). Stages: 1=wait entered, 2=irq saved,
@@ -676,7 +688,7 @@ pub extern "C" fn bkl_release_asm() {
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "smp")]
-use core::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use core::sync::atomic::Ordering as AtomicOrdering;
 
 /// Boot parameters consumed by the physical AP trampoline. Fields are
 /// atomics so the boot CPU can publish them with Release stores; the
@@ -822,6 +834,7 @@ pub fn boot_secondary_cpus() {
         return;
     }
     crate::console::write_str("SMP: powering on secondary CPUs\r\n");
+    EXPECTED_CPUS.store(1, Ordering::Release);
     for cpu in 1..cpu_count() {
         let Some((stack, stack_generation)) =
             crate::frame_allocator::alloc_contiguous_pages_tagged(2)
@@ -911,12 +924,16 @@ pub fn boot_secondary_cpus() {
         if result != 0 {
             // The CPU never entered the trampoline, so nothing references
             // this stack or address space. Release both instead of leaking
-            // them on every late bring-up failure.
+            // them, and keep probing the remaining slots: a QEMU machine with
+            // fewer CPUs than `MAX_CPUS` simply reports every missing slot as
+            // offline instead of aborting the whole bring-up.
             crate::mmu::destroy_task_space(space_token, private, private_generation);
             crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: CPU_ON failed, CPU left offline\r\n");
-            return;
+            continue;
         }
+        // PSCI accepted this CPU; the self-test will wait for it to publish.
+        EXPECTED_CPUS.fetch_add(1, Ordering::Release);
     }
 
     #[cfg(feature = "smp-selftest")]
@@ -941,16 +958,23 @@ fn run_quiesce_selftest() {
         return;
     }
     let me = this_cpu_id();
+    let expected = expected_cpus();
     let mut spins: u32 = 0;
     let peers = loop {
         let online = (0..cpu_count())
             .filter(|&cpu| cpu != me && cpu_online(cpu))
             .count();
-        if online > 0 {
+        if online + 1 >= expected {
             break online;
         }
         spins += 1;
         if spins >= 5_000_000 {
+            if online > 0 {
+                // PSCI accepted more CPUs than published: a GIC failure parks
+                // an AP offline by design. Test the set that is actually up.
+                crate::console::write_str("SMP SELFTEST: waiting for all CPUs gave up\r\n");
+                break online;
+            }
             crate::console::write_str("SMP SELFTEST: skipped, no secondary online\r\n");
             return;
         }
@@ -997,6 +1021,41 @@ fn run_quiesce_selftest() {
     crate::console::write_str("SMP SELFTEST: quiesce PASS (");
     crate::console::write_dec_u64(SELFTEST_ROUNDS as u64);
     crate::console::write_str(" rounds, ");
+    crate::console::write_dec_u64(peers as u64);
+    crate::console::write_str(" peer CPU(s))\r\n");
+
+    // Timer liveness: the stop-the-world handshake proves a peer can take an
+    // SGI from the BKL retry loop, which does not require IRQs. Check each
+    // published CPU's own PPI counter as well, so an online-but-deaf core is
+    // reported instead of looking healthy until a deadline stops expiring.
+    let mut baseline = [0_u64; MAX_CPUS];
+    for (cpu, value) in baseline.iter_mut().enumerate() {
+        *value = crate::timer::cpu_ticks(cpu);
+    }
+    let mut spins: u32 = 0;
+    loop {
+        let mut all = true;
+        for cpu in 0..cpu_count() {
+            if cpu == me || !cpu_online(cpu) {
+                continue;
+            }
+            if crate::timer::cpu_ticks(cpu) <= baseline[cpu] {
+                all = false;
+            }
+        }
+        if all {
+            break;
+        }
+        spins += 1;
+        if spins >= 50_000_000 {
+            crate::console::write_str("SMP SELFTEST: ticks FAIL (a CPU missed its timer PPI)\r\n");
+            return;
+        }
+        unsafe {
+            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+        }
+    }
+    crate::console::write_str("SMP SELFTEST: ticks PASS (");
     crate::console::write_dec_u64(peers as u64);
     crate::console::write_str(" peer CPU(s))\r\n");
 }

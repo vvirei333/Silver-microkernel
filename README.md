@@ -83,7 +83,7 @@ userspace.
 - [x] Boot-time MMU TLB proof: read through TTBR0, remap the same VA, read again (fails the boot if the `tlbi` broadcast is missing)
 - [x] Per-task anonymous-mapping quota (16 MiB) and a DMA quarantine window before revoked frames are recycled
 - [ ] SFS write path, block-path interrupts, remaining resource quotas and persistent storage
-- [ ] SMP (`-smp 2`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings CPU1 online, runs tasks on both CPUs and passes the `demo-tasks` regression (66 PASS / 0 PANIC). `no_std,smp-selftest` additionally runs 64 back-to-back SGI1 stop-the-world rounds at boot and verifies cross-CPU visibility. Physical SMP, TLB-shootdown stress and device-DMA quiescence remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
+- [ ] SMP (`-smp 4`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to three APs online (CPU1–CPU3), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` (66 PASS / 0 PANIC). `no_std,smp-selftest` additionally runs 64 back-to-back SGI1 stop-the-world rounds, verifies cross-CPU visibility, and checks that every online CPU advances its own timer tick. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Physical SMP, true cross-PE TLB-shootdown stress and device-DMA quiescence remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
 
 ## Redmi 10C (`fog`, SM6225) — RAM-only bring-up
 
@@ -130,11 +130,12 @@ device has been booted with it yet.
 cargo build --release --target aarch64-unknown-none \
     --no-default-features --features no_std,fog
 
-# QEMU-only SMP: AP online, GIC/timer/IPI and task execution
+# QEMU-only SMP (up to 4 CPUs; run QEMU with -smp 4): APs online,
+# GIC/timer/IPI and task execution on every PE
 cargo build --release --target aarch64-unknown-none \
     --no-default-features --features no_std,smp
 
-# Same, plus 64 boot-time SGI1 stop-the-world rounds (PASS/FAIL log)
+# Same, plus 64 boot-time SGI1 stop-the-world rounds and a per-CPU timer check
 cargo build --release --target aarch64-unknown-none \
     --no-default-features --features no_std,smp-selftest
 
@@ -382,9 +383,9 @@ Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
 `Cargo.toml` has `std` (default host stub), `no_std` (bare metal), `smp`
-(opt-in QEMU SMP), `smp-selftest` (SMP plus 64 boot-time SGI1 quiescence
-rounds with a cross-CPU visibility check), `demo-tasks` (opt-in regression
-programs), `tablet` (SM8650), `fog`
+(opt-in QEMU SMP, up to 4 CPUs), `smp-selftest` (SMP plus 64 boot-time SGI1
+quiescence rounds, a cross-CPU visibility check and a per-CPU timer check),
+`demo-tasks` (opt-in regression programs), `tablet` (SM8650), `fog`
 (SM6225 RAM-only bring-up) and `fog-reloc` (explicit opt-in for the fog
 self-relocation copy). Normal bare-metal boot starts only
 silverd, which then starts Scout, the block driver, the network driver, the SFS
@@ -651,23 +652,27 @@ device-quiescence proof — stopping the queue remains the driver's contract.
 Current verification snapshot (2026-11-04): **142 host tests** pass; the fog
 QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
-`howl>`; the demo regression reports 66 PASS / 0 PANIC and also passes under
-`no_std,smp` with QEMU `-smp 2`; all four release
+`howl>`; the demo regression reports 66 PASS / 0 PANIC under `no_std,smp` with
+QEMU `-smp 4` (and `-smp 2`); all four release
 feature sets (`no_std`, `fog`, `fog-reloc`, `tablet`) build. The opt-in
-`no_std,smp` build on QEMU `-smp 2` brings CPU1 online, runs tasks on both
-CPUs, and reaches a working `howl>` prompt. DMA teardown stops the other CPUs
-with a round-qualified SGI1 acknowledgement handshake; a timeout falls back to
-the conservative quiescence gate (a space still current on a CPU is not
-destroyed, and a range mapped by a running task is deferred and leaked).
-Revoked DMA runs are quarantined for several scheduling epochs before their
-frames return to the allocator, and a boot self-test proves the window. The
-opt-in `no_std,smp-selftest` run executes 64 back-to-back rounds and proves
-per-round memory visibility across CPUs. A separate boot self-test proves that
-a TTBR0 remap followed by the `tlbi ...is` broadcast changes what the CPU
-reads (removing the `tlbi` makes the boot fail with exception 9). True
-cross-PE stale-translation stress, in-flight device DMA and physical SMP
-remain open; see
-[SMP_STATUS.md](SMP_STATUS.md). A physical Redmi
+`no_std,smp` build on QEMU `-smp 4` brings CPU1–CPU3 online, runs tasks on
+all four CPUs, and reaches a working `howl>` prompt; slots the machine does
+not expose stay offline instead of aborting bring-up. DMA teardown stops the
+other CPUs with a round-qualified SGI1 acknowledgement handshake; a timeout
+falls back to the conservative quiescence gate (a space still current on a
+CPU is not destroyed, and a range mapped by a running task is deferred and
+leaked). Revoked DMA runs are quarantined for several scheduling epochs before
+their frames return to the allocator, and a boot self-test proves the window.
+The opt-in `no_std,smp-selftest` run executes 64 back-to-back rounds, proves
+per-round memory visibility across CPUs, and verifies that every online PE
+advances its own timer tick (`ticks PASS (3 peer CPU(s))` on `-smp 4`). A
+separate boot self-test proves that a TTBR0 remap followed by the
+`tlbi ...is` broadcast changes what the CPU reads (removing the `tlbi` makes
+the boot fail with exception 9). Kernel console writes take a bounded
+best-effort writer lock, so bytes from different CPUs no longer interleave
+inside one call; whole diagnostic lines can still interleave at call
+boundaries. True cross-PE stale-translation stress, in-flight device DMA and
+physical SMP remain open; see [SMP_STATUS.md](SMP_STATUS.md). A physical Redmi
 10C `rain` unit boots the post-E2 RAM-only image to the `fog-ui` panel with
 `GICV3 ONLINE`, `TIMER ONLINE` and growing `TICKS`. The GIC gate deliberately
 does not use `GICR_IGROUPR0`: on Rain it reads zero for timer PPI 18 even

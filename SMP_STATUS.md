@@ -7,11 +7,13 @@
 > the earlier SMP session.
 >
 > **Phases 1–2 are implemented as the opt-in `smp` feature (QEMU only).**
-> Default builds remain single-core. With `no_std,smp` and QEMU `-smp 2`,
-> CPU1 is brought online through a physical AP trampoline, its GICv3/GICv2
-> PPI and timer are initialized, it receives IPIs, and it executes tasks. The
-> scheduler keeps one idle context per CPU; AP idle ids live above the user id
-> space so `SCOUT_ID` and spawn-order identities do not move.
+> Default builds remain single-core. With `no_std,smp` and QEMU `-smp 4`,
+> CPU1–CPU3 are brought online through the physical AP trampoline, their
+> GICv3/GICv2 PPI and timer are initialized, they receive IPIs, and they
+> execute tasks on every PE. Slots the machine does not expose fail `CPU_ON`
+> and stay offline instead of aborting bring-up. The scheduler keeps one idle
+> context per CPU; AP idle ids live above the user id space so `SCOUT_ID` and
+> spawn-order identities do not move.
 >
 > Package E2 (owner-aware page-table walks, DRAM-bounded revoke, `CTR_EL0`
 > cache-line helper) was written for the single-CPU model. AP task execution
@@ -200,6 +202,37 @@ counters:
 Verified on QEMU `-smp 2`, three consecutive boots:
 `SMP SELFTEST: quiesce PASS (64 rounds, 1 peer CPU(s))`.
 
+### Phase 4.3: four-core bring-up (2026-11-04)
+
+`cpu_count()` now reports `MAX_CPUS` (4) on QEMU, and the remaining pieces were
+made count-agnostic:
+
+- `boot_secondary_cpus` keeps probing after a failed `CPU_ON` instead of
+  aborting the loop, so `-smp 2` / `-smp 3` log the missing slots as offline
+  and still reach the self-test. `EXPECTED_CPUS` records how many CPUs PSCI
+  actually accepted, and the self-test waits for exactly that set.
+- AP slot assignment stays independent of the PSCI index: each AP receives its
+  own `ApBootParams` and claims the first free `CPUS` slot, so concurrent
+  CPU2/CPU3 starts cannot corrupt each other's stack or space.
+- GICv2 `GICD_SGIR` (`all but self`, filter `0b01`) and GICv3 `ICC_SGI1R`
+  (`IRM` set) already broadcast to any CPU count; the per-PE GIC/timer init
+  was not CPU1-specific.
+- The kernel console takes a bounded best-effort writer lock so bytes from
+  different PEs cannot interleave *inside* one write call. Whole diagnostic
+  lines can still interleave at call boundaries; the self-test lines are
+  printed by the boot CPU after the APs have stopped logging.
+- `timer` now keeps a per-CPU tick counter alongside the boot-CPU-only global
+  `TICKS`. `smp-selftest` waits for every online PE to advance its own counter,
+  which distinguishes a live core from one that is online but no longer taking
+  its PPI.
+- The 4-core demo regression passes with the same suite.
+
+Verified on QEMU `-smp 4` (GICv2 `virt`, cortex-a72):
+`SMP SELFTEST: quiesce PASS (64 rounds, 3 peer CPU(s))` and
+`SMP SELFTEST: ticks PASS (3 peer CPU(s))`, then `howl>`;
+`no_std,smp,demo-tasks -smp 4` exits **66 PASS / 0 FAIL / 0 PANIC** with no
+DMA leak, and `-smp 2` still reports one peer.
+
 ## Что сделано (фазы 1–6 задания TASK №6)
 
 | Фаза | Содержание | Состояние |
@@ -210,9 +243,9 @@ Verified on QEMU `-smp 2`, three consecutive boots:
 | 4. Синхро-примитивы | Mutex/WaitQueue под kernel lock, `bkl_assert_held()` в точках мутации, дока обновлена | написано |
 | 5. IRQ/таймер | gic: `init`/`cpu_init` разделены (banked SGI0+PPI30 в `cpu_init`), `send_sgi_all_but_self` (GICD_SGIR); gicv3: **поиск redistributor по `GICR_TYPER`**, ICC_SGI1R; таймер per-CPU (`cpu_init`), глобальный `TICKS` инкрементирует только CPU0 | написано |
 | 6. TLB | `tlbi vmalle1is` + `dsb ish` в `flush_after_table_change`/`switch_address_space`/`configure_and_enable`; протокол задокументирован в доке | написано |
-| 7. AP-boot | PSCI `CPU_ON` (HVC, `0xC4000003`), physical trampoline, `ApBootParams`, FP/SIMD + MMU enable, `boot_secondary_cpus()` from the first `schedule()` | работает на QEMU `-smp 2` |
+| 7. AP-boot | PSCI `CPU_ON` (HVC, `0xC4000003`), physical trampoline, `ApBootParams`, FP/SIMD + MMU enable, `boot_secondary_cpus()` from the first `schedule()` | работает на QEMU `-smp 2` и `-smp 4` |
 | 8. Shared DMA | под BKL: создание маппингов (syscall) и revoke/teardown взаимоисключены; fail-safe leak сохранён | написано |
-| 9. Тесты | — | **не начинались** |
+| 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — 64 раунда quiesce + visibility + per-CPU timer; boot-самотесты MMU TLB и DMA quarantine | написано |
 
 ## Найдено и исправлено попутно (реальные баги)
 
@@ -297,10 +330,11 @@ Verified on QEMU `-smp 2`, three consecutive boots:
    executing PE; a second PE holding the *same* space is still untested.
 2. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
    DMA revoke while a client runs, and page-table teardown under load. The
-   `demo-tasks` suite passes on `-smp 2` (66 PASS, 0 PANIC) and
-   `smp-selftest` runs 64 back-to-back stop-the-world rounds with a
-   per-round visibility check. A true cross-PE stale-translation /
-   in-flight-MMAP stress still needs a task pinned to a shared space.
+   `demo-tasks` suite passes on `-smp 2` and `-smp 4` (66 PASS, 0 PANIC);
+   `smp-selftest` runs 64 back-to-back stop-the-world rounds with a per-round
+   visibility check and a per-CPU timer-liveness check. A true cross-PE
+   stale-translation / in-flight-MMAP stress still needs a task pinned to a
+   shared space.
 3. **Device DMA quiescence.** The stop-the-world window covers CPUs, not a
    device with an armed queue; the driver stop/reset contract stays
    authoritative. *Done (kernel side):* revoked runs are quarantined for
@@ -349,12 +383,16 @@ Verified on QEMU `-smp 2`, three consecutive boots:
 
 - `cargo test --lib`: **142/142**.
 - Default `no_std` build, QEMU `-smp 2`: single-core, reaches `howl>`.
-- `no_std,smp` build, QEMU `-smp 2`: CPU1 online (GIC/timer/IPI), both CPUs
-  execute tasks, `howl ready`/prompt and `ps` work; 60 s without panic/BKL-stuck.
-- `no_std,smp,demo-tasks`, QEMU `-smp 2`: **66 PASS / 0 PANIC**, clean exit;
-  spawn/kill/reap and DMA revoke ran while both CPUs were scheduling.
-- `no_std,smp-selftest`, QEMU `-smp 2`: `SMP SELFTEST: quiesce PASS (64
-  rounds, 1 peer CPU(s))` during boot, then `howl>`; repeated over three boots.
+- `no_std,smp` build, QEMU `-smp 4`: CPU1–CPU3 online (GIC/timer/IPI), all
+  four CPUs execute tasks; `howl ready`/prompt and `ps` work.
+- `no_std,smp` build, QEMU `-smp 2`: only CPU1 comes online; CPU2/CPU3 report
+  `CPU_ON failed` and stay offline without aborting the boot.
+- `no_std,smp,demo-tasks`, QEMU `-smp 4`: **66 PASS / 0 FAIL / 0 PANIC**,
+  clean exit, no DMA leak; spawn/kill/reap and DMA revoke ran while all four
+  CPUs were scheduling. The same suite passes on `-smp 2`.
+- `no_std,smp-selftest`, QEMU `-smp 4`: `SMP SELFTEST: quiesce PASS (64
+  rounds, 3 peer CPU(s))` and `SMP SELFTEST: ticks PASS (3 peer CPU(s))`, then
+  `howl>`; `-smp 2` reports one peer.
 - Forced AP GIC failure (temporary build-only patch): CPU1 stays offline,
   prints `AP GIC unavailable`, and the system still reaches `howl>`.
 - Boot self-tests: `MMU TLB OK` (TTBR0 remap proof) and `DMA QUARANTINE OK`

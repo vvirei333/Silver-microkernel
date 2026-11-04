@@ -5,6 +5,27 @@ pub const TICK_INTERVAL_MS: u64 = 10;
 static INTERVAL_TICKS: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
 
+/// Per-CPU tick counters. `TICKS` stays boot-CPU-only so deadlines do not
+/// compress with the CPU count, but every PE's own PPI must still advance:
+/// this is what the SMP liveness self-test checks, and what identifies a core
+/// that is online yet no longer taking its timer interrupt.
+static CPU_TICKS: [AtomicU64; crate::smp::MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// Ticks observed on `cpu` (0 when the index is out of range). Only the
+/// `smp-selftest` liveness check consumes this.
+#[cfg(feature = "smp-selftest")]
+pub fn cpu_ticks(cpu: usize) -> u64 {
+    CPU_TICKS
+        .get(cpu)
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or(0)
+}
+
 pub fn init() {
     let mut frequency = counter_frequency();
     if frequency == 0 {
@@ -56,7 +77,13 @@ pub fn handle_irq() {
     // Every CPU has its own timer PPI, but they exist for preemption only:
     // global time advances on the boot CPU alone, otherwise N CPUs would
     // count N ticks per interval and every deadline would compress N-fold.
-    if crate::smp::this_cpu_id() == 0 {
+    // The per-CPU counter always advances so a live core can be distinguished
+    // from one that is online but no longer receiving its PPI.
+    let cpu = crate::smp::this_cpu_id();
+    if let Some(counter) = CPU_TICKS.get(cpu) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+    if cpu == 0 {
         TICKS.fetch_add(1, Ordering::Relaxed);
     }
     crate::smp::probe(21);

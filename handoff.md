@@ -51,6 +51,19 @@ AP publication gated on a usable banked GIC.
   private page and task space instead of leaking them. The opt-in
   `smp-selftest` feature now runs 64 back-to-back SGI1 rounds and checks that
   every acking CPU observed the generation published before each request.
+- **Four-core bring-up (2026-11-04).** `cpu_count()` reports `MAX_CPUS` (4) on
+  QEMU; `boot_secondary_cpus` probes every slot and keeps going when `CPU_ON`
+  rejects one, so `-smp 2`/`-smp 3` leave the missing slots offline instead of
+  aborting. `EXPECTED_CPUS` records the accepted set and the self-test waits
+  for exactly that many CPUs. Each AP still receives its own `ApBootParams` and
+  claims the first free `CPUS` slot, so concurrent CPU2/CPU3 starts cannot
+  corrupt each other. Kernel console writes take a bounded best-effort writer
+  lock (bytes no longer interleave inside one call), and the timer keeps a
+  per-CPU tick counter so `smp-selftest` can prove every online PE takes its
+  PPI (`ticks PASS`) even when the SGI path works. Verified: `-smp 4` brings
+  CPU1–CPU3 online with `quiesce PASS (64 rounds, 3 peers)` and
+  `ticks PASS (3 peers)`; `demo-tasks` on `-smp 4` is 66 PASS / 0 FAIL /
+  0 PANIC with no DMA leak.
 - **Ctrl-Z regression fixed after S-01.** The audit added a
   `CAP_CONSOLE_GRANT` gate to `SYS_STOP_CONSOLE`, but Howler's initial
   self-capabilities did not include it, so the userspace UART driver could no
@@ -89,9 +102,10 @@ AP publication gated on a usable banked GIC.
 - Verified in this snapshot: **142 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
-  `no_std,smp` with QEMU `-smp 2`, `no_std,smp-selftest` logging
-  `quiesce PASS (64 rounds, 1 peer CPU(s))` on three consecutive boots,
-  tablet build, and fog boot image v3. The boot self-tests log
+  `no_std,smp` with QEMU `-smp 2` and `-smp 4`, `no_std,smp-selftest` logging
+  `quiesce PASS (64 rounds, 3 peer CPU(s))` and `ticks PASS (3 peer CPU(s))`
+  on `-smp 4` (one peer on `-smp 2`), tablet build, and fog boot image v3.
+  The boot self-tests log
   `MMU TLB OK` and `DMA QUARANTINE OK`.
 - **Hardware coverage after E2 is a smoke test, not a proof.** The post-E2
   image boots on physical `rain` and the GIC/timer panel is live, but QEMU and

@@ -9,8 +9,56 @@
 //! `Kind::Unknown` deliberately has no output path: writing to an unproven
 //! MMIO address is a bus abort, so silence is the only safe behaviour.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::fdt::UartKind;
 use crate::platform::{self, Kind};
+
+/// Best-effort writer serialization for the single UART FIFO.
+///
+/// Every CPU shares one transmitter; without this, two PEs interleave bytes
+/// *inside* one `write_str` and the boot log becomes unreadable (visible as
+/// soon as three APs print on QEMU `-smp 4`). This is deliberately not a hard
+/// spinlock: `pl011::write_byte` re-enables IRQs while it waits for FIFO space,
+/// so the owner can be preempted and the lock must never be held across a
+/// context switch by contract. A bounded spin serializes the common short
+/// write; on timeout the caller writes anyway, because interleaved diagnostics
+/// beat a silent hang (this path is also used by the panic dumper).
+static WRITER_BUSY: AtomicBool = AtomicBool::new(false);
+const WRITER_SPIN_LIMIT: u32 = 100_000;
+
+struct WriterGuard {
+    owned: bool,
+}
+
+impl WriterGuard {
+    fn acquire() -> Self {
+        let mut spins = 0u32;
+        loop {
+            if WRITER_BUSY
+                .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
+                return Self { owned: true };
+            }
+            spins += 1;
+            if spins >= WRITER_SPIN_LIMIT {
+                return Self { owned: false };
+            }
+            unsafe {
+                core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+            }
+        }
+    }
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        if self.owned {
+            WRITER_BUSY.store(false, Ordering::Release);
+        }
+    }
+}
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum Active {
@@ -53,6 +101,7 @@ pub fn init() {
 }
 
 pub fn write_byte(byte: u8) {
+    let _writer = WriterGuard::acquire();
     match active() {
         Active::Geni => crate::geni_uart::write_byte(byte),
         Active::Pl011 => crate::pl011::write_byte(byte),
@@ -61,6 +110,7 @@ pub fn write_byte(byte: u8) {
 }
 
 pub fn write_str(message: &str) {
+    let _writer = WriterGuard::acquire();
     match active() {
         Active::Geni => crate::geni_uart::write_str(message),
         Active::Pl011 => crate::pl011::write_str(message),
@@ -69,6 +119,7 @@ pub fn write_str(message: &str) {
 }
 
 pub fn write_bytes(bytes: &[u8]) {
+    let _writer = WriterGuard::acquire();
     match active() {
         Active::Geni => crate::geni_uart::write_bytes(bytes),
         Active::Pl011 => crate::pl011::write_bytes(bytes),
@@ -77,6 +128,7 @@ pub fn write_bytes(bytes: &[u8]) {
 }
 
 pub fn write_hex_u64(value: u64) {
+    let _writer = WriterGuard::acquire();
     match active() {
         Active::Geni => crate::geni_uart::write_hex_u64(value),
         Active::Pl011 => crate::pl011::write_hex_u64(value),
@@ -85,6 +137,7 @@ pub fn write_hex_u64(value: u64) {
 }
 
 pub fn write_dec_u64(value: u64) {
+    let _writer = WriterGuard::acquire();
     match active() {
         Active::Geni => crate::geni_uart::write_dec_u64(value),
         Active::Pl011 => crate::pl011::write_dec_u64(value),
