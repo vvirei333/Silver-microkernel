@@ -583,11 +583,12 @@ pub fn run_smp_churn_selftest() -> bool {
     let last_id = first_id + total as u64 - 1;
 
     // The boot CPU holds the BKL. Release it so the APs can run the tasks;
-    // the boot task itself stays Running and cannot be claimed. Re-enable
-    // IRQs while waiting: global time (`timer::ticks`) advances on CPU 0
-    // only, so a masked wait would freeze every `sleep` deadline. A timer
-    // taken here re-enters `schedule`, which refuses the nested pass and
-    // returns, leaving this CPU's pass untouched.
+    // the boot task itself stays Running and cannot be claimed. Keep IRQs
+    // enabled while waiting so this CPU can still acknowledge a peer's
+    // stop-the-world SGI and take reschedule IPIs. A timer taken here
+    // re-enters `schedule`, which refuses the nested pass and returns,
+    // leaving this CPU's pass untouched; global time comes from the system
+    // counter, so deadlines advance whether or not this CPU takes its PPI.
     smp::bkl_release();
     interrupts::enable_irq();
     let mut spins: u32 = 0;

@@ -185,6 +185,15 @@ depend on four online CPUs.
   exception 9. Userspace drivers cannot arm a lease yet — that needs a syscall —
   so their ranges still rely on the quarantine window alone; the gap is
   explicit in `map_dma_to_user` and `SMP_STATUS.md`.
+- **Global monotonic clock (2026-11-04).** `timer::ticks()` no longer counts
+  only the boot CPU's timer interrupt. It derives 100 Hz ticks from
+  `CNTPCT_EL0` relative to the base captured in `timer::init`, so one clock
+  serves every PE and deadlines survive a CPU that cannot take its PPI. The
+  per-CPU counters stay as liveness evidence for `ticks PASS`. A boot test
+  masks the boot CPU, waits for one tick and logs
+  `clock PASS (CPU0 masked, ticks +N)`; the same test fails when `ticks()`
+  is switched back to the boot-CPU-only counter. This closes the churn-time
+  stall where six sleeping tasks never reached their deadlines.
 - **SMP churn harness (2026-11-04, opt-in `smp-churn`).** The boot CPU spawns
   12 short-lived kernel tasks with explicit high ids (`next_id` is saved and
   restored around each spawn so user spawn ids stay in lockstep with per-task
@@ -219,9 +228,9 @@ depend on four online CPUs.
   `tlb cross-PE PASS (3 peer CPU(s) saw the remap)`,
   `quiesce PASS (64 rounds, 3 peer CPU(s))` and `ticks PASS (3 peer CPU(s))`
   on `-smp 4` (one peer on `-smp 2`), and the combined
-  `no_std,smp,demo-tasks,smp-selftest` profile at **69 PASS / 0 FAIL / 0 PANIC**
+  `no_std,smp,demo-tasks,smp-selftest` profile at **70 PASS / 0 FAIL / 0 PANIC**
   with zero invariant failures and a `ready queues local=.. steal=.. scan=0`
-  dispatch-mix line. The opt-in
+  dispatch-mix line, including `clock PASS (CPU0 masked, ticks +1)`. The opt-in
   `no_std,smp-selftest,smp-churn` profile passed 28 consecutive `-smp 4` runs
   (`churn PASS`, audit active, no lock underflow or `BKL STUCK`). A negative build that drops the
   `running_on` claim makes the invariant check fire on the next pass

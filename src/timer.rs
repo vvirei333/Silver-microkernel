@@ -4,11 +4,15 @@ pub const TICK_INTERVAL_MS: u64 = 10;
 
 static INTERVAL_TICKS: AtomicU64 = AtomicU64::new(0);
 static TICKS: AtomicU64 = AtomicU64::new(0);
+/// System-counter value captured by [`init`]. Global tick time is derived from
+/// `CNTPCT_EL0` relative to this base, so it is one monotonic clock for every
+/// PE and keeps advancing while a CPU cannot take its own timer PPI.
+static COUNTER_BASE: AtomicU64 = AtomicU64::new(0);
 
-/// Per-CPU tick counters. `TICKS` stays boot-CPU-only so deadlines do not
-/// compress with the CPU count, but every PE's own PPI must still advance:
-/// this is what the SMP liveness self-test checks, and what identifies a core
-/// that is online yet no longer taking its timer interrupt.
+/// Per-CPU tick counters. They are liveness evidence only: what identifies a
+/// core that is online yet no longer taking its timer interrupt. Global time
+/// comes from the system counter, not from this array, so N CPUs cannot make
+/// time run N times faster.
 static CPU_TICKS: [AtomicU64; crate::smp::MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -39,6 +43,10 @@ pub fn init() {
     let interval = frequency * TICK_INTERVAL_MS / 1000;
     let interval = if interval == 0 { 1 } else { interval };
 
+    // Capture the base before publishing the interval: `ticks()` falls back to
+    // the interrupt counter while the interval is still zero, and once it sees
+    // a non-zero interval the base is already valid.
+    COUNTER_BASE.store(read_counter(), Ordering::Relaxed);
     INTERVAL_TICKS.store(interval, Ordering::Relaxed);
 
     if !available() {
@@ -75,10 +83,11 @@ pub fn cpu_init() {
 
 pub fn handle_irq() {
     // Every CPU has its own timer PPI, but they exist for preemption only:
-    // global time advances on the boot CPU alone, otherwise N CPUs would
-    // count N ticks per interval and every deadline would compress N-fold.
-    // The per-CPU counter always advances so a live core can be distinguished
-    // from one that is online but no longer receiving its PPI.
+    // global time comes from `CNTPCT_EL0` (see `ticks`), otherwise N CPUs
+    // would count N ticks per interval and every deadline would compress
+    // N-fold. The per-CPU interrupt counter still advances so a live core can
+    // be distinguished from one that is online but no longer receiving its
+    // PPI, and `TICKS` stays as the pre-init fallback.
     let cpu = crate::smp::this_cpu_id();
     if let Some(counter) = CPU_TICKS.get(cpu) {
         counter.fetch_add(1, Ordering::Relaxed);
@@ -91,8 +100,30 @@ pub fn handle_irq() {
     rearm();
 }
 
+/// Monotonic global time in [`TICK_INTERVAL_MS`] units.
+///
+/// The value comes from the always-on system counter, not from the boot CPU's
+/// interrupt handler: deadlines must not stop while CPU0 is in a long
+/// IRQ-masked section (a kernel lock held across a stop-the-world round, a
+/// diagnostic spin, or the churn harness's wait). `TICKS` remains the
+/// interrupt-driven fallback for the window before `init` publishes an
+/// interval.
 pub fn ticks() -> u64 {
-    TICKS.load(Ordering::Relaxed)
+    let interval = INTERVAL_TICKS.load(Ordering::Relaxed);
+    if interval == 0 {
+        return TICKS.load(Ordering::Relaxed);
+    }
+    read_counter().saturating_sub(COUNTER_BASE.load(Ordering::Relaxed)) / interval
+}
+
+/// Reads the EL1 physical counter (`CNTPCT_EL0`), the same time base the
+/// physical timer compares against.
+fn read_counter() -> u64 {
+    let counter: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) counter, options(nomem, nostack));
+    }
+    counter
 }
 
 pub fn milliseconds_to_ticks(milliseconds: u64) -> u64 {

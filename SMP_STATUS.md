@@ -247,7 +247,7 @@ DMA leak, and `-smp 2` still reports one peer.
 | 6. TLB | per-space ASID (`1..=255`, 8-bit) в `TTBR0[63:48]`; `switch_address_space` только `msr`+`isb`; правка PTE — `tlbi aside1is` по ASID; создание/AP-identity — `vmalle1is`; батчевая публикация (`finish_table_changes_for`); cross-PE probe доказывает, что ASID-scoped broadcast доходит до второго PE; boot-тест ASID-изоляции | написано, проверено на QEMU `-smp 4` |
 | 7. AP-boot | PSCI `CPU_ON` (HVC, `0xC4000003`), physical trampoline, `ApBootParams`, FP/SIMD + MMU enable, `boot_secondary_cpus()` from the first `schedule()` | работает на QEMU `-smp 2` и `-smp 4` |
 | 8. Shared DMA | под BKL: создание маппингов (syscall) и revoke/teardown взаимоисключены; fail-safe leak сохранён; `DmaLease` in-flight gate: диапазон с живым lease не освобождается | написано, boot-тест `DMA LEASE` |
-| 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer + проверка `running_on`/`current_index` на каждом проходе; `demo-tasks,smp-selftest` — 69 PASS / 0 PANIC / 0 invariant FAIL; boot-самотесты MMU TLB и DMA quarantine | написано, негативные тесты подтверждены |
+| 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer + проверка `running_on`/`current_index` на каждом проходе; `demo-tasks,smp-selftest` — 70 PASS / 0 PANIC / 0 invariant FAIL; boot-самотесты MMU TLB и DMA quarantine | написано, негативные тесты подтверждены |
 
 ## Найдено и исправлено попутно (реальные баги)
 
@@ -442,7 +442,7 @@ DMA leak, and `-smp 2` still reports one peer.
   Negative build (broadcast `tlbi vmalle1is` replaced by local `tlbi vmalle1`
   in `finish_table_changes`): `tlb cross-PE FAIL (3 CPU(s) kept the stale
   translation)` while quiesce/ticks still pass.
-- `no_std,smp,demo-tasks,smp-selftest`, QEMU `-smp 4`: **69 PASS / 0 FAIL /
+- `no_std,smp,demo-tasks,smp-selftest`, QEMU `-smp 4`: **70 PASS / 0 FAIL /
   0 PANIC** with zero `sched invariant FAIL`; the extra three PASS are the
   selftest lines. The dispatch-mix line reports the per-CPU queues doing the
   work (`ready queues local=35 steal=29 scan=0`; selftest-only reports more

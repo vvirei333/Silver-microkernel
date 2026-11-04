@@ -1015,12 +1015,51 @@ pub fn boot_secondary_cpus() {
         // cross-PE TLB proof must run before the stop-the-world rounds.
         run_cross_pe_tlb_probe();
         run_quiesce_selftest();
+        run_clock_selftest();
         // Last: spawn short-lived tasks and let the APs run/reap them while
         // the boot CPU waits with the BKL released. Opt-in `smp-churn`: it
         // currently exposes an intermittent scheduler-index race, so it must
         // not run in the normal selftest profile.
         #[cfg(feature = "smp-churn")]
         crate::scheduler::run_smp_churn_selftest();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Global clock self-test
+// ---------------------------------------------------------------------------
+
+/// Proves that global time does not depend on the boot CPU taking its timer
+/// PPI. The boot CPU masks IRQs and waits for one tick; with the old
+/// boot-CPU-only counter this would never advance and every `sleep` deadline
+/// would freeze for as long as CPU0 stays masked. The system counter is
+/// independent of both the PPI and the CPU, so one tick is reached regardless.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+fn run_clock_selftest() {
+    let start = crate::timer::ticks();
+    let target = start.saturating_add(1);
+    let saved_daif = crate::interrupts::save_and_disable_irq();
+    let mut spins: u32 = 0;
+    while crate::timer::ticks() < target && spins < 20_000_000 {
+        spins += 1;
+        unsafe {
+            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+        }
+    }
+    let end = crate::timer::ticks();
+    crate::interrupts::restore_irq(saved_daif);
+    if end >= target {
+        crate::console::write_str("SMP SELFTEST: clock PASS (CPU0 masked, ticks +");
+        crate::console::write_dec_u64(end - start);
+        crate::console::write_str(")\r\n");
+    } else {
+        crate::console::write_str("SMP SELFTEST: clock FAIL (start=");
+        crate::console::write_dec_u64(start);
+        crate::console::write_str(" end=");
+        crate::console::write_dec_u64(end);
+        crate::console::write_str(" spins=");
+        crate::console::write_dec_u64(spins as u64);
+        crate::console::write_str(")\r\n");
     }
 }
 

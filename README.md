@@ -700,9 +700,14 @@ falls back to the conservative quiescence gate (a space still current on a
 CPU is not destroyed, and a range mapped by a running task is deferred and
 leaked). Revoked DMA runs are quarantined for several scheduling epochs before
 their frames return to the allocator, and a boot self-test proves the window.
-The opt-in `no_std,smp-selftest` run executes 64 back-to-back rounds, proves
-per-round memory visibility across CPUs, and verifies that every online PE
-advances its own timer tick (`ticks PASS (3 peer CPU(s))` on `-smp 4`). A
+Global time is derived from the always-on system counter (`CNTPCT_EL0`)
+relative to the value captured at timer init, so `sleep`/IPC deadlines are one
+monotonic clock for every PE and keep advancing while a CPU is in a long
+IRQ-masked section; the boot test `clock PASS (CPU0 masked, ticks +N)` masks
+the boot CPU and fails on the old boot-CPU-only counter. The opt-in
+`no_std,smp-selftest` run executes 64 back-to-back rounds, proves per-round
+memory visibility across CPUs, and verifies that every online PE advances its
+own timer tick (`ticks PASS (3 peer CPU(s))` on `-smp 4`). A
 separate boot self-test proves that a TTBR0 remap followed by the
 `tlbi ...is` broadcast changes what the CPU reads (removing the `tlbi` makes
 the boot fail with exception 9). Kernel console writes take a bounded
