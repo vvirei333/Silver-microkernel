@@ -27,6 +27,77 @@ const IDLE_TASK_ID: u64 = 0;
 /// shift SCOUT_ID or any other spawn-order identity.
 const AP_IDLE_ID_BASE: u64 = 1 << 40;
 
+/// `smp-selftest` observability: where each dispatch came from. A healthy
+/// system dispatches from the per-CPU queue (`local`) or steals a runnable
+/// task from a peer; `scan` is the correctness fallback (expected mainly for
+/// idle tasks and for a task whose enqueue was missed).
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static READY_LOCAL_PICKS: [AtomicU64; smp::MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static READY_STEAL_PICKS: [AtomicU64; smp::MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static READY_SCAN_PICKS: [AtomicU64; smp::MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static READY_QUEUES_REPORTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+fn note_pick(counter: &[AtomicU64; smp::MAX_CPUS], cpu: usize) {
+    counter[cpu.min(smp::MAX_CPUS - 1)].fetch_add(1, Ordering::Relaxed);
+}
+
+/// Aggregate dispatch-source counts `(local, steal, fallback-scan)`.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn ready_queue_stats() -> (u64, u64, u64) {
+    let sum = |counter: &[AtomicU64; smp::MAX_CPUS]| {
+        counter
+            .iter()
+            .map(|value| value.load(Ordering::Relaxed))
+            .sum()
+    };
+    (
+        sum(&READY_LOCAL_PICKS),
+        sum(&READY_STEAL_PICKS),
+        sum(&READY_SCAN_PICKS),
+    )
+}
+
+/// Prints the dispatch-source mix once, after enough picks have happened to be
+/// meaningful. The queues are a cache with a fallback, so this is evidence
+/// that the fast path is actually used — not a pass/fail gate.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+fn report_ready_queues_once() {
+    if READY_QUEUES_REPORTED.load(Ordering::Relaxed) {
+        return;
+    }
+    let (local, steal, scan) = ready_queue_stats();
+    if local + steal + scan < 64 {
+        return;
+    }
+    READY_QUEUES_REPORTED.store(true, Ordering::Relaxed);
+    console::write_str("SMP SELFTEST: ready queues local=");
+    console::write_dec_u64(local);
+    console::write_str(" steal=");
+    console::write_dec_u64(steal);
+    console::write_str(" scan=");
+    console::write_dec_u64(scan);
+    console::write_str("\r\n");
+}
+
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum TaskState {
     Ready,
@@ -154,6 +225,17 @@ pub struct TaskManager {
     tasks: Vec<Task>,
     next_id: u64,
     console_parent: Option<u64>,
+    /// Per-CPU FIFO of Ready, **non-idle** tasks as `(id, index)` pairs. This
+    /// is a cache of the global `tasks` array, not the sole source of truth:
+    /// the stored id is checked against `tasks[index].id` on every dequeue, so
+    /// a missed rebuild after an index shift can only discard an entry, never
+    /// run the wrong task. `find_next_task` also falls back to a full scan, so
+    /// a missed enqueue can delay a task but never strand it. Idle tasks stay
+    /// out of the queues so the "real task before idle" policy is unchanged.
+    ///
+    /// Indices are invalidated by any `tasks.remove`/`retain`; those paths
+    /// rebuild every queue (see [`rebuild_ready_queues`]).
+    ready: [Vec<(u64, usize)>; smp::MAX_CPUS],
 }
 
 const TRACE_LEN: usize = 16;
@@ -418,6 +500,7 @@ pub fn init() {
         tasks: Vec::new(),
         next_id: 0,
         console_parent: None,
+        ready: core::array::from_fn(|_| Vec::new()),
     });
 
     let _idle_id = spawn_idle(None);
@@ -520,6 +603,7 @@ pub fn init_fog() {
         tasks: Vec::new(),
         next_id: 0,
         console_parent: None,
+        ready: core::array::from_fn(|_| Vec::new()),
     });
 
     let _idle_id = spawn_idle(None);
@@ -618,15 +702,15 @@ pub fn wake_bound_irq(intid: u32) -> bool {
     let Some(manager) = scheduler_manager() else {
         return false;
     };
-    let Some(task) = manager
+    let Some(index) = manager
         .tasks
-        .iter_mut()
-        .find(|task| !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(intid))
+        .iter()
+        .position(|task| !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq == Some(intid))
     else {
         return false;
     };
-    task.irq_pending = true;
-    wake_blocked_task(task);
+    manager.tasks[index].irq_pending = true;
+    wake_blocked_index(manager, index, smp::this_cpu_id());
     true
 }
 
@@ -656,16 +740,12 @@ pub fn notify_bound_task(id: u64) -> bool {
     let saved_daif = interrupts::save_and_disable_irq();
     let notified = scheduler_manager()
         .and_then(|manager| {
-            manager
-                .tasks
-                .iter_mut()
-                .find(|task| {
-                    task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq.is_some()
-                })
-                .map(|task| {
-                    task.irq_pending = true;
-                    wake_blocked_task(task);
-                })
+            let index = manager.tasks.iter().position(|task| {
+                task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie) && task.bound_irq.is_some()
+            })?;
+            manager.tasks[index].irq_pending = true;
+            wake_blocked_index(manager, index, smp::this_cpu_id());
+            Some(())
         })
         .is_some();
     interrupts::restore_irq(saved_daif);
@@ -708,8 +788,8 @@ pub fn wake_task(id: u64) {
     let saved_daif = interrupts::save_and_disable_irq();
     smp::bkl_acquire();
     if let Some(manager) = scheduler_manager() {
-        if let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) {
-            wake_blocked_task(task);
+        if let Some(index) = manager.tasks.iter().position(|task| task.id == id) {
+            wake_blocked_index(manager, index, smp::this_cpu_id());
         }
     }
     smp::bkl_release();
@@ -1055,6 +1135,9 @@ fn take_zombie(manager: &mut TaskManager, index: usize) -> u64 {
     let live_id = manager.tasks.get(smp::current_index()).map(|task| task.id);
     manager.tasks.remove(index);
     remap_current_indices(manager, &cpu_ids, live_id);
+    // Every later task moved down one slot, so every queued index now names a
+    // different task. Rebuild from the table instead of trying to shift.
+    rebuild_ready_queues(manager);
     if let Some(current) = manager.tasks.get_mut(smp::current_index()) {
         current.cap_table.remove_for_target(id);
     }
@@ -1196,21 +1279,32 @@ fn verify_scheduling_invariants(manager: &TaskManager) -> Result<(), &'static st
             }
         }
     }
+
+    // A queue entry out of range means an index-shifting removal forgot to
+    // rebuild; an id that no longer matches `tasks[index]` means the same drift
+    // was not rebuilt. Either would be a dispatch-time memory-safety bug.
+    for queue in &manager.ready {
+        for &(id, index) in queue {
+            match tasks.get(index) {
+                None => return Err("a ready queue holds an out-of-range index"),
+                Some(task) if task.id != id => {
+                    return Err("a ready queue entry names the wrong task")
+                }
+                _ => {}
+            }
+        }
+    }
     Ok(())
 }
 
 fn wake_process_waiters(manager: &mut TaskManager) {
     let mut woke_any = false;
     while let Some(waiter) = PROCESS_WAIT_QUEUE.pop() {
-        if let Some(task) = manager
-            .tasks
-            .iter_mut()
-            .find(|task| {
-                task.id == waiter
-                    && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
-            })
-        {
-            wake_blocked_task(task);
+        let found = manager.tasks.iter().position(|task| {
+            task.id == waiter && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+        });
+        if let Some(index) = found {
+            wake_blocked_index(manager, index, smp::this_cpu_id());
             woke_any = true;
         }
     }
@@ -1219,11 +1313,15 @@ fn wake_process_waiters(manager: &mut TaskManager) {
     }
 }
 
-fn wake_blocked_task(task: &mut Task) {
-    match task.state {
+fn wake_blocked_index(manager: &mut TaskManager, index: usize, cpu: usize) -> bool {
+    let Some(task) = manager.tasks.get_mut(index) else {
+        return false;
+    };
+    let became_ready = match task.state {
         TaskState::Blocked | TaskState::BlockedUntil(_) => {
             task.state = TaskState::Ready;
             task.waiting_on = None;
+            true
         }
         TaskState::Stopped
             if matches!(
@@ -1233,9 +1331,18 @@ fn wake_blocked_task(task: &mut Task) {
         {
             task.resume_state = Some(TaskState::Ready);
             task.waiting_on = None;
+            false
         }
-        _ => {}
+        _ => false,
+    };
+    if became_ready {
+        // A task still recorded as running on a CPU (its block released the
+        // lock, but its own pass has not switched away yet) is not queued: its
+        // owning CPU's switch-away path enqueues it. Queuing it here would let
+        // another CPU claim a task that is still executing.
+        enqueue_ready(manager, cpu, index);
     }
+    became_ready
 }
 
 pub fn current_task_id() -> u64 {
@@ -1321,19 +1428,23 @@ pub fn resume_task(id: u64) -> bool {
     let saved_daif = interrupts::save_and_disable_irq();
     let result = scheduler_manager()
         .map(|manager| {
-            let Some(task) = manager
+            let Some(index) = manager
                 .tasks
-                .iter_mut()
-                .find(|task| task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie))
+                .iter()
+                .position(|task| task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie))
             else {
                 return false;
             };
-            if task.state == TaskState::Stopped {
-                task.state = task.resume_state.take().unwrap_or(TaskState::Ready);
-                if task.state == TaskState::Running {
-                    task.state = TaskState::Ready;
+            {
+                let task = &mut manager.tasks[index];
+                if task.state == TaskState::Stopped {
+                    task.state = task.resume_state.take().unwrap_or(TaskState::Ready);
+                    if task.state == TaskState::Running {
+                        task.state = TaskState::Ready;
+                    }
                 }
             }
+            enqueue_ready(manager, smp::this_cpu_id(), index);
             true
         })
         .unwrap_or(false);
@@ -1580,6 +1691,8 @@ pub fn schedule() {
         console::write_str(")\r\n");
         panic!("scheduling invariant violated");
     }
+    #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+    report_ready_queues_once();
     wake_expired_tasks(manager, timer::ticks());
 
     if AP_BOOT_PENDING.swap(false, core::sync::atomic::Ordering::AcqRel) {
@@ -1612,7 +1725,7 @@ pub fn schedule() {
     }
 
     let scan_base = if had_current { current_index } else { 0 };
-    let Some(next_index) = find_next_task(manager, scan_base) else {
+    let Some(next_index) = find_next_task(manager, smp::this_cpu_id(), scan_base) else {
         if had_current && manager.tasks[current_index].state == TaskState::Ready {
             manager.tasks[current_index].state = TaskState::Running;
         }
@@ -1632,13 +1745,23 @@ pub fn schedule() {
     // Switching away: the outgoing task stops running on this CPU. An AP's
     // first pass has no outgoing task, so there is no state to clear.
     if had_current {
-        match manager.tasks.get_mut(current_index) {
-            Some(outgoing) => outgoing.running_on = None,
+        let outgoing_ready = match manager.tasks.get_mut(current_index) {
+            Some(outgoing) => {
+                outgoing.running_on = None;
+                // The outgoing task may be `Ready` (it yielded, or a wake moved
+                // it back to Ready while it still owned this CPU). Now that no
+                // CPU owns it, put it on this CPU's ready queue.
+                outgoing.state == TaskState::Ready
+            }
             None => {
                 console::write_str("SCHEDULE: current_index out of range: ");
                 console::write_dec_u64(current_index as u64);
                 console::write_str("\r\n");
+                false
             }
+        };
+        if outgoing_ready {
+            enqueue_ready(manager, smp::this_cpu_id(), current_index);
         }
     }
 
@@ -1829,6 +1952,9 @@ fn spawn_elf_task(image: LoadedImage, argument: u64) -> Option<u64> {
     task.cwd = cwd;
     manager.tasks.push(task);
     manager.next_id += 1;
+    // A freshly spawned task starts Ready: queue it on the spawning CPU.
+    let index = manager.tasks.len() - 1;
+    enqueue_ready(manager, smp::this_cpu_id(), index);
     Some(id)
 }
 
@@ -2115,10 +2241,99 @@ fn spawn_inner(
 
     manager.tasks.push(task);
     manager.next_id += 1;
+    // A freshly spawned task starts Ready: queue it on the spawning CPU.
+    let index = manager.tasks.len() - 1;
+    enqueue_ready(manager, smp::this_cpu_id(), index);
     Some(id)
 }
 
-fn find_next_task(manager: &TaskManager, scan_base: usize) -> Option<usize> {
+/// True when `index` names a task this scheduler pass may dispatch right now:
+/// in range, not terminal, not owned by a CPU, and not an idle task (idle is
+/// only ever chosen by the global fallback so real work always wins).
+fn ready_for_queue(manager: &TaskManager, index: usize) -> bool {
+    manager.tasks.get(index).is_some_and(|task| {
+        !task.is_idle
+            && task.state == TaskState::Ready
+            && task.running_on.is_none()
+    })
+}
+
+/// Appends `index` to `cpu`'s ready queue if it is dispatchable and not
+/// already present. Deduplicating keeps the queues from growing when a task is
+/// woken repeatedly without being dispatched.
+fn enqueue_ready(manager: &mut TaskManager, cpu: usize, index: usize) {
+    if !ready_for_queue(manager, index) {
+        return;
+    }
+    let id = manager.tasks[index].id;
+    let cpu = cpu.min(smp::MAX_CPUS - 1);
+    if !manager.ready[cpu]
+        .iter()
+        .any(|&(queued_id, queued_index)| queued_index == index && queued_id == id)
+    {
+        manager.ready[cpu].push((id, index));
+    }
+}
+
+/// Pops the next dispatchable task from `cpu`'s queue, discarding stale
+/// entries: a task that was killed, blocked again, claimed by another CPU, or
+/// whose index was shifted by a removal (the stored id no longer matches).
+fn dequeue_ready(manager: &mut TaskManager, cpu: usize) -> Option<usize> {
+    let cpu = cpu.min(smp::MAX_CPUS - 1);
+    while let Some((id, index)) = manager.ready[cpu].pop() {
+        let same_task = manager
+            .tasks
+            .get(index)
+            .map(|task| task.id == id)
+            .unwrap_or(false);
+        if same_task && ready_for_queue(manager, index) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+/// Rebuilds every queue from the task table. Required after any operation that
+/// shifts indices (`Vec::remove` / `retain`); also used to seed the queues
+/// after a state sweep.
+fn rebuild_ready_queues(manager: &mut TaskManager) {
+    for queue in &mut manager.ready {
+        queue.clear();
+    }
+    let cpus = smp::cpu_count().max(1);
+    // Split borrows: `tasks` is read while `ready` is written.
+    let tasks = &manager.tasks;
+    let ready = &mut manager.ready;
+    for index in 0..tasks.len() {
+        let task = &tasks[index];
+        if !task.is_idle && task.state == TaskState::Ready && task.running_on.is_none() {
+            let cpu = index % cpus;
+            ready[cpu].push((task.id, index));
+        }
+    }
+}
+
+fn find_next_task(manager: &mut TaskManager, cpu: usize, scan_base: usize) -> Option<usize> {
+    // 1. This CPU's own queue — the common case, O(1).
+    if let Some(index) = dequeue_ready(manager, cpu) {
+        #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+        note_pick(&READY_LOCAL_PICKS, cpu);
+        return Some(index);
+    }
+    // 2. Work stealing: take one dispatchable task from another CPU's queue.
+    //    This can only move a task that is not currently owned by a CPU, so it
+    //    never preempts a running task.
+    for other in 0..smp::cpu_count() {
+        if other != cpu {
+            if let Some(index) = dequeue_ready(manager, other) {
+                #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+                note_pick(&READY_STEAL_PICKS, cpu);
+                return Some(index);
+            }
+        }
+    }
+    // 3. Fallback full scan: covers idle tasks and any Ready task whose enqueue
+    //    was missed. Same "non-idle first" policy as before the queues.
     let task_count = manager.tasks.len();
 
     for offset in 1..=task_count {
@@ -2128,6 +2343,8 @@ fn find_next_task(manager: &TaskManager, scan_base: usize) -> Option<usize> {
             && task.state == TaskState::Ready
             && task.running_on.is_none()
         {
+            #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+            note_pick(&READY_SCAN_PICKS, cpu);
             return Some(index);
         }
     }
@@ -2136,6 +2353,8 @@ fn find_next_task(manager: &TaskManager, scan_base: usize) -> Option<usize> {
         let index = (scan_base + offset) % task_count;
         let task = &manager.tasks[index];
         if task.state == TaskState::Ready && task.running_on.is_none() {
+            #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+            note_pick(&READY_SCAN_PICKS, cpu);
             return Some(index);
         }
     }
@@ -2164,7 +2383,8 @@ fn detach_from_wait_queue(task: &mut Task) {
 }
 
 fn wake_expired_tasks(manager: &mut TaskManager, now: u64) {
-    for task in &mut manager.tasks {
+    let mut became_ready: Vec<usize> = Vec::new();
+    for (index, task) in manager.tasks.iter_mut().enumerate() {
         if task.state == TaskState::Stopped {
             let expired = match task.resume_state {
                 Some(TaskState::Sleeping(deadline) | TaskState::BlockedUntil(deadline)) => {
@@ -2200,7 +2420,11 @@ fn wake_expired_tasks(manager: &mut TaskManager, now: u64) {
                 detach_from_wait_queue(task);
             }
             task.state = TaskState::Ready;
+            became_ready.push(index);
         }
+    }
+    for index in became_ready {
+        enqueue_ready(manager, smp::this_cpu_id(), index);
     }
 }
 
@@ -2365,10 +2589,11 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
 
     // Wake mutex waiters released by the teardown.
     for id in wake {
-        if let Some(task) = manager.tasks.iter_mut().find(|task| {
+        let found = manager.tasks.iter().position(|task| {
             task.id == id && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
-        }) {
-            wake_blocked_task(task);
+        });
+        if let Some(index) = found {
+            wake_blocked_index(manager, index, smp::this_cpu_id());
         }
     }
 
@@ -2392,6 +2617,8 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         manager
             .tasks
             .retain(|task| !(task.state == TaskState::Zombie && drop_ids.contains(&task.id)));
+        // Indices shifted: rebuild the per-CPU queues from the new table.
+        rebuild_ready_queues(manager);
     }
 
     remap_current_indices(manager, &cpu_current_ids, live_id);

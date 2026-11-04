@@ -240,7 +240,7 @@ DMA leak, and `-smp 2` still reports one peer.
 | Фаза | Содержание | Состояние |
 |---|---|---|
 | 1. Примитивы | `src/smp.rs` (новый): `SpinLock<T>` (IRQ-save + asm-спин), per-CPU массив `CPUS[4]` через `TPIDR_EL1`, Big Kernel Lock (atomic owner + per-CPU depth, реентерабельный), `BklGuard`, IPI-хелпер | написано, собирается |
-| 2. Планировщик | `current_index` → per-CPU; `Task.running_on` (Some ⟺ Running); reap скипает `Dead && running_on.is_some()`; `schedule()` под BKL; `schedule_released()` для всех блокирующих путей; wake → reschedule-IPI | написано |
+| 2. Планировщик | `current_index` → per-CPU; `Task.running_on` (Some ⟺ Running); reap скипает `Dead && running_on.is_some()`; `schedule()` под BKL; `schedule_released()` для всех блокирующих путей; wake → reschedule-IPI; per-CPU ready queues `(id, index)` с local→steal→scan порядком | написано, очереди проверены на `-smp 4` |
 | 3. Аллокаторы | frame allocator `STATE` → `SpinLock`; `PageTableRegistry` → `SpinLock` | написано |
 | 4. Синхро-примитивы | Mutex/WaitQueue под kernel lock, `bkl_assert_held()` в точках мутации, дока обновлена | написано |
 | 5. IRQ/таймер | gic: `init`/`cpu_init` разделены (banked SGI0+PPI30 в `cpu_init`), `send_sgi_all_but_self` (GICD_SGIR); gicv3: **поиск redistributor по `GICR_TYPER`**, ICC_SGI1R; таймер per-CPU (`cpu_init`), глобальный `TICKS` инкрементирует только CPU0 | написано |
@@ -348,7 +348,12 @@ DMA leak, and `-smp 2` still reports one peer.
    not provide. Every scheduling pass in `smp-selftest` builds also verifies
    the `running_on`/`current_index` pairing across CPUs after the reap remap;
    the `demo-tasks,smp-selftest` profile exercises that under the full
-   regression (69 PASS / 0 PANIC, no invariant failure).
+   regression (69 PASS / 0 PANIC, no invariant failure). Dispatch now goes
+   through per-CPU ready queues: local queue, then steal one task from a peer,
+   then the old full scan as a fallback. Entries carry `(id, index)`, so an
+   index shift can only discard an entry; the removal paths rebuild every
+   queue. The counters report `local`/`steal`/`scan`, and a corrupted-id
+   negative build trips the invariant audit.
 3. **Device DMA quiescence.** The stop-the-world window covers CPUs, not a
    device with an armed queue; the driver stop/reset contract stays
    authoritative. *Done (kernel side):* revoked runs are quarantined for
@@ -412,9 +417,16 @@ DMA leak, and `-smp 2` still reports one peer.
   translation)` while quiesce/ticks still pass.
 - `no_std,smp,demo-tasks,smp-selftest`, QEMU `-smp 4`: **69 PASS / 0 FAIL /
   0 PANIC** with zero `sched invariant FAIL`; the extra three PASS are the
-  selftest lines. Negative build (the `running_on` claim removed in
-  `schedule`): `sched invariant FAIL (a CPU's current task is not marked
-  running on it)` followed by `PANIC MSG scheduling invariant violated`.
+  selftest lines. The dispatch-mix line reports the per-CPU queues doing the
+  work (`ready queues local=35 steal=29 scan=0`; selftest-only reports more
+  `scan` because idle tasks are deliberately not queued). Negative build
+  (queued entry id deliberately corrupted): `sched invariant FAIL (a ready
+  queue entry names the wrong task)` followed by `PANIC MSG scheduling
+  invariant violated`.
+- `no_std,smp,demo-tasks,smp-selftest`, QEMU `-smp 4`: negative build (the
+  `running_on` claim removed in `schedule`): `sched invariant FAIL (a CPU's
+  current task is not marked running on it)` followed by `PANIC MSG
+  scheduling invariant violated`.
 - Forced AP GIC failure (temporary build-only patch): CPU1 stays offline,
   prints `AP GIC unavailable`, and the system still reaches `howl>`.
 - Boot self-tests: `MMU TLB OK` (TTBR0 remap proof) and `DMA QUARANTINE OK`

@@ -14,6 +14,11 @@ GICv3 single-window bound-IRQ dispatch; AP publication gated on a usable
 banked GIC; round-qualified quiescence; and up to four QEMU CPUs with
 per-CPU timer liveness.
 
+**SMP feature program (2026-11-04):** four packages, in order —
+(1) per-CPU ready queues **[done]**, (2) ASID-tagged address spaces **[next]**,
+(3) DMA in-flight quiescence contract, (4) SMP churn stress. Each package is
+verified on its own before the next starts.
+
 - **Page-table ownership and DMA reclamation (Packages E/E1/E2).** Every page
   table is registered with `(frame, generation, owner)`; walks validate the
   owner of the root and of every level before touching a descriptor. A
@@ -139,6 +144,18 @@ per-CPU timer liveness.
   PPI and a healthy system reported `ticks FAIL`. The observation window now
   releases the BKL (the boot task stays `Running`, so no other CPU can claim
   it) and reacquires it afterwards.
+- **Per-CPU ready queues (2026-11-04).** `TaskManager.ready` holds one FIFO per
+  CPU of `(task id, index)` pairs for Ready, non-idle tasks.
+  `find_next_task` tries the local queue, then steals one task from a peer,
+  then falls back to the previous full scan (which still owns idle-task
+  selection and covers any missed enqueue). Because entries carry the id, an
+  index shift can only discard an entry, never dispatch the wrong task; the
+  removal paths (`take_zombie`, zombie-cap `retain`) rebuild every queue. The
+  `smp-selftest` invariant audit also validates queue ids/indices, and a
+  one-shot counter line reports the dispatch mix. The combined profile shows
+  the fast path working (`ready queues local=35 steal=29 scan=0`); a debug
+  build that corrupts a queued id fires `sched invariant FAIL (a ready queue
+  entry names the wrong task)`.
 - Verified in this snapshot: **142 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
@@ -147,7 +164,8 @@ per-CPU timer liveness.
   `quiesce PASS (64 rounds, 3 peer CPU(s))` and `ticks PASS (3 peer CPU(s))`
   on `-smp 4` (one peer on `-smp 2`), and the combined
   `no_std,smp,demo-tasks,smp-selftest` profile at **69 PASS / 0 FAIL / 0 PANIC**
-  with zero invariant failures. A negative build that drops the
+  with zero invariant failures and a `ready queues local=.. steal=.. scan=0`
+  dispatch-mix line. A negative build that drops the
   `running_on` claim makes the invariant check fire on the next pass
   (`sched invariant FAIL (a CPU's current task is not marked running on it)`).
   Tablet build, and fog boot image v3. The boot self-tests log
