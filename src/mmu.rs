@@ -1486,7 +1486,10 @@ pub fn map_phys_to_user(
 /// Device-quiescence precondition: freeing a DMA range requires that the
 /// device can no longer issue DMA to it (queue stopped or device reset, with
 /// completion observed). `revoke_phys_range` proves only that CPU mappings are
-/// gone; without an IOMMU it cannot stop a device that is still running.
+/// gone; without an IOMMU it cannot stop a device that is still running. An
+/// in-kernel driver must hold a [`crate::scheduler::DmaLease`] across the armed
+/// window: the revoke path leaks any range with a live lease instead of
+/// reusing it.
 pub fn map_dma_to_user(
     task: &crate::scheduler::Task,
     phys_addr: usize,

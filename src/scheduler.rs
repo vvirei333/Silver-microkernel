@@ -408,6 +408,67 @@ pub fn run_dma_quarantine_self_test() -> bool {
     queued && still_held && released
 }
 
+// ---------------------------------------------------------------------------
+// In-flight DMA lease contract
+// ---------------------------------------------------------------------------
+
+static DMA_LEASES: smp::SpinLock<silver_microkernel::DmaLeaseTable> =
+    smp::SpinLock::new(silver_microkernel::DmaLeaseTable::new());
+
+/// RAII claim that a device may still DMA into `[physical, physical + len)`.
+///
+/// An in-kernel driver arms a lease *before* handing the buffer to the device
+/// and drops it only after observing completion and stopping the queue.
+/// [`dma_range_in_flight`] is consulted by the revoke path: a live claim makes
+/// the range leak instead of being quarantined and reused under a running
+/// device. Userspace drivers cannot arm a lease yet (that needs a syscall), so
+/// their ranges still rely on the quarantine window alone.
+pub struct DmaLease {
+    slot: usize,
+}
+
+impl DmaLease {
+    /// Claims the range. Returns `None` when the table is full or the range is
+    /// empty/overflowing; the caller must then not hand the buffer to a device.
+    pub fn arm(physical: usize, byte_len: usize) -> Option<Self> {
+        let slot = DMA_LEASES.lock().arm(physical, byte_len)?;
+        Some(Self { slot })
+    }
+}
+
+impl Drop for DmaLease {
+    fn drop(&mut self) {
+        DMA_LEASES.lock().release(self.slot);
+    }
+}
+
+/// True while any armed lease overlaps the range.
+pub fn dma_range_in_flight(physical: usize, byte_len: usize) -> bool {
+    DMA_LEASES.lock().range_busy(physical, byte_len)
+}
+
+/// Boot-time proof of the lease gate: an armed range is reported busy at both
+/// edges and becomes free once the handle drops.
+pub fn run_dma_lease_self_test() -> bool {
+    const PAGES: usize = 2;
+    let Some((physical, generation)) = frame_allocator::alloc_contiguous_pages_tagged(PAGES) else {
+        return false;
+    };
+    let span = PAGES * PAGE_SIZE;
+    let Some(lease) = DmaLease::arm(physical, span) else {
+        frame_allocator::free_contiguous_pages_tagged(physical, PAGES, generation);
+        return false;
+    };
+    let busy = dma_range_in_flight(physical, span);
+    let left_edge = dma_range_in_flight(physical - PAGE_SIZE, PAGES * PAGE_SIZE);
+    let right_edge = dma_range_in_flight(physical + span - PAGE_SIZE, PAGE_SIZE);
+    let disjoint = !dma_range_in_flight(physical + span, PAGE_SIZE);
+    drop(lease);
+    let released = !dma_range_in_flight(physical, span);
+    let freed = frame_allocator::free_contiguous_pages_tagged(physical, PAGES, generation);
+    busy && left_edge && right_edge && disjoint && released && freed
+}
+
 /// Frees quarantined runs whose grace window has elapsed. Runs with the kernel
 /// lock held from `reap_dead_tasks`; the frame-allocator lock is taken only
 /// after the quarantine lock has been released, so no inner-lock ordering
@@ -2498,6 +2559,19 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
                 dma_revokes.push((physical, page_count, fail));
                 continue;
             };
+            // Device contract: an armed lease means the driver has not yet
+            // observed completion and stopped the queue, so the device may
+            // still write here. Quarantine only bounds a *quiet* range; it
+            // cannot stop a running device. Leak instead.
+            if dma_range_in_flight(physical, span) {
+                console::write_str("DMA revoke: range 0x");
+                console::write_hex_u64(physical as u64);
+                console::write_str("-0x");
+                console::write_hex_u64(phys_end as u64);
+                console::write_str(": device lease still armed - leaked\r\n");
+                dma_revokes.push((physical, page_count, fail));
+                continue;
+            }
             // Quiescence: a range mapped by a task currently executing on
             // another CPU must not be revoked or freed underneath it. Abort
             // the whole range before the first PTE is cleared; the caller

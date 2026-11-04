@@ -246,7 +246,7 @@ DMA leak, and `-smp 2` still reports one peer.
 | 5. IRQ/таймер | gic: `init`/`cpu_init` разделены (banked SGI0+PPI30 в `cpu_init`), `send_sgi_all_but_self` (GICD_SGIR); gicv3: **поиск redistributor по `GICR_TYPER`**, ICC_SGI1R; таймер per-CPU (`cpu_init`), глобальный `TICKS` инкрементирует только CPU0 | написано |
 | 6. TLB | per-space ASID (`1..=255`, 8-bit) в `TTBR0[63:48]`; `switch_address_space` только `msr`+`isb`; правка PTE — `tlbi aside1is` по ASID; создание/AP-identity — `vmalle1is`; батчевая публикация (`finish_table_changes_for`); cross-PE probe доказывает, что ASID-scoped broadcast доходит до второго PE; boot-тест ASID-изоляции | написано, проверено на QEMU `-smp 4` |
 | 7. AP-boot | PSCI `CPU_ON` (HVC, `0xC4000003`), physical trampoline, `ApBootParams`, FP/SIMD + MMU enable, `boot_secondary_cpus()` from the first `schedule()` | работает на QEMU `-smp 2` и `-smp 4` |
-| 8. Shared DMA | под BKL: создание маппингов (syscall) и revoke/teardown взаимоисключены; fail-safe leak сохранён | написано |
+| 8. Shared DMA | под BKL: создание маппингов (syscall) и revoke/teardown взаимоисключены; fail-safe leak сохранён; `DmaLease` in-flight gate: диапазон с живым lease не освобождается | написано, boot-тест `DMA LEASE` |
 | 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer + проверка `running_on`/`current_index` на каждом проходе; `demo-tasks,smp-selftest` — 69 PASS / 0 PANIC / 0 invariant FAIL; boot-самотесты MMU TLB и DMA quarantine | написано, негативные тесты подтверждены |
 
 ## Найдено и исправлено попутно (реальные баги)
@@ -368,6 +368,11 @@ DMA leak, and `-smp 2` still reports one peer.
    `DMA_QUARANTINE_EPOCHS` scheduling passes (~80 ms) before their frames
    return to the allocator, and a boot self-test proves the window. This bounds
    the post-revoke reuse window; it is not an IOMMU or a device-reset proof.
+   *Lease gate:* `DmaLeaseTable` lets an in-kernel driver declare a range
+   in-flight; revoke leaks any range with a live lease instead of quarantining
+   it. The boot `DMA LEASE` test proves the overlap gate, and disabling it
+   fails the boot. Userspace drivers (`block_driver`) cannot arm a lease yet —
+   that needs a new syscall — so their ranges still use the time window.
 4. **Hardware.** Fog/tablet stay single-core; physical SMP remains unproven.
 
 
@@ -438,10 +443,12 @@ DMA leak, and `-smp 2` still reports one peer.
 - Forced AP GIC failure (temporary build-only patch): CPU1 stays offline,
   prints `AP GIC unavailable`, and the system still reaches `howl>`.
 - Boot self-tests: `MMU TLB OK` (TTBR0 remap proof), `MMU ASID OK` (two spaces,
-  same VA, switched without a flush, each read returns its own frame) and
-  `DMA QUARANTINE OK` (grace-window proof) run on every boot. Removing the
-  `tlbi` in `flush_after_table_change` makes the TLB test stop the boot with
-  exception 9; dropping the ASID tag from `tagged_ttbr0` makes the ASID test
-  stop the boot with exception 9.
+  same VA, switched without a flush, each read returns its own frame),
+  `DMA QUARANTINE OK` (grace-window proof) and `DMA LEASE OK` (in-flight gate
+  proof) run on every boot. Removing the `tlbi` in `flush_after_table_change`
+  makes the TLB test stop the boot with exception 9; dropping the ASID tag from
+  `tagged_ttbr0` makes the ASID test stop the boot with exception 9; disabling
+  `DmaLeaseTable::range_busy` makes the lease test stop the boot with
+  exception 9.
 - `no_std,fog` / `no_std,tablet`: build; fog QEMU integration PASS.
 - Physical SMP: **not verified**; fog/tablet remain single-core.

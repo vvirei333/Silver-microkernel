@@ -300,11 +300,80 @@ pub fn mount_match<'m, 'p>(mounts: &[&'m str], path: &'p str) -> Option<(usize, 
     })
 }
 
+/// Capacity of the in-flight DMA lease table.
+pub const DMA_LEASE_CAPACITY: usize = 16;
+
+/// Fixed-capacity table of in-flight DMA claims.
+///
+/// A driver arms a physical range *before* handing the buffer to a device and
+/// releases it only after it has observed completion and stopped the queue.
+/// The kernel consults this table before freeing a revoked range: a live claim
+/// means the device may still issue DMA, so the frames are leaked instead of
+/// being reused under a running device.
+///
+/// The table is pure so the overlap, capacity and slot rules are host-tested;
+/// the kernel wraps it in a spinlock and exposes the RAII handle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DmaLeaseTable {
+    entries: [Option<(usize, usize)>; DMA_LEASE_CAPACITY],
+}
+
+impl DmaLeaseTable {
+    pub const fn new() -> Self {
+        Self {
+            entries: [None; DMA_LEASE_CAPACITY],
+        }
+    }
+
+    /// Claims `[physical, physical + byte_len)`. Returns a slot token for
+    /// [`release`](Self::release). Refuses a zero-length or overflowing range
+    /// and a full table.
+    pub fn arm(&mut self, physical: usize, byte_len: usize) -> Option<usize> {
+        if byte_len == 0 || physical.checked_add(byte_len).is_none() {
+            return None;
+        }
+        let slot = self.entries.iter().position(Option::is_none)?;
+        self.entries[slot] = Some((physical, byte_len));
+        Some(slot)
+    }
+
+    /// Releases the claim in `slot`. A stale slot is ignored: the token is not
+    /// a capability and cannot affect another driver's range.
+    pub fn release(&mut self, slot: usize) {
+        if let Some(entry) = self.entries.get_mut(slot) {
+            *entry = None;
+        }
+    }
+
+    /// True when any live claim overlaps `[physical, physical + byte_len)`.
+    /// Fails closed on overflow (returns `true`) so a malformed range cannot
+    /// bypass the gate.
+    pub fn range_busy(&self, physical: usize, byte_len: usize) -> bool {
+        if byte_len == 0 {
+            return false;
+        }
+        let Some(end) = physical.checked_add(byte_len) else {
+            return true;
+        };
+        self.entries.iter().flatten().any(|&(start, len)| {
+            let Some(other_end) = start.checked_add(len) else {
+                return true;
+            };
+            start < end && physical < other_end
+        })
+    }
+
+    pub fn active(&self) -> usize {
+        self.entries.iter().filter(|entry| entry.is_some()).count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         align_range, build_argv_envp, clear_frame_bit, mmap_place, mmap_quota_ok, mount_match,
-        parse_spawn_args, path_is_under, MAX_SPAWN_ARGS, SPAWN_ARGS_VERSION,
+        parse_spawn_args, path_is_under, DmaLeaseTable, DMA_LEASE_CAPACITY, MAX_SPAWN_ARGS,
+        SPAWN_ARGS_VERSION,
     };
 
     const PAGE: usize = 4096;
@@ -589,5 +658,49 @@ mod tests {
         assert_eq!(clear_frame_bit(0b1010, 0), None);
         assert_eq!(clear_frame_bit(0, 0), None);
         assert_eq!(clear_frame_bit(u64::MAX, 64), None);
+    }
+
+    #[test]
+    fn dma_lease_reports_overlap_at_both_edges() {
+        let mut table = DmaLeaseTable::new();
+        let slot = table.arm(0x1000, 0x1000).expect("lease");
+        assert!(table.range_busy(0x1000, 1));
+        assert!(table.range_busy(0x1FFF, 1));
+        assert!(table.range_busy(0x0800, 0x1000));
+        assert!(table.range_busy(0x1800, 0x1000));
+        assert!(!table.range_busy(0x2000, 0x1000));
+        assert!(!table.range_busy(0x0000, 0x1000));
+        table.release(slot);
+        assert!(!table.range_busy(0x1000, 0x1000));
+        assert_eq!(table.active(), 0);
+    }
+
+    #[test]
+    fn dma_lease_capacity_is_bounded() {
+        let mut table = DmaLeaseTable::new();
+        for index in 0..DMA_LEASE_CAPACITY {
+            assert_eq!(table.arm(0x1000 * (index + 1), 0x1000), Some(index));
+        }
+        assert_eq!(table.arm(0x1000, 0x1000), None);
+        assert_eq!(table.active(), DMA_LEASE_CAPACITY);
+        table.release(3);
+        assert_eq!(table.arm(0x9000, 0x1000), Some(3));
+    }
+
+    #[test]
+    fn dma_lease_rejects_bad_ranges_and_stale_slots() {
+        let mut table = DmaLeaseTable::new();
+        assert_eq!(table.arm(0x1000, 0), None);
+        assert_eq!(table.arm(usize::MAX, 1), None);
+        // A stale slot release must not affect another live claim.
+        let slot = table.arm(0x1000, 0x1000).unwrap();
+        table.release(slot + 1);
+        assert!(table.range_busy(0x1000, 0x1000));
+    }
+
+    #[test]
+    fn dma_lease_range_busy_fails_closed_on_overflow() {
+        let table = DmaLeaseTable::new();
+        assert!(table.range_busy(usize::MAX, 2));
     }
 }

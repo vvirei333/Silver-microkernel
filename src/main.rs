@@ -1383,6 +1383,15 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::log("DMA QUARANTINE OK");
     ram_log::fb_progress();
 
+    // In-flight DMA lease gate: an armed device range must block reuse until
+    // the driver drops the lease.
+    if !scheduler::run_dma_lease_self_test() {
+        exceptions::silver_handle_exception(9, 0, 0, 0);
+    }
+    console::write_str("DMA LEASE OK\r\n");
+    ram_log::log("DMA LEASE OK");
+    ram_log::fb_progress();
+
     drop(value);
     #[cfg(feature = "fog")]
     {

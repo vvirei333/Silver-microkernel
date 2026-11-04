@@ -83,7 +83,7 @@ userspace.
 - [x] Boot-time MMU TLB proof: read through TTBR0, remap the same VA, read again (fails the boot if the `tlbi` broadcast is missing)
 - [x] Per-task anonymous-mapping quota (16 MiB) and a DMA quarantine window before revoked frames are recycled
 - [ ] SFS write path, block-path interrupts, remaining resource quotas and persistent storage
-- [ ] SMP (`-smp 4`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to three APs online (CPU1–CPU3), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` (66 PASS / 0 PANIC). Dispatch uses per-CPU ready queues (local queue → steal from a peer → full-scan fallback), with entries carrying `(id, index)` so an index shift can only discard an entry. Every address space carries a unique 8-bit ASID, so a context switch no longer flushes the domain-wide TLB and a PTE edit invalidates only the edited ASID. `no_std,smp-selftest` additionally runs a cross-PE TLB probe (every AP reads a VA, the boot CPU re-points the same PTE, every AP must observe the new frame), 64 back-to-back SGI1 stop-the-world rounds, a per-CPU timer-tick check, a `running_on`/`current_index` pairing check on every scheduling pass, and a one-shot `ready queues local/steal/scan` report. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Physical SMP, in-flight-MMAP stress and device-DMA quiescence remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
+- [ ] SMP (`-smp 4`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to three APs online (CPU1–CPU3), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` (66 PASS / 0 PANIC). Dispatch uses per-CPU ready queues (local queue → steal from a peer → full-scan fallback), with entries carrying `(id, index)` so an index shift can only discard an entry. Every address space carries a unique 8-bit ASID, so a context switch no longer flushes the domain-wide TLB and a PTE edit invalidates only the edited ASID. `no_std,smp-selftest` additionally runs a cross-PE TLB probe (every AP reads a VA, the boot CPU re-points the same PTE, every AP must observe the new frame), 64 back-to-back SGI1 stop-the-world rounds, a per-CPU timer-tick check, a `running_on`/`current_index` pairing check on every scheduling pass, and a one-shot `ready queues local/steal/scan` report. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Device-DMA quiescence is enforced for in-kernel `DmaLease` holders (a live lease makes revoke leak instead of reuse); userspace drivers still rely on the quarantine window. Physical SMP and in-flight-MMAP stress remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
 
 ## Design references
 
@@ -572,7 +572,10 @@ Unmap and reclamation are fail-closed. A partial `munmap` is refused without
 touching the mapped part; if a backing run cannot be proven fully unmapped it is
 leaked (`MMAP_LEAKED_FRAMES`) instead of being handed to a new owner. DMA frames
 are freed only after every live address space has been scanned and
-`safe_to_free` is true; otherwise they are leaked (`DMA_LEAKED_FRAMES`).
+`safe_to_free` is true; otherwise they are leaked (`DMA_LEAKED_FRAMES`). An
+in-kernel driver that holds a `DmaLease` for a range keeps it out of the free
+path even when the CPU scan is clean: a live lease means the device may still
+write. The lease is the kernel-visible half of the device stop/reset contract.
 `safe_to_free` covers CPU mappings only: without an IOMMU it does not prove that
 a device has stopped DMA. A driver must stop or reset its queue and observe
 completion before it exits.
@@ -681,7 +684,7 @@ device-quiescence proof — stopping the queue remains the driver's contract.
 | [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU bring-up of up to four CPUs behind the `smp` feature, round-qualified quiescence, per-CPU timer checks and boot selftests; true cross-PE TLB stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 
-Current verification snapshot (2026-11-04): **142 host tests** pass; the fog
+Current verification snapshot (2026-11-04): **146 host tests** pass; the fog
 QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 `howl>`; the demo regression reports 66 PASS / 0 PANIC under `no_std,smp` with

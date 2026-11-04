@@ -16,8 +16,8 @@ per-CPU timer liveness.
 
 **SMP feature program (2026-11-04):** four packages, in order —
 (1) per-CPU ready queues **[done]**, (2) ASID-tagged address spaces **[done]**,
-(3) DMA in-flight quiescence contract **[next]**, (4) SMP churn stress. Each
-package is verified on its own before the next starts.
+(3) DMA in-flight quiescence contract **[done]**, (4) SMP churn stress **[next]**.
+Each package is verified on its own before the next starts.
 
 - **Page-table ownership and DMA reclamation (Packages E/E1/E2).** Every page
   table is registered with `(frame, generation, owner)`; walks validate the
@@ -170,7 +170,19 @@ package is verified on its own before the next starts.
   frames and switches between them **without any flush**, requiring each read
   to return its own value; dropping the ASID tag makes it fail closed with
   exception 9.
-- Verified in this snapshot: **142 host tests**, fog QEMU relocation/at-link/
+- **In-flight DMA lease contract (2026-11-04).** `DmaLeaseTable` (pure,
+  host-tested) holds up to 16 physical `(start, length)` claims. An in-kernel
+  driver arms a `DmaLease` before handing a buffer to a device and drops it
+  only after observing completion and stopping the queue. The revoke path now
+  checks `dma_range_in_flight()` before touching the range: a live lease means
+  the device may still write, so the frames are leaked instead of being
+  quarantined and reused. This is a stricter gate than the time window, which
+  can only bound a quiet range. The boot self-test proves the overlap rules at
+  both range edges and after drop; disabling the gate fails the boot with
+  exception 9. Userspace drivers cannot arm a lease yet — that needs a syscall —
+  so their ranges still rely on the quarantine window alone; the gap is
+  explicit in `map_dma_to_user` and `SMP_STATUS.md`.
+- Verified in this snapshot: **146 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
   `no_std,smp` with QEMU `-smp 2` and `-smp 4`, `no_std,smp-selftest` logging
@@ -183,8 +195,10 @@ package is verified on its own before the next starts.
   `running_on` claim makes the invariant check fire on the next pass
   (`sched invariant FAIL (a CPU's current task is not marked running on it)`).
   Tablet build, and fog boot image v3. The boot self-tests log
-  `MMU TLB OK`, `MMU ASID OK` and `DMA QUARANTINE OK`; a build that drops the
-  ASID tag fails the ASID test with exception 9 before the scheduler starts.
+  `MMU TLB OK`, `MMU ASID OK`, `DMA QUARANTINE OK` and `DMA LEASE OK`; a build
+  that drops the ASID tag fails the ASID test with exception 9 before the
+  scheduler starts, and a build with the lease gate disabled fails the lease
+  test the same way.
 - **Hardware coverage after E2 is a smoke test, not a proof.** The post-E2
   image boots on physical `rain` and the GIC/timer panel is live, but QEMU and
   a single boot are not evidence for TLB/cache maintenance under load or for
