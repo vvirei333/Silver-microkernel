@@ -263,7 +263,10 @@ pub fn probe(params: &BootParams) -> FogInfo {
     let mut memory = [Region::default(); 16];
     let memory_count = tree.memory_regions(&mut memory);
     let mut reserved = [Region::default(); 64];
-    let mut reserved_count = tree.reserved_regions(&mut reserved);
+    // `/reserved-memory` carve-outs fail closed too: an overflowing or
+    // malformed `reg` must not be silently dropped from the exclusion list.
+    let reserved_result = tree.reserved_regions(&mut reserved);
+    let mut reserved_count = reserved_result.unwrap_or(0);
     if reserved_count > 0 {
         result.reserved_first = reserved[0];
     }
@@ -284,6 +287,7 @@ pub fn probe(params: &BootParams) -> FogInfo {
     let truncated = memory_count == memory.len()
         || reserved_count == reserved.len()
         || memreserve_count == reserved_slots
+        || reserved_result.is_none()
         || memreserve.is_none();
 
     // Exclusions: reservations, the loaded image (including its BSS and

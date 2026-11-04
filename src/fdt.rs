@@ -298,7 +298,12 @@ impl<'a> Fdt<'a> {
     }
 
     /// Copies `/reserved-memory` child regions into `out`.
-    pub fn reserved_regions(&self, out: &mut [Region]) -> usize {
+    ///
+    /// Fails closed (`None`) on a malformed `reg`, an overflowing
+    /// `address + size`, or a carve-out list that does not fit in `out`.
+    /// Dropping a reservation would let the allocator hand out memory the
+    /// firmware marked as reserved, so a partial answer is never returned.
+    pub fn reserved_regions(&self, out: &mut [Region]) -> Option<usize> {
         let mut visitor = ReservedRegions {
             regions: out,
             count: 0,
@@ -308,10 +313,11 @@ impl<'a> Fdt<'a> {
             depth: 0,
             malformed: false,
         };
-        if self.walk(&mut visitor).is_none() || visitor.malformed {
-            return 0;
+        self.walk(&mut visitor)?;
+        if visitor.malformed {
+            return None;
         }
-        visitor.count
+        Some(visitor.count)
     }
 
     /// Copies the DTB header memory-reservation map into `out`. This is where
@@ -707,14 +713,14 @@ impl<'a, 'o> Visitor<'a> for ReservedRegions<'o> {
         // including nested children, is a carve-out.
         if name == "reg" {
             if !parse_regions(
-            value,
-            self.address_cells,
-            self.size_cells,
-            self.regions,
-            &mut self.count,
-        ) {
-            self.malformed = true;
-        }
+                value,
+                self.address_cells,
+                self.size_cells,
+                self.regions,
+                &mut self.count,
+            ) {
+                self.malformed = true;
+            }
         }
     }
 
@@ -736,8 +742,17 @@ struct CpuCounter {
 }
 
 impl<'a> Visitor<'a> for CpuCounter {
-    fn begin(&mut self, _path: &str, name: &str) {
-        let is_cpu = name == "cpu" || name.starts_with("cpu@");
+    fn begin(&mut self, path: &str, _name: &str) {
+        // Only DIRECT `/cpus` children count. `path` is the full node path, so
+        // require exactly one component below `/cpus`: a node named `cpu`
+        // elsewhere in the tree must not inflate the slot count.
+        let Some(rest) = path.strip_prefix("/cpus/") else {
+            return;
+        };
+        if rest.contains('/') {
+            return;
+        }
+        let is_cpu = rest == "cpu" || rest.starts_with("cpu@");
         if is_cpu && self.count < self.limit {
             self.count += 1;
         }
@@ -1598,10 +1613,39 @@ mod tests {
         let blob = sample_dtb().build();
         let fdt = Fdt::new(&blob).unwrap();
         let mut regions = [Region::default(); 4];
-        let count = fdt.reserved_regions(&mut regions);
+        let count = fdt.reserved_regions(&mut regions).unwrap();
         assert_eq!(count, 2);
         assert_eq!(regions[0], Region::new(0x4570_0000, 0x45d0_0000));
         assert_eq!(regions[1], Region::new(0x5c00_0000, 0x5cf0_0000));
+    }
+
+    #[test]
+    fn reserved_memory_overflow_fails_closed() {
+        // `/reserved-memory` children use their own #address-cells/#size-cells;
+        // an entry whose address + size wraps cannot be represented and must
+        // fail the boot instead of being dropped from the exclusion list.
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.prop_str("compatible", "test,board");
+        dtb.begin("reserved-memory");
+        dtb.prop_u32("#address-cells", 2);
+        dtb.prop_u32("#size-cells", 2);
+        dtb.begin("broken@f000000000000000");
+        dtb.prop_reg2("reg", 0xF000_0000_0000_0000, 0x2000_0000_0000_0000);
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let fdt = Fdt::new(&blob).unwrap();
+        let mut regions = [Region::default(); 4];
+        assert_eq!(fdt.reserved_regions(&mut regions), None);
+    }
+
+    #[test]
+    fn reserved_memory_out_of_space_fails_closed() {
+        let blob = sample_dtb().build();
+        let fdt = Fdt::new(&blob).unwrap();
+        let mut regions = [Region::default(); 1];
+        assert_eq!(fdt.reserved_regions(&mut regions), None);
     }
 
     #[test]
@@ -1699,6 +1743,12 @@ mod tests {
             dtb.prop_str("device_type", "cpu");
             dtb.end();
         }
+        dtb.end();
+        // A node named `cpu` outside /cpus must not be counted.
+        dtb.begin("soc");
+        dtb.begin("cpu@0");
+        dtb.prop_str("device_type", "cpu");
+        dtb.end();
         dtb.end();
         let blob = dtb.build();
         let fdt = Fdt::new(&blob).unwrap();
