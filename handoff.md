@@ -72,12 +72,27 @@ AP publication gated on a usable banked GIC.
 - GICv3 no longer falls back to redistributor frame 0. The boot CPU's frame is
   matched by `GICR_TYPER` affinity in bits `[63:32]`; if no frame matches, the
   timer PPI is left disabled and timer-dependent scheduling does not start.
-- Verified in this snapshot: **139 host tests**, fog QEMU relocation/at-link/
+- **Memory and DMA hardening (2026-11-04).** Three kernel-side additions:
+  - A per-task anonymous-mapping quota (`MAX_MMAP_BYTES_PER_TASK`, 16 MiB)
+    enforced before any frame or PTE is touched, so one EL0 task can no longer
+    `mmap` the whole machine. The pure arithmetic lives in
+    `silver_microkernel::mmap_quota_ok` and has host tests.
+  - A DMA quarantine: a range whose revoke scan proved `safe_to_free` is held
+    for `DMA_QUARANTINE_EPOCHS` scheduling passes (~80 ms) before its frames
+    return to the allocator. This bounds the window in which an armed device
+    queue could write into a recycled frame; a full quarantine falls back to
+    the leak policy. `run_dma_quarantine_self_test` proves the window at boot.
+  - A TTBR0 TLB self-test (`mmu::run_tlb_self_test`): the boot CPU switches to
+    a scratch space, reads a value, repoints the same VA at another frame and
+    reads again. Removing the `tlbi ...is` from `flush_after_table_change` makes
+    this boot test stop with exception 9, so the test is proven sensitive.
+- Verified in this snapshot: **142 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
   `no_std,smp` with QEMU `-smp 2`, `no_std,smp-selftest` logging
   `quiesce PASS (64 rounds, 1 peer CPU(s))` on three consecutive boots,
-  tablet build, and fog boot image v3.
+  tablet build, and fog boot image v3. The boot self-tests log
+  `MMU TLB OK` and `DMA QUARANTINE OK`.
 - **Hardware coverage after E2 is a smoke test, not a proof.** The post-E2
   image boots on physical `rain` and the GIC/timer panel is live, but QEMU and
   a single boot are not evidence for TLB/cache maintenance under load or for
@@ -1676,11 +1691,14 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   thread safety or double-free detection. `SYS_MMAP`/`SYS_MUNMAP` exist, but
   only for anonymous, fixed-placement private pages; there is no file-backed
   `mmap` and the user stack remains fixed at 8 KB. The private window is one
-  page.
+  page. Anonymous mappings are now capped at 16 MiB per task
+  (`MAX_MMAP_BYTES_PER_TASK`); this bounds a single task, not the aggregate.
 - DMA quiescence is a driver contract, not a kernel guarantee. `safe_to_free`
   proves only that CPU mappings in the MMIO window are gone; there is no
   IOMMU, no device reset on task death and no proof that an armed queue has
-  stopped. A shared-DMA physical address is a bearer capability, and cache
+  stopped. Revoked runs are quarantined for ~80 ms before reuse, which bounds
+  the window but does not make reclamation safe for a device that keeps
+  writing. A shared-DMA physical address is a bearer capability, and cache
   coherence for shared DMA relies on all participants using Normal
   Non-Cacheable aliases after the initial clean.
 - Interactive mode prevents ordinary background/foreground output interleaving,

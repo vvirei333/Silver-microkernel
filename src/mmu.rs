@@ -1578,6 +1578,98 @@ pub fn run_self_test() -> bool {
     mapped && partial_refused && still_mapped && unmapped && gone && space_released && stale_refused
 }
 
+/// Boot-time proof that the CPU honours a translation-table edit: read a value
+/// through TTBR0, remap the same VA to a second frame, and read it again. A
+/// descriptor-only check cannot catch a missing TLB invalidation; this one
+/// reads through the translation the CPU itself is using, so it also covers
+/// `switch_address_space` and the `tlbi ...is` + `dsb ish` protocol.
+pub fn run_tlb_self_test() -> bool {
+    const FIRST_VALUE: u64 = 0x544C_4200_0000_0001;
+    const SECOND_VALUE: u64 = 0x544C_4200_0000_0002;
+
+    let Some((first, first_generation)) = frame_allocator::alloc_page_tagged() else {
+        return false;
+    };
+    let Some((second, second_generation)) = frame_allocator::alloc_page_tagged() else {
+        frame_allocator::free_page_tagged(first, first_generation);
+        return false;
+    };
+    let Some((private, private_generation)) = frame_allocator::alloc_page_tagged() else {
+        frame_allocator::free_page_tagged(second, second_generation);
+        frame_allocator::free_page_tagged(first, first_generation);
+        return false;
+    };
+
+    let Some((root, space)) = create_task_space(private, 0, None) else {
+        frame_allocator::free_page_tagged(private, private_generation);
+        frame_allocator::free_page_tagged(second, second_generation);
+        frame_allocator::free_page_tagged(first, first_generation);
+        return false;
+    };
+    let va = USER_MMAP_VA;
+
+    // The test switches the running PE's own TTBR0. IRQs must stay masked:
+    // an IRQ handler that touched user memory would see this scratch space.
+    let saved_daif = crate::interrupts::save_and_disable_irq();
+    let previous = current_ttbr0();
+    switch_address_space(root);
+
+    // Published frames are zeroed by `map_user_pages_at`, so seed the first
+    // page through the *user* mapping and read it back.
+    let mapped_first = map_user_pages_at(root, va, first, 1, PROT_WRITE);
+    let first_read = if mapped_first {
+        unsafe {
+            (va as *mut u64).write_volatile(FIRST_VALUE);
+            (va as *const u64).read_volatile()
+        }
+    } else {
+        0
+    };
+
+    // Repoint the same VA at `second`, using the user map (which zeroes it) and
+    // then seeding it through the kernel alias. A stale TLB entry for `first`
+    // would still read FIRST_VALUE here, which is exactly the failure this
+    // test must catch.
+    let remapped =
+        unmap_user_pages_at(root, va, 1) && map_user_pages_at(root, va, second, 1, PROT_WRITE);
+    if remapped {
+        unsafe {
+            (phys_to_virt(second) as *mut u64).write_volatile(SECOND_VALUE);
+        }
+        clean_range_to_poc(second, GRANULE);
+    }
+    let second_read = if remapped {
+        unsafe { (va as *const u64).read_volatile() }
+    } else {
+        0
+    };
+
+    switch_address_space(previous);
+    crate::interrupts::restore_irq(saved_daif);
+
+    // Tear the scratch space down exactly once. If a PTE survived, the frames
+    // must be leaked rather than handed to the allocator under a live mapping.
+    unmap_user_pages_at(root, va, 1);
+    let mut safe_to_free = !user_page_is_mapped(root, va);
+    if safe_to_free {
+        safe_to_free &= frame_allocator::free_page_tagged(first, first_generation);
+        safe_to_free &= frame_allocator::free_page_tagged(second, second_generation);
+    }
+    let released = destroy_task_space(space, private, private_generation);
+
+    first_read == FIRST_VALUE && second_read == SECOND_VALUE && safe_to_free && released
+}
+
+/// Reads the TTBR0 value installed on this CPU (used only by the boot TLB
+/// self-test, which restores it after switching to a scratch space).
+pub fn current_ttbr0() -> usize {
+    let value: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, ttbr0_el1", out(reg) value, options(nomem, nostack));
+    }
+    value as usize
+}
+
 /// Pushes `size` bytes at a kernel virtual (== physical, low identity)
 /// address to the point of coherency. Used to publish AP boot parameters to
 /// a CPU that starts with cold caches.

@@ -3,7 +3,7 @@
 > **Current project status (2026-11-04):** this file remains the authoritative
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
-> test suite is now **139/139**; the 13/13 figure below is the checkpoint from
+> test suite is now **142/142**; the 13/13 figure below is the checkpoint from
 > the earlier SMP session.
 >
 > **Phases 1–2 are implemented as the opt-in `smp` feature (QEMU only).**
@@ -290,12 +290,23 @@ Verified on QEMU `-smp 2`, three consecutive boots:
 1. **TLB/DMA under SMP.** Re-audit `flush_after_table_change`,
    `switch_address_space` and `revoke_phys_range` against a second PE holding a
    stale translation; keep `safe_to_free` CPU-only and retain the leak policy.
+   *Done:* a boot self-test now switches the running PE to a scratch TTBR0,
+   reads a value, repoints the same VA at another frame and reads again. It
+   fails the boot if the `tlbi ...is` in `flush_after_table_change` is removed
+   (verified by a negative build: exception 9). This proves the flush on the
+   executing PE; a second PE holding the *same* space is still untested.
 2. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
    DMA revoke while a client runs, and page-table teardown under load. The
-   `demo-tasks` suite now passes on `-smp 2` (66 PASS, 0 PANIC); a dedicated
-   TLB-shootdown/in-flight-MMAP stress is still missing.
+   `demo-tasks` suite passes on `-smp 2` (66 PASS, 0 PANIC) and
+   `smp-selftest` runs 64 back-to-back stop-the-world rounds with a
+   per-round visibility check. A true cross-PE stale-translation /
+   in-flight-MMAP stress still needs a task pinned to a shared space.
 3. **Device DMA quiescence.** The stop-the-world window covers CPUs, not a
-   device with an armed queue; retain the driver stop/reset contract.
+   device with an armed queue; the driver stop/reset contract stays
+   authoritative. *Done (kernel side):* revoked runs are quarantined for
+   `DMA_QUARANTINE_EPOCHS` scheduling passes (~80 ms) before their frames
+   return to the allocator, and a boot self-test proves the window. This bounds
+   the post-revoke reuse window; it is not an IOMMU or a device-reset proof.
 4. **Hardware.** Fog/tablet stay single-core; physical SMP remains unproven.
 
 
@@ -336,7 +347,7 @@ Verified on QEMU `-smp 2`, three consecutive boots:
 
 ## Проверки на текущем состоянии
 
-- `cargo test --lib`: **139/139**.
+- `cargo test --lib`: **142/142**.
 - Default `no_std` build, QEMU `-smp 2`: single-core, reaches `howl>`.
 - `no_std,smp` build, QEMU `-smp 2`: CPU1 online (GIC/timer/IPI), both CPUs
   execute tasks, `howl ready`/prompt and `ps` work; 60 s without panic/BKL-stuck.
@@ -346,5 +357,8 @@ Verified on QEMU `-smp 2`, three consecutive boots:
   rounds, 1 peer CPU(s))` during boot, then `howl>`; repeated over three boots.
 - Forced AP GIC failure (temporary build-only patch): CPU1 stays offline,
   prints `AP GIC unavailable`, and the system still reaches `howl>`.
+- Boot self-tests: `MMU TLB OK` (TTBR0 remap proof) and `DMA QUARANTINE OK`
+  (grace-window proof) run on every boot; removing the `tlbi` in
+  `flush_after_table_change` makes the TLB test stop the boot with exception 9.
 - `no_std,fog` / `no_std,tablet`: build; fog QEMU integration PASS.
 - Physical SMP: **not verified**; fog/tablet remain single-core.

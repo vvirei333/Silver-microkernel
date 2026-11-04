@@ -198,6 +198,17 @@ where
     Some((virtual_address, page_count))
 }
 
+/// Per-task anonymous-mapping quota check: a request may grow the task's
+/// `current` total by `request` bytes only while the result stays within
+/// `limit`. Overflow and a zero-length request are refused.
+///
+/// DRAM is shared by every task; without this bound one EL0 task could `mmap`
+/// the entire machine and starve the scheduler, IPC and the kernel heap. The
+/// frame allocator's global limit is the last line of defence, not the first.
+pub fn mmap_quota_ok(current: usize, request: usize, limit: usize) -> bool {
+    request != 0 && current.checked_add(request).is_some_and(|total| total <= limit)
+}
+
 /// Aligns a half-open physical interval inward to `alignment`.
 ///
 /// The frame allocator must never hand out a partial page, and a malformed
@@ -292,8 +303,8 @@ pub fn mount_match<'m, 'p>(mounts: &[&'m str], path: &'p str) -> Option<(usize, 
 #[cfg(test)]
 mod tests {
     use super::{
-        align_range, build_argv_envp, clear_frame_bit, mmap_place, mount_match, parse_spawn_args,
-        path_is_under, MAX_SPAWN_ARGS, SPAWN_ARGS_VERSION,
+        align_range, build_argv_envp, clear_frame_bit, mmap_place, mmap_quota_ok, mount_match,
+        parse_spawn_args, path_is_under, MAX_SPAWN_ARGS, SPAWN_ARGS_VERSION,
     };
 
     const PAGE: usize = 4096;
@@ -363,6 +374,35 @@ mod tests {
         // Corrupted kernel-side region data must not panic the helper either.
         let bad = [(usize::MAX - PAGE / 2, usize::MAX)];
         assert_eq!(mmap_place(PAGE, MIN_VA, MAX_VA, PAGE, regions(&bad)), None);
+    }
+
+    // --- per-task anonymous-mapping quota ---------------------------------
+
+    const QUOTA: usize = 16 * 1024 * 1024;
+
+    #[test]
+    fn quota_allows_exact_limit_and_no_more() {
+        assert!(mmap_quota_ok(0, QUOTA, QUOTA));
+        assert!(mmap_quota_ok(QUOTA - PAGE, PAGE, QUOTA));
+        assert!(!mmap_quota_ok(0, QUOTA + PAGE, QUOTA));
+        assert!(!mmap_quota_ok(QUOTA, PAGE, QUOTA));
+    }
+
+    #[test]
+    fn quota_rejects_zero_and_overflow() {
+        assert!(!mmap_quota_ok(0, 0, QUOTA));
+        assert!(!mmap_quota_ok(usize::MAX, 1, QUOTA));
+        assert!(!mmap_quota_ok(QUOTA, usize::MAX, QUOTA));
+    }
+
+    #[test]
+    fn quota_repeated_allocations_accumulate() {
+        let mut used = 0;
+        for _ in 0..4 {
+            assert!(mmap_quota_ok(used, QUOTA / 4, QUOTA));
+            used += QUOTA / 4;
+        }
+        assert!(!mmap_quota_ok(used, PAGE, QUOTA));
     }
 
     // --- mount table resolution -------------------------------------------

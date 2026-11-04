@@ -1358,6 +1358,22 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::log("MMU RECLAIM OK");
     ram_log::fb_progress();
 
+    // TLB proof: read through TTBR0, remap the same VA to another frame and
+    // read again. Fails closed if the flush did not change the translation.
+    if !mmu::run_tlb_self_test() {
+        exceptions::silver_handle_exception(9, 0, 0, 0);
+    }
+    ram_log::log("MMU TLB OK");
+    ram_log::fb_progress();
+
+    // DMA quarantine window: a released run must survive the grace passes and
+    // then return to the frame allocator.
+    if !scheduler::run_dma_quarantine_self_test() {
+        exceptions::silver_handle_exception(9, 0, 0, 0);
+    }
+    ram_log::log("DMA QUARANTINE OK");
+    ram_log::fb_progress();
+
     drop(value);
     #[cfg(feature = "fog")]
     {

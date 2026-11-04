@@ -80,7 +80,9 @@ userspace.
 - [x] Power off: the GPU "Power" button shuts QEMU down via PSCI `SYSTEM_OFF`
 - [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation with pre-copy FDT destination validation (QEMU-verified, and booted on a physical `rain` unit)
 - [x] Real Redmi 10C boot: RAM-only `fastboot boot` reaches the scheduler and the Howl task, with live GICv3 timer interrupts (verified on a `rain` unit)
-- [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
+- [x] Boot-time MMU TLB proof: read through TTBR0, remap the same VA, read again (fails the boot if the `tlbi` broadcast is missing)
+- [x] Per-task anonymous-mapping quota (16 MiB) and a DMA quarantine window before revoked frames are recycled
+- [ ] SFS write path, block-path interrupts, remaining resource quotas and persistent storage
 - [ ] SMP (`-smp 2`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings CPU1 online, runs tasks on both CPUs and passes the `demo-tasks` regression (66 PASS / 0 PANIC). `no_std,smp-selftest` additionally runs 64 back-to-back SGI1 stop-the-world rounds at boot and verifies cross-CPU visibility. Physical SMP, TLB-shootdown stress and device-DMA quiescence remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
 
 ## Redmi 10C (`fog`, SM6225) — RAM-only bring-up
@@ -629,10 +631,14 @@ IRQ and PCI operations check capability rights; `SYS_CAP_GRANT` delegates only a
 subset of the caller's rights, and task death revokes or downgrades affected
 capabilities. Page-table walks are owner-checked and DMA revocation is bounded
 to DRAM, so a corrupted descriptor cannot redirect a walk into a foreign table
-or below `DRAM_BASE`. Spawn, heap, DMA, VFS and wait-queue resource quotas are
-still limited or absent, so denial-of-service resistance remains incomplete.
-A shared-DMA physical address is a bearer capability, and `safe_to_free` does
-not prove device quiescence; both remain driver/IPC-protocol responsibilities.
+or below `DRAM_BASE`. Anonymous mappings are capped per task (16 MiB) so one
+EL0 task cannot claim the whole machine, and VFS, open-file, DMA-window, task
+and capability counts have explicit bounds; heap and wait-queue growth still
+lack a per-task quota, so denial-of-service resistance remains incomplete.
+A shared-DMA physical address is a bearer capability. `safe_to_free` proves
+only that CPU mappings are gone; revoked ranges are additionally quarantined
+for a bounded drain window, but that is a mitigation rather than a
+device-quiescence proof — stopping the queue remains the driver's contract.
 
 ## Documentation
 
@@ -642,7 +648,7 @@ not prove device quiescence; both remain driver/IPC-protocol responsibilities.
 | [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU AP bring-up and task execution behind the `smp` feature; quiescence stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 
-Current verification snapshot (2026-11-04): **139 host tests** pass; the fog
+Current verification snapshot (2026-11-04): **142 host tests** pass; the fog
 QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 `howl>`; the demo regression reports 66 PASS / 0 PANIC and also passes under
@@ -652,10 +658,15 @@ feature sets (`no_std`, `fog`, `fog-reloc`, `tablet`) build. The opt-in
 CPUs, and reaches a working `howl>` prompt. DMA teardown stops the other CPUs
 with a round-qualified SGI1 acknowledgement handshake; a timeout falls back to
 the conservative quiescence gate (a space still current on a CPU is not
-destroyed, and a range mapped by a running task is deferred and leaked). The
+destroyed, and a range mapped by a running task is deferred and leaked).
+Revoked DMA runs are quarantined for several scheduling epochs before their
+frames return to the allocator, and a boot self-test proves the window. The
 opt-in `no_std,smp-selftest` run executes 64 back-to-back rounds and proves
-per-round memory visibility across CPUs. TLB shootdown under load, device-DMA
-quiescence and physical SMP remain open; see
+per-round memory visibility across CPUs. A separate boot self-test proves that
+a TTBR0 remap followed by the `tlbi ...is` broadcast changes what the CPU
+reads (removing the `tlbi` makes the boot fail with exception 9). True
+cross-PE stale-translation stress, in-flight device DMA and physical SMP
+remain open; see
 [SMP_STATUS.md](SMP_STATUS.md). A physical Redmi
 10C `rain` unit boots the post-E2 RAM-only image to the `fog-ui` panel with
 `GICV3 ONLINE`, `TIMER ONLINE` and growing `TICKS`. The GIC gate deliberately

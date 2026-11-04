@@ -1,5 +1,5 @@
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
 use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
@@ -123,6 +123,9 @@ pub struct Task {
     space_token: TableToken,
     dma_pages: Vec<(usize, usize, u32)>,
     mmap_regions: Vec<MmapRegion>,
+    /// Sum of `mmap_regions` spans, bounded by [`MAX_MMAP_BYTES_PER_TASK`].
+    /// Kept separately so the quota check is O(1), not a walk per request.
+    mmap_bytes: usize,
     program_break: usize,
     waiting_on: Option<WaitLink>,
     owned_mutexes: Vec<*mut mutex::MutexState>,
@@ -231,6 +234,127 @@ static DMA_LEAKED_FRAMES: AtomicUsize = AtomicUsize::new(0);
 /// leaked instead of freed, because a still-live PTE must never point at a
 /// frame the allocator can hand out again.
 static MMAP_LEAKED_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// DMA ranges whose PTEs are gone but whose frames stay allocated for a grace
+/// window, so a device queue that was still draining when its task died cannot
+/// write into a frame the allocator has already handed to a new owner.
+///
+/// This is a bounded kernel-side mitigation, **not** a device-quiescence
+/// proof: a driver that owns a device must still stop or reset its queue
+/// before it exits. The window turns "freed the instant the last PTE vanished"
+/// into "recycled only after several scheduling epochs", which covers the
+/// common case of an in-flight descriptor being consumed.
+const DMA_QUARANTINE_SLOTS: usize = 32;
+/// Reclaim passes a range waits before it can be freed. Scheduling runs one
+/// pass per timer tick (~10 ms), so the window is roughly 80 ms.
+const DMA_QUARANTINE_EPOCHS: u64 = 8;
+
+#[derive(Copy, Clone)]
+struct DmaQuarantineEntry {
+    physical: usize,
+    page_count: usize,
+    generation: u32,
+    released_epoch: u64,
+}
+
+impl DmaQuarantineEntry {
+    const EMPTY: Self = Self {
+        physical: 0,
+        page_count: 0,
+        generation: 0,
+        released_epoch: 0,
+    };
+}
+
+static DMA_QUARANTINE: smp::SpinLock<[DmaQuarantineEntry; DMA_QUARANTINE_SLOTS]> =
+    smp::SpinLock::new([DmaQuarantineEntry::EMPTY; DMA_QUARANTINE_SLOTS]);
+/// Monotonic reclaim-pass counter; incremented by every `reap_dead_tasks`
+/// call, including passes that find nothing to free.
+static DMA_QUARANTINE_EPOCH: AtomicU64 = AtomicU64::new(0);
+/// Frames currently held (not yet reclaimed or leaked) by the quarantine.
+static DMA_QUARANTINED_FRAMES: AtomicUsize = AtomicUsize::new(0);
+
+/// Queues a revoked DMA run for delayed release. Returns `false` when every
+/// slot is taken; the caller must then fall back to the existing leak policy.
+fn quarantine_dma_run(physical: usize, page_count: usize, generation: u32) -> bool {
+    let epoch = DMA_QUARANTINE_EPOCH.load(Ordering::Acquire);
+    let mut slots = DMA_QUARANTINE.lock();
+    let Some(slot) = slots.iter_mut().find(|slot| slot.page_count == 0) else {
+        return false;
+    };
+    *slot = DmaQuarantineEntry {
+        physical,
+        page_count,
+        generation,
+        released_epoch: epoch,
+    };
+    DMA_QUARANTINED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
+    true
+}
+
+/// Boot-time proof of the DMA quarantine window: a queued run stays allocated
+/// for `DMA_QUARANTINE_EPOCHS` reclaim passes and is released on the next one.
+/// The frame allocator is otherwise untouched by this test.
+pub fn run_dma_quarantine_self_test() -> bool {
+    const PAGES: usize = 2;
+    let Some((physical, generation)) = frame_allocator::alloc_contiguous_pages_tagged(PAGES) else {
+        return false;
+    };
+    if !quarantine_dma_run(physical, PAGES, generation) {
+        frame_allocator::free_contiguous_pages_tagged(physical, PAGES, generation);
+        return false;
+    }
+    let queued = frame_allocator::frame_in_use(physical);
+
+    // One pass short of the window: the run must still be allocated.
+    for _ in 0..(DMA_QUARANTINE_EPOCHS - 1) {
+        reclaim_quarantined_dma();
+    }
+    let still_held = frame_allocator::frame_in_use(physical);
+    reclaim_quarantined_dma();
+    let released = !frame_allocator::frame_in_use(physical);
+
+    queued && still_held && released
+}
+
+/// Frees quarantined runs whose grace window has elapsed. Runs with the kernel
+/// lock held from `reap_dead_tasks`; the frame-allocator lock is taken only
+/// after the quarantine lock has been released, so no inner-lock ordering
+/// cycle is introduced.
+fn reclaim_quarantined_dma() {
+    let epoch = DMA_QUARANTINE_EPOCH
+        .fetch_add(1, Ordering::AcqRel)
+        .saturating_add(1);
+    loop {
+        let entry = {
+            let mut slots = DMA_QUARANTINE.lock();
+            let Some(index) = slots.iter().position(|slot| {
+                slot.page_count != 0
+                    && epoch.saturating_sub(slot.released_epoch) >= DMA_QUARANTINE_EPOCHS
+            }) else {
+                return;
+            };
+            let entry = slots[index];
+            slots[index] = DmaQuarantineEntry::EMPTY;
+            entry
+        };
+        DMA_QUARANTINED_FRAMES.fetch_sub(entry.page_count, Ordering::Relaxed);
+        if !frame_allocator::free_contiguous_pages_tagged(
+            entry.physical,
+            entry.page_count,
+            entry.generation,
+        ) {
+            // The tag no longer matches (reallocated frame or accounting bug):
+            // never free blindly, count the leak instead.
+            DMA_LEAKED_FRAMES.fetch_add(entry.page_count, Ordering::Relaxed);
+            console::write_str("DMA QUARANTINE: release refused for 0x");
+            console::write_hex_u64(entry.physical as u64);
+            console::write_str(" (");
+            console::write_dec_u64(entry.page_count as u64);
+            console::write_str(" pages)\r\n");
+        }
+    }
+}
 
 core::arch::global_asm!(
     r#"
@@ -654,6 +778,13 @@ fn has_task_capacity(manager: &TaskManager) -> bool {
 /// more entries than the 128 MiB DRAM can back; this cap bounds the metadata
 /// Vec itself, not just the frames.
 const MAX_MMAP_REGIONS: usize = 128;
+
+/// Per-task cap on anonymous mapping bytes. The mmap window is ~1 GiB but DRAM
+/// is shared by every task, so one EL0 task must not be able to claim the whole
+/// machine and starve the scheduler, IPC and the kernel heap. 16 MiB covers the
+/// demo/`memtest` workloads with room to spare while keeping the global frame
+/// allocator as the last line of defence rather than the first.
+const MAX_MMAP_BYTES_PER_TASK: usize = 16 * 1024 * 1024;
 
 pub fn exit_current() -> ! {
     exit_current_with_status(0)
@@ -1998,6 +2129,11 @@ fn wake_expired_tasks(manager: &mut TaskManager, now: u64) {
 }
 
 fn reap_dead_tasks(manager: &mut TaskManager) {
+    // Drain the DMA quarantine on every pass, including passes with no dead
+    // task: the grace window is measured in these passes, and delaying the
+    // reclaim until the next death would hold the frames indefinitely.
+    reclaim_quarantined_dma();
+
     if !manager
         .tasks
         .iter()
@@ -2384,6 +2520,7 @@ impl Task {
             heap_pages: Vec::new(),
             dma_pages: Vec::new(),
             mmap_regions: Vec::new(),
+            mmap_bytes: 0,
             program_break: mmu::USER_HEAP_VA,
             waiting_on: None,
             owned_mutexes: Vec::new(),
@@ -2461,6 +2598,13 @@ impl Task {
                 .map(|region| (region.virtual_address, region.page_count)),
         )?;
 
+        // Per-task memory quota: reject before any frame or PTE is touched, so
+        // a refused request leaves no state behind.
+        let span = page_count.checked_mul(PAGE_SIZE)?;
+        if !silver_microkernel::mmap_quota_ok(self.mmap_bytes, span, MAX_MMAP_BYTES_PER_TASK) {
+            return None;
+        }
+
         let (physical_start, generation) =
             frame_allocator::alloc_contiguous_pages_tagged(page_count)?;
         if !mmu::map_user_pages_at(self.ttbr0, virtual_address, physical_start, page_count, prot) {
@@ -2484,6 +2628,7 @@ impl Task {
             .position(|existing| existing.virtual_address > virtual_address)
             .unwrap_or(self.mmap_regions.len());
         self.mmap_regions.insert(position, region);
+        self.mmap_bytes += span;
         Some(virtual_address)
     }
 
@@ -2519,6 +2664,9 @@ impl Task {
             return false;
         }
         self.mmap_regions.remove(position);
+        self.mmap_bytes = self
+            .mmap_bytes
+            .saturating_sub(page_count.saturating_mul(PAGE_SIZE));
         if !frame_allocator::free_contiguous_pages_tagged(physical_start, page_count, generation) {
             console::write_str("MMAP: allocator refused run 0x");
             console::write_hex_u64(physical_start as u64);
@@ -2566,10 +2714,12 @@ impl Task {
     /// handed back while a foreign mapping might still reference them.
     ///
     /// Quiescence precondition: `safe_to_free` is a CPU-mapping proof. It does
-    /// not prove that the device stopped DMA. Automatic reclamation here is
-    /// sound only while the platform has no IOMMU and no driver can outlive
-    /// its task with an armed queue; a driver that owns a device must stop the
-    /// queue (or reset it and observe completion) before it exits.
+    /// not prove that the device stopped DMA. The kernel therefore hands a
+    /// provably-unmapped range to the DMA quarantine (see
+    /// [`DMA_QUARANTINE_EPOCHS`]) instead of freeing it at once, which gives
+    /// an armed queue a bounded drain window; a driver that owns a device must
+    /// still stop the queue (or reset it and observe completion) before it
+    /// exits, and a full quarantine falls back to the leak policy.
     ///
     /// Guarded by `resources_released`/`ttbr0`: a zombie has already run this
     /// once, and calling it again with `ttbr0 == 0` would dereference zero.
@@ -2620,11 +2770,17 @@ impl Task {
                 .find(|(base, pages, _)| *base == physical && *pages == page_count);
             match record {
                 Some((_, _, result)) if result.safe_to_free => {
-                    frame_allocator::free_contiguous_pages_tagged(
-                        physical,
-                        page_count,
-                        generation,
-                    );
+                    // Quarantine instead of freeing immediately: a device
+                    // queue may still be draining even though every CPU
+                    // mapping is gone. See `DMA_QUARANTINE_EPOCHS`.
+                    if !quarantine_dma_run(physical, page_count, generation) {
+                        DMA_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
+                        console::write_str("DMA LEAK: quarantine full, range 0x");
+                        console::write_hex_u64(physical as u64);
+                        console::write_str(" (");
+                        console::write_dec_u64(page_count as u64);
+                        console::write_str(" pages)\r\n");
+                    }
                 }
                 _ => {
                     DMA_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
@@ -2658,6 +2814,7 @@ impl Task {
         self.heap_pages.clear();
         self.dma_pages.clear();
         self.mmap_regions.clear();
+        self.mmap_bytes = 0;
         self.arguments = Vec::new();
         self.argv.clear();
         self.envp.clear();
