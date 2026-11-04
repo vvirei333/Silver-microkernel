@@ -131,7 +131,8 @@ Phase 4 work.
 The conservative gate now has a real stop-the-world fast path:
 
 - SGI1 (`QUIESCE_IRQ`) is enabled on every CPU. Its handler issues `dsb sy`,
-  sets a per-CPU acknowledgement and parks until the reaper releases it.
+  records a per-CPU acknowledgement for the current round and parks until the
+  reaper releases that round.
 - Kernel code runs with IRQs masked, so `bkl_acquire` waiters cannot take
   SGI1; their retry loop checks the same request and parks/acknowledges there.
 - `smp::quiesce_begin()` (called with the BKL held) sends SGI1, waits for every
@@ -168,10 +169,36 @@ Verified with the `demo-tasks` regression on QEMU `-smp 2`: **66 PASS /
 schedule. A forced `gic::cpu_init()` failure parks CPU1 offline and still
 reaches `howl>`, proving the failure branch cannot hang quiescence.
 
-The opt-in `smp-selftest` feature runs one real SGI1 stop-the-world round once
-a secondary is published and logs `SMP SELFTEST: quiesce PASS`; it exercises
-the same acknowledgement path (including BKL waiters) that DMA teardown uses.
+The opt-in `smp-selftest` feature runs real SGI1 stop-the-world rounds once a
+secondary is published and logs `SMP SELFTEST: quiesce PASS`; it exercises the
+same acknowledgement path (including BKL waiters) that DMA teardown uses.
 This is functional stress coverage, not a TLB-shootdown proof.
+
+### Phase 4.2: round-qualified quiescence and repeated selftest (2026-11-04)
+
+The boolean `active`/`release`/`ack` triple was replaced by monotonic round
+counters:
+
+- `QUIESCE_ROUND` is bumped by each `quiesce_begin`; `QUIESCE_RELEASE` names
+  the highest released round; `QUIESCE_ACK[cpu]` (a monotonic `fetch_max`)
+  names the highest round that CPU vouched for. `quiesce_active()` is derived
+  as `release < round`, so a timeout cannot leave a separate flag disagreeing
+  with the parked CPUs.
+- A CPU that is still parked when the next round starts now acknowledges the
+  new round from inside its wait loop instead of being stranded by a cleared
+  boolean. Previously a CPU descheduled across `quiesce_end` → `quiesce_begin`
+  could miss the release and make the next round time out, falling back to the
+  leak gate and dropping DMA frames. The window is narrow and did not fire in
+  QEMU, but it was unbounded in the protocol.
+- `smp-selftest` now runs **64 back-to-back rounds** (no yield between them)
+  and checks memory visibility, not just arrival: the boot CPU publishes a
+  generation before each request, every acking CPU reads it after its own
+  `dsb sy`, and the boot CPU verifies the observation while the world is still
+  stopped. A missed generation or a timed-out round fails the log line with the
+  round number.
+
+Verified on QEMU `-smp 2`, three consecutive boots:
+`SMP SELFTEST: quiesce PASS (64 rounds, 1 peer CPU(s))`.
 
 ## Что сделано (фазы 1–6 задания TASK №6)
 
@@ -315,8 +342,8 @@ This is functional stress coverage, not a TLB-shootdown proof.
   execute tasks, `howl ready`/prompt and `ps` work; 60 s without panic/BKL-stuck.
 - `no_std,smp,demo-tasks`, QEMU `-smp 2`: **66 PASS / 0 PANIC**, clean exit;
   spawn/kill/reap and DMA revoke ran while both CPUs were scheduling.
-- `no_std,smp-selftest`, QEMU `-smp 2`: `SMP SELFTEST: quiesce PASS` during
-  boot, then `howl>`.
+- `no_std,smp-selftest`, QEMU `-smp 2`: `SMP SELFTEST: quiesce PASS (64
+  rounds, 1 peer CPU(s))` during boot, then `howl>`; repeated over three boots.
 - Forced AP GIC failure (temporary build-only patch): CPU1 stays offline,
   prints `AP GIC unavailable`, and the system still reaches `howl>`.
 - `no_std,fog` / `no_std,tablet`: build; fog QEMU integration PASS.

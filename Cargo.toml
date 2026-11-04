@@ -12,9 +12,9 @@ no_std = []
 # Opt-in QEMU SMP bring-up. Default builds stay single-core; the fog/tablet
 # profiles force one CPU regardless of this feature.
 smp = []
-# Opt-in QEMU self-test: after the APs are launched, run one SGI1
-# stop-the-world round and report PASS/FAIL. Kernel-only; no userspace
-# protocol is involved.
+# Opt-in QEMU self-test: after the APs are launched, run 64 back-to-back SGI1
+# stop-the-world rounds, verify cross-CPU visibility and report PASS/FAIL.
+# Kernel-only; no userspace protocol is involved.
 smp-selftest = ["smp"]
 demo-tasks = []
 tablet = []

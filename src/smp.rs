@@ -37,7 +37,7 @@
 //! belt-and-braces; it is explicitly NOT a cross-CPU synchronization.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
 use crate::{interrupts, platform};
 
@@ -326,9 +326,7 @@ pub fn bkl_acquire() {
         *depth += 1;
         return;
     }
-    if QUIESCE_ACTIVE.load(Ordering::Acquire)
-        && KERNEL_LOCK.owner.load(Ordering::Relaxed) != cpu.cpu_id as isize
-    {
+    if quiesce_active() && KERNEL_LOCK.owner.load(Ordering::Relaxed) != cpu.cpu_id as isize {
         // The quiescing CPU owns the BKL. Kernel code cannot take SGI1 with
         // IRQs masked, so acknowledge from the BKL wait loop instead.
         quiesce_ack_and_wait();
@@ -339,9 +337,7 @@ pub fn bkl_acquire() {
     // the first contended acquire. The asm `yield` makes the loop real.
     let mut spins: u32 = 0;
     loop {
-        if QUIESCE_ACTIVE.load(Ordering::Acquire)
-            && KERNEL_LOCK.owner.load(Ordering::Relaxed) != cpu.cpu_id as isize
-        {
+        if quiesce_active() && KERNEL_LOCK.owner.load(Ordering::Relaxed) != cpu.cpu_id as isize {
             quiesce_ack_and_wait();
         }
         let matched = KERNEL_LOCK
@@ -508,32 +504,82 @@ pub fn ipi_reschedule_others() {
 // Stop-the-world quiescence
 // ---------------------------------------------------------------------------
 
-static QUIESCE_ACTIVE: AtomicBool = AtomicBool::new(false);
-static QUIESCE_RELEASE: AtomicBool = AtomicBool::new(false);
-static QUIESCE_ACK: [AtomicBool; MAX_CPUS] = [
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
+/// Monotonic stop-the-world round counter. Each `quiesce_begin` takes a new
+/// value; `0` means no round has ever started. A monotonically increasing
+/// counter (instead of a boolean "active" flag) is what makes a round and its
+/// acknowledgement unambiguous: a CPU parked in an older round can vouch for a
+/// newer one instead of being woken *into* it by the same release store.
+static QUIESCE_ROUND: AtomicU32 = AtomicU32::new(0);
+/// Highest round that has been released. A parked CPU may leave once this
+/// reaches the round it acknowledged, and a timing-out `quiesce_begin`
+/// releases the world by storing its own round here.
+static QUIESCE_RELEASE: AtomicU32 = AtomicU32::new(0);
+/// Highest round each CPU has acknowledged. Monotonic (`fetch_max`), so a CPU
+/// that never left the parked loop between two back-to-back rounds covers the
+/// newer round without needing to re-enter the SGI handler. This closes the
+/// straggler hang: with a plain boolean, the next round cleared the ACK and
+/// reset RELEASE while that CPU was still spinning, so it could neither see
+/// the new release nor take the new SGI (IRQs are masked inside the handler).
+static QUIESCE_ACK: [AtomicU32; MAX_CPUS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Opt-in `smp-selftest` observation: generation written by the boot CPU
+/// before a round, and the value each parked CPU read back after its `dsb sy`.
+#[cfg(feature = "smp-selftest")]
+static SELFTEST_GENERATION: AtomicU32 = AtomicU32::new(0);
+#[cfg(feature = "smp-selftest")]
+static SELFTEST_SEEN: [AtomicU32; MAX_CPUS] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
 ];
 
 /// Parks the calling CPU until the quiescing CPU releases the world. Called
 /// from the SGI1 handler and from `bkl_acquire` waiters (which cannot take an
 /// IRQ because kernel code runs with IRQs masked). The caller must not hold
 /// the BKL: the quiescing CPU owns it while the world is stopped.
+///
+/// The loop re-reads the round on every iteration. If a new round starts while
+/// this CPU is still parked the CPU acknowledges the new round and keeps
+/// waiting, so back-to-back rounds cannot strand it.
 pub fn quiesce_ack_and_wait() {
-    // Complete every memory access issued before the stop request before
-    // telling the reaper that this CPU is quiescent.
-    unsafe {
-        core::arch::asm!("dsb sy", options(nostack));
-    }
     let cpu = this_cpu_id();
-    if cpu < MAX_CPUS {
-        QUIESCE_ACK[cpu].store(true, Ordering::Release);
-    }
-    while !QUIESCE_RELEASE.load(Ordering::Acquire) {
+    loop {
+        // Complete every memory access issued before the stop request before
+        // telling the reaper that this CPU is quiescent. Re-issued per round
+        // so a straggler's newer acknowledgement has the same ordering.
         unsafe {
-            core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+            core::arch::asm!("dsb sy", options(nostack));
+        }
+        let round = QUIESCE_ROUND.load(Ordering::Acquire);
+        if round == 0 {
+            // No stop-the-world has ever started; nothing to park for.
+            return;
+        }
+        #[cfg(feature = "smp-selftest")]
+        if cpu < MAX_CPUS {
+            SELFTEST_SEEN[cpu].store(
+                SELFTEST_GENERATION.load(Ordering::Acquire),
+                Ordering::Release,
+            );
+        }
+        if cpu < MAX_CPUS {
+            QUIESCE_ACK[cpu].fetch_max(round, Ordering::Release);
+        }
+        while QUIESCE_RELEASE.load(Ordering::Acquire) < round {
+            unsafe {
+                core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
+            }
+        }
+        // A newer round may have started while this CPU was parked. Keep
+        // covering it until the round we acknowledged is the newest one.
+        if QUIESCE_ROUND.load(Ordering::Acquire) == round {
+            return;
         }
     }
 }
@@ -546,11 +592,24 @@ pub fn quiesce_begin() -> bool {
     if cpu_count() <= 1 {
         return true;
     }
-    for ack in &QUIESCE_ACK {
-        ack.store(false, Ordering::Relaxed);
-    }
-    QUIESCE_RELEASE.store(false, Ordering::Release);
-    QUIESCE_ACTIVE.store(true, Ordering::SeqCst);
+    // Start a new round. `QUIESCE_RELEASE` still names the previous round, so
+    // `quiesce_active()` is true from this store until `quiesce_end` (or the
+    // timeout branch) moves it forward. Only the BKL holder mutates the
+    // counters, so the load/store pair needs no compare-exchange.
+    let previous = QUIESCE_ROUND.load(Ordering::Acquire);
+    let round = if previous == u32::MAX {
+        // `0` is the "never started" sentinel. On wrap restart at 1 and clear
+        // the acknowledgements, which name the old maximum round, so every CPU
+        // has to vouch for the restarted sequence.
+        for ack in &QUIESCE_ACK {
+            ack.store(0, Ordering::Relaxed);
+        }
+        QUIESCE_RELEASE.store(0, Ordering::Release);
+        1
+    } else {
+        previous + 1
+    };
+    QUIESCE_ROUND.store(round, Ordering::Release);
     crate::gic::send_sgi_all_but_self(crate::gic::QUIESCE_IRQ);
 
     let me = this_cpu_id();
@@ -561,7 +620,7 @@ pub fn quiesce_begin() -> bool {
             if cpu == me || !cpu_online(cpu) {
                 continue;
             }
-            if !QUIESCE_ACK[cpu].load(Ordering::Acquire) {
+            if QUIESCE_ACK[cpu].load(Ordering::Acquire) < round {
                 all = false;
                 // Re-send periodically in case an SGI was coalesced while
                 // the target was still in a masked kernel section.
@@ -576,8 +635,9 @@ pub fn quiesce_begin() -> bool {
         }
         spins += 1;
         if spins >= 20_000_000 {
-            QUIESCE_RELEASE.store(true, Ordering::Release);
-            QUIESCE_ACTIVE.store(false, Ordering::Release);
+            // Fail closed: release the round so nobody stays parked, and let
+            // the caller fall back to the conservative leak gate.
+            QUIESCE_RELEASE.store(round, Ordering::Release);
             return false;
         }
         unsafe {
@@ -588,13 +648,14 @@ pub fn quiesce_begin() -> bool {
 
 /// Releases CPUs parked by [`quiesce_begin`].
 pub fn quiesce_end() {
-    QUIESCE_RELEASE.store(true, Ordering::Release);
-    QUIESCE_ACTIVE.store(false, Ordering::Release);
+    let round = QUIESCE_ROUND.load(Ordering::Acquire);
+    QUIESCE_RELEASE.store(round, Ordering::Release);
 }
 
-/// True while a stop-the-world request is active.
+/// True while a stop-the-world request is active. Derived from the round
+/// counters so there is no separate flag to get out of sync with a timeout.
 pub fn quiesce_active() -> bool {
-    QUIESCE_ACTIVE.load(Ordering::Acquire)
+    QUIESCE_RELEASE.load(Ordering::Acquire) < QUIESCE_ROUND.load(Ordering::Acquire)
 }
 
 /// Kernel-lock depth on this CPU (0 = not held). Used by kernel-task entry
@@ -862,9 +923,18 @@ pub fn boot_secondary_cpus() {
     run_quiesce_selftest();
 }
 
-/// Opt-in boot self-test: wait for a published secondary, then run one real
-/// SGI1 stop-the-world round. This exercises the same handshake DMA teardown
-/// uses, including the BKL-waiter acknowledgement path.
+/// Number of back-to-back stop-the-world rounds in the opt-in self-test.
+/// Consecutive rounds (no yield in between) exercise the straggler path: a CPU
+/// still parked from round N must acknowledge round N+1 instead of being
+/// stranded by a cleared flag.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+const SELFTEST_ROUNDS: u32 = 64;
+
+/// Opt-in boot self-test: wait for a published secondary, then run
+/// [`SELFTEST_ROUNDS`] real SGI1 stop-the-world rounds. Each round also proves
+/// memory visibility: the boot CPU publishes a generation before the request,
+/// every acking CPU reads it after its own `dsb sy`, and the boot CPU checks
+/// the observation while the world is still stopped.
 #[cfg(all(feature = "smp", feature = "smp-selftest"))]
 fn run_quiesce_selftest() {
     if cpu_count() <= 1 {
@@ -872,7 +942,13 @@ fn run_quiesce_selftest() {
     }
     let me = this_cpu_id();
     let mut spins: u32 = 0;
-    while !(0..cpu_count()).any(|cpu| cpu != me && cpu_online(cpu)) {
+    let peers = loop {
+        let online = (0..cpu_count())
+            .filter(|&cpu| cpu != me && cpu_online(cpu))
+            .count();
+        if online > 0 {
+            break online;
+        }
         spins += 1;
         if spins >= 5_000_000 {
             crate::console::write_str("SMP SELFTEST: skipped, no secondary online\r\n");
@@ -881,16 +957,48 @@ fn run_quiesce_selftest() {
         unsafe {
             core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
         }
-    }
+    };
 
     // The peer may have published but not yet unmasked IRQs. `quiesce_begin`
     // re-sends SGI1 and the BKL retry loop acknowledges once IRQs are enabled.
-    if quiesce_begin() {
+    for round in 1..=SELFTEST_ROUNDS {
+        SELFTEST_GENERATION.store(round, Ordering::Release);
+        unsafe {
+            core::arch::asm!("dsb sy", options(nostack));
+        }
+        if !quiesce_begin() {
+            crate::console::write_str("SMP SELFTEST: quiesce FAIL (timeout, round ");
+            crate::console::write_dec_u64(round as u64);
+            crate::console::write_str(")\r\n");
+            return;
+        }
+        // The world is stopped, so no peer can change its observation: every
+        // CPU that acknowledged this round must have seen the new generation.
+        let mut stale = 0u64;
+        for cpu in 0..cpu_count() {
+            if cpu == me || !cpu_online(cpu) {
+                continue;
+            }
+            if SELFTEST_SEEN[cpu].load(Ordering::Acquire) != round {
+                stale += 1;
+            }
+        }
         quiesce_end();
-        crate::console::write_str("SMP SELFTEST: quiesce PASS\r\n");
-    } else {
-        crate::console::write_str("SMP SELFTEST: quiesce FAIL (timeout)\r\n");
+        if stale != 0 {
+            crate::console::write_str("SMP SELFTEST: quiesce FAIL (");
+            crate::console::write_dec_u64(stale);
+            crate::console::write_str(" CPU(s) missed generation at round ");
+            crate::console::write_dec_u64(round as u64);
+            crate::console::write_str(")\r\n");
+            return;
+        }
     }
+
+    crate::console::write_str("SMP SELFTEST: quiesce PASS (");
+    crate::console::write_dec_u64(SELFTEST_ROUNDS as u64);
+    crate::console::write_str(" rounds, ");
+    crate::console::write_dec_u64(peers as u64);
+    crate::console::write_str(" peer CPU(s))\r\n");
 }
 
 /// PSCI CPU_ON (SMC64 function id 0xC4000003) over QEMU `virt`'s HVC

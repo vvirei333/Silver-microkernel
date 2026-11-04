@@ -41,11 +41,16 @@ AP publication gated on a usable banked GIC.
   and the Phase 5 list are in [`SMP_STATUS.md`](SMP_STATUS.md). A stop-the-world
   SGI1 handshake now parks every other CPU (including BKL waiters) around DMA
   teardown, with a `dsb sy` before acknowledgement; a timeout falls back to the
-  conservative `space_is_running` / `range_mapped_by` leak gate. An AP is
-  published online only after its banked GIC bring-up succeeds; a failed AP
+  conservative `space_is_running` / `range_mapped_by` leak gate. The handshake
+  is round-qualified: `QUIESCE_ROUND` / `QUIESCE_RELEASE` / a monotonic
+  per-CPU `QUIESCE_ACK` replace the old boolean triple, so a CPU parked across
+  `quiesce_end` → `quiesce_begin` acknowledges the new round instead of being
+  stranded (which used to time out the next round and leak DMA frames). An AP
+  is published online only after its banked GIC bring-up succeeds; a failed AP
   parks offline, and late `boot_secondary_cpus` failures release the stack,
   private page and task space instead of leaking them. The opt-in
-  `smp-selftest` feature exercises one real SGI1 stop-the-world round at boot.
+  `smp-selftest` feature now runs 64 back-to-back SGI1 rounds and checks that
+  every acking CPU observed the generation published before each request.
 - **Ctrl-Z regression fixed after S-01.** The audit added a
   `CAP_CONSOLE_GRANT` gate to `SYS_STOP_CONSOLE`, but Howler's initial
   self-capabilities did not include it, so the userspace UART driver could no
@@ -70,7 +75,9 @@ AP publication gated on a usable banked GIC.
 - Verified in this snapshot: **139 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
-  `no_std,smp` with QEMU `-smp 2`, tablet build, and fog boot image v3.
+  `no_std,smp` with QEMU `-smp 2`, `no_std,smp-selftest` logging
+  `quiesce PASS (64 rounds, 1 peer CPU(s))` on three consecutive boots,
+  tablet build, and fog boot image v3.
 - **Hardware coverage after E2 is a smoke test, not a proof.** The post-E2
   image boots on physical `rain` and the GIC/timer panel is live, but QEMU and
   a single boot are not evidence for TLB/cache maintenance under load or for

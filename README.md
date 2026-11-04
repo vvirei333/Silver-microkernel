@@ -81,7 +81,7 @@ userspace.
 - [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation with pre-copy FDT destination validation (QEMU-verified, and booted on a physical `rain` unit)
 - [x] Real Redmi 10C boot: RAM-only `fastboot boot` reaches the scheduler and the Howl task, with live GICv3 timer interrupts (verified on a `rain` unit)
 - [ ] SFS write path, block-path interrupts, resource quotas and persistent storage
-- [ ] SMP (`-smp 2`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings CPU1 online, runs tasks on both CPUs and passes the `demo-tasks` regression (66 PASS / 0 PANIC). `no_std,smp-selftest` additionally runs one SGI1 stop-the-world round at boot. Physical SMP, TLB-shootdown stress and device-DMA quiescence remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
+- [ ] SMP (`-smp 2`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings CPU1 online, runs tasks on both CPUs and passes the `demo-tasks` regression (66 PASS / 0 PANIC). `no_std,smp-selftest` additionally runs 64 back-to-back SGI1 stop-the-world rounds at boot and verifies cross-CPU visibility. Physical SMP, TLB-shootdown stress and device-DMA quiescence remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
 
 ## Redmi 10C (`fog`, SM6225) — RAM-only bring-up
 
@@ -132,7 +132,7 @@ cargo build --release --target aarch64-unknown-none \
 cargo build --release --target aarch64-unknown-none \
     --no-default-features --features no_std,smp
 
-# Same, plus one boot-time SGI1 stop-the-world round (PASS/FAIL log)
+# Same, plus 64 boot-time SGI1 stop-the-world rounds (PASS/FAIL log)
 cargo build --release --target aarch64-unknown-none \
     --no-default-features --features no_std,smp-selftest
 
@@ -380,8 +380,9 @@ Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
 `Cargo.toml` has `std` (default host stub), `no_std` (bare metal), `smp`
-(opt-in QEMU SMP), `smp-selftest` (SMP plus one boot-time SGI1 quiescence
-round), `demo-tasks` (opt-in regression programs), `tablet` (SM8650), `fog`
+(opt-in QEMU SMP), `smp-selftest` (SMP plus 64 boot-time SGI1 quiescence
+rounds with a cross-CPU visibility check), `demo-tasks` (opt-in regression
+programs), `tablet` (SM8650), `fog`
 (SM6225 RAM-only bring-up) and `fog-reloc` (explicit opt-in for the fog
 self-relocation copy). Normal bare-metal boot starts only
 silverd, which then starts Scout, the block driver, the network driver, the SFS
@@ -649,10 +650,12 @@ FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 feature sets (`no_std`, `fog`, `fog-reloc`, `tablet`) build. The opt-in
 `no_std,smp` build on QEMU `-smp 2` brings CPU1 online, runs tasks on both
 CPUs, and reaches a working `howl>` prompt. DMA teardown stops the other CPUs
-with an SGI1 acknowledgement handshake; a timeout falls back to the
-conservative quiescence gate (a space still current on a CPU is not destroyed,
-and a range mapped by a running task is deferred and leaked). TLB shootdown
-under load, device-DMA quiescence and physical SMP remain open; see
+with a round-qualified SGI1 acknowledgement handshake; a timeout falls back to
+the conservative quiescence gate (a space still current on a CPU is not
+destroyed, and a range mapped by a running task is deferred and leaked). The
+opt-in `no_std,smp-selftest` run executes 64 back-to-back rounds and proves
+per-round memory visibility across CPUs. TLB shootdown under load, device-DMA
+quiescence and physical SMP remain open; see
 [SMP_STATUS.md](SMP_STATUS.md). A physical Redmi
 10C `rain` unit boots the post-E2 RAM-only image to the `fog-ui` panel with
 `GICV3 ONLINE`, `TIMER ONLINE` and growing `TICKS`. The GIC gate deliberately
