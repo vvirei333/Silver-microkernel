@@ -47,10 +47,11 @@
   self-loop'ов (слой A): рангтайм попадал в недостижимые по LLVM ветки,
   и регистры при замерах могли не отражать реальные данные списка.
 
-**ВНИМАНИЕ: незавершённая работа. Ядро на `-smp 2` не проходит первый блокирующий
-IPC-приём silverd. Диагностические RAM-пробы и serial-принты (M1–M5, S1/S2,
-SYS sp=, C1–C3) СОХРАНЕНЫ сознательно — они нужны для охоты на писателя кадра
-0x40081000 (слой B).**
+> **Историческая заметка (чекпойнт 2026-11-01).** Тогда ядро на `-smp 2` не
+> проходило первый блокирующий IPC-приём silverd; разделы «ОТКАЗЫ» ниже
+> описывают расследование слоёв A/B. С тех пор это исправлено (см. Phase 1–4.3
+> выше: QEMU `-smp 4` работает), а диагностические пробы M1–M8, S1/S2, `SYS sp=`
+> и C1–C3 из дерева удалены.
 
 ## PHASE 1 (2026-11-03): AP bring-up, QEMU opt-in
 
@@ -81,10 +82,11 @@ Landed behind `--features no_std,smp`; default builds keep `cpu_count() == 1`.
   (`AP_TASK_SCHEDULING=false`). Phase 2 below enables task execution and fixes
   the idle-context problem that blocked it.
 
-Verified: `cargo test --lib` 138/138; default `no_std` on QEMU `-smp 2` stays
-single-core and reaches `howl>`; `no_std,smp` on QEMU `-smp 2` shows
-`SMP: CPU1 online` and reaches `howl>`; 60 s run has no panic/BKL-stuck;
-fog QEMU integration remains PASS. No physical hardware SMP.
+Verified (phase-1 snapshot): `cargo test --lib` 138/138; default `no_std` on
+QEMU `-smp 2` stays single-core and reaches `howl>`; `no_std,smp` on QEMU
+`-smp 2` shows `SMP: CPU1 online` and reaches `howl>`; 60 s run has no
+panic/BKL-stuck; fog QEMU integration remains PASS. No physical hardware SMP.
+Later phases raised the same profile to four CPUs; see Phase 4.3.
 
 ### Phase 2: AP task execution (working on QEMU)
 
@@ -382,7 +384,7 @@ DMA leak, and `-smp 2` still reports one peer.
 ## Проверки на текущем состоянии
 
 - `cargo test --lib`: **142/142**.
-- Default `no_std` build, QEMU `-smp 2`: single-core, reaches `howl>`.
+- Default `no_std` build, QEMU `-smp 4`: single-core, reaches `howl>`.
 - `no_std,smp` build, QEMU `-smp 4`: CPU1–CPU3 online (GIC/timer/IPI), all
   four CPUs execute tasks; `howl ready`/prompt and `ps` work.
 - `no_std,smp` build, QEMU `-smp 2`: only CPU1 comes online; CPU2/CPU3 report

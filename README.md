@@ -646,15 +646,15 @@ device-quiescence proof — stopping the queue remains the driver's contract.
 | Document | Contents |
 | --- | --- |
 | [redmi10c_poc/README.md](redmi10c_poc/README.md) | Authoritative Redmi 10C / fog bring-up: design, live-FDT policy, fail-closed relocation, QEMU tests, unconfirmed hardware parameters |
-| [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU AP bring-up and task execution behind the `smp` feature; quiescence stress and physical SMP are not verified |
+| [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU bring-up of up to four CPUs behind the `smp` feature, round-qualified quiescence, per-CPU timer checks and boot selftests; true cross-PE TLB stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 
 Current verification snapshot (2026-11-04): **142 host tests** pass; the fog
 QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 `howl>`; the demo regression reports 66 PASS / 0 PANIC under `no_std,smp` with
-QEMU `-smp 4` (and `-smp 2`); all four release
-feature sets (`no_std`, `fog`, `fog-reloc`, `tablet`) build. The opt-in
+QEMU `-smp 4` (and `-smp 2`); the `no_std`, `fog`, `fog-reloc`, `tablet`,
+`smp`, `smp-selftest` and `demo-tasks` configurations all build. The opt-in
 `no_std,smp` build on QEMU `-smp 4` brings CPU1–CPU3 online, runs tasks on
 all four CPUs, and reaches a working `howl>` prompt; slots the machine does
 not expose stay offline instead of aborting bring-up. DMA teardown stops the

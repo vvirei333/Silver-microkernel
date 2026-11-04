@@ -5,11 +5,14 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## CURRENT STATUS (2026-11-04, TASK №23)
 
-Checkpoint: package E2 plus the external audit fixes (`b22e3a0`) and the
-follow-up SMP hardening: owner-aware page-table walks, explicit DRAM bounds
-and a portable cache-line helper; fail-closed FDT/region parsing; zeroed DMA
-publication; serialized PL011 RX; GICv3 single-window bound-IRQ dispatch; and
-AP publication gated on a usable banked GIC.
+Checkpoint: package E2, the external audit fixes (`b22e3a0`), the SMP
+hardening (`b2f0e57`, `145ef54`), the quota / DMA-quarantine / TLB-test
+package (`681e64c`) and the four-core bring-up (`ad20630`): owner-aware
+page-table walks, explicit DRAM bounds and a portable cache-line helper;
+fail-closed FDT/region parsing; zeroed DMA publication; serialized PL011 RX;
+GICv3 single-window bound-IRQ dispatch; AP publication gated on a usable
+banked GIC; round-qualified quiescence; and up to four QEMU CPUs with
+per-CPU timer liveness.
 
 - **Page-table ownership and DMA reclamation (Packages E/E1/E2).** Every page
   table is registered with `(frame, generation, owner)`; walks validate the
@@ -30,13 +33,14 @@ AP publication gated on a usable banked GIC.
   self-test, GIC/timer and scheduler/Howl start; it does **not** stress DMA
   reclamation, TLB shootdown or cache maintenance under load.
 - **SMP Phase 1 (opt-in `smp`, QEMU only).** Default builds stay single-core.
-  `no_std,smp` with QEMU `-smp 2` brings CPU1 online through a physical AP
-  trampoline (correct PSCI `0xC4000003` HVC call, physical entry/params,
-  `CPACR_EL1` FP/SIMD enable, high-half jump), initializes its GIC/timer and
+  `no_std,smp` with QEMU `-smp 4` brings CPU1–CPU3 online through physical AP
+  trampolines (correct PSCI `0xC4000003` HVC call, physical entry/params,
+  `CPACR_EL1` FP/SIMD enable, high-half jump), initializes each GIC/timer and
   accepts IPIs **and executes tasks**. Per-CPU idle contexts plus AP idle ids
   above the user id space fixed the shared-idle livelock without shifting
-  `SCOUT_ID`; QEMU `-smp 2` reaches `howl ready`, commands work and a 60 s run
-  is clean. Fog/tablet still force one CPU. Space quiescence for teardown/DMA
+  `SCOUT_ID`; QEMU `-smp 4` reaches `howl ready`, commands work and the
+  `demo-tasks` suite is clean, while `-smp 2` still runs with CPU1 only.
+  Fog/tablet still force one CPU. Space quiescence for teardown/DMA
   revoke, TLB shootdown under load and physical SMP remain unproven; details
   and the Phase 5 list are in [`SMP_STATUS.md`](SMP_STATUS.md). A stop-the-world
   SGI1 handshake now parks every other CPU (including BKL waiters) around DMA
@@ -137,9 +141,11 @@ Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
   defined `unregister_mutex` not-found path, ipc receive bisect bypass
   removed).
 - **Verified working at that checkpoint:** single-CPU boot unchanged;
-  `cargo test --lib` 13/13 (the current suite is 138/138); debug and release
+  `cargo test --lib` 13/13 (the current suite is 142/142); debug and release
   builds pass.
-- **NOT working: `-smp 2`** dies at silverd's first blocking IPC receive.
+- **Historical (fixed): `-smp 2`** died at silverd's first blocking IPC
+  receive at the 2026-11-01 checkpoint; the layers below are the investigation
+  record, not the current state (see the status section at the top).
   Two independent failure layers, both new relative to pre-SMP:
   - Layer A: O3+LTO emits literal `b .` self-loops on *reachable* paths
     (~22 sites: raw_lock/raw_unlock, Semaphore::wait, Channel send/receive,
@@ -1526,15 +1532,21 @@ read back only their own values.
 
 ## Architectural invariants (do not break!)
 
-1. **Single-CPU by default; QEMU SMP is an opt-in experiment.** Default
-   builds keep `cpu_count() == 1`; fog and tablet force one CPU. The `smp`
-   feature brings QEMU APs online (GIC/timer/IPI), but AP task scheduling is
-   parked and the single-CPU ownership/quiescence proofs still apply. Every
-   `unsafe impl Sync` on an UnsafeCell wrapper (`TaskManager`, `IpcState`)
-   must be re-proven before APs execute tasks; real spinlocks come first.
-2. **Critical sections via DAIF.** Global kernel state (scheduler, IPC) is
-   mutated only under `save_and_disable_irq` / `restore_irq`. That is the
-   only mutual-exclusion mechanism besides Mutex + Condvar.
+1. **Single-CPU by default; QEMU SMP is opt-in.** Default builds keep
+   `cpu_count() == 1`; fog and tablet force one CPU. The `smp` feature brings
+   up to `MAX_CPUS` (4) QEMU APs online (GIC/timer/IPI) and APs execute tasks;
+   `smp-selftest` adds the boot checks. The earlier single-CPU ownership
+   proofs are replaced by a locking contract: the BKL serializes kernel state,
+   the inner spinlocks (frame allocator, page-table registry, DMA quarantine)
+   cover short mutations, and teardown/reap runs behind the quiescence gate
+   (the SGI1 stop-the-world handshake when a dead task owns DMA) before the
+   first PTE edit. Any new shared `UnsafeCell` wrapper must state which of
+   those protects it before APs may touch it.
+2. **Critical sections via the BKL, with DAIF as local belt-and-braces.**
+   Global kernel state (scheduler, IPC) is mutated with the kernel lock held;
+   kernel entry/IRQ paths also mask IRQs locally, but IRQ masking is not the
+   cross-CPU mechanism. Blocking paths release the BKL before `schedule` and
+   re-acquire on resume; `Mutex`/`Condvar` remain the task-level primitives.
 3. **The DAIF rule for tasks.** A voluntary context switch (`sleep` /
    `yield` / `block_current_on`) inherits masked IRQs. Kernel task entry points
    must call `interrupts::enable_irq()` before waiting; idle does this.
