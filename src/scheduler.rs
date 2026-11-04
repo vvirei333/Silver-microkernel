@@ -307,6 +307,15 @@ static AP_BOOT_PENDING: core::sync::atomic::AtomicBool = core::sync::atomic::Ato
 /// boot stack into idle's context. `schedule` must be a no-op before this flag.
 static SCHEDULER_READY: AtomicBool = AtomicBool::new(false);
 
+/// Set by `start()` once the first task is marked `Running` on CPU 0.
+///
+/// Between `finish_init` (`SCHEDULER_READY`) and `start`'s first switch the
+/// documented boot window allows a timer IRQ to enter `schedule` while
+/// `current_index` already names idle but `running_on` is still unset. The
+/// invariant audit must not report that window as a scheduling violation.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static SCHEDULER_STARTED: AtomicBool = AtomicBool::new(false);
+
 /// Data frames of shared-DMA ranges whose revoke scan could not prove the
 /// absence of foreign mappings (see `reap_dead_tasks`): deliberately leaked
 /// instead of risking a use-after-free through a live foreign mapping.
@@ -1372,7 +1381,7 @@ pub fn space_is_running(ttbr0: usize) -> bool {
         };
         if task.state == TaskState::Running
             && task.running_on == Some(cpu)
-            && task.ttbr0 == ttbr0
+            && mmu::root_of(task.ttbr0) == mmu::root_of(ttbr0)
         {
             return true;
         }
@@ -1598,6 +1607,8 @@ pub fn start() -> ! {
     crate::fog::paint(0xFFFF_8000); // orange: BKL acquired
     first_task.state = TaskState::Running;
     first_task.running_on = Some(0);
+    #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+    SCHEDULER_STARTED.store(true, Ordering::Release);
     trace_switch(
         0,
         first_task.id,
@@ -1685,11 +1696,13 @@ pub fn schedule() {
     // `running_on`/`current_index` drift into a loud boot failure instead of a
     // task resuming with another task's address space.
     #[cfg(all(feature = "smp", feature = "smp-selftest"))]
-    if let Err(reason) = verify_scheduling_invariants(manager) {
-        console::write_str("SMP SELFTEST: sched invariant FAIL (");
-        console::write_str(reason);
-        console::write_str(")\r\n");
-        panic!("scheduling invariant violated");
+    if SCHEDULER_STARTED.load(Ordering::Acquire) {
+        if let Err(reason) = verify_scheduling_invariants(manager) {
+            console::write_str("SMP SELFTEST: sched invariant FAIL (");
+            console::write_str(reason);
+            console::write_str(")\r\n");
+            panic!("scheduling invariant violated");
+        }
     }
     #[cfg(all(feature = "smp", feature = "smp-selftest"))]
     report_ready_queues_once();
@@ -3075,6 +3088,7 @@ impl Task {
             self.space_token,
             self.private_page,
             self.private_page_generation,
+            mmu::asid_of(self.ttbr0),
         ) {
             console::write_str("MMU: address space teardown was refused\r\n");
         }

@@ -15,9 +15,9 @@ banked GIC; round-qualified quiescence; and up to four QEMU CPUs with
 per-CPU timer liveness.
 
 **SMP feature program (2026-11-04):** four packages, in order —
-(1) per-CPU ready queues **[done]**, (2) ASID-tagged address spaces **[next]**,
-(3) DMA in-flight quiescence contract, (4) SMP churn stress. Each package is
-verified on its own before the next starts.
+(1) per-CPU ready queues **[done]**, (2) ASID-tagged address spaces **[done]**,
+(3) DMA in-flight quiescence contract **[next]**, (4) SMP churn stress. Each
+package is verified on its own before the next starts.
 
 - **Page-table ownership and DMA reclamation (Packages E/E1/E2).** Every page
   table is registered with `(frame, generation, owner)`; walks validate the
@@ -156,6 +156,20 @@ verified on its own before the next starts.
   the fast path working (`ready queues local=35 steal=29 scan=0`); a debug
   build that corrupts a queued id fires `sched invariant FAIL (a ready queue
   entry names the wrong task)`.
+- **ASID-tagged address spaces (2026-11-04).** `create_task_space` allocates a
+  unique ASID (`1..=255`; `TCR_EL1.AS` stays 0, the ARMv8.0 8-bit baseline) and
+  tags the returned TTBR0 in bits `[63:48]`. `switch_address_space` now only
+  writes TTBR0 and executes `isb`: the outgoing space's translations stay
+  valid and tagged, so a context switch no longer broadcasts
+  `tlbi vmalle1is` to every CPU. A PTE edit invalidates only the edited space
+  with `tlbi aside1is` (still inner-shareable, so peers drop the stale entry);
+  `destroy_task_space` invalidates the ASID before retiring the tables and
+  returns it to a live-bitmap pool. Every function that treats a `ttbr0`
+  argument as a frame address goes through `root_of()`; the boot/kernel TTBR0
+  stays ASID 0. A new boot test maps the same VA in two spaces to different
+  frames and switches between them **without any flush**, requiring each read
+  to return its own value; dropping the ASID tag makes it fail closed with
+  exception 9.
 - Verified in this snapshot: **142 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
@@ -169,7 +183,8 @@ verified on its own before the next starts.
   `running_on` claim makes the invariant check fire on the next pass
   (`sched invariant FAIL (a CPU's current task is not marked running on it)`).
   Tablet build, and fog boot image v3. The boot self-tests log
-  `MMU TLB OK` and `DMA QUARANTINE OK`.
+  `MMU TLB OK`, `MMU ASID OK` and `DMA QUARANTINE OK`; a build that drops the
+  ASID tag fails the ASID test with exception 9 before the scheduler starts.
 - **Hardware coverage after E2 is a smoke test, not a proof.** The post-E2
   image boots on physical `rain` and the GIC/timer panel is live, but QEMU and
   a single boot are not evidence for TLB/cache maintenance under load or for

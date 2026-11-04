@@ -103,9 +103,10 @@ fn page_table_owned_by(frame: usize, owner: usize) -> bool {
 /// same invariant `retire_space` checks, so a walker cannot treat another
 /// space's child table as a root.
 fn space_root_valid(ttbr0: usize) -> bool {
-    ttbr0 % GRANULE == 0
-        && frame_allocator::frame_in_use(ttbr0)
-        && page_table_owned_by(ttbr0, ttbr0)
+    let root = root_of(ttbr0);
+    root % GRANULE == 0
+        && frame_allocator::frame_in_use(root)
+        && page_table_owned_by(root, root)
 }
 
 /// Frees a page-table frame only when `token` is the live registration.
@@ -248,6 +249,115 @@ const UXN: u64 = 1 << 54;
 const PXN: u64 = 1 << 53;
 
 const ADDRESS_MASK: u64 = 0x0000_FFFF_FFFF_F000;
+
+/// `TTBR0_EL1[63:48]` carries the address-space identifier. `TCR_EL1.AS` is
+/// left at 0 (the ARMv8.0 baseline), so the architectural limit is 8 bits:
+/// ASIDs `1..=255` are allocatable and `0` is reserved for the boot/kernel
+/// TTBR0. Every task space gets a unique ASID until it is destroyed, which
+/// lets a context switch keep both spaces' translations cached and lets a PTE
+/// edit invalidate only the edited space.
+const TTBR0_ASID_SHIFT: u32 = 48;
+const ASID_BITS: usize = 8;
+const ASID_WORDS: usize = (1usize << ASID_BITS) / 64;
+
+/// Root physical address of a TTBR0 value (ASID bits removed). Every place
+/// that treats a `ttbr0` argument as a frame address must go through this.
+pub fn root_of(ttbr0: usize) -> usize {
+    ttbr0 & ADDRESS_MASK as usize
+}
+
+/// ASID carried by a tagged TTBR0 value.
+pub fn asid_of(ttbr0: usize) -> u16 {
+    ((ttbr0 >> TTBR0_ASID_SHIFT) & 0xFF) as u16
+}
+
+fn tagged_ttbr0(root: usize, asid: u16) -> usize {
+    root_of(root) | ((asid as usize) << TTBR0_ASID_SHIFT)
+}
+
+/// Live-ASID bitmap. Bit 0 (ASID 0) is permanently set; allocation scans the
+/// remaining 255 bits. Allocation is rare and runs under the kernel lock, so
+/// a linear scan under a small spinlock is cheaper than a free-list structure.
+struct AsidPool {
+    live: [u64; ASID_WORDS],
+}
+
+impl AsidPool {
+    const fn new() -> Self {
+        Self {
+            live: [0; ASID_WORDS],
+        }
+    }
+}
+
+static ASIDS: SpinLock<AsidPool> = SpinLock::new(AsidPool::new());
+
+fn alloc_asid() -> Option<u16> {
+    let mut pool = ASIDS.lock();
+    pool.live[0] |= 1; // reserve ASID 0 for the boot/kernel TTBR0
+    for word in 0..ASID_WORDS {
+        let free = !pool.live[word];
+        if free != 0 {
+            let bit = free.trailing_zeros() as usize;
+            pool.live[word] |= 1u64 << bit;
+            let asid = (word * 64 + bit) as u16;
+            if asid != 0 {
+                return Some(asid);
+            }
+        }
+    }
+    None
+}
+
+fn release_asid(asid: u16) {
+    if asid == 0 {
+        return;
+    }
+    let index = asid as usize;
+    let mut pool = ASIDS.lock();
+    pool.live[index / 64] &= !(1u64 << (index % 64));
+}
+
+/// Broadcast-invalidates every translation tagged with `asid`. The `is`
+/// suffix covers the inner-shareable domain, so a stale entry on another CPU
+/// is dropped too; the trailing `dsb ish` makes the invalidation complete
+/// before the caller frees a table or reuses the ASID.
+fn invalidate_asid(asid: u16) {
+    if asid == 0 {
+        return;
+    }
+    unsafe {
+        core::arch::asm!(
+            "tlbi aside1is, {op}",
+            "dsb ish",
+            "isb",
+            op = in(reg) (asid as u64) << TTBR0_ASID_SHIFT,
+            options(nostack),
+        );
+    }
+}
+
+/// Completes a batch of edits to the space named by `ttbr0`: one store-order
+/// barrier, one ASID-scoped broadcast invalidation, one completion barrier.
+/// ASID 0 (boot tables) falls back to the full broadcast.
+fn finish_table_changes_for(ttbr0: usize) {
+    let asid = asid_of(ttbr0);
+    if asid == 0 {
+        finish_table_changes();
+        return;
+    }
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi aside1is, {op}",
+            "dsb ish",
+            "isb",
+            op = in(reg) (asid as u64) << TTBR0_ASID_SHIFT,
+            options(nostack),
+        );
+    }
+}
+
 /// MAIR_EL1 attribute bytes, one per `ATTR_*` index:
 /// * index 0 = `0xFF` Normal, Outer/Inner Write-Back Non-transient (cacheable)
 /// * index 1 = `0x00` Device-nGnRnE (MMIO)
@@ -620,20 +730,6 @@ fn clean_table_lines(table_start: usize, table_bytes: usize) {
 /// translation system-wide on each mapping request. The address form keeps the
 /// rest of the TLB warm and, unlike a block-wide flush, cannot be skipped by
 /// accident when a task maps into a page table that was just installed.
-fn invalidate_user_page(virtual_address: usize) {
-    unsafe {
-        core::arch::asm!(
-            "dsb ishst",
-            // VA[55:12] is what VAE1IS takes; the low 12 bits are the offset.
-            "tlbi vaae1is, {va}",
-            "dsb ish",
-            "isb",
-            va = in(reg) (virtual_address as u64) >> 12,
-            options(nostack),
-        );
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Per-task user address spaces
 // ---------------------------------------------------------------------------
@@ -654,6 +750,10 @@ pub fn create_task_space(
     if image.is_some_and(|image| image.page_count == 0 || image.page_count > ENTRIES) {
         return None;
     }
+    let Some(asid) = alloc_asid() else {
+        crate::console::write_str("MMU: no free ASID, space creation refused\r\n");
+        return None;
+    };
     let mut pages = [0_usize; 9];
     let mut generations = [0_u32; 9];
     for index in 0..pages.len() {
@@ -662,6 +762,7 @@ pub fn create_task_space(
             for prior in 0..index {
                 frame_allocator::free_page_tagged(pages[prior], generations[prior]);
             }
+            release_asid(asid);
             return None;
         };
         pages[index] = page;
@@ -680,6 +781,7 @@ pub fn create_task_space(
             for prior in &tokens[..index] {
                 free_table_frame(*prior);
             }
+            release_asid(asid);
             return None;
         };
         tokens[index] = token;
@@ -741,7 +843,9 @@ pub fn create_task_space(
     for page in pages {
         flush_after_table_change(page, GRANULE);
     }
-    Some((l0, tokens[0]))
+    // The space starts life with a unique ASID, so a later context switch can
+    // install TTBR0 without flushing every CPU's TLB.
+    Some((tagged_ttbr0(l0, asid), tokens[0]))
 }
 
 /// Replaces the AP space's empty user-image L3 with one EL1-only 2 MiB
@@ -756,16 +860,17 @@ pub fn create_task_space(
 /// this does not expose the kernel image to EL0. The replaced L3 table stays
 /// registered and is reclaimed with the space.
 pub fn install_ap_identity(ttbr0: usize) -> bool {
-    if !space_root_valid(ttbr0) {
+    let root = root_of(ttbr0);
+    if !space_root_valid(root) {
         return false;
     }
     unsafe {
-        let root_entry = read_entry(ttbr0, 0);
-        let Some(l1_user) = follow_validated_table(root_entry, ttbr0) else {
+        let root_entry = read_entry(root, 0);
+        let Some(l1_user) = follow_validated_table(root_entry, root) else {
             return false;
         };
         let l2_entry = read_entry(l1_user, 1);
-        let Some(l2_user) = follow_validated_table(l2_entry, ttbr0) else {
+        let Some(l2_user) = follow_validated_table(l2_entry, root) else {
             return false;
         };
         write_entry(
@@ -789,6 +894,7 @@ pub fn install_ap_identity(ttbr0: usize) -> bool {
 /// heap by hundreds of pages at a time.
 pub fn map_user_heap_pages(ttbr0: usize, first_index: usize, physical_pages: &[usize]) -> bool {
     let count = physical_pages.len();
+    let root = root_of(ttbr0);
     let Some(last) = first_index.checked_add(count) else {
         return false;
     };
@@ -799,7 +905,7 @@ pub fn map_user_heap_pages(ttbr0: usize, first_index: usize, physical_pages: &[u
         return false;
     }
     unsafe {
-        let l1_user = follow_table(ttbr0, 0);
+        let l1_user = follow_table(root, 0);
         let l2_user = follow_table(l1_user, 1);
         let l3_heap = follow_table(l2_user, USER_HEAP_L2_INDEX);
         if l3_heap == 0 {
@@ -817,7 +923,7 @@ pub fn map_user_heap_pages(ttbr0: usize, first_index: usize, physical_pages: &[u
             clean_entry_line(l3_heap, index);
         }
     }
-    finish_table_changes();
+    finish_table_changes_for(ttbr0);
     true
 }
 
@@ -826,8 +932,10 @@ pub fn unmap_user_heap_page(ttbr0: usize, index: usize) -> Option<usize> {
     if index >= USER_HEAP_MAX_PAGES {
         return None;
     }
+    let root = root_of(ttbr0);
+    let physical;
     unsafe {
-        let l1_user = follow_table(ttbr0, 0);
+        let l1_user = follow_table(root, 0);
         let l2_user = follow_table(l1_user, 1);
         let l3_heap = follow_table(l2_user, USER_HEAP_L2_INDEX);
         if l3_heap == 0 {
@@ -838,9 +946,11 @@ pub fn unmap_user_heap_page(ttbr0: usize, index: usize) -> Option<usize> {
             return None;
         }
         write_entry(l3_heap, index, 0);
-        flush_after_table_change(l3_heap, GRANULE);
-        Some(descriptor_address(entry) as usize)
+        clean_entry_line(l3_heap, index);
+        physical = descriptor_address(entry) as usize;
     }
+    finish_table_changes_for(ttbr0);
+    Some(physical)
 }
 
 /// Maps `page_count` anonymous pages at `virtual_address` into the current
@@ -887,8 +997,9 @@ pub fn map_user_pages_at(
         return false;
     }
 
+    let root = root_of(ttbr0);
     unsafe {
-        let l1_user = follow_table(ttbr0, 0);
+        let l1_user = follow_table(root, 0);
         let l2_user = follow_table(l1_user, 1);
         // All-or-nothing: `done` counts fully installed pages; every failure
         // path unrolls them before returning. The rollback cannot refuse:
@@ -904,17 +1015,17 @@ pub fn map_user_pages_at(
                 let Some((page, generation)) = frame_allocator::alloc_page_tagged() else {
                     // F1: no frame left for a new L3 table.
                     unmap_user_pages_at(ttbr0, virtual_address, done);
-                    finish_table_changes();
+                    finish_table_changes_for(ttbr0);
                     return false;
                 };
                 zero_page(page);
-                if page_table_register(page, generation, ttbr0).is_none() {
+                if page_table_register(page, generation, root).is_none() {
                     // Registration refused: the L2 entry below is only written
                     // after a successful registration, so the frame is still
                     // unlinked and its own tag is correct.
                     frame_allocator::free_page_tagged(page, generation);
                     unmap_user_pages_at(ttbr0, virtual_address, done);
-                    finish_table_changes();
+                    finish_table_changes_for(ttbr0);
                     return false;
                 }
                 // Registered before the first link; the rollback paths below
@@ -930,13 +1041,13 @@ pub fn map_user_pages_at(
             } else {
                 // F2: unexpected descriptor kind in the user L2.
                 unmap_user_pages_at(ttbr0, virtual_address, done);
-                finish_table_changes();
+                finish_table_changes_for(ttbr0);
                 return false;
             };
             if read_entry(l3, l3_index) != 0 {
                 // F3: target slot already mapped.
                 unmap_user_pages_at(ttbr0, virtual_address, done);
-                finish_table_changes();
+                finish_table_changes_for(ttbr0);
                 return false;
             }
             // Zero before publication: the frame is recycled allocator memory
@@ -957,7 +1068,7 @@ pub fn map_user_pages_at(
     // One barrier + broadcast for the whole range. The caller runs under the
     // kernel lock and the target space is not executing on another CPU, so no
     // translation can be observed between the individual entry writes.
-    finish_table_changes();
+    finish_table_changes_for(ttbr0);
     true
 }
 
@@ -992,8 +1103,9 @@ pub fn replace_user_page(
     if virtual_address < USER_MMAP_VA || end > USER_MMAP_MAX_VA {
         return false;
     }
+    let root = root_of(ttbr0);
     unsafe {
-        let l1_user = follow_table(ttbr0, 0);
+        let l1_user = follow_table(root, 0);
         let l2_user = follow_table(l1_user, 1);
         let l2_index = (virtual_address - DRAM_BASE) / BLOCK_2M;
         let l3_index = (virtual_address >> 12) & 0x1FF;
@@ -1008,7 +1120,7 @@ pub fn replace_user_page(
         write_entry(l3, l3_index, user_anonymous_page(physical, prot));
         clean_entry_line(l3, l3_index);
     }
-    finish_table_changes();
+    finish_table_changes_for(ttbr0);
     true
 }
 
@@ -1040,8 +1152,9 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
     if end > DRAM_BASE + 0x4000_0000 {
         return false;
     }
+    let root = root_of(ttbr0);
     unsafe {
-        let l1_user = follow_table(ttbr0, 0);
+        let l1_user = follow_table(root, 0);
         let l2_user = follow_table(l1_user, 1);
 
         // Pre-scan: no mutation until every page in the range is proven to be
@@ -1068,7 +1181,7 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
             let l3_index = (va >> 12) & 0x1FF;
             let l3 = descriptor_address(read_entry(l2_user, l2_index)) as usize;
             write_entry(l3, l3_index, 0);
-            flush_after_table_change(l3, GRANULE);
+            clean_entry_line(l3, l3_index);
             // The heap and stack L3 tables are persistent: `brk` and the
             // fixed stack window reuse them after an unmap empties the last
             // page. Freeing them would leave map/unmap_user_heap_page
@@ -1077,11 +1190,12 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
                 || l2_index == USER_STACK_L2_INDEX;
             if !persistent && table_empty(l3) {
                 write_entry(l2_user, l2_index, 0);
-                flush_after_table_change(l2_user, GRANULE);
-                free_table_frame_owned(l3, ttbr0);
+                clean_entry_line(l2_user, l2_index);
+                free_table_frame_owned(l3, root);
             }
         }
     }
+    finish_table_changes_for(ttbr0);
     true
 }
 
@@ -1160,26 +1274,27 @@ pub fn range_mapped_by(ttbr0: usize, phys_base: usize, phys_end: usize) -> bool 
     {
         return true;
     }
+    let root = root_of(ttbr0);
     unsafe {
-        let root_entry = read_entry(ttbr0, 0);
+        let root_entry = read_entry(root, 0);
         if root_entry == 0 {
             return false;
         }
-        let Some(l1_user) = follow_validated_table(root_entry, ttbr0) else {
+        let Some(l1_user) = follow_validated_table(root_entry, root) else {
             return true;
         };
         let l1_entry = read_entry(l1_user, USER_MMIO_L1_INDEX);
         if l1_entry == 0 {
             return false;
         }
-        let Some(l2_mmio) = follow_validated_table(l1_entry, ttbr0) else {
+        let Some(l2_mmio) = follow_validated_table(l1_entry, root) else {
             return true;
         };
         let l2_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
         if l2_entry == 0 {
             return false;
         }
-        let Some(l3_mmio) = follow_validated_table(l2_entry, ttbr0) else {
+        let Some(l3_mmio) = follow_validated_table(l2_entry, root) else {
             return true;
         };
         for index in 0..ENTRIES {
@@ -1235,6 +1350,7 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
         };
     }
 
+    let root = root_of(ttbr0);
     unsafe {
         // The root table named by `ttbr0` must be a registered space root:
         // `create_task_space` registers it with itself as owner. A `ttbr0`
@@ -1249,14 +1365,14 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
 
         // L0 → L1_user. A zero entry means the user half is absent: nothing
         // in this address space can map the range.
-        let root_entry = read_entry(ttbr0, 0);
+        let root_entry = read_entry(root, 0);
         if root_entry == 0 {
             return RevokeResult {
                 unmapped: 0,
                 safe_to_free: true,
             };
         }
-        let Some(l1_user) = follow_validated_table(root_entry, ttbr0) else {
+        let Some(l1_user) = follow_validated_table(root_entry, root) else {
             return RevokeResult {
                 unmapped: 0,
                 safe_to_free: false,
@@ -1271,7 +1387,7 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
                 safe_to_free: true,
             };
         }
-        let Some(l2_mmio) = follow_validated_table(l1_entry, ttbr0) else {
+        let Some(l2_mmio) = follow_validated_table(l1_entry, root) else {
             return RevokeResult {
                 unmapped: 0,
                 safe_to_free: false,
@@ -1285,7 +1401,7 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
                 safe_to_free: true,
             };
         }
-        let Some(l3_mmio) = follow_validated_table(l2_entry, ttbr0) else {
+        let Some(l3_mmio) = follow_validated_table(l2_entry, root) else {
             return RevokeResult {
                 unmapped: 0,
                 safe_to_free: false,
@@ -1293,6 +1409,7 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
         };
 
         let mut unmapped = 0usize;
+        let mut changed = false;
         for index in 0..ENTRIES {
             let entry = read_entry(l3_mmio, index);
             if entry == 0 {
@@ -1301,6 +1418,9 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
             if entry & DESC_PAGE != DESC_PAGE {
                 // Not a valid page descriptor: this window cannot be fully
                 // verified, so the caller must not free the frames.
+                if changed {
+                    finish_table_changes_for(ttbr0);
+                }
                 return RevokeResult {
                     unmapped,
                     safe_to_free: false,
@@ -1309,9 +1429,13 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
             let physical = descriptor_address(entry) as usize;
             if physical >= phys_base && physical < phys_end {
                 write_entry(l3_mmio, index, 0);
-                flush_after_table_change(l3_mmio, GRANULE);
+                clean_entry_line(l3_mmio, index);
                 unmapped += 1;
+                changed = true;
             }
+        }
+        if changed {
+            finish_table_changes_for(ttbr0);
         }
         RevokeResult {
             unmapped,
@@ -1453,21 +1577,18 @@ fn map_user_pages(
         }
 
         for page_index in 0..page_count {
+            let index = first + page_index;
             write_entry(
                 l3_mmio,
-                first + page_index,
+                index,
                 descriptor(physical_start + page_index * GRANULE),
             );
+            clean_entry_line(l3_mmio, index);
         }
-        // The descriptor lives in memory, so it has to reach the point of
-        // coherency before the stale translation is dropped; otherwise the
-        // walker can still load the old (empty) slot and the task keeps seeing
-        // the previous mapping of this window.
-        clean_table_lines(l3_mmio, GRANULE);
+        // One ASID-scoped invalidation publishes the whole device window. The
+        // caller holds the kernel lock and the target task is not executing.
+        finish_table_changes_for(task.ttbr0);
         let virtual_address = USER_MMIO_VA + first * GRANULE;
-        for page_index in 0..page_count {
-            invalidate_user_page(virtual_address + page_index * GRANULE);
-        }
         Some(virtual_address + physical_offset)
     }
 }
@@ -1488,17 +1609,18 @@ fn clean_dma_range(physical: usize, size: usize) {
 /// descriptor is refused before it is dereferenced or modified, and the
 /// mapping path never writes into another space's table.
 fn user_mmio_table(ttbr0: usize) -> Option<usize> {
+    let root = root_of(ttbr0);
     unsafe {
-        if !space_root_valid(ttbr0) {
+        if !space_root_valid(root) {
             return None;
         }
-        let root_entry = read_entry(ttbr0, 0);
-        let l1_user = follow_validated_table(root_entry, ttbr0)?;
+        let root_entry = read_entry(root, 0);
+        let l1_user = follow_validated_table(root_entry, root)?;
         let existing = read_entry(l1_user, USER_MMIO_L1_INDEX);
         if existing & DESC_TABLE == DESC_TABLE {
-            let l2_mmio = follow_validated_table(existing, ttbr0)?;
+            let l2_mmio = follow_validated_table(existing, root)?;
             let l3_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
-            return follow_validated_table(l3_entry, ttbr0);
+            return follow_validated_table(l3_entry, root);
         }
         if existing != 0 {
             return None;
@@ -1506,7 +1628,7 @@ fn user_mmio_table(ttbr0: usize) -> Option<usize> {
 
         let (l2_mmio, l2_generation) = frame_allocator::alloc_page_tagged()?;
         zero_page(l2_mmio);
-        let Some(l2_token) = page_table_register(l2_mmio, l2_generation, ttbr0) else {
+        let Some(l2_token) = page_table_register(l2_mmio, l2_generation, root) else {
             // Registration refused: `l1_user` is only linked after both
             // registrations succeed, so the frame is still unlinked.
             frame_allocator::free_page_tagged(l2_mmio, l2_generation);
@@ -1517,7 +1639,7 @@ fn user_mmio_table(ttbr0: usize) -> Option<usize> {
             return None;
         };
         zero_page(l3_mmio);
-        if page_table_register(l3_mmio, l3_generation, ttbr0).is_none() {
+        if page_table_register(l3_mmio, l3_generation, root).is_none() {
             // `l3_mmio` was never linked (its L2 entry is written below);
             // `l2_mmio` is registered but not yet linked into `l1_user`.
             frame_allocator::free_page_tagged(l3_mmio, l3_generation);
@@ -1526,9 +1648,9 @@ fn user_mmio_table(ttbr0: usize) -> Option<usize> {
         }
         write_entry(l2_mmio, USER_MMIO_L2_INDEX, l3_mmio as u64 | DESC_TABLE);
         write_entry(l1_user, USER_MMIO_L1_INDEX, l2_mmio as u64 | DESC_TABLE);
-        flush_after_table_change(l3_mmio, GRANULE);
-        flush_after_table_change(l2_mmio, GRANULE);
-        flush_after_table_change(l1_user, GRANULE);
+        clean_entry_line(l2_mmio, USER_MMIO_L2_INDEX);
+        clean_entry_line(l1_user, USER_MMIO_L1_INDEX);
+        finish_table_changes_for(ttbr0);
         Some(l3_mmio)
     }
 }
@@ -1545,8 +1667,9 @@ pub fn destroy_task_space(
     space: TableToken,
     private_page: usize,
     private_page_generation: u32,
+    asid: u16,
 ) -> bool {
-    destroy_task_space_inner(space, private_page, private_page_generation, true)
+    destroy_task_space_inner(space, private_page, private_page_generation, asid, true)
 }
 
 /// `diagnose = false` is used only by the boot self-test for its intentional
@@ -1555,6 +1678,7 @@ fn destroy_task_space_inner(
     space: TableToken,
     private_page: usize,
     private_page_generation: u32,
+    asid: u16,
     diagnose: bool,
 ) -> bool {
     // Quiescence proof: a space still current on an online CPU may have live
@@ -1568,6 +1692,10 @@ fn destroy_task_space_inner(
         }
         return false;
     }
+    // Drop every translation tagged with this ASID before the tables go away,
+    // and before the ASID can be handed to a new space. Broadcast: the space
+    // may have run on another CPU earlier.
+    invalidate_asid(asid);
     let retired = PAGE_TABLE_FRAMES.lock().retire_space(space);
     let tokens = match retired {
         SpaceRetire::Retired(tokens) => tokens,
@@ -1622,6 +1750,9 @@ fn destroy_task_space_inner(
         }
         complete = false;
     }
+    // The space is retired and its ASID was invalidated above, so the value is
+    // safe to reissue even if a frame-accounting anomaly kept `complete` false.
+    release_asid(asid);
     complete
 }
 
@@ -1635,8 +1766,9 @@ pub fn user_page_is_mapped(ttbr0: usize, virtual_address: usize) -> bool {
     if l2_index >= ENTRIES {
         return false;
     }
+    let root = root_of(ttbr0);
     unsafe {
-        let l1_user = follow_table(ttbr0, 0);
+        let l1_user = follow_table(root, 0);
         let l2_user = follow_table(l1_user, 1);
         let l2_entry = read_entry(l2_user, l2_index);
         if l2_entry & DESC_TABLE != DESC_TABLE {
@@ -1675,11 +1807,11 @@ pub fn run_self_test() -> bool {
     let gone = mapped && !user_page_is_mapped(root, va);
 
     frame_allocator::free_page_tagged(data, data_generation);
-    let space_released = destroy_task_space(space, private, private_generation);
+    let space_released = destroy_task_space(space, private, private_generation, asid_of(root));
     // Stale/double teardown: the registry record is gone, so this must fail
     // without freeing anything else. Quiet: this refusal is the expected
     // result, not a fault.
-    let stale_refused = !destroy_task_space_inner(space, 0, 0, false);
+    let stale_refused = !destroy_task_space_inner(space, 0, 0, asid_of(root), false);
 
     mapped && partial_refused && still_mapped && unmapped && gone && space_released && stale_refused
 }
@@ -1761,9 +1893,103 @@ pub fn run_tlb_self_test() -> bool {
         safe_to_free &= frame_allocator::free_page_tagged(first, first_generation);
         safe_to_free &= frame_allocator::free_page_tagged(second, second_generation);
     }
-    let released = destroy_task_space(space, private, private_generation);
+    let released = destroy_task_space(space, private, private_generation, asid_of(root));
 
     first_read == FIRST_VALUE && second_read == SECOND_VALUE && safe_to_free && released
+}
+
+/// Boot-time proof that two address spaces are isolated by their ASID tag:
+/// both map the same VA to different frames, and switching between them
+/// **without any TLB invalidation** must return each space's own value. This
+/// is exactly the property that lets [`switch_address_space`] skip the
+/// domain-wide flush; without ASIDs the second read would keep the first
+/// space's stale translation.
+pub fn run_asid_self_test() -> bool {
+    const VALUE_A: u64 = 0x4153_4944_0000_0001;
+    const VALUE_B: u64 = 0x4153_4944_0000_0002;
+
+    let Some((private_a, private_generation_a)) = frame_allocator::alloc_page_tagged() else {
+        return false;
+    };
+    let Some((private_b, private_generation_b)) = frame_allocator::alloc_page_tagged() else {
+        frame_allocator::free_page_tagged(private_a, private_generation_a);
+        return false;
+    };
+    let Some((frame_a, frame_generation_a)) = frame_allocator::alloc_page_tagged() else {
+        frame_allocator::free_page_tagged(private_b, private_generation_b);
+        frame_allocator::free_page_tagged(private_a, private_generation_a);
+        return false;
+    };
+    let Some((frame_b, frame_generation_b)) = frame_allocator::alloc_page_tagged() else {
+        frame_allocator::free_page_tagged(frame_a, frame_generation_a);
+        frame_allocator::free_page_tagged(private_b, private_generation_b);
+        frame_allocator::free_page_tagged(private_a, private_generation_a);
+        return false;
+    };
+
+    let Some((space_a, token_a)) = create_task_space(private_a, 0, None) else {
+        frame_allocator::free_page_tagged(frame_b, frame_generation_b);
+        frame_allocator::free_page_tagged(frame_a, frame_generation_a);
+        frame_allocator::free_page_tagged(private_b, private_generation_b);
+        frame_allocator::free_page_tagged(private_a, private_generation_a);
+        return false;
+    };
+    let Some((space_b, token_b)) = create_task_space(private_b, 0, None) else {
+        destroy_task_space(token_a, private_a, private_generation_a, asid_of(space_a));
+        frame_allocator::free_page_tagged(frame_b, frame_generation_b);
+        frame_allocator::free_page_tagged(frame_a, frame_generation_a);
+        frame_allocator::free_page_tagged(private_b, private_generation_b);
+        return false;
+    };
+
+    let va = USER_MMAP_VA;
+    let mapped = map_user_pages_at(space_a, va, frame_a, 1, PROT_WRITE)
+        && map_user_pages_at(space_b, va, frame_b, 1, PROT_WRITE);
+    let distinct_asids =
+        asid_of(space_a) != 0 && asid_of(space_b) != 0 && asid_of(space_a) != asid_of(space_b);
+
+    if mapped {
+        unsafe {
+            (phys_to_virt(frame_a) as *mut u64).write_volatile(VALUE_A);
+            (phys_to_virt(frame_b) as *mut u64).write_volatile(VALUE_B);
+        }
+        clean_range_to_poc(frame_a, GRANULE);
+        clean_range_to_poc(frame_b, GRANULE);
+    }
+
+    // The test switches the running PE's own TTBR0. IRQs stay masked: a
+    // handler that touched user memory would see a scratch space.
+    let saved_daif = crate::interrupts::save_and_disable_irq();
+    let previous = current_ttbr0();
+    let mut read_a1 = 0_u64;
+    let mut read_b = 0_u64;
+    let mut read_a2 = 0_u64;
+    if mapped {
+        switch_address_space(space_a);
+        read_a1 = unsafe { (va as *const u64).read_volatile() };
+        // Deliberately no flush between these switches.
+        switch_address_space(space_b);
+        read_b = unsafe { (va as *const u64).read_volatile() };
+        switch_address_space(space_a);
+        read_a2 = unsafe { (va as *const u64).read_volatile() };
+    }
+    switch_address_space(previous);
+    crate::interrupts::restore_irq(saved_daif);
+
+    unmap_user_pages_at(space_a, va, 1);
+    unmap_user_pages_at(space_b, va, 1);
+    let released = destroy_task_space(token_a, private_a, private_generation_a, asid_of(space_a))
+        & destroy_task_space(token_b, private_b, private_generation_b, asid_of(space_b));
+    let freed = frame_allocator::free_page_tagged(frame_a, frame_generation_a)
+        & frame_allocator::free_page_tagged(frame_b, frame_generation_b);
+
+    distinct_asids
+        && mapped
+        && read_a1 == VALUE_A
+        && read_b == VALUE_B
+        && read_a2 == VALUE_A
+        && released
+        && freed
 }
 
 /// Reads the TTBR0 value installed on this CPU (used only by the boot TLB
@@ -1823,15 +2049,15 @@ pub fn ap_enable(ap_ttbr0: usize) {
 
 /// Switches only the user half. The executing high-half kernel code and its
 /// stack remain visible through TTBR1_EL1 for every task.
+///
+/// No TLB invalidation is needed: every space carries a unique ASID in
+/// `TTBR0_EL1[63:48]`, so the old space's entries stay tagged and valid while
+/// the new space's entries are selected by the new ASID. An ASID is only
+/// reused after [`invalidate_asid`] broadcast-invalidated it on destroy.
 pub fn switch_address_space(ttbr0: usize) {
     unsafe {
         core::arch::asm!(
             "msr ttbr0_el1, {ttbr}",
-            // IS scope: other CPUs do not use this address space, but the
-            // broadcast is cheap and keeps every invalidation in the kernel
-            // domain-wide by contract.
-            "tlbi vmalle1is",
-            "dsb ish",
             "isb",
             ttbr = in(reg) ttbr0 as u64,
             options(nostack),

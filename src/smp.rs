@@ -876,7 +876,7 @@ pub fn boot_secondary_cpus() {
         if !crate::mmu::install_ap_identity(ttbr0) {
             // No AP was started, so the freshly built space is not running
             // anywhere and can be torn down without the quiescence gate.
-            crate::mmu::destroy_task_space(space_token, private, private_generation);
+            crate::mmu::destroy_task_space(space_token, private, private_generation, crate::mmu::asid_of(ttbr0));
             crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: no AP identity map for CPU");
             crate::console::write_dec_u64(cpu as u64);
@@ -921,7 +921,7 @@ pub fn boot_secondary_cpus() {
         let params_pa = crate::memory::virt_to_phys(params_va);
         crate::mmu::clean_range_to_poc(params_va, core::mem::size_of::<ApBootParams>());
         crate::mmu::clean_range_to_poc(
-            crate::memory::phys_to_virt(ttbr0),
+            crate::memory::phys_to_virt(crate::mmu::root_of(ttbr0)),
             crate::memory::PAGE_SIZE,
         );
 
@@ -940,7 +940,7 @@ pub fn boot_secondary_cpus() {
             // them, and keep probing the remaining slots: a QEMU machine with
             // fewer CPUs than `MAX_CPUS` simply reports every missing slot as
             // offline instead of aborting the whole bring-up.
-            crate::mmu::destroy_task_space(space_token, private, private_generation);
+            crate::mmu::destroy_task_space(space_token, private, private_generation, crate::mmu::asid_of(ttbr0));
             crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: CPU_ON failed, CPU left offline\r\n");
             continue;
@@ -1129,7 +1129,7 @@ impl TlbProbeScratch {
         let mut frames = [(0usize, 0u32); 2];
         for slot in &mut frames {
             let Some((frame, generation)) = crate::frame_allocator::alloc_page_tagged() else {
-                crate::mmu::destroy_task_space(token, private, private_generation);
+                crate::mmu::destroy_task_space(token, private, private_generation, crate::mmu::asid_of(ttbr0));
                 for &(frame, generation) in frames.iter() {
                     // Generation 0 means "slot never filled".
                     if generation != 0 {
@@ -1155,7 +1155,7 @@ impl Drop for TlbProbeScratch {
     fn drop(&mut self) {
         // Every peer acknowledged phase B only after restoring its own TTBR0,
         // so no online CPU can still be walking these tables.
-        crate::mmu::destroy_task_space(self.token, self.private, self.private_generation);
+        crate::mmu::destroy_task_space(self.token, self.private, self.private_generation, crate::mmu::asid_of(self.ttbr0));
         for &(frame, generation) in self.frames.iter() {
             crate::frame_allocator::free_page_tagged(frame, generation);
         }

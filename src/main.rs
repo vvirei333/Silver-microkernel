@@ -1366,6 +1366,15 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::log("MMU TLB OK");
     ram_log::fb_progress();
 
+    // ASID isolation: two spaces map the same VA to different frames; two
+    // switches without any flush must still return each space's own value.
+    if !mmu::run_asid_self_test() {
+        exceptions::silver_handle_exception(9, 0, 0, 0);
+    }
+    console::write_str("MMU ASID OK\r\n");
+    ram_log::log("MMU ASID OK");
+    ram_log::fb_progress();
+
     // DMA quarantine window: a released run must survive the grace passes and
     // then return to the frame allocator.
     if !scheduler::run_dma_quarantine_self_test() {

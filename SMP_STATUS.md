@@ -244,7 +244,7 @@ DMA leak, and `-smp 2` still reports one peer.
 | 3. Аллокаторы | frame allocator `STATE` → `SpinLock`; `PageTableRegistry` → `SpinLock` | написано |
 | 4. Синхро-примитивы | Mutex/WaitQueue под kernel lock, `bkl_assert_held()` в точках мутации, дока обновлена | написано |
 | 5. IRQ/таймер | gic: `init`/`cpu_init` разделены (banked SGI0+PPI30 в `cpu_init`), `send_sgi_all_but_self` (GICD_SGIR); gicv3: **поиск redistributor по `GICR_TYPER`**, ICC_SGI1R; таймер per-CPU (`cpu_init`), глобальный `TICKS` инкрементирует только CPU0 | написано |
-| 6. TLB | `tlbi vmalle1is` + `dsb ish` в `flush_after_table_change`/`switch_address_space`/`configure_and_enable`; протокол задокументирован в доке; батчевая публикация (`finish_table_changes`, один shootdown на map/heap-growth); cross-PE probe доказывает, что broadcast доходит до второго PE | написано, cross-PE проверено на QEMU `-smp 4` |
+| 6. TLB | per-space ASID (`1..=255`, 8-bit) в `TTBR0[63:48]`; `switch_address_space` только `msr`+`isb`; правка PTE — `tlbi aside1is` по ASID; создание/AP-identity — `vmalle1is`; батчевая публикация (`finish_table_changes_for`); cross-PE probe доказывает, что ASID-scoped broadcast доходит до второго PE; boot-тест ASID-изоляции | написано, проверено на QEMU `-smp 4` |
 | 7. AP-boot | PSCI `CPU_ON` (HVC, `0xC4000003`), physical trampoline, `ApBootParams`, FP/SIMD + MMU enable, `boot_secondary_cpus()` from the first `schedule()` | работает на QEMU `-smp 2` и `-smp 4` |
 | 8. Shared DMA | под BKL: создание маппингов (syscall) и revoke/teardown взаимоисключены; fail-safe leak сохранён | написано |
 | 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer + проверка `running_on`/`current_index` на каждом проходе; `demo-tasks,smp-selftest` — 69 PASS / 0 PANIC / 0 invariant FAIL; boot-самотесты MMU TLB и DMA quarantine | написано, негативные тесты подтверждены |
@@ -337,6 +337,14 @@ DMA leak, and `-smp 2` still reports one peer.
    non-broadcast flush on a *different* PE.
    Table publication is now batched (`finish_table_changes`, one shootdown per
    map/heap-growth call) in the XNU `pmap` "edit the range, flush once" style.
+   *ASID follow-up:* every space now owns a unique ASID in `TTBR0[63:48]`.
+   `switch_address_space` writes TTBR0 and executes `isb` only — no
+   domain-wide flush on a context switch — and a PTE edit uses
+   `tlbi aside1is` for the edited ASID (still a broadcast within the
+   inner-shareable domain). `destroy_task_space` invalidates the ASID before
+   the tables are retired and returns it to a 255-entry live bitmap. A boot
+   test maps the same VA in two spaces and switches between them without a
+   flush; dropping the tag makes it fail closed.
 2. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
    DMA revoke while a client runs, and page-table teardown under load. The
    `demo-tasks` suite passes on `-smp 2` and `-smp 4` (66 PASS, 0 PANIC);
@@ -429,8 +437,11 @@ DMA leak, and `-smp 2` still reports one peer.
   scheduling invariant violated`.
 - Forced AP GIC failure (temporary build-only patch): CPU1 stays offline,
   prints `AP GIC unavailable`, and the system still reaches `howl>`.
-- Boot self-tests: `MMU TLB OK` (TTBR0 remap proof) and `DMA QUARANTINE OK`
-  (grace-window proof) run on every boot; removing the `tlbi` in
-  `flush_after_table_change` makes the TLB test stop the boot with exception 9.
+- Boot self-tests: `MMU TLB OK` (TTBR0 remap proof), `MMU ASID OK` (two spaces,
+  same VA, switched without a flush, each read returns its own frame) and
+  `DMA QUARANTINE OK` (grace-window proof) run on every boot. Removing the
+  `tlbi` in `flush_after_table_change` makes the TLB test stop the boot with
+  exception 9; dropping the ASID tag from `tagged_ttbr0` makes the ASID test
+  stop the boot with exception 9.
 - `no_std,fog` / `no_std,tablet`: build; fog QEMU integration PASS.
 - Physical SMP: **not verified**; fog/tablet remain single-core.
