@@ -411,6 +411,11 @@ pub fn bkl_acquire() {
             break;
         }
         spins += 1;
+        // This PE is masked and parked on the lock by design; `BKL STUCK`
+        // below owns the diagnostic. The stall watchdog must not double-report
+        // a bounded wait as a dead CPU.
+        #[cfg(feature = "smp")]
+        crate::watchdog::set_bkl_waiting(cpu.cpu_id as usize, true);
         if spins == 50_000_000 {
             let owner = KERNEL_LOCK.owner.load(Ordering::Relaxed);
             crate::console::write_str("BKL STUCK: owner=");
@@ -432,6 +437,8 @@ pub fn bkl_acquire() {
         }
     }
     *depth = 1;
+    #[cfg(feature = "smp")]
+    crate::watchdog::set_bkl_waiting(cpu.cpu_id as usize, false);
     interrupts::restore_irq(saved_daif);
 }
 
@@ -907,7 +914,9 @@ extern "C" fn smp_ap_main() -> ! {
     ap_tlb_probe_wait();
 
     // Same contract as the boot CPU: kernel tasks run with IRQs enabled and
-    // pick up work through the scheduler.
+    // pick up work through the scheduler. Publish to the stall watchdog first:
+    // a PE parked in `ap_tlb_probe_wait` must not be judged as hung.
+    crate::watchdog::cpu_started(this_cpu_id());
     interrupts::enable_irq();
     loop {
         crate::scheduler::schedule();
@@ -1044,10 +1053,18 @@ pub fn boot_secondary_cpus() {
         // task, which is exactly the window the remap sentinel test needs.
         // Wait for them to publish `online` first (they park right after it).
         let _ = wait_for_online_peers();
+        // Pure decision policy, linked into the kernel.
+        crate::watchdog::run_policy_selftest();
         crate::scheduler::run_remap_sentinel_selftest();
+        // Proves the ready queues are FIFO: a stack-shaped queue would starve
+        // the oldest of three runnable tasks forever.
+        crate::scheduler::run_ready_queue_selftest();
         // The peers are parked in `ap_tlb_probe_wait` right now, so the
         // cross-PE TLB proof must run before the stop-the-world rounds.
         run_cross_pe_tlb_probe();
+        // The APs are in their scheduler loops once the TLB probe completes,
+        // so every watched CPU must be taking its timer PPI now.
+        crate::watchdog::run_heartbeat_selftest();
         run_quiesce_selftest();
         run_clock_selftest();
         // Last: spawn short-lived tasks and let the APs run/reap them while
@@ -1055,7 +1072,12 @@ pub fn boot_secondary_cpus() {
         // currently exposes an intermittent scheduler-index race, so it must
         // not run in the normal selftest profile.
         #[cfg(feature = "smp-churn")]
-        crate::scheduler::run_smp_churn_selftest();
+        {
+            crate::scheduler::run_smp_churn_selftest();
+            // Negative test: a task that really spins with IRQs masked must be
+            // reported by the monitor on another PE.
+            crate::scheduler::run_stall_selftest();
+        }
     }
 }
 

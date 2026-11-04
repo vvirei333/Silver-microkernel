@@ -1,6 +1,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
+use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
 
@@ -233,9 +234,13 @@ pub struct TaskManager {
     /// a missed enqueue can delay a task but never strand it. Idle tasks stay
     /// out of the queues so the "real task before idle" policy is unchanged.
     ///
+    /// FIFO is a correctness property, not a hint: with a stack-shaped queue
+    /// (push/pop) and three or more runnable tasks, the oldest entry was never
+    /// dispatched. Push at the back, pop at the front.
+    ///
     /// Indices are invalidated by any `tasks.remove`/`retain`; those paths
     /// rebuild every queue (see [`rebuild_ready_queues`]).
-    ready: [Vec<(u64, usize)>; smp::MAX_CPUS],
+    ready: [VecDeque<(u64, usize)>; smp::MAX_CPUS],
 }
 
 const TRACE_LEN: usize = 16;
@@ -661,6 +666,106 @@ pub fn run_smp_churn_selftest() -> bool {
     ok
 }
 
+/// Opt-in negative test for the stall watchdog: this task masks IRQs and
+/// spins for longer than the watchdog grace window, exactly like a PE that
+/// hangs in a non-scheduling loop. It then unmasks, yields and exits.
+#[cfg(all(feature = "smp", feature = "smp-churn"))]
+extern "C" fn stall_probe_task() -> ! {
+    crate::interrupts::save_and_disable_irq();
+    let start = crate::timer::ticks();
+    // 120 ticks = 1.2 s at 100 Hz: three 250 ms check rounds plus margin.
+    while crate::timer::ticks().saturating_sub(start) < 120 {
+        core::hint::spin_loop();
+    }
+    crate::interrupts::enable_irq();
+    yield_current();
+    exit_current()
+}
+
+/// Proves the monitor end to end: spawn a kernel task that masks IRQs and
+/// spins, let an AP pick it, and require another PE to report the stall. The
+/// probe is retired afterwards and the boot continues.
+#[cfg(all(feature = "smp", feature = "smp-churn"))]
+pub fn run_stall_selftest() -> bool {
+    if smp::online_cpu_count() < 2 {
+        return true;
+    }
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    const STALL_PROBE_ID: u64 = 1 << 44;
+    let saved_next = manager.next_id;
+    manager.next_id = STALL_PROBE_ID;
+    let probe = spawn_kernel(stall_probe_task);
+    manager.next_id = saved_next;
+    let Some(id) = probe else {
+        return false;
+    };
+    if let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) {
+        // A diagnostic probe must never take the demo console.
+        task.owns_console = false;
+    }
+    crate::watchdog::reset_for_test();
+
+    // Release the BKL so an AP can dispatch the probe, and keep our own IRQs
+    // enabled so this CPU runs its own check rounds.
+    smp::bkl_release();
+    interrupts::enable_irq();
+    let detect_deadline = timer::ticks().saturating_add(200);
+    while crate::watchdog::stall_count() == 0 && timer::ticks() < detect_deadline {
+        core::hint::spin_loop();
+    }
+    let reported = crate::watchdog::stall_count() > 0;
+
+    // The probe stops masking on its own; give it time to yield and exit.
+    let cleanup_deadline = timer::ticks().saturating_add(100);
+    while timer::ticks() < cleanup_deadline {
+        core::hint::spin_loop();
+    }
+    interrupts::save_and_disable_irq();
+    smp::bkl_acquire();
+
+    let mut pending = true;
+    for _ in 0..64 {
+        reap_dead_tasks(manager);
+        pending = manager
+            .tasks
+            .iter()
+            .any(|task| task.id == id && task.state != TaskState::Zombie);
+        if !pending {
+            break;
+        }
+        smp::bkl_release();
+        interrupts::enable_irq();
+        for _ in 0..100_000 {
+            core::hint::spin_loop();
+        }
+        interrupts::save_and_disable_irq();
+        smp::bkl_acquire();
+    }
+    if let Some(index) = manager
+        .tasks
+        .iter()
+        .position(|task| task.id == id && task.state == TaskState::Zombie)
+    {
+        take_zombie(manager, index);
+    }
+    let cleaned = manager.tasks.iter().all(|task| task.id != id);
+    let ok = reported && cleaned && !pending;
+    if ok {
+        console::write_str("SMP SELFTEST: watchdog stall PASS (masked-IRQ probe detected)\r\n");
+    } else {
+        console::write_str("SMP SELFTEST: watchdog stall FAIL (reported=");
+        console::write_dec_u64(reported as u64);
+        console::write_str(" cleaned=");
+        console::write_dec_u64(cleaned as u64);
+        console::write_str(" pending=");
+        console::write_dec_u64(pending as u64);
+        console::write_str(")\r\n");
+    }
+    ok
+}
+
 /// Frees quarantined runs whose grace window has elapsed. Runs with the kernel
 /// lock held from `reap_dead_tasks`; the frame-allocator lock is taken only
 /// after the quarantine lock has been released, so no inner-lock ordering
@@ -762,7 +867,7 @@ pub fn init() {
         tasks: Vec::new(),
         next_id: 0,
         console_parent: None,
-        ready: core::array::from_fn(|_| Vec::new()),
+        ready: core::array::from_fn(|_| VecDeque::new()),
     });
 
     let _idle_id = spawn_idle(None);
@@ -865,7 +970,7 @@ pub fn init_fog() {
         tasks: Vec::new(),
         next_id: 0,
         console_parent: None,
-        ready: core::array::from_fn(|_| Vec::new()),
+        ready: core::array::from_fn(|_| VecDeque::new()),
     });
 
     let _idle_id = spawn_idle(None);
@@ -908,6 +1013,98 @@ pub fn run_console_cap_selftest() -> bool {
     let denied = initial_self_rights(user_program::BLOCK_DRIVER)
         .is_some_and(|rights| rights & capability::CAP_CONSOLE_GRANT == 0);
     allowed && denied
+}
+
+/// Proves the ready queue is FIFO, not a stack. Three probes are spawned in
+/// order and every queue is drained: the probes must appear in spawn order.
+/// The old `Vec` + `pop()` pair dispatched the newest entry first, so with
+/// three or more runnable tasks the oldest one was never dispatched at all.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+extern "C" fn ready_queue_probe_task() -> ! {
+    exit_current()
+}
+
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn run_ready_queue_selftest() -> bool {
+    const PROBE_BASE: u64 = 1 << 43;
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    let saved_next = manager.next_id;
+    let mut ids = [0u64; 3];
+    let mut spawned = 0usize;
+    for (offset, slot) in ids.iter_mut().enumerate() {
+        // Explicit ids keep `next_id` untouched: user-space spawn logic
+        // assumes task ids and per-task cap-handle ids advance in lockstep.
+        manager.next_id = PROBE_BASE + offset as u64;
+        let Some(id) = spawn_kernel(ready_queue_probe_task) else {
+            break;
+        };
+        *slot = id;
+        spawned += 1;
+    }
+    manager.next_id = saved_next;
+
+    // Pop every queue through the real `dequeue_ready` path (not `drain`,
+    // which always walks front to back and would hide a stack-shaped queue),
+    // record the dispatch order, then restore the snapshot.
+    let mut seen = [usize::MAX; 3];
+    let mut duplicates = false;
+    let mut position = 0usize;
+    for cpu in 0..smp::MAX_CPUS {
+        let snapshot: Vec<(u64, usize)> = manager.ready[cpu].iter().copied().collect();
+        while let Some(index) = dequeue_ready(manager, cpu) {
+            let id = manager.tasks[index].id;
+            if let Some(slot) = ids[..spawned].iter().position(|probe| *probe == id) {
+                if seen[slot] != usize::MAX {
+                    duplicates = true;
+                }
+                seen[slot] = position;
+            }
+            position += 1;
+        }
+        manager.ready[cpu].clear();
+        manager.ready[cpu].extend(snapshot);
+    }
+
+    let ordered = spawned == 3
+        && !duplicates
+        && seen.iter().all(|&slot| slot != usize::MAX)
+        && seen.windows(2).all(|pair| pair[0] < pair[1]);
+
+    // The probes never ran; retire them exactly like a task that died before
+    // its first dispatch (reap, then remove the zombie record).
+    for &id in &ids[..spawned] {
+        if let Some(index) = manager.tasks.iter().position(|task| task.id == id) {
+            manager.tasks[index].state = TaskState::Dead;
+            manager.tasks[index].running_on = None;
+        }
+    }
+    reap_dead_tasks(manager);
+    for &id in &ids[..spawned] {
+        if let Some(index) = manager
+            .tasks
+            .iter()
+            .position(|task| task.id == id && task.state == TaskState::Zombie)
+        {
+            take_zombie(manager, index);
+        }
+    }
+
+    if ordered {
+        console::write_str("SMP SELFTEST: ready fifo PASS (3 probes in spawn order)\r\n");
+    } else {
+        console::write_str("SMP SELFTEST: ready fifo FAIL (spawned=");
+        console::write_dec_u64(spawned as u64);
+        console::write_str(" positions=");
+        console::write_dec_u64(seen[0] as u64);
+        console::write_str(",");
+        console::write_dec_u64(seen[1] as u64);
+        console::write_str(",");
+        console::write_dec_u64(seen[2] as u64);
+        console::write_str(")\r\n");
+    }
+    ordered
 }
 
 /// Runs one blocking scheduling step for a caller that does not necessarily
@@ -1996,6 +2193,8 @@ pub fn start() -> ! {
     first_task.running_on = Some(0);
     #[cfg(all(feature = "smp", feature = "smp-selftest"))]
     SCHEDULER_STARTED.store(true, Ordering::Release);
+    #[cfg(feature = "smp")]
+    crate::watchdog::cpu_started(0);
     trace_switch(
         0,
         first_task.id,
@@ -2060,6 +2259,8 @@ pub fn schedule() {
     // alone is not a complete guard). The mask is dropped again only after
     // the kernel lock has been released, right before returning or resuming.
     let pass_cpu = smp::this_cpu_id();
+    #[cfg(feature = "smp")]
+    crate::watchdog::note_progress(pass_cpu);
     if SCHED_PASS_ACTIVE[pass_cpu].swap(true, Ordering::AcqRel) {
         return;
     }
@@ -2701,7 +2902,9 @@ fn enqueue_ready(manager: &mut TaskManager, cpu: usize, index: usize) {
         .iter()
         .any(|&(queued_id, queued_index)| queued_index == index && queued_id == id)
     {
-        manager.ready[cpu].push((id, index));
+        // Back of the queue: newest last, so the oldest runnable task is the
+        // next one dispatched.
+        manager.ready[cpu].push_back((id, index));
     }
 }
 
@@ -2710,7 +2913,7 @@ fn enqueue_ready(manager: &mut TaskManager, cpu: usize, index: usize) {
 /// whose index was shifted by a removal (the stored id no longer matches).
 fn dequeue_ready(manager: &mut TaskManager, cpu: usize) -> Option<usize> {
     let cpu = cpu.min(smp::MAX_CPUS - 1);
-    while let Some((id, index)) = manager.ready[cpu].pop() {
+    while let Some((id, index)) = manager.ready[cpu].pop_front() {
         let same_task = manager
             .tasks
             .get(index)
@@ -2738,7 +2941,7 @@ fn rebuild_ready_queues(manager: &mut TaskManager) {
         let task = &tasks[index];
         if !task.is_idle && task.state == TaskState::Ready && task.running_on.is_none() {
             let cpu = index % cpus;
-            ready[cpu].push((task.id, index));
+            ready[cpu].push_back((task.id, index));
         }
     }
 }

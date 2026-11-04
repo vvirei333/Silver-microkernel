@@ -78,6 +78,8 @@ mod timer;
 mod user_memory;
 #[cfg(not(feature = "std"))]
 mod user_program;
+#[cfg(all(not(feature = "std"), feature = "smp"))]
+mod watchdog;
 #[cfg(not(feature = "std"))]
 mod vfs;
 #[cfg(not(feature = "std"))]

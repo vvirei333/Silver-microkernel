@@ -20,9 +20,8 @@ static CPU_TICKS: [AtomicU64; crate::smp::MAX_CPUS] = [
     AtomicU64::new(0),
 ];
 
-/// Ticks observed on `cpu` (0 when the index is out of range). Only the
-/// `smp-selftest` liveness check consumes this.
-#[cfg(feature = "smp-selftest")]
+/// Ticks observed on `cpu` (0 when the index is out of range). The stall
+/// watchdog and the `smp-selftest` liveness check consume this.
 pub fn cpu_ticks(cpu: usize) -> u64 {
     CPU_TICKS
         .get(cpu)
@@ -97,6 +96,8 @@ pub fn handle_irq() {
     }
     crate::smp::probe(21);
     crate::smp::TICK_PROBE.bump();
+    #[cfg(feature = "smp")]
+    crate::watchdog::on_timer_tick(cpu);
     rearm();
 }
 

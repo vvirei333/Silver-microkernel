@@ -16,6 +16,7 @@ pub mod phys_range;
 pub mod reloc;
 pub mod table_registry;
 pub mod wait_queue;
+pub mod watchdog_policy;
 
 use alloc::vec::Vec;
 
