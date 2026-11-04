@@ -3,7 +3,7 @@
 > **Current project status (2026-11-04):** this file remains the authoritative
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
-> test suite is now **142/142**; the 13/13 figure below is the checkpoint from
+> test suite is now **156/156**; the 13/13 figure below is the checkpoint from
 > the earlier SMP session.
 >
 > **Phases 1–2 are implemented as the opt-in `smp` feature (QEMU only).**
@@ -21,6 +21,47 @@
 > and DMA revoke have not yet proven that no CPU can hold a translation for a
 > space being freed. Keep kill/reap-under-load and physical SMP in the
 > unproven column.
+
+## 2026-11-05 — FIFO ready queues and per-CPU stall watchdog
+
+Two scheduler/SMP packages landed in `35c44b4`, on top of the reservation fix
+`a8e948e` and the audit round `af23b29`.
+
+- **Ready queues are FIFO.** `TaskManager.ready` was declared FIFO but was a
+  `Vec` popped from the back, i.e. a stack: with three or more runnable tasks
+  the oldest entry was never dispatched (`A,B,C` ran `C,B,C,B,...` and `A`
+  starved until it blocked). It is now a `VecDeque` with
+  `push_back`/`pop_front`. `run_ready_queue_selftest` spawns three probes with
+  explicit ids (`next_id` saved/restored), pops them through the real
+  `dequeue_ready`, restores the queue snapshot and requires spawn order:
+  `SMP SELFTEST: ready fifo PASS (3 probes in spawn order)`. Switching the
+  pop back to `pop_back` reports `positions=2,1,0` and fails the boot, so the
+  test is a real regression guard.
+- **Per-CPU stall watchdog.** A PE that has entered the scheduler loop must
+  take its timer PPI or complete a scheduling pass every 250 ms check round.
+  Three consecutive rounds without progress make any other PE print
+  `WATCHDOG: CPU<n> stalled (beats=... index=... rounds=3)` once per episode;
+  it does not panic, because a long IRQ mask can recover. The decision lives
+  in the host-tested `silver_microkernel::watchdog_policy`. Exemptions: PEs
+  that have not called `cpu_started` (AP bring-up, `ap_tlb_probe_wait`), a
+  stop-the-world quiesce (all grace windows are rebased), and a CPU parked in
+  `bkl_acquire` (`BKL STUCK` owns that condition).
+- **Evidence.** `-smp 4` selftest: `WATCHDOG: policy PASS`,
+  `WATCHDOG: heartbeat PASS (4 CPU(s) ticking)`, `ready fifo PASS`, plus the
+  existing `tlb cross-PE`, `quiesce` (64 rounds), `ticks` and `clock` PASS
+  lines. Combined `demo-tasks,smp-selftest` is **74 PASS / 0 FAIL / 0 PANIC**
+  with no invariant failure.
+- **Negative test (opt-in `smp-churn`).** A kernel task masks IRQs and spins
+  for 1.2 s; an AP picks it up and another PE reports it
+  (`WATCHDOG: CPU3 stalled (beats=32 index=20 rounds=3)` — the index is the
+  probe task), then the task is retired (`watchdog stall PASS`). The stall is
+  detected on different APs across runs (CPU1 and CPU3 observed). Disabling
+  the check call turns the result into
+  `watchdog stall FAIL (reported=0 cleaned=1 pending=0)`.
+- **Coverage limits.** QEMU only; no physical-SMP run of this HEAD. The
+  watchdog detects a PE that stops making scheduler/timer progress; it does
+  not prove device quiescence, and it deliberately does not report a bounded
+  BKL wait.
 
 ## CHECKPOINT (финальные проверки)
 
@@ -247,7 +288,7 @@ DMA leak, and `-smp 2` still reports one peer.
 | 6. TLB | per-space ASID (`1..=255`, 8-bit) в `TTBR0[63:48]`; `switch_address_space` только `msr`+`isb`; правка PTE — `tlbi aside1is` по ASID; создание/AP-identity — `vmalle1is`; батчевая публикация (`finish_table_changes_for`); cross-PE probe доказывает, что ASID-scoped broadcast доходит до второго PE; boot-тест ASID-изоляции | написано, проверено на QEMU `-smp 4` |
 | 7. AP-boot | PSCI `CPU_ON` (HVC, `0xC4000003`), physical trampoline, `ApBootParams`, FP/SIMD + MMU enable, `boot_secondary_cpus()` from the first `schedule()` | работает на QEMU `-smp 2` и `-smp 4` |
 | 8. Shared DMA | под BKL: создание маппингов (syscall) и revoke/teardown взаимоисключены; fail-safe leak сохранён; `DmaLease` in-flight gate: диапазон с живым lease не освобождается | написано, boot-тест `DMA LEASE` |
-| 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer + проверка `running_on`/`current_index` на каждом проходе; `demo-tasks,smp-selftest` — 70 PASS / 0 PANIC / 0 invariant FAIL; boot-самотесты MMU TLB и DMA quarantine | написано, негативные тесты подтверждены |
+| 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer + проверка `running_on`/`current_index` на каждом проходе + FIFO-порядок очередей + stall-watchdog policy/heartbeat; `demo-tasks,smp-selftest` — 74 PASS / 0 PANIC / 0 invariant FAIL; boot-самотесты MMU TLB, MMU HEAP, DMA ZERO, UART RING, CONSOLE CAP и DMA quarantine | написано, негативные тесты подтверждены |
 
 ## Найдено и исправлено попутно (реальные баги)
 
@@ -427,7 +468,7 @@ DMA leak, and `-smp 2` still reports one peer.
 
 ## Проверки на текущем состоянии
 
-- `cargo test --lib`: **142/142**.
+- `cargo test --lib`: **156/156**.
 - Default `no_std` build, QEMU `-smp 4`: single-core, reaches `howl>`.
 - `no_std,smp` build, QEMU `-smp 4`: CPU1–CPU3 online (GIC/timer/IPI), all
   four CPUs execute tasks; `howl ready`/prompt and `ps` work.
@@ -442,11 +483,13 @@ DMA leak, and `-smp 2` still reports one peer.
   Negative build (broadcast `tlbi vmalle1is` replaced by local `tlbi vmalle1`
   in `finish_table_changes`): `tlb cross-PE FAIL (3 CPU(s) kept the stale
   translation)` while quiesce/ticks still pass.
-- `no_std,smp,demo-tasks,smp-selftest`, QEMU `-smp 4`: **70 PASS / 0 FAIL /
-  0 PANIC** with zero `sched invariant FAIL`; the extra three PASS are the
-  selftest lines. The dispatch-mix line reports the per-CPU queues doing the
-  work (`ready queues local=35 steal=29 scan=0`; selftest-only reports more
-  `scan` because idle tasks are deliberately not queued). Negative build
+- `no_std,smp,demo-tasks,smp-selftest`, QEMU `-smp 4`: **74 PASS / 0 FAIL /
+  0 PANIC** with zero `sched invariant FAIL`; the extra PASS lines are the
+  selftest lines (FIFO order, stall-watchdog policy and heartbeat, remap
+  sentinel, cross-PE TLB, quiesce, ticks, clock). The dispatch-mix line reports
+  the per-CPU queues doing the work (`ready queues local=.. steal=.. scan=..`;
+  selftest-only reports more `scan` because idle tasks are deliberately not
+  queued). Negative build
   (queued entry id deliberately corrupted): `sched invariant FAIL (a ready
   queue entry names the wrong task)` followed by `PANIC MSG scheduling
   invariant violated`.

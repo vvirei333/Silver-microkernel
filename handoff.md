@@ -3,16 +3,20 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## CURRENT STATUS (2026-11-04, TASK №23)
+## CURRENT STATUS (2026-11-05, TASK №23)
 
 Checkpoint: package E2, the external audit fixes (`b22e3a0`), the SMP
 hardening (`b2f0e57`, `145ef54`), the quota / DMA-quarantine / TLB-test
-package (`681e64c`) and the four-core bring-up (`ad20630`): owner-aware
-page-table walks, explicit DRAM bounds and a portable cache-line helper;
-fail-closed FDT/region parsing; zeroed DMA publication; serialized PL011 RX;
-GICv3 single-window bound-IRQ dispatch; AP publication gated on a usable
-banked GIC; round-qualified quiescence; and up to four QEMU CPUs with
-per-CPU timer liveness.
+package (`681e64c`), the four-core bring-up (`ad20630`), the audit fix
+round plus honest CPU accounting (`af23b29`), fail-closed FDT reservations
+(`a8e948e`), and FIFO ready queues with a per-CPU stall watchdog
+(`35c44b4`): owner-aware page-table walks, explicit DRAM bounds and a
+portable cache-line helper; fail-closed FDT/region parsing; zeroed DMA
+publication; serialized PL011 RX; GICv3 single-window bound-IRQ dispatch;
+AP publication gated on a usable banked GIC; round-qualified quiescence;
+up to four QEMU CPUs with per-CPU timer liveness; an FDT-sized CPU slot
+count; in-order dispatch; and a monitor that reports a PE which stops
+making progress.
 
 **SMP feature program (2026-11-04):** four packages, in order —
 (1) per-CPU ready queues **[done]**, (2) ASID-tagged address spaces **[done]**,
@@ -156,9 +160,17 @@ depend on four online CPUs.
   removal paths (`take_zombie`, zombie-cap `retain`) rebuild every queue. The
   `smp-selftest` invariant audit also validates queue ids/indices, and a
   one-shot counter line reports the dispatch mix. The combined profile shows
-  the fast path working (`ready queues local=35 steal=29 scan=0`); a debug
+  the fast path working (`ready queues local=.. steal=.. scan=..`); a debug
   build that corrupts a queued id fires `sched invariant FAIL (a ready queue
   entry names the wrong task)`.
+  **FIFO correction (2026-11-05, `35c44b4`):** the queue was a `Vec` with
+  `push` + `pop`, i.e. a stack. With three or more runnable tasks the oldest
+  entry was never dispatched (`A,B,C` ran `C,B,C,B,...` and `A` starved until
+  it blocked). It is now a `VecDeque` with `push_back`/`pop_front`;
+  `run_ready_queue_selftest` pops through the real `dequeue_ready`, requires
+  spawn order, and fails with `positions=2,1,0` when the queue is switched
+  back to `pop_back`. The first version of that test drained the deque
+  directly and would not have caught the bug; the negative run exposed it.
 - **ASID-tagged address spaces (2026-11-04).** `create_task_space` allocates a
   unique ASID (`1..=255`; `TCR_EL1.AS` stays 0, the ARMv8.0 8-bit baseline) and
   tags the returned TTBR0 in bits `[63:48]`. `switch_address_space` now only
@@ -218,28 +230,74 @@ depend on four online CPUs.
   next task:
   `exit_current` drains any remaining depth before its `wfi` loop. Kernel
   tasks no longer print an `EXIT:` line (`program == u64::MAX`). The harness
-  is stable across repeated `-smp 4` runs with the audit active but stays
-  opt-in: `cpu_count()` assumes `MAX_CPUS`, so a machine with fewer online
-  CPUs fails its "N CPUs took part" policy rather than the scheduler.
-- Verified in this snapshot: **146 host tests**, fog QEMU relocation/at-link/
+  is stable with the audit active and, since the online-count policy landed,
+  passes on `-smp 2` as well as `-smp 3`/`-smp 4`. It stays opt-in because it
+  is a stress/injection suite (it also runs the masked-IRQ watchdog probe),
+  not because of a CPU-count assumption.
+- **Audit fix round and honest CPU accounting (2026-11-04, `af23b29`).**
+  Six of seven audit findings were already closed in `b22e3a0`; the round
+  verified each one and added the missing evidence, plus one real fix.
+  `F1`: the per-CPU index snapshot was a compact `Vec` of online CPUs zipped
+  in the remap, so an AP publishing `online` between snapshot and remap
+  shifted every later entry; the snapshot is now keyed by CPU id and a `None`
+  entry (no current task) is skipped. `F2`: the heap L3 descriptor kind is
+  validated before dereference, and a boot test empties the heap through the
+  generic unmap and maps again. `F3`: `map_dma_to_user_space` lets a boot test
+  poison a recycled frame and verify the published frame is zeroed. `F5`:
+  a wraparound/full-drop RX-ring test. `F6`: a policy test proves the console
+  owner holds `CAP_CONSOLE_GRANT` and a plain driver does not. `F7` is below.
+  `F4` was verified in the tablet disassembly. CPU accounting: `Fdt::cpu_count`
+  sizes the slot count from the live tree, `smp::online_cpu_count` is used by
+  policies that must reflect the machine that actually came up, and the churn
+  rule now passes on `-smp 2` as well.
+- **Reservation parsing fails closed (2026-11-04, `a8e948e`).**
+  `memreserve_regions` had already returned `Option`; the `/reserved-memory`
+  child path still turned a malformed or overflowing `reg` into `0`. Both
+  `reserved_regions` and `memreserve_regions` now return `Option<usize>` and
+  `fog::probe` marks the tree truncated on `None`, so the planner never hands
+  out firmware-reserved memory. Host tests cover an overflowing child `reg`, a
+  carve-out list that does not fit, and an oversized memreserve map.
+  `CpuCounter` also counts only direct `/cpus` children.
+- **Per-CPU stall watchdog (2026-11-05, `35c44b4`).** A PE that has entered
+  the scheduler loop must take its timer PPI or complete a scheduling pass
+  every check round. After three consecutive 250 ms rounds without progress,
+  any other PE prints `WATCHDOG: CPU<n> stalled (beats=... index=... rounds=3)`
+  once per episode; it never panics, because a long IRQ mask can recover.
+  The decision is the host-tested `silver_microkernel::watchdog_policy`
+  module. Exemptions keep the signal honest: only PEs that called
+  `cpu_started` are judged (AP bring-up and `ap_tlb_probe_wait` are out), a
+  stop-the-world quiesce rebases every grace window, and a CPU parked in
+  `bkl_acquire` is marked waiting because `BKL STUCK` owns that condition.
+  The boot logs `WATCHDOG: policy PASS` and
+  `WATCHDOG: heartbeat PASS (4 CPU(s) ticking)`. The opt-in `smp-churn`
+  profile adds a real negative test: a kernel task masks IRQs and spins for
+  1.2 s, another PE reports it, and the task is retired
+  (`watchdog stall PASS`). Disabling the check call yields
+  `watchdog stall FAIL (reported=0 ...)`, so the harness is not vacuous.
+- Verified in this snapshot: **156 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
   `no_std,smp` with QEMU `-smp 2` and `-smp 4`, `no_std,smp-selftest` logging
+  `ready fifo PASS (3 probes in spawn order)`,
+  `WATCHDOG: policy PASS`, `WATCHDOG: heartbeat PASS (4 CPU(s) ticking)`,
   `tlb cross-PE PASS (3 peer CPU(s) saw the remap)`,
   `quiesce PASS (64 rounds, 3 peer CPU(s))` and `ticks PASS (3 peer CPU(s))`
   on `-smp 4` (one peer on `-smp 2`), and the combined
-  `no_std,smp,demo-tasks,smp-selftest` profile at **70 PASS / 0 FAIL / 0 PANIC**
-  with zero invariant failures and a `ready queues local=.. steal=.. scan=0`
-  dispatch-mix line, including `clock PASS (CPU0 masked, ticks +1)`. The opt-in
-  `no_std,smp-selftest,smp-churn` profile passed 28 consecutive `-smp 4` runs
-  (`churn PASS`, audit active, no lock underflow or `BKL STUCK`). A negative build that drops the
-  `running_on` claim makes the invariant check fire on the next pass
+  `no_std,smp,demo-tasks,smp-selftest` profile at **74 PASS / 0 FAIL / 0 PANIC**
+  with zero invariant failures and a `ready queues local=.. steal=.. scan=..`
+  dispatch-mix line, including `clock PASS (CPU0 masked, ticks +1)`. The
+  opt-in `no_std,smp-selftest,smp-churn` profile passes `churn PASS` and
+  `watchdog stall PASS` on `-smp 2`, `-smp 3` and `-smp 4` with the audit
+  active and no lock underflow or `BKL STUCK`; the stall is detected on
+  different APs across runs (CPU1 and CPU3 observed). A negative build that
+  drops the `running_on` claim makes the invariant check fire on the next pass
   (`sched invariant FAIL (a CPU's current task is not marked running on it)`).
   Tablet build, and fog boot image v3. The boot self-tests log
-  `MMU TLB OK`, `MMU ASID OK`, `DMA QUARANTINE OK` and `DMA LEASE OK`; a build
-  that drops the ASID tag fails the ASID test with exception 9 before the
-  scheduler starts, and a build with the lease gate disabled fails the lease
-  test the same way.
+  `MMU TLB OK`, `MMU ASID OK`, `MMU HEAP OK`, `DMA ZERO OK`,
+  `UART RING OK`, `CONSOLE CAP OK`, `DMA QUARANTINE OK` and `DMA LEASE OK`; a
+  build that drops the ASID tag fails the ASID test with exception 9 before
+  the scheduler starts, and a build with the lease gate disabled fails the
+  lease test the same way.
 - **Hardware coverage after E2 is a smoke test, not a proof.** The post-E2
   image boots on physical `rain` and the GIC/timer panel is live, but QEMU and
   a single boot are not evidence for TLB/cache maintenance under load or for
@@ -270,7 +328,7 @@ Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
   defined `unregister_mutex` not-found path, ipc receive bisect bypass
   removed).
 - **Verified working at that checkpoint:** single-CPU boot unchanged;
-  `cargo test --lib` 13/13 (the current suite is 142/142); debug and release
+  `cargo test --lib` 13/13 (the current suite is 156/156); debug and release
   builds pass.
 - **Historical (fixed): `-smp 2`** died at silverd's first blocking IPC
   receive at the 2026-11-01 checkpoint; the layers below are the investigation
@@ -1894,6 +1952,24 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   it does not reset the machine or turn the fault into a debuggable
   core/register dump for offline triage.
 
+
+## Kernel hardening queue (2026-11-05)
+
+- **Priority + aging** on top of the FIFO ready queues: two or three classes
+  with aging so the lowest class cannot starve; a boot test must prove order
+  and bounded waiting.
+- **Push migration** for skewed per-CPU queues (work stealing is pull-only).
+- **BKL-holder watchdog:** the stall monitor deliberately exempts a CPU parked
+  in `bkl_acquire`; a holder that never releases is only reported by the
+  one-shot `BKL STUCK` line today, with no timeout or recovery.
+- **Caches (`SCTLR.C/I`):** the table-clean ritual in
+  `mmu::flush_after_table_change` becomes mandatory once caches are on;
+  re-verify `dc cvac`/`tlbi` ordering on physical `rain` (step 9 below keeps
+  the HIL caveat).
+- **VM extensions:** file-backed and sparse multi-window mappings, growable
+  stacks and demand paging on top of `SYS_MMAP`/`SYS_MUNMAP`.
+- **Spawn credentials and a userspace DMA-lease syscall** need an explicit
+  syscall-scope decision before they can land; current fixes are kernel-only.
 
 ## Next steps (by priority)
 

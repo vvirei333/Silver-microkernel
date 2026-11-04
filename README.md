@@ -34,6 +34,8 @@ userspace.
 - [x] Kernel heap + Rust global allocator (`alloc`: `Box`, `Vec`)
 - [x] GICv2 + ARM Generic Timer (QEMU: IRQ 30, 100 Hz tick) + PL011 RX (INTID 33); runtime GICv3 dispatch for SM8650/fog
 - [x] Round-robin scheduler: spawn with numeric/string arguments, `yield`, `sleep`, `kill`, `wait`
+- [x] Per-CPU FIFO ready queues: dispatch order is enqueue order (the old stack-shaped queue starved the oldest of three runnable tasks; a boot test fails on the stack version)
+- [x] Per-CPU stall watchdog: a PE that stops taking its timer PPI or completing scheduling passes is reported with CPU id and scheduler index; an opt-in `smp-churn` injection proves the detector
 - [x] Console ownership + job control: `bg`/`fg`, Ctrl-Z, `Stopped`, resume and shell recovery
 - [x] Lifecycle cleanup: address spaces, mailboxes, file handles, wait queues and owned mutexes
 - [x] Blocking mutex with FIFO wait queue, ownership tracking and RAII guard
@@ -83,7 +85,7 @@ userspace.
 - [x] Boot-time MMU TLB proof: read through TTBR0, remap the same VA, read again (fails the boot if the `tlbi` broadcast is missing)
 - [x] Per-task anonymous-mapping quota (16 MiB) and a DMA quarantine window before revoked frames are recycled
 - [ ] SFS write path, block-path interrupts, remaining resource quotas and persistent storage
-- [ ] SMP (`-smp 4`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to three APs online (CPU1–CPU3), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` (66 PASS / 0 PANIC). Dispatch uses per-CPU ready queues (local queue → steal from a peer → full-scan fallback), with entries carrying `(id, index)` so an index shift can only discard an entry. Every address space carries a unique 8-bit ASID, so a context switch no longer flushes the domain-wide TLB and a PTE edit invalidates only the edited ASID. `no_std,smp-selftest` additionally runs a cross-PE TLB probe (every AP reads a VA, the boot CPU re-points the same PTE, every AP must observe the new frame), 64 back-to-back SGI1 stop-the-world rounds, a per-CPU timer-tick check, a `running_on`/`current_index` pairing check on every scheduling pass, and a one-shot `ready queues local/steal/scan` report. An opt-in `smp-churn` diagnostic spawns short-lived kernel tasks while the APs run/reap them, with the per-pass invariant audit active; it found and now regression-tests three scheduler bugs (preemptible passes, kernel-task lock imbalance, IRQ window in lock acquisition) and passes repeatedly on `-smp 4`. It stays out of `smp-selftest` because `cpu_count()` assumes `MAX_CPUS`, so fewer online CPUs would fail the harness policy. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Device-DMA quiescence is enforced for in-kernel `DmaLease` holders (a live lease makes revoke leak instead of reuse); userspace drivers still rely on the quarantine window. Physical SMP and in-flight-MMAP stress remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
+- [ ] SMP (`-smp 4`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to three APs online (CPU1–CPU3), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` (66 PASS / 0 PANIC). Dispatch uses per-CPU FIFO ready queues (local queue → steal from a peer → full-scan fallback), with entries carrying `(id, index)` so an index shift can only discard an entry. Every address space carries a unique 8-bit ASID, so a context switch no longer flushes the domain-wide TLB and a PTE edit invalidates only the edited ASID. `no_std,smp-selftest` additionally runs a cross-PE TLB probe (every AP reads a VA, the boot CPU re-points the same PTE, every AP must observe the new frame), 64 back-to-back SGI1 stop-the-world rounds, a per-CPU timer-tick check, a `running_on`/`current_index` pairing check on every scheduling pass, a FIFO-order probe, the stall-watchdog policy and heartbeat checks, and a one-shot `ready queues local/steal/scan` report. An opt-in `smp-churn` diagnostic spawns short-lived kernel tasks while the APs run/reap them, with the per-pass invariant audit active; it found and now regression-tests three scheduler bugs (preemptible passes, kernel-task lock imbalance, IRQ window in lock acquisition). It also injects a real masked-IRQ stall and requires another PE to report it (`watchdog stall PASS`). It stays opt-in because it is a stress/injection suite, not a correctness prerequisite; both parts pass on `-smp 2`, `-smp 3` and `-smp 4`. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Device-DMA quiescence is enforced for in-kernel `DmaLease` holders (a live lease makes revoke leak instead of reuse); userspace drivers still rely on the quarantine window. Physical SMP and in-flight-MMAP stress remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
 
 ## Design references
 
@@ -681,17 +683,17 @@ device-quiescence proof — stopping the queue remains the driver's contract.
 | Document | Contents |
 | --- | --- |
 | [redmi10c_poc/README.md](redmi10c_poc/README.md) | Authoritative Redmi 10C / fog bring-up: design, live-FDT policy, fail-closed relocation, QEMU tests, unconfirmed hardware parameters |
-| [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU bring-up of up to four CPUs behind the `smp` feature, round-qualified quiescence, per-CPU timer checks and boot selftests; true cross-PE TLB stress and physical SMP are not verified |
+| [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU bring-up of up to four CPUs behind the `smp` feature, round-qualified quiescence, FIFO ready queues, per-CPU timer checks, a stall watchdog and boot selftests; true cross-PE TLB stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 
-Current verification snapshot (2026-11-04): **146 host tests** pass; the fog
+Current verification snapshot (2026-11-05): **156 host tests** pass; the fog
 QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 `howl>`; the demo regression reports 66 PASS / 0 PANIC under `no_std,smp` with
 QEMU `-smp 4` (and `-smp 2`); the `no_std`, `fog`, `fog-reloc`, `tablet`,
 `smp`, `smp-selftest`, `smp-churn` and `demo-tasks` configurations all build;
-the opt-in `smp-churn` profile passed 28 consecutive `-smp 4` runs with the
-per-pass invariant audit active. The opt-in
+the opt-in `smp-churn` profile passes `churn PASS` and `watchdog stall PASS`
+on `-smp 2`, `-smp 3` and `-smp 4` with the per-pass invariant audit active. The opt-in
 `no_std,smp` build on QEMU `-smp 4` brings CPU1–CPU3 online, runs tasks on
 all four CPUs, and reaches a working `howl>` prompt; slots the machine does
 not expose stay offline instead of aborting bring-up. DMA teardown stops the
@@ -710,7 +712,13 @@ memory visibility across CPUs, and verifies that every online PE advances its
 own timer tick (`ticks PASS (3 peer CPU(s))` on `-smp 4`). A
 separate boot self-test proves that a TTBR0 remap followed by the
 `tlbi ...is` broadcast changes what the CPU reads (removing the `tlbi` makes
-the boot fail with exception 9). Kernel console writes take a bounded
+the boot fail with exception 9). Ready queues are FIFO again and dispatch the
+oldest runnable task first; a boot test proves spawn order, and reverting the
+queue to a stack fails it (`positions=2,1,0`). A per-CPU stall watchdog reports
+a PE that stops taking timer interrupts or completing scheduling passes
+(`WATCHDOG: CPU<n> stalled (beats=... index=... rounds=3)`); its decision
+function is host-tested, and the opt-in `smp-churn` profile proves the detector
+with a task that spins with IRQs masked. Kernel console writes take a bounded
 best-effort writer lock, so bytes from different CPUs no longer interleave
 inside one call; whole diagnostic lines can still interleave at call
 boundaries. True cross-PE stale-translation stress, in-flight device DMA and
