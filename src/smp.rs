@@ -37,7 +37,7 @@
 //! belt-and-braces; it is explicitly NOT a cross-CPU synchronization.
 
 use core::cell::UnsafeCell;
-use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, AtomicU64, Ordering};
 
 use crate::{interrupts, platform};
 
@@ -63,8 +63,16 @@ pub struct PerCpu {
     pub mpidr: u64,
     /// Index into `TaskManager.tasks` of this CPU's current task.
     current_index: UnsafeCell<usize>,
-    /// Kernel-lock nesting depth on this CPU (0 = not held here).
-    bkl_depth: UnsafeCell<u32>,
+    /// Task id of this CPU's current task (`0` = none). `current_index` is
+    /// rewritten only under the kernel lock, but the BKL stall diagnostic has
+    /// to read a peer's identity while the lock is held by someone else: this
+    /// mirrored atomic is what it reads instead of walking the scheduler
+    /// vector from a racing PE.
+    current_task: AtomicU64,
+    /// Kernel-lock nesting depth on this CPU (0 = not held here). Atomic so a
+    /// diagnostic on another PE can read it without a data race; only the
+    /// owning CPU mutates it.
+    bkl_depth: AtomicU32,
 }
 
 unsafe impl Sync for PerCpu {}
@@ -77,7 +85,8 @@ impl PerCpu {
             cpu_id: 0,
             mpidr: 0,
             current_index: UnsafeCell::new(usize::MAX),
-            bkl_depth: UnsafeCell::new(0),
+            current_task: AtomicU64::new(0),
+            bkl_depth: AtomicU32::new(0),
         }
     }
 }
@@ -166,11 +175,31 @@ pub fn current_index() -> usize {
 }
 
 /// Only called with the kernel lock held (schedule/spawn paths).
+/// Publishes both halves of "this CPU's current task": the scheduler's index
+/// and the lock-free task id mirror read by the BKL stall diagnostic.
 #[inline]
-pub fn set_current_index(index: usize) {
+pub fn set_current_task(index: usize, id: u64) {
+    let cpu = this_cpu();
     unsafe {
-        *this_cpu().current_index.get() = index;
+        *cpu.current_index.get() = index;
     }
+    cpu.current_task.store(id, Ordering::Release);
+}
+
+/// [`set_current_task`] for another CPU; the caller holds the kernel lock.
+#[inline]
+pub fn set_current_task_for(cpu: usize, index: usize, id: u64) {
+    unsafe {
+        *CPUS[cpu].current_index.get() = index;
+    }
+    CPUS[cpu].current_task.store(id, Ordering::Release);
+}
+
+/// Task id dispatched on `cpu`, or `0` when it has none. Safe to call from any
+/// PE: the scheduler publishes it atomically.
+#[inline]
+pub fn current_task_of(cpu: usize) -> u64 {
+    CPUS[cpu.min(MAX_CPUS - 1)].current_task.load(Ordering::Acquire)
 }
 
 /// Reads another (online) CPU's current index — used by reap to reposition
@@ -178,14 +207,6 @@ pub fn set_current_index(index: usize) {
 #[inline]
 pub fn current_index_of(cpu: usize) -> usize {
     unsafe { *CPUS[cpu].current_index.get() }
-}
-
-/// Repositions another CPU's current index. Kernel lock must be held.
-#[inline]
-pub fn set_current_index_for(cpu: usize, index: usize) {
-    unsafe {
-        *CPUS[cpu].current_index.get() = index;
-    }
 }
 
 /// Installs the per-CPU pointer and claims `slot`. Runs with MMU state as the
@@ -259,6 +280,47 @@ static KERNEL_LOCK: KernelLock = KernelLock {
 /// BISECT switch: 1 = kernel lock disabled entirely.
 pub static BKL_DISABLED: AtomicBool = AtomicBool::new(false);
 
+/// A waiter that has not acquired the kernel lock for this many ticks reports
+/// the holder. At 100 Hz this is one second: long enough that a normal
+/// syscall or scheduling pass never trips it, short enough to catch a hold
+/// that will never end. The report is diagnostic only — stealing a live lock
+/// is unsafe, so there is no recovery.
+const BKL_STALL_TICKS: u64 = 100;
+
+/// Fallback for the window before global time is published (the system
+/// counter is not yet the tick source): 50M yields is already pathological.
+const BKL_SPIN_REPORT_LIMIT: u32 = 50_000_000;
+
+static BKL_STALLS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Best-effort serialization for the report line. Every waiter reports without
+/// the lock, so two peers can reach the console at the same time and interleave
+/// their fields into an unreadable line. The counter still counts every
+/// episode; only the printing is single-flight.
+static BKL_REPORTING: AtomicBool = AtomicBool::new(false);
+
+/// One report per waiter episode. Cleared when the lock is finally acquired,
+/// so a later independent stall is reported again instead of being masked by
+/// the first one.
+static BKL_STALL_REPORTED: [AtomicBool; MAX_CPUS] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
+
+/// Keeps the intentional selftest stall out of normal boot logs; the counter
+/// still increments and is what the test asserts on.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static BKL_STALL_SILENT: AtomicBool = AtomicBool::new(false);
+
+/// Number of kernel-lock stall reports since boot. A non-zero value on a
+/// production boot is a serious scheduling/lock bug worth collecting.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn bkl_stalls() -> u64 {
+    BKL_STALLS.load(Ordering::Acquire)
+}
+
 /// Enables AP task execution once the per-CPU idle contexts exist. Kept as a
 /// runtime switch for bisect/rollback; `smp` builds default to true.
 #[cfg(feature = "smp")]
@@ -269,9 +331,6 @@ pub static AP_TASK_SCHEDULING: AtomicBool = AtomicBool::new(true);
 /// block on slots the firmware rejected while `-smp 4` waits for all three APs.
 #[cfg(feature = "smp")]
 use core::sync::atomic::AtomicUsize;
-
-#[cfg(all(feature = "smp", feature = "smp-selftest"))]
-use core::sync::atomic::AtomicU64;
 
 #[cfg(feature = "smp")]
 static EXPECTED_CPUS: AtomicUsize = AtomicUsize::new(1);
@@ -378,9 +437,11 @@ pub fn bkl_acquire() {
     // them enabled get their state back on return.
     let saved_daif = interrupts::save_and_disable_irq();
     let cpu = this_cpu();
-    let depth = unsafe { &mut *cpu.bkl_depth.get() };
-    if *depth > 0 {
-        *depth += 1;
+    let depth = cpu.bkl_depth.load(Ordering::Relaxed);
+    if depth > 0 {
+        // Nesting is only ever performed by the owning CPU, so a relaxed
+        // read-modify-write is enough; peers only read the value.
+        cpu.bkl_depth.store(depth + 1, Ordering::Relaxed);
         interrupts::restore_irq(saved_daif);
         return;
     }
@@ -393,10 +454,17 @@ pub fn bkl_acquire() {
     // `while cmpxchg { spin_loop() }` was lowered by LLVM to a bare `b .`
     // (the atomic retry got deleted with the loop), hanging the kernel on
     // the first contended acquire. The asm `yield` makes the loop real.
+    #[cfg(feature = "smp")]
     let mut spins: u32 = 0;
+    #[cfg(feature = "smp")]
+    let mut wait_start = crate::timer::ticks();
     loop {
+        #[cfg(feature = "smp")]
         if quiesce_active() && KERNEL_LOCK.owner.load(Ordering::Relaxed) != cpu.cpu_id as isize {
             quiesce_ack_and_wait();
+            // Quiesce parking is deliberate: restart the stall window instead
+            // of counting a stop-the-world round as a stuck holder.
+            wait_start = crate::timer::ticks();
         }
         let matched = KERNEL_LOCK
             .owner
@@ -410,36 +478,116 @@ pub fn bkl_acquire() {
         if matched {
             break;
         }
-        spins += 1;
-        // This PE is masked and parked on the lock by design; `BKL STUCK`
-        // below owns the diagnostic. The stall watchdog must not double-report
-        // a bounded wait as a dead CPU.
         #[cfg(feature = "smp")]
-        crate::watchdog::set_bkl_waiting(cpu.cpu_id as usize, true);
-        if spins == 50_000_000 {
-            let owner = KERNEL_LOCK.owner.load(Ordering::Relaxed);
-            crate::console::write_str("BKL STUCK: owner=");
-            crate::console::write_hex_u64(owner as u64);
-            crate::console::write_str(" owner_depth=");
-            if owner >= 0 && (owner as usize) < MAX_CPUS {
-                crate::console::write_dec_u64(
-                    unsafe { *CPUS[owner as usize].bkl_depth.get() } as u64
-                );
-            } else {
-                crate::console::write_str("free");
+        {
+            spins = spins.saturating_add(1);
+            if spins & 0x3FF == 0 {
+                let waited = crate::timer::ticks().saturating_sub(wait_start);
+                let stalled = waited >= BKL_STALL_TICKS || spins >= BKL_SPIN_REPORT_LIMIT;
+                if stalled
+                    && !BKL_STALL_REPORTED[cpu.cpu_id as usize]
+                        .swap(true, Ordering::AcqRel)
+                {
+                    BKL_STALLS.fetch_add(1, Ordering::AcqRel);
+                    report_bkl_stall(cpu.cpu_id as usize, depth, waited, spins);
+                }
             }
-            crate::console::write_str(" self_depth=");
-            crate::console::write_dec_u64(*depth as u64);
-            crate::console::write_str("\r\n");
+            // This PE is masked and parked on the lock by design; the stall
+            // watchdog must not double-report a bounded wait as a dead CPU.
+            crate::watchdog::set_bkl_waiting(cpu.cpu_id as usize, true);
         }
         unsafe {
             core::arch::asm!("yield", options(nomem, nostack, preserves_flags));
         }
     }
-    *depth = 1;
+    cpu.bkl_depth.store(1, Ordering::Relaxed);
     #[cfg(feature = "smp")]
-    crate::watchdog::set_bkl_waiting(cpu.cpu_id as usize, false);
+    {
+        BKL_STALL_REPORTED[cpu.cpu_id as usize].store(false, Ordering::Release);
+        crate::watchdog::set_bkl_waiting(cpu.cpu_id as usize, false);
+    }
     interrupts::restore_irq(saved_daif);
+}
+
+/// Reports a holder that a waiter has failed to acquire for too long. Runs on
+/// the waiter with IRQs masked and the lock NOT held, so it reads the holder's
+/// state without the protection of the lock: the fields it prints are plain
+/// atomics/cell reads meant for diagnostics, and a torn read here is only a
+/// misleading log line, never a decision.
+#[cfg(feature = "smp")]
+fn report_bkl_stall(waiter: usize, waiter_depth: u32, waited: u64, spins: u32) {
+    #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+    if BKL_STALL_SILENT.load(Ordering::Relaxed) {
+        return;
+    }
+    if BKL_REPORTING.swap(true, Ordering::Acquire) {
+        return;
+    }
+    let owner = KERNEL_LOCK.owner.load(Ordering::Relaxed);
+    crate::console::write_str("BKL STALL: owner=");
+    if owner < 0 {
+        crate::console::write_str("free");
+    } else {
+        crate::console::write_dec_u64(owner as u64);
+    }
+    crate::console::write_str(" depth=");
+    if owner >= 0 && (owner as usize) < MAX_CPUS {
+        crate::console::write_dec_u64(CPUS[owner as usize].bkl_depth.load(Ordering::Relaxed) as u64);
+    } else {
+        crate::console::write_str("?");
+    }
+    crate::console::write_str(" waiter=");
+    crate::console::write_dec_u64(waiter as u64);
+    crate::console::write_str(" waiter_depth=");
+    crate::console::write_dec_u64(waiter_depth as u64);
+    crate::console::write_str(" waited=");
+    crate::console::write_dec_u64(waited);
+    crate::console::write_str(" spins=");
+    crate::console::write_dec_u64(spins as u64);
+    crate::console::write_str(" owner_task=");
+    if owner >= 0 && (owner as usize) < MAX_CPUS {
+        crate::console::write_dec_u64(current_task_of(owner as usize));
+    } else {
+        crate::console::write_str("none");
+    }
+    crate::console::write_str("\r\n");
+    BKL_REPORTING.store(false, Ordering::Release);
+}
+
+/// Holds the kernel lock just past the stall threshold while the APs are
+/// blocked in `bkl_acquire`, and requires their detector to count at least one
+/// report. The hold is intentional; the report itself is silenced so ordinary
+/// `smp-selftest` logs do not contain a fake failure.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn run_bkl_stall_selftest() -> bool {
+    if cpu_count() <= 1 {
+        return true;
+    }
+    // Start from a clean slate: an AP may have reported while it was already
+    // parked on the lock during an earlier boot phase.
+    BKL_STALLS.store(0, Ordering::Relaxed);
+    for flag in &BKL_STALL_REPORTED {
+        flag.store(false, Ordering::Relaxed);
+    }
+    let before = bkl_stalls();
+    BKL_STALL_SILENT.store(true, Ordering::Release);
+    let start = crate::timer::ticks();
+    while crate::timer::ticks().saturating_sub(start) < BKL_STALL_TICKS + 30 {
+        core::hint::spin_loop();
+    }
+    let after = bkl_stalls();
+    BKL_STALL_SILENT.store(false, Ordering::Release);
+    let ok = after > before;
+    if ok {
+        crate::console::write_str("SMP SELFTEST: bkl stall PASS (");
+        crate::console::write_dec_u64(after - before);
+        crate::console::write_str(" waiter report(s))\r\n");
+    } else {
+        crate::console::write_str("SMP SELFTEST: bkl stall FAIL (reports=");
+        crate::console::write_dec_u64(after - before);
+        crate::console::write_str(")\r\n");
+    }
+    ok
 }
 
 /// Releases the kernel lock. Must be paired with [`bkl_acquire`].
@@ -449,9 +597,9 @@ pub fn bkl_release() {
         return;
     }
     let cpu = this_cpu();
-    let depth = unsafe { &mut *cpu.bkl_depth.get() };
-    debug_assert!(*depth > 0, "bkl_release without acquire");
-    if *depth == 0 {
+    let depth = cpu.bkl_depth.load(Ordering::Relaxed);
+    debug_assert!(depth > 0, "bkl_release without acquire");
+    if depth == 0 {
         // A release without a matching acquire is never legitimate: the
         // per-CPU depth counts this CPU's own holds only. Decrementing here
         // would wrap to `u32::MAX` and turn every later acquire into a silent
@@ -466,8 +614,8 @@ pub fn bkl_release() {
         }
         return;
     }
-    *depth -= 1;
-    if *depth == 0 {
+    cpu.bkl_depth.store(depth - 1, Ordering::Relaxed);
+    if depth == 1 {
         KERNEL_LOCK.owner.store(BKL_FREE, Ordering::Release);
     }
 }
@@ -477,7 +625,7 @@ pub fn bkl_release() {
 #[inline]
 pub fn bkl_assert_held() {
     debug_assert!(
-        unsafe { *this_cpu().bkl_depth.get() } > 0,
+        this_cpu().bkl_depth.load(Ordering::Relaxed) > 0,
         "kernel lock not held"
     );
 }
@@ -756,7 +904,7 @@ pub fn quiesce_active() -> bool {
 /// Kernel-lock depth on this CPU (0 = not held). Used by kernel-task entry
 /// code that must drop a lock inherited from its dispatcher.
 pub fn bkl_depth() -> u32 {
-    unsafe { *this_cpu().bkl_depth.get() }
+    this_cpu().bkl_depth.load(Ordering::Relaxed)
 }
 
 /// True when an IRQ handler may run a scheduling pass. The interrupted
@@ -877,12 +1025,18 @@ extern "C" {
 /// TTBR0/TTBR1, enabled the MMU and switched SP to the high alias.
 #[cfg(feature = "smp")]
 extern "C" fn smp_ap_main() -> ! {
+    // First Rust-side action: match the boot CPU's cache attributes before
+    // touching shared kernel state (console, CPU slot, scheduler).
+    let cache_state = crate::cache::enable_secondary();
     crate::console::write_str("SMP: AP MMU on\r\n");
 
     let Some(slot) = claim_cpu_slot() else {
         panic!("AP: no free per-CPU slot");
     };
     init_cpu_unpublished(slot);
+    // Publish the read-back SCTLR before this CPU goes online, so the boot
+    // self-test never sees an online AP without a recorded cache state.
+    crate::cache::record_secondary(slot, cache_state);
     crate::console::write_str("SMP: AP slot claimed\r\n");
     if !crate::gic::cpu_init() {
         // No redistributor/CPU interface means no banked SGI0/SGI1. Publishing
@@ -918,6 +1072,15 @@ extern "C" fn smp_ap_main() -> ! {
     // a PE parked in `ap_tlb_probe_wait` must not be judged as hung.
     crate::watchdog::cpu_started(this_cpu_id());
     interrupts::enable_irq();
+    // Take at least one timer PPI before entering the scheduler loop. The
+    // heartbeat selftest uses `cpu_ticks > 0` as proof that this PE's timer is
+    // wired, but a PE blocked in `bkl_acquire` runs with IRQs masked and
+    // cannot take another tick; without this window the test is a race.
+    let cpu = this_cpu_id();
+    let tick_deadline = crate::timer::ticks().saturating_add(50);
+    while crate::timer::cpu_ticks(cpu) == 0 && crate::timer::ticks() < tick_deadline {
+        core::hint::spin_loop();
+    }
     loop {
         crate::scheduler::schedule();
         interrupts::wait_for_irq();
@@ -985,6 +1148,14 @@ pub fn boot_secondary_cpus() {
                 2 * crate::memory::PAGE_SIZE,
             );
         }
+        // The AP runs with caches off until its first Rust instruction and
+        // writes this stack through non-cacheable normal memory. Clean the
+        // zeroing writes now: a dirty line left in this CPU's cache would be
+        // written back later and clobber the AP's live stack.
+        crate::mmu::clean_range_to_poc(
+            crate::memory::phys_to_virt(stack),
+            2 * crate::memory::PAGE_SIZE,
+        );
 
         // The AP starts with cold caches. Publish its parameter block and
         // page-table root through the high alias (the boot CPU has no low
@@ -1059,12 +1230,22 @@ pub fn boot_secondary_cpus() {
         // Proves the ready queues are FIFO: a stack-shaped queue would starve
         // the oldest of three runnable tasks forever.
         crate::scheduler::run_ready_queue_selftest();
+        // Priority classes with aging: high first, FIFO inside a class, and
+        // a low-class probe promoted under constant high-class pressure.
+        crate::scheduler::run_priority_selftest();
         // The peers are parked in `ap_tlb_probe_wait` right now, so the
         // cross-PE TLB proof must run before the stop-the-world rounds.
         run_cross_pe_tlb_probe();
         // The APs are in their scheduler loops once the TLB probe completes,
         // so every watched CPU must be taking its timer PPI now.
         crate::watchdog::run_heartbeat_selftest();
+        // Every online CPU must have enabled C/I in its own SCTLR. This runs
+        // before the stop-the-world and heavy stress tests so a missing cache
+        // enable is reported as a plain boot failure.
+        crate::cache::run_cache_selftest();
+        // The APs are in their scheduler loops trying to take the lock this
+        // CPU holds, which is exactly the waiter state the detector watches.
+        run_bkl_stall_selftest();
         run_quiesce_selftest();
         run_clock_selftest();
         // Last: spawn short-lived tasks and let the APs run/reap them while
@@ -1074,6 +1255,9 @@ pub fn boot_secondary_cpus() {
         #[cfg(feature = "smp-churn")]
         {
             crate::scheduler::run_smp_churn_selftest();
+            // By now the APs have completed passes and sit on their idle
+            // tasks, so a real idle peer exists for the push probe.
+            crate::scheduler::run_push_selftest();
             // Negative test: a task that really spins with IRQs masked must be
             // reported by the monitor on another PE.
             crate::scheduler::run_stall_selftest();

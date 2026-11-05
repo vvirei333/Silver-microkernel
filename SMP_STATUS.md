@@ -3,7 +3,7 @@
 > **Current project status (2026-11-04):** this file remains the authoritative
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
-> test suite is now **156/156**; the 13/13 figure below is the checkpoint from
+> test suite is now **171/171**; the 13/13 figure below is the checkpoint from
 > the earlier SMP session.
 >
 > **Phases 1–2 are implemented as the opt-in `smp` feature (QEMU only).**
@@ -37,6 +37,64 @@ Two scheduler/SMP packages landed in `35c44b4`, on top of the reservation fix
   `SMP SELFTEST: ready fifo PASS (3 probes in spawn order)`. Switching the
   pop back to `pop_back` reports `positions=2,1,0` and fails the boot, so the
   test is a real regression guard.
+- **Priority classes with aging.** Each ready-queue entry carries a class
+  (0 high, 1 normal, 2 low; every task defaults to Normal) and an age in
+  dispatch attempts. `dequeue_ready` ages every queued entry once per call and
+  dispatches the FIFO-first entry with the best effective class;
+  `sched_policy::effective` promotes one class every 8 rounds, so a low-class
+  task reaches the top class after at most 16 attempts even while high-class
+  arrivals keep the queue busy. FIFO order inside a class is preserved.
+  `run_priority_selftest` drives the real queue:
+  `SMP SELFTEST: priority PASS (high first, FIFO in class, low aged in 16
+  round(s))`. With aging disabled (`AGING_PASSES = 1000`) it reports
+  `priority FAIL (... aged_round=0)` while the order check still passes, which
+  isolates the aging property. `set_task_priority` is kernel-only; there is
+  no syscall and userspace tasks stay Normal.
+- **Push migration.** After a local dispatch, a CPU that still has queued work
+  hands one task to the first idle peer with an empty queue
+  (`sched_policy::push_target`); the entry keeps its aging. The destination
+  must be idle and empty, otherwise the push is refused. The dispatch mix
+  reports `push=`; ordinary `-smp 4` runs show `push=1`. `run_push_selftest`
+  verifies the real queue move with an explicit idle mask, because a live AP
+  is usually parked on the kernel lock during the boot selftests. Disabling
+  the policy gives `push FAIL (moved=0 ...)` and `push=0` while churn still
+  passes. No IPI is sent: the idle PE re-evaluates on its next 10 ms timer
+  tick.
+- **Data/instruction caches.** After the boot stub published the tables and
+  `mmu::init` switched to the per-task TTBR0, `cache::init_boot` invalidates the
+  inherited data cache by set/way (boot-only, one PE), invalidates the
+  instruction cache, and sets `SCTLR_EL1.C/I`. Every AP calls
+  `cache::enable_secondary` as its first Rust-side action — before console,
+  slot or scheduler state — so its attributes match the boot CPU's before it
+  touches shared memory; the AP skips the set/way sweep, which is unsafe once
+  another PE has dirty lines. Each CPU records the `SCTLR_EL1` it read back and
+  `run_cache_selftest` requires `C=1 I=1` on every online CPU:
+  `SMP SELFTEST: cache PASS (4 CPU(s) C=1 I=1)`, with `CACHE=ON line=64` in the
+  boot log. `cache::ENABLE_CACHES = false` gives `CACHE=OFF` and
+  `cache FAIL (... local_sctlr=0x...50839)` while the rest of the boot runs,
+  so the check is not vacuous. Turning caches on also made two latent real-HW
+  steps explicit: the freshly zeroed AP stack is cleaned to the point of
+  coherency before `CPU_ON` (a dirty zero line in the boot CPU's cache would
+  otherwise be written back over the AP's stack), and `DMA ZERO OK` now crosses
+  the cacheable/Non-Cacheable aliases in both directions. QEMU does not model
+  caches, so the cross-alias probe is HIL evidence; the SCTLR read-back and the
+  cache-bit self-test are what the emulated runs prove.
+- **Kernel-lock stall detector.** `bkl_acquire` reports a holder that a
+  waiter cannot get past for one second: `BKL STALL: owner=... depth=...
+  waiter=... waited=... owner_task=...`, once per waiter
+  episode. Quiesce parking restarts the window; there is no recovery by
+  design. The holder's task id comes from an atomic per-CPU mirror updated by
+  the scheduler, and `bkl_depth` is atomic too, so a waiter can report on a
+  peer that holds the lock without a data race; the reporter no longer walks
+  the scheduler vector. Only one waiter prints at a time (`BKL_REPORTING`), so
+  concurrent reports cannot interleave into a garbled line; every episode is
+  still counted. `run_bkl_stall_selftest` holds the lock just past the threshold with
+  the APs blocked in `bkl_acquire` and requires their reports
+  (`bkl stall PASS (3 waiter report(s))` on `-smp 4`, one on `-smp 2`), with
+  the intentional reports silenced. Disabling the detector gives
+  `bkl stall FAIL (reports=0)`. The detector found that the watchdog's own
+  `stall_probe_task` inherited the BKL and kept it through its masked spin;
+  the probe now drops the inherited hold like `churn_task`.
 - **Per-CPU stall watchdog.** A PE that has entered the scheduler loop must
   take its timer PPI or complete a scheduling pass every 250 ms check round.
   Three consecutive rounds without progress make any other PE print
@@ -45,12 +103,14 @@ Two scheduler/SMP packages landed in `35c44b4`, on top of the reservation fix
   in the host-tested `silver_microkernel::watchdog_policy`. Exemptions: PEs
   that have not called `cpu_started` (AP bring-up, `ap_tlb_probe_wait`), a
   stop-the-world quiesce (all grace windows are rebased), and a CPU parked in
-  `bkl_acquire` (`BKL STUCK` owns that condition).
+  `bkl_acquire` (the dedicated BKL stall detector owns that condition).
 - **Evidence.** `-smp 4` selftest: `WATCHDOG: policy PASS`,
-  `WATCHDOG: heartbeat PASS (4 CPU(s) ticking)`, `ready fifo PASS`, plus the
-  existing `tlb cross-PE`, `quiesce` (64 rounds), `ticks` and `clock` PASS
-  lines. Combined `demo-tasks,smp-selftest` is **74 PASS / 0 FAIL / 0 PANIC**
-  with no invariant failure.
+  `WATCHDOG: heartbeat PASS (4 CPU(s) ticking)`, `ready fifo PASS`,
+  `priority PASS`, plus the existing `tlb cross-PE`, `quiesce` (64 rounds),
+  `ticks` and `clock` PASS lines, plus `cache PASS (4 CPU(s) C=1 I=1)` and
+  `CACHE=ON line=64`; the opt-in churn profile adds `push PASS`, `bkl stall
+  PASS` and no real `BKL STALL:` lines. Combined `demo-tasks,smp-selftest` is
+  **77 PASS / 0 FAIL / 0 PANIC** with no invariant failure.
 - **Negative test (opt-in `smp-churn`).** A kernel task masks IRQs and spins
   for 1.2 s; an AP picks it up and another PE reports it
   (`WATCHDOG: CPU3 stalled (beats=32 index=20 rounds=3)` — the index is the
@@ -288,7 +348,7 @@ DMA leak, and `-smp 2` still reports one peer.
 | 6. TLB | per-space ASID (`1..=255`, 8-bit) в `TTBR0[63:48]`; `switch_address_space` только `msr`+`isb`; правка PTE — `tlbi aside1is` по ASID; создание/AP-identity — `vmalle1is`; батчевая публикация (`finish_table_changes_for`); cross-PE probe доказывает, что ASID-scoped broadcast доходит до второго PE; boot-тест ASID-изоляции | написано, проверено на QEMU `-smp 4` |
 | 7. AP-boot | PSCI `CPU_ON` (HVC, `0xC4000003`), physical trampoline, `ApBootParams`, FP/SIMD + MMU enable, `boot_secondary_cpus()` from the first `schedule()` | работает на QEMU `-smp 2` и `-smp 4` |
 | 8. Shared DMA | под BKL: создание маппингов (syscall) и revoke/teardown взаимоисключены; fail-safe leak сохранён; `DmaLease` in-flight gate: диапазон с живым lease не освобождается | написано, boot-тест `DMA LEASE` |
-| 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer + проверка `running_on`/`current_index` на каждом проходе + FIFO-порядок очередей + stall-watchdog policy/heartbeat; `demo-tasks,smp-selftest` — 74 PASS / 0 PANIC / 0 invariant FAIL; boot-самотесты MMU TLB, MMU HEAP, DMA ZERO, UART RING, CONSOLE CAP и DMA quarantine | написано, негативные тесты подтверждены |
+| 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer + проверка `running_on`/`current_index` на каждом проходе + FIFO-порядок очередей + приоритеты/aging + push migration + BKL stall detector + кэши (SCTLR.C/I) + stall-watchdog policy/heartbeat; `demo-tasks,smp-selftest` — 77 PASS / 0 PANIC / 0 invariant FAIL; boot-самотесты MMU TLB, MMU HEAP, DMA ZERO, UART RING, CONSOLE CAP и DMA quarantine | написано, негативные тесты подтверждены |
 
 ## Найдено и исправлено попутно (реальные баги)
 
@@ -461,14 +521,14 @@ DMA leak, and `-smp 2` still reports one peer.
 - `src/syscall.rs`: `SYS <n> sp=` трейс.
 - `src/scheduler.rs`: `B1/B2` в `block_current_on`, `R1–R4` в
   `schedule_released`, `SCHED_SEEN` в `schedule`.
-- `src/smp.rs`: `BKL STUCK`-детектор в `bkl_acquire`; `BKL_DISABLED`-свитч
+- `src/smp.rs`: `BKL STALL`-детектор в `bkl_acquire`; `BKL_DISABLED`-свитч
   (оставить механизм, значение `false`); `AP_TASK_SCHEDULING` — runtime gate,
   в `smp`-сборке `true`.
 - `src/allocator.rs`: `HEAP_PAGES` 512 (бисект) — вернуть 256.
 
 ## Проверки на текущем состоянии
 
-- `cargo test --lib`: **156/156**.
+- `cargo test --lib`: **171/171**.
 - Default `no_std` build, QEMU `-smp 4`: single-core, reaches `howl>`.
 - `no_std,smp` build, QEMU `-smp 4`: CPU1–CPU3 online (GIC/timer/IPI), all
   four CPUs execute tasks; `howl ready`/prompt and `ps` work.
@@ -483,10 +543,10 @@ DMA leak, and `-smp 2` still reports one peer.
   Negative build (broadcast `tlbi vmalle1is` replaced by local `tlbi vmalle1`
   in `finish_table_changes`): `tlb cross-PE FAIL (3 CPU(s) kept the stale
   translation)` while quiesce/ticks still pass.
-- `no_std,smp,demo-tasks,smp-selftest`, QEMU `-smp 4`: **74 PASS / 0 FAIL /
+- `no_std,smp,demo-tasks,smp-selftest`, QEMU `-smp 4`: **77 PASS / 0 FAIL /
   0 PANIC** with zero `sched invariant FAIL`; the extra PASS lines are the
-  selftest lines (FIFO order, stall-watchdog policy and heartbeat, remap
-  sentinel, cross-PE TLB, quiesce, ticks, clock). The dispatch-mix line reports
+  selftest lines (FIFO order, priority/aging, stall-watchdog policy and
+  heartbeat, remap sentinel, cross-PE TLB, quiesce, ticks, clock). The dispatch-mix line reports
   the per-CPU queues doing the work (`ready queues local=.. steal=.. scan=..`;
   selftest-only reports more `scan` because idle tasks are deliberately not
   queued). Negative build

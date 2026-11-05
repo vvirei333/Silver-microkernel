@@ -5,6 +5,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
 
+use silver_microkernel::sched_policy;
 use silver_microkernel::table_registry::TableToken;
 
 use crate::{
@@ -54,6 +55,13 @@ static READY_SCAN_PICKS: [AtomicU64; smp::MAX_CPUS] = [
     AtomicU64::new(0),
 ];
 #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+static READY_PUSH_PICKS: [AtomicU64; smp::MAX_CPUS] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
 static READY_QUEUES_REPORTED: AtomicBool = AtomicBool::new(false);
 
 #[cfg(all(feature = "smp", feature = "smp-selftest"))]
@@ -61,9 +69,9 @@ fn note_pick(counter: &[AtomicU64; smp::MAX_CPUS], cpu: usize) {
     counter[cpu.min(smp::MAX_CPUS - 1)].fetch_add(1, Ordering::Relaxed);
 }
 
-/// Aggregate dispatch-source counts `(local, steal, fallback-scan)`.
+/// Aggregate dispatch-source counts `(local, steal, fallback-scan, push)`.
 #[cfg(all(feature = "smp", feature = "smp-selftest"))]
-pub fn ready_queue_stats() -> (u64, u64, u64) {
+pub fn ready_queue_stats() -> (u64, u64, u64, u64) {
     let sum = |counter: &[AtomicU64; smp::MAX_CPUS]| {
         counter
             .iter()
@@ -74,6 +82,7 @@ pub fn ready_queue_stats() -> (u64, u64, u64) {
         sum(&READY_LOCAL_PICKS),
         sum(&READY_STEAL_PICKS),
         sum(&READY_SCAN_PICKS),
+        sum(&READY_PUSH_PICKS),
     )
 }
 
@@ -85,7 +94,7 @@ fn report_ready_queues_once() {
     if READY_QUEUES_REPORTED.load(Ordering::Relaxed) {
         return;
     }
-    let (local, steal, scan) = ready_queue_stats();
+    let (local, steal, scan, push) = ready_queue_stats();
     if local + steal + scan < 64 {
         return;
     }
@@ -96,6 +105,8 @@ fn report_ready_queues_once() {
     console::write_dec_u64(steal);
     console::write_str(" scan=");
     console::write_dec_u64(scan);
+    console::write_str(" push=");
+    console::write_dec_u64(push);
     console::write_str("\r\n");
 }
 
@@ -178,6 +189,9 @@ pub struct Task {
     /// are spawned after the boot tasks to preserve SCOUT_ID and the other
     /// spawn-order identities.
     is_idle: bool,
+    /// Dispatch class (0 high, 1 normal, 2 low). Kernel-only: userspace tasks
+    /// are always Normal, and aging lives in the ready queue, not here.
+    priority: u8,
     pub context: TaskContext,
     pub stack: MemoryRegion,
     pub user_stack: MemoryRegion,
@@ -222,6 +236,19 @@ pub enum WaitLink {
     Shared(Arc<Condvar>),
 }
 
+/// One queued task in a CPU's ready queue.
+///
+/// `priority` is the task's class at enqueue time; `age` counts dispatch
+/// attempts spent waiting. The age is what gives a low-class task a bounded
+/// waiting time (see `sched_policy`).
+#[derive(Copy, Clone)]
+struct ReadyEntry {
+    id: u64,
+    index: usize,
+    priority: u8,
+    age: u16,
+}
+
 pub struct TaskManager {
     tasks: Vec<Task>,
     next_id: u64,
@@ -236,11 +263,12 @@ pub struct TaskManager {
     ///
     /// FIFO is a correctness property, not a hint: with a stack-shaped queue
     /// (push/pop) and three or more runnable tasks, the oldest entry was never
-    /// dispatched. Push at the back, pop at the front.
+    /// dispatched. Push at the back; dispatch selects the FIFO-first entry of
+    /// the best effective class (priority plus aging).
     ///
     /// Indices are invalidated by any `tasks.remove`/`retain`; those paths
     /// rebuild every queue (see [`rebuild_ready_queues`]).
-    ready: [VecDeque<(u64, usize)>; smp::MAX_CPUS],
+    ready: [VecDeque<ReadyEntry>; smp::MAX_CPUS],
 }
 
 const TRACE_LEN: usize = 16;
@@ -319,7 +347,7 @@ static SCHED_PASS_ACTIVE: [core::sync::atomic::AtomicBool; smp::MAX_CPUS] = [
     core::sync::atomic::AtomicBool::new(false),
 ];
 
-/// Set once `init` has published the first task and `set_current_index`.
+/// Set once `init` has published the first task and `set_current_task`.
 ///
 /// Until then there is no valid current task: a timer IRQ can fire inside
 /// `scheduler::init` because the PL011 TX wait temporarily unmasks IRQs, and
@@ -671,6 +699,13 @@ pub fn run_smp_churn_selftest() -> bool {
 /// hangs in a non-scheduling loop. It then unmasks, yields and exits.
 #[cfg(all(feature = "smp", feature = "smp-churn"))]
 extern "C" fn stall_probe_task() -> ! {
+    // A first dispatch inherits the dispatcher's kernel-lock hold. Drop it:
+    // the probe must simulate a CPU stuck with IRQs masked, not a CPU that
+    // also owns the global lock (which would stall every other CPU and is a
+    // different failure).
+    if smp::bkl_depth() > 0 {
+        smp::bkl_release();
+    }
     crate::interrupts::save_and_disable_irq();
     let start = crate::timer::ticks();
     // 120 ticks = 1.2 s at 100 Hz: three 250 ms check rounds plus margin.
@@ -990,13 +1025,20 @@ fn finish_init(first_id: u64) {
     let manager = scheduler_manager().unwrap();
     // Per-CPU "current": the boot CPU starts on the first spawned task; APs
     // begin at no-task and pick one in their own first `schedule`.
-    smp::set_current_index(
-        manager
-            .tasks
-            .iter()
-            .position(|task| task.id == first_id)
-            .unwrap_or(0),
-    );
+    let first_index = manager
+        .tasks
+        .iter()
+        .position(|task| task.id == first_id)
+        .unwrap_or(0);
+    // Publish the id that actually sits at the resolved index: `first_id == 0`
+    // is the "not spawned yet" sentinel and falls back to index 0 (the idle
+    // task), whose real id is what the lock-free diagnostic should report.
+    let first_task_id = manager
+        .tasks
+        .get(first_index)
+        .map(|task| task.id)
+        .unwrap_or(0);
+    smp::set_current_task(first_index, first_task_id);
     // From here on `schedule` may run: the current index names a real task.
     SCHEDULER_READY.store(true, Ordering::Release);
 }
@@ -1052,7 +1094,7 @@ pub fn run_ready_queue_selftest() -> bool {
     let mut duplicates = false;
     let mut position = 0usize;
     for cpu in 0..smp::MAX_CPUS {
-        let snapshot: Vec<(u64, usize)> = manager.ready[cpu].iter().copied().collect();
+        let snapshot: Vec<ReadyEntry> = manager.ready[cpu].iter().copied().collect();
         while let Some(index) = dequeue_ready(manager, cpu) {
             let id = manager.tasks[index].id;
             if let Some(slot) = ids[..spawned].iter().position(|probe| *probe == id) {
@@ -1105,6 +1147,285 @@ pub fn run_ready_queue_selftest() -> bool {
         console::write_str(")\r\n");
     }
     ordered
+}
+
+/// Kernel-only scheduling class setter; there is no syscall for it (userspace
+/// tasks are always Normal). Kernel policy and the boot selftest use it.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn set_task_priority(id: u64, priority: u8) -> bool {
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    let Some(task) = manager.tasks.iter_mut().find(|task| task.id == id) else {
+        return false;
+    };
+    task.priority = sched_policy::normalize(priority);
+    // Queues cache the class captured at enqueue time, so a change must
+    // rebuild them to take effect on the next dispatch.
+    rebuild_ready_queues(manager);
+    true
+}
+
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+extern "C" fn priority_probe_task() -> ! {
+    exit_current()
+}
+
+/// Proves the priority/aging contract on the real ready queue:
+/// * a high-class probe enqueued last is dispatched before lower classes;
+/// * two normal probes keep FIFO order;
+/// * a low-class probe sitting behind a stream of fresh high-class arrivals
+///   is promoted after two aging windows, so it cannot starve.
+///
+/// The queue is treated as scratch space: it is snapshotted before the probes
+/// are spawned and restored afterwards, then the probes are retired.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn run_priority_selftest() -> bool {
+    const PROBE_BASE: u64 = 1 << 45;
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    let cpu = smp::this_cpu_id().min(smp::MAX_CPUS - 1);
+    let snapshot: Vec<ReadyEntry> = manager.ready[cpu].iter().copied().collect();
+
+    let saved_next = manager.next_id;
+    let mut ids = [0u64; 4];
+    let mut spawned = 0usize;
+    for (offset, slot) in ids.iter_mut().enumerate() {
+        // Explicit ids keep `next_id` (and the user-space task-id/cap-handle
+        // lockstep) untouched.
+        manager.next_id = PROBE_BASE + offset as u64;
+        let Some(id) = spawn_kernel(priority_probe_task) else {
+            break;
+        };
+        *slot = id;
+        spawned += 1;
+    }
+    manager.next_id = saved_next;
+
+    let mut ok = spawned == 4;
+    // Classes: low, normal, normal, high.
+    if ok {
+        ok = set_task_priority(ids[0], sched_policy::PRIORITY_LOW)
+            && set_task_priority(ids[1], sched_policy::PRIORITY_NORMAL)
+            && set_task_priority(ids[2], sched_policy::PRIORITY_NORMAL)
+            && set_task_priority(ids[3], sched_policy::PRIORITY_HIGH);
+    }
+
+    // 1. Priority beats arrival order; same-class entries stay FIFO.
+    let mut order = [0u64; 4];
+    if ok {
+        manager.ready[cpu].clear();
+        for (slot, &id) in ids.iter().enumerate() {
+            let Some(index) = manager.tasks.iter().position(|task| task.id == id) else {
+                ok = false;
+                break;
+            };
+            let priority = match slot {
+                0 => sched_policy::PRIORITY_LOW,
+                3 => sched_policy::PRIORITY_HIGH,
+                _ => sched_policy::PRIORITY_NORMAL,
+            };
+            manager.ready[cpu].push_back(ReadyEntry {
+                id,
+                index,
+                priority,
+                age: 0,
+            });
+        }
+        for slot in order.iter_mut() {
+            let Some(index) = dequeue_ready(manager, cpu) else {
+                ok = false;
+                break;
+            };
+            *slot = manager.tasks[index].id;
+        }
+        ok &= order == [ids[3], ids[1], ids[2], ids[0]];
+    }
+
+    // 2. Bounded waiting: the low probe must win after two aging windows
+    //    while a fresh high probe keeps being re-enqueued behind it.
+    let mut aged_round = 0u32;
+    if ok {
+        let Some(low_index) = manager.tasks.iter().position(|task| task.id == ids[0]) else {
+            return false;
+        };
+        let Some(high_index) = manager.tasks.iter().position(|task| task.id == ids[3]) else {
+            return false;
+        };
+        manager.ready[cpu].clear();
+        manager.ready[cpu].push_back(ReadyEntry {
+            id: ids[0],
+            index: low_index,
+            priority: sched_policy::PRIORITY_LOW,
+            age: 0,
+        });
+        manager.ready[cpu].push_back(ReadyEntry {
+            id: ids[3],
+            index: high_index,
+            priority: sched_policy::PRIORITY_HIGH,
+            age: 0,
+        });
+        for round in 1..=32u32 {
+            let Some(index) = dequeue_ready(manager, cpu) else {
+                ok = false;
+                break;
+            };
+            if manager.tasks[index].id == ids[0] {
+                aged_round = round;
+                break;
+            }
+            // The high probe ran and yielded: put it back at the tail as a
+            // fresh arrival, so pressure on the low probe stays constant.
+            manager.ready[cpu].push_back(ReadyEntry {
+                id: ids[3],
+                index: high_index,
+                priority: sched_policy::PRIORITY_HIGH,
+                age: 0,
+            });
+        }
+        ok &= aged_round > 0
+            && aged_round <= (sched_policy::AGING_PASSES as u32 * 2 + 1);
+    }
+
+    // Restore the real queue and retire the probes.
+    manager.ready[cpu].clear();
+    manager.ready[cpu].extend(snapshot);
+    for &id in &ids[..spawned] {
+        if let Some(index) = manager.tasks.iter().position(|task| task.id == id) {
+            manager.tasks[index].state = TaskState::Dead;
+            manager.tasks[index].running_on = None;
+        }
+    }
+    reap_dead_tasks(manager);
+    for &id in &ids[..spawned] {
+        if let Some(index) = manager
+            .tasks
+            .iter()
+            .position(|task| task.id == id && task.state == TaskState::Zombie)
+        {
+            take_zombie(manager, index);
+        }
+    }
+
+    if ok {
+        console::write_str("SMP SELFTEST: priority PASS (high first, FIFO in class, low aged in ");
+        console::write_dec_u64(aged_round as u64);
+        console::write_str(" round(s))\r\n");
+    } else {
+        console::write_str("SMP SELFTEST: priority FAIL (spawned=");
+        console::write_dec_u64(spawned as u64);
+        console::write_str(" order=");
+        console::write_dec_u64(order[0]);
+        console::write_str(",");
+        console::write_dec_u64(order[1]);
+        console::write_str(",");
+        console::write_dec_u64(order[2]);
+        console::write_str(",");
+        console::write_dec_u64(order[3]);
+        console::write_str(" aged_round=");
+        console::write_dec_u64(aged_round as u64);
+        console::write_str(")\r\n");
+    }
+    ok
+}
+
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+extern "C" fn push_probe_task() -> ! {
+    exit_current()
+}
+
+/// Proves push migration on the real queue: with one probe queued locally and
+/// an idle, empty peer, `push_migrate` must move the probe to that peer. Skips
+/// (returns true) when no peer is idle, which is legitimate for a profile that
+/// keeps every CPU busy.
+#[cfg(all(feature = "smp", feature = "smp-selftest"))]
+pub fn run_push_selftest() -> bool {
+    const PUSH_PROBE_ID: u64 = 1 << 46;
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    let me = smp::this_cpu_id();
+    // Pick an online peer and mark it idle for the test. A live AP is usually
+    // parked on the kernel lock with no current task here, so observing real
+    // idleness would make this test timing-dependent; the real `push_migrate`
+    // path uses `cpu_is_idle` and is visible in the `push=` dispatch counter.
+    let Some(target) = (0..smp::MAX_CPUS)
+        .find(|&cpu| cpu != me && cpu < smp::cpu_count() && smp::cpu_online(cpu))
+    else {
+        console::write_str("SMP SELFTEST: push SKIP (no online peer)\r\n");
+        return true;
+    };
+    // Set the peer's queue aside (we hold the kernel lock, so it cannot drain
+    // it) and restore it after the probe.
+    let saved_target_queue: Vec<ReadyEntry> = manager.ready[target].drain(..).collect();
+
+    let saved_next = manager.next_id;
+    manager.next_id = PUSH_PROBE_ID;
+    let probe = spawn_kernel(push_probe_task);
+    manager.next_id = saved_next;
+    let Some(id) = probe else {
+        return false;
+    };
+    // A pass on another CPU cannot run while this CPU holds the kernel lock,
+    // so the queue is stable: drop any copy spawn made and install exactly
+    // one entry at the back of the local queue.
+    for cpu in 0..smp::MAX_CPUS {
+        manager.ready[cpu].retain(|entry| entry.id != id);
+    }
+    let Some(index) = manager.tasks.iter().position(|task| task.id == id) else {
+        return false;
+    };
+    manager.ready[me].push_back(ReadyEntry {
+        id,
+        index,
+        priority: manager.tasks[index].priority,
+        age: 0,
+    });
+
+    let cpus = smp::cpu_count().clamp(1, smp::MAX_CPUS);
+    let mut idle = [false; smp::MAX_CPUS];
+    idle[target] = true;
+    let moved = push_migrate_with(manager, me, &idle[..cpus]).is_some();
+    let on_target = manager.ready[target].iter().any(|entry| entry.id == id);
+    let off_source = !manager.ready[me].iter().any(|entry| entry.id == id);
+
+    // Undo the test's view of the target queue: drop the probe (it is retired
+    // below) and put the peer's own entries back in their original order.
+    manager.ready[target].retain(|entry| entry.id != id);
+    manager.ready[target].extend(saved_target_queue);
+
+    // Retire the probe before it can run.
+    if let Some(index) = manager.tasks.iter().position(|task| task.id == id) {
+        manager.tasks[index].state = TaskState::Dead;
+        manager.tasks[index].running_on = None;
+    }
+    reap_dead_tasks(manager);
+    if let Some(index) = manager
+        .tasks
+        .iter()
+        .position(|task| task.id == id && task.state == TaskState::Zombie)
+    {
+        take_zombie(manager, index);
+    }
+
+    let ok = moved && on_target && off_source;
+    if ok {
+        console::write_str("SMP SELFTEST: push PASS (probe moved to CPU");
+        console::write_dec_u64(target as u64);
+        console::write_str(")\r\n");
+    } else {
+        console::write_str("SMP SELFTEST: push FAIL (target=");
+        console::write_dec_u64(target as u64);
+        console::write_str(" moved=");
+        console::write_dec_u64(moved as u64);
+        console::write_str(" on_target=");
+        console::write_dec_u64(on_target as u64);
+        console::write_str(" off_source=");
+        console::write_dec_u64(off_source as u64);
+        console::write_str(")\r\n");
+    }
+    ok
 }
 
 /// Runs one blocking scheduling step for a caller that does not necessarily
@@ -1734,7 +2055,8 @@ fn remap_current_indices(
             .iter()
             .position(|task| task.id == *current_id)
             .unwrap_or(usize::MAX);
-        smp::set_current_index_for(cpu, index);
+        let published = if index == usize::MAX { 0 } else { *current_id };
+        smp::set_current_task_for(cpu, index, published);
     }
     // The caller's own CPU may be missing from the snapshot only if it is not
     // `online`; `live_id` remains the authoritative value for it. A `None`
@@ -1746,7 +2068,8 @@ fn remap_current_indices(
             .iter()
             .position(|task| task.id == id)
             .unwrap_or(usize::MAX);
-        smp::set_current_index(index);
+        let published = if index == usize::MAX { 0 } else { id };
+        smp::set_current_task(index, published);
     }
 }
 
@@ -1883,10 +2206,10 @@ fn verify_scheduling_invariants(manager: &TaskManager) -> Result<(), &'static st
     // rebuild; an id that no longer matches `tasks[index]` means the same drift
     // was not rebuilt. Either would be a dispatch-time memory-safety bug.
     for queue in &manager.ready {
-        for &(id, index) in queue {
-            match tasks.get(index) {
+        for entry in queue {
+            match tasks.get(entry.index) {
                 None => return Err("a ready queue holds an out-of-range index"),
-                Some(task) if task.id != id => {
+                Some(task) if task.id != entry.id => {
                     return Err("a ready queue entry names the wrong task")
                 }
                 _ => {}
@@ -2426,7 +2749,7 @@ pub fn schedule() {
     let next_context_elr = next_task.context.elr;
     next_task.state = TaskState::Running;
     next_task.running_on = Some(smp::this_cpu_id());
-    smp::set_current_index(next_index);
+    smp::set_current_task(next_index, next_id);
 
     let has_current = current_index < tasks_len;
     let current_context = if live_is_dead {
@@ -2896,34 +3219,63 @@ fn enqueue_ready(manager: &mut TaskManager, cpu: usize, index: usize) {
     if !ready_for_queue(manager, index) {
         return;
     }
-    let id = manager.tasks[index].id;
+    let task = &manager.tasks[index];
+    let id = task.id;
+    let priority = task.priority;
     let cpu = cpu.min(smp::MAX_CPUS - 1);
     if !manager.ready[cpu]
         .iter()
-        .any(|&(queued_id, queued_index)| queued_index == index && queued_id == id)
+        .any(|entry| entry.index == index && entry.id == id)
     {
-        // Back of the queue: newest last, so the oldest runnable task is the
-        // next one dispatched.
-        manager.ready[cpu].push_back((id, index));
+        // Back of the queue: newest last, so same-class work stays FIFO. The
+        // age starts at zero; a freshly readied task has not waited yet.
+        manager.ready[cpu].push_back(ReadyEntry {
+            id,
+            index,
+            priority,
+            age: 0,
+        });
     }
 }
 
 /// Pops the next dispatchable task from `cpu`'s queue, discarding stale
 /// entries: a task that was killed, blocked again, claimed by another CPU, or
 /// whose index was shifted by a removal (the stored id no longer matches).
+///
+/// Each call is one aging round: every entry that stays queued gains one
+/// pass, so a low-class task is promoted even while high-class arrivals keep
+/// the queue non-empty.
 fn dequeue_ready(manager: &mut TaskManager, cpu: usize) -> Option<usize> {
     let cpu = cpu.min(smp::MAX_CPUS - 1);
-    while let Some((id, index)) = manager.ready[cpu].pop_front() {
+    for entry in manager.ready[cpu].iter_mut() {
+        entry.age = entry.age.saturating_add(1);
+    }
+    loop {
+        let entry = pop_best(&mut manager.ready[cpu])?;
         let same_task = manager
             .tasks
-            .get(index)
-            .map(|task| task.id == id)
+            .get(entry.index)
+            .map(|task| task.id == entry.id)
             .unwrap_or(false);
-        if same_task && ready_for_queue(manager, index) {
-            return Some(index);
+        if same_task && ready_for_queue(manager, entry.index) {
+            return Some(entry.index);
         }
     }
-    None
+}
+
+/// Removes and returns the entry the policy would dispatch: the FIFO-first
+/// entry with the best (lowest) effective class.
+fn pop_best(queue: &mut VecDeque<ReadyEntry>) -> Option<ReadyEntry> {
+    let mut best = None;
+    let mut best_class = u8::MAX;
+    for (position, entry) in queue.iter().enumerate() {
+        let class = sched_policy::effective(entry.priority, entry.age);
+        if class < best_class {
+            best = Some(position);
+            best_class = class;
+        }
+    }
+    queue.remove(best?)
 }
 
 /// Rebuilds every queue from the task table. Required after any operation that
@@ -2941,9 +3293,68 @@ fn rebuild_ready_queues(manager: &mut TaskManager) {
         let task = &tasks[index];
         if !task.is_idle && task.state == TaskState::Ready && task.running_on.is_none() {
             let cpu = index % cpus;
-            ready[cpu].push_back((task.id, index));
+            ready[cpu].push_back(ReadyEntry {
+                id: task.id,
+                index,
+                priority: task.priority,
+                age: 0,
+            });
         }
     }
+}
+
+/// True when `cpu` is online and currently runs its idle task. Read under the
+/// kernel lock, which serialises every `current_index` mutation.
+#[cfg(feature = "smp")]
+fn cpu_is_idle(manager: &TaskManager, cpu: usize) -> bool {
+    if !smp::cpu_online(cpu) {
+        return false;
+    }
+    let index = smp::current_index_of(cpu);
+    manager
+        .tasks
+        .get(index)
+        .is_some_and(|task| task.is_idle)
+}
+
+/// Moves one queued task from `from` to an idle peer, if the policy finds a
+/// worthwhile target. Called after a successful local dispatch: a CPU that
+/// still holds work shares it instead of letting an idle PE sleep through a
+/// timer window. The entry keeps its age, so a migrated low-class task does
+/// not restart its aging.
+#[cfg(feature = "smp")]
+fn push_migrate(manager: &mut TaskManager, from: usize) -> bool {
+    let cpus = smp::cpu_count().clamp(1, smp::MAX_CPUS);
+    let mut idle = [false; smp::MAX_CPUS];
+    for cpu in 0..cpus {
+        idle[cpu] = cpu_is_idle(manager, cpu);
+    }
+    let moved = push_migrate_with(manager, from, &idle[..cpus]);
+    if let Some(target) = moved {
+        #[cfg(all(feature = "smp", feature = "smp-selftest"))]
+        READY_PUSH_PICKS[target].fetch_add(1, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
+
+/// [`push_migrate`] with an explicit idle view. Kept separate so the boot test
+/// can exercise the queue move deterministically: a live AP is usually parked
+/// on the kernel lock with no current task at that moment, so "really idle"
+/// cannot be observed from the boot CPU.
+#[cfg(feature = "smp")]
+fn push_migrate_with(manager: &mut TaskManager, from: usize, idle: &[bool]) -> Option<usize> {
+    let from = from.min(smp::MAX_CPUS - 1);
+    let cpus = idle.len().clamp(1, smp::MAX_CPUS);
+    let mut loads = [0usize; smp::MAX_CPUS];
+    for (cpu, load) in loads.iter_mut().enumerate().take(cpus) {
+        *load = manager.ready[cpu].len();
+    }
+    let target = sched_policy::push_target(&loads[..cpus], idle, from)?;
+    let entry = manager.ready[from].pop_back()?;
+    manager.ready[target].push_back(entry);
+    Some(target)
 }
 
 fn find_next_task(manager: &mut TaskManager, cpu: usize, scan_base: usize) -> Option<usize> {
@@ -2951,6 +3362,8 @@ fn find_next_task(manager: &mut TaskManager, cpu: usize, scan_base: usize) -> Op
     if let Some(index) = dequeue_ready(manager, cpu) {
         #[cfg(all(feature = "smp", feature = "smp-selftest"))]
         note_pick(&READY_LOCAL_PICKS, cpu);
+        #[cfg(feature = "smp")]
+        push_migrate(manager, cpu);
         return Some(index);
     }
     // 2. Work stealing: take one dispatchable task from another CPU's queue.
@@ -3440,6 +3853,7 @@ impl Task {
             state: TaskState::Ready,
             resume_state: None,
             is_idle: false,
+            priority: sched_policy::PRIORITY_NORMAL,
             program: user.map_or(u64::MAX, |(program, _)| program),
             argument: user.map_or(0, |(_, argument)| argument),
             cap_table,

@@ -464,6 +464,12 @@ pub fn init() {
 
     clean_tables_to_point_of_coherency();
     configure_and_enable();
+    // Caches were off while the boot stub and this function built and
+    // published the tables, so the D-cache may still hold firmware lines.
+    // `cache::init_boot` drops them and enables C/I; from that point the
+    // table-clean and DMA-clean rituals are load-bearing rather than
+    // ceremonial.
+    crate::cache::init_boot();
 }
 
 fn table_descriptor(table: &Table) -> u64 {
@@ -609,6 +615,31 @@ fn clean_cache_range(start: usize, end: usize) {
             );
             line += line_size;
         }
+    }
+}
+
+/// Invalidates (no write-back) every data-cache line overlapping
+/// `[start, end)`.
+///
+/// This is the receive half of the DMA handover: after a device (or another
+/// non-cacheable agent) wrote the buffer, a clean line may still hold the old
+/// contents. Invalidating by VA discards that copy so the next load observes
+/// memory. Never call this on lines that hold the only copy of dirty data.
+pub fn invalidate_range(start: usize, end: usize) {
+    let line_size = data_cache_line_size();
+    let mask = line_size - 1;
+    let mut line = start & !mask;
+    let end = end.saturating_add(mask) & !mask;
+    unsafe {
+        while line < end {
+            core::arch::asm!(
+                "dc ivac, {line}",
+                line = in(reg) line,
+                options(nostack, preserves_flags),
+            );
+            line += line_size;
+        }
+        core::arch::asm!("dsb sy", options(nostack, preserves_flags));
     }
 }
 
@@ -1921,6 +1952,15 @@ pub fn run_tlb_self_test() -> bool {
 /// Proves that a recycled DMA frame is zeroed before it is published to EL0.
 /// The frame is poisoned, then mapped through the same `map_dma_to_user_space`
 /// path userspace DMA uses; any stale byte would still be readable afterwards.
+///
+/// With caches enabled the test also crosses the two aliases: the zeroes must
+/// be visible through the Normal Non-Cacheable mapping (the clean in the
+/// publish path is what puts them in memory), and a write through that mapping
+/// must become visible to the cacheable kernel alias after an invalidate.
+/// On hardware that models caches, removing either maintenance step makes this
+/// check fail once `SCTLR_EL1.C` is on; QEMU does not model caches, so there
+/// the probe passes either way and is HIL evidence rather than an emulated
+/// discriminator.
 pub fn run_dma_zero_self_test() -> bool {
     let Some((private, private_generation)) = frame_allocator::alloc_page_tagged() else {
         return false;
@@ -1940,7 +1980,7 @@ pub fn run_dma_zero_self_test() -> bool {
     }
     clean_range_to_poc(frame, GRANULE);
 
-    let mapped = map_dma_to_user_space(space, frame, GRANULE).is_some();
+    let mapped = map_dma_to_user_space(space, frame, GRANULE);
     let mut zeroed = true;
     for index in 0..GRANULE {
         let byte = unsafe { (phys_to_virt(frame) as *const u8).add(index).read() };
@@ -1950,9 +1990,30 @@ pub fn run_dma_zero_self_test() -> bool {
         }
     }
 
+    let mut coherent = false;
+    if let Some(va) = mapped {
+        let saved_daif = crate::interrupts::save_and_disable_irq();
+        let previous = current_ttbr0();
+        switch_address_space(space);
+        // Direction 1: CPU wrote, device reads. The zeros were written through
+        // the cacheable alias; the NC side must see them after the clean.
+        let mut probe = [0xFF_u8; 8];
+        let visible =
+            crate::user_memory::copy_from_user(va as u64, &mut probe).is_ok()
+                && probe == [0_u8; 8];
+        // Direction 2: device wrote, CPU reads. The device updates memory
+        // behind a clean cached line; only an invalidate can expose it.
+        let wrote = crate::user_memory::copy_to_user(&[0x5A], va as u64).is_ok();
+        invalidate_range(phys_to_virt(frame), phys_to_virt(frame) + GRANULE);
+        let read_back = unsafe { (phys_to_virt(frame) as *const u8).read_volatile() };
+        switch_address_space(previous);
+        crate::interrupts::restore_irq(saved_daif);
+        coherent = visible && wrote && read_back == 0x5A;
+    }
+
     destroy_task_space(token, private, private_generation, asid_of(space));
     frame_allocator::free_page_tagged(frame, frame_generation);
-    mapped && zeroed
+    mapped.is_some() && zeroed && coherent
 }
 
 /// Proves the heap-L3 persistence contract exercised by `SYS_MUNMAP`/`brk`:

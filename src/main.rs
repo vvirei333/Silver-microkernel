@@ -11,6 +11,8 @@ mod boot;
 #[cfg(not(feature = "std"))]
 mod boot_metrics;
 #[cfg(not(feature = "std"))]
+mod cache;
+#[cfg(not(feature = "std"))]
 mod capability;
 #[cfg(not(feature = "std"))]
 mod channel;
@@ -1286,6 +1288,20 @@ pub extern "C" fn kernel_main() -> ! {
     // Console first: a bad memory map must be *reported* before the
     // allocator asserts on an empty window.
     console::init();
+    // Cache state is reported on every console-capable profile. The boot
+    // self-test below re-checks the same bits on the APs, whose values are
+    // recorded per CPU rather than inferred from this line.
+    #[cfg(not(feature = "tablet"))]
+    {
+        console::write_str("CACHE=");
+        if cache::caches_on(cache::read_sctlr()) {
+            console::write_str("ON line=");
+            console::write_dec_u64(cache::line_bytes() as u64);
+        } else {
+            console::write_str("OFF");
+        }
+        console::write_str("\r\n");
+    }
     #[cfg(feature = "fog-paint")]
     fog::paint(0xFFFF_FF00); // yellow: console/probe path is alive
     #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]

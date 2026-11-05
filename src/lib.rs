@@ -8,12 +8,14 @@
 
 extern crate alloc;
 
+pub mod cache_policy;
 pub mod fdt;
 pub mod fog_validate;
 pub mod gicv3_policy;
 pub mod irq_policy;
 pub mod phys_range;
 pub mod reloc;
+pub mod sched_policy;
 pub mod table_registry;
 pub mod wait_queue;
 pub mod watchdog_policy;

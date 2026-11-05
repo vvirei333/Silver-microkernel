@@ -15,8 +15,9 @@ portable cache-line helper; fail-closed FDT/region parsing; zeroed DMA
 publication; serialized PL011 RX; GICv3 single-window bound-IRQ dispatch;
 AP publication gated on a usable banked GIC; round-qualified quiescence;
 up to four QEMU CPUs with per-CPU timer liveness; an FDT-sized CPU slot
-count; in-order dispatch; and a monitor that reports a PE which stops
-making progress.
+count; in-order dispatch; three priority classes with aging; push migration
+to idle peers; a kernel-lock stall detector; and a monitor that reports a PE
+which stops making progress.
 
 **SMP feature program (2026-11-04):** four packages, in order —
 (1) per-CPU ready queues **[done]**, (2) ASID-tagged address spaces **[done]**,
@@ -258,6 +259,82 @@ depend on four online CPUs.
   out firmware-reserved memory. Host tests cover an overflowing child `reg`, a
   carve-out list that does not fit, and an oversized memreserve map.
   `CpuCounter` also counts only direct `/cpus` children.
+- **Priority classes with aging (2026-11-05).** The ready queue now carries a
+  scheduling class per entry (0 high, 1 normal, 2 low; every task defaults to
+  Normal) and an age in dispatch attempts. `dequeue_ready` ages every queued
+  entry once per call and dispatches the FIFO-first entry with the best
+  effective class; `sched_policy::effective` promotes one class every
+  `AGING_PASSES` (8) rounds, so a low-class task reaches the top class after
+  at most `(classes - 1) * AGING_PASSES` attempts regardless of how many
+  high-class arrivals keep the queue busy. Within a class the order stays
+  FIFO. The decision function is host-tested (`sched_policy`, 6 tests); the
+  boot probe `run_priority_selftest` drives the real queue: high enqueued last
+  is dispatched first, normal probes keep spawn order, and a low probe under
+  constant high pressure wins after 16 rounds
+  (`priority PASS (high first, FIFO in class, low aged in 16 round(s))`).
+  Setting `AGING_PASSES` to 1000, i.e. disabling aging, produces
+  `priority FAIL (... aged_round=0)` while the order part still passes.
+  There is no syscall: `set_task_priority` is kernel-only and userspace tasks
+  stay Normal, so the EL0 ABI is unchanged.
+- **Push migration (2026-11-05).** After a successful local dispatch, a CPU
+  that still has queued work calls `push_migrate`: `cpu_is_idle` builds an
+  idle view, `sched_policy::push_target` picks the first idle peer with an
+  empty queue, and the back entry is moved there with its `age` intact, so a
+  migrated low-class task does not restart its aging. A push is refused when
+  the destination already has local work, which would reorder its queue for
+  no gain. The policy is host-tested; the dispatch mix now reports `push=`.
+  A live AP is normally parked on the kernel lock during the boot selftests
+  (no current task or a stale index), so `run_push_selftest` passes an
+  explicit idle mask to `push_migrate_with` and verifies the real queue move;
+  the live `cpu_is_idle` path is evidenced by `push=1` in ordinary `-smp 4`
+  runs. Disabling `push_target` makes the probe fail (`moved=0`, `push=0`)
+  while churn still passes. No IPI is sent: an idle PE re-evaluates its queue
+  on the next 10 ms timer tick.
+- **Data/instruction caches (2026-11-05).** The boot stub builds the tables
+  and enables the MMU with `SCTLR_EL1.C = 0`, `I = 0`, so every access is plain
+  memory. `mmu::init` now ends in `cache::init_boot`, which invalidates the
+  inherited data cache by set/way (boot-only, single PE, so no shared-cache
+  hazard yet), invalidates the instruction cache, and sets `C | I` in one
+  `SCTLR_EL1` write. Every AP calls `cache::enable_secondary` as its first
+  Rust-side action, before console/slot/scheduler state, so its memory
+  attributes match the boot CPU's before it touches shared data; it does not
+  run the set/way sweep, which would be unsafe once another PE has dirty
+  lines. Each CPU stores the `SCTLR_EL1` value it read back and
+  `run_cache_selftest` requires `C=1 I=1` for every online CPU
+  (`SMP SELFTEST: cache PASS (4 CPU(s) C=1 I=1)`); a build with
+  `cache::ENABLE_CACHES = false` boots with `CACHE=OFF` and reports
+  `cache FAIL (... local_sctlr=0x...50839)` rather than skipping silently.
+  Two consequences that only matter once caches are real:
+  `boot_secondary_cpus` now cleans the freshly zeroed AP stack to the point of
+  coherency (a dirty zero line in the boot CPU's cache would otherwise be
+  written back over the AP's live stack), and `run_dma_zero_self_test` now
+  crosses the cacheable and Normal Non-Cacheable aliases in both directions,
+  cleaning before the device reads and invalidating before the CPU reads after
+  the device wrote. QEMU does not model caches, so that probe is HIL evidence;
+  the `SCTLR_EL1` read-back is what the emulated run proves.
+- **Kernel-lock stall detector (2026-11-05).** `bkl_acquire` now timestamps
+  the start of its retry loop and, after one second without acquiring (or 50M
+  yields before global time exists), prints one `BKL STALL:` line per waiter
+  episode with the holder CPU, holder depth, waiter CPU/depth, elapsed ticks,
+  spins, and the holder's task id. Each CPU mirrors its current task id into
+  an atomic (`PerCpu::current_task`) when the scheduler changes its index, so
+  the diagnostic reads a plain atomic on a PE that does not hold the lock
+  instead of walking the scheduler vector while another CPU mutates it;
+  `bkl_depth` is likewise an atomic read-only-from-peers field. Printing is
+  single-flight (`BKL_REPORTING`) so two waiters never interleave their fields
+  into one unreadable console line; the counter still counts every episode.
+  capped at one report: the holder may recover. There is no recovery
+  mechanism — stealing a live lock is unsafe — and the report is a diagnostic
+  for a bug that would otherwise look like a silent hang. Quiesce parking
+  restarts the window, because a stop-the-world round intentionally blocks
+  waiters. `run_bkl_stall_selftest` holds the lock just past the threshold
+  while the APs are blocked in `bkl_acquire` and requires their reports; the
+  reports are silenced for the probe so ordinary logs stay clean. Disabling
+  the detector makes the probe fail (`bkl stall FAIL (reports=0)`).
+  The detector immediately found a real bug in our own `stall_probe_task`: a
+  newly dispatched kernel task inherits the dispatcher's BKL hold, and the
+  probe did not drop it, so its 1.2 s masked spin also blocked every other
+  CPU. It now drops the inherited hold exactly like `churn_task`.
 - **Per-CPU stall watchdog (2026-11-05, `35c44b4`).** A PE that has entered
   the scheduler loop must take its timer PPI or complete a scheduling pass
   every check round. After three consecutive 250 ms rounds without progress,
@@ -267,28 +344,33 @@ depend on four online CPUs.
   module. Exemptions keep the signal honest: only PEs that called
   `cpu_started` are judged (AP bring-up and `ap_tlb_probe_wait` are out), a
   stop-the-world quiesce rebases every grace window, and a CPU parked in
-  `bkl_acquire` is marked waiting because `BKL STUCK` owns that condition.
+  `bkl_acquire` is marked waiting because the dedicated BKL stall detector
+  owns that condition.
   The boot logs `WATCHDOG: policy PASS` and
   `WATCHDOG: heartbeat PASS (4 CPU(s) ticking)`. The opt-in `smp-churn`
   profile adds a real negative test: a kernel task masks IRQs and spins for
   1.2 s, another PE reports it, and the task is retired
   (`watchdog stall PASS`). Disabling the check call yields
   `watchdog stall FAIL (reported=0 ...)`, so the harness is not vacuous.
-- Verified in this snapshot: **156 host tests**, fog QEMU relocation/at-link/
+- Verified in this snapshot: **171 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
   demo regression **66 PASS / 0 PANIC** on both the default build and
   `no_std,smp` with QEMU `-smp 2` and `-smp 4`, `no_std,smp-selftest` logging
   `ready fifo PASS (3 probes in spawn order)`,
+  `priority PASS (high first, FIFO in class, low aged in 16 round(s))`,
   `WATCHDOG: policy PASS`, `WATCHDOG: heartbeat PASS (4 CPU(s) ticking)`,
+  `push PASS (probe moved to CPU<n>)`,
+  `bkl stall PASS (3 waiter report(s))`,
+  `SMP SELFTEST: cache PASS (4 CPU(s) C=1 I=1)` and `CACHE=ON line=64`,
   `tlb cross-PE PASS (3 peer CPU(s) saw the remap)`,
   `quiesce PASS (64 rounds, 3 peer CPU(s))` and `ticks PASS (3 peer CPU(s))`
   on `-smp 4` (one peer on `-smp 2`), and the combined
-  `no_std,smp,demo-tasks,smp-selftest` profile at **74 PASS / 0 FAIL / 0 PANIC**
-  with zero invariant failures and a `ready queues local=.. steal=.. scan=..`
-  dispatch-mix line, including `clock PASS (CPU0 masked, ticks +1)`. The
+  `no_std,smp,demo-tasks,smp-selftest` profile at **77 PASS / 0 FAIL / 0 PANIC**
+  with zero invariant failures and a `ready queues local=.. steal=.. scan=..
+  push=..` dispatch-mix line, including `clock PASS (CPU0 masked, ticks +1)`. The
   opt-in `no_std,smp-selftest,smp-churn` profile passes `churn PASS` and
   `watchdog stall PASS` on `-smp 2`, `-smp 3` and `-smp 4` with the audit
-  active and no lock underflow or `BKL STUCK`; the stall is detected on
+  active and no lock underflow or real BKL stall report; the stall is detected on
   different APs across runs (CPU1 and CPU3 observed). A negative build that
   drops the `running_on` claim makes the invariant check fire on the next pass
   (`sched invariant FAIL (a CPU's current task is not marked running on it)`).
@@ -328,7 +410,7 @@ Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
   defined `unregister_mutex` not-found path, ipc receive bisect bypass
   removed).
 - **Verified working at that checkpoint:** single-CPU boot unchanged;
-  `cargo test --lib` 13/13 (the current suite is 156/156); debug and release
+  `cargo test --lib` 13/13 (the current suite is 171/171); debug and release
   builds pass.
 - **Historical (fixed): `-smp 2`** died at silverd's first blocking IPC
   receive at the 2026-11-01 checkpoint; the layers below are the investigation
@@ -1418,8 +1500,9 @@ handles both CR and LF from UART.
 - Translation uses 48-bit VAs on both halves (T0SZ=T1SZ=16), 4 KB granules,
   40-bit PAs and four table levels. MMIO is device-nGnRnE; ordinary DRAM is
   normal WB inner-shareable; user DMA is Normal Non-Cacheable. MAIR entries
-  are `0xFF`, `0x00`, `0x44` at indices 0, 1, 2. Data/instruction caches remain
-  off (SCTLR.C/I = 0).
+  are `0xFF`, `0x00`, `0x44` at indices 0, 1, 2. Data/instruction caches are
+  off through the boot stub (SCTLR.C/I = 0) and are enabled by
+  `mmu::init` -> `cache::init_boot` once the tables are published.
 
 ## Boot and high-half memory model
 
@@ -1955,17 +2038,10 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 ## Kernel hardening queue (2026-11-05)
 
-- **Priority + aging** on top of the FIFO ready queues: two or three classes
-  with aging so the lowest class cannot starve; a boot test must prove order
-  and bounded waiting.
-- **Push migration** for skewed per-CPU queues (work stealing is pull-only).
-- **BKL-holder watchdog:** the stall monitor deliberately exempts a CPU parked
-  in `bkl_acquire`; a holder that never releases is only reported by the
-  one-shot `BKL STUCK` line today, with no timeout or recovery.
-- **Caches (`SCTLR.C/I`):** the table-clean ritual in
-  `mmu::flush_after_table_change` becomes mandatory once caches are on;
-  re-verify `dc cvac`/`tlbi` ordering on physical `rain` (step 9 below keeps
-  the HIL caveat).
+- **Caches on physical hardware:** QEMU does not model caches, so the
+  `dc cvac`/`dc ivac`/`tlbi` ordering, the reported `CTR_EL0` line size, the
+  AP cold-cache assumption and the AP stack clean are HIL items; re-verify
+  them on `rain` before trusting the cached SMP path there (step 8 below).
 - **VM extensions:** file-backed and sparse multi-window mappings, growable
   stacks and demand paging on top of `SYS_MMAP`/`SYS_MUNMAP`.
 - **Spawn credentials and a userspace DMA-lease syscall** need an explicit
@@ -1998,11 +2074,11 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
    segments instead of slurping the whole file, load from the on-disk SFS once
    it can read files, and add PIE/dynamic linking later. A program-credential
    model should gate both `spawn` and `run` (see step 2).
-8. **Enable caches** (SCTLR.C/I): once enabled, the table-clean ritual in
-   `mmu::flush_after_table_change` becomes mandatory, not ceremonial. The
-   maintenance loops already read `CTR_EL0.DminLine`; re-verify on physical
-   `rain` that `dc cvac`/`tlbi` ordering is correct and that the reported line
-   size matches the maintenance behaviour.
+8. **Caches on physical hardware**: software enablement is done (see the
+   2026-11-05 package), and the table-clean/DMA-clean rituals are now
+   mandatory rather than ceremonial. What remains is HIL evidence on `rain`:
+   `dc cvac`/`dc ivac`/`tlbi` ordering, the reported line size, the AP
+   cold-cache assumption and the AP stack clean (QEMU does not model caches).
 
 Nameserver watch notifications are explicitly deferred. Later IPC control-plane
 work should also address nonblocking/priority replies, send timeouts/cancellation
