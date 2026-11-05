@@ -89,6 +89,115 @@ pub fn used_pages() -> usize {
     state.total_pages - state.free_pages
 }
 
+/// Test/bisect lever: a value other than `usize::MAX` replaces the policy
+/// reserve. The boot self-test uses it to prove the gate refuses without
+/// draining the machine.
+static USER_RESERVE_OVERRIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+/// Frames currently kept out of user-visible allocations.
+pub fn user_reserve_frames() -> usize {
+    let override_value = USER_RESERVE_OVERRIDE.load(Ordering::Relaxed);
+    if override_value == usize::MAX {
+        silver_microkernel::mem_policy::reserve_frames(total_pages())
+    } else {
+        override_value
+    }
+}
+
+fn user_alloc_allowed(page_count: usize) -> bool {
+    let free = free_pages();
+    let override_value = USER_RESERVE_OVERRIDE.load(Ordering::Relaxed);
+    if override_value == usize::MAX {
+        silver_microkernel::mem_policy::user_alloc_ok(free, page_count, total_pages())
+    } else {
+        free.checked_sub(override_value)
+            .map_or(false, |remaining| remaining >= page_count)
+    }
+}
+
+/// Allocates one frame for user-visible memory. Refuses when the request would
+/// dip into [`user_reserve_frames`], so user tasks cannot drain the frames the
+/// kernel and its devices still need. Every caller runs under the kernel lock,
+/// which serializes the check with the other CPUs' user allocations.
+pub fn alloc_user_page_tagged() -> Option<(usize, u32)> {
+    if !user_alloc_allowed(1) {
+        return None;
+    }
+    alloc_page_tagged()
+}
+
+/// Contiguous variant of [`alloc_user_page_tagged`].
+pub fn alloc_user_contiguous_pages_tagged(page_count: usize) -> Option<(usize, u32)> {
+    if page_count == 0 || !user_alloc_allowed(page_count) {
+        return None;
+    }
+    alloc_contiguous_pages_tagged(page_count)
+}
+
+/// Boot proof that the user-reserve gate is wired and one-sided: it refuses a
+/// user page when the reserve is forced one frame above the free count, while
+/// the raw kernel allocator keeps working and the normal path opens again once
+/// the override is cleared.
+pub fn run_user_reserve_selftest() -> bool {
+    let free = free_pages();
+    let total = total_pages();
+    let reserve = silver_microkernel::mem_policy::reserve_frames(total);
+    let policy_ok = reserve <= total / 2 && reserve < total.max(1);
+
+    // The normal path must be grantable on a healthy boot.
+    let normal = alloc_user_page_tagged();
+    let normal_ok = normal.is_some();
+    if let Some((page, tag)) = normal {
+        free_page_tagged(page, tag);
+    }
+
+    // Force the reserve above the free count: user allocations are refused,
+    // kernel allocations are not.
+    USER_RESERVE_OVERRIDE.store(free.saturating_add(1), Ordering::Relaxed);
+    let refused = alloc_user_page_tagged().is_none();
+    let kernel = alloc_page_tagged();
+    let kernel_ok = kernel.is_some();
+    if let Some((page, tag)) = kernel {
+        free_page_tagged(page, tag);
+    }
+
+    // Clearing the override must restore the policy, not leave it closed.
+    USER_RESERVE_OVERRIDE.store(usize::MAX, Ordering::Relaxed);
+    let restored = alloc_user_page_tagged();
+    let restored_ok = restored.is_some();
+    if let Some((page, tag)) = restored {
+        free_page_tagged(page, tag);
+    }
+
+    let ok = policy_ok && normal_ok && refused && kernel_ok && restored_ok;
+    // The tablet has no proven console; keep the check, skip the writes there.
+    #[cfg(not(feature = "tablet"))]
+    if ok {
+        crate::console::write_str("MEM RESERVE PASS (free=");
+        crate::console::write_dec_u64(free as u64);
+        crate::console::write_str(" reserve=");
+        crate::console::write_dec_u64(reserve as u64);
+        crate::console::write_str(")\r\n");
+    }
+    #[cfg(not(feature = "tablet"))]
+    if !ok {
+        crate::console::write_str("MEM RESERVE FAIL (free=");
+        crate::console::write_dec_u64(free as u64);
+        crate::console::write_str(" reserve=");
+        crate::console::write_dec_u64(reserve as u64);
+        crate::console::write_str(" normal=");
+        crate::console::write_dec_u64(u64::from(normal_ok));
+        crate::console::write_str(" refused=");
+        crate::console::write_dec_u64(u64::from(refused));
+        crate::console::write_str(" kernel=");
+        crate::console::write_dec_u64(u64::from(kernel_ok));
+        crate::console::write_str(" restored=");
+        crate::console::write_dec_u64(u64::from(restored_ok));
+        crate::console::write_str(")\r\n");
+    }
+    ok
+}
+
 /// Read-only allocation query: `true` only when `address` is a page-aligned
 /// frame inside the managed range whose bitmap bit is currently set (used).
 ///

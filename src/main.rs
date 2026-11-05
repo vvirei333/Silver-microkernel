@@ -1362,6 +1362,16 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::log("FRAME ALLOC OK");
     ram_log::fb_progress();
 
+    // User-visible memory (mmap, brk, DMA, ELF images, task stacks) may not
+    // eat the frames the kernel and its devices still need. The gate is a
+    // free-count policy; prove here that it refuses one-sidedly and that the
+    // raw kernel allocator is unaffected.
+    if !frame_allocator::run_user_reserve_selftest() {
+        exceptions::silver_handle_exception(6, 0, 0, 0);
+    }
+    ram_log::log("MEM RESERVE OK");
+    ram_log::fb_progress();
+
     let Some(heap_base) = allocator::init() else {
         exceptions::silver_handle_exception(7, 0, 0, 0);
     };

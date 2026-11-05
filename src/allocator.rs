@@ -4,7 +4,13 @@ use linked_list_allocator::LockedHeap;
 
 use crate::{exceptions, frame_allocator, memory, console};
 
-pub const HEAP_PAGES: usize = 512; // BISECT: doubled from 256
+/// Kernel heap size in 4 KiB pages. 512 pages (2 MiB) is required, not a
+/// leftover bisect knob: the demo resource probe grows a VFS file to the
+/// 512 KiB cap, and `RamFs::write_at` materialises that growth in the kernel
+/// heap (`next_power_of_two`). With 256 pages the combined
+/// `demo-tasks,smp-selftest` build dies with `ALLOCATION ERROR SIZE=0x80000`.
+/// Shrinking this needs file storage moved out of the kernel heap first.
+pub const HEAP_PAGES: usize = 512;
 pub const HEAP_SIZE: usize = HEAP_PAGES * crate::memory::PAGE_SIZE;
 
 struct KernelAllocator {

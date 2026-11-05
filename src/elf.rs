@@ -360,8 +360,9 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedImage, ElfError> {
         return Err(ElfError::HoleInImage);
     }
 
-    let (physical_start, generation) = frame_allocator::alloc_contiguous_pages_tagged(page_count)
-        .ok_or(ElfError::OutOfMemory)?;
+    let (physical_start, generation) =
+        frame_allocator::alloc_user_contiguous_pages_tagged(page_count)
+            .ok_or(ElfError::OutOfMemory)?;
 
     // Zero the whole run (BSS is the tail of `data` that `p_filesz` does not
     // cover), then copy each segment's file bytes over it.

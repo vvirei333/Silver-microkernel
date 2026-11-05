@@ -5,6 +5,7 @@ use alloc::collections::VecDeque;
 use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
 
+use silver_microkernel::mem_policy;
 use silver_microkernel::sched_policy;
 use silver_microkernel::table_registry::TableToken;
 
@@ -24,6 +25,19 @@ const TASK_STACK_SIZE: usize = TASK_STACK_PAGES * PAGE_SIZE;
 const TASK_USER_STACK_PAGES: usize = mmu::USER_STACK_PAGES;
 const TASK_USER_STACK_SIZE: usize = mmu::USER_STACK_SIZE;
 const IDLE_TASK_ID: u64 = 0;
+
+/// Test/bisect lever: a value other than `usize::MAX` replaces the per-task
+/// frame limit (`mem_policy::task_frame_limit`).
+static TASK_LIMIT_OVERRIDE: AtomicUsize = AtomicUsize::new(usize::MAX);
+
+fn task_frame_limit() -> usize {
+    let override_value = TASK_LIMIT_OVERRIDE.load(Ordering::Relaxed);
+    if override_value == usize::MAX {
+        mem_policy::task_frame_limit(frame_allocator::total_pages())
+    } else {
+        override_value
+    }
+}
 
 /// AP idle-task ids live above the user id space so spawning them cannot
 /// shift SCOUT_ID or any other spawn-order identity.
@@ -212,6 +226,11 @@ pub struct Task {
     /// Sum of `mmap_regions` spans, bounded by [`MAX_MMAP_BYTES_PER_TASK`].
     /// Kept separately so the quota check is O(1), not a walk per request.
     mmap_bytes: usize,
+    /// Frames this task has charged to its ledger: every frame it can pin,
+    /// including the fixed address-space tables, stacks, image, heap, mmap and
+    /// DMA. Bounded by `mem_policy::task_frame_limit`; the global user-frame
+    /// reserve is the second, machine-wide bound.
+    mem_frames: usize,
     program_break: usize,
     waiting_on: Option<WaitLink>,
     owned_mutexes: Vec<*mut mutex::MutexState>,
@@ -1039,8 +1058,123 @@ fn finish_init(first_id: u64) {
         .map(|task| task.id)
         .unwrap_or(0);
     smp::set_current_task(first_index, first_task_id);
+    // Run the boot proofs BEFORE `SCHEDULER_READY`: console writes re-enable
+    // IRQs while waiting for FIFO space, so a timer IRQ can reach `schedule()`
+    // in the middle of a selftest. With the scheduler not ready that call is a
+    // no-op; otherwise it would boot the APs and run the whole SMP selftest
+    // suite underneath these checks.
+    if !run_task_ledger_selftest() {
+        panic!("task ledger selftest failed");
+    }
+    if !run_mmap_split_selftest() {
+        panic!("mmap split selftest failed");
+    }
     // From here on `schedule` may run: the current index names a real task.
     SCHEDULER_READY.store(true, Ordering::Release);
+}
+
+/// Boot proof of partial `munmap`: map four pages, remove the middle two,
+/// require the surviving ends to stay mapped and the hole to be gone, refill
+/// the hole (first-fit), then release every remaining range and require the
+/// ledger to return to its baseline.
+pub fn run_mmap_split_selftest() -> bool {
+    let Some(baseline) = current_task_mem_frames() else {
+        return false;
+    };
+    let Some(ttbr0) = current_task_mut().map(|task| task.ttbr0) else {
+        return false;
+    };
+    let page = PAGE_SIZE;
+    let Some(base) = mmap_anonymous(4 * page, mmu::PROT_WRITE) else {
+        return false;
+    };
+    let split = munmap(base + page, 2 * page);
+    let split_regions = current_task_mmap_regions();
+    let holes_gone = !mmu::user_page_is_mapped(ttbr0, base + page)
+        && !mmu::user_page_is_mapped(ttbr0, base + 2 * page);
+    let ends_kept = mmu::user_page_is_mapped(ttbr0, base)
+        && mmu::user_page_is_mapped(ttbr0, base + 3 * page);
+    // First-fit must put the next single page back into the hole.
+    let refilled = mmap_anonymous(page, mmu::PROT_WRITE) == Some(base + page);
+    let mut freed = refilled;
+    if refilled {
+        freed &= munmap(base + page, page);
+        freed &= munmap(base, page);
+        freed &= munmap(base + 3 * page, page);
+    }
+    let empty = current_task_mem_frames() == Some(baseline);
+    let ok = split && holes_gone && ends_kept && refilled && freed && empty;
+    #[cfg(not(feature = "tablet"))]
+    {
+        crate::console::write_str(if ok {
+            "MMAP SPLIT PASS (regions="
+        } else {
+            "MMAP SPLIT FAIL (regions="
+        });
+        crate::console::write_dec_u64(split_regions as u64);
+        crate::console::write_str(", ledger=");
+        crate::console::write_dec_u64(current_task_mem_frames().unwrap_or(0) as u64);
+        crate::console::write_str(")\r\n");
+    }
+    ok
+}
+
+fn current_task_mmap_regions() -> usize {
+    current_task_mut()
+        .map(|task| task.mmap_regions.len())
+        .unwrap_or(0)
+}
+
+/// Current task's charged frame count.
+pub fn current_task_mem_frames() -> Option<usize> {
+    current_task_mut().map(|task| task.mem_frames)
+}
+
+/// Charges `count` frames to the running task's ledger.
+pub fn charge_current_frames(count: usize) -> bool {
+    current_task_mut().map_or(false, |task| task.charge_frames(count))
+}
+
+/// Releases `count` frames from the running task's ledger.
+pub fn release_current_frames(count: usize) {
+    if let Some(task) = current_task_mut() {
+        task.release_frames(count);
+    }
+}
+
+/// Boot proof that the per-task ledger is wired: a two-frame charge fits a
+/// forced limit exactly, one more frame is refused without changing the
+/// counter, releasing restores the original value, and clearing the override
+/// reopens the gate.
+pub fn run_task_ledger_selftest() -> bool {
+    let Some(before) = current_task_mem_frames() else {
+        return false;
+    };
+    let limit = task_frame_limit();
+    TASK_LIMIT_OVERRIDE.store(before.saturating_add(2), Ordering::Relaxed);
+    let charged = charge_current_frames(2);
+    let refused = !charge_current_frames(1);
+    release_current_frames(2);
+    let restored = current_task_mem_frames() == Some(before);
+    TASK_LIMIT_OVERRIDE.store(usize::MAX, Ordering::Relaxed);
+    let reopened = charge_current_frames(1);
+    if reopened {
+        release_current_frames(1);
+    }
+    let ok = charged && refused && restored && reopened && current_task_mem_frames() == Some(before);
+    #[cfg(not(feature = "tablet"))]
+    {
+        crate::console::write_str(if ok {
+            "TASK LEDGER PASS (limit="
+        } else {
+            "TASK LEDGER FAIL (limit="
+        });
+        crate::console::write_dec_u64(limit as u64);
+        crate::console::write_str(" frames, before=");
+        crate::console::write_dec_u64(before as u64);
+        crate::console::write_str(")\r\n");
+    }
+    ok
 }
 
 /// Asserts the SYS_STOP_CONSOLE policy: the syscall requires
@@ -3049,11 +3183,16 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
             console::write_str("DMA: FAIL - no CAP_MMIO rights\r\n");
             return None;
         }
+        if !task.charge_frames(page_count) {
+            console::write_str("DMA: FAIL - per-task memory ledger full\r\n");
+            return None;
+        }
         let (physical, generation) =
-            match frame_allocator::alloc_contiguous_pages_tagged(page_count) {
+            match frame_allocator::alloc_user_contiguous_pages_tagged(page_count) {
                 Some(pair) => pair,
                 None => {
                     console::write_str("DMA: FAIL - alloc_contiguous_pages returned None\r\n");
+                    task.release_frames(page_count);
                     return None;
                 }
             };
@@ -3064,6 +3203,7 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
         let Some(virtual_address) = mmu::map_dma_to_user(task, physical, mapped_size) else {
             console::write_str("DMA: FAIL - mmu::map_dma_to_user returned None\r\n");
             frame_allocator::free_contiguous_pages_tagged(physical, page_count, generation);
+            task.release_frames(page_count);
             return None;
         };
         task.dma_pages.push((physical, page_count, generation));
@@ -3752,13 +3892,30 @@ impl Task {
                 mmu::USER_STACK_SIZE - 1024,
             )?)
         };
+        // Charge the fixed footprint before allocating anything: the image
+        // pages already exist (RAII releases them if this returns None), and
+        // every other frame is allocated below. Page tables beyond the fixed
+        // space are not charged separately (at most one L3 per 2 MiB).
+        let image_frames = image.as_ref().map_or(0, |image| image.page_count);
+        let ledger_frames = TASK_STACK_PAGES
+            + mmu::SPACE_TABLE_FRAMES
+            + 1 // private page
+            + if user.is_some() {
+                TASK_USER_STACK_PAGES + image_frames
+            } else {
+                0
+            };
+        if !mem_policy::task_charge_ok(0, ledger_frames, task_frame_limit()) {
+            return None;
+        }
+
         let Some(stack_start) = kernel_stack::alloc() else {
             return None;
         };
 
         let (user_stack, user_stack_generation) = if user.is_some() {
             let Some((user_start, generation)) =
-                frame_allocator::alloc_contiguous_pages_tagged(TASK_USER_STACK_PAGES)
+                frame_allocator::alloc_user_contiguous_pages_tagged(TASK_USER_STACK_PAGES)
             else {
                 kernel_stack::free(stack_start);
                 return None;
@@ -3771,7 +3928,7 @@ impl Task {
             (MemoryRegion::new(0, 0), 0)
         };
 
-        let Some((private_page, private_page_generation)) = frame_allocator::alloc_page_tagged()
+        let Some((private_page, private_page_generation)) = frame_allocator::alloc_user_page_tagged()
         else {
             if !user_stack.is_empty() {
                 frame_allocator::free_contiguous_pages_tagged(
@@ -3880,11 +4037,27 @@ impl Task {
             dma_pages: Vec::new(),
             mmap_regions: Vec::new(),
             mmap_bytes: 0,
+            mem_frames: ledger_frames,
             program_break: mmu::USER_HEAP_VA,
             waiting_on: None,
             owned_mutexes: Vec::new(),
             running_on: None,
         })
+    }
+
+    /// Charges `count` frames to this task's ledger. All-or-nothing: the
+    /// counter is untouched on refusal.
+    fn charge_frames(&mut self, count: usize) -> bool {
+        if !mem_policy::task_charge_ok(self.mem_frames, count, task_frame_limit()) {
+            return false;
+        }
+        // `task_charge_ok` already proved `mem_frames + count` cannot overflow.
+        self.mem_frames += count;
+        true
+    }
+
+    fn release_frames(&mut self, count: usize) {
+        self.mem_frames = self.mem_frames.saturating_sub(count);
     }
 
     fn change_program_break(&mut self, requested: usize) -> Option<usize> {
@@ -3906,13 +4079,17 @@ impl Task {
             // `dsb`/`tlbi` each. On any failure every freshly allocated frame
             // is returned and the address space is untouched.
             let growth = target_pages - original_pages;
+            if !self.charge_frames(growth) {
+                return None;
+            }
             let mut frames: Vec<usize> = Vec::with_capacity(growth);
             let mut generations: Vec<u32> = Vec::with_capacity(growth);
             for _ in 0..growth {
-                let Some((frame, generation)) = frame_allocator::alloc_page_tagged() else {
+                let Some((frame, generation)) = frame_allocator::alloc_user_page_tagged() else {
                     for (&frame, &generation) in frames.iter().zip(generations.iter()) {
                         frame_allocator::free_page_tagged(frame, generation);
                     }
+                    self.release_frames(growth);
                     return None;
                 };
                 frames.push(frame);
@@ -3922,6 +4099,7 @@ impl Task {
                 for (&frame, &generation) in frames.iter().zip(generations.iter()) {
                     frame_allocator::free_page_tagged(frame, generation);
                 }
+                self.release_frames(growth);
                 return None;
             }
             self.heap_pages
@@ -3934,6 +4112,7 @@ impl Task {
     }
 
     fn truncate_heap(&mut self, target_pages: usize) {
+        let before = self.heap_pages.len();
         while self.heap_pages.len() > target_pages {
             let index = self.heap_pages.len() - 1;
             let mapped = mmu::unmap_user_heap_page(self.ttbr0, index)
@@ -3942,6 +4121,7 @@ impl Task {
             debug_assert_eq!(mapped, tracked.0);
             frame_allocator::free_page_tagged(mapped, tracked.1);
         }
+        self.release_frames(before.saturating_sub(self.heap_pages.len()));
     }
 
     /// Allocates and maps `length` bytes of anonymous memory into a free virtual
@@ -3978,8 +4158,21 @@ impl Task {
             return None;
         }
 
+        // Charge the data pages before the frame allocation. Page tables added
+        // by `map_user_pages_at` beyond the fixed space cost at most one L3 per
+        // 2 MiB (0.2%), which the flat `SPACE_TABLE_FRAMES` charge covers for
+        // budgeting purposes.
+        if !self.charge_frames(page_count) {
+            return None;
+        }
         let (physical_start, generation) =
-            frame_allocator::alloc_contiguous_pages_tagged(page_count)?;
+            match frame_allocator::alloc_user_contiguous_pages_tagged(page_count) {
+                Some(pair) => pair,
+                None => {
+                    self.release_frames(page_count);
+                    return None;
+                }
+            };
         if !mmu::map_user_pages_at(
             self.ttbr0,
             virtual_address,
@@ -3988,6 +4181,7 @@ impl Task {
             prot,
         ) {
             frame_allocator::free_contiguous_pages_tagged(physical_start, page_count, generation);
+            self.release_frames(page_count);
             return None;
         }
 
@@ -4007,7 +4201,9 @@ impl Task {
         Some(virtual_address)
     }
 
-    /// Unmaps the anonymous region that exactly matches `address` and `length`.
+    /// Unmaps a page-aligned sub-range of one anonymous mapping. A range in
+    /// the middle of a mapping splits the bookkeeping into two regions; the
+    /// pages on both sides keep the original physical run and generation.
     fn munmap(&mut self, address: usize, length: usize) -> bool {
         let page_count = length.div_ceil(PAGE_SIZE);
         // Same user-controlled bound as `mmap_anonymous`: an absurd length
@@ -4015,38 +4211,82 @@ impl Task {
         if page_count == 0 || page_count > mmu::USER_MMAP_MAX_PAGES {
             return false;
         }
-        let Some(position) = self.mmap_regions.iter().position(|region| {
-            region.virtual_address == address && region.page_count == page_count
-        }) else {
+        let Some(removal) = silver_microkernel::mmap_remove(
+            self.mmap_regions
+                .iter()
+                .map(|region| (region.virtual_address, region.page_count)),
+            address,
+            page_count,
+            PAGE_SIZE,
+        ) else {
             return false;
         };
-        let region = &self.mmap_regions[position];
+        // A middle range needs one extra bookkeeping slot. Refuse before any
+        // PTE or frame is touched, so a full table leaves the mapping intact.
+        if removal.left_pages > 0
+            && removal.right_pages > 0
+            && self.mmap_regions.len() >= MAX_MMAP_REGIONS
+        {
+            return false;
+        }
+
+        let region = &self.mmap_regions[removal.index];
         let (virtual_address, physical_start, generation) = (
             region.virtual_address,
             region.physical_start,
             region.generation,
         );
+        let span = page_count * PAGE_SIZE;
+        let removed_physical = physical_start + (address - virtual_address);
+
         // Fail closed: `unmap_user_pages_at` is all-or-nothing, so on failure
         // nothing was unmapped and the region stays tracked. Freeing the run
         // here would leave live PTEs pointing at reclaimed frames.
-        if !mmu::unmap_user_pages_at(self.ttbr0, virtual_address, page_count) {
+        if !mmu::unmap_user_pages_at(self.ttbr0, address, page_count) {
             MMAP_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
             console::write_str("MMAP LEAK: range 0x");
-            console::write_hex_u64(physical_start as u64);
+            console::write_hex_u64(removed_physical as u64);
             console::write_str(" left mapped after refused unmap (");
             console::write_dec_u64(page_count as u64);
             console::write_str(" pages)\r\n");
             return false;
         }
-        self.mmap_regions.remove(position);
-        self.mmap_bytes = self
-            .mmap_bytes
-            .saturating_sub(page_count.saturating_mul(PAGE_SIZE));
-        if !frame_allocator::free_contiguous_pages_tagged(physical_start, page_count, generation) {
+        // Free only the removed slice of the original contiguous run; every
+        // page in it shares the run's generation.
+        if !frame_allocator::free_contiguous_pages_tagged(removed_physical, page_count, generation) {
             console::write_str("MMAP: allocator refused run 0x");
-            console::write_hex_u64(physical_start as u64);
+            console::write_hex_u64(removed_physical as u64);
             console::write_str(" - leaked\r\n");
         }
+
+        let left = removal.left_pages;
+        let right = removal.right_pages;
+        match (left > 0, right > 0) {
+            (false, false) => {
+                self.mmap_regions.remove(removal.index);
+            }
+            (true, false) => {
+                self.mmap_regions[removal.index].page_count = left;
+            }
+            (false, true) => {
+                let region = &mut self.mmap_regions[removal.index];
+                region.virtual_address = address + span;
+                region.physical_start = removed_physical + span;
+                region.page_count = right;
+            }
+            (true, true) => {
+                let tail = MmapRegion {
+                    virtual_address: address + span,
+                    physical_start: removed_physical + span,
+                    page_count: right,
+                    generation,
+                };
+                self.mmap_regions[removal.index].page_count = left;
+                self.mmap_regions.insert(removal.index + 1, tail);
+            }
+        }
+        self.mmap_bytes = self.mmap_bytes.saturating_sub(span);
+        self.release_frames(page_count);
         true
     }
 
@@ -4191,6 +4431,9 @@ impl Task {
         self.dma_pages.clear();
         self.mmap_regions.clear();
         self.mmap_bytes = 0;
+        // The ledger is only meaningful while the task can allocate; a zombie
+        // keeps metadata only, so drop the stale charge with the resources.
+        self.mem_frames = 0;
         self.arguments = Vec::new();
         self.argv.clear();
         self.envp.clear();

@@ -13,6 +13,7 @@ pub mod fdt;
 pub mod fog_validate;
 pub mod gicv3_policy;
 pub mod irq_policy;
+pub mod mem_policy;
 pub mod phys_range;
 pub mod reloc;
 pub mod sched_policy;
@@ -201,6 +202,56 @@ where
     Some((virtual_address, page_count))
 }
 
+/// A page-aligned sub-range located inside one anonymous mapping.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct MmapRemoval {
+    /// Index of the containing region in the sorted list.
+    pub index: usize,
+    /// Pages before the removed range inside that region.
+    pub left_pages: usize,
+    /// Pages after the removed range inside that region.
+    pub right_pages: usize,
+}
+
+/// Locates a page-aligned sub-range inside one anonymous mapping.
+///
+/// The removed range must lie wholly inside a single region: a request that
+/// spans two mappings is refused instead of partially applying. Returns the
+/// region index and how many pages remain on each side, so the caller can trim
+/// the left part, split off the right part and free only the removed pages.
+pub fn mmap_remove<I>(
+    regions: I,
+    address: usize,
+    page_count: usize,
+    page_size: usize,
+) -> Option<MmapRemoval>
+where
+    I: Iterator<Item = (usize, usize)>,
+{
+    if page_size == 0 || page_count == 0 || address % page_size != 0 {
+        return None;
+    }
+    let span = page_count.checked_mul(page_size)?;
+    for (index, (start, pages)) in regions.enumerate() {
+        let region_end = start.checked_add(pages.checked_mul(page_size)?)?;
+        let Some(remove_end) = address.checked_add(span) else {
+            return None;
+        };
+        if address < start || remove_end > region_end {
+            continue;
+        }
+        let offset_pages = (address - start) / page_size;
+        let left_pages = offset_pages;
+        let right_pages = pages.checked_sub(offset_pages)?.checked_sub(page_count)?;
+        return Some(MmapRemoval {
+            index,
+            left_pages,
+            right_pages,
+        });
+    }
+    None
+}
+
 /// Per-task anonymous-mapping quota check: a request may grow the task's
 /// `current` total by `request` bytes only while the result stays within
 /// `limit`. Overflow and a zero-length request are refused.
@@ -374,7 +425,8 @@ impl DmaLeaseTable {
 #[cfg(test)]
 mod tests {
     use super::{
-        align_range, build_argv_envp, clear_frame_bit, mmap_place, mmap_quota_ok, mount_match,
+        align_range, build_argv_envp, clear_frame_bit, mmap_place, mmap_quota_ok, mmap_remove,
+        mount_match,
         parse_spawn_args, path_is_under, DmaLeaseTable, DMA_LEASE_CAPACITY, MAX_SPAWN_ARGS,
         SPAWN_ARGS_VERSION,
     };
@@ -451,6 +503,49 @@ mod tests {
     // --- per-task anonymous-mapping quota ---------------------------------
 
     const QUOTA: usize = 16 * 1024 * 1024;
+
+    #[test]
+    fn mmap_remove_locates_exact_and_partial_ranges() {
+        let list = [(MIN_VA, 4)];
+        let exact = mmap_remove(regions(&list), MIN_VA, 4, PAGE).unwrap();
+        assert_eq!((exact.index, exact.left_pages, exact.right_pages), (0, 0, 0));
+        // Trim one page from the left, from the right, and split the middle.
+        let left = mmap_remove(regions(&list), MIN_VA, 1, PAGE).unwrap();
+        assert_eq!((left.index, left.left_pages, left.right_pages), (0, 0, 3));
+        let right = mmap_remove(regions(&list), MIN_VA + 3 * PAGE, 1, PAGE).unwrap();
+        assert_eq!((right.index, right.left_pages, right.right_pages), (0, 3, 0));
+        let middle = mmap_remove(regions(&list), MIN_VA + PAGE, 2, PAGE).unwrap();
+        assert_eq!((middle.index, middle.left_pages, middle.right_pages), (0, 1, 1));
+    }
+
+    #[test]
+    fn mmap_remove_uses_the_containing_region_index() {
+        let list = [(MIN_VA, 2), (MIN_VA + 8 * PAGE, 3)];
+        let found = mmap_remove(regions(&list), MIN_VA + 9 * PAGE, 1, PAGE).unwrap();
+        assert_eq!((found.index, found.left_pages, found.right_pages), (1, 1, 1));
+    }
+
+    #[test]
+    fn mmap_remove_rejects_unaligned_empty_and_foreign_ranges() {
+        let list = [(MIN_VA, 4)];
+        assert_eq!(mmap_remove(regions(&list), MIN_VA + 1, 1, PAGE), None);
+        assert_eq!(mmap_remove(regions(&list), MIN_VA, 0, PAGE), None);
+        assert_eq!(mmap_remove(regions(&list), MIN_VA - PAGE, 1, PAGE), None);
+        assert_eq!(mmap_remove(regions(&list), MIN_VA + 3 * PAGE, 2, PAGE), None);
+        // A range that starts in one region and ends in another is refused.
+        let two = [(MIN_VA, 1), (MIN_VA + PAGE, 1)];
+        assert_eq!(mmap_remove(regions(&two), MIN_VA, 2, PAGE), None);
+        // Overflowing address arithmetic fails instead of wrapping.
+        assert_eq!(
+            mmap_remove(
+                regions(&[(usize::MAX - PAGE, 1)]),
+                usize::MAX - PAGE + 1,
+                1,
+                PAGE
+            ),
+            None
+        );
+    }
 
     #[test]
     fn quota_allows_exact_limit_and_no_more() {

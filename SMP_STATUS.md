@@ -3,7 +3,7 @@
 > **Current project status (2026-11-04):** this file remains the authoritative
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
-> test suite is now **171/171**; the 13/13 figure below is the checkpoint from
+> test suite is now **182/182**; the 13/13 figure below is the checkpoint from
 > the earlier SMP session.
 >
 > **Phases 1–2 are implemented as the opt-in `smp` feature (QEMU only).**
@@ -104,13 +104,45 @@ Two scheduler/SMP packages landed in `35c44b4`, on top of the reservation fix
   that have not called `cpu_started` (AP bring-up, `ap_tlb_probe_wait`), a
   stop-the-world quiesce (all grace windows are rebased), and a CPU parked in
   `bkl_acquire` (the dedicated BKL stall detector owns that condition).
+- **Partial `munmap`.** `Task::munmap` now accepts a page-aligned sub-range of
+  one mapping: `mmap_remove` finds the region and the split points, the kernel
+  unmaps the range, frees only the removed slice of the run and keeps the two
+  sides as separate regions (a full region table refuses a middle split before
+  touching a PTE). The hole is reusable by the next first-fit `mmap`.
+  `run_mmap_split_selftest` proves the split, the surviving ends, the refill
+  and the ledger return (`MMAP SPLIT PASS (regions=2, ledger=14)`).
+- **Boot proofs run before `SCHEDULER_READY`.** Console writes may re-enable
+  IRQs while waiting for FIFO space; with the scheduler already marked ready, a
+  timer IRQ could enter `schedule()` and boot the APs in the middle of the
+  ledger/mmap selftests. Both proofs now run first; `schedule()` is a no-op
+  until the flag is set. This removed the observed mid-boot panics and the
+  non-deterministic churn failures that followed.
+- **Per-task memory ledger.** Every frame a task can pin is charged to one
+  counter: the fixed address-space tables (`SPACE_TABLE_FRAMES` = 9), kernel
+  and user stacks, the private page, the ELF image, `brk`, anonymous `mmap`
+  (data plus an upper-bound L3 estimate) and DMA. The limit is a quarter of the
+  usable window (`mem_policy::task_frame_limit`); charges are all-or-nothing
+  and released on shrink/unmap/failure. `run_task_ledger_selftest` forces the
+  limit two frames above the current charge, requires the next frame to be
+  refused (counter unchanged), releases and reopens
+  (`TASK LEDGER PASS (limit=... frames, before=14)`); disabling the check
+  panics at boot. This bounds one task; the user-frame reserve bounds the
+  machine.
+- **User-memory reserve.** User-visible allocations (`brk`, anonymous `mmap`,
+  DMA, ELF image, per-task stack/private page) go through
+  `frame_allocator::alloc_user_*`, which refuses once granting them would leave
+  fewer than 1/8 of the window free (half at most). Kernel metadata keeps the
+  raw allocator. `run_user_reserve_selftest` forces the reserve above the free
+  count and requires refusal while the raw allocator still works, then reopens
+  it (`MEM RESERVE PASS (free=... reserve=...)`); disabling the gate halts the
+  boot with `MEM RESERVE FAIL (... refused=0)`.
 - **Evidence.** `-smp 4` selftest: `WATCHDOG: policy PASS`,
-  `WATCHDOG: heartbeat PASS (4 CPU(s) ticking)`, `ready fifo PASS`,
+  `WATCHDOG: heartbeat PASS (3 peer CPU(s) ticking)`, `ready fifo PASS`,
   `priority PASS`, plus the existing `tlb cross-PE`, `quiesce` (64 rounds),
   `ticks` and `clock` PASS lines, plus `cache PASS (4 CPU(s) C=1 I=1)` and
   `CACHE=ON line=64`; the opt-in churn profile adds `push PASS`, `bkl stall
   PASS` and no real `BKL STALL:` lines. Combined `demo-tasks,smp-selftest` is
-  **77 PASS / 0 FAIL / 0 PANIC** with no invariant failure.
+  **79 PASS / 0 FAIL / 0 PANIC** with no invariant failure.
 - **Negative test (opt-in `smp-churn`).** A kernel task masks IRQs and spins
   for 1.2 s; an AP picks it up and another PE reports it
   (`WATCHDOG: CPU3 stalled (beats=32 index=20 rounds=3)` — the index is the
@@ -333,7 +365,7 @@ made count-agnostic:
 Verified on QEMU `-smp 4` (GICv2 `virt`, cortex-a72):
 `SMP SELFTEST: quiesce PASS (64 rounds, 3 peer CPU(s))` and
 `SMP SELFTEST: ticks PASS (3 peer CPU(s))`, then `howl>`;
-`no_std,smp,demo-tasks -smp 4` exits **66 PASS / 0 FAIL / 0 PANIC** with no
+`no_std,smp,demo-tasks -smp 4` exits **69 PASS / 0 FAIL / 0 PANIC** with no
 DMA leak, and `-smp 2` still reports one peer.
 
 ## Что сделано (фазы 1–6 задания TASK №6)
@@ -348,7 +380,7 @@ DMA leak, and `-smp 2` still reports one peer.
 | 6. TLB | per-space ASID (`1..=255`, 8-bit) в `TTBR0[63:48]`; `switch_address_space` только `msr`+`isb`; правка PTE — `tlbi aside1is` по ASID; создание/AP-identity — `vmalle1is`; батчевая публикация (`finish_table_changes_for`); cross-PE probe доказывает, что ASID-scoped broadcast доходит до второго PE; boot-тест ASID-изоляции | написано, проверено на QEMU `-smp 4` |
 | 7. AP-boot | PSCI `CPU_ON` (HVC, `0xC4000003`), physical trampoline, `ApBootParams`, FP/SIMD + MMU enable, `boot_secondary_cpus()` from the first `schedule()` | работает на QEMU `-smp 2` и `-smp 4` |
 | 8. Shared DMA | под BKL: создание маппингов (syscall) и revoke/teardown взаимоисключены; fail-safe leak сохранён; `DmaLease` in-flight gate: диапазон с живым lease не освобождается | написано, boot-тест `DMA LEASE` |
-| 9. Тесты | `demo-tasks` (66 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer + проверка `running_on`/`current_index` на каждом проходе + FIFO-порядок очередей + приоритеты/aging + push migration + BKL stall detector + кэши (SCTLR.C/I) + stall-watchdog policy/heartbeat; `demo-tasks,smp-selftest` — 77 PASS / 0 PANIC / 0 invariant FAIL; boot-самотесты MMU TLB, MMU HEAP, DMA ZERO, UART RING, CONSOLE CAP и DMA quarantine | написано, негативные тесты подтверждены |
+| 9. Тесты | `demo-tasks` (69 PASS) на `-smp 2`/`-smp 4`; `smp-selftest` — cross-PE TLB probe + 64 раунда quiesce + visibility + per-CPU timer + проверка `running_on`/`current_index` на каждом проходе + FIFO-порядок очередей + приоритеты/aging + push migration + BKL stall detector + кэши (SCTLR.C/I) + stall-watchdog policy/heartbeat; `demo-tasks,smp-selftest` — 80 PASS / 0 PANIC / 0 invariant FAIL; boot-самотесты MMU TLB, MMU HEAP, DMA ZERO, MEM RESERVE, TASK LEDGER, MMAP SPLIT, UART RING, CONSOLE CAP и DMA quarantine | написано, негативные тесты подтверждены |
 
 ## Найдено и исправлено попутно (реальные баги)
 
@@ -448,7 +480,7 @@ DMA leak, and `-smp 2` still reports one peer.
    flush; dropping the tag makes it fail closed.
 2. **Stress tests.** Multi-CPU timer/IPI, concurrent spawn/kill/reap, shared
    DMA revoke while a client runs, and page-table teardown under load. The
-   `demo-tasks` suite passes on `-smp 2` and `-smp 4` (66 PASS, 0 PANIC);
+   `demo-tasks` suite passes on `-smp 2` and `-smp 4` (69 PASS, 0 PANIC);
    `smp-selftest` runs 64 back-to-back stop-the-world rounds with a per-round
    visibility check and a per-CPU timer-liveness check. The cross-PE TLB probe
    above proves one remap crosses the domain, but an in-flight-MMAP stress
@@ -514,27 +546,30 @@ DMA leak, and `-smp 2` still reports one peer.
 - gdb-стаб: в этом окружении подключения нестабильны (таймауты), stale QEMU
   держат lock disk.img — чистить `ps` + `/bin/kill -9`.
 
-## Бисект-мусор в дереве (убрать перед сдачей)
+## Бисект-мусор в дереве (проверено 2026-11-05)
 
-- `src/ipc.rs`: prints M1–M8 + sp, `SEND from=` в `send`.
-- `src/condvar.rs`: prints C1–C3.
-- `src/syscall.rs`: `SYS <n> sp=` трейс.
-- `src/scheduler.rs`: `B1/B2` в `block_current_on`, `R1–R4` в
-  `schedule_released`, `SCHED_SEEN` в `schedule`.
-- `src/smp.rs`: `BKL STALL`-детектор в `bkl_acquire`; `BKL_DISABLED`-свитч
-  (оставить механизм, значение `false`); `AP_TASK_SCHEDULING` — runtime gate,
-  в `smp`-сборке `true`.
-- `src/allocator.rs`: `HEAP_PAGES` 512 (бисект) — вернуть 256.
+- `src/ipc.rs`, `src/condvar.rs`, `src/syscall.rs`, `src/scheduler.rs`:
+  отладочные prints `M1–M8`/`sp`, `SEND from=`, `C1–C3`, `SYS <n> sp=`,
+  `B1/B2`, `R1–R4` удалены. Остался один one-shot `SMP: schedule() first
+  entry` (`SCHED_SEEN`) — это штатная boot-диагностика, не бисект.
+- `src/smp.rs`: `BKL STALL`-детектор повышен до штатной диагностики (не
+  мусор); `BKL_DISABLED` остаётся свитчем со значением `false`;
+  `AP_TASK_SCHEDULING` — runtime gate, в `smp`-сборке `true`.
+- `src/allocator.rs`: `HEAP_PAGES` 512 — **не бисект, проверено**: ресурсный
+  demo-пробник растит VFS-файл до 512 KiB, `RamFs::write_at` выделяет это
+  в kernel heap; со 256 страницами комбо `demo-tasks,smp-selftest` падает
+  `ALLOCATION ERROR SIZE=0x80000`. Уменьшать только вместе с выносом
+  файловых данных из kernel heap.
 
 ## Проверки на текущем состоянии
 
-- `cargo test --lib`: **171/171**.
+- `cargo test --lib`: **182/182**.
 - Default `no_std` build, QEMU `-smp 4`: single-core, reaches `howl>`.
 - `no_std,smp` build, QEMU `-smp 4`: CPU1–CPU3 online (GIC/timer/IPI), all
   four CPUs execute tasks; `howl ready`/prompt and `ps` work.
 - `no_std,smp` build, QEMU `-smp 2`: only CPU1 comes online; CPU2/CPU3 report
   `CPU_ON failed` and stay offline without aborting the boot.
-- `no_std,smp,demo-tasks`, QEMU `-smp 4`: **66 PASS / 0 FAIL / 0 PANIC**,
+- `no_std,smp,demo-tasks`, QEMU `-smp 4`: **69 PASS / 0 FAIL / 0 PANIC**,
   clean exit, no DMA leak; spawn/kill/reap and DMA revoke ran while all four
   CPUs were scheduling. The same suite passes on `-smp 2`.
 - `no_std,smp-selftest`, QEMU `-smp 4`: `SMP SELFTEST: tlb cross-PE PASS (3
@@ -543,7 +578,7 @@ DMA leak, and `-smp 2` still reports one peer.
   Negative build (broadcast `tlbi vmalle1is` replaced by local `tlbi vmalle1`
   in `finish_table_changes`): `tlb cross-PE FAIL (3 CPU(s) kept the stale
   translation)` while quiesce/ticks still pass.
-- `no_std,smp,demo-tasks,smp-selftest`, QEMU `-smp 4`: **77 PASS / 0 FAIL /
+- `no_std,smp,demo-tasks,smp-selftest`, QEMU `-smp 4`: **80 PASS / 0 FAIL /
   0 PANIC** with zero `sched invariant FAIL`; the extra PASS lines are the
   selftest lines (FIFO order, priority/aging, stall-watchdog policy and
   heartbeat, remap sentinel, cross-PE TLB, quiesce, ticks, clock). The dispatch-mix line reports

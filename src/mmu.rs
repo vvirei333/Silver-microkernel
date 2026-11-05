@@ -765,6 +765,11 @@ fn clean_table_lines(table_start: usize, table_bytes: usize) {
 // Per-task user address spaces
 // ---------------------------------------------------------------------------
 
+/// Frames a freshly created address space owns: root, user L1/L2, image/heap/
+/// stack L3s, and the private L1/L2/L3 trio. Charged to the task's memory
+/// ledger as one flat cost; `mmap` adds its own L3 estimate separately.
+pub const SPACE_TABLE_FRAMES: usize = 9;
+
 /// Builds a user TTBR0. `user_stack_start == 0` creates no stack mapping
 /// (used for the EL1 idle task). A loaded ELF supplies independently owned
 /// image pages instead of the old shared kernel text/rodata alias. The heap
@@ -785,8 +790,8 @@ pub fn create_task_space(
         crate::console::write_str("MMU: no free ASID, space creation refused\r\n");
         return None;
     };
-    let mut pages = [0_usize; 9];
-    let mut generations = [0_u32; 9];
+    let mut pages = [0_usize; SPACE_TABLE_FRAMES];
+    let mut generations = [0_u32; SPACE_TABLE_FRAMES];
     for index in 0..pages.len() {
         let Some((page, generation)) = frame_allocator::alloc_page_tagged() else {
             // Nothing is registered or linked yet: release the raw runs.
@@ -803,7 +808,7 @@ pub fn create_task_space(
     // All nine frames are allocated before any is linked. Register them with
     // the root frame as owner; the root itself is registered as its own
     // space root, which is what `retire_space` validates.
-    let mut tokens = [TableToken::empty(); 9];
+    let mut tokens = [TableToken::empty(); SPACE_TABLE_FRAMES];
     for index in 0..pages.len() {
         let Some(token) = page_table_register(pages[index], generations[index], pages[0]) else {
             // The refused frame is still unlinked; prior frames are

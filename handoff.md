@@ -79,7 +79,7 @@ depend on four online CPUs.
   per-CPU tick counter so `smp-selftest` can prove every online PE takes its
   PPI (`ticks PASS`) even when the SGI path works. Verified: `-smp 4` brings
   CPU1–CPU3 online with `quiesce PASS (64 rounds, 3 peers)` and
-  `ticks PASS (3 peers)`; `demo-tasks` on `-smp 4` is 66 PASS / 0 FAIL /
+  `ticks PASS (3 peers)`; `demo-tasks` on `-smp 4` is 69 PASS / 0 FAIL /
   0 PANIC with no DMA leak.
 - **Ctrl-Z regression fixed after S-01.** The audit added a
   `CAP_CONSOLE_GRANT` gate to `SYS_STOP_CONSOLE`, but Howler's initial
@@ -290,6 +290,49 @@ depend on four online CPUs.
   runs. Disabling `push_target` makes the probe fail (`moved=0`, `push=0`)
   while churn still passes. No IPI is sent: an idle PE re-evaluates its queue
   on the next 10 ms timer tick.
+- **Partial `munmap` (2026-11-05).** `Task::munmap` accepts any page-aligned
+  sub-range of one anonymous mapping, not only an exact region match. The
+  host-tested `mmap_remove` locates the containing region and returns how many
+  pages stay on each side; the task unmaps the range, frees only that slice of
+  the original contiguous run (every page shares the run generation), trims the
+  left part and splits off the right part when the range is in the middle. The
+  removed pages are released from the ledger, and the resulting hole is
+  reusable by the next first-fit `mmap`. A split needs one extra bookkeeping
+  slot, so a full `mmap_regions` table refuses the request before touching a
+  PTE. `run_mmap_split_selftest` maps four pages, removes the middle two,
+  proves the ends survive and the hole is gone, refills it, and releases
+  everything back to the ledger baseline (`MMAP SPLIT PASS (regions=2,
+  ledger=14)`). Making every `munmap` exact-match again makes the boot proof
+  fail and panic.
+- **Per-task memory ledger (2026-11-05).** Each task carries `mem_frames`,
+  the frames it can pin: the fixed address-space tables and kernel/user stacks,
+  the private page, the ELF image, `brk` pages, anonymous `mmap` (data plus an
+  upper-bound estimate of the L3 tables it creates) and DMA runs. The limit is
+  `mem_policy::task_frame_limit(total)` — a quarter of the usable window, with
+  a small floor so a tiny machine still spawns — and every charge is
+  all-or-nothing with a matching release on shrink/unmap/failure. The ledger
+  complements the global reserve: the reserve bounds the machine, the ledger
+  bounds one task. `run_task_ledger_selftest` charges two frames against a
+  forced limit, requires the next frame to be refused without changing the
+  counter, releases and reopens (`TASK LEDGER PASS (limit=... frames,
+  before=...)`); disabling the check gives `TASK LEDGER FAIL` and a panic at
+  boot.
+- **User-memory reserve (2026-11-05).** User-visible allocations no longer go
+  straight to the frame allocator: `alloc_user_page_tagged` and
+  `alloc_user_contiguous_pages_tagged` refuse a request once granting it would
+  leave fewer than `mem_policy::reserve_frames(total)` frames free (one eighth
+  of the usable window, capped at half so a tiny fog window can still start a
+  task). The policy is a pure host-tested function of the current free count,
+  so no per-allocation accounting can drift; every user path runs under the
+  kernel lock, which serializes the check with the other CPUs' requests. The
+  gated paths are `brk`, anonymous `mmap`, DMA allocation, ELF image pages,
+  and the per-task user stack/private page; kernel metadata (page tables,
+  kernel stacks, AP stacks, boot self-tests) keeps using the raw allocator.
+  `run_user_reserve_selftest` forces the reserve one frame above the free
+  count: the user allocator must refuse while the raw allocator still works,
+  and clearing the override must reopen the gate (`MEM RESERVE PASS
+  (free=... reserve=...)`). Disabling the gate gives `MEM RESERVE FAIL
+  (... refused=0)` and halts the boot.
 - **Data/instruction caches (2026-11-05).** The boot stub builds the tables
   and enables the MMU with `SCTLR_EL1.C = 0`, `I = 0`, so every access is plain
   memory. `mmu::init` now ends in `cache::init_boot`, which invalidates the
@@ -347,25 +390,33 @@ depend on four online CPUs.
   `bkl_acquire` is marked waiting because the dedicated BKL stall detector
   owns that condition.
   The boot logs `WATCHDOG: policy PASS` and
-  `WATCHDOG: heartbeat PASS (4 CPU(s) ticking)`. The opt-in `smp-churn`
-  profile adds a real negative test: a kernel task masks IRQs and spins for
-  1.2 s, another PE reports it, and the task is retired
-  (`watchdog stall PASS`). Disabling the check call yields
-  `watchdog stall FAIL (reported=0 ...)`, so the harness is not vacuous.
-- Verified in this snapshot: **171 host tests**, fog QEMU relocation/at-link/
+  `WATCHDOG: heartbeat PASS (3 peer CPU(s) ticking)`. The heartbeat check
+  deliberately excludes the CPU running it: that CPU is inside a pass with
+  IRQs masked and may not have taken a tick yet, which used to make the test a
+  boot-timing race (`live=3/4`); its PPI path is covered by the clock/ticks
+  tests and the post-boot monitor. The opt-in `smp-churn` profile adds a real
+  negative test: a kernel task masks IRQs and spins for 1.2 s, another PE
+  reports it, and the task is retired (`watchdog stall PASS`). Disabling the
+  check call yields `watchdog stall FAIL (reported=0 ...)`, so the harness is
+  not vacuous. The opt-in churn profile still has a known intermittent
+  `sched invariant FAIL (a CPU's current task is not marked running on it)`
+  after the stall probe retires (observed roughly once in seven runs before
+  the boot-proof ordering fix, zero in 21 runs after it); it is timing
+  sensitive and not root-caused, so churn remains diagnostic only.
+- Verified in this snapshot: **182 host tests**, fog QEMU relocation/at-link/
   fail-closed-park/reserved-destination cases, normal QEMU boot to `howl>`,
-  demo regression **66 PASS / 0 PANIC** on both the default build and
+  demo regression **69 PASS / 0 PANIC** on both the default build and
   `no_std,smp` with QEMU `-smp 2` and `-smp 4`, `no_std,smp-selftest` logging
   `ready fifo PASS (3 probes in spawn order)`,
   `priority PASS (high first, FIFO in class, low aged in 16 round(s))`,
-  `WATCHDOG: policy PASS`, `WATCHDOG: heartbeat PASS (4 CPU(s) ticking)`,
+  `WATCHDOG: policy PASS`, `WATCHDOG: heartbeat PASS (3 peer CPU(s) ticking)`,
   `push PASS (probe moved to CPU<n>)`,
   `bkl stall PASS (3 waiter report(s))`,
   `SMP SELFTEST: cache PASS (4 CPU(s) C=1 I=1)` and `CACHE=ON line=64`,
   `tlb cross-PE PASS (3 peer CPU(s) saw the remap)`,
   `quiesce PASS (64 rounds, 3 peer CPU(s))` and `ticks PASS (3 peer CPU(s))`
   on `-smp 4` (one peer on `-smp 2`), and the combined
-  `no_std,smp,demo-tasks,smp-selftest` profile at **77 PASS / 0 FAIL / 0 PANIC**
+  `no_std,smp,demo-tasks,smp-selftest` profile at **80 PASS / 0 FAIL / 0 PANIC**
   with zero invariant failures and a `ready queues local=.. steal=.. scan=..
   push=..` dispatch-mix line, including `clock PASS (CPU0 masked, ticks +1)`. The
   opt-in `no_std,smp-selftest,smp-churn` profile passes `churn PASS` and
@@ -375,7 +426,8 @@ depend on four online CPUs.
   drops the `running_on` claim makes the invariant check fire on the next pass
   (`sched invariant FAIL (a CPU's current task is not marked running on it)`).
   Tablet build, and fog boot image v3. The boot self-tests log
-  `MMU TLB OK`, `MMU ASID OK`, `MMU HEAP OK`, `DMA ZERO OK`,
+  `MMU TLB OK`, `MMU ASID OK`, `MMU HEAP OK`, `DMA ZERO OK`, `MEM RESERVE OK`,
+  `TASK LEDGER OK`, `MMAP SPLIT OK`,
   `UART RING OK`, `CONSOLE CAP OK`, `DMA QUARANTINE OK` and `DMA LEASE OK`; a
   build that drops the ASID tag fails the ASID test with exception 9 before
   the scheduler starts, and a build with the lease gate disabled fails the
@@ -410,7 +462,7 @@ Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
   defined `unregister_mutex` not-found path, ipc receive bisect bypass
   removed).
 - **Verified working at that checkpoint:** single-CPU boot unchanged;
-  `cargo test --lib` 13/13 (the current suite is 171/171); debug and release
+  `cargo test --lib` 13/13 (the current suite is 182/182); debug and release
   builds pass.
 - **Historical (fixed): `-smp 2`** died at silverd's first blocking IPC
   receive at the 2026-11-01 checkpoint; the layers below are the investigation
@@ -1981,7 +2033,10 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   a full client mailbox can therefore block the nameserver. Selective receive
   on a full mailbox can likewise deadlock with its expected sender. Spawn counts,
   kernel heap/VFS growth and per-task memory consumption need quotas for DoS
-  resistance.
+  resistance. Bounded today: task count, per-task mmap bytes, per-task heap,
+  the shared VFS budget, the global user-frame reserve and the per-task frame
+  ledger (which includes DMA). Still open: wait-queue growth and kernel-heap
+  growth accounting.
 - The user heap is limited to one 2 MB L3 window. The allocator supports only
   alignments up to 16 bytes and has no explicit C-style `realloc`/`calloc`,
   thread safety or double-free detection. `SYS_MMAP`/`SYS_MUNMAP` exist, but
@@ -2057,8 +2112,9 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 2. **Program credentials:** define which embedded programs a task may request;
    currently any task can still spawn the shell ELF. Capability delegation is
    available through `SYS_CAP_GRANT`.
-3. **Resource quotas:** bound task count, per-task/kernel memory, wait queues and
-   VFS file growth; define behavior under exhaustion before adding more services.
+3. **Resource quotas:** task count, per-task mmap/heap, VFS budget, the global
+   user-frame reserve and the per-task frame ledger are bounded; the remaining
+   pieces are wait-queue growth and kernel-heap accounting.
 4. **Network services:** add TCP/UDP sockets on smoltcp, DHCP/DNS configuration
    and a `net` command surface beyond `ping`. Replace the 10 ms RX poll with
    virtio-net interrupts, then add multiple frames per direction and zero-copy

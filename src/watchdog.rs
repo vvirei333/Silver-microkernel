@@ -195,13 +195,23 @@ fn report(cpu: usize, beat: u64, stale: u32) {
     console::write_str(")\r\n");
 }
 
-/// Checks that every online, watched CPU is still taking its timer PPI. Runs
-/// after the APs have entered the scheduler loop; a frozen heartbeat here is a
-/// real stall, so the answer is a boot failure rather than a log line.
+/// Checks that every online, watched **peer** CPU is still taking its timer
+/// PPI. Runs after the APs have entered the scheduler loop; a frozen heartbeat
+/// here is a real stall, so the answer is a boot failure rather than a log
+/// line.
+///
+/// The calling CPU is excluded on purpose: this test runs inside a scheduling
+/// pass with IRQs masked, so the caller cannot take a tick during the wait. If
+/// it has not taken one yet, counting it turns the check into a race about
+/// boot timing (observed as a rare `live=3/4`). The caller proves its own
+/// liveness by executing the check; its PPI path is covered by the boot
+/// `clock`/`ticks` tests and by the post-boot stall monitor.
 #[cfg(all(feature = "smp", feature = "smp-selftest"))]
 pub fn run_heartbeat_selftest() -> bool {
-    let expected = smp::online_cpu_count();
-    if expected <= 1 {
+    let local = smp::this_cpu_id();
+    let local_online = smp::cpu_online(local);
+    let expected = smp::online_cpu_count().saturating_sub(u64::from(local_online) as usize);
+    if expected == 0 {
         return true;
     }
     let mut spins: u32 = 0;
@@ -209,7 +219,8 @@ pub fn run_heartbeat_selftest() -> bool {
     loop {
         let live = (0..smp::MAX_CPUS)
             .filter(|&cpu| {
-                WATCHED[cpu].load(Ordering::Acquire)
+                cpu != local
+                    && WATCHED[cpu].load(Ordering::Acquire)
                     && smp::cpu_online(cpu)
                     && timer::cpu_ticks(cpu) > 0
             })
@@ -217,7 +228,7 @@ pub fn run_heartbeat_selftest() -> bool {
         if live >= expected {
             console::write_str("WATCHDOG: heartbeat PASS (");
             console::write_dec_u64(live as u64);
-            console::write_str(" CPU(s) ticking)\r\n");
+            console::write_str(" peer CPU(s) ticking)\r\n");
             return true;
         }
         spins += 1;
