@@ -3471,6 +3471,11 @@ fn push_migrate(manager: &mut TaskManager, from: usize) -> bool {
     }
     let moved = push_migrate_with(manager, from, &idle[..cpus]);
     if let Some(target) = moved {
+        // The target may be parked in WFI or spinning on the kernel lock;
+        // without an IPI the migrated task waits for the next timer tick.
+        if let Some(mpidr) = smp::mpidr_of(target) {
+            crate::gic::send_sgi_to(mpidr, crate::gic::RESCHEDULE_IRQ);
+        }
         #[cfg(all(feature = "smp", feature = "smp-selftest"))]
         READY_PUSH_PICKS[target].fetch_add(1, Ordering::Relaxed);
         true

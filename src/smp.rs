@@ -202,6 +202,15 @@ pub fn current_task_of(cpu: usize) -> u64 {
     CPUS[cpu.min(MAX_CPUS - 1)].current_task.load(Ordering::Acquire)
 }
 
+/// Affinity value of an online CPU, for a targeted SGI. `None` for a slot
+/// that has not been brought up.
+pub fn mpidr_of(cpu: usize) -> Option<u64> {
+    if cpu >= MAX_CPUS || !CPUS[cpu].online.load(Ordering::Acquire) {
+        return None;
+    }
+    Some(CPUS[cpu].mpidr)
+}
+
 /// Reads another (online) CPU's current index — used by reap to reposition
 /// every CPU after the task vector shrinks. Kernel lock must be held.
 #[inline]

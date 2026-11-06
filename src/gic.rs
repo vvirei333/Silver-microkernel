@@ -239,6 +239,17 @@ pub fn send_sgi_all_but_self(intid: u32) {
     );
 }
 
+/// Signals `intid` to the PE with this affinity value. GICv2 targets CPUs by
+/// CPU-interface bits rather than MPIDR, so it falls back to a broadcast: the
+/// extra reschedule on the other PEs is harmless.
+pub fn send_sgi_to(mpidr: u64, intid: u32) {
+    if platform::detect().uses_gicv3() {
+        gicv3::send_sgi_to(mpidr, intid);
+        return;
+    }
+    send_sgi_all_but_self(intid);
+}
+
 pub fn enable_irq(irq: u32) {
     if platform::detect().uses_gicv3() {
         gicv3::enable_irq(irq);

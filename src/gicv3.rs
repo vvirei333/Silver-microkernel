@@ -533,6 +533,32 @@ pub fn send_sgi_all_but_self(intid: u32) {
     }
 }
 
+/// Signals `intid` to one PE identified by its MPIDR affinity value.
+///
+/// ICC_SGI1R_EL1 with IRM=0: `TargetList` holds one bit per Aff0 (values
+/// 0..15), and Aff1..Aff3 live in their fields. A higher Aff0 cannot be
+/// addressed by a single register write without the range selector, which
+/// this kernel does not use.
+pub fn send_sgi_to(mpidr: u64, intid: u32) {
+    let aff0 = (mpidr & 0xFF) as u32;
+    if aff0 >= 16 {
+        return;
+    }
+    let value = (1_u64 << aff0)
+        | (((mpidr >> 8) & 0xFF) << 16)
+        | (u64::from(intid & 0x0F) << 24)
+        | (((mpidr >> 16) & 0xFF) << 32)
+        | (((mpidr >> 32) & 0xFF) << 40);
+    unsafe {
+        core::arch::asm!(
+            "msr icc_sgi1r_el1, {value}",
+            "isb",
+            value = in(reg) value,
+            options(nostack),
+        );
+    }
+}
+
 /// Routes and classifies the UART SPI in GICD but does not enable it (see the
 /// module doc): geni_uart is polling TX-only, RX IRQ support comes later.
 fn configure_uart_spi() {
