@@ -27,6 +27,7 @@ mod input_proto;
 mod syscall;
 
 use core::panic::PanicInfo;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 // ---------------------------------------------------------------------------
 // fw_cfg MMIO (QEMU `virt`)
@@ -111,9 +112,14 @@ static mut UI: UiState = UiState {
 /// click so button presses can be reported to the console owner.
 static mut HOWL_ID: Option<u64> = None;
 
-/// Task that draws through the compositor channel; pointer samples are
-/// forwarded here and nowhere else.
-static mut UI_CLIENT: Option<u64> = None;
+/// Task that owns the screen: the first client to issue a draw operation.
+/// `0` means the screen is unclaimed. Draw calls from anyone else are ignored,
+/// so one task cannot repaint the display or steal the pointer stream.
+static UI_OWNER: AtomicU64 = AtomicU64::new(0);
+
+/// Task id of the registered input driver, resolved lazily through the
+/// nameserver. Pointer samples from any other sender are dropped.
+static INPUT_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Silver home screen at the reference handset geometry (640 x 1136):
 /// a 4 x 5 app grid plus a four-app dock.
@@ -220,21 +226,70 @@ fn serve() -> ! {
     loop {
         let mut message = ipc::Message::new(0, &[]);
         if syscall::receive(&mut message) {
-            if handle_compositor_request(&message) {
-                unsafe { UI_CLIENT = Some(message.sender) };
+            // Resolve the input driver only for actual pointer samples: a
+            // nameserver lookup on every draw op would stall the compositor
+            // (and back-pressure the client's mailbox).
+            if message.payload[0] == input_proto::OP_POINTER
+                && input_sender_ok(message.sender)
+            {
+                if let Some(input) = input_proto::decode(&message) {
+                    handle_pointer(input);
+                }
                 continue;
             }
-            if let Some(input) = input_proto::decode(&message) {
-                handle_pointer(input);
-            }
+            let _ = handle_compositor_request(&message);
         }
     }
+}
+
+/// True only for the task registered as `input_driver`. The id is resolved
+/// once and then compared by value; until the name exists every sample is
+/// rejected (fail-closed).
+fn input_sender_ok(sender: u64) -> bool {
+    let cached = INPUT_ID.load(Ordering::Acquire);
+    if cached != 0 {
+        return cached == sender;
+    }
+    match syscall::lookup("input_driver") {
+        Some(id) => {
+            INPUT_ID.store(id, Ordering::Release);
+            id == sender
+        }
+        None => false,
+    }
+}
+
+/// Claims the screen for `sender` on the first draw call. Returns true when the
+/// caller owns it.
+fn claim_ui(sender: u64) -> bool {
+    if sender == 0 {
+        return false;
+    }
+    match UI_OWNER.compare_exchange(0, sender, Ordering::AcqRel, Ordering::Acquire) {
+        Ok(_) => true,
+        Err(owner) => owner == sender,
+    }
+}
+
+fn release_ui(sender: u64) {
+    let _ = UI_OWNER.compare_exchange(sender, 0, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// Handles one compositor request. Returns true when the message was a draw
 /// command, so the caller does not treat it as input.
 fn handle_compositor_request(message: &ipc::Message) -> bool {
     let payload = message.payload;
+    // Only compositor opcodes reach the ownership check; pointer samples and
+    // shell notifications keep their own paths.
+    if !matches!(
+        payload[0],
+        GUI_CLEAR | GUI_RECT | GUI_TEXT | GUI_TEXT_SCALED
+    ) {
+        return false;
+    }
+    if !claim_ui(message.sender) {
+        return true;
+    }
     match payload[0] {
         GUI_CLEAR => {
             let color = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
@@ -289,15 +344,20 @@ fn fill_solid(x: u32, y: u32, w: u32, h: u32, color: u32) {
 /// Forwards one pointer sample to the registered UI client. The compositor
 /// never decides what a tap means; that belongs to the home-screen client.
 fn handle_pointer(input: input_proto::InputMsg) {
-    let Some(client) = (unsafe { UI_CLIENT }) else {
+    let client = UI_OWNER.load(Ordering::Acquire);
+    if client == 0 {
         return;
-    };
+    }
     let mut payload = [0_u8; 6];
     payload[0] = GUI_POINTER;
     payload[1..3].copy_from_slice(&input.x.to_le_bytes());
     payload[3..5].copy_from_slice(&input.y.to_le_bytes());
     payload[5] = u8::from(input.left_clicked);
-    let _ = syscall::try_send(client, &ipc::Message::new(0, &payload));
+    if !syscall::try_send(client, &ipc::Message::new(0, &payload)) {
+        // The owner died: free the screen for the next home-screen client
+        // instead of forwarding samples into a void forever.
+        release_ui(client);
+    }
 }
 
 /// Reports a completed button click to the shell (Howl), which owns the console.

@@ -177,6 +177,11 @@ static mut GPU_ID: Option<u64> = None;
 pub extern "C" fn _start(_argument: u64) -> ! {
     syscall::sleep(CONSOLE_HANDOFF_DELAY_MS);
     syscall::print("INPUT DRIVER STARTED\r\n");
+    // The compositor accepts pointer samples only from this registered name;
+    // an unauthenticated `OP_POINTER` must not be able to inject taps.
+    if !syscall::register("input_driver") {
+        syscall::print("INPUT DRIVER: WARNING: name registration failed\r\n");
+    }
 
     let Some(device) = find_virtio_input() else {
         fail(INIT_NOT_FOUND, "VIRTIO-INPUT NOT FOUND\r\n");
