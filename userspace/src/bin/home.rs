@@ -671,9 +671,9 @@ pub extern "C" fn _start(_argument: u64) -> ! {
                     // The three built-ins are real processes now. If the image
                     // cannot be launched, fall back to the in-process screen.
                     let (disk, initramfs) = match app {
-                        APP_CALC => ("/sfs/calc.elf", "/apps/calc.elf"),
-                        APP_GALLERY => ("/sfs/gallery.elf", "/apps/gallery.elf"),
-                        APP_NOTES => ("/sfs/notes.elf", "/apps/notes.elf"),
+                        APP_CALC => ("/sfs/apps/calc.elf", "/apps/calc.elf"),
+                        APP_GALLERY => ("/sfs/apps/gallery.elf", "/apps/gallery.elf"),
+                        APP_NOTES => ("/sfs/apps/notes.elf", "/apps/notes.elf"),
                         _ => ("", ""),
                     };
                     let launched = !disk.is_empty()

@@ -9,9 +9,11 @@
 //! written through to the device sector by sector, so the on-disk state stays
 //! authoritative and survives a reboot.
 //!
-//! Scope of this step: the root directory, four direct blocks plus one single
-//! indirect block per file (66 KiB), create/truncate/append, mkdir, unlink and
-//! rename. Nested directories and double-indirect blocks are next.
+//! Scope of this step: hierarchical directories of any depth, four direct
+//! blocks plus one single indirect block per file (66 KiB), and the usual
+//! create/truncate/append, mkdir, unlink, rmdir and rename operations. A
+//! directory holds up to 64 entries (four direct blocks); double-indirect
+//! files and directory growth are next.
 
 use alloc::vec::Vec;
 
@@ -311,19 +313,61 @@ fn free_blocks(image: &mut [u8], superblock: &Superblock, blocks: &[u32]) {
 }
 
 /// Finds a root-directory entry by name: `(inode, kind, size)`.
-fn lookup(image: &[u8], superblock: &Superblock, name: &str) -> Option<(u32, u32, u32)> {
-    let (block, slot) = find_entry(image, superblock, name)?;
+/// Splits a backend-relative path into validated components.
+fn split_path(path: &str) -> Result<Vec<&str>, ()> {
+    let trimmed = path.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut parts = Vec::new();
+    for part in trimmed.split('/') {
+        if part.is_empty() || part == "." || part == ".." || part.len() > NAME_MAX {
+            return Err(());
+        }
+        parts.push(part);
+    }
+    Ok(parts)
+}
+
+/// Resolves a directory path to its inode, rejecting a missing component or a
+/// file where a directory is required.
+fn resolve_dir(image: &[u8], superblock: &Superblock, parts: &[&str]) -> Option<u32> {
+    let mut inode = superblock.root_inode;
+    for name in parts {
+        let (block, slot) = find_entry(image, superblock, inode, name)?;
+        let index = u32_at(image, block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE);
+        let (kind, _, _, _) = inode_get(image, superblock, index)?;
+        if kind != INODE_KIND_DIR {
+            return None;
+        }
+        inode = index;
+    }
+    Some(inode)
+}
+
+/// Resolves a full path to `(inode, kind, size)`.
+fn lookup(image: &[u8], superblock: &Superblock, path: &str) -> Option<(u32, u32, u32)> {
+    let parts = split_path(path).ok()?;
+    let (&name, parent) = parts.split_last()?;
+    let dir = resolve_dir(image, superblock, parent)?;
+    let (block, slot) = find_entry(image, superblock, dir, name)?;
     let index = u32_at(image, block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE);
     let (kind, size, _, _) = inode_get(image, superblock, index)?;
     Some((index, kind, size))
 }
 
-/// Locates the 32-byte directory slot holding `name`: `(block, slot)`.
-fn find_entry(image: &[u8], superblock: &Superblock, name: &str) -> Option<(usize, usize)> {
+/// Locates the 32-byte directory slot holding `name` inside `dir`:
+/// `(block, slot)`.
+fn find_entry(
+    image: &[u8],
+    superblock: &Superblock,
+    dir: u32,
+    name: &str,
+) -> Option<(usize, usize)> {
     if name.is_empty() || name.len() > NAME_MAX {
         return None;
     }
-    let (_, _, blocks, _) = inode_get(image, superblock, superblock.root_inode)?;
+    let (_, _, blocks, _) = inode_get(image, superblock, dir)?;
     for block in blocks {
         if block == 0 {
             break;
@@ -357,19 +401,19 @@ fn find_free_inode(image: &[u8], superblock: &Superblock) -> Option<u32> {
     None
 }
 
-/// Adds `name -> child` to the root directory, allocating a directory block
-/// when every existing slot is taken.
+/// Adds `name -> child` to directory `dir`, allocating a directory block when
+/// every existing slot is taken.
 fn add_entry(
     image: &mut [u8],
     superblock: &Superblock,
+    dir: u32,
     name: &str,
     child: u32,
 ) -> Option<()> {
     if name.is_empty() || name.len() > NAME_MAX {
         return None;
     }
-    let root = superblock.root_inode;
-    let (_, _, mut blocks, _) = inode_get(image, superblock, root)?;
+    let (_, _, mut blocks, _) = inode_get(image, superblock, dir)?;
 
     for &block in blocks.iter() {
         if block == 0 {
@@ -420,7 +464,7 @@ fn add_entry(
     if !flush_block(image, superblock, block as usize) {
         return None;
     }
-    if !inode_put(image, superblock, root, INODE_KIND_DIR, 0, &blocks, 0) {
+    if !inode_put(image, superblock, dir, INODE_KIND_DIR, 0, &blocks, 0) {
         return None;
     }
     flush_bitmap(image, superblock);
@@ -430,6 +474,7 @@ fn add_entry(
 fn create_inode(
     image: &mut [u8],
     superblock: &Superblock,
+    parent: u32,
     name: &str,
     kind: u32,
 ) -> Option<u32> {
@@ -438,7 +483,7 @@ fn create_inode(
     if !inode_put(image, superblock, index, kind, 0, &empty, 0) {
         return None;
     }
-    if add_entry(image, superblock, name, index).is_none() {
+    if add_entry(image, superblock, parent, name, index).is_none() {
         let _ = inode_put(image, superblock, index, INODE_KIND_FREE, 0, &empty, 0);
         return None;
     }
@@ -575,72 +620,60 @@ fn store(
     true
 }
 
-fn component(path: &str) -> Result<&str, ()> {
-    let trimmed = path.trim_matches('/');
-    if trimmed.is_empty() {
-        return Ok("");
-    }
-    if trimmed.contains('/') {
-        return Err(());
-    }
-    Ok(trimmed)
-}
-
 pub struct Sfs;
 
 impl FileSystem for Sfs {
     fn create_file(&mut self, path: &str) -> Result<(), ()> {
-        let name = component(path)?;
-        if name.is_empty() {
-            return Err(());
-        }
+        let parts = split_path(path)?;
+        let (&name, parent_parts) = parts.split_last().ok_or(())?;
         let image = image_mut()?;
         let superblock = superblock(image)?;
-        match lookup(image, &superblock, name) {
-            Some((index, INODE_KIND_FILE, _)) => {
+        let parent = resolve_dir(image, &superblock, parent_parts).ok_or(())?;
+        match find_entry(image, &superblock, parent, name) {
+            Some((block, slot)) => {
+                let index = u32_at(image, block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE);
+                let (kind, _, _, _) = inode_get(image, &superblock, index).ok_or(())?;
+                if kind != INODE_KIND_FILE {
+                    return Err(());
+                }
                 if truncate(image, &superblock, index) {
                     Ok(())
                 } else {
                     Err(())
                 }
             }
-            Some(_) => Err(()),
-            None => create_inode(image, &superblock, name, INODE_KIND_FILE)
+            None => create_inode(image, &superblock, parent, name, INODE_KIND_FILE)
                 .map(|_| ())
                 .ok_or(()),
         }
     }
 
     fn make_directory(&mut self, path: &str) -> Result<(), ()> {
-        let name = component(path)?;
-        if name.is_empty() {
-            return Err(());
-        }
+        let parts = split_path(path)?;
+        let (&name, parent_parts) = parts.split_last().ok_or(())?;
         let image = image_mut()?;
         let superblock = superblock(image)?;
-        if lookup(image, &superblock, name).is_some() {
+        let parent = resolve_dir(image, &superblock, parent_parts).ok_or(())?;
+        if find_entry(image, &superblock, parent, name).is_some() {
             return Err(());
         }
-        create_inode(image, &superblock, name, INODE_KIND_DIR)
+        create_inode(image, &superblock, parent, name, INODE_KIND_DIR)
             .map(|_| ())
             .ok_or(())
     }
 
     fn remove_file(&mut self, path: &str) -> Result<(), ()> {
-        let name = component(path)?;
-        if name.is_empty() {
-            return Err(());
-        }
+        let parts = split_path(path)?;
+        let (&name, parent_parts) = parts.split_last().ok_or(())?;
         let image = image_mut()?;
         let superblock = superblock(image)?;
-        let (index, kind, _) = lookup(image, &superblock, name).ok_or(())?;
+        let parent = resolve_dir(image, &superblock, parent_parts).ok_or(())?;
+        let (block, slot) = find_entry(image, &superblock, parent, name).ok_or(())?;
+        let index = u32_at(image, block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE);
+        let (kind, _, blocks, indirect) = inode_get(image, &superblock, index).ok_or(())?;
         if kind != INODE_KIND_FILE {
             return Err(());
         }
-        let Some((block, slot)) = find_entry(image, &superblock, name) else {
-            return Err(());
-        };
-        let (_, _, blocks, indirect) = inode_get(image, &superblock, index).ok_or(())?;
         let entry = block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE;
         for byte in &mut image[entry..entry + DIR_ENTRY_SIZE] {
             *byte = 0;
@@ -658,23 +691,20 @@ impl FileSystem for Sfs {
     }
 
     fn remove_directory(&mut self, path: &str) -> Result<(), ()> {
-        let name = component(path)?;
-        if name.is_empty() {
-            return Err(());
-        }
+        let parts = split_path(path)?;
+        let (&name, parent_parts) = parts.split_last().ok_or(())?;
         let image = image_mut()?;
         let superblock = superblock(image)?;
-        let (index, kind, _) = lookup(image, &superblock, name).ok_or(())?;
-        if kind != INODE_KIND_DIR {
+        let parent = resolve_dir(image, &superblock, parent_parts).ok_or(())?;
+        let (block, slot) = find_entry(image, &superblock, parent, name).ok_or(())?;
+        let index = u32_at(image, block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE);
+        let (kind, _, blocks, indirect) = inode_get(image, &superblock, index).ok_or(())?;
+        if kind != INODE_KIND_DIR
+            || indirect != 0
+            || blocks.iter().any(|&block| block != 0)
+        {
             return Err(());
         }
-        let (_, _, blocks, _) = inode_get(image, &superblock, index).ok_or(())?;
-        if blocks.iter().any(|&block| block != 0) {
-            return Err(());
-        }
-        let Some((block, slot)) = find_entry(image, &superblock, name) else {
-            return Err(());
-        };
         let entry = block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE;
         for byte in &mut image[entry..entry + DIR_ENTRY_SIZE] {
             *byte = 0;
@@ -689,23 +719,36 @@ impl FileSystem for Sfs {
     }
 
     fn rename(&mut self, source: &str, destination: &str) -> Result<(), ()> {
-        let old = component(source)?;
-        let new = component(destination)?;
-        if old.is_empty() || new.is_empty() || new.len() > NAME_MAX {
-            return Err(());
-        }
+        let source_parts = split_path(source)?;
+        let dest_parts = split_path(destination)?;
+        let (&old_name, old_parent_parts) = source_parts.split_last().ok_or(())?;
+        let (&new_name, new_parent_parts) = dest_parts.split_last().ok_or(())?;
         let image = image_mut()?;
         let superblock = superblock(image)?;
-        if lookup(image, &superblock, new).is_some() {
+        let old_parent = resolve_dir(image, &superblock, old_parent_parts).ok_or(())?;
+        let new_parent = resolve_dir(image, &superblock, new_parent_parts).ok_or(())?;
+        if find_entry(image, &superblock, new_parent, new_name).is_some() {
             return Err(());
         }
-        let Some((block, slot)) = find_entry(image, &superblock, old) else {
-            return Err(());
-        };
+        let (block, slot) = find_entry(image, &superblock, old_parent, old_name).ok_or(())?;
+        let index = u32_at(image, block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE);
+
+        if old_parent == new_parent {
+            let entry = block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE;
+            image[entry + 4] = new_name.len() as u8;
+            image[entry + 5..entry + 5 + new_name.len()].copy_from_slice(new_name.as_bytes());
+            for byte in &mut image[entry + 5 + new_name.len()..entry + DIR_ENTRY_SIZE] {
+                *byte = 0;
+            }
+            if !flush_block(image, &superblock, block) {
+                return Err(());
+            }
+            return Ok(());
+        }
+
+        add_entry(image, &superblock, new_parent, new_name, index).ok_or(())?;
         let entry = block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE;
-        image[entry + 4] = new.len() as u8;
-        image[entry + 5..entry + 5 + new.len()].copy_from_slice(new.as_bytes());
-        for byte in &mut image[entry + 5 + new.len()..entry + DIR_ENTRY_SIZE] {
+        for byte in &mut image[entry..entry + DIR_ENTRY_SIZE] {
             *byte = 0;
         }
         if !flush_block(image, &superblock, block) {
@@ -717,21 +760,20 @@ impl FileSystem for Sfs {
     fn is_directory(&self, path: &str) -> Result<bool, ()> {
         let image = image()?;
         let superblock = superblock(image)?;
-        let name = component(path)?;
-        if name.is_empty() {
+        let parts = split_path(path)?;
+        if parts.is_empty() {
             return Ok(true);
         }
-        let (_, kind, _) = lookup(image, &superblock, name).ok_or(())?;
+        let (_, kind, _) = lookup(image, &superblock, path).ok_or(())?;
         Ok(kind == INODE_KIND_DIR)
     }
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, ()> {
         let image = image()?;
         let superblock = superblock(image)?;
-        if !component(path)?.is_empty() {
-            return Err(());
-        }
-        let (_, _, blocks, _) = inode_get(image, &superblock, superblock.root_inode).ok_or(())?;
+        let parts = split_path(path)?;
+        let dir = resolve_dir(image, &superblock, &parts).ok_or(())?;
+        let (_, _, blocks, _) = inode_get(image, &superblock, dir).ok_or(())?;
         let mut entries = Vec::new();
         for block in blocks {
             if block == 0 {
@@ -764,11 +806,7 @@ impl FileSystem for Sfs {
     fn read_at(&self, path: &str, offset: usize, limit: usize) -> Result<Vec<u8>, ()> {
         let image = image()?;
         let superblock = superblock(image)?;
-        let name = component(path)?;
-        if name.is_empty() {
-            return Err(());
-        }
-        let (index, _, size) = lookup(image, &superblock, name).ok_or(())?;
+        let (index, _, size) = lookup(image, &superblock, path).ok_or(())?;
         if offset >= size as usize {
             return Ok(Vec::new());
         }
@@ -795,25 +833,26 @@ impl FileSystem for Sfs {
         bytes: &[u8],
         append: bool,
     ) -> Result<(usize, usize), ()> {
-        let name = component(path)?;
-        if name.is_empty() {
-            return Err(());
-        }
+        let parts = split_path(path)?;
+        let (&name, parent_parts) = parts.split_last().ok_or(())?;
         let image = image_mut()?;
         let superblock = superblock(image)?;
-        let (index, _, size) = match lookup(image, &superblock, name) {
-            Some((index, INODE_KIND_FILE, size)) => (index, INODE_KIND_FILE, size),
-            Some(_) => return Err(()),
-            None => (
-                create_inode(image, &superblock, name, INODE_KIND_FILE).ok_or(())?,
-                INODE_KIND_FILE,
-                u32::from(0_u8),
-            ),
+        let parent = resolve_dir(image, &superblock, parent_parts).ok_or(())?;
+        let index = match find_entry(image, &superblock, parent, name) {
+            Some((block, slot)) => {
+                let index = u32_at(image, block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE);
+                let (kind, _, _, _) = inode_get(image, &superblock, index).ok_or(())?;
+                if kind != INODE_KIND_FILE {
+                    return Err(());
+                }
+                index
+            }
+            None => create_inode(image, &superblock, parent, name, INODE_KIND_FILE).ok_or(())?,
         };
-        let _ = size;
 
         let base = if append {
-            lookup(image, &superblock, name).map(|(_, _, size)| size as usize).unwrap_or(0)
+            let (_, _, size) = lookup(image, &superblock, path).ok_or(())?;
+            size as usize
         } else {
             if offset != 0 {
                 return Err(());
@@ -827,19 +866,17 @@ impl FileSystem for Sfs {
         if append {
             let (_, _, old_blocks, old_indirect) = inode_get(image, &superblock, index).ok_or(())?;
             let mut existing = Vec::new();
-            if base > 0 {
-                let size = base;
-                let mut position = 0;
-                while position < size {
-                    let slot = position / BLOCK_SIZE;
-                    let block = inode_slot_block(image, &superblock, &old_blocks, old_indirect, slot)
+            let mut position = 0;
+            while position < base {
+                let slot = position / BLOCK_SIZE;
+                let block =
+                    inode_slot_block(image, &superblock, &old_blocks, old_indirect, slot)
                         .ok_or(())?;
-                    let start = block_start(image, &superblock, block).ok_or(())?;
-                    let within = position % BLOCK_SIZE;
-                    let take = (BLOCK_SIZE - within).min(size - position);
-                    existing.extend_from_slice(&image[start + within..start + within + take]);
-                    position += take;
-                }
+                let start = block_start(image, &superblock, block).ok_or(())?;
+                let within = position % BLOCK_SIZE;
+                let take = (BLOCK_SIZE - within).min(base - position);
+                existing.extend_from_slice(&image[start + within..start + within + take]);
+                position += take;
             }
             existing.extend_from_slice(bytes);
             if !store(image, &superblock, index, &existing, &old_blocks, old_indirect) {
@@ -859,25 +896,35 @@ impl FileSystem for Sfs {
     fn len(&self, path: &str) -> Result<usize, ()> {
         let image = image()?;
         let superblock = superblock(image)?;
-        let name = component(path)?;
-        if name.is_empty() {
+        if split_path(path)?.is_empty() {
             return Ok(0);
         }
-        let (_, _, size) = lookup(image, &superblock, name).ok_or(())?;
+        let (_, kind, size) = lookup(image, &superblock, path).ok_or(())?;
+        if kind != INODE_KIND_FILE {
+            return Err(());
+        }
         Ok(size as usize)
     }
 
     fn seed_file(&mut self, path: &str, contents: &[u8]) -> Result<(), ()> {
-        let name = component(path)?;
-        if name.is_empty() || contents.len() > MAX_FILE_BLOCKS * BLOCK_SIZE {
+        if contents.len() > MAX_FILE_BLOCKS * BLOCK_SIZE {
             return Err(());
         }
+        let parts = split_path(path)?;
+        let (&name, parent_parts) = parts.split_last().ok_or(())?;
         let image = image_mut()?;
         let superblock = superblock(image)?;
-        let index = match lookup(image, &superblock, name) {
-            Some((index, INODE_KIND_FILE, _)) => index,
-            Some(_) => return Err(()),
-            None => create_inode(image, &superblock, name, INODE_KIND_FILE).ok_or(())?,
+        let parent = resolve_dir(image, &superblock, parent_parts).ok_or(())?;
+        let index = match find_entry(image, &superblock, parent, name) {
+            Some((block, slot)) => {
+                let index = u32_at(image, block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE);
+                let (kind, _, _, _) = inode_get(image, &superblock, index).ok_or(())?;
+                if kind != INODE_KIND_FILE {
+                    return Err(());
+                }
+                index
+            }
+            None => create_inode(image, &superblock, parent, name, INODE_KIND_FILE).ok_or(())?,
         };
         if !truncate(image, &superblock, index) {
             return Err(());

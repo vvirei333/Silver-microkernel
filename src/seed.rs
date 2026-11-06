@@ -19,10 +19,14 @@ pub const NOTES_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/notes.elf
 /// Installs the built-in app bundles into the mounted SFS. Called after
 /// `/sfs` is mounted; a file whose size already matches is left untouched.
 pub fn seed_apps() {
+    // One directory per install root. `mkdir` fails when it already exists,
+    // which is the normal case after the first boot; a genuinely broken path
+    // shows up as a failed install below.
+    let _ = crate::vfs::mkdir("/", "/sfs/apps");
     for (path, image) in [
-        ("/sfs/calc.elf", CALC_ELF),
-        ("/sfs/gallery.elf", GALLERY_ELF),
-        ("/sfs/notes.elf", NOTES_ELF),
+        ("/sfs/apps/calc.elf", CALC_ELF),
+        ("/sfs/apps/gallery.elf", GALLERY_ELF),
+        ("/sfs/apps/notes.elf", NOTES_ELF),
     ] {
         match crate::vfs::file_len("/", path) {
             Ok(length) if length == image.len() => continue,
