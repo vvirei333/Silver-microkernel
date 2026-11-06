@@ -96,10 +96,24 @@ fn superblock(image: &[u8]) -> Result<Superblock, ()> {
     let bitmap_block = u32_at(image, 24);
     let inode_table_block = u32_at(image, 28);
     let data_block_start = u32_at(image, 36);
+    // Every metadata bound is checked here, before any of these fields can
+    // become an image offset. A corrupt or hostile superblock must fail the
+    // mount instead of panicking the kernel on the first filesystem call.
+    let bitmap_end = (bitmap_block as usize)
+        .saturating_mul(BLOCK_SIZE)
+        .saturating_add((total_blocks as usize).div_ceil(8));
+    let inode_end = (inode_table_block as usize)
+        .saturating_mul(BLOCK_SIZE)
+        .saturating_add((inode_count as usize).saturating_mul(INODE_SIZE));
     if block_size as usize != BLOCK_SIZE
         || total_blocks as usize * BLOCK_SIZE > image.len()
         || inode_count == 0
         || data_block_start >= total_blocks
+        || bitmap_block >= total_blocks
+        || inode_table_block >= total_blocks
+        || bitmap_end > image.len()
+        || inode_end > image.len()
+        || root_inode >= inode_count
     {
         return Err(());
     }
@@ -120,15 +134,41 @@ fn inode_offset(superblock: &Superblock, inode: u32) -> Option<usize> {
     Some(superblock.inode_table_block as usize * BLOCK_SIZE + inode as usize * INODE_SIZE)
 }
 
+/// `inode_offset` plus the image-bounds check, for callers that read the
+/// inode through [`u32_at`] instead of [`inode_get`].
+fn inode_offset_checked(
+    image: &[u8],
+    superblock: &Superblock,
+    inode: u32,
+) -> Option<usize> {
+    let offset = inode_offset(superblock, inode)?;
+    if offset + INODE_SIZE > image.len() {
+        return None;
+    }
+    Some(offset)
+}
+
+/// Validates a data-block number read from an inode or a directory entry
+/// before it is used as an image offset. Metadata blocks, out-of-range
+/// numbers and blocks that fall outside the loaded image are rejected, so a
+/// corrupt image yields `None` instead of a slice panic.
+fn block_start(image: &[u8], superblock: &Superblock, block: u32) -> Option<usize> {
+    if block < superblock.data_block_start || block >= superblock.total_blocks {
+        return None;
+    }
+    let start = (block as usize).checked_mul(BLOCK_SIZE)?;
+    if start.checked_add(BLOCK_SIZE)? > image.len() {
+        return None;
+    }
+    Some(start)
+}
+
 fn inode_get(
     image: &[u8],
     superblock: &Superblock,
     index: u32,
 ) -> Option<(u32, u32, [u32; DIRECT_BLOCKS])> {
-    let offset = inode_offset(superblock, index)?;
-    if offset + INODE_SIZE > image.len() {
-        return None;
-    }
+    let offset = inode_offset_checked(image, superblock, index)?;
     let kind = u32_at(image, offset);
     let size = u32_at(image, offset + 4);
     let mut blocks = [0_u32; DIRECT_BLOCKS];
@@ -209,7 +249,8 @@ fn alloc_block(image: &mut [u8], superblock: &Superblock) -> Option<u32> {
 
 fn free_blocks(image: &mut [u8], superblock: &Superblock, blocks: &[u32; DIRECT_BLOCKS]) {
     for &block in blocks {
-        if block != 0 {
+        // Never let a corrupt inode release metadata into the free pool.
+        if block >= superblock.data_block_start && block < superblock.total_blocks {
             bitmap_set(image, superblock, block, false);
         }
     }
@@ -233,10 +274,7 @@ fn find_entry(image: &[u8], superblock: &Superblock, name: &str) -> Option<(usiz
         if block == 0 {
             break;
         }
-        let start = block as usize * BLOCK_SIZE;
-        if start + BLOCK_SIZE > image.len() {
-            return None;
-        }
+        let start = block_start(image, superblock, block)?;
         for slot in 0..DIR_ENTRIES_PER_BLOCK {
             let entry = start + slot * DIR_ENTRY_SIZE;
             let index = u32_at(image, entry);
@@ -257,7 +295,8 @@ fn find_entry(image: &[u8], superblock: &Superblock, name: &str) -> Option<(usiz
 
 fn find_free_inode(image: &[u8], superblock: &Superblock) -> Option<u32> {
     for index in 1..superblock.inode_count {
-        if u32_at(image, inode_offset(superblock, index)?) == INODE_KIND_FREE {
+        let offset = inode_offset_checked(image, superblock, index)?;
+        if u32_at(image, offset) == INODE_KIND_FREE {
             return Some(index);
         }
     }
@@ -282,7 +321,7 @@ fn add_entry(
         if block == 0 {
             break;
         }
-        let start = block as usize * BLOCK_SIZE;
+        let start = block_start(image, superblock, block)?;
         for slot in 0..DIR_ENTRIES_PER_BLOCK {
             let entry = start + slot * DIR_ENTRY_SIZE;
             if u32_at(image, entry) == 0 {
@@ -301,7 +340,10 @@ fn add_entry(
     }
 
     let block = alloc_block(image, superblock)?;
-    let start = block as usize * BLOCK_SIZE;
+    let Some(start) = block_start(image, superblock, block) else {
+        bitmap_set(image, superblock, block, false);
+        return None;
+    };
     for byte in &mut image[start..start + BLOCK_SIZE] {
         *byte = 0;
     }
@@ -366,6 +408,7 @@ fn store(
     superblock: &Superblock,
     index: u32,
     bytes: &[u8],
+    replacing: &[u32; DIRECT_BLOCKS],
 ) -> bool {
     let blocks_needed = bytes.len().div_ceil(BLOCK_SIZE);
     if blocks_needed > DIRECT_BLOCKS {
@@ -379,15 +422,21 @@ fn store(
         };
         *slot = block;
     }
+    // Persist the allocation *before* the inode can point at these blocks.
+    // A crash after this point leaks blocks (recoverable); the reverse order
+    // would let the allocator hand an inode-owned block to another file and
+    // cross-link their data.
+    if !flush_bitmap(image, superblock) {
+        return false;
+    }
     for (offset, &block) in blocks.iter().enumerate().take(blocks_needed) {
         let start = offset * BLOCK_SIZE;
         let end = (start + BLOCK_SIZE).min(bytes.len());
         let mut sector = [0_u8; BLOCK_SIZE];
         sector[..end - start].copy_from_slice(&bytes[start..end]);
-        let image_start = block as usize * BLOCK_SIZE;
-        if image_start + BLOCK_SIZE > image.len() {
+        let Some(image_start) = block_start(image, superblock, block) else {
             return false;
-        }
+        };
         image[image_start..image_start + BLOCK_SIZE].copy_from_slice(&sector);
         if !virtio_blk::write_sector(block as u64, &sector) {
             return false;
@@ -395,6 +444,14 @@ fn store(
     }
     if !inode_put(image, superblock, index, INODE_KIND_FILE, bytes.len() as u32, &blocks) {
         return false;
+    }
+    // The inode no longer references the old blocks, so they can be released.
+    // Skip anything that ended up in the new set (only possible if the bitmap
+    // was already inconsistent before this call).
+    for &block in replacing {
+        if block != 0 && !blocks.contains(&block) {
+            bitmap_set(image, superblock, block, false);
+        }
     }
     flush_bitmap(image, superblock);
     true
@@ -560,10 +617,7 @@ impl FileSystem for Sfs {
             if block == 0 {
                 break;
             }
-            let start = block as usize * BLOCK_SIZE;
-            if start + BLOCK_SIZE > image.len() {
-                return Err(());
-            }
+            let start = block_start(image, &superblock, block).ok_or(())?;
             for slot in 0..DIR_ENTRIES_PER_BLOCK {
                 let entry = start + slot * DIR_ENTRY_SIZE;
                 let index = u32_at(image, entry);
@@ -595,7 +649,7 @@ impl FileSystem for Sfs {
             return Err(());
         }
         let (index, _, size) = lookup(image, &superblock, name).ok_or(())?;
-        if offset as u32 >= size {
+        if offset >= size as usize {
             return Ok(Vec::new());
         }
         let end = offset.saturating_add(limit).min(size as usize);
@@ -607,12 +661,9 @@ impl FileSystem for Sfs {
             if slot >= DIRECT_BLOCKS || blocks[slot] == 0 {
                 return Err(());
             }
-            let start = blocks[slot] as usize * BLOCK_SIZE;
+            let start = block_start(image, &superblock, blocks[slot]).ok_or(())?;
             let within = position % BLOCK_SIZE;
             let take = (BLOCK_SIZE - within).min(end - position);
-            if start + within + take > image.len() {
-                return Err(());
-            }
             data.extend_from_slice(&image[start + within..start + within + take]);
             position += take;
         }
@@ -666,7 +717,7 @@ impl FileSystem for Sfs {
                     if slot >= DIRECT_BLOCKS || blocks[slot] == 0 {
                         return Err(());
                     }
-                    let start = blocks[slot] as usize * BLOCK_SIZE;
+                    let start = block_start(image, &superblock, blocks[slot]).ok_or(())?;
                     let within = position % BLOCK_SIZE;
                     let take = (BLOCK_SIZE - within).min(size - position);
                     existing.extend_from_slice(&image[start + within..start + within + take]);
@@ -674,14 +725,16 @@ impl FileSystem for Sfs {
                 }
             }
             existing.extend_from_slice(bytes);
-            if !store(image, &superblock, index, &existing) {
+            let (_, _, old_blocks) = inode_get(image, &superblock, index).ok_or(())?;
+            if !store(image, &superblock, index, &existing, &old_blocks) {
                 return Err(());
             }
             let end = existing.len();
             return Ok((end - base, end));
         }
 
-        if !store(image, &superblock, index, bytes) {
+        let empty = [0_u32; DIRECT_BLOCKS];
+        if !store(image, &superblock, index, bytes, &empty) {
             return Err(());
         }
         Ok((bytes.len(), bytes.len()))
@@ -732,6 +785,17 @@ pub fn load() -> bool {
     unsafe {
         IMAGE_PTR = base as *mut u8;
         IMAGE_LEN = bytes;
+    }
+    // Refuse an image whose metadata cannot be trusted instead of mounting a
+    // filesystem where every operation is guaranteed to fail.
+    let snapshot = unsafe { core::slice::from_raw_parts(IMAGE_PTR, IMAGE_LEN) };
+    if superblock(snapshot).is_err() {
+        unsafe {
+            IMAGE_PTR = core::ptr::null_mut();
+            IMAGE_LEN = 0;
+        }
+        console::write_str("KSFS: bad superblock\r\n");
+        return false;
     }
     true
 }
