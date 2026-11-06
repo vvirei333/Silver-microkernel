@@ -18,6 +18,10 @@ static CPU_TICKS: [AtomicU64; crate::smp::MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
 ];
 
 /// Ticks observed on `cpu` (0 when the index is out of range). The stall

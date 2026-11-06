@@ -36,36 +36,60 @@ static WATCHED: [AtomicBool; smp::MAX_CPUS] = [
     AtomicBool::new(false),
     AtomicBool::new(false),
     AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
 ];
 static BEAT: [AtomicU64; smp::MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
 ];
 static LAST_BEAT: [AtomicU64; smp::MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
 ];
 static STALE: [AtomicU32; smp::MAX_CPUS] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
 ];
 static REPORTED: [AtomicBool; smp::MAX_CPUS] = [
     AtomicBool::new(false),
     AtomicBool::new(false),
     AtomicBool::new(false),
     AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
 ];
 static BKL_WAITING: [AtomicBool; smp::MAX_CPUS] = [
     AtomicBool::new(false),
     AtomicBool::new(false),
     AtomicBool::new(false),
     AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
 ];
 
 /// One checker at a time; a contended check is simply skipped because the

@@ -36,6 +36,10 @@ static CACHE_RECORD: [AtomicU64; MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
 ];
 
 #[inline]

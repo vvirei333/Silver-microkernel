@@ -53,6 +53,10 @@ static READY_LOCAL_PICKS: [AtomicU64; smp::MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
 ];
 #[cfg(all(feature = "smp", feature = "smp-selftest"))]
 static READY_STEAL_PICKS: [AtomicU64; smp::MAX_CPUS] = [
@@ -60,6 +64,10 @@ static READY_STEAL_PICKS: [AtomicU64; smp::MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
 ];
 #[cfg(all(feature = "smp", feature = "smp-selftest"))]
 static READY_SCAN_PICKS: [AtomicU64; smp::MAX_CPUS] = [
@@ -67,6 +75,10 @@ static READY_SCAN_PICKS: [AtomicU64; smp::MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
 ];
 #[cfg(all(feature = "smp", feature = "smp-selftest"))]
 static READY_PUSH_PICKS: [AtomicU64; smp::MAX_CPUS] = [
@@ -74,6 +86,10 @@ static READY_PUSH_PICKS: [AtomicU64; smp::MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
 ];
 #[cfg(all(feature = "smp", feature = "smp-selftest"))]
 static READY_QUEUES_REPORTED: AtomicBool = AtomicBool::new(false);
@@ -367,6 +383,10 @@ static SCHED_PASS_ACTIVE: [core::sync::atomic::AtomicBool; smp::MAX_CPUS] = [
     core::sync::atomic::AtomicBool::new(false),
     core::sync::atomic::AtomicBool::new(false),
     core::sync::atomic::AtomicBool::new(false),
+core::sync::atomic::AtomicBool::new(false),
+core::sync::atomic::AtomicBool::new(false),
+core::sync::atomic::AtomicBool::new(false),
+core::sync::atomic::AtomicBool::new(false),
 ];
 
 /// Set once `init` has published the first task and `set_current_task`.
@@ -561,6 +581,10 @@ static CHURN_ON_CPU: [AtomicUsize; smp::MAX_CPUS] = [
     AtomicUsize::new(0),
     AtomicUsize::new(0),
     AtomicUsize::new(0),
+AtomicUsize::new(0),
+AtomicUsize::new(0),
+AtomicUsize::new(0),
+AtomicUsize::new(0),
 ];
 
 /// Spawns one churn task with an explicit high id, restoring `next_id` so a

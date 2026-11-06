@@ -43,7 +43,7 @@ use crate::{interrupts, platform};
 
 /// Maximum CPUs the per-CPU array covers. The QEMU profile runs `-smp 2`;
 /// the tablet boots a single core (ABL parks the rest).
-pub const MAX_CPUS: usize = 4;
+pub const MAX_CPUS: usize = 8;
 
 const BKL_FREE: isize = -1;
 
@@ -96,6 +96,10 @@ static CPUS: [PerCpu; MAX_CPUS] = [
     PerCpu::empty(),
     PerCpu::empty(),
     PerCpu::empty(),
+PerCpu::empty(),
+PerCpu::empty(),
+PerCpu::empty(),
+PerCpu::empty(),
 ];
 
 /// CPU slots the machine actually exposes, learned from the live FDT before
@@ -316,6 +320,10 @@ static BKL_STALL_REPORTED: [AtomicBool; MAX_CPUS] = [
     AtomicBool::new(false),
     AtomicBool::new(false),
     AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
+AtomicBool::new(false),
 ];
 
 /// Keeps the intentional selftest stall out of normal boot logs; the counter
@@ -777,6 +785,10 @@ static QUIESCE_ACK: [AtomicU32; MAX_CPUS] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
 ];
 
 /// Opt-in `smp-selftest` observation: generation written by the boot CPU
@@ -789,6 +801,10 @@ static SELFTEST_SEEN: [AtomicU32; MAX_CPUS] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
 ];
 
 /// Parks the calling CPU until the quiescing CPU releases the world. Called
@@ -975,6 +991,10 @@ static AP_PARAMS: [ApBootParams; MAX_CPUS] = [
     ApBootParams::empty(),
     ApBootParams::empty(),
     ApBootParams::empty(),
+ApBootParams::empty(),
+ApBootParams::empty(),
+ApBootParams::empty(),
+ApBootParams::empty(),
 ];
 
 // Physical AP trampoline. PSCI CPU_ON enters this at its physical address
@@ -1345,6 +1365,10 @@ static TLB_PROBE_SEEN: [AtomicU64; MAX_CPUS] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
     AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
+AtomicU64::new(0),
 ];
 #[cfg(all(feature = "smp", feature = "smp-selftest"))]
 static TLB_PROBE_ACK: [AtomicU32; MAX_CPUS] = [
@@ -1352,6 +1376,10 @@ static TLB_PROBE_ACK: [AtomicU32; MAX_CPUS] = [
     AtomicU32::new(0),
     AtomicU32::new(0),
     AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
+AtomicU32::new(0),
 ];
 
 /// Waits until every PSCI-accepted CPU is published, then returns the number of
