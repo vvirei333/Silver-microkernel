@@ -3862,7 +3862,9 @@ fn initial_self_rights(program: u64) -> Option<u32> {
         // The shell hands device rights to the tasks it spawns by hand
         // (`spawn block_driver`), and `CapTable::grant` only allows a task to
         // pass on a right it already holds.
-        user_program::HOWL => capability::CAP_MMIO,
+        user_program::HOWL => capability::CAP_MMIO | capability::CAP_FS_WRITE,
+        // Trusted filesystem stress helper (not an installed app bundle).
+        user_program::BIGDIR => capability::CAP_FS_WRITE,
         // The graphics driver owns the on-screen Power button; only this
         // trusted component receives the power privilege.
         user_program::GPU_DRIVER => capability::CAP_MMIO | capability::CAP_POWER,

@@ -237,16 +237,22 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         }
         SYS_FS_OPEN => sys_fs_open(frame[0], frame[1]),
         SYS_FS_READ => sys_fs_read(frame[0], frame[1], frame[2]),
-        SYS_FS_WRITE => sys_fs_write(frame[0], frame[1], frame[2]),
-        SYS_FS_CREATE => sys_fs_create(frame[0]),
+        SYS_FS_WRITE if fs_write_allowed() => sys_fs_write(frame[0], frame[1], frame[2]),
+        SYS_FS_WRITE => SYSCALL_ERROR,
+        SYS_FS_CREATE if fs_write_allowed() => sys_fs_create(frame[0]),
+        SYS_FS_CREATE => SYSCALL_ERROR,
         SYS_FS_CLOSE => sys_fs_close(frame[0]),
         SYS_FS_READ_DIR => sys_fs_read_dir(frame[0], frame[1], frame[2]),
-        SYS_FS_MKDIR => sys_fs_mkdir(frame[0]),
+        SYS_FS_MKDIR if fs_write_allowed() => sys_fs_mkdir(frame[0]),
+        SYS_FS_MKDIR => SYSCALL_ERROR,
         SYS_CHDIR => sys_chdir(frame[0]),
         SYS_GETCWD => sys_getcwd(frame[0], frame[1]),
-        SYS_FS_UNLINK => sys_fs_unlink(frame[0]),
-        SYS_FS_RMDIR => sys_fs_rmdir(frame[0]),
-        SYS_FS_RENAME => sys_fs_rename(frame[0], frame[1]),
+        SYS_FS_UNLINK if fs_write_allowed() => sys_fs_unlink(frame[0]),
+        SYS_FS_UNLINK => SYSCALL_ERROR,
+        SYS_FS_RMDIR if fs_write_allowed() => sys_fs_rmdir(frame[0]),
+        SYS_FS_RMDIR => SYSCALL_ERROR,
+        SYS_FS_RENAME if fs_write_allowed() => sys_fs_rename(frame[0], frame[1]),
+        SYS_FS_RENAME => SYSCALL_ERROR,
         SYS_CAP_GET_TASK_ID => scheduler::capability_task_id(frame[0]).unwrap_or(SYSCALL_ERROR),
         SYS_CAP_GRANT => {
             if scheduler::grant_capability(frame[0], frame[1], frame[2] as u32) {
@@ -513,6 +519,13 @@ fn sys_fs_open(path_ptr: u64, flags: u64) -> u64 {
     with_path(path_ptr, |path| {
         vfs::open(scheduler::current_task_id(), &cwd, path, flags).unwrap_or(SYSCALL_ERROR)
     })
+}
+
+/// Write-side filesystem operations require the holder's own `CAP_FS_WRITE`.
+/// The kernel's own boot-time installers call the VFS directly and are not
+/// affected; this gate covers EL0 callers only.
+fn fs_write_allowed() -> bool {
+    scheduler::current_task_has_rights(capability::CAP_FS_WRITE)
 }
 
 fn sys_fs_create(path_ptr: u64) -> u64 {

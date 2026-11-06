@@ -17,6 +17,10 @@ pub const CAP_MOUNT: u32 = 1 << 7;
 /// Deliberately kept out of [`CAP_ALL`]; only trusted components (SILVERD,
 /// the graphics driver and explicitly provisioned probes) hold it.
 pub const CAP_POWER: u32 = 1 << 8;
+/// Write access to the filesystem (create/truncate/write/unlink/mkdir/rmdir/
+/// rename). Apps spawned from `/sfs/apps` do not hold it: an installed ELF can
+/// read the tree but cannot modify the disk until a bundle manifest grants it.
+pub const CAP_FS_WRITE: u32 = 1 << 9;
 
 /// Rights that describe authority over a specific `target_task`. They are
 /// only meaningful together with a target and are checked with
@@ -26,10 +30,17 @@ pub const CAP_TARGET_BITS: u32 = CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_R
 /// Rights that describe a process-wide/system privilege of the holder. Such a
 /// right is held only by a self-capability (`target_task == own id`), never by
 /// a handle on another task.
-pub const CAP_GLOBAL_BITS: u32 = CAP_MMIO | CAP_IRQ | CAP_PCI | CAP_MOUNT | CAP_POWER;
+pub const CAP_GLOBAL_BITS: u32 =
+    CAP_MMIO | CAP_IRQ | CAP_PCI | CAP_MOUNT | CAP_POWER | CAP_FS_WRITE;
 
-pub const CAP_ALL: u32 =
-    CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME | CAP_MMIO | CAP_IRQ | CAP_PCI;
+pub const CAP_ALL: u32 = CAP_KILL
+    | CAP_WAIT
+    | CAP_CONSOLE_GRANT
+    | CAP_RESUME
+    | CAP_MMIO
+    | CAP_IRQ
+    | CAP_PCI
+    | CAP_FS_WRITE;
 
 /// Upper bound on capability records in one task. Spawn handles alone need up
 /// to `MAX_TASKS` entries in a parent; repeated `SYS_CAP_GRANT` must not grow
