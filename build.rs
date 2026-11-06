@@ -71,7 +71,7 @@ fn main() {
         ("net_server", "net_server.elf"),
         ("gpu_driver", "gpu_driver.elf"),
         ("input_driver", "input_driver.elf"),
-        ("springboard", "springboard.elf"),
+        ("home", "home.elf"),
         // Seeded into the VFS (see src/seed.rs) so `run bin/hello` exercises the
         // dynamic ELF loader and `run bin/crash` exercises EL0 fault containment;
         // deliberately NOT in user_program::image.

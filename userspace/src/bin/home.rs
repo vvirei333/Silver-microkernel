@@ -1,4 +1,4 @@
-//! SpringBoard: the home screen client of the Silver compositor.
+//! SilverHome: the single-page home screen client of the Silver compositor.
 //!
 //! It owns no pixels. Everything is drawn through the compositor channel
 //! (`GUI_CLEAR` / `GUI_RECT` / `GUI_TEXT`), and the compositor forwards touch
@@ -30,9 +30,9 @@ const DOCK_ICON: u32 = 108;
 const DOCK_APPS: [usize; 4] = [0, 1, 2, 3];
 
 const APP_LABELS: [&str; 20] = [
-    "Phone", "Mail", "Safari", "iPod", "Messages", "Calendar", "Photos", "Camera", "YouTube",
-    "Stocks", "Maps", "Weather", "Clock", "Calculator", "Notes", "Settings", "Videos",
-    "Voice Memos", "Compass", "Reminders",
+    "Calls", "Post", "Browser", "Music", "Chat", "Calendar", "Gallery", "Camera", "Video",
+    "Markets", "Maps", "Weather", "Clock", "Calc", "Notes", "Setup", "Films", "Recorder",
+    "Compass", "Tasks",
 ];
 const APP_COLORS: [u32; 20] = [
     0xFF3CB44B, 0xFF2E6FD9, 0xFF29A3E8, 0xFFE8467C, 0xFF4CD964, 0xFFE8E8E8, 0xFFF5A623,
@@ -116,7 +116,7 @@ fn dock_position(slot: usize) -> (u32, u32) {
 }
 
 fn draw_home(gpu: u64, pressed: Option<usize>) {
-    // Wallpaper: a few solid bands approximate the iOS gradient.
+    // Wallpaper: a few solid bands approximate a soft vertical gradient.
     let bands = 16_u32;
     for band in 0..bands {
         let t = band * 255 / bands;

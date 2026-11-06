@@ -88,7 +88,7 @@ pub const PROGRAM_NET_DRIVER: u64 = 12;
 pub const PROGRAM_NET_SERVER: u64 = 13;
 pub const PROGRAM_GPU_DRIVER: u64 = 14;
 pub const PROGRAM_INPUT_DRIVER: u64 = 15;
-pub const PROGRAM_SPRINGBOARD: u64 = 16;
+pub const PROGRAM_HOME: u64 = 16;
 /// Sentinel program ID for tasks spawned from a dynamically loaded ELF.
 pub const PROGRAM_DYNAMIC: u64 = u64::MAX - 1;
 pub const CAP_MMIO: u32 = 1 << 4;

@@ -115,7 +115,7 @@ static mut HOWL_ID: Option<u64> = None;
 /// forwarded here and nowhere else.
 static mut UI_CLIENT: Option<u64> = None;
 
-/// SpringBoard-style home screen at the iPhone 5 geometry (640 x 1136):
+/// Silver home screen at the reference handset geometry (640 x 1136):
 /// a 4 x 5 app grid plus a four-app dock.
 const ICON_SIZE: u32 = 118;
 const ICON_GAP_X: u32 = 26;
@@ -130,9 +130,9 @@ const DOCK_Y: u32 = 962;
 const DOCK_ICON: u32 = 108;
 const DOCK_APPS: [usize; 4] = [0, 1, 2, 3];
 const APP_LABELS: [&str; 20] = [
-    "Phone", "Mail", "Safari", "iPod", "Messages", "Calendar", "Photos", "Camera", "YouTube",
-    "Stocks", "Maps", "Weather", "Clock", "Calculator", "Notes", "Settings", "Videos",
-    "Voice Memos", "Compass", "Reminders",
+    "Calls", "Post", "Browser", "Music", "Chat", "Calendar", "Gallery", "Camera", "Video",
+    "Markets", "Maps", "Weather", "Clock", "Calc", "Notes", "Setup", "Films", "Recorder",
+    "Compass", "Tasks",
 ];
 const APP_COLORS: [u32; 20] = [
     0xFF3CB44B, 0xFF2E6FD9, 0xFF29A3E8, 0xFFE8467C, 0xFF4CD964, 0xFFE8E8E8, 0xFFF5A623,
@@ -143,7 +143,7 @@ const APP_COLORS: [u32; 20] = [
 /// `0` and `1` are taken by Howler input and pointer samples respectively.
 const GUI_BUTTON_PRESSED: u8 = 2;
 /// Compositor control channel. A UI client (the shell or a future
-/// SpringBoard service) draws through these messages instead of touching the
+/// home-screen service) draws through these messages instead of touching the
 /// framebuffer: the compositor owns the pixels.
 const GUI_CLEAR: u8 = 0x10;
 const GUI_RECT: u8 = 0x11;
@@ -275,7 +275,7 @@ fn fill_solid(x: u32, y: u32, w: u32, h: u32, color: u32) {
 }
 
 /// Forwards one pointer sample to the registered UI client. The compositor
-/// never decides what a tap means; that belongs to SpringBoard.
+/// never decides what a tap means; that belongs to the home-screen client.
 fn handle_pointer(input: input_proto::InputMsg) {
     let Some(client) = (unsafe { UI_CLIENT }) else {
         return;
@@ -665,7 +665,7 @@ fn draw_home(pressed_app: Option<usize>) {
         }
     }
 
-    // Status bar: time, carrier and battery, like the first iPhone.
+    // Status bar: time, carrier and battery.
     draw_rect(0, 0, SCREEN_WIDTH, 48, 0xFF00_0000, 0xFF00_0000);
     draw_text_scaled(12, 12, "9:41", COLOR_WHITE, 2);
     draw_text_centered_scaled(SCREEN_WIDTH / 2, 12, "Silver", COLOR_WHITE, 2);
