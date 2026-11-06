@@ -148,6 +148,8 @@ const GUI_BUTTON_PRESSED: u8 = 2;
 const GUI_CLEAR: u8 = 0x10;
 const GUI_RECT: u8 = 0x11;
 const GUI_TEXT: u8 = 0x12;
+/// Scaled text: x, y, colour, scale, len, bytes.
+const GUI_TEXT_SCALED: u8 = 0x14;
 /// Compositor -> client: pointer sample (x, y, pressed).
 const GUI_POINTER: u8 = 0x13;
 
@@ -246,6 +248,16 @@ fn handle_compositor_request(message: &ipc::Message) -> bool {
             let h = u16::from_le_bytes([payload[7], payload[8]]) as u32;
             let color = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
             fill_solid(x, y, w, h, color);
+            true
+        }
+        GUI_TEXT_SCALED => {
+            let x = u16::from_le_bytes([payload[1], payload[2]]) as u32;
+            let y = u16::from_le_bytes([payload[3], payload[4]]) as u32;
+            let color = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+            let scale = u32::from(payload[9].max(1));
+            let len = (payload[10] as usize).min(ipc::PAYLOAD_SIZE - 11);
+            let text = core::str::from_utf8(&payload[11..11 + len]).unwrap_or("");
+            draw_text_scaled(x, y, text, color, scale);
             true
         }
         GUI_TEXT => {
