@@ -79,7 +79,9 @@ fn main() {
         // dynamic ELF loader and `run bin/crash` exercises EL0 fault containment;
         // deliberately NOT in user_program::image.
         ("bigdir", "bigdir.elf"),
+        ("bigfile", "bigfile.elf"),
         ("writeprobe", "writeprobe.elf"),
+        ("regprobe", "regprobe.elf"),
         ("scopeprobe", "scopeprobe.elf"),
         ("hello", "hello.elf"),
         ("crash", "crash.elf"),

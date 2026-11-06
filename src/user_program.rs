@@ -18,6 +18,7 @@ pub const GPU_DRIVER: u64 = 14;
 pub const INPUT_DRIVER: u64 = 15;
 pub const HOME: u64 = 16;
 pub const BIGDIR: u64 = 17;
+pub const BIGFILE: u64 = 18;
 
 /// Sentinel program ID for tasks spawned from a dynamically loaded ELF (the
 /// `run <path>` path). Distinct from `u64::MAX`, which marks kernel tasks.
@@ -41,6 +42,7 @@ static GPU_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_dri
 static INPUT_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/input_driver.elf"));
 static HOME_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/home.elf"));
 static BIGDIR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigdir.elf"));
+static BIGFILE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigfile.elf"));
 
 /// Selects an executable for spawn. Unknown program IDs are rejected.
 pub fn image(program: u64) -> Option<&'static [u8]> {
@@ -63,6 +65,7 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         INPUT_DRIVER => Some(INPUT_DRIVER_ELF),
         HOME => Some(HOME_ELF),
         BIGDIR => Some(BIGDIR_ELF),
+        BIGFILE => Some(BIGFILE_ELF),
         _ => None,
     }
 }

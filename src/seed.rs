@@ -10,6 +10,8 @@
 pub const HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
 /// Filesystem sandbox probe: `run /bin/writeprobe` must fail to write `/sfs`.
 pub const WRITEPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/writeprobe.elf"));
+/// Register-preservation probe: `run /bin/regprobe` (status 0 = all kept).
+pub const REGPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/regprobe.elf"));
 /// Manifest-scope probe: installed under `/sfs/apps` with a write grant.
 pub const SCOPEPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scopeprobe.elf"));
 /// The write prefix the probe's manifest grants, and the manifest itself.
@@ -53,6 +55,9 @@ pub fn seed() {
     }
     if crate::vfs::seed_file("/", "/bin/crash", CRASH_ELF).is_err() {
         crate::console::write_str("SEED: failed to seed /bin/crash\r\n");
+    }
+    if crate::vfs::seed_file("/", "/bin/regprobe", REGPROBE_ELF).is_err() {
+        crate::console::write_str("SEED: failed to seed /bin/regprobe\r\n");
     }
     if crate::vfs::seed_file("/", "/bin/writeprobe", WRITEPROBE_ELF).is_err() {
         crate::console::write_str("SEED: failed to seed /bin/writeprobe\r\n");
