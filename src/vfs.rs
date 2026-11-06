@@ -861,7 +861,7 @@ impl Vfs {
         flags: u64,
         in_use: impl FnOnce(&str) -> bool,
     ) -> Result<(), ()> {
-        if flags != 0 || fstype != "ramfs" {
+        if flags != 0 {
             return Err(());
         }
         if self.mounts.len() >= MAX_MOUNTS {
@@ -887,10 +887,12 @@ impl Vfs {
         {
             return Err(());
         }
-        self.mounts.push(Mount {
-            point,
-            fs: Box::new(RamFs::empty()),
-        });
+        let fs: Box<dyn FileSystem> = match fstype {
+            "ramfs" => Box::new(RamFs::empty()),
+            "sfs" => Box::new(crate::sfs::Sfs),
+            _ => return Err(()),
+        };
+        self.mounts.push(Mount { point, fs });
         Ok(())
     }
 

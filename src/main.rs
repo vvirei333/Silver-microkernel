@@ -79,7 +79,9 @@ mod timer;
 #[cfg(not(feature = "std"))]
 mod user_memory;
 #[cfg(not(feature = "std"))]
+mod sfs;
 mod user_program;
+mod virtio_blk;
 #[cfg(all(not(feature = "std"), feature = "smp"))]
 mod watchdog;
 #[cfg(not(feature = "std"))]
@@ -1359,6 +1361,13 @@ pub extern "C" fn kernel_main() -> ! {
     if !memory_map.is_valid() || available_pages == 0 || !frame_allocator::run_self_test() {
         exceptions::silver_handle_exception(6, 0, 0, 0);
     }
+    // Snapshot the on-disk SFS before the EL0 block driver claims the device,
+    // then serve it read-only from the kernel VFS. Additive: a missing device
+    // leaves the boot path unchanged.
+    if sfs::load() {
+        sfs::report();
+        ram_log::log("KSFS loaded");
+    }
     ram_log::log("FRAME ALLOC OK");
     ram_log::fb_progress();
 
@@ -1540,6 +1549,14 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::fb_progress();
     vfs::init();
     seed::seed();
+    // The kernel SFS snapshot is mounted read-only. The userspace SFS server
+    // keeps the write path until the kernel owns it.
+    if sfs::loaded() {
+        let _ = vfs::mkdir("/", "/sfs");
+        if vfs::mount("/", "/sfs", "sfs", "", 0, |_| false).is_ok() {
+            ram_log::log("KSFS mounted");
+        }
+    }
     #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     vfs::run_self_test();
     ram_log::log("VFS+SEED OK");

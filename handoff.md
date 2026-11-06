@@ -5,6 +5,41 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## CURRENT STATUS (2026-11-05, TASK №23)
 
+## 2026-11-06 — SFS moves toward the kernel
+
+Milestone: the kernel now owns a synchronous disk path and mounts SFS in the
+VFS.
+
+- `src/virtio_blk.rs` — polled virtio-blk-pci driver inside the kernel (BAR4 at
+  `0x1010_0000`, modern layout common/ISR/device/notify at 0/0x1000/0x2000/
+  0x3000, one queue, one outstanding request, `dc cvac`/`dc ivac` fences).
+  Boot probe reads sector 0 and prints `KBLK: sector 0 magic 0x53465321`.
+  It resets the device afterwards so the EL0 `block_driver` re-initializes it
+  cleanly; `sfsinfo` and the userspace write path still work.
+- `src/sfs.rs` — read-only SFS backend for the VFS. `sfs::load()` snapshots the
+  whole 1 MiB image before the EL0 driver claims the disk, and the backend
+  serves `read_dir`/`read_at`/`len` from that snapshot. Mutating operations
+  fail closed.
+- `src/vfs.rs` — `mount(..., "sfs", ...)` constructs the new backend.
+- `src/main.rs` — loads the snapshot after the frame allocator, then mounts it
+  at `/sfs` right after `vfs::init`/`seed`.
+
+Verified in QEMU with a disk carrying `a.txt = "hi"`:
+
+```
+howl> ls /sfs
+a.txt
+howl> cat /sfs/a.txt
+hi
+```
+
+Not done yet: the write path stays in the userspace `sfs_server`, so `/sfs` is
+a boot-time snapshot; nested directories and indirect blocks are still
+unsupported. Next step is to make the kernel driver the sole owner of the
+device (drop `block_driver`/`sfs_server` from the boot chain) and add write
+support plus an on-demand (not snapshot) block read path.
+
+
 Checkpoint: package E2, the external audit fixes (`b22e3a0`), the SMP
 hardening (`b2f0e57`, `145ef54`), the quota / DMA-quarantine / TLB-test
 package (`681e64c`), the four-core bring-up (`ad20630`), the audit fix
