@@ -264,7 +264,7 @@ fn execute(command: &str) {
         Some("memtest") => memtest(),
         Some("ping") => ping_command(words.next()),
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
-        Some("bigdir") => run_utility(syscall::PROGRAM_BIGDIR, ""),
+        Some("bigdir") => run_utility(syscall::PROGRAM_BIGDIR, words.next().unwrap_or("")),
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("touch") => touch_command(words.next()),
         Some("run") => run_elf(words.next().unwrap_or("")),

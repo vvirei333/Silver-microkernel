@@ -391,6 +391,69 @@ fn find_entry(
     None
 }
 
+/// True when every one of the 16 slots in `block` is free.
+fn dir_block_empty(image: &[u8], superblock: &Superblock, block: u32) -> bool {
+    let Some(start) = block_start(image, superblock, block) else {
+        return false;
+    };
+    (0..DIR_ENTRIES_PER_BLOCK).all(|slot| u32_at(image, start + slot * DIR_ENTRY_SIZE) == 0)
+}
+
+/// Removes an empty `removed` block from directory `dir` and compacts the
+/// list so the packed iteration order (stop at the first missing slot) stays
+/// valid. Also frees the block and, when the tail is gone, the indirect table.
+fn shrink_dir_block(
+    image: &mut [u8],
+    superblock: &Superblock,
+    dir: u32,
+    removed: u32,
+) -> bool {
+    let Some((_, _, blocks, indirect)) = inode_get(image, superblock, dir) else {
+        return false;
+    };
+    let mut list = Vec::new();
+    for slot in 0..MAX_FILE_BLOCKS {
+        let Some(block) = inode_slot_block(image, superblock, &blocks, indirect, slot) else {
+            break;
+        };
+        list.push(block);
+    }
+    let Some(position) = list.iter().position(|&block| block == removed) else {
+        return false;
+    };
+    list.remove(position);
+
+    let mut direct = [0_u32; DIRECT_BLOCKS];
+    for (slot, &block) in list.iter().take(DIRECT_BLOCKS).enumerate() {
+        direct[slot] = block;
+    }
+    let mut table = indirect;
+    if list.len() > DIRECT_BLOCKS {
+        let Some(start) = block_start(image, superblock, table) else {
+            return false;
+        };
+        for byte in &mut image[start..start + BLOCK_SIZE] {
+            *byte = 0;
+        }
+        for (pointer, &block) in list[DIRECT_BLOCKS..].iter().enumerate() {
+            put_u32(image, start + pointer * 4, block);
+        }
+        if !flush_block(image, superblock, table as usize) {
+            return false;
+        }
+    } else if table != 0 {
+        free_blocks(image, superblock, &[table]);
+        table = 0;
+    }
+
+    free_blocks(image, superblock, &[removed]);
+    if !inode_put(image, superblock, dir, INODE_KIND_DIR, 0, &direct, table) {
+        return false;
+    }
+    flush_bitmap(image, superblock);
+    true
+}
+
 fn find_free_inode(image: &[u8], superblock: &Superblock) -> Option<u32> {
     for index in 1..superblock.inode_count {
         let offset = inode_offset_checked(image, superblock, index)?;
@@ -724,6 +787,9 @@ impl FileSystem for Sfs {
         if !flush_block(image, &superblock, block) {
             return Err(());
         }
+        if dir_block_empty(image, &superblock, block as u32) {
+            shrink_dir_block(image, &superblock, parent, block as u32);
+        }
         let empty = [0_u32; DIRECT_BLOCKS];
         inode_put(image, &superblock, index, INODE_KIND_FREE, 0, &empty, 0);
         // Release only after the inode stopped referencing the blocks: a crash
@@ -798,6 +864,9 @@ impl FileSystem for Sfs {
         }
         if !flush_block(image, &superblock, block) {
             return Err(());
+        }
+        if dir_block_empty(image, &superblock, block as u32) {
+            shrink_dir_block(image, &superblock, old_parent, block as u32);
         }
         Ok(())
     }
