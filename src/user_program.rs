@@ -16,6 +16,7 @@ pub const NET_DRIVER: u64 = 12;
 pub const NET_SERVER: u64 = 13;
 pub const GPU_DRIVER: u64 = 14;
 pub const INPUT_DRIVER: u64 = 15;
+pub const SPRINGBOARD: u64 = 16;
 
 /// Sentinel program ID for tasks spawned from a dynamically loaded ELF (the
 /// `run <path>` path). Distinct from `u64::MAX`, which marks kernel tasks.
@@ -37,6 +38,7 @@ static NET_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_dri
 static NET_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_server.elf"));
 static GPU_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_driver.elf"));
 static INPUT_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/input_driver.elf"));
+static SPRINGBOARD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/springboard.elf"));
 
 /// Selects an executable for spawn. Unknown program IDs are rejected.
 pub fn image(program: u64) -> Option<&'static [u8]> {
@@ -57,6 +59,7 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         NET_SERVER => Some(NET_SERVER_ELF),
         GPU_DRIVER => Some(GPU_DRIVER_ELF),
         INPUT_DRIVER => Some(INPUT_DRIVER_ELF),
+        SPRINGBOARD => Some(SPRINGBOARD_ELF),
         _ => None,
     }
 }
