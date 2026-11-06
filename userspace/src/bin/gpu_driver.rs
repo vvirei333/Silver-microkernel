@@ -58,12 +58,13 @@ const FW_CFG_FILE_ENTRY_SIZE: u32 = 64;
 // ---------------------------------------------------------------------------
 
 const SCREEN_WIDTH: u32 = 640;
-const SCREEN_HEIGHT: u32 = 480;
-const BYTES_PER_PIXEL: u32 = 4;
+const SCREEN_HEIGHT: u32 = 1136;
+const BYTES_PER_PIXEL: u32 = 2;
 const SCREEN_BYTES: u64 = SCREEN_WIDTH as u64 * SCREEN_HEIGHT as u64 * BYTES_PER_PIXEL as u64;
 
-/// DRM fourcc `ARGB8888` = fourcc_code('A','R','2','4'), big-endian on the wire.
-const FOURCC_ARGB8888: u32 = 0x3432_5241;
+/// DRM fourcc `RG16` (RGB565) = fourcc_code('R','G','1','6'). Two bytes per
+/// pixel keep the 640x1136 framebuffer inside the 2 MiB user DMA window.
+const FOURCC_RGB565: u32 = 0x3631_4752;
 
 // Palette (0xAARRGGBB little-endian word: B, G, R, A bytes).
 const COLOR_BLACK: u32 = 0xFF00_0000;
@@ -111,26 +112,29 @@ static mut UI: UiState = UiState {
 /// click so button presses can be reported to the console owner.
 static mut HOWL_ID: Option<u64> = None;
 
-/// SpringBoard-style home screen: a 4 x 3 app grid plus a four-app dock.
-const ICON_SIZE: u32 = 72;
-const ICON_GAP_X: u32 = 24;
-const ICON_GAP_Y: u32 = 30;
+/// SpringBoard-style home screen at the iPhone 5 geometry (640 x 1136):
+/// a 4 x 5 app grid plus a four-app dock.
+const ICON_SIZE: u32 = 118;
+const ICON_GAP_X: u32 = 26;
+const ICON_ROW_STEP: u32 = 174;
 const GRID_COLUMNS: usize = 4;
-const GRID_ROWS: usize = 3;
+const GRID_ROWS: usize = 5;
 const GRID_X: u32 =
     (SCREEN_WIDTH - (GRID_COLUMNS as u32 * ICON_SIZE + (GRID_COLUMNS as u32 - 1) * ICON_GAP_X))
         / 2;
-const GRID_Y: u32 = 48;
-const DOCK_Y: u32 = 384;
-const DOCK_ICON: u32 = 56;
+const GRID_Y: u32 = 96;
+const DOCK_Y: u32 = 962;
+const DOCK_ICON: u32 = 108;
 const DOCK_APPS: [usize; 4] = [0, 1, 2, 3];
-const APP_LABELS: [&str; 12] = [
-    "Phone", "Mail", "Safari", "iPod", "SMS", "Calendar", "Photos", "Camera", "YouTube",
-    "Stocks", "Maps", "Weather",
+const APP_LABELS: [&str; 20] = [
+    "Phone", "Mail", "Safari", "iPod", "Messages", "Calendar", "Photos", "Camera", "YouTube",
+    "Stocks", "Maps", "Weather", "Clock", "Calculator", "Notes", "Settings", "Videos",
+    "Voice Memos", "Compass", "Reminders",
 ];
-const APP_COLORS: [u32; 12] = [
+const APP_COLORS: [u32; 20] = [
     0xFF3CB44B, 0xFF2E6FD9, 0xFF29A3E8, 0xFFE8467C, 0xFF4CD964, 0xFFE8E8E8, 0xFFF5A623,
-    0xFF8E8E93, 0xFFE52D27, 0xFF1F1F1F, 0xFF34A853, 0xFF4A90E2,
+    0xFF8E8E93, 0xFFE52D27, 0xFF1F1F1F, 0xFF34A853, 0xFF4A90E2, 0xFF1C1C1E, 0xFF3A3A3C,
+    0xFFF7D154, 0xFF8E8E93, 0xFF5AC8FA, 0xFFAF52DE, 0xFF1F1F1F, 0xFFFF3B30,
 ];
 /// IPC opcode for a button press reported to the shell (which owns the console).
 /// `0` and `1` are taken by Howler input and pointer samples respectively.
@@ -193,7 +197,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     };
     render(cursor_x, cursor_y, pressed_btn);
 
-    syscall::print("GPU DRIVER: ENGINEER MENU DRAWN\r\n");
+    syscall::print("GPU DRIVER: HOME SCREEN DRAWN\r\n");
 
     // The frame buffer must stay mapped for the life of the display; exiting
     // would release the DMA pages and leave ramfb scanning freed RAM. Block on
@@ -385,7 +389,7 @@ fn configure_ramfb(
     //   stride (u32).
     let config = scratch_vaddr + SCRATCH_CONFIG_OFF;
     write_be64(config, fb_paddr);
-    write_be32(config + 8, FOURCC_ARGB8888);
+    write_be32(config + 8, FOURCC_RGB565);
     write_be32(config + 12, 0); // flags
     write_be32(config + 16, SCREEN_WIDTH);
     write_be32(config + 20, SCREEN_HEIGHT);
@@ -491,6 +495,37 @@ fn draw_text_centered(center_x: u32, y: u32, text: &str, color: u32) {
     draw_text(x, y, text, color);
 }
 
+fn draw_text_scaled(x: u32, y: u32, text: &str, color: u32, scale: u32) {
+    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+        return;
+    };
+    for (index, byte) in text.bytes().enumerate() {
+        let glyph_x = x + index as u32 * 8 * scale;
+        let glyph = match byte {
+            0x20..=0x7E => (byte - 0x20) as usize,
+            _ => 0,
+        };
+        for row in 0..8_u32 {
+            let bits = FONT[glyph * 8 + row as usize];
+            for col in 0..8_u32 {
+                if bits & (1_u8 << col) == 0 {
+                    continue;
+                }
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        plot(framebuffer, glyph_x + col * scale + dx, y + row * scale + dy, color);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn draw_text_centered_scaled(center_x: u32, y: u32, text: &str, color: u32, scale: u32) {
+    let width = (text.len() as u32).saturating_mul(8 * scale);
+    draw_text_scaled(center_x.saturating_sub(width / 2), y, text, color, scale);
+}
+
 fn draw_char(x: u32, y: u32, byte: u8, color: u32) {
     let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
         return;
@@ -516,8 +551,12 @@ fn plot(framebuffer: Framebuffer, x: u32, y: u32, color: u32) {
     }
     let offset = (u64::from(y) * u64::from(framebuffer.width) + u64::from(x))
         * u64::from(BYTES_PER_PIXEL);
+    let r = (color >> 16) & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = color & 0xFF;
+    let packed = ((r >> 3) << 11 | (g >> 2) << 5 | (b >> 3)) as u16;
     unsafe {
-        core::ptr::write_volatile((framebuffer.vaddr + offset) as *mut u32, color);
+        core::ptr::write_volatile((framebuffer.vaddr + offset) as *mut u16, packed);
     }
 }
 
@@ -530,7 +569,7 @@ fn draw_icon(x: u32, y: u32, size: u32, color: u32) {
     let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
         return;
     };
-    let radius = 10_i32;
+    let radius = 18_i32;
     for py in 0..size {
         for px in 0..size {
             let dx = if (px as i32) < radius { radius - px as i32 } else if (px as i32) + radius >= size as i32 { (px as i32) + radius - size as i32 + 1 } else { 0 };
@@ -557,7 +596,7 @@ fn grid_rect(index: usize) -> (u32, u32) {
     let row = (index / GRID_COLUMNS) as u32;
     (
         GRID_X + col * (ICON_SIZE + ICON_GAP_X),
-        GRID_Y + row * (ICON_SIZE + ICON_GAP_Y),
+        GRID_Y + row * ICON_ROW_STEP,
     )
 }
 
@@ -583,10 +622,10 @@ fn draw_home(pressed_app: Option<usize>) {
     }
 
     // Status bar: time, carrier and battery, like the first iPhone.
-    draw_rect(0, 0, SCREEN_WIDTH, 24, 0xFF00_0000, 0xFF00_0000);
-    draw_text(8, 8, "9:41", COLOR_WHITE);
-    draw_text_centered(SCREEN_WIDTH / 2, 8, "Silver", COLOR_WHITE);
-    draw_rect(SCREEN_WIDTH - 44, 8, 32, 10, 0xFF30D158, 0xFFE8E8E8);
+    draw_rect(0, 0, SCREEN_WIDTH, 48, 0xFF00_0000, 0xFF00_0000);
+    draw_text_scaled(12, 12, "9:41", COLOR_WHITE, 2);
+    draw_text_centered_scaled(SCREEN_WIDTH / 2, 12, "Silver", COLOR_WHITE, 2);
+    draw_rect(SCREEN_WIDTH - 60, 14, 44, 16, 0xFF30D158, 0xFFE8E8E8);
 
     // App grid.
     for index in 0..APP_LABELS.len() {
@@ -597,7 +636,13 @@ fn draw_home(pressed_app: Option<usize>) {
             APP_COLORS[index]
         };
         draw_icon(x, y, ICON_SIZE, color);
-        draw_text_centered(x + ICON_SIZE / 2, y + ICON_SIZE + 6, APP_LABELS[index], COLOR_WHITE);
+        draw_text_centered_scaled(
+            x + ICON_SIZE / 2,
+            y + ICON_SIZE + 10,
+            APP_LABELS[index],
+            COLOR_WHITE,
+            1,
+        );
     }
 
     // Dock.

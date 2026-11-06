@@ -9,7 +9,7 @@
 //!
 //! This driver polls the used ring (no IRQ binding), turns each `EV_SYN`
 //! batch into one [`input_proto::InputMsg`] with absolute coordinates already
-//! scaled to the 640x480 screen, and sends it to `gpu_driver` over IPC.
+//! scaled to the 640x1136 screen, and sends it to `gpu_driver` over IPC.
 
 #![no_std]
 #![no_main]
@@ -74,7 +74,7 @@ const BTN_LEFT: u16 = 0x0110;
 
 /// Screen geometry, kept in sync with `gpu_driver`.
 const SCREEN_WIDTH: u32 = 640;
-const SCREEN_HEIGHT: u32 = 480;
+const SCREEN_HEIGHT: u32 = 1136;
 
 /// QEMU's virtio-input tablet reports absolute coordinates in `0..=32767`.
 const COORD_MAX: u32 = 32767;
