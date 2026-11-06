@@ -72,6 +72,9 @@ fn main() {
         ("gpu_driver", "gpu_driver.elf"),
         ("input_driver", "input_driver.elf"),
         ("home", "home.elf"),
+        ("calc", "calc.elf"),
+        ("gallery", "gallery.elf"),
+        ("notes", "notes.elf"),
         // Seeded into the VFS (see src/seed.rs) so `run bin/hello` exercises the
         // dynamic ELF loader and `run bin/crash` exercises EL0 fault containment;
         // deliberately NOT in user_program::image.

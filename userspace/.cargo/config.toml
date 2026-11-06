@@ -2,4 +2,7 @@
 linker = "rust-lld"
 rustflags = [
     "-C", "link-arg=--gc-sections",
+    # The kernel's ELF loader maps 4 KiB pages; aarch64's default 64 KiB
+    # max-page-size only pads the file (95 KiB -> ~24 KiB).
+    "-C", "link-arg=-zmax-page-size=4096",
 ]

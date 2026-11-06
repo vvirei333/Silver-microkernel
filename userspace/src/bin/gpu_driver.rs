@@ -112,9 +112,12 @@ static mut UI: UiState = UiState {
 /// click so button presses can be reported to the console owner.
 static mut HOWL_ID: Option<u64> = None;
 
-/// Task that owns the screen: the first client to issue a draw operation.
-/// `0` means the screen is unclaimed. Draw calls from anyone else are ignored,
-/// so one task cannot repaint the display or steal the pointer stream.
+/// Permanent home-screen client: the first task to draw. It may hand the
+/// screen to an app and take it back, and its draw calls are always accepted.
+static UI_HOST: AtomicU64 = AtomicU64::new(0);
+
+/// Task that currently draws and receives pointer samples: the host, or an app
+/// the host handed the screen to. Anyone else is ignored.
 static UI_OWNER: AtomicU64 = AtomicU64::new(0);
 
 /// Task id of the registered input driver, resolved lazily through the
@@ -158,6 +161,9 @@ const GUI_TEXT: u8 = 0x12;
 const GUI_TEXT_SCALED: u8 = 0x14;
 /// Compositor -> client: pointer sample (x, y, pressed).
 const GUI_POINTER: u8 = 0x13;
+/// Host -> compositor: hand the screen to another task (u64 task id, 0 = the
+/// host itself). Only the host may send this.
+const GUI_HANDOFF: u8 = 0x15;
 
 
 #[no_mangle]
@@ -259,26 +265,56 @@ fn input_sender_ok(sender: u64) -> bool {
     }
 }
 
-/// Claims the screen for `sender` on the first draw call. Returns true when the
-/// caller owns it.
+/// True when `sender` may draw: the host or the task it handed the screen to.
+/// The first draw client becomes the host and starts as the owner.
 fn claim_ui(sender: u64) -> bool {
     if sender == 0 {
         return false;
     }
-    match UI_OWNER.compare_exchange(0, sender, Ordering::AcqRel, Ordering::Acquire) {
-        Ok(_) => true,
-        Err(owner) => owner == sender,
+    if UI_HOST.load(Ordering::Acquire) == 0 {
+        if UI_HOST
+            .compare_exchange(0, sender, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            let _ = UI_OWNER.compare_exchange(0, sender, Ordering::AcqRel, Ordering::Acquire);
+            return true;
+        }
+        // Lost the race for host: fall through to the ownership check.
     }
+    sender == UI_HOST.load(Ordering::Acquire) || sender == UI_OWNER.load(Ordering::Acquire)
+}
+
+/// Moves the pointer/draw ownership to `target` (0 = back to the host). Only
+/// the host may do this, so an app cannot steal the screen back.
+fn handoff_ui(sender: u64, target: u64) {
+    let host = UI_HOST.load(Ordering::Acquire);
+    if host == 0 || sender != host {
+        return;
+    }
+    UI_OWNER.store(if target == 0 { host } else { target }, Ordering::Release);
 }
 
 fn release_ui(sender: u64) {
-    let _ = UI_OWNER.compare_exchange(sender, 0, Ordering::AcqRel, Ordering::Acquire);
+    let host = UI_HOST.load(Ordering::Acquire);
+    let _ = UI_OWNER.compare_exchange(sender, host, Ordering::AcqRel, Ordering::Acquire);
 }
 
 /// Handles one compositor request. Returns true when the message was a draw
 /// command, so the caller does not treat it as input.
 fn handle_compositor_request(message: &ipc::Message) -> bool {
     let payload = message.payload;
+    // Ownership handoff is a control operation, not a draw: the host does not
+    // need to own the screen at that moment (it is handing it away or back).
+    if payload[0] == GUI_HANDOFF {
+        if ipc::PAYLOAD_SIZE >= 9 {
+            let target = u64::from_le_bytes([
+                payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7],
+                payload[8],
+            ]);
+            handoff_ui(message.sender, target);
+        }
+        return true;
+    }
     // Only compositor opcodes reach the ownership check; pointer samples and
     // shell notifications keep their own paths.
     if !matches!(

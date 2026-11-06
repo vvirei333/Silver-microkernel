@@ -58,6 +58,7 @@ const GUI_RECT: u8 = 0x11;
 const GUI_TEXT: u8 = 0x12;
 const GUI_TEXT_SCALED: u8 = 0x14;
 const GUI_POINTER: u8 = 0x13;
+const GUI_HANDOFF: u8 = 0x15;
 const GUI_BUTTON_PRESSED: u8 = 2;
 
 #[derive(Copy, Clone)]
@@ -580,6 +581,35 @@ fn draw_app(gpu: u64, app: usize) {
 }
 
 // ---------------------------------------------------------------------------
+// App launching
+// ---------------------------------------------------------------------------
+
+/// Hands the child the screen before waiting for it and takes it back
+/// afterwards. Returns false when the image cannot be spawned, so the caller
+/// can fall back to the in-process screen.
+fn launch_app(gpu: u64, path: &str) -> bool {
+    let Some(cap) = syscall::spawn_path(path) else {
+        return false;
+    };
+    let Some(task) = syscall::cap_get_task_id(cap) else {
+        let _ = syscall::wait(cap);
+        return false;
+    };
+    handoff_ui(gpu, task);
+    let _ = syscall::wait(cap);
+    handoff_ui(gpu, 0);
+    true
+}
+
+/// Tells the compositor who may draw and receive pointer samples next.
+fn handoff_ui(gpu: u64, task: u64) {
+    let mut payload = [0_u8; 9];
+    payload[0] = GUI_HANDOFF;
+    payload[1..9].copy_from_slice(&task.to_le_bytes());
+    send(gpu, &payload);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -638,6 +668,22 @@ pub extern "C" fn _start(_argument: u64) -> ! {
                 } else if let Some(app) = pressed.take() {
                     notify_howl(app);
                     screen.app = app;
+                    // The three built-ins are real processes now. If the image
+                    // cannot be launched, fall back to the in-process screen.
+                    let image = match app {
+                        APP_CALC => Some("/apps/calc.elf"),
+                        APP_GALLERY => Some("/apps/gallery.elf"),
+                        APP_NOTES => Some("/apps/notes.elf"),
+                        _ => None,
+                    };
+                    if let Some(path) = image {
+                        if launch_app(gpu, path) {
+                            screen.mode = 0;
+                            pressed = None;
+                            draw_home(gpu, None);
+                            continue;
+                        }
+                    }
                     match app {
                         APP_CALC => screen.mode = 1,
                         APP_GALLERY => {
