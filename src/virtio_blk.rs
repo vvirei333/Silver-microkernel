@@ -14,7 +14,7 @@
 //! BAR+0x3000). BAR4 is programmed to `BAR4_PA`, inside the first 1 GiB the
 //! kernel maps Device-nGnRnE.
 
-use core::sync::atomic::{compiler_fence, Ordering};
+use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
 
 use crate::console;
 use crate::frame_allocator;
@@ -32,6 +32,12 @@ const BAR4_PA: usize = 0x1010_0000;
 const NOTIFY_OFF: usize = 0x3000;
 
 const QUEUE_SIZE: usize = 256;
+
+/// Set when a request times out. The in-flight descriptor stays in the ring,
+/// so reusing the slot would pair a new request with the stale completion;
+/// the driver instead fail-stops and the filesystem reports I/O errors until
+/// the next boot.
+static STALLED: AtomicBool = AtomicBool::new(false);
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -237,6 +243,9 @@ pub fn write_sector(sector: u64, buffer: &[u8; 512]) -> bool {
 }
 
 fn request(sector: u64, buffer: Option<&mut [u8; 512]>, write: bool) -> bool {
+    if STALLED.load(Ordering::Acquire) {
+        return false;
+    }
     unsafe {
         let slot = core::ptr::addr_of_mut!(QUEUE) as *mut Option<Queue>;
         let Some(queue) = (*slot).as_mut() else {
@@ -315,6 +324,13 @@ fn request(sector: u64, buffer: Option<&mut [u8; 512]>, write: bool) -> bool {
             }
             spins += 1;
             if spins > 50_000_000 {
+                // Never hand this descriptor to another request: `used.idx`
+                // would still point at the abandoned completion.
+                if !STALLED.swap(true, Ordering::AcqRel) {
+                    console::write_str(
+                        "VIRTIO: device stalled; filesystem is read-only until reboot\r\n",
+                    );
+                }
                 return false;
             }
             core::hint::spin_loop();

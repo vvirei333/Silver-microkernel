@@ -17,7 +17,7 @@ use alloc::{boxed::Box, string::String, vec::Vec};
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::{console, interrupts};
+use crate::{console, interrupts, smp};
 
 pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_PATH_LEN: usize = 191;
@@ -1045,11 +1045,20 @@ pub fn umount(cwd: &str, target: &str, in_use: impl FnOnce(&str) -> bool) -> Res
     with_vfs(|vfs| vfs.umount(cwd, target, in_use))
 }
 
+/// Serializes every VFS entry point across CPUs.
+///
+/// Masking IRQs only protects the *local* PE: two CPUs issuing filesystem
+/// syscalls would otherwise mutate the shared SFS image buffer and the single
+/// virtio request slot concurrently. `SpinLock::lock` disables IRQs as well and
+/// restores DAIF when the guard drops, so it replaces the manual mask.
+///
+/// Lock order: BKL -> `VFS_LOCK`. Nothing inside a VFS backend takes the BKL,
+/// and no interrupt handler enters the VFS, so the order is acyclic.
+static VFS_LOCK: smp::SpinLock<()> = smp::SpinLock::new(());
+
 fn with_vfs<T>(call: impl FnOnce(&mut Vfs) -> T) -> T {
-    let saved = interrupts::save_and_disable_irq();
-    let result = call(vfs_slot().expect("VFS is not initialized"));
-    interrupts::restore_irq(saved);
-    result
+    let _guard = VFS_LOCK.lock();
+    call(vfs_slot().expect("VFS is not initialized"))
 }
 
 fn vfs_slot() -> Option<&'static mut Vfs> {

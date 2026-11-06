@@ -1549,8 +1549,8 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::fb_progress();
     vfs::init();
     seed::seed();
-    // The kernel SFS snapshot is mounted read-only. The userspace SFS server
-    // keeps the write path until the kernel owns it.
+    // The kernel SFS snapshot is mounted read-write: the kernel owns the
+    // virtio-blk device and every VFS write is flushed through to disk.
     if sfs::loaded() {
         let _ = vfs::mkdir("/", "/sfs");
         if vfs::mount("/", "/sfs", "sfs", "", 0, |_| false).is_ok() {
