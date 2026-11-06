@@ -111,15 +111,27 @@ static mut UI: UiState = UiState {
 /// click so button presses can be reported to the console owner.
 static mut HOWL_ID: Option<u64> = None;
 
-/// Center 3 x 2 button grid geometry (shared by drawing and hit-testing).
-const BUTTON_W: u32 = 120;
-const BUTTON_H: u32 = 60;
-const BUTTON_GAP: u32 = 16;
-const BUTTON_GRID_X: u32 = (SCREEN_WIDTH - (3 * BUTTON_W + 2 * BUTTON_GAP)) / 2;
-const BUTTON_GRID_Y: u32 = 150;
-const BUTTON_LABELS: [&str; 6] = ["Phone", "SMS", "Web", "Media", "Power", "Settings"];
-/// Index of "Power" in [`BUTTON_LABELS`]; clicking it shuts the machine down.
-const POWER_BUTTON_INDEX: usize = 4;
+/// SpringBoard-style home screen: a 4 x 3 app grid plus a four-app dock.
+const ICON_SIZE: u32 = 72;
+const ICON_GAP_X: u32 = 24;
+const ICON_GAP_Y: u32 = 30;
+const GRID_COLUMNS: usize = 4;
+const GRID_ROWS: usize = 3;
+const GRID_X: u32 =
+    (SCREEN_WIDTH - (GRID_COLUMNS as u32 * ICON_SIZE + (GRID_COLUMNS as u32 - 1) * ICON_GAP_X))
+        / 2;
+const GRID_Y: u32 = 48;
+const DOCK_Y: u32 = 384;
+const DOCK_ICON: u32 = 56;
+const DOCK_APPS: [usize; 4] = [0, 1, 2, 3];
+const APP_LABELS: [&str; 12] = [
+    "Phone", "Mail", "Safari", "iPod", "SMS", "Calendar", "Photos", "Camera", "YouTube",
+    "Stocks", "Maps", "Weather",
+];
+const APP_COLORS: [u32; 12] = [
+    0xFF3CB44B, 0xFF2E6FD9, 0xFF29A3E8, 0xFFE8467C, 0xFF4CD964, 0xFFE8E8E8, 0xFFF5A623,
+    0xFF8E8E93, 0xFFE52D27, 0xFF1F1F1F, 0xFF34A853, 0xFF4A90E2,
+];
 /// IPC opcode for a button press reported to the shell (which owns the console).
 /// `0` and `1` are taken by Howler input and pointer samples respectively.
 const GUI_BUTTON_PRESSED: u8 = 2;
@@ -211,7 +223,7 @@ fn handle_pointer(input: input_proto::InputMsg) {
 
     if input.left_clicked {
         // Pressing over a button selects it; releasing leaves it selected.
-        if let Some(index) = button_at(input.x, input.y) {
+        if let Some(index) = app_at(input.x, input.y) {
             ui.pressed_btn = Some(index);
         }
     } else if let Some(index) = ui.pressed_btn.take() {
@@ -219,9 +231,6 @@ fn handle_pointer(input: input_proto::InputMsg) {
         // sees it as pressed. Report the click to the shell, which owns the
         // console (this driver's own `syscall::print` is discarded).
         notify_press(index);
-        if index == POWER_BUTTON_INDEX {
-            syscall::power_off();
-        }
     }
 
     render(ui.cursor_x, ui.cursor_y, ui.pressed_btn);
@@ -235,7 +244,7 @@ fn notify_press(index: usize) {
     let Some(howl) = resolve_howl() else {
         return;
     };
-    let label = BUTTON_LABELS[index].as_bytes();
+    let label = APP_LABELS[index].as_bytes();
     let mut payload = [0_u8; ipc::PAYLOAD_SIZE];
     payload[0] = GUI_BUTTON_PRESSED;
     let len = label.len().min(ipc::PAYLOAD_SIZE - 1);
@@ -516,71 +525,115 @@ fn plot(framebuffer: Framebuffer, x: u32, y: u32, color: u32) {
 // Engineer menu
 // ---------------------------------------------------------------------------
 
-/// Draws the full engineer menu (cells, buttons, panel) without clearing the
-/// frame or drawing the cursor. `pressed_btn` selects the pressed button fill.
-fn draw_menu(pressed_btn: Option<usize>) {
-    // Top: three small grey status cells.
-    const CELL_Y: u32 = 20;
-    const CELL_H: u32 = 44;
-    const CELL_W: u32 = 192;
-    const GAP: u32 = 16;
-    const MARGIN: u32 = 16;
+/// Draws one rounded square (radius corners) with a 2 px darker border.
+fn draw_icon(x: u32, y: u32, size: u32, color: u32) {
+    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+        return;
+    };
+    let radius = 10_i32;
+    for py in 0..size {
+        for px in 0..size {
+            let dx = if (px as i32) < radius { radius - px as i32 } else if (px as i32) + radius >= size as i32 { (px as i32) + radius - size as i32 + 1 } else { 0 };
+            let dy = if (py as i32) < radius { radius - py as i32 } else if (py as i32) + radius >= size as i32 { (py as i32) + radius - size as i32 + 1 } else { 0 };
+            if dx * dx + dy * dy > radius * radius {
+                continue;
+            }
+            let edge = px < 2 || py < 2 || px + 2 >= size || py + 2 >= size || dx * dx + dy * dy > (radius - 2) * (radius - 2);
+            plot(framebuffer, x + px, y + py, if edge { shade(color) } else { color });
+        }
+    }
+}
 
-    let cells: [(&str, u32); 3] = [("Num", 0), ("No Data", 1), ("Date", 2)];
-    for (label, index) in cells {
-        let x = MARGIN + index * (CELL_W + GAP);
-        draw_rect(x, CELL_Y, CELL_W, CELL_H, COLOR_GRAY, COLOR_LIGHT_GRAY);
-        draw_text_centered(x + CELL_W / 2, CELL_Y + CELL_H / 2 - 4, label, COLOR_BLACK);
+fn shade(color: u32) -> u32 {
+    let r = (color >> 16) & 0xFF;
+    let g = (color >> 8) & 0xFF;
+    let b = color & 0xFF;
+    let scale = |value: u32| (value * 3) / 4;
+    0xFF00_0000 | (scale(r) << 16) | (scale(g) << 8) | scale(b)
+}
+
+fn grid_rect(index: usize) -> (u32, u32) {
+    let col = (index % GRID_COLUMNS) as u32;
+    let row = (index / GRID_COLUMNS) as u32;
+    (
+        GRID_X + col * (ICON_SIZE + ICON_GAP_X),
+        GRID_Y + row * (ICON_SIZE + ICON_GAP_Y),
+    )
+}
+
+fn dock_rect(slot: usize) -> (u32, u32) {
+    let total = DOCK_APPS.len() as u32 * DOCK_ICON + (DOCK_APPS.len() as u32 - 1) * 28;
+    let x = (SCREEN_WIDTH - total) / 2 + slot as u32 * (DOCK_ICON + 28);
+    (x, DOCK_Y + 12)
+}
+
+/// Paints the home screen: wallpaper, status bar, app grid and dock.
+fn draw_home(pressed_app: Option<usize>) {
+    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+        return;
+    };
+
+    // Wallpaper: a soft vertical gradient from deep blue to teal.
+    for y in 0..SCREEN_HEIGHT {
+        let t = y * 255 / SCREEN_HEIGHT;
+        let color = 0xFF00_0000 | ((12 + t / 6) << 16) | ((48 + t / 3) << 8) | (96 + t / 2);
+        for x in 0..SCREEN_WIDTH {
+            plot(framebuffer, x, y, color);
+        }
     }
 
-    // Center: 3 x 2 grid of blue buttons with white text.
-    for index in 0..BUTTON_LABELS.len() {
-        draw_button(index, pressed_btn == Some(index));
+    // Status bar: time, carrier and battery, like the first iPhone.
+    draw_rect(0, 0, SCREEN_WIDTH, 24, 0xFF00_0000, 0xFF00_0000);
+    draw_text(8, 8, "9:41", COLOR_WHITE);
+    draw_text_centered(SCREEN_WIDTH / 2, 8, "Silver", COLOR_WHITE);
+    draw_rect(SCREEN_WIDTH - 44, 8, 32, 10, 0xFF30D158, 0xFFE8E8E8);
+
+    // App grid.
+    for index in 0..APP_LABELS.len() {
+        let (x, y) = grid_rect(index);
+        let color = if pressed_app == Some(index) {
+            shade(APP_COLORS[index])
+        } else {
+            APP_COLORS[index]
+        };
+        draw_icon(x, y, ICON_SIZE, color);
+        draw_text_centered(x + ICON_SIZE / 2, y + ICON_SIZE + 6, APP_LABELS[index], COLOR_WHITE);
     }
 
-    // Bottom: one wide grey panel with serial and OS version.
-    const PANEL_Y: u32 = 340;
-    const PANEL_H: u32 = 100;
-    draw_rect(
-        MARGIN,
-        PANEL_Y,
-        SCREEN_WIDTH - 2 * MARGIN,
-        PANEL_H,
-        COLOR_GRAY,
-        COLOR_LIGHT_GRAY,
-    );
-    draw_text_centered(SCREEN_WIDTH / 2, PANEL_Y + 24, "SN: 877...", COLOR_BLACK);
-    draw_text_centered(SCREEN_WIDTH / 2, PANEL_Y + 56, "Silver Microkernel v0.1", COLOR_BLACK);
+    // Dock.
+    draw_rect(0, DOCK_Y, SCREEN_WIDTH, SCREEN_HEIGHT - DOCK_Y, 0xFF10_1A2A, 0xFF20_3048);
+    for (slot, &app) in DOCK_APPS.iter().enumerate() {
+        let (x, y) = dock_rect(slot);
+        let color = if pressed_app == Some(app) {
+            shade(APP_COLORS[app])
+        } else {
+            APP_COLORS[app]
+        };
+        draw_icon(x, y, DOCK_ICON, color);
+    }
 }
 
 /// Repaints the whole frame: clear, menu, then the cursor on top.
 fn render(cursor_x: u16, cursor_y: u16, pressed_btn: Option<usize>) {
     clear_screen(COLOR_BLACK);
-    draw_menu(pressed_btn);
+    draw_home(pressed_btn);
     draw_cursor(cursor_x, cursor_y);
 }
 
 /// Returns the pixel rectangle of button `index` (row-major, 3 columns).
-fn button_rect(index: usize) -> (u32, u32, u32, u32) {
-    let col = (index % 3) as u32;
-    let row = (index / 3) as u32;
-    let x = BUTTON_GRID_X + col * (BUTTON_W + BUTTON_GAP);
-    let y = BUTTON_GRID_Y + row * (BUTTON_H + BUTTON_GAP);
-    (x, y, BUTTON_W, BUTTON_H)
+fn app_rect(index: usize) -> (u32, u32, u32, u32) {
+    if let Some(slot) = DOCK_APPS.iter().position(|&app| app == index) {
+        let (x, y) = dock_rect(slot);
+        return (x, y, DOCK_ICON, DOCK_ICON);
+    }
+    let (x, y) = grid_rect(index);
+    (x, y, ICON_SIZE, ICON_SIZE + 14)
 }
 
-/// Draws one button, dark blue while `pressed` and the normal blue otherwise.
-fn draw_button(index: usize, pressed: bool) {
-    let (x, y, w, h) = button_rect(index);
-    let fill = if pressed { COLOR_PRESSED_BLUE } else { COLOR_BLUE };
-    draw_rect(x, y, w, h, fill, COLOR_DARK_GRAY);
-    draw_text_centered(x + w / 2, y + h / 2 - 4, BUTTON_LABELS[index], COLOR_WHITE);
-}
-
-/// Returns the index of the button under `(x, y)`, if any.
-fn button_at(x: u16, y: u16) -> Option<usize> {
-    for index in 0..BUTTON_LABELS.len() {
-        let (bx, by, bw, bh) = button_rect(index);
+/// Maps a touch position to an app index (grid first, then the dock).
+fn app_at(x: u16, y: u16) -> Option<usize> {
+    for index in 0..APP_LABELS.len() {
+        let (bx, by, bw, bh) = app_rect(index);
         let within_x = u32::from(x) >= bx && u32::from(x) < bx + bw;
         let within_y = u32::from(y) >= by && u32::from(y) < by + bh;
         if within_x && within_y {
@@ -590,7 +643,6 @@ fn button_at(x: u16, y: u16) -> Option<usize> {
     None
 }
 
-/// Draws a small white arrow pointer with its tip at `(x, y)`.
 fn draw_cursor(x: u16, y: u16) {
     // 8x8 arrow: bit 7 of each row byte is the leftmost pixel, so row 0 is the
     // tip and each row grows one pixel to the right.
