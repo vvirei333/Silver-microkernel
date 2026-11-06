@@ -205,7 +205,8 @@ const _: () = assert!(USER_STACK_GUARD_VA % GRANULE == 0);
 
 /// A 2 MB first-fit window for explicitly authorized user MMIO and DMA mappings.
 pub const USER_MMIO_VA: usize = USER_IMAGE_VA + 0x4000_0000;
-pub const USER_DMA_MAX_SIZE: usize = ENTRIES * GRANULE;
+const USER_MMIO_L2_GROUPS: usize = 2;
+pub const USER_DMA_MAX_SIZE: usize = ENTRIES * GRANULE * USER_MMIO_L2_GROUPS;
 const USER_MMIO_L1_INDEX: usize = (USER_MMIO_VA >> 30) & 0x1FF;
 const USER_MMIO_L2_INDEX: usize = 0;
 
@@ -1336,24 +1337,26 @@ pub fn range_mapped_by(ttbr0: usize, phys_base: usize, phys_end: usize) -> bool 
         let Some(l2_mmio) = follow_validated_table(l1_entry, root) else {
             return true;
         };
-        let l2_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
-        if l2_entry == 0 {
-            return false;
-        }
-        let Some(l3_mmio) = follow_validated_table(l2_entry, root) else {
-            return true;
-        };
-        for index in 0..ENTRIES {
-            let entry = read_entry(l3_mmio, index);
-            if entry == 0 {
+        for group in 0..USER_MMIO_L2_GROUPS {
+            let l2_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX + group);
+            if l2_entry == 0 {
                 continue;
             }
-            if entry & DESC_PAGE != DESC_PAGE {
+            let Some(l3_mmio) = follow_validated_table(l2_entry, root) else {
                 return true;
-            }
-            let physical = descriptor_address(entry) as usize;
-            if physical >= phys_base && physical < phys_end {
-                return true;
+            };
+            for index in 0..ENTRIES {
+                let entry = read_entry(l3_mmio, index);
+                if entry == 0 {
+                    continue;
+                }
+                if entry & DESC_PAGE != DESC_PAGE {
+                    return true;
+                }
+                let physical = descriptor_address(entry) as usize;
+                if physical >= phys_base && physical < phys_end {
+                    return true;
+                }
             }
         }
     }
@@ -1398,19 +1401,12 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
 
     let root = root_of(ttbr0);
     unsafe {
-        // The root table named by `ttbr0` must be a registered space root:
-        // `create_task_space` registers it with itself as owner. A `ttbr0`
-        // that fails any check means corrupted task state (or another
-        // space's child table): unverifiable, and not read.
         if !space_root_valid(ttbr0) {
             return RevokeResult {
                 unmapped: 0,
                 safe_to_free: false,
             };
         }
-
-        // L0 → L1_user. A zero entry means the user half is absent: nothing
-        // in this address space can map the range.
         let root_entry = read_entry(root, 0);
         if root_entry == 0 {
             return RevokeResult {
@@ -1424,8 +1420,6 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
                 safe_to_free: false,
             };
         };
-
-        // L1 → mmio window. Zero means the task never opened an MMIO window.
         let l1_entry = read_entry(l1_user, USER_MMIO_L1_INDEX);
         if l1_entry == 0 {
             return RevokeResult {
@@ -1440,30 +1434,14 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
             };
         };
 
-        let l2_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
-        if l2_entry == 0 {
-            return RevokeResult {
-                unmapped: 0,
-                safe_to_free: true,
-            };
-        }
-        let Some(l3_mmio) = follow_validated_table(l2_entry, root) else {
-            return RevokeResult {
-                unmapped: 0,
-                safe_to_free: false,
-            };
-        };
-
         let mut unmapped = 0usize;
         let mut changed = false;
-        for index in 0..ENTRIES {
-            let entry = read_entry(l3_mmio, index);
-            if entry == 0 {
+        for group in 0..USER_MMIO_L2_GROUPS {
+            let l2_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX + group);
+            if l2_entry == 0 {
                 continue;
             }
-            if entry & DESC_PAGE != DESC_PAGE {
-                // Not a valid page descriptor: this window cannot be fully
-                // verified, so the caller must not free the frames.
+            let Some(l3_mmio) = follow_validated_table(l2_entry, root) else {
                 if changed {
                     finish_table_changes_for(ttbr0);
                 }
@@ -1471,13 +1449,28 @@ pub fn revoke_phys_range(ttbr0: usize, phys_base: usize, phys_end: usize) -> Rev
                     unmapped,
                     safe_to_free: false,
                 };
-            }
-            let physical = descriptor_address(entry) as usize;
-            if physical >= phys_base && physical < phys_end {
-                write_entry(l3_mmio, index, 0);
-                clean_entry_line(l3_mmio, index);
-                unmapped += 1;
-                changed = true;
+            };
+            for index in 0..ENTRIES {
+                let entry = read_entry(l3_mmio, index);
+                if entry == 0 {
+                    continue;
+                }
+                if entry & DESC_PAGE != DESC_PAGE {
+                    if changed {
+                        finish_table_changes_for(ttbr0);
+                    }
+                    return RevokeResult {
+                        unmapped,
+                        safe_to_free: false,
+                    };
+                }
+                let physical = descriptor_address(entry) as usize;
+                if physical >= phys_base && physical < phys_end {
+                    write_entry(l3_mmio, index, 0);
+                    clean_entry_line(l3_mmio, index);
+                    unmapped += 1;
+                    changed = true;
+                }
             }
         }
         if changed {
@@ -1553,7 +1546,7 @@ pub fn map_dma_to_user_space(ttbr0: usize, phys_addr: usize, size: usize) -> Opt
     }
     checked_range_end(phys_addr, size, DRAM_BASE, DRAM_END)?;
     let page_count = size / GRANULE;
-    if page_count > ENTRIES {
+    if page_count > ENTRIES * USER_MMIO_L2_GROUPS {
         return None;
     }
 
@@ -1612,40 +1605,48 @@ fn map_user_pages(
     descriptor: fn(usize) -> u64,
 ) -> Option<usize> {
     unsafe {
-        let l3_mmio = user_mmio_table(ttbr0)?;
-        let mut first = ENTRIES;
-        let mut run_length = 0;
-        for index in 0..ENTRIES {
-            if read_entry(l3_mmio, index) == 0 {
-                if run_length == 0 {
-                    first = index;
-                }
-                run_length += 1;
-                if run_length == page_count {
-                    break;
-                }
-            } else {
+        let total = ENTRIES * USER_MMIO_L2_GROUPS;
+        if page_count == 0 || page_count > total {
+            return None;
+        }
+        let mut first_slot = usize::MAX;
+        let mut run_length = 0usize;
+        'search: for group in 0..USER_MMIO_L2_GROUPS {
+            let Some(table) = user_mmio_table(ttbr0, group) else {
                 run_length = 0;
+                continue;
+            };
+            for index in 0..ENTRIES {
+                if read_entry(table, index) == 0 {
+                    if run_length == 0 {
+                        first_slot = group * ENTRIES + index;
+                    }
+                    run_length += 1;
+                    if run_length == page_count {
+                        break 'search;
+                    }
+                } else {
+                    run_length = 0;
+                }
             }
         }
         if run_length != page_count {
             return None;
         }
-
         for page_index in 0..page_count {
-            let index = first + page_index;
+            let slot = first_slot + page_index;
+            let group = slot / ENTRIES;
+            let index = slot % ENTRIES;
+            let table = user_mmio_table(ttbr0, group)?;
             write_entry(
-                l3_mmio,
+                table,
                 index,
                 descriptor(physical_start + page_index * GRANULE),
             );
-            clean_entry_line(l3_mmio, index);
+            clean_entry_line(table, index);
         }
-        // One ASID-scoped invalidation publishes the whole device window. The
-        // caller holds the kernel lock and the target task is not executing.
         finish_table_changes_for(ttbr0);
-        let virtual_address = USER_MMIO_VA + first * GRANULE;
-        Some(virtual_address + physical_offset)
+        Some(USER_MMIO_VA + first_slot * GRANULE + physical_offset)
     }
 }
 
@@ -1664,7 +1665,10 @@ fn clean_dma_range(physical: usize, size: usize) {
 /// owner-aware checks as [`revoke_phys_range`]: a foreign or corrupted
 /// descriptor is refused before it is dereferenced or modified, and the
 /// mapping path never writes into another space's table.
-fn user_mmio_table(ttbr0: usize) -> Option<usize> {
+fn user_mmio_table(ttbr0: usize, group: usize) -> Option<usize> {
+    if group >= USER_MMIO_L2_GROUPS {
+        return None;
+    }
     let root = root_of(ttbr0);
     unsafe {
         if !space_root_valid(root) {
@@ -1673,41 +1677,40 @@ fn user_mmio_table(ttbr0: usize) -> Option<usize> {
         let root_entry = read_entry(root, 0);
         let l1_user = follow_validated_table(root_entry, root)?;
         let existing = read_entry(l1_user, USER_MMIO_L1_INDEX);
-        if existing & DESC_TABLE == DESC_TABLE {
-            let l2_mmio = follow_validated_table(existing, root)?;
-            let l3_entry = read_entry(l2_mmio, USER_MMIO_L2_INDEX);
-            return follow_validated_table(l3_entry, root);
-        }
-        if existing != 0 {
+        let l2_mmio = if existing & DESC_TABLE == DESC_TABLE {
+            follow_validated_table(existing, root)?
+        } else if existing == 0 {
+            let (l2, generation) = frame_allocator::alloc_page_tagged()?;
+            zero_page(l2);
+            if page_table_register(l2, generation, root).is_none() {
+                frame_allocator::free_page_tagged(l2, generation);
+                return None;
+            }
+            write_entry(l1_user, USER_MMIO_L1_INDEX, l2 as u64 | DESC_TABLE);
+            clean_entry_line(l1_user, USER_MMIO_L1_INDEX);
+            l2
+        } else {
             return None;
-        }
+        };
 
-        let (l2_mmio, l2_generation) = frame_allocator::alloc_page_tagged()?;
-        zero_page(l2_mmio);
-        let Some(l2_token) = page_table_register(l2_mmio, l2_generation, root) else {
-            // Registration refused: `l1_user` is only linked after both
-            // registrations succeed, so the frame is still unlinked.
-            frame_allocator::free_page_tagged(l2_mmio, l2_generation);
-            return None;
-        };
-        let Some((l3_mmio, l3_generation)) = frame_allocator::alloc_page_tagged() else {
-            free_table_frame(l2_token);
-            return None;
-        };
-        zero_page(l3_mmio);
-        if page_table_register(l3_mmio, l3_generation, root).is_none() {
-            // `l3_mmio` was never linked (its L2 entry is written below);
-            // `l2_mmio` is registered but not yet linked into `l1_user`.
-            frame_allocator::free_page_tagged(l3_mmio, l3_generation);
-            free_table_frame(l2_token);
+        let index = USER_MMIO_L2_INDEX + group;
+        let entry = read_entry(l2_mmio, index);
+        if entry & DESC_TABLE == DESC_TABLE {
+            return follow_validated_table(entry, root);
+        }
+        if entry != 0 {
             return None;
         }
-        write_entry(l2_mmio, USER_MMIO_L2_INDEX, l3_mmio as u64 | DESC_TABLE);
-        write_entry(l1_user, USER_MMIO_L1_INDEX, l2_mmio as u64 | DESC_TABLE);
-        clean_entry_line(l2_mmio, USER_MMIO_L2_INDEX);
-        clean_entry_line(l1_user, USER_MMIO_L1_INDEX);
+        let (l3, generation) = frame_allocator::alloc_page_tagged()?;
+        zero_page(l3);
+        if page_table_register(l3, generation, root).is_none() {
+            frame_allocator::free_page_tagged(l3, generation);
+            return None;
+        }
+        write_entry(l2_mmio, index, l3 as u64 | DESC_TABLE);
+        clean_entry_line(l2_mmio, index);
         finish_table_changes_for(ttbr0);
-        Some(l3_mmio)
+        Some(l3)
     }
 }
 

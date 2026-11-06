@@ -205,6 +205,16 @@ pub extern "C" fn _start(_argument: u64) -> ! {
 
     draw_home(gpu);
 
+    // Boot beacon: Howl owns the console and prints app notifications, so a
+    // synthetic one proves the client drew and the IPC path is live.
+    for _ in 0..20 {
+        if syscall::lookup("howl").is_some() {
+            break;
+        }
+        syscall::sleep(100);
+    }
+    notify_howl(15); // "Settings" is only a marker at this point
+
     loop {
         let mut message = ipc::Message::new(0, &[]);
         if !syscall::receive(&mut message) {

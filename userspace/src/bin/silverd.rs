@@ -121,6 +121,10 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("SILVERD: HOWLER CAP GRANT FAILED\r\n");
     }
 
+    // 10. SpringBoard (home screen client of the compositor).
+    let _springboard_cap = syscall::spawn(syscall::PROGRAM_SPRINGBOARD, syscall::task_id())
+        .unwrap_or_else(|| fail("SILVERD: SPRINGBOARD SPAWN FAILED\r\n"));
+
     loop {
         // Mailbox reading loop to check for SFS errors
         let mut msg = ipc::Message::new(0, &[]);
