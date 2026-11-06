@@ -9,7 +9,7 @@
 //! exceptions that overwrite the CPU-global ELR_EL1/SPSR_EL1 registers.
 //! The per-task stack copy is what makes eret land back in the right task.
 
-use alloc::{vec, vec::Vec};
+use alloc::{format, string::String, vec, vec::Vec};
 
 use crate::{
     capability, channel, elf, frame_allocator, ipc, memory, mmu, mutex, console, scheduler, timer,
@@ -237,22 +237,16 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         }
         SYS_FS_OPEN => sys_fs_open(frame[0], frame[1]),
         SYS_FS_READ => sys_fs_read(frame[0], frame[1], frame[2]),
-        SYS_FS_WRITE if fs_write_allowed() => sys_fs_write(frame[0], frame[1], frame[2]),
-        SYS_FS_WRITE => SYSCALL_ERROR,
-        SYS_FS_CREATE if fs_write_allowed() => sys_fs_create(frame[0]),
-        SYS_FS_CREATE => SYSCALL_ERROR,
+        SYS_FS_WRITE => sys_fs_write(frame[0], frame[1], frame[2]),
+        SYS_FS_CREATE => sys_fs_create(frame[0]),
         SYS_FS_CLOSE => sys_fs_close(frame[0]),
         SYS_FS_READ_DIR => sys_fs_read_dir(frame[0], frame[1], frame[2]),
-        SYS_FS_MKDIR if fs_write_allowed() => sys_fs_mkdir(frame[0]),
-        SYS_FS_MKDIR => SYSCALL_ERROR,
+        SYS_FS_MKDIR => sys_fs_mkdir(frame[0]),
         SYS_CHDIR => sys_chdir(frame[0]),
         SYS_GETCWD => sys_getcwd(frame[0], frame[1]),
-        SYS_FS_UNLINK if fs_write_allowed() => sys_fs_unlink(frame[0]),
-        SYS_FS_UNLINK => SYSCALL_ERROR,
-        SYS_FS_RMDIR if fs_write_allowed() => sys_fs_rmdir(frame[0]),
-        SYS_FS_RMDIR => SYSCALL_ERROR,
-        SYS_FS_RENAME if fs_write_allowed() => sys_fs_rename(frame[0], frame[1]),
-        SYS_FS_RENAME => SYSCALL_ERROR,
+        SYS_FS_UNLINK => sys_fs_unlink(frame[0]),
+        SYS_FS_RMDIR => sys_fs_rmdir(frame[0]),
+        SYS_FS_RENAME => sys_fs_rename(frame[0], frame[1]),
         SYS_CAP_GET_TASK_ID => scheduler::capability_task_id(frame[0]).unwrap_or(SYSCALL_ERROR),
         SYS_CAP_GRANT => {
             if scheduler::grant_capability(frame[0], frame[1], frame[2] as u32) {
@@ -435,6 +429,47 @@ fn sys_spawn_with_argsv(program: u64, argument: u64, block_ptr: u64, block_len: 
 /// The kernel reads the file itself (rather than the shell shipping the bytes):
 /// the ELF is far larger than the 4 KiB single-copy limit, and the loader
 /// already validates every byte against the 2 MiB image window.
+/// Bundle manifest: `write=<absolute prefix>` (one directive per line, `#`
+/// starts a comment). It grants a dynamic ELF a path-scoped write window when
+/// it has no global `CAP_FS_WRITE`.
+fn bundle_write_scope(cwd: &str, elf_path: &str) -> Option<String> {
+    const MANIFEST_MAX: usize = 512;
+    const SCOPE_MAX: usize = 96;
+    if elf_path.len() + ".manifest".len() > vfs::MAX_PATH_LEN {
+        return None;
+    }
+    // `notes.elf` is described by `notes.manifest`; anything else gets
+    // `.manifest` appended verbatim.
+    let manifest = match elf_path.strip_suffix(".elf") {
+        Some(stem) => format!("{stem}.manifest"),
+        None => format!("{elf_path}.manifest"),
+    };
+    match vfs::file_len(cwd, &manifest) {
+        Ok(length) if length != 0 && length <= MANIFEST_MAX => {}
+        _ => return None,
+    }
+    let bytes = vfs::read_file(cwd, &manifest).ok()?;
+    let text = core::str::from_utf8(&bytes).ok()?;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some(scope) = line.strip_prefix("write=") else {
+            continue;
+        };
+        let scope = scope.trim();
+        if scope.len() <= SCOPE_MAX
+            && scope.starts_with('/')
+            && !scope.contains("..")
+            && !scope.ends_with('/')
+        {
+            return Some(String::from(scope));
+        }
+    }
+    None
+}
+
 fn sys_spawn_path(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
@@ -454,7 +489,8 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
             Ok(image) => image,
             Err(_) => return SYSCALL_ERROR,
         };
-        scheduler::spawn_elf(image, 0).unwrap_or(SYSCALL_ERROR)
+        let scope = bundle_write_scope(&cwd, path);
+        scheduler::spawn_elf_with_scope(image, 0, scope).unwrap_or(SYSCALL_ERROR)
     })
 }
 
@@ -517,20 +553,23 @@ fn sys_arguments(buffer_ptr: u64, capacity: u64) -> u64 {
 fn sys_fs_open(path_ptr: u64, flags: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
+        // Opening for write is the consent point for later `SYS_FS_WRITE` on
+        // this descriptor, so the scope check happens here once.
+        if flags & (vfs::OPEN_WRITE | vfs::OPEN_APPEND) != 0
+            && !scheduler::fs_write_allowed(path)
+        {
+            return SYSCALL_ERROR;
+        }
         vfs::open(scheduler::current_task_id(), &cwd, path, flags).unwrap_or(SYSCALL_ERROR)
     })
-}
-
-/// Write-side filesystem operations require the holder's own `CAP_FS_WRITE`.
-/// The kernel's own boot-time installers call the VFS directly and are not
-/// affected; this gate covers EL0 callers only.
-fn fs_write_allowed() -> bool {
-    scheduler::current_task_has_rights(capability::CAP_FS_WRITE)
 }
 
 fn sys_fs_create(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
+        if !scheduler::fs_write_allowed(path) {
+            return SYSCALL_ERROR;
+        }
         if vfs::create(&cwd, path).is_ok() {
             0
         } else {
@@ -542,6 +581,9 @@ fn sys_fs_create(path_ptr: u64) -> u64 {
 fn sys_fs_mkdir(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
+        if !scheduler::fs_write_allowed(path) {
+            return SYSCALL_ERROR;
+        }
         if vfs::mkdir(&cwd, path).is_ok() {
             0
         } else {
@@ -553,6 +595,9 @@ fn sys_fs_mkdir(path_ptr: u64) -> u64 {
 fn sys_fs_unlink(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
+        if !scheduler::fs_write_allowed(path) {
+            return SYSCALL_ERROR;
+        }
         if vfs::unlink(&cwd, path).is_ok() {
             0
         } else {
@@ -564,6 +609,9 @@ fn sys_fs_unlink(path_ptr: u64) -> u64 {
 fn sys_fs_rmdir(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
+        if !scheduler::fs_write_allowed(path) {
+            return SYSCALL_ERROR;
+        }
         if vfs::rmdir(&cwd, path, scheduler::cwd_in_use).is_ok() {
             0
         } else {
@@ -576,6 +624,11 @@ fn sys_fs_rename(source_ptr: u64, destination_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(source_ptr, |source| {
         with_path(destination_ptr, |destination| {
+            if !scheduler::fs_write_allowed(source)
+                || !scheduler::fs_write_allowed(destination)
+            {
+                return SYSCALL_ERROR;
+            }
             if vfs::rename(&cwd, source, destination, scheduler::cwd_in_use).is_ok() {
                 0
             } else {

@@ -182,6 +182,9 @@ pub struct Task {
     pub program: u64,
     pub argument: u64,
     pub cap_table: capability::CapTable,
+    /// Path prefix this task may write under, taken from the bundle manifest.
+    /// Only meaningful when the task has no global `CAP_FS_WRITE`.
+    fs_write_prefix: Option<String>,
     pub bound_irq: Option<u32>,
     irq_pending: bool,
     arguments: Vec<u8>,
@@ -2997,6 +3000,17 @@ pub fn spawn_user_with_cap(program: u64, argument: u64) -> Option<capability::Ca
 /// dynamically loaded task receives no kernel-granted capabilities by default
 /// — any device rights must be delegated by its parent.
 pub fn spawn_elf(image: LoadedImage, argument: u64) -> Option<capability::CapId> {
+    spawn_elf_with_scope(image, argument, None)
+}
+
+/// [`spawn_elf`] with an optional write scope from the bundle manifest. The
+/// task still receives no global rights: without `CAP_FS_WRITE` it may only
+/// write paths under `fs_write_prefix`.
+pub fn spawn_elf_with_scope(
+    image: LoadedImage,
+    argument: u64,
+    fs_write_prefix: Option<String>,
+) -> Option<capability::CapId> {
     if scheduler_manager().map_or(true, |manager| !has_task_capacity(manager)) {
         // Dropping `image` releases its frames (RAII).
         return None;
@@ -3007,12 +3021,16 @@ pub fn spawn_elf(image: LoadedImage, argument: u64) -> Option<capability::CapId>
     if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
         return None;
     }
-    let task_id = spawn_elf_task(image, argument)?;
+    let task_id = spawn_elf_task(image, argument, fs_write_prefix)?;
     let parent = current_task_mut()?;
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
 }
 
-fn spawn_elf_task(image: LoadedImage, argument: u64) -> Option<u64> {
+fn spawn_elf_task(
+    image: LoadedImage,
+    argument: u64,
+    fs_write_prefix: Option<String>,
+) -> Option<u64> {
     let manager = scheduler_manager()?;
     if !has_task_capacity(manager) {
         return None;
@@ -3032,6 +3050,7 @@ fn spawn_elf_task(image: LoadedImage, argument: u64) -> Option<u64> {
         Vec::new(),
         Vec::new(),
         current_task_pid(),
+        fs_write_prefix,
     )?;
     task.cwd = cwd;
     manager.tasks.push(task);
@@ -3120,6 +3139,24 @@ pub fn current_task_has_rights(rights: u32) -> bool {
         .map(|task| {
             let id = task.id;
             task.cap_table.has_self_rights(id, rights)
+        })
+        .unwrap_or(false)
+}
+
+/// True when the current task may write `path`: it either holds the global
+/// `CAP_FS_WRITE`, or its bundle manifest granted a matching prefix.
+pub fn fs_write_allowed(path: &str) -> bool {
+    current_task_mut()
+        .map(|task| {
+            let id = task.id;
+            if task.cap_table.has_self_rights(id, capability::CAP_FS_WRITE) {
+                return true;
+            }
+            let Some(scope) = task.fs_write_prefix.as_deref() else {
+                return false;
+            };
+            path == scope
+                || (path.starts_with(scope) && path.as_bytes().get(scope.len()) == Some(&b'/'))
         })
         .unwrap_or(false)
 }
@@ -3332,7 +3369,7 @@ fn spawn_inner(
         .get(smp::current_index())
         .map(|task| task.cwd.clone())
         .unwrap_or_else(|| String::from("/"));
-    let mut task = Task::new(id, entry, user, image, arguments, argv, envp, ppid)?;
+    let mut task = Task::new(id, entry, user, image, arguments, argv, envp, ppid, None)?;
     task.cwd = cwd;
 
     manager.tasks.push(task);
@@ -3883,6 +3920,7 @@ impl Task {
         argv: Vec<Vec<u8>>,
         envp: Vec<Vec<u8>>,
         ppid: Option<u64>,
+        fs_write_prefix: Option<String>,
     ) -> Option<Self> {
         // Build the argv/envp stack image before allocating anything: a
         // malformed or oversized argument list must fail without leaking.
@@ -4013,6 +4051,7 @@ impl Task {
         }
 
         Some(Self {
+            fs_write_prefix,
             id,
             state: TaskState::Ready,
             resume_state: None,

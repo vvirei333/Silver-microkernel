@@ -10,6 +10,10 @@
 pub const HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
 /// Filesystem sandbox probe: `run /bin/writeprobe` must fail to write `/sfs`.
 pub const WRITEPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/writeprobe.elf"));
+/// Manifest-scope probe: installed under `/sfs/apps` with a write grant.
+pub const SCOPEPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scopeprobe.elf"));
+/// The write prefix the probe's manifest grants, and the manifest itself.
+const SCOPEPROBE_MANIFEST: &[u8] = b"# scopeprobe: only this subtree is writable\nwrite=/sfs/probe-scope\n";
 /// The `crash` EL0 (userspace) program, loaded dynamically by `run bin/crash`. It writes
 /// to `0x0` so the EL0 fault handler has a deterministic way to be exercised.
 pub const CRASH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/crash.elf"));
@@ -29,6 +33,8 @@ pub fn seed_apps() {
         ("/sfs/apps/calc.elf", CALC_ELF),
         ("/sfs/apps/gallery.elf", GALLERY_ELF),
         ("/sfs/apps/notes.elf", NOTES_ELF),
+        ("/sfs/apps/scopeprobe.elf", SCOPEPROBE_ELF),
+        ("/sfs/apps/scopeprobe.manifest", SCOPEPROBE_MANIFEST),
     ] {
         match crate::vfs::file_len("/", path) {
             Ok(length) if length == image.len() => continue,

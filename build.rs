@@ -80,6 +80,7 @@ fn main() {
         // deliberately NOT in user_program::image.
         ("bigdir", "bigdir.elf"),
         ("writeprobe", "writeprobe.elf"),
+        ("scopeprobe", "scopeprobe.elf"),
         ("hello", "hello.elf"),
         ("crash", "crash.elf"),
     ] {
