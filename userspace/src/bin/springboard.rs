@@ -115,7 +115,7 @@ fn dock_position(slot: usize) -> (u32, u32) {
     (x, DOCK_Y + 20)
 }
 
-fn draw_home(gpu: u64) {
+fn draw_home(gpu: u64, pressed: Option<usize>) {
     // Wallpaper: a few solid bands approximate the iOS gradient.
     let bands = 16_u32;
     for band in 0..bands {
@@ -140,8 +140,13 @@ fn draw_home(gpu: u64) {
     // App grid: darker border, lighter face, label underneath.
     for index in 0..APP_LABELS.len() {
         let (x, y) = grid_position(index);
+        let face = if pressed == Some(index) {
+            shade(APP_COLORS[index])
+        } else {
+            APP_COLORS[index]
+        };
         rect(gpu, x, y, ICON_SIZE, ICON_SIZE, shade(APP_COLORS[index]));
-        rect(gpu, x + 2, y + 2, ICON_SIZE - 4, ICON_SIZE - 4, APP_COLORS[index]);
+        rect(gpu, x + 2, y + 2, ICON_SIZE - 4, ICON_SIZE - 4, face);
         text_centered(
             gpu,
             x + ICON_SIZE / 2,
@@ -155,9 +160,27 @@ fn draw_home(gpu: u64) {
     rect(gpu, 0, DOCK_Y, SCREEN_WIDTH, SCREEN_HEIGHT - DOCK_Y, 0xFF10_1A2A);
     for (slot, &app) in DOCK_APPS.iter().enumerate() {
         let (x, y) = dock_position(slot);
+        let face = if pressed == Some(app) {
+            shade(APP_COLORS[app])
+        } else {
+            APP_COLORS[app]
+        };
         rect(gpu, x, y, DOCK_ICON, DOCK_ICON, shade(APP_COLORS[app]));
-        rect(gpu, x + 2, y + 2, DOCK_ICON - 4, DOCK_ICON - 4, APP_COLORS[app]);
+        rect(gpu, x + 2, y + 2, DOCK_ICON - 4, DOCK_ICON - 4, face);
     }
+}
+
+/// A single-app screen: full-bleed app colour, title, big icon and a hint.
+/// Tapping anywhere returns to the home page.
+fn draw_app(gpu: u64, app: usize) {
+    clear(gpu, shade(APP_COLORS[app]));
+    rect(gpu, 0, 0, SCREEN_WIDTH, 48, COLOR_BLACK);
+    text(gpu, 12, 16, COLOR_WHITE, "9:41");
+    rect(gpu, 0, 48, SCREEN_WIDTH, SCREEN_HEIGHT - 48, APP_COLORS[app]);
+    text_centered(gpu, SCREEN_WIDTH / 2, 110, COLOR_WHITE, APP_LABELS[app]);
+    rect(gpu, (SCREEN_WIDTH - 200) / 2, 360, 200, 200, shade(APP_COLORS[app]));
+    rect(gpu, (SCREEN_WIDTH - 196) / 2, 362, 196, 196, APP_COLORS[app]);
+    text_centered(gpu, SCREEN_WIDTH / 2, 760, COLOR_WHITE, "Tap to return");
 }
 
 fn app_at(x: u32, y: u32) -> Option<usize> {
@@ -203,7 +226,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         syscall::exit();
     };
 
-    draw_home(gpu);
+    draw_home(gpu, None);
 
     // Boot beacon: Howl owns the console and prints app notifications, so a
     // synthetic one proves the client drew and the IPC path is live.
@@ -215,6 +238,9 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     }
     notify_howl(15); // "Settings" is only a marker at this point
 
+    let mut pressed: Option<usize> = None;
+    let mut open_app: Option<usize> = None;
+
     loop {
         let mut message = ipc::Message::new(0, &[]);
         if !syscall::receive(&mut message) {
@@ -225,15 +251,31 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         }
         let x = u32::from(u16::from_le_bytes([message.payload[1], message.payload[2]]));
         let y = u32::from(u16::from_le_bytes([message.payload[3], message.payload[4]]));
-        let pressed = message.payload[5] != 0;
-        if pressed {
+        let down = message.payload[5] != 0;
+
+        if open_app.is_some() {
+            if !down {
+                open_app = None;
+                pressed = None;
+                draw_home(gpu, None);
+            }
             continue;
         }
-        if let Some(app) = app_at(x, y) {
+
+        if down {
+            let hit = app_at(x, y);
+            if hit != pressed {
+                pressed = hit;
+                draw_home(gpu, pressed);
+            }
+        } else if let Some(app) = pressed.take() {
+            open_app = Some(app);
+            draw_app(gpu, app);
             notify_howl(app);
+        } else {
+            draw_home(gpu, None);
         }
-    }
-}
+    }}
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
