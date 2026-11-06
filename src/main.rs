@@ -1555,6 +1555,8 @@ pub extern "C" fn kernel_main() -> ! {
         let _ = vfs::mkdir("/", "/sfs");
         if vfs::mount("/", "/sfs", "sfs", "", 0, |_| false).is_ok() {
             ram_log::log("KSFS mounted");
+            // Install the app bundles on first boot (or after a size change).
+            seed::seed_apps();
         }
     }
     #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]

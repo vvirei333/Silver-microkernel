@@ -9,9 +9,9 @@
 //! written through to the device sector by sector, so the on-disk state stays
 //! authoritative and survives a reboot.
 //!
-//! Scope of this step: the root directory, direct blocks (4 x 512 bytes per
-//! file), create/truncate/append, mkdir, unlink and rename. Nested directories
-//! and indirect blocks are the next milestone.
+//! Scope of this step: the root directory, four direct blocks plus one single
+//! indirect block per file (66 KiB), create/truncate/append, mkdir, unlink and
+//! rename. Nested directories and double-indirect blocks are next.
 
 use alloc::vec::Vec;
 
@@ -28,6 +28,10 @@ const DIR_ENTRY_SIZE: usize = 32;
 const DIR_ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DIR_ENTRY_SIZE;
 const NAME_MAX: usize = 27;
 const DIRECT_BLOCKS: usize = 4;
+/// Pointers in the single indirect block (512 / 4). A file is therefore capped
+/// at 4 * 512 + 128 * 512 = 66 KiB, enough for an app ELF.
+const INDIRECT_POINTERS: usize = BLOCK_SIZE / 4;
+const MAX_FILE_BLOCKS: usize = DIRECT_BLOCKS + INDIRECT_POINTERS;
 
 const INODE_KIND_FREE: u32 = 0;
 const INODE_KIND_FILE: u32 = 1;
@@ -167,7 +171,7 @@ fn inode_get(
     image: &[u8],
     superblock: &Superblock,
     index: u32,
-) -> Option<(u32, u32, [u32; DIRECT_BLOCKS])> {
+) -> Option<(u32, u32, [u32; DIRECT_BLOCKS], u32)> {
     let offset = inode_offset_checked(image, superblock, index)?;
     let kind = u32_at(image, offset);
     let size = u32_at(image, offset + 4);
@@ -175,7 +179,10 @@ fn inode_get(
     for (slot, block) in blocks.iter_mut().enumerate() {
         *block = u32_at(image, offset + 8 + slot * 4);
     }
-    Some((kind, size, blocks))
+    // Bytes 24..28 were reserved in format 1 and are zero in existing images,
+    // so an older filesystem simply has no indirect block.
+    let indirect = u32_at(image, offset + 8 + DIRECT_BLOCKS * 4);
+    Some((kind, size, blocks, indirect))
 }
 
 fn inode_put(
@@ -185,6 +192,7 @@ fn inode_put(
     kind: u32,
     size: u32,
     blocks: &[u32; DIRECT_BLOCKS],
+    indirect: u32,
 ) -> bool {
     let Some(offset) = inode_offset(superblock, index) else {
         return false;
@@ -197,6 +205,7 @@ fn inode_put(
     for (slot, &block) in blocks.iter().enumerate() {
         put_u32(image, offset + 8 + slot * 4, block);
     }
+    put_u32(image, offset + 8 + DIRECT_BLOCKS * 4, indirect);
     flush_block(image, superblock, offset / BLOCK_SIZE)
 }
 
@@ -237,6 +246,51 @@ fn flush_bitmap(image: &[u8], superblock: &Superblock) -> bool {
     flush_block(image, superblock, superblock.bitmap_block as usize)
 }
 
+/// Resolves a logical file block to a physical block number, following the
+/// single indirect table past the four direct slots.
+fn inode_slot_block(
+    image: &[u8],
+    superblock: &Superblock,
+    blocks: &[u32; DIRECT_BLOCKS],
+    indirect: u32,
+    slot: usize,
+) -> Option<u32> {
+    if slot < DIRECT_BLOCKS {
+        let block = blocks[slot];
+        return (block != 0).then_some(block);
+    }
+    let index = slot - DIRECT_BLOCKS;
+    if index >= INDIRECT_POINTERS || indirect == 0 {
+        return None;
+    }
+    let start = block_start(image, superblock, indirect)?;
+    let block = u32_at(image, start + index * 4);
+    (block != 0).then_some(block)
+}
+
+/// Releases every block an inode owns: the direct entries, the blocks listed
+/// in the indirect table, and the table block itself.
+fn free_inode_blocks(
+    image: &mut [u8],
+    superblock: &Superblock,
+    blocks: &[u32; DIRECT_BLOCKS],
+    indirect: u32,
+) {
+    free_blocks(image, superblock, blocks);
+    if indirect == 0 {
+        return;
+    }
+    if let Some(start) = block_start(image, superblock, indirect) {
+        for index in 0..INDIRECT_POINTERS {
+            let block = u32_at(image, start + index * 4);
+            if block != 0 {
+                free_blocks(image, superblock, &[block]);
+            }
+        }
+    }
+    free_blocks(image, superblock, &[indirect]);
+}
+
 fn alloc_block(image: &mut [u8], superblock: &Superblock) -> Option<u32> {
     for block in superblock.data_block_start..superblock.total_blocks {
         if !bitmap_used(image, superblock, block) {
@@ -247,7 +301,7 @@ fn alloc_block(image: &mut [u8], superblock: &Superblock) -> Option<u32> {
     None
 }
 
-fn free_blocks(image: &mut [u8], superblock: &Superblock, blocks: &[u32; DIRECT_BLOCKS]) {
+fn free_blocks(image: &mut [u8], superblock: &Superblock, blocks: &[u32]) {
     for &block in blocks {
         // Never let a corrupt inode release metadata into the free pool.
         if block >= superblock.data_block_start && block < superblock.total_blocks {
@@ -260,7 +314,7 @@ fn free_blocks(image: &mut [u8], superblock: &Superblock, blocks: &[u32; DIRECT_
 fn lookup(image: &[u8], superblock: &Superblock, name: &str) -> Option<(u32, u32, u32)> {
     let (block, slot) = find_entry(image, superblock, name)?;
     let index = u32_at(image, block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE);
-    let (kind, size, _) = inode_get(image, superblock, index)?;
+    let (kind, size, _, _) = inode_get(image, superblock, index)?;
     Some((index, kind, size))
 }
 
@@ -269,7 +323,7 @@ fn find_entry(image: &[u8], superblock: &Superblock, name: &str) -> Option<(usiz
     if name.is_empty() || name.len() > NAME_MAX {
         return None;
     }
-    let (_, _, blocks) = inode_get(image, superblock, superblock.root_inode)?;
+    let (_, _, blocks, _) = inode_get(image, superblock, superblock.root_inode)?;
     for block in blocks {
         if block == 0 {
             break;
@@ -315,7 +369,7 @@ fn add_entry(
         return None;
     }
     let root = superblock.root_inode;
-    let (_, _, mut blocks) = inode_get(image, superblock, root)?;
+    let (_, _, mut blocks, _) = inode_get(image, superblock, root)?;
 
     for &block in blocks.iter() {
         if block == 0 {
@@ -366,7 +420,7 @@ fn add_entry(
     if !flush_block(image, superblock, block as usize) {
         return None;
     }
-    if !inode_put(image, superblock, root, INODE_KIND_DIR, 0, &blocks) {
+    if !inode_put(image, superblock, root, INODE_KIND_DIR, 0, &blocks, 0) {
         return None;
     }
     flush_bitmap(image, superblock);
@@ -381,11 +435,11 @@ fn create_inode(
 ) -> Option<u32> {
     let index = find_free_inode(image, superblock)?;
     let empty = [0_u32; DIRECT_BLOCKS];
-    if !inode_put(image, superblock, index, kind, 0, &empty) {
+    if !inode_put(image, superblock, index, kind, 0, &empty, 0) {
         return None;
     }
     if add_entry(image, superblock, name, index).is_none() {
-        let _ = inode_put(image, superblock, index, INODE_KIND_FREE, 0, &empty);
+        let _ = inode_put(image, superblock, index, INODE_KIND_FREE, 0, &empty, 0);
         return None;
     }
     flush_bitmap(image, superblock);
@@ -393,12 +447,15 @@ fn create_inode(
 }
 
 fn truncate(image: &mut [u8], superblock: &Superblock, index: u32) -> bool {
-    let Some((kind, _, blocks)) = inode_get(image, superblock, index) else {
+    let Some((kind, _, blocks, indirect)) = inode_get(image, superblock, index) else {
         return false;
     };
-    free_blocks(image, superblock, &blocks);
     let empty = [0_u32; DIRECT_BLOCKS];
-    let ok = inode_put(image, superblock, index, kind, 0, &empty);
+    // Publish the empty inode first, then release: a crash in between leaks
+    // blocks instead of leaving the inode pointing at blocks another file
+    // may already own.
+    let ok = inode_put(image, superblock, index, kind, 0, &empty, 0);
+    free_inode_blocks(image, superblock, &blocks, indirect);
     flush_bitmap(image, superblock);
     ok
 }
@@ -408,19 +465,47 @@ fn store(
     superblock: &Superblock,
     index: u32,
     bytes: &[u8],
-    replacing: &[u32; DIRECT_BLOCKS],
+    old_blocks: &[u32; DIRECT_BLOCKS],
+    old_indirect: u32,
 ) -> bool {
     let blocks_needed = bytes.len().div_ceil(BLOCK_SIZE);
-    if blocks_needed > DIRECT_BLOCKS {
+    if blocks_needed > MAX_FILE_BLOCKS {
         return false;
     }
+
     let mut blocks = [0_u32; DIRECT_BLOCKS];
-    for slot in blocks.iter_mut().take(blocks_needed) {
-        let Some(block) = alloc_block(image, superblock) else {
-            free_blocks(image, superblock, &blocks);
+    let mut indirect = 0_u32;
+    if blocks_needed > DIRECT_BLOCKS {
+        let Some(table) = alloc_block(image, superblock) else {
             return false;
         };
-        *slot = block;
+        indirect = table;
+        if let Some(start) = block_start(image, superblock, table) {
+            // A recycled block may still hold another file's pointers.
+            for byte in &mut image[start..start + BLOCK_SIZE] {
+                *byte = 0;
+            }
+        } else {
+            free_blocks(image, superblock, &[table]);
+            return false;
+        }
+    }
+
+    for slot in 0..blocks_needed {
+        let Some(block) = alloc_block(image, superblock) else {
+            free_blocks(image, superblock, &blocks);
+            if indirect != 0 {
+                free_blocks(image, superblock, &[indirect]);
+            }
+            return false;
+        };
+        if slot < DIRECT_BLOCKS {
+            blocks[slot] = block;
+        } else if let Some(start) = block_start(image, superblock, indirect) {
+            put_u32(image, start + (slot - DIRECT_BLOCKS) * 4, block);
+        } else {
+            return false;
+        }
     }
     // Persist the allocation *before* the inode can point at these blocks.
     // A crash after this point leaks blocks (recoverable); the reverse order
@@ -429,8 +514,15 @@ fn store(
     if !flush_bitmap(image, superblock) {
         return false;
     }
-    for (offset, &block) in blocks.iter().enumerate().take(blocks_needed) {
-        let start = offset * BLOCK_SIZE;
+    if indirect != 0 && !flush_block(image, superblock, indirect as usize) {
+        return false;
+    }
+
+    for slot in 0..blocks_needed {
+        let Some(block) = inode_slot_block(image, superblock, &blocks, indirect, slot) else {
+            return false;
+        };
+        let start = slot * BLOCK_SIZE;
         let end = (start + BLOCK_SIZE).min(bytes.len());
         let mut sector = [0_u8; BLOCK_SIZE];
         sector[..end - start].copy_from_slice(&bytes[start..end]);
@@ -442,15 +534,41 @@ fn store(
             return false;
         }
     }
-    if !inode_put(image, superblock, index, INODE_KIND_FILE, bytes.len() as u32, &blocks) {
+
+    if !inode_put(
+        image,
+        superblock,
+        index,
+        INODE_KIND_FILE,
+        bytes.len() as u32,
+        &blocks,
+        indirect,
+    ) {
         return false;
     }
+
     // The inode no longer references the old blocks, so they can be released.
-    // Skip anything that ended up in the new set (only possible if the bitmap
-    // was already inconsistent before this call).
-    for &block in replacing {
-        if block != 0 && !blocks.contains(&block) {
-            bitmap_set(image, superblock, block, false);
+    // Build the new set first so a block that is somehow reused is not freed.
+    let mut new_blocks = [0_u32; MAX_FILE_BLOCKS];
+    for slot in 0..blocks_needed {
+        new_blocks[slot] = inode_slot_block(image, superblock, &blocks, indirect, slot).unwrap_or(0);
+    }
+    for &block in old_blocks.iter() {
+        if block != 0 && !new_blocks.contains(&block) {
+            free_blocks(image, superblock, &[block]);
+        }
+    }
+    if old_indirect != 0 && old_indirect != indirect {
+        if let Some(start) = block_start(image, superblock, old_indirect) {
+            for pointer in 0..INDIRECT_POINTERS {
+                let block = u32_at(image, start + pointer * 4);
+                if block != 0 && !new_blocks.contains(&block) {
+                    free_blocks(image, superblock, &[block]);
+                }
+            }
+        }
+        if !new_blocks.contains(&old_indirect) {
+            free_blocks(image, superblock, &[old_indirect]);
         }
     }
     flush_bitmap(image, superblock);
@@ -522,8 +640,7 @@ impl FileSystem for Sfs {
         let Some((block, slot)) = find_entry(image, &superblock, name) else {
             return Err(());
         };
-        let (_, _, blocks) = inode_get(image, &superblock, index).ok_or(())?;
-        free_blocks(image, &superblock, &blocks);
+        let (_, _, blocks, indirect) = inode_get(image, &superblock, index).ok_or(())?;
         let entry = block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE;
         for byte in &mut image[entry..entry + DIR_ENTRY_SIZE] {
             *byte = 0;
@@ -532,7 +649,10 @@ impl FileSystem for Sfs {
             return Err(());
         }
         let empty = [0_u32; DIRECT_BLOCKS];
-        inode_put(image, &superblock, index, INODE_KIND_FREE, 0, &empty);
+        inode_put(image, &superblock, index, INODE_KIND_FREE, 0, &empty, 0);
+        // Release only after the inode stopped referencing the blocks: a crash
+        // in between leaks them instead of cross-linking two files.
+        free_inode_blocks(image, &superblock, &blocks, indirect);
         flush_bitmap(image, &superblock);
         Ok(())
     }
@@ -548,7 +668,7 @@ impl FileSystem for Sfs {
         if kind != INODE_KIND_DIR {
             return Err(());
         }
-        let (_, _, blocks) = inode_get(image, &superblock, index).ok_or(())?;
+        let (_, _, blocks, _) = inode_get(image, &superblock, index).ok_or(())?;
         if blocks.iter().any(|&block| block != 0) {
             return Err(());
         }
@@ -563,7 +683,7 @@ impl FileSystem for Sfs {
             return Err(());
         }
         let empty = [0_u32; DIRECT_BLOCKS];
-        inode_put(image, &superblock, index, INODE_KIND_FREE, 0, &empty);
+        inode_put(image, &superblock, index, INODE_KIND_FREE, 0, &empty, 0);
         flush_bitmap(image, &superblock);
         Ok(())
     }
@@ -611,7 +731,7 @@ impl FileSystem for Sfs {
         if !component(path)?.is_empty() {
             return Err(());
         }
-        let (_, _, blocks) = inode_get(image, &superblock, superblock.root_inode).ok_or(())?;
+        let (_, _, blocks, _) = inode_get(image, &superblock, superblock.root_inode).ok_or(())?;
         let mut entries = Vec::new();
         for block in blocks {
             if block == 0 {
@@ -628,7 +748,7 @@ impl FileSystem for Sfs {
                 if length == 0 || length > NAME_MAX {
                     continue;
                 }
-                let (kind, _, _) = inode_get(image, &superblock, index).ok_or(())?;
+                let (kind, _, _, _) = inode_get(image, &superblock, index).ok_or(())?;
                 let mut name = [0_u8; MAX_NAME_LEN];
                 name[..length].copy_from_slice(&image[entry + 5..entry + 5 + length]);
                 entries.push(DirEntry {
@@ -653,15 +773,13 @@ impl FileSystem for Sfs {
             return Ok(Vec::new());
         }
         let end = offset.saturating_add(limit).min(size as usize);
-        let (_, _, blocks) = inode_get(image, &superblock, index).ok_or(())?;
+        let (_, _, blocks, indirect) = inode_get(image, &superblock, index).ok_or(())?;
         let mut data = Vec::with_capacity(end - offset);
         let mut position = offset;
         while position < end {
             let slot = position / BLOCK_SIZE;
-            if slot >= DIRECT_BLOCKS || blocks[slot] == 0 {
-                return Err(());
-            }
-            let start = block_start(image, &superblock, blocks[slot]).ok_or(())?;
+            let block = inode_slot_block(image, &superblock, &blocks, indirect, slot).ok_or(())?;
+            let start = block_start(image, &superblock, block).ok_or(())?;
             let within = position % BLOCK_SIZE;
             let take = (BLOCK_SIZE - within).min(end - position);
             data.extend_from_slice(&image[start + within..start + within + take]);
@@ -707,17 +825,16 @@ impl FileSystem for Sfs {
         };
 
         if append {
+            let (_, _, old_blocks, old_indirect) = inode_get(image, &superblock, index).ok_or(())?;
             let mut existing = Vec::new();
             if base > 0 {
-                let (_, _, blocks) = inode_get(image, &superblock, index).ok_or(())?;
                 let size = base;
                 let mut position = 0;
                 while position < size {
                     let slot = position / BLOCK_SIZE;
-                    if slot >= DIRECT_BLOCKS || blocks[slot] == 0 {
-                        return Err(());
-                    }
-                    let start = block_start(image, &superblock, blocks[slot]).ok_or(())?;
+                    let block = inode_slot_block(image, &superblock, &old_blocks, old_indirect, slot)
+                        .ok_or(())?;
+                    let start = block_start(image, &superblock, block).ok_or(())?;
                     let within = position % BLOCK_SIZE;
                     let take = (BLOCK_SIZE - within).min(size - position);
                     existing.extend_from_slice(&image[start + within..start + within + take]);
@@ -725,8 +842,7 @@ impl FileSystem for Sfs {
                 }
             }
             existing.extend_from_slice(bytes);
-            let (_, _, old_blocks) = inode_get(image, &superblock, index).ok_or(())?;
-            if !store(image, &superblock, index, &existing, &old_blocks) {
+            if !store(image, &superblock, index, &existing, &old_blocks, old_indirect) {
                 return Err(());
             }
             let end = existing.len();
@@ -734,7 +850,7 @@ impl FileSystem for Sfs {
         }
 
         let empty = [0_u32; DIRECT_BLOCKS];
-        if !store(image, &superblock, index, bytes, &empty) {
+        if !store(image, &superblock, index, bytes, &empty, 0) {
             return Err(());
         }
         Ok((bytes.len(), bytes.len()))
@@ -751,8 +867,27 @@ impl FileSystem for Sfs {
         Ok(size as usize)
     }
 
-    fn seed_file(&mut self, _path: &str, _contents: &[u8]) -> Result<(), ()> {
-        Err(())
+    fn seed_file(&mut self, path: &str, contents: &[u8]) -> Result<(), ()> {
+        let name = component(path)?;
+        if name.is_empty() || contents.len() > MAX_FILE_BLOCKS * BLOCK_SIZE {
+            return Err(());
+        }
+        let image = image_mut()?;
+        let superblock = superblock(image)?;
+        let index = match lookup(image, &superblock, name) {
+            Some((index, INODE_KIND_FILE, _)) => index,
+            Some(_) => return Err(()),
+            None => create_inode(image, &superblock, name, INODE_KIND_FILE).ok_or(())?,
+        };
+        if !truncate(image, &superblock, index) {
+            return Err(());
+        }
+        let empty = [0_u32; DIRECT_BLOCKS];
+        if !store(image, &superblock, index, contents, &empty, 0) {
+            return Err(());
+        }
+        flush_bitmap(image, &superblock);
+        Ok(())
     }
 }
 

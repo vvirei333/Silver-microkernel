@@ -56,19 +56,21 @@ def main(path: str) -> int:
         off = itable * BLOCK + index * INODE_SIZE
         kind, size = struct.unpack_from("<II", image, off)
         blocks = struct.unpack_from("<4I", image, off + 8)
+        indirect = struct.unpack_from("<I", image, off + 24)[0]
         if kind == 0:
-            if any(blocks):
-                problems.append(f"inode {index}: free but has blocks {blocks}")
+            if any(blocks) or indirect != 0:
+                problems.append(f"inode {index}: free but has blocks {blocks} indirect {indirect}")
             continue
         if kind == 1:
             files += 1
-            if size > DIRECT * BLOCK:
-                problems.append(f"inode {index}: size {size} exceeds direct blocks")
+            if size > (DIRECT + 128) * BLOCK:
+                problems.append(f"inode {index}: size {size} exceeds indirect capacity")
         elif kind == 2:
             dirs += 1
         else:
             problems.append(f"inode {index}: unknown kind {kind}")
             continue
+
         for slot, block in enumerate(blocks):
             if block == 0:
                 continue
@@ -77,7 +79,7 @@ def main(path: str) -> int:
                 continue
             if block in owners:
                 problems.append(
-                    f"CROSS-LINK: block {block} owned by inode {owners[block]} and {index}"
+                    f"CROSS-LINK: block {block} owned by {owners[block]} and {index}"
                 )
             else:
                 owners[block] = index
@@ -85,6 +87,40 @@ def main(path: str) -> int:
                 problems.append(f"inode {index}: block {block} not marked used in bitmap")
             if kind == 1 and slot * BLOCK >= size:
                 problems.append(f"inode {index}: block {block} beyond size {size}")
+
+        if indirect == 0:
+            continue
+        if not (data_start <= indirect < total):
+            problems.append(f"inode {index}: indirect block {indirect} outside data area")
+            continue
+        if indirect in owners:
+            problems.append(
+                f"CROSS-LINK: indirect table {indirect} also owned by {owners[indirect]}"
+            )
+        else:
+            owners[indirect] = f"{index} (table)"
+        if not used(indirect):
+            problems.append(f"inode {index}: indirect table {indirect} not marked used")
+        table = struct.unpack_from("<128I", image, indirect * BLOCK)
+        for pointer, block in enumerate(table):
+            if block == 0:
+                continue
+            slot = DIRECT + pointer
+            if not (data_start <= block < total):
+                problems.append(
+                    f"inode {index} indirect[{pointer}]: block {block} outside data area"
+                )
+                continue
+            if block in owners:
+                problems.append(
+                    f"CROSS-LINK: block {block} owned by {owners[block]} and inode {index}"
+                )
+            else:
+                owners[block] = f"{index} indirect[{pointer}]"
+            if not used(block):
+                problems.append(f"inode {index}: block {block} not marked used in bitmap")
+            if kind == 1 and slot * BLOCK >= size:
+                problems.append(f"inode {index}: indirect block {block} beyond size {size}")
 
     leaked = [b for b in range(data_start, total) if used(b) and b not in owners]
     free = sum(1 for b in range(data_start, total) if not used(b))

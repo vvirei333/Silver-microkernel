@@ -57,6 +57,11 @@ with open(DISK, 'r+b') as f:
     f.write(bytes(inode_table))
 
     # 4. Блоки данных остаются как есть (битмап помечает их свободными).
+#
+# Inode (64 байта): kind u32 @0, size u32 @4, direct[4] @8..24,
+# indirect u32 @24 (0 = нет), остальное зарезервировано. Один indirect-блок
+# хранит 128 указателей, поэтому файл занимает до 4 + 128 = 132 блоков
+# (66 КиБ).
 
     print("SUCCESS: SFS formatted (superblock + bitmap + inode table)")
     print(f"Magic: {hex(MAGIC)}  Block size: {BLOCK_SIZE}  Blocks: {TOTAL_BLOCKS}")

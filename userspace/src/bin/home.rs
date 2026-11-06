@@ -670,19 +670,19 @@ pub extern "C" fn _start(_argument: u64) -> ! {
                     screen.app = app;
                     // The three built-ins are real processes now. If the image
                     // cannot be launched, fall back to the in-process screen.
-                    let image = match app {
-                        APP_CALC => Some("/apps/calc.elf"),
-                        APP_GALLERY => Some("/apps/gallery.elf"),
-                        APP_NOTES => Some("/apps/notes.elf"),
-                        _ => None,
+                    let (disk, initramfs) = match app {
+                        APP_CALC => ("/sfs/calc.elf", "/apps/calc.elf"),
+                        APP_GALLERY => ("/sfs/gallery.elf", "/apps/gallery.elf"),
+                        APP_NOTES => ("/sfs/notes.elf", "/apps/notes.elf"),
+                        _ => ("", ""),
                     };
-                    if let Some(path) = image {
-                        if launch_app(gpu, path) {
-                            screen.mode = 0;
-                            pressed = None;
-                            draw_home(gpu, None);
-                            continue;
-                        }
+                    let launched = !disk.is_empty()
+                        && (launch_app(gpu, disk) || launch_app(gpu, initramfs));
+                    if launched {
+                        screen.mode = 0;
+                        pressed = None;
+                        draw_home(gpu, None);
+                        continue;
                     }
                     match app {
                         APP_CALC => screen.mode = 1,
