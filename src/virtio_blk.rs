@@ -227,6 +227,16 @@ unsafe fn init_device() -> Option<Queue> {
 
 /// Reads one 512-byte sector through queue 0.
 pub fn read_sector(sector: u64, buffer: &mut [u8; 512]) -> bool {
+    request(sector, Some(buffer), false)
+}
+
+/// Writes one 512-byte sector through queue 0.
+pub fn write_sector(sector: u64, buffer: &[u8; 512]) -> bool {
+    let mut copy = *buffer;
+    request(sector, Some(&mut copy), true)
+}
+
+fn request(sector: u64, buffer: Option<&mut [u8; 512]>, write: bool) -> bool {
     unsafe {
         let slot = core::ptr::addr_of_mut!(QUEUE) as *mut Option<Queue>;
         let Some(queue) = (*slot).as_mut() else {
@@ -240,10 +250,18 @@ pub fn read_sector(sector: u64, buffer: &mut [u8; 512]) -> bool {
         let data_pa = queue.request_pa + 16;
         let status_pa = queue.request_pa + 16 + 512;
 
-        core::ptr::write_volatile(header as *mut u32, VIRTIO_BLK_T_IN);
+        core::ptr::write_volatile(
+            header as *mut u32,
+            if write { 1 } else { VIRTIO_BLK_T_IN },
+        );
         core::ptr::write_volatile((header + 4) as *mut u32, 0);
         core::ptr::write_volatile((header + 8) as *mut u64, sector);
         core::ptr::write_volatile(status as *mut u8, 0xFF_u8);
+        if let Some(source) = buffer.as_ref() {
+            if write {
+                core::ptr::copy_nonoverlapping(source.as_ptr(), data as *mut u8, 512);
+            }
+        }
 
         let desc = queue.descriptors;
         core::ptr::write_volatile(desc as *mut u64, header_pa as u64);
@@ -255,7 +273,11 @@ pub fn read_sector(sector: u64, buffer: &mut [u8; 512]) -> bool {
         core::ptr::write_volatile((desc + 24) as *mut u32, 512);
         core::ptr::write_volatile(
             (desc + 28) as *mut u16,
-            VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE,
+            if write {
+                VIRTQ_DESC_F_NEXT
+            } else {
+                VIRTQ_DESC_F_NEXT | VIRTQ_DESC_F_WRITE
+            },
         );
         core::ptr::write_volatile((desc + 30) as *mut u16, 2);
 
@@ -300,10 +322,12 @@ pub fn read_sector(sector: u64, buffer: &mut [u8; 512]) -> bool {
         queue.last_used = queue.last_used.wrapping_add(1);
 
         invalidate(status, 1);
-        invalidate(data, 512);
         let ok = core::ptr::read_volatile(status as *const u8) == 0;
-        if ok {
-            core::ptr::copy_nonoverlapping(data as *const u8, buffer.as_mut_ptr(), 512);
+        if ok && !write {
+            if let Some(target) = buffer {
+                invalidate(data, 512);
+                core::ptr::copy_nonoverlapping(data as *const u8, target.as_mut_ptr(), 512);
+            }
         }
         ok
     }

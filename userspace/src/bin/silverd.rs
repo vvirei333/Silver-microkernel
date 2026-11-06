@@ -28,12 +28,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         syscall::print("SILVERD: SCOUT READY TIMEOUT, CONTINUING\r\n");
     }
 
-    // 2. Block driver
-    let block_id = syscall::spawn(syscall::PROGRAM_BLOCK_DRIVER, syscall::task_id())
-        .unwrap_or_else(|| fail("SILVERD: BLOCK DRIVER SPAWN FAILED\r\n"));
-    if !syscall::cap_grant(block_id, block_id, syscall::CAP_MMIO | syscall::CAP_PCI) {
-        fail("SILVERD: BLOCK DRIVER CAP GRANT FAILED\r\n");
-    }
+    // 2. Block driver — retired: the kernel owns virtio-blk and SFS now.
 
     // 3. Network driver
     let net_cap = syscall::spawn(syscall::PROGRAM_NET_DRIVER, syscall::task_id())
@@ -57,15 +52,8 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         syscall::print("SILVERD: NET DRIVER CONSOLE LEND FAILED\r\n");
     }
 
-    // 4. Filesystem server
-    let sfs_id = syscall::spawn(syscall::PROGRAM_SFS_SERVER, syscall::task_id())
-        .unwrap_or_else(|| fail("SILVERD: SFS SERVER SPAWN FAILED\r\n"));
-    if !syscall::cap_grant(sfs_id, sfs_id, syscall::CAP_MMIO) {
-        fail("SILVERD: SFS SERVER CAP GRANT FAILED\r\n");
-    }
-    if !await_sfs_ready(sfs_id) {
-        syscall::print("SILVERD: SFS SERVER NOT READY, CONTINUING\r\n");
-    }
+    // 4. Filesystem server — retired: SFS lives in the kernel and is mounted
+    // by `main` at `/sfs`.
 
     // 5. Network server (smoltcp). It receives the driver's task ID so it can
     // attach its DMA mailbox; the attach is retried, so no readiness wait.
