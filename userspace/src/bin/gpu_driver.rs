@@ -139,6 +139,15 @@ const APP_COLORS: [u32; 20] = [
 /// IPC opcode for a button press reported to the shell (which owns the console).
 /// `0` and `1` are taken by Howler input and pointer samples respectively.
 const GUI_BUTTON_PRESSED: u8 = 2;
+/// Compositor control channel. A UI client (the shell or a future
+/// SpringBoard service) draws through these messages instead of touching the
+/// framebuffer: the compositor owns the pixels.
+const GUI_CLEAR: u8 = 0x10;
+const GUI_RECT: u8 = 0x11;
+const GUI_TEXT: u8 = 0x12;
+/// Compositor -> client: pointer sample (x, y, pressed).
+const GUI_POINTER: u8 = 0x13;
+
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -211,9 +220,57 @@ fn serve() -> ! {
     loop {
         let mut message = ipc::Message::new(0, &[]);
         if syscall::receive(&mut message) {
+            if handle_compositor_request(&message) {
+                continue;
+            }
             if let Some(input) = input_proto::decode(&message) {
                 handle_pointer(input);
             }
+        }
+    }
+}
+
+/// Handles one compositor request. Returns true when the message was a draw
+/// command, so the caller does not treat it as input.
+fn handle_compositor_request(message: &ipc::Message) -> bool {
+    let payload = message.payload;
+    match payload[0] {
+        GUI_CLEAR => {
+            let color = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+            clear_screen(color);
+            true
+        }
+        GUI_RECT => {
+            let x = u16::from_le_bytes([payload[1], payload[2]]) as u32;
+            let y = u16::from_le_bytes([payload[3], payload[4]]) as u32;
+            let w = u16::from_le_bytes([payload[5], payload[6]]) as u32;
+            let h = u16::from_le_bytes([payload[7], payload[8]]) as u32;
+            let color = u32::from_le_bytes([payload[9], payload[10], payload[11], payload[12]]);
+            fill_solid(x, y, w, h, color);
+            true
+        }
+        GUI_TEXT => {
+            let x = u16::from_le_bytes([payload[1], payload[2]]) as u32;
+            let y = u16::from_le_bytes([payload[3], payload[4]]) as u32;
+            let color = u32::from_le_bytes([payload[5], payload[6], payload[7], payload[8]]);
+            let len = (payload[9] as usize).min(ipc::PAYLOAD_SIZE - 10);
+            let text = core::str::from_utf8(&payload[10..10 + len]).unwrap_or("");
+            draw_text(x, y, text, color);
+            true
+        }
+        _ => false,
+    }
+}
+
+fn fill_solid(x: u32, y: u32, w: u32, h: u32, color: u32) {
+    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+        return;
+    };
+    let end_x = x.saturating_add(w).min(framebuffer.width);
+    let end_y = y.saturating_add(h).min(framebuffer.height);
+    for py in y..end_y {
+        for px in x..end_x {
+            plot(framebuffer, px, py, color);
         }
     }
 }
