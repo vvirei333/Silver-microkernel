@@ -17,6 +17,7 @@ pub mod mem_policy;
 pub mod phys_range;
 pub mod reloc;
 pub mod sched_policy;
+pub mod sfs_format;
 pub mod table_registry;
 pub mod wait_queue;
 pub mod watchdog_policy;

@@ -604,3 +604,41 @@ DMA leak, and `-smp 2` still reports one peer.
   exception 9.
 - `no_std,fog` / `no_std,tablet`: build; fog QEMU integration PASS.
 - Physical SMP: **not verified**; fog/tablet remain single-core.
+
+## 2026-11-08 — root cause of the layout-flaky boot panic; 6 CPUs; SFS stage 1
+
+**Boot-stack overflow root-caused (was "layer B", Prefetch-Abort/garbage
+statics):** `kernel_main` runs on the 16 KiB boot stack from `linker.ld` and
+overflowed it by at least 1 KiB before `sfs::load`. The overwrite landed in
+the tail of `.bss` — whichever static sat there became the victim
+(`DMA_QUARANTINE` slots in the reproduction), which made the failure look
+layout-flaky: unrelated code changes flipped the panic on and off, and the
+O3 `b .` self-loop theory masked the real cause. Proof: gdb hardware
+watchpoint on a quarantine slot caught the first touch at
+`memset` from `console::write_dec_u64` (via `boot_metrics::log_milestone`)
+with `SP = 0xffff000040163b90`, i.e. 1 KiB **below** `__stack_bottom`
+(`0xffff000040163f90`). Fix: the boot stack is now 64 KiB
+(`.stack` in `linker.ld`). Consequences of the fix:
+
+- `kernel-release` boots cleanly again; the deterministic boot panic is gone.
+- `MAX_CPUS` raised 4 → 8 with all per-CPU arrays padded; QEMU `-smp 6`
+  verified end to end: 6 CPUs online (mpidr 1–5), remap sentinel / ready fifo
+  / priority / TLB cross-PE (5 peers) / watchdog heartbeat+policy+stall /
+  cache (6 CPUs) / bkl stall (5 waiters) / quiesce 64 rounds / ticks / clock
+  / churn (12 tasks) / push-migration — all PASS.
+- The historic "layer A" O3 self-loop finding needs re-examination: at least
+  part of what looked like miscompilation is explained by this overflow.
+
+**SFS stage 1:** the on-disk format logic moved into `src/sfs_format.rs`
+(lib target, `SfsDisk` trait injects the device: virtio in the kernel,
+in-memory disk in host tests; +18 host tests, 200/200 total). New:
+`fsck` at mount (cross-links / referenced-but-free / dangling entries fail
+the boot closed; leaks are reported and tolerated), superblock rejects a
+bitmap/inode-table overlap, positioned overwrites that fit the existing
+block map go in place (no whole-file rewrite), cross-directory rename rolls
+back the new entry when clearing the old one fails, `virtio_blk::
+sector_count()` from the device config, and `load()` sizes the image from
+device capacity clamped to 8 MiB. `scripts/make_sfs.py` formats 8 MiB images
+(bitmap geometry fixed: the bitmap spans several blocks and the inode table
+starts after it). Verified: `-smp 2/4` boots with 1 MiB and 8 MiB disks,
+fsck clean, end-to-end shell write/append/rename/mkdir/rm/rmdir smoke PASS.

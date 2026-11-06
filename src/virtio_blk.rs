@@ -30,6 +30,7 @@ const PCI_DEVICE_BLOCK_TRANSITIONAL: u16 = 0x1001;
 /// window, so the kernel claims the same one.
 const BAR4_PA: usize = 0x1010_0000;
 const NOTIFY_OFF: usize = 0x3000;
+const DEVICE_CFG_OFF: usize = 0x2000;
 
 const QUEUE_SIZE: usize = 256;
 
@@ -117,6 +118,10 @@ unsafe fn read8(offset: usize) -> u8 {
 
 unsafe fn read16(offset: usize) -> u16 {
     core::ptr::read_volatile(common(offset) as *const u16)
+}
+
+unsafe fn read32(offset: usize) -> u32 {
+    core::ptr::read_volatile(common(offset) as *const u32)
 }
 
 unsafe fn write8(offset: usize, value: u8) {
@@ -259,6 +264,14 @@ unsafe fn init_device() -> Option<Queue> {
         request: request_va,
         request_pa,
     })
+}
+
+pub fn sector_count() -> u64 {
+    unsafe {
+        let low = read32(DEVICE_CFG_OFF) as u64;
+        let high = read32(DEVICE_CFG_OFF + 4) as u64;
+        (high << 32) | low
+    }
 }
 
 /// Reads one 512-byte sector through queue 0.
