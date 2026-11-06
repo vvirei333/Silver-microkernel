@@ -183,12 +183,12 @@ fn report(cpu: usize, beat: u64, stale: u32) {
     console::write_dec_u64(cpu as u64);
     console::write_str(" stalled (beats=");
     console::write_dec_u64(beat);
-    console::write_str(" index=");
-    let index = smp::current_index_of(cpu);
-    if index == usize::MAX {
+    console::write_str(" task=");
+    let task = smp::current_task_of(cpu);
+    if task == 0 {
         console::write_str("none");
     } else {
-        console::write_dec_u64(index as u64);
+        console::write_dec_u64(task);
     }
     console::write_str(" rounds=");
     console::write_dec_u64(stale as u64);

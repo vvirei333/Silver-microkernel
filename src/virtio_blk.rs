@@ -166,8 +166,25 @@ fn claim_device(bus: u8, device: u8, function: u8) -> bool {
         return false;
     };
     let base = bar4 & !0xF;
-    if base == 0 || base == !0xF {
-        return pci_write32(bus, device, function, 0x20, BAR4_PA as u32);
+    if base == !0xF {
+        // BAR4 is not implemented: the modern capability block we need lives
+        // in it, so there is nothing to drive.
+        return false;
+    }
+    if base != BAR4_PA as u32 {
+        // The MMIO helpers are compiled against `BAR4_PA`. Move the BAR there
+        // (nothing else in this kernel drives the device) and verify the
+        // read-back instead of trusting a write that may be ignored.
+        if !pci_write32(bus, device, function, 0x20, BAR4_PA as u32) {
+            return false;
+        }
+    }
+    let Some(assigned) = pci_read32(bus, device, function, 0x20) else {
+        return false;
+    };
+    if (assigned & !0xF) != BAR4_PA as u32 {
+        console::write_str("VIRTIO: BAR4 relocation failed\r\n");
+        return false;
     }
     true
 }
@@ -185,6 +202,19 @@ unsafe fn init_device() -> Option<Queue> {
 
     write8(0x14, 3 | 8); // FEATURES_OK
     if read8(0x14) & 8 == 0 {
+        return None;
+    }
+
+    // The queue size register reports the device maximum; the driver must
+    // program a value it can actually allocate (power of two, <= that max).
+    let max_queue = read16(0x18);
+    if max_queue < QUEUE_SIZE as u16 {
+        console::write_str("VIRTIO: queue too small\r\n");
+        return None;
+    }
+    write16(0x18, QUEUE_SIZE as u16);
+    if read16(0x18) != QUEUE_SIZE as u16 {
+        console::write_str("VIRTIO: queue size rejected\r\n");
         return None;
     }
 

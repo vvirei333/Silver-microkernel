@@ -1238,6 +1238,11 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
             if !persistent && table_empty(l3) {
                 write_entry(l2_user, l2_index, 0);
                 clean_entry_line(l2_user, l2_index);
+                // Publish the removal before the frame can be handed to a new
+                // owner: a walker on another PE must never read a recycled
+                // table. Tables empty rarely, so a flush per retired table is
+                // cheaper than tracking them across the loop.
+                finish_table_changes_for(ttbr0);
                 free_table_frame_owned(l3, root);
             }
         }
@@ -1633,21 +1638,44 @@ fn map_user_pages(
         if run_length != page_count {
             return None;
         }
-        for page_index in 0..page_count {
-            let slot = first_slot + page_index;
+        let mut written = 0usize;
+        while written < page_count {
+            let slot = first_slot + written;
             let group = slot / ENTRIES;
             let index = slot % ENTRIES;
-            let table = user_mmio_table(ttbr0, group)?;
+            let Some(table) = user_mmio_table(ttbr0, group) else {
+                rollback_user_pages(ttbr0, first_slot, written);
+                return None;
+            };
             write_entry(
                 table,
                 index,
-                descriptor(physical_start + page_index * GRANULE),
+                descriptor(physical_start + written * GRANULE),
             );
             clean_entry_line(table, index);
+            written += 1;
         }
         finish_table_changes_for(ttbr0);
         Some(USER_MMIO_VA + first_slot * GRANULE + physical_offset)
     }
+}
+
+/// Undoes a partially written map run so a failed mapping never leaves
+/// half a window visible to EL0.
+fn rollback_user_pages(ttbr0: usize, first_slot: usize, written: usize) {
+    unsafe {
+        for page_index in 0..written {
+            let slot = first_slot + page_index;
+            let group = slot / ENTRIES;
+            let index = slot % ENTRIES;
+            let Some(table) = user_mmio_table(ttbr0, group) else {
+                continue;
+            };
+            write_entry(table, index, 0);
+            clean_entry_line(table, index);
+        }
+    }
+    finish_table_changes_for(ttbr0);
 }
 
 fn clean_dma_range(physical: usize, size: usize) {
@@ -1686,6 +1714,11 @@ fn user_mmio_table(ttbr0: usize, group: usize) -> Option<usize> {
                 frame_allocator::free_page_tagged(l2, generation);
                 return None;
             }
+            // Publish the zeroed contents to the point of coherency *before*
+            // the parent entry can make a walker read this table. Cleaning
+            // only the parent descriptor would let a real CPU fetch stale
+            // lines from the recycled frame.
+            flush_after_table_change(l2, GRANULE);
             write_entry(l1_user, USER_MMIO_L1_INDEX, l2 as u64 | DESC_TABLE);
             clean_entry_line(l1_user, USER_MMIO_L1_INDEX);
             l2
@@ -1707,6 +1740,7 @@ fn user_mmio_table(ttbr0: usize, group: usize) -> Option<usize> {
             frame_allocator::free_page_tagged(l3, generation);
             return None;
         }
+        flush_after_table_change(l3, GRANULE);
         write_entry(l2_mmio, index, l3 as u64 | DESC_TABLE);
         clean_entry_line(l2_mmio, index);
         finish_table_changes_for(ttbr0);

@@ -119,14 +119,23 @@ fn invalidate_dcache_all() {
         select_cache_level(((level - 1) as u64) << 1);
         let (line_bytes, ways, sets) = cache_policy::ccsidr_geometry(read_ccsidr());
         let line_shift = line_bytes.trailing_zeros();
-        let way_shift = 32 - ways.trailing_zeros();
+        // DC ISW encodes the way in the top `ceil(log2(ways))` bits. A cache
+        // with non-power-of-two associativity would otherwise get a shift that
+        // truncates the way index; clamp the index to the encoded field.
+        let way_bits = usize::BITS - ways.saturating_sub(1).leading_zeros();
+        let way_shift = 32 - way_bits;
+        let way_mask = if way_bits >= 32 {
+            usize::MAX
+        } else {
+            (1usize << way_bits) - 1
+        };
         for way in 0..ways {
             for set in 0..sets {
                 let operand = cache_policy::set_way_operand(
                     level - 1,
                     line_shift,
                     way_shift,
-                    way,
+                    way & way_mask,
                     set,
                 );
                 unsafe {
