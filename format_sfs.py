@@ -8,8 +8,8 @@ import os
 # Layout (block size = 512 байт, всего 2048 блоков):
 #   блок 0            суперблок (40 байт значащих, добивка до 64)
 #   блок 1            битмап свободных блоков (2048 бит = 256 байт; 1 = занят)
-#   блоки 2..17       таблица inode (128 inode x 64 байта = 8192 байта)
-#   блоки 18..2047    блоки данных (2030 блоков)
+#   блоки 2..65       таблица inode (512 inode x 64 байта = 32768 байт)
+#   блоки 66..2047    блоки данных (1982 блока)
 DISK = 'disk.img'
 
 if not os.path.exists(DISK):
@@ -21,12 +21,12 @@ VERSION = 1
 BLOCK_SIZE = 512
 TOTAL_BLOCKS = 2048
 ROOT_INODE = 0
-INODE_COUNT = 128
+INODE_COUNT = 512
 
 BITMAP_BLOCK = 1
 INODE_TABLE_BLOCK = 2
-INODE_TABLE_BLOCKS = 16  # 128 inode x 64 байта = 8192 байта = 16 блоков
-DATA_BLOCK_START = 18
+INODE_TABLE_BLOCKS = 64  # 512 inode x 64 байта = 32768 байт = 64 блока
+DATA_BLOCK_START = 66
 
 INODE_SIZE = 64
 INODE_KIND_FREE = 0

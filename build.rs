@@ -78,6 +78,7 @@ fn main() {
         // Seeded into the VFS (see src/seed.rs) so `run bin/hello` exercises the
         // dynamic ELF loader and `run bin/crash` exercises EL0 fault containment;
         // deliberately NOT in user_program::image.
+        ("bigdir", "bigdir.elf"),
         ("hello", "hello.elf"),
         ("crash", "crash.elf"),
     ] {

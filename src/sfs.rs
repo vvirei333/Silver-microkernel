@@ -12,8 +12,8 @@
 //! Scope of this step: hierarchical directories of any depth, four direct
 //! blocks plus one single indirect block per file (66 KiB), and the usual
 //! create/truncate/append, mkdir, unlink, rmdir and rename operations. A
-//! directory holds up to 64 entries (four direct blocks); double-indirect
-//! files and directory growth are next.
+//! directory holds 16 entries per block and grows like a file: four direct
+//! blocks, then a single indirect table (132 blocks, 2112 entries).
 
 use alloc::vec::Vec;
 
@@ -367,11 +367,11 @@ fn find_entry(
     if name.is_empty() || name.len() > NAME_MAX {
         return None;
     }
-    let (_, _, blocks, _) = inode_get(image, superblock, dir)?;
-    for block in blocks {
-        if block == 0 {
+    let (_, _, blocks, indirect) = inode_get(image, superblock, dir)?;
+    for block_slot in 0..MAX_FILE_BLOCKS {
+        let Some(block) = inode_slot_block(image, superblock, &blocks, indirect, block_slot) else {
             break;
-        }
+        };
         let start = block_start(image, superblock, block)?;
         for slot in 0..DIR_ENTRIES_PER_BLOCK {
             let entry = start + slot * DIR_ENTRY_SIZE;
@@ -413,12 +413,13 @@ fn add_entry(
     if name.is_empty() || name.len() > NAME_MAX {
         return None;
     }
-    let (_, _, mut blocks, _) = inode_get(image, superblock, dir)?;
+    let (_, _, mut blocks, mut indirect) = inode_get(image, superblock, dir)?;
 
-    for &block in blocks.iter() {
-        if block == 0 {
+    // 1. An existing block may still have a free slot.
+    for block_slot in 0..MAX_FILE_BLOCKS {
+        let Some(block) = inode_slot_block(image, superblock, &blocks, indirect, block_slot) else {
             break;
-        }
+        };
         let start = block_start(image, superblock, block)?;
         for slot in 0..DIR_ENTRIES_PER_BLOCK {
             let entry = start + slot * DIR_ENTRY_SIZE;
@@ -437,6 +438,8 @@ fn add_entry(
         }
     }
 
+    // 2. Every block is full: append a new one. A directory therefore grows
+    //    from 4 direct blocks to a single indirect table (132 blocks total).
     let block = alloc_block(image, superblock)?;
     let Some(start) = block_start(image, superblock, block) else {
         bitmap_set(image, superblock, block, false);
@@ -458,13 +461,53 @@ fn add_entry(
         }
     }
     if !placed {
-        bitmap_set(image, superblock, block, false);
-        return None;
+        if indirect == 0 {
+            let Some(table) = alloc_block(image, superblock) else {
+                bitmap_set(image, superblock, block, false);
+                return None;
+            };
+            let Some(table_start) = block_start(image, superblock, table) else {
+                bitmap_set(image, superblock, block, false);
+                bitmap_set(image, superblock, table, false);
+                return None;
+            };
+            for byte in &mut image[table_start..table_start + BLOCK_SIZE] {
+                *byte = 0;
+            }
+            if !flush_block(image, superblock, table as usize) {
+                bitmap_set(image, superblock, block, false);
+                bitmap_set(image, superblock, table, false);
+                return None;
+            }
+            indirect = table;
+        }
+        let Some(table_start) = block_start(image, superblock, indirect) else {
+            bitmap_set(image, superblock, block, false);
+            return None;
+        };
+        let mut stored = false;
+        for pointer in 0..INDIRECT_POINTERS {
+            if u32_at(image, table_start + pointer * 4) == 0 {
+                put_u32(image, table_start + pointer * 4, block);
+                stored = true;
+                break;
+            }
+        }
+        if !stored || !flush_block(image, superblock, indirect as usize) {
+            bitmap_set(image, superblock, block, false);
+            return None;
+        }
     }
+
     if !flush_block(image, superblock, block as usize) {
         return None;
     }
-    if !inode_put(image, superblock, dir, INODE_KIND_DIR, 0, &blocks, 0) {
+    // Allocation is now reachable from the directory inode, so persist the
+    // bitmap before publishing the inode (same rule as file data).
+    if !flush_bitmap(image, superblock) {
+        return None;
+    }
+    if !inode_put(image, superblock, dir, INODE_KIND_DIR, 0, &blocks, indirect) {
         return None;
     }
     flush_bitmap(image, superblock);
@@ -699,6 +742,8 @@ impl FileSystem for Sfs {
         let (block, slot) = find_entry(image, &superblock, parent, name).ok_or(())?;
         let index = u32_at(image, block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE);
         let (kind, _, blocks, indirect) = inode_get(image, &superblock, index).ok_or(())?;
+        // A directory that ever held an entry keeps its block, because entries
+        // are cleared in place; only a never-used directory is removable.
         if kind != INODE_KIND_DIR
             || indirect != 0
             || blocks.iter().any(|&block| block != 0)
@@ -773,12 +818,14 @@ impl FileSystem for Sfs {
         let superblock = superblock(image)?;
         let parts = split_path(path)?;
         let dir = resolve_dir(image, &superblock, &parts).ok_or(())?;
-        let (_, _, blocks, _) = inode_get(image, &superblock, dir).ok_or(())?;
+        let (_, _, blocks, indirect) = inode_get(image, &superblock, dir).ok_or(())?;
         let mut entries = Vec::new();
-        for block in blocks {
-            if block == 0 {
+        for block_slot in 0..MAX_FILE_BLOCKS {
+            let Some(block) =
+                inode_slot_block(image, &superblock, &blocks, indirect, block_slot)
+            else {
                 break;
-            }
+            };
             let start = block_start(image, &superblock, block).ok_or(())?;
             for slot in 0..DIR_ENTRIES_PER_BLOCK {
                 let entry = start + slot * DIR_ENTRY_SIZE;

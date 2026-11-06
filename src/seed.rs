@@ -8,6 +8,8 @@
 
 /// The `hello` EL0 (userspace) program, loaded dynamically by `run bin/hello`.
 pub const HELLO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/hello.elf"));
+/// Filesystem stress helper: `run /bin/bigdir` creates 300 files in `/sfs`.
+pub const BIGDIR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigdir.elf"));
 /// The `crash` EL0 (userspace) program, loaded dynamically by `run bin/crash`. It writes
 /// to `0x0` so the EL0 fault handler has a deterministic way to be exercised.
 pub const CRASH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/crash.elf"));
@@ -45,5 +47,8 @@ pub fn seed() {
     }
     if crate::vfs::seed_file("/", "/bin/crash", CRASH_ELF).is_err() {
         crate::console::write_str("SEED: failed to seed /bin/crash\r\n");
+    }
+    if crate::vfs::seed_file("/", "/bin/bigdir", BIGDIR_ELF).is_err() {
+        crate::console::write_str("SEED: failed to seed /bin/bigdir\r\n");
     }
 }
