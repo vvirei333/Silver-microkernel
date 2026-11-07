@@ -66,7 +66,9 @@ SFS с чтением и записью, VFS с монтированием бэ�
 ### L2. Драйверы / HAL (C++)
 
 Каждый драйвер — отдельная задача с минимальным набором capability:
-`CAP_MMIO`, `CAP_PCI`, `CAP_IRQ`. Общение с остальной системой — только IPC.
+`CAP_MMIO`, `CAP_PCI`, `CAP_IRQ` (у композитора дополнительно `CAP_SURFACE`
+для выдачи и сканирования поверхностей). Общение с остальной системой —
+только IPC.
 
 - `gpu_driver` — virtio-gpu/ramfb (QEMU), позже MSM DSI/GPU;
 - `input_driver` — virtio-tablet/тач;

@@ -3,7 +3,28 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## CURRENT STATUS (2026-11-05, TASK №23)
+## CURRENT STATUS (2026-11-07)
+
+Four roadmap holes are closed: the fog DMA window, kernel surface objects with
+zero-copy present, Ed25519 bundle signatures, and the final audit.
+
+- **Host tests:** 217/217 (`cargo test --lib`).
+- **Builds:** `no_std`, `no_std,smp-selftest`, `no_std,tablet`,
+  `no_std,fog,fog-reloc`, `no_std,fog,fog-ui`.
+- **QEMU:** 640x1136 SilverHome frame, pointer click into Calc, back to home;
+  `MMU TLB/ASID/HEAP`, `DMA ZERO`, `DMA WINDOW`, `SURFACE READY`,
+  `howl ready`, no panic; `scopeprobe` status 0 with no leaks; `sfs_fsck`
+  clean. SMP `-smp 4` selftest: 15 PASS / 0 FAIL.
+- **Signing:** unsigned bundle under a provisioned key is refused; a valid
+  `sig=` runs (status 0); a tampered signature is refused.
+- **Latest commits:** `d0ac546` DMA window, `9bf3b8b` Ed25519 signatures,
+  `8b5158a` surface objects + zero-copy, `f6ee824` audit fixes.
+- Full audit report: [`docs/FINAL_AUDIT.md`](docs/FINAL_AUDIT.md).
+
+Immediate next steps are a kernel fence object (guaranteed present
+completion), `SYS_SURFACE_DESTROY`/surface reuse, app-side zero-copy, and
+hardware (rain/fog) execution of the now-enabled cache/DMA self-tests.
+Existing signed-key provisioning is manual; there is no rotation yet.
 
 ## 2026-11-06 — SFS moves toward the kernel
 
@@ -497,8 +518,8 @@ Authoritative status lives in **`SMP_STATUS.md`** (read it first). Summary:
   defined `unregister_mutex` not-found path, ipc receive bisect bypass
   removed).
 - **Verified working at that checkpoint:** single-CPU boot unchanged;
-  `cargo test --lib` 13/13 (the current suite is 182/182); debug and release
-  builds pass.
+  `cargo test --lib` 13/13 (the suite has since grown; see CURRENT STATUS);
+  debug and release builds pass.
 - **Historical (fixed): `-smp 2`** died at silverd's first blocking IPC
   receive at the 2026-11-01 checkpoint; the layers below are the investigation
   record, not the current state (see the status section at the top).
@@ -721,9 +742,9 @@ warning.
   images are supported; there is no PIE, dynamic linking, relocation or shared
   libraries.
 - The dynamic task's argument is always `0`; there is no argv beyond the fixed
-  numeric argument. `/bin/hello` is the only seeded file, and it is built by
-  `build.rs` (not read from the on-disk SFS, whose server still exposes only the
-  superblock).
+  numeric argument. `/bin/hello` and the `/sfs/apps` bundles are seeded at boot
+  by `src/seed.rs`; the SFS image itself is loaded into kernel RAM by the
+  in-kernel virtio-blk path, not by a userspace server.
 - The user stack is fixed at 2 pages and the image at 2 MB, matching the embedded
   path; neither is configurable per program.
 
@@ -759,10 +780,19 @@ so `input_driver` resolves it with `SYS_LOOKUP` on its first pointer sample.
 
 ### Graphics driver (`userspace/src/bin/gpu_driver.rs`)
 
-- Resolution 640x480, 32-bit ARGB. The frame buffer comes from `SYS_ALLOC_DMA`
-  (Normal Non-Cacheable, `(vaddr, paddr)`); `SYS_MAP_PHYS` maps only the
-  `fw_cfg` MMIO window, because `map_phys_to_user` rejects DRAM. The same split
-  would hold for a real PL111: registers are MMIO, the scan-out buffer is RAM.
+- Resolution 640x1136 (portrait), 32-bit ARGB. The frame buffer comes from
+  `SYS_ALLOC_DMA` (Normal Non-Cacheable, `(vaddr, paddr)`); `SYS_MAP_PHYS` maps
+  only the `fw_cfg` MMIO window, because `map_phys_to_user` rejects DRAM. The
+  same split would hold for a real PL111: registers are MMIO, the scan-out
+  buffer is RAM.
+- SilverHome is zero-copy: it creates a kernel surface
+  (`SYS_SURFACE_CREATE`), draws pixels directly through
+  `userspace/src/framebuffer.rs`, grants the compositor read/scanout access and
+  sends `GUI_SURFACE_ATTACH`. The compositor re-points `ramfb` at that physical
+  range; no blit. Installed apps still use the command stream into an offscreen
+  surface, and `PRESENT` copies that surface to the framebuffer.
+- The compositor's old engineer menu remains as a fallback when no client has
+  attached.
 - `fw_cfg` MMIO is at `0x09020000` (`data` @+0x00, `ctl` @+0x08, `dma` @+0x10).
   Transfers use the DMA interface only: a 16-byte `FWCfgDmaAccess` struct is
   written to a scratch DMA page, then a single 8-byte store to the `dma`
@@ -832,9 +862,11 @@ restores `(0,90,181)` while "SMS" stays normal.
 
 ### Limitations recorded for the next phase
 
-- The menu is single-buffered: every sample repaints the whole 640x480 frame
-  (clear + menu + cursor). There is no backbuffer/flip, so `render()` is the
-  `present()`.
+- The fallback engineer menu is single-buffered: every sample repaints the whole
+  frame (clear + menu + cursor). The primary SilverHome path is double-buffered
+  when two surfaces fit, but installed apps still draw through the command
+  stream and a full-frame blit; present fences are best-effort `try_send`, not
+  a kernel wait object.
 - Input is polled at ~100 Hz, not IRQ-driven; virtio-input MSI-X/INTx is not
   wired. Absolute scaling assumes QEMU's `0..32767` range (the device-config
   `ABS_INFO` min/max is not read).
@@ -2058,11 +2090,12 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   into kernel memory before parsing it (bounded by `EXEC_FILE_LIMIT`), and the
   dynamic task's argument is always `0`.
 - Programs come either from ELFs embedded at kernel build time or from the
-  RAM-VFS via `run <path>`; there is no persistent on-disk program storage (the
-  on-disk SFS server still exposes only the superblock) and no program
-  credential model. Task control and rights delegation use per-task
-  capabilities, but any task can still request an embedded shell ELF or load
-  any VFS file it can name.
+  kernel-owned SFS (`/sfs/apps`) via `run <path>`; bundles can carry manifest
+  write scopes, quotas, SHA-256 and Ed25519 signatures. There is still no
+  per-program credential model beyond capabilities, and a signed build requires
+  every filesystem bundle to be signed. Any task that can call `SYS_SPAWN` can
+  still request an embedded shell ELF, and `run` still loads any bundle the
+  caller can name (subject to its manifest policy).
 - Mutex and condvar wait queues still have no growth limits. Mailboxes are
   bounded at 16 messages, but nameserver/control replies also obey backpressure;
   a full client mailbox can therefore block the nameserver. Selective receive
@@ -2112,13 +2145,27 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
   dead `net_server` leaves the driver holding the old mapping until the next
   attach. TX-ring exhaustion drops the frame (`NET DRIVER: TX FRAME DROPPED`)
   rather than blocking the server.
-- The graphics menu is single-buffered: `gpu_driver` repaints the entire
-  640x480 frame (clear + menu + cursor) on every pointer sample, with no
-  dirty-region tracking; `ramfb` has no hardware flip or vsync. The input driver
-  polls the virtio event queue at ~100 Hz instead of using a virtio IRQ, and
-  assumes QEMU's fixed `0..32767` absolute range. The input driver's 64 KiB BAR
-  is fixed at `0x1030_0000`, extending the fixed-BAR assumption already used by
-  the block (`0x1010_0000`) and net (`0x1020_0000`) drivers.
+- The compositor still has two presentation paths. SilverHome is zero-copy:
+  it owns a kernel surface and `ramfb` scans that buffer. Installed apps use
+  the legacy command stream and a full-frame blit; the compositor's own
+  engineer menu is a fallback when no client is attached. Present fences are
+  best-effort `try_send` (no kernel fence object, no wait), and there is no
+  `SYS_SURFACE_DESTROY`: a surface lives until its owner exits. The input
+  driver still polls the virtio event queue at ~100 Hz and assumes QEMU's
+  fixed `0..32767` absolute range. The input driver's 64 KiB BAR is fixed at
+  `0x1030_0000`, extending the fixed-BAR assumption used by the block
+  (`0x1010_0000`) and net (`0x1020_0000`) drivers.
+- Bundle signing keys are provisioned manually at build time
+  (`keys/bundle_ed25519.pub` or `SILVER_BUNDLE_PUBKEY`). There is no key
+  rotation, revocation, per-publisher keyring or developer-mode exception,
+  and the seeded in-kernel manifests are unsigned (the default build has no
+  trusted key). A signed build requires signing every filesystem bundle
+  through `scripts/sign_bundle.py`.
+- A surface physical address is only returned to a grantee that holds the
+  `SCANOUT` right, but a physical address is still a bearer capability: a
+  task with `CAP_MMIO` that learns one can map it through `SYS_MAP_PHYS`.
+  There is no IOMMU. Scanout frames are pinned/leaked on holder death, so the
+  display cannot cause a use-after-free, but the frames are not reclaimed.
 - The EL1/kernel exception path now halts (`silver_handle_exception` dumps the
   registers and spins in a `wfe` loop) instead of resuming the current task;
   see the Phase 7 section. The remaining gap is that the halt is a bare spin —
@@ -2139,41 +2186,74 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 
 ## Next steps (by priority)
 
-1. **Graphics/input polish.** Double-buffer the menu and repaint only the dirty
-   region under the cursor/button instead of the whole frame; wire virtio-input
-   interrupts to replace the 100 Hz poll; read `ABS_INFO` min/max from the
-   device config instead of assuming `0..32767`; and turn the six menu buttons
-   into real actions.
-2. **Program credentials:** define which embedded programs a task may request;
-   currently any task can still spawn the shell ELF. Capability delegation is
-   available through `SYS_CAP_GRANT`.
-3. **Resource quotas:** task count, per-task mmap/heap, VFS budget, the global
-   user-frame reserve and the per-task frame ledger are bounded; the remaining
-   pieces are wait-queue growth and kernel-heap accounting.
-4. **Network services:** add TCP/UDP sockets on smoltcp, DHCP/DNS configuration
-   and a `net` command surface beyond `ping`. Replace the 10 ms RX poll with
-   virtio-net interrupts, then add multiple frames per direction and zero-copy
-   or scatter-gather TX.
-5. **SFS write path and persistence:** block-path interrupts, write support,
-   file-size quotas and overwrite/rename options; then keep the image across
-   reboot.
-6. **Generalize per-task VM:** file-backed and sparse multi-window mappings,
-   growable stacks and demand paging on top of the existing anonymous
-   `SYS_MMAP`/`SYS_MUNMAP`. Add over-aligned user allocations and explicit
-   `realloc`/`calloc` when their use cases appear.
-7. **Dynamic loader follow-ups:** pass argv/`char*` to `run`'d programs, stream
-   segments instead of slurping the whole file, load from the on-disk SFS once
-   it can read files, and add PIE/dynamic linking later. A program-credential
-   model should gate both `spawn` and `run` (see step 2).
-8. **Caches on physical hardware**: software enablement is done (see the
-   2026-11-05 package), and the table-clean/DMA-clean rituals are now
-   mandatory rather than ceremonial. What remains is HIL evidence on `rain`:
-   `dc cvac`/`dc ivac`/`tlbi` ordering, the reported line size, the AP
-   cold-cache assumption and the AP stack clean (QEMU does not model caches).
+1. **Kernel fence object.** Replace best-effort `try_send` fence acks with a
+   kernel object the client can wait on (sequence + completion + timeout), so
+   a frame is provably on screen before the back buffer is reused. This is the
+   remaining correctness gap in the zero-copy present path.
+2. **Surface lifecycle and app zero-copy.** Add `SYS_SURFACE_DESTROY` and a
+   reusable surface pool, then move Calc/Gallery/Notes from the command stream
+   to client-owned surfaces (they currently need `CAP_SURFACE` and a direct
+   renderer). Keep the compositor's framebuffer path as the fallback.
+3. **Bundle key management.** Add key rotation/revocation, a per-publisher
+   keyring and an explicit developer-mode policy. The current build-time single
+   key is enough for signature verification, not for operating a store.
+4. **Hardware verification (rain/fog).** Run the now-enabled boot checks on
+   real hardware: multi-group DMA window, DMA-zero/cache maintenance,
+   `CAP_SURFACE` mapping and scanout pinning. QEMU does not model caches; these
+   are HIL items. Also verify the 16 MiB per-task MMIO/DMA window on the panel
+   path (fog UI itself does not start userspace).
+5. **SFS durability.** Per-bundle block/inode quotas and atomic replacement are
+   done; a metadata journal, crash recovery beyond the current fail-closed
+   fsck direction, file-size quotas and larger-image sparse reads remain.
+6. **Resource limits.** Wait-queue growth and kernel-heap accounting are still
+   unbounded; everything else has an explicit cap.
+7. **Network services.** TCP/UDP on smoltcp, DHCP/DNS, virtio-net interrupts
+   and more than one frame per direction.
+8. **Program credentials and dynamic loader.** Decide which embedded programs
+   a task may request, then add argv/`char*`, streaming segments and PIE/dynamic
+   linking. This should gate both `spawn` and `run`.
 
 Nameserver watch notifications are explicitly deferred. Later IPC control-plane
 work should also address nonblocking/priority replies, send timeouts/cancellation
 and the full-mailbox selective-receive limitation recorded above.
+
+## Current verification commands (2026-11-07)
+
+Host logic and crypto:
+
+```bash
+cargo test --lib                     # 217 tests
+```
+
+Required build profiles (all must stay green):
+
+```bash
+cargo build --release --target aarch64-unknown-none --no-default-features --features no_std
+cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,smp-selftest
+cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,tablet
+cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog,fog-reloc
+cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog,fog-ui
+```
+
+QEMU smoke: boot to `howl ready`, require `MMU TLB OK`, `MMU ASID OK`,
+`MMU HEAP OK`, `DMA ZERO OK`, `DMA WINDOW OK`, `SURFACE READY` and a 640x1136
+`P2/P6` screenshot with non-black samples. Click an app through QMP
+`input-send-event`, confirm the app frame, click its back button and confirm the
+home frame returns. Run `run /sfs/apps/scopeprobe.elf` (status 0), `health`
+(DMA leaked 0) and `du /sfs/apps`; finish with `scripts/sfs_fsck.py`.
+
+Bundle signing check (needs a throwaway key):
+
+```bash
+scripts/sign_bundle.py keygen /tmp/werewolf-dev
+SILVER_BUNDLE_PUBKEY=$(cat /tmp/werewolf-dev.pub) ./build_and_qemu.sh --no-run
+# boot with a fresh image: unsigned probe must fail,
+# append `echo sig=<signature> >> /sfs/apps/scopeprobe.manifest` and it runs.
+```
+
+The four MMU/DMA boot self-tests are now unconditional. A boot that stops at
+`EL1 EXCEPTION kind=9` before `MMU ASID OK` is a real failure in the
+TLB/ASID/heap/DMA-zero invariant, not a skipped test.
 
 ## Workflow for a new feature
 

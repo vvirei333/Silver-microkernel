@@ -452,7 +452,7 @@ finish_table_changes_for(ttbr0);
 - в `docs/ARCHITECTURE.md` обновлён раздел про SFS: порядок флаша, лимит
   direct-блоков, fail-stop virtio;
 - отчёт в конце: что исправлено, чем подтверждено, что осталось.
-## Current status (2026-11-08)
+## Current status (2026-11-07)
 
 The historical findings below remain preserved as an audit trail. The current
 tree has since moved beyond the original userspace storage-server design:
@@ -460,19 +460,25 @@ tree has since moved beyond the original userspace storage-server design:
 - SFS is kernel-owned, mounted read-write at `/sfs`, and backed by the
   synchronous in-kernel virtio-blk path.
 - Files support direct, single-indirect and double-indirect block trees;
-  positioned writes, directory growth/shrink and offline fsck are covered by
-  regression tests.
-- App bundles use manifest write scopes (`write=/prefix`). Dynamic ELFs start
-  without global rights; capability delegation separates target rights from
-  process-wide rights.
+  positioned writes, directory growth/shrink, atomic replacement and offline
+  fsck are covered by regression tests.
+- App bundles use manifest write scopes (`write=/prefix`), per-bundle
+  block/inode quotas (`quota=`), SHA-256 integrity (`sha256=`) and Ed25519
+  authenticity (`sig=`). Dynamic ELFs start without global rights; capability
+  delegation separates target rights from process-wide rights.
 - Per-task open-file quota is 32 descriptors, global VFS quota is 128; task
   teardown closes descriptors and releases address-space/DMA/heap/mmap/capability
   resources.
 - `SYS_MEMINFO_V2` exposes versioned resource diagnostics without changing the
   legacy `SYS_MEMINFO` ABI.
-- Current host test baseline: 199 passing tests. QEMU SMP self-tests and the
-  `no_std`, `fog`, `fog-reloc` and UI-related builds remain required before
-  merging kernel changes.
+- Display surfaces are kernel objects (`CAP_SURFACE`); SilverHome presents
+  zero-copy via `GUI_SURFACE_ATTACH`, and scanout frames are pinned/leaked
+  instead of recycled.
+- Current host test baseline: **217 passing tests**. QEMU SMP self-tests and
+  the `no_std`, `fog`, `fog-reloc`, `fog-ui` and `tablet` builds remain
+  required before merging kernel changes.
 
-Remaining security work includes SFS per-bundle inode/block quotas, metadata
-journaling, surface/PRESENT fencing and signed ELF bundles.
+Remaining work: a kernel fence object (guaranteed present completion),
+`SYS_SURFACE_DESTROY` and app-side zero-copy, a metadata journal, key
+rotation/revocation, and hardware (rain/fog) verification of the cache/DMA
+self-tests. See [`FINAL_AUDIT.md`](FINAL_AUDIT.md).

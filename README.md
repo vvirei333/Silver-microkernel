@@ -54,9 +54,9 @@ userspace.
 - [x] Condition variable: per-mailbox wait queues, targeted wakeups and timed waits
 - [x] Counting semaphore + bounded channel with backpressure
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
-- [x] Sixteen userspace ELFs with checked `PT_LOAD` loading and BSS zeroing
+- [x] Userspace ELFs (apps, drivers, shell and probes) with checked `PT_LOAD` loading and BSS zeroing
 - [x] Init architecture: `silverd` starts Scout, the block, network, graphics and input drivers, the SFS and network servers, Howl and Howler, all resolved by program ID
-- [x] howl: `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`, `sl`, `run`, `mkdir`, `rm`, `rmdir`, `mv`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`
+- [x] howl: `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`, `sl`, `run`, `mkdir`, `rm`, `rmdir`, `mv`, `replace`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`, `health`, `du`
 - [x] Shell output redirection: `>` truncates, `>>` appends, quoted operators stay literal
 - [x] ANSI clear/home and a bold cyan `howl>` prompt
 - [x] RAM-VFS: `/bin`, `/etc`, `/tmp`, files/directories and per-task descriptors
@@ -84,7 +84,7 @@ userspace.
 - [x] EL0 fault triage: `ESR_EL1`/`ELR_EL1`/`FAR_EL1` dump and a 16-entry context-switch trace before the guilty task dies
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
 - [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
-- [x] Graphics driver: `ramfb` framebuffer through `fw_cfg` DMA, a 640x480 ARGB engineer menu with an 8x8 font
+- [x] Graphics driver: `ramfb` framebuffer through `fw_cfg` DMA, a 640×1136 ARGB SilverHome with an 8×8 font (the old engineer menu remains a fallback)
 - [x] Compositor offscreen surface with atomic `PRESENT`; SilverHome publishes each frame in one pass
 - [x] Kernel surface objects (`SYS_SURFACE_CREATE/GRANT/MAP/REVOKE/SCANOUT`): owner-checked, read-only cross-task mapping, and scanout pinning so frames are never recycled under a display controller
 - [x] Zero-copy home screen: SilverHome draws pixels into its own 640×1136 kernel surface; the compositor points `ramfb` at that buffer (`GUI_SURFACE_ATTACH`) instead of blitting
@@ -103,8 +103,9 @@ userspace.
 - [x] SHA-256 bundle integrity: manifest `sha256=` is checked before an ELF becomes a task
 - [x] Ed25519 bundle signatures: `sig=` over the digest, enforced when a trusted public key is compiled in
 - [x] Versioned `SYS_MEMINFO_V2` resource diagnostics for the current task
-- [ ] SFS per-bundle inode/block quotas and metadata journal
-- [ ] SMP (`-smp 4`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to three APs online (CPU1–CPU3), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` (68 PASS / 0 PANIC). Dispatch uses per-CPU FIFO ready queues (local queue → steal from a peer → full-scan fallback), with entries carrying `(id, index)` so an index shift can only discard an entry. Every address space carries a unique 8-bit ASID, so a context switch no longer flushes the domain-wide TLB and a PTE edit invalidates only the edited ASID. `no_std,smp-selftest` additionally runs a cross-PE TLB probe (every AP reads a VA, the boot CPU re-points the same PTE, every AP must observe the new frame), 64 back-to-back SGI1 stop-the-world rounds, a per-CPU timer-tick check, a `running_on`/`current_index` pairing check on every scheduling pass, a FIFO-order probe, a priority/aging probe, a push-migration probe, the BKL stall detector, the stall-watchdog policy and heartbeat checks, and a one-shot `ready queues local/steal/scan/push` report. An opt-in `smp-churn` diagnostic spawns short-lived kernel tasks while the APs run/reap them, with the per-pass invariant audit active; it found and now regression-tests three scheduler bugs (preemptible passes, kernel-task lock imbalance, IRQ window in lock acquisition). It also injects a real masked-IRQ stall and requires another PE to report it (`watchdog stall PASS`). It stays opt-in because it is a stress/injection suite, not a correctness prerequisite; both parts pass on `-smp 2`, `-smp 3` and `-smp 4`. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Device-DMA quiescence is enforced for in-kernel `DmaLease` holders (a live lease makes revoke leak instead of reuse); userspace drivers still rely on the quarantine window. Physical SMP and in-flight-MMAP stress remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
+- [x] SFS per-bundle block/inode quotas (`quota=`), `SYS_FS_USAGE` and `du`
+- [ ] SFS metadata journal and crash recovery beyond the current quota/atomic-replace tests
+- [ ] SMP (`-smp 4/6`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to seven APs online (CPU slots 1–7), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` and `-smp 6`. Dispatch uses per-CPU FIFO ready queues (local queue → steal from a peer → full-scan fallback), with entries carrying `(id, index)` so an index shift can only discard an entry. Every address space carries a unique 8-bit ASID, so a context switch no longer flushes the domain-wide TLB and a PTE edit invalidates only the edited ASID. `no_std,smp-selftest` additionally runs a cross-PE TLB probe (every AP reads a VA, the boot CPU re-points the same PTE, every AP must observe the new frame), 64 back-to-back SGI1 stop-the-world rounds, a per-CPU timer-tick check, a `running_on`/`current_index` pairing check on every scheduling pass, a FIFO-order probe, a priority/aging probe, a push-migration probe, the BKL stall detector, the stall-watchdog policy and heartbeat checks, and a one-shot `ready queues local/steal/scan/push` report. An opt-in `smp-churn` diagnostic spawns short-lived kernel tasks while the APs run/reap them, with the per-pass invariant audit active; it found and now regression-tests three scheduler bugs (preemptible passes, kernel-task lock imbalance, IRQ window in lock acquisition). It also injects a real masked-IRQ stall and requires another PE to report it (`watchdog stall PASS`). It stays opt-in because it is a stress/injection suite, not a correctness prerequisite; both parts pass on `-smp 2`, `-smp 3` and `-smp 4`. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Device-DMA quiescence is enforced for in-kernel `DmaLease` holders (a live lease makes revoke leak instead of reuse); userspace drivers still rely on the quarantine window. Physical SMP and in-flight-MMAP stress remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
 
 ## Design references
 
@@ -175,7 +176,7 @@ device has been booted with it yet.
 cargo build --release --target aarch64-unknown-none \
     --no-default-features --features no_std,fog
 
-# QEMU-only SMP (up to 4 CPUs; run QEMU with -smp 4): APs online,
+# QEMU-only SMP (up to 8 CPU slots; run QEMU with -smp 4 or -smp 6): APs online,
 # GIC/timer/IPI and task execution on every PE
 cargo build --release --target aarch64-unknown-none \
     --no-default-features --features no_std,smp
@@ -215,37 +216,50 @@ directions, smoltcp's ARP and IPv4/ICMP layers, and the checksum check. Any
 IPv4 address can be pinged — not only the slirp gateway — and success is
 reported only on a matching echo reply before the timeout.
 
-## Phase 5: Graphics and input — complete
+## Phase 5: Graphics, surfaces and input — complete
 
-The graphics and input path works end-to-end. `gpu_driver` paints a static
-"engineer menu" (BIOS / iPhone Field-Test style) onto a `ramfb` framebuffer, and
-`input_driver` drives the `virtio-tablet-pci` mouse into a live cursor that
-presses and releases the menu buttons.
+The graphics path is 640×1136 portrait. SilverHome owns the visible UI:
+it paints the wallpaper, status bar, 4×5 app grid and dock, and forwards
+touches to Calc/Gallery/Notes or to Howl. The compositor (`gpu_driver`) keeps an
+ARGB `ramfb` framebuffer and the old engineer menu as a fallback when no client
+has attached.
 
 `ramfb` (not PL111, which the `virt` machine does not have) is QEMU's plain-RAM
-framebuffer: the guest allocates a contiguous 640x480 ARGB frame buffer with
-`SYS_ALLOC_DMA`, writes a big-endian `RAMFBCfg` descriptor to the `etc/ramfb`
-`fw_cfg` file through the `fw_cfg` DMA interface (`0x09020000`), and then paints
-pixels directly into the RAM. `input_driver` finds the modern-only
-`virtio-tablet-pci` (`1af4:1052`) device, provides 64 x 8-byte
-`virtio_input_event` buffers on its event queue, and on every `EV_SYN` scales the
-absolute `0..32767` coordinates to 640x480 and sends one `InputMsg` to
-`gpu_driver` (resolved by name through the nameserver).
+framebuffer: the guest allocates a contiguous ARGB buffer with `SYS_ALLOC_DMA`,
+writes a big-endian `RAMFBCfg` descriptor to the `etc/ramfb` `fw_cfg` file
+through the `fw_cfg` DMA interface (`0x09020000`), and then paints pixels
+directly into RAM. `input_driver` finds the modern-only `virtio-tablet-pci`
+(`1af4:1052`) device, provides 64 × 8-byte `virtio_input_event` buffers on its
+event queue, and on every `EV_SYN` scales the absolute `0..32767` coordinates to
+the panel and sends one `InputMsg` to `gpu_driver`.
 
-The menu draws three grey status cells ("Num", "No Data", "Date"), a 3x2 grid of
-blue buttons ("Phone", "SMS", "Web", "Media", "Power", "Settings") and a bottom
-panel ("SN: 877...", "Silver Microkernel v0.1"). Moving the mouse repaints the
-frame with a white arrow cursor on top; holding a button fills it dark blue
-(`0x003366`) and releasing restores the normal blue.
+There are now two present paths:
+
+- **Zero-copy (SilverHome).** `SYS_SURFACE_CREATE` allocates a kernel surface;
+  SilverHome grants the compositor read/scanout access and draws pixels
+  directly into its Normal Non-Cacheable mapping. `GUI_SURFACE_ATTACH` asks the
+  compositor to point `ramfb` at that physical buffer — no blit. Two surfaces
+  are used when the ledger allows, so the displayed frame is not drawn into.
+- **Command stream (installed apps).** Calc/Gallery/Notes send
+  `GUI_CLEAR`/`RECT`/`TEXT`/`TEXT_SCALED` into an offscreen surface; `PRESENT`
+  copies it to the compositor framebuffer and returns a fence sequence.
+
+Surfaces are kernel objects, not bare addresses: the owner keeps the writable
+alias, a grantee maps read-only, scanout is a separate right, and frames that a
+display controller may still read are never returned to the allocator. The
+in-kernel Virtual DMA window is 16 MiB (eight 2 MiB groups) so the compositor can
+hold the framebuffer, its legacy offscreen surface and a client surface at once.
 
 ```bash
 ./build_and_qemu.sh release   # opens a GTK window (ramfb + tablet, show-cursor)
 ```
 
-The script now passes `-device ramfb -device virtio-tablet-pci,disable-legacy=on`
+The script passes `-device ramfb -device virtio-tablet-pci,disable-legacy=on`
 and `-display gtk,show-cursor=on` (the shell stays multiplexed on stdio via
-`-serial mon:stdio`). To run headless, substitute `-display vnc=...` and drive
-the mouse with QMP `input-send-event`.
+`-serial mon:stdio`). To verify headless, use `-display none`, a QMP socket and
+`screendump` plus `input-send-event`; a 640×1136 `P6` PPM with non-black samples
+proves the frame reached the display.
+
 
 ## Phase 6: Dynamic ELF loader — complete
 
@@ -277,6 +291,44 @@ u64::MAX - 1`).
 program table, so `run bin/hello` is the only way to execute it — proving the
 loader path end-to-end. The embedded `spawn` path is unchanged and shares the
 same `elf::load_elf` (via the thin `elf_loader` shim).
+
+## Bundle manifests and signing — complete
+
+An ELF loaded through `SYS_SPAWN_PATH` may have a sibling manifest
+(`app.elf` → `app.manifest`):
+
+```text
+write=/sfs/demo          # only subtree the app may write
+quota=8:5                # blocks:inodes for that subtree
+sha256=<64 hex>          # digest of the exact ELF bytes
+sig=<128 hex>            # Ed25519 signature over that digest
+```
+
+Rules enforced by the kernel (`src/bundle.rs`):
+
+- `sha256=` is always checked when present; a mismatch refuses the spawn.
+- With a trusted public key compiled in (`keys/bundle_ed25519.pub` or
+  `SILVER_BUNDLE_PUBKEY=<64 hex>`), **every** filesystem bundle needs a valid
+  digest **and** signature. A missing signature is refused.
+- Without a key the kernel is integrity-only, and a manifest that claims a
+  signature it cannot authenticate is refused rather than silently downgraded.
+- A malformed `quota=`, `sha256=` or `sig=` sets `InvalidPolicy`; it never
+  degrades into "no restriction".
+- The digest is checked before the signature, so a valid signature over a
+  different file cannot authenticate this one.
+
+Generate a development key and sign a manifest:
+
+```bash
+scripts/sign_bundle.py keygen /tmp/werewolf-dev
+cp /tmp/werewolf-dev.pub keys/bundle_ed25519.pub
+scripts/sign_bundle.py sign /tmp/werewolf-dev.key app.elf app.manifest
+scripts/sign_bundle.py verify /tmp/werewolf-dev.pub app.elf app.manifest
+```
+
+Never commit `*.key` (it is in `.gitignore`). Signing is authenticity for a
+single build-time publisher key; rotation, revocation and per-publisher
+keyrings are future work (`docs/FINAL_AUDIT.md`).
 
 ## Phase 7: EL0 fault containment + teardown — complete
 
@@ -428,7 +480,7 @@ Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
 `Cargo.toml` has `std` (default host stub), `no_std` (bare metal), `smp`
-(opt-in QEMU SMP, up to 4 CPUs), `smp-selftest` (SMP plus 64 boot-time SGI1
+(opt-in QEMU SMP, up to 8 CPU slots; verified on `-smp 4` and `-smp 6`), `smp-selftest` (SMP plus 64 boot-time SGI1
 quiescence rounds, a cross-CPU visibility check and a per-CPU timer check),
 `demo-tasks` (opt-in regression programs), `tablet` (SM8650), `fog`
 (SM6225 RAM-only bring-up) and `fog-reloc` (explicit opt-in for the fog
@@ -521,6 +573,9 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `src/wait_queue.rs` | Shared FIFO queue with dead-waiter removal |
 | `src/ipc.rs` | Bounded mailboxes, backpressure, timed/selective receive and cleanup |
 | `src/syscall.rs` | System call table and checked user-buffer operations |
+| `src/bundle.rs` | Manifest parsing, write scope/quota, digest and signature policy |
+| `src/bundle_sig.rs` | Ed25519 public-key parsing and verification |
+| `src/sha256.rs` | FIPS 180-4 SHA-256 and hex digest parsing |
 | `src/user_memory.rs` | PAN-compatible `LDTR/STTR` copyin/copyout |
 | `src/condvar.rs` | Condition variable: timed/infinite wait and targeted wakeups |
 | `src/semaphore.rs` | Counting semaphore on mutex + condvar |
@@ -530,13 +585,14 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `src/elf.rs` | Dynamic ELF64/AArch64 `PT_LOAD` loader, `LoadedImage`, `PageKind`, `ElfError` |
 | `src/user_program.rs` | Program IDs and embedded userspace ELF selection |
 | `src/vfs.rs` | RAM file tree, normalized paths and per-task file descriptors |
-| `src/seed.rs` | Boot-time VFS seeding of `/bin/hello` for the dynamic loader |
+| `src/seed.rs` | Boot-time VFS seeding of apps, probes and `/bin/hello` |
 | `userspace/src/allocator.rs` | Per-task first-fit `malloc/free` over `SYS_BRK` |
 | `userspace/src/bin/silvershell.rs` | Interactive shell and `logo.txt` fastfetch screen |
 | `userspace/src/bin/net_driver.rs` | VirtIO-Net driver, split virtqueues and frame mailbox |
 | `userspace/src/bin/net_server.rs` | `smoltcp` TCP/IP stack and ICMP echo |
 | `userspace/src/net_ipc.rs` | Shared-memory frame protocol used by both network tasks |
-| `userspace/src/bin/gpu_driver.rs` | ramfb framebuffer, engineer menu, cursor and button UI |
+| `userspace/src/bin/gpu_driver.rs` | ramfb framebuffer, compositor, legacy engineer menu and zero-copy attach |
+| `userspace/src/framebuffer.rs` | 32-bit pixel/font drawing used by SilverHome surfaces |
 | `userspace/src/bin/input_driver.rs` | virtio-tablet absolute-pointer driver |
 | `userspace/src/input_proto.rs` | Pointer-sample IPC shared by the input and graphics drivers |
 | `userspace/src/bin/{ls,cat,echo}.rs` | Separate EL0 file/console utilities |
@@ -546,6 +602,7 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `redmi10c_poc/README.md` | Authoritative Redmi 10C (fog) bring-up document |
 | `redmi10c_poc/test_fog_qemu.sh` | Fog QEMU relocation/at-link/fail-closed regression |
 | `redmi10c_poc/build_boot_image.sh` | RAM-only Android boot image v3 builder (no device operation) |
+| `scripts/sign_bundle.py` | Ed25519 key generation, manifest signing and verification |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
 ## Memory model
@@ -696,31 +753,44 @@ This is not yet a complete security model. Kill, wait, console, resume, MMIO,
 IRQ and PCI operations check capability rights; `SYS_CAP_GRANT` delegates only a
 subset of the caller's rights, and task death revokes or downgrades affected
 capabilities. Page-table walks are owner-checked and DMA revocation is bounded
-    to DRAM, so a corrupted descriptor cannot redirect a walk into a foreign table
-    or below `DRAM_BASE`. Anonymous mappings are capped per task (16 MiB), the
-    task frame ledger bounds heap/ELF/stack/mmap/DMA frames, and VFS, open-file,
-    DMA-window, task and capability counts have explicit bounds. SFS per-bundle
-    block/inode quotas and metadata journaling remain future work.
-A shared-DMA physical address is a bearer capability. `safe_to_free` proves
-only that CPU mappings are gone; revoked ranges are additionally quarantined
-for a bounded drain window, but that is a mitigation rather than a
-device-quiescence proof — stopping the queue remains the driver's contract.
+to DRAM, so a corrupted descriptor cannot redirect a walk into a foreign table
+or below `DRAM_BASE`. Anonymous mappings are capped per task (16 MiB), the task
+frame ledger bounds heap/ELF/stack/mmap/DMA frames, and VFS, open-file,
+DMA-window, task and capability counts have explicit bounds. SFS per-bundle
+block/inode quotas, atomic replace and crash-consistency tests are in place; a
+metadata journal remains future work.
+
+Bundle authenticity is Ed25519 over the SHA-256 digest (`sig=`), enforced when
+a trusted public key is compiled in. Surface objects use a separate
+`CAP_SURFACE` right instead of `CAP_MMIO`; a grantee maps read-only, scanout is
+an explicit grant, and frames a display may still read are pinned/leaked rather
+than recycled. A physical DMA address is still a bearer capability (no IOMMU):
+`safe_to_free` proves only that CPU mappings are gone, and revoked ranges are
+quarantined for a bounded drain window. Stopping the device queue remains the
+driver's contract.
 
 ## Documentation
 
 | Document | Contents |
 | --- | --- |
 | [redmi10c_poc/README.md](redmi10c_poc/README.md) | Authoritative Redmi 10C / fog bring-up: design, live-FDT policy, fail-closed relocation, QEMU tests, unconfirmed hardware parameters |
-| [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU bring-up of up to four CPUs behind the `smp` feature, round-qualified quiescence, FIFO ready queues, per-CPU timer checks, a stall watchdog and boot selftests; true cross-PE TLB stress and physical SMP are not verified |
+| [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU bring-up of up to eight CPU slots (verified on four and six) behind the `smp` feature, round-qualified quiescence, FIFO ready queues, per-CPU timer checks, a stall watchdog and boot selftests; true cross-PE TLB stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
+| [docs/FINAL_AUDIT.md](docs/FINAL_AUDIT.md) | Final audit: DMA window, surface objects/zero-copy, Ed25519 signing, evidence and known limitations |
+| [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
 
-Current verification snapshot (2026-11-08): **199 host tests** pass; the fog
+Current verification snapshot (2026-11-07): **217 host tests** pass; the fog
 QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 `howl>`; the demo regression reports 69 PASS / 0 PANIC under `no_std,smp` with
-QEMU `-smp 4` (and `-smp 2`); the `no_std`, `fog`, `fog-reloc`, `tablet`,
-`smp`, `smp-selftest`, `smp-churn` and `demo-tasks` configurations all build;
-the opt-in `smp-churn` profile passes `churn PASS`, `push PASS`,
+QEMU `-smp 4` (and `-smp 2`); the `no_std`, `fog`, `fog-reloc`, `fog-ui`,
+`tablet`, `smp`, `smp-selftest`, `smp-churn` and `demo-tasks` configurations
+all build. The surface/signing checkpoint additionally verifies: zero-copy
+SilverHome frame (640×1136, non-black screenshot), QMP click into Calc and back
+to home, `SURFACE READY`, `MMU TLB/ASID/HEAP`, `DMA ZERO` and `DMA WINDOW`,
+`scopeprobe` status 0 with no leaks, `sfs_fsck` clean, and the three signing
+cases (unsigned refused, valid `sig=` accepted, tampered signature refused).
+The opt-in `smp-churn` profile passes `churn PASS`, `push PASS`,
 `watchdog stall PASS`, `bkl stall PASS` and `priority PASS` on `-smp 2`,
 `-smp 3` and `-smp 4` with the per-pass invariant audit active. Caches are on
 in every console-capable profile (`CACHE=ON line=64`) and

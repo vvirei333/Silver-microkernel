@@ -1,10 +1,13 @@
 # SMP Status — TASK №6/№7 (2026-11-01, сессия 3)
 
-> **Current project status (2026-11-04):** this file remains the authoritative
+> **Current project status (2026-11-07):** this file remains the authoritative
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
-> test suite is now **182/182**; the 13/13 figure below is the checkpoint from
-> the earlier SMP session.
+> test suite is now **217/217**; the 13/13 figure below is the checkpoint from
+> the earlier SMP session. The surface/signing checkpoint (`8b5158a`,
+> `f6ee824`) re-ran `no_std,smp-selftest` on QEMU `-smp 4`: 15 PASS / 0 FAIL,
+> including cross-PE TLB, 64 quiescence rounds, per-CPU ticks and the BKL
+> stall probe.
 >
 > **Phases 1–2 are implemented as the opt-in `smp` feature (QEMU only).**
 > Default builds remain single-core. With `no_std,smp` and QEMU `-smp 4`,
@@ -563,10 +566,11 @@ DMA leak, and `-smp 2` still reports one peer.
 
 ## Проверки на текущем состоянии
 
-- `cargo test --lib`: **182/182**.
+- `cargo test --lib`: **217/217** (2026-11-07, surface/signing checkpoint).
 - Default `no_std` build, QEMU `-smp 4`: single-core, reaches `howl>`.
-- `no_std,smp` build, QEMU `-smp 4`: CPU1–CPU3 online (GIC/timer/IPI), all
-  four CPUs execute tasks; `howl ready`/prompt and `ps` work.
+- `no_std,smp-selftest` build, QEMU `-smp 4`: **15 PASS / 0 FAIL**, CPU1–CPU3
+  online (GIC/timer/IPI), all four CPUs execute tasks; `howl ready`/prompt and
+  `ps` work.
 - `no_std,smp` build, QEMU `-smp 2`: only CPU1 comes online; CPU2/CPU3 report
   `CPU_ON failed` and stay offline without aborting the boot.
 - `no_std,smp,demo-tasks`, QEMU `-smp 4`: **69 PASS / 0 FAIL / 0 PANIC**,
