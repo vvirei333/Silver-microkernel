@@ -203,9 +203,13 @@ const _: () = assert!(USER_STACK_L3_INDEX + USER_STACK_PAGES <= ENTRIES);
 const _: () = assert!(USER_STACK_VA % GRANULE == 0);
 const _: () = assert!(USER_STACK_GUARD_VA % GRANULE == 0);
 
-/// A 2 MB first-fit window for explicitly authorized user MMIO and DMA mappings.
+/// A multi-group first-fit window for explicitly authorized user MMIO and DMA
+/// mappings. Four L2 groups (8 MiB) are required by the display path: the
+/// visible framebuffer and one offscreen surface are ~2.8 MiB each, so a
+/// single 2 MiB group cannot hold even the framebuffer alone.
 pub const USER_MMIO_VA: usize = USER_IMAGE_VA + 0x4000_0000;
 const USER_MMIO_L2_GROUPS: usize = 4;
+const _: () = assert!(USER_MMIO_L2_GROUPS >= 4);
 pub const USER_DMA_MAX_SIZE: usize = ENTRIES * GRANULE * USER_MMIO_L2_GROUPS;
 const USER_MMIO_L1_INDEX: usize = (USER_MMIO_VA >> 30) & 0x1FF;
 const USER_MMIO_L2_INDEX: usize = 0;
@@ -1590,7 +1594,10 @@ pub fn map_shared_dma_to_user(
     checked_range_end(phys_addr, size, DRAM_BASE, DRAM_END)?;
     let (physical_start, physical_offset, page_count) =
         aligned_page_span(phys_addr, size, GRANULE)?;
-    if page_count > ENTRIES {
+    // Shared mappings use the same four-group window as owner mappings. The
+    // earlier one-group bound silently rejected every full-size display
+    // surface (710 pages), so cross-task sharing could never work.
+    if page_count > ENTRIES * USER_MMIO_L2_GROUPS {
         return None;
     }
     map_user_pages(
@@ -1907,6 +1914,51 @@ pub fn run_self_test() -> bool {
     let stale_refused = !destroy_task_space_inner(space, 0, 0, asid_of(root), false);
 
     mapped && partial_refused && still_mapped && unmapped && gone && space_released && stale_refused
+}
+
+/// Proves the enlarged user DMA window really spans more than one 2 MiB L2
+/// group and that an oversized request is refused without side effects. The
+/// display path needs two ~2.8 MiB surfaces, which only fits because the
+/// first-fit allocator walks all four groups.
+///
+/// This runs on every platform, including fog, so a device boot that reaches
+/// this point has exercised the same multi-group mapping arithmetic the
+/// framebuffer path uses (the fog UI itself does not start userspace).
+pub fn run_dma_window_self_test() -> bool {
+    // One page into the second group: the mapping must cross a group boundary.
+    let pages = ENTRIES + 1;
+    let span = pages * GRANULE;
+    let Some((physical, generation)) = frame_allocator::alloc_user_contiguous_pages_tagged(pages)
+    else {
+        return false;
+    };
+    let Some((private, private_generation)) = frame_allocator::alloc_page_tagged() else {
+        frame_allocator::free_contiguous_pages_tagged(physical, pages, generation);
+        return false;
+    };
+    let Some((space, token)) = create_task_space(private, 0, None) else {
+        frame_allocator::free_page_tagged(private, private_generation);
+        frame_allocator::free_contiguous_pages_tagged(physical, pages, generation);
+        return false;
+    };
+
+    let mapped = map_dma_to_user_space(space, physical, span);
+    // The run may start in group 0 and continue across the boundary; what
+    // matters is that the last page lives in a later group.
+    let crossed_group = mapped
+        .is_some_and(|va| va + span > USER_MMIO_VA + ENTRIES * GRANULE);
+    // A request larger than the whole window must fail closed. It must not
+    // install a partial run or disturb the mapping just published.
+    let oversized_refused =
+        map_dma_to_user_space(space, physical, USER_DMA_MAX_SIZE + GRANULE).is_none();
+
+    let revoke = revoke_phys_range(space, physical, physical + span);
+    let released = destroy_task_space(token, private, private_generation, asid_of(space));
+    let freed = revoke.safe_to_free
+        && revoke.unmapped == pages
+        && frame_allocator::free_contiguous_pages_tagged(physical, pages, generation);
+
+    mapped.is_some() && crossed_group && oversized_refused && freed && released
 }
 
 /// Boot-time proof that the CPU honours a translation-table edit: read a value

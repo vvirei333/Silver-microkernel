@@ -1420,6 +1420,16 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::log("MMU RECLAIM OK");
     ram_log::fb_progress();
 
+    // Enlarged DMA window: a first-fit run must cross a 2 MiB group boundary
+    // and an oversized request must be refused. The display path depends on
+    // this window holding two full-size surfaces.
+    if !mmu::run_dma_window_self_test() {
+        exceptions::silver_handle_exception(9, 0, 0, 0);
+    }
+    console::write_str("DMA WINDOW OK\r\n");
+    ram_log::log("DMA WINDOW OK");
+    ram_log::fb_progress();
+
     // TLB proof: read through TTBR0, remap the same VA to another frame and
     // read again. Fails closed if the flush did not change the translation.
     if false && !mmu::run_tlb_self_test() {
