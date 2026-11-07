@@ -73,7 +73,7 @@ The real-device boot of `fog-display` remains a hardware check.
 | Stage | Goal | State |
 | --- | --- | --- |
 | 0 | Boot stub, FDT proof, MMU, GICv3, timer, scheduler, Howl | done on `rain` |
-| 1 | Panel framebuffer + real compositor/SilverHome | code done, QEMU-verified; hardware pending |
+| 1 | Panel framebuffer + real compositor/SilverHome | hardware: maps/clears; HOME draw still pending; QEMU-verified at 720x1650 |
 | 2 | Touch input (GENI I2C + touch controller) | not started |
 | 3 | Persistent storage (eMMC/UFS) for `/sfs` | not started |
 | 4 | Battery/thermal/power key, safe shutdown | not started |
@@ -167,3 +167,52 @@ QEMU:
 
 Collect the exact commands and logs in the bring-up notes; a screenshot of the
 panel is the primary evidence when UART is unavailable.
+
+## Real-device findings (2026-11-07, `rain`)
+
+RAM-only `fastboot boot` of the `fog-display` image exposed six issues that
+QEMU cannot show. Four are fixed in the tree, one is the next task, and the
+last is still open:
+
+1. **Kernel SFS probed QEMU PCI on the phone.** `sfs::load()` called
+   `virtio_blk::init()`, which scanned the ECAM window at `0x40_1000_0000`.
+   That address is not mapped on fog, so the first config read took a
+   synchronous fault and the unit stopped at the "frame allocator OK" stage.
+   `virtio_blk::init()` now returns `false` unless the platform is `Qemu`;
+   storage on a phone must come from the future eMMC/UFS driver.
+2. **GENI UART TX could stall for ~100 ms per byte.** `poll_status` spun up to
+   50,000,000 times before aborting. The unit's UART is not proven clocked, so
+   every console line delayed boot by seconds and the scheduler started much
+   later than the diagnostic deadlines. The budget is now 500,000 spins and
+   the first timeout sets `TX_STALLED`, after which TX returns immediately.
+3. **The newer MMU boot proofs wedge the unit.** The first TTBR0 TLB self-test
+   (added after the last hardware run) hangs on `rain`. A default fog image now
+   skips the post-DMA-window MMU/ASID/heap/DMA proofs and logs
+   `SILVER DEEP SELFTESTS SKIPPED (fog hardware profile)`. The
+   `fog-hw-selftests` feature opts back in for a dedicated debugging image.
+   This is a tactical skip: the proofs must be debugged before the port claims
+   MMU/TLB coverage on hardware.
+4. **PSCI `SYSTEM_RESET` over `smc` works on the unit.** `hvc` is not a valid
+   conduit there. The opt-in `fog-auto-reset` feature resets the SoC 30 s after
+   the timer is up, so a RAM-only diagnostic image returns to Android without a
+   power-key hold. This is diagnostic-only and is not part of a release image.
+5. **The platform panel path maps and clears.** With `fog-display`, userspace
+   maps the live `cont_splash` carve-out through `SYS_DISPLAY_MAP` and wipes
+   the panel, so the bootloader splash disappears on the real unit.
+6. **HOME/compositor use the live panel geometry.** `SYS_DISPLAY_INFO` now
+   supplies 720x1650 to SilverHome, and the platform path draws directly into
+   the fixed scanout buffer. The old 640x1136 offscreen surface is QEMU-only:
+   creating it on the phone made `present_surface()` reject the blit (size
+   mismatch) and left the panel black after the clear.
+
+**Still open:** after the compositor's initial clear the panel stays black on
+`rain`; SilverHome's command stream is not reaching the panel yet. QEMU with a
+1 GiB synthetic khaje tree draws the full 720x1650 UI (wallpaper pixels at
+`0x5C0E1000`), so the remaining fault is in the hardware handshake
+(name registration, UI ownership or the first `GUI_RECT`). Instrument that
+handshake before touching touch/storage.
+
+The image name for the current bring-up check is
+`redmi10c_poc/out/boot-reloc-display-reset.img` (features
+`no_std,fog,fog-reloc,fog-display,fog-auto-reset`). `build_boot_image.sh`
+accepts `--display`, `--paint` and `--autoreset`.

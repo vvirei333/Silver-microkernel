@@ -18,8 +18,13 @@ zero-copy present, Ed25519 bundle signatures, and the final audit.
   clean. SMP `-smp 4` selftest: 15 PASS / 0 FAIL.
 - **Phone groundwork:** `fog-display` registers the live-FDT `cont_splash`
   carve-out (`SYS_DISPLAY_INFO/MAP`) and starts compositor + SilverHome on it.
-  With a 1 GiB synthetic khaje tree, pixels appear at `0x5C000000`; default
-  `fog` is unchanged. See [`docs/PORTING_FOG.md`](docs/PORTING_FOG.md).
+  With a 1 GiB synthetic khaje tree, the full 720x1650 UI is drawn; default
+  `fog` is unchanged. On the real `rain` unit the compositor maps and clears
+  the panel, but HOME's draw is still pending (see the hardware findings in
+  [`docs/PORTING_FOG.md`](docs/PORTING_FOG.md)). Hardware forced three fixes:
+  the virtio-blk PCI probe is QEMU-only, GENI UART TX fails fast instead of
+  stalling per byte, and the newer MMU boot proofs are skipped on fog by
+  default (`fog-hw-selftests` opts in).
 - **Signing:** unsigned bundle under a provisioned key is refused; a valid
   `sig=` runs (status 0); a tampered signature is refused.
 - **Latest commits:** `d0ac546` DMA window, `9bf3b8b` Ed25519 signatures,

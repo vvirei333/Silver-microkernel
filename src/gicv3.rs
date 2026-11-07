@@ -727,6 +727,10 @@ pub fn handle_irq() {
         _ if irq == timer_irq() => {
             timer::handle_irq();
             end_interrupt(acknowledge_register);
+            // Diagnostic builds arm a one-shot PSCI reset; checking it on the
+            // tick keeps the deadline independent of scheduler load.
+            #[cfg(feature = "fog-auto-reset")]
+            crate::fog::auto_reset_poll();
             if crate::smp::irq_may_schedule() {
                 scheduler::schedule();
             }

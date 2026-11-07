@@ -207,33 +207,22 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("GPU DRIVER: REGISTER FAILED\r\n");
     }
 
-    // Offscreen surface for atomic PRESENT. A second full-size DMA buffer is
-    // optional: if the ledger refuses it, drawing stays immediate and correct.
-    if let Some((surface_vaddr, _)) = syscall::alloc_dma(SCREEN_BYTES) {
-        unsafe {
-            SURFACE = Some(Framebuffer {
-                vaddr: surface_vaddr,
-                width: SCREEN_WIDTH,
-                height: SCREEN_HEIGHT,
-                stride: SCREEN_WIDTH,
-            });
-        }
-        syscall::print("COMPOSITOR: SURFACE READY\r\n");
-    }
-
     // Two backends: QEMU's `ramfb` (the guest owns the buffer and points the
     // device at it) or a platform panel buffer registered by the kernel. The
     // latter is the phone path: the bootloader already configured the panel and
     // left `cont_splash` in reserved memory.
     let platform = syscall::display_info().filter(|info| info.present());
     if let Some(info) = platform {
+        // The panel scans one fixed buffer, so the offscreen SURFACE is not
+        // used at all: HOME draws straight into FRAMEBUFFER. Creating it here
+        // used to make present_surface() reject the blit (640x1136 vs the
+        // panel's 720x1650) and left the panel black after the initial wipe.
         let Some(fb_vaddr) = syscall::display_map() else {
             fail("GPU DRIVER: PLATFORM DISPLAY MAP FAILED\r\n");
         };
         PLATFORM_DISPLAY.store(1, Ordering::Release);
-        // Clear the whole panel once so the bootloader splash does not frame
-        // the 640x1136 UI area. The compositor still draws the app at
-        // SCREEN_WIDTH/HEIGHT; only this initial wipe uses the panel mode.
+        // The panel is the logical screen: HOME now reads the same geometry
+        // from SYS_DISPLAY_INFO, so its coordinates are panel-sized too.
         let panel = Framebuffer {
             vaddr: fb_vaddr,
             width: info.width as u32,
@@ -248,8 +237,8 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         unsafe {
             FRAMEBUFFER = Some(Framebuffer {
                 vaddr: fb_vaddr,
-                width: SCREEN_WIDTH,
-                height: SCREEN_HEIGHT,
+                width: info.width as u32,
+                height: info.height as u32,
                 stride: info.stride as u32,
             });
         }
@@ -270,6 +259,19 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         let Some((scratch_vaddr, scratch_paddr)) = syscall::alloc_dma(SCRATCH_SIZE) else {
             fail("GPU DRIVER: SCRATCH ALLOCATION FAILED\r\n");
         };
+        // Offscreen surface for atomic PRESENT (QEMU only; the platform panel
+        // draws directly into its fixed scanout buffer).
+        if let Some((surface_vaddr, _)) = syscall::alloc_dma(SCREEN_BYTES) {
+            unsafe {
+                SURFACE = Some(Framebuffer {
+                    vaddr: surface_vaddr,
+                    width: SCREEN_WIDTH,
+                    height: SCREEN_HEIGHT,
+                    stride: SCREEN_WIDTH,
+                });
+            }
+            syscall::print("COMPOSITOR: SURFACE READY\r\n");
+        }
         unsafe {
             FRAMEBUFFER = Some(Framebuffer {
                 vaddr: fb_vaddr,

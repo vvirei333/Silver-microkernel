@@ -8,6 +8,9 @@
 use crate::boot::BootParams;
 use crate::fdt::{self, Fdt, Region};
 
+#[cfg(feature = "fog-auto-reset")]
+use core::sync::atomic::{AtomicU64, Ordering};
+
 /// Debug-only colour ladder on the Rain/Fog cont_splash framebuffer.
 /// `fog-paint` is not part of a normal build; it assumes the live Rain
 /// reserved-memory base at 0x5C00_0000 and exists only to make a UART-less
@@ -51,6 +54,67 @@ pub fn paint_band(color: u32) {
 #[cfg(not(feature = "fog-paint"))]
 #[inline(always)]
 pub fn paint_band(_color: u32) {}
+
+/// Diagnostic progress bars for `fog-paint` builds: a full-screen stage colour
+/// would erase every earlier marker, so each completed sub-stage draws one
+/// white bar below the previous one. The number of bars is the number of
+/// completed sub-stages; the background stays on the last full-screen colour.
+#[cfg(feature = "fog-paint")]
+pub fn stage_mark(index: u32) {
+    const BASE: usize = 0x5C00_0000;
+    const WIDTH: usize = 720;
+    const BAR_HEIGHT: usize = 12;
+    const BAR_STEP: usize = 24;
+    let pointer = crate::memory::phys_to_virt(BASE) as *mut u32;
+    let y = 8 + index as usize * BAR_STEP;
+    for row in 0..BAR_HEIGHT {
+        for x in 0..WIDTH {
+            unsafe {
+                core::ptr::write_volatile(pointer.add((y + row) * WIDTH + x), 0xFFFF_FFFF);
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "fog-paint"))]
+#[inline(always)]
+pub fn stage_mark(_index: u32) {}
+
+#[cfg(feature = "fog-auto-reset")]
+static AUTO_RESET_AT: AtomicU64 = AtomicU64::new(0);
+
+/// Arms a one-shot reset `seconds` after this call. Runs from the timer IRQ,
+/// which only exists once the scheduler is alive; a boot that wedges earlier
+/// still needs the power key.
+#[cfg(feature = "fog-auto-reset")]
+pub fn arm_auto_reset(seconds: u64) {
+    let deadline = crate::timer::ticks()
+        .saturating_add(crate::timer::milliseconds_to_ticks(seconds.saturating_mul(1000)));
+    AUTO_RESET_AT.store(deadline, Ordering::Release);
+    crate::console::write_str("SILVER AUTO-RESET armed (");
+    crate::console::write_dec_u64(seconds);
+    crate::console::write_str(" s)\r\n");
+}
+
+/// Called from the timer tick. The deadline is cleared before the PSCI call so
+/// a refused reset cannot re-enter from the next tick.
+#[cfg(feature = "fog-auto-reset")]
+pub fn auto_reset_poll() {
+    let deadline = AUTO_RESET_AT.load(Ordering::Acquire);
+    if deadline != 0 && crate::timer::ticks() >= deadline {
+        AUTO_RESET_AT.store(0, Ordering::Release);
+        crate::console::write_str("SILVER AUTO-RESET: PSCI SYSTEM_RESET\r\n");
+        crate::power::system_reset();
+    }
+}
+
+#[cfg(not(feature = "fog-auto-reset"))]
+#[inline(always)]
+pub fn arm_auto_reset(_seconds: u64) {}
+
+#[cfg(not(feature = "fog-auto-reset"))]
+#[inline(always)]
+pub fn auto_reset_poll() {}
 
 pub const FOG_COMPATIBLE: [&str; 2] = ["qcom,khaje", "qcom,sm6225"];
 

@@ -160,10 +160,16 @@ pub fn init() {
     init_at(0x0089_C000);
 }
 
+/// Set when a TX poll exhausts its budget. The UART is not clocked on the
+/// first fog unit, and every stuck byte used to cost an enormous spin (the
+/// boot lost tens of seconds to console output). After one timeout the driver
+/// stops transmitting instead of stalling each following byte.
+static TX_STALLED: AtomicBool = AtomicBool::new(false);
+
 /// Transmits a single byte by driving the main sequencer through a one-byte
 /// transfer, then waits for it to drain. Polling only, no interrupts.
 pub fn write_byte(byte: u8) {
-    if !READY.load(Ordering::Acquire) {
+    if !READY.load(Ordering::Acquire) || TX_STALLED.load(Ordering::Acquire) {
         return;
     }
     // Hand the sequencer a one-byte transfer and start it.
@@ -171,14 +177,20 @@ pub fn write_byte(byte: u8) {
     write_reg(SE_GENI_M_CMD0, UART_START_TX << M_OPCODE_SHFT);
 
     // Wait for FIFO space (watermark status bit).
-    poll_status(SE_GENI_M_IRQ_STATUS, M_TX_FIFO_WATERMARK_EN, true);
+    if !poll_status(SE_GENI_M_IRQ_STATUS, M_TX_FIFO_WATERMARK_EN, true) {
+        TX_STALLED.store(true, Ordering::Release);
+        return;
+    }
 
     // Push the byte. With 4x8 packing, byte 0 of the FIFO word is the LSB.
     write_reg(SE_GENI_TX_FIFON, u32::from(byte));
     write_reg(SE_GENI_M_IRQ_CLEAR, M_TX_FIFO_WATERMARK_EN);
 
     // Wait for the transfer to complete, then acknowledge it.
-    poll_status(SE_GENI_M_IRQ_STATUS, M_CMD_DONE_EN, true);
+    if !poll_status(SE_GENI_M_IRQ_STATUS, M_CMD_DONE_EN, true) {
+        TX_STALLED.store(true, Ordering::Release);
+        return;
+    }
     write_reg(SE_GENI_M_IRQ_CLEAR, M_CMD_DONE_EN);
 }
 
@@ -289,20 +301,22 @@ fn start_read() {
 
 /// Polls `SE_GENI_M_IRQ_STATUS` until `field` reads as `set`, with a bounded
 /// spin so a missing/disabled UART can never wedge the kernel forever.
-fn poll_status(offset: usize, field: u32, set: bool) {
+/// Returns `false` when the budget is exhausted; the caller then stops
+/// transmitting instead of paying the same cost for every later byte.
+fn poll_status(offset: usize, field: u32, set: bool) -> bool {
     let mut spins = 0_u32;
     loop {
         let value = read_reg(offset);
         if ((value & field) != 0) == set {
-            return;
+            return true;
         }
         spins = spins.wrapping_add(1);
-        if spins == 50_000_000 {
+        if spins == 500_000 {
             // Abort the stuck transfer so a later write can retry cleanly.
             if offset == SE_GENI_M_IRQ_STATUS {
                 write_reg(SE_GENI_M_CMD_CTRL_REG, M_GENI_CMD_ABORT);
             }
-            return;
+            return false;
         }
         core::hint::spin_loop();
     }

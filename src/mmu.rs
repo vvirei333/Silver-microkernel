@@ -2051,15 +2051,22 @@ pub fn run_tlb_self_test() -> bool {
     };
     let va = USER_MMAP_VA;
 
+    #[cfg(feature = "fog-paint")]
+    crate::fog::stage_mark(13); // scratch address space created
+
     // The test switches the running PE's own TTBR0. IRQs must stay masked:
     // an IRQ handler that touched user memory would see this scratch space.
     let saved_daif = crate::interrupts::save_and_disable_irq();
     let previous = current_ttbr0();
     switch_address_space(root);
+    #[cfg(feature = "fog-paint")]
+    crate::fog::stage_mark(14); // TTBR0 switched to the scratch space
 
     // Published frames are zeroed by `map_user_pages_at`, so seed the first
     // page through the *user* mapping and read it back.
     let mapped_first = map_user_pages_at(root, va, first, 1, PROT_WRITE);
+    #[cfg(feature = "fog-paint")]
+    crate::fog::stage_mark(15); // first page mapped and TLB invalidated
     let first_read = if mapped_first {
         unsafe {
             (va as *mut u64).write_volatile(FIRST_VALUE);
@@ -2068,6 +2075,8 @@ pub fn run_tlb_self_test() -> bool {
     } else {
         0
     };
+    #[cfg(feature = "fog-paint")]
+    crate::fog::stage_mark(16); // first page written and read
 
     // Repoint the same VA at `second`, using the user map (which zeroes it) and
     // then seeding it through the kernel alias. A stale TLB entry for `first`
@@ -2075,6 +2084,8 @@ pub fn run_tlb_self_test() -> bool {
     // test must catch.
     let remapped =
         unmap_user_pages_at(root, va, 1) && map_user_pages_at(root, va, second, 1, PROT_WRITE);
+    #[cfg(feature = "fog-paint")]
+    crate::fog::stage_mark(17); // second page mapped over the same VA
     if remapped {
         unsafe {
             (phys_to_virt(second) as *mut u64).write_volatile(SECOND_VALUE);
@@ -2086,9 +2097,13 @@ pub fn run_tlb_self_test() -> bool {
     } else {
         0
     };
+    #[cfg(feature = "fog-paint")]
+    crate::fog::stage_mark(18); // second page written and read
 
     switch_address_space(previous);
     crate::interrupts::restore_irq(saved_daif);
+    #[cfg(feature = "fog-paint")]
+    crate::fog::stage_mark(19); // restored the previous TTBR0
 
     // Tear the scratch space down exactly once. If a PTE survived, the frames
     // must be leaked rather than handed to the allocator under a live mapping.
@@ -2099,6 +2114,8 @@ pub fn run_tlb_self_test() -> bool {
         safe_to_free &= frame_allocator::free_page_tagged(second, second_generation);
     }
     let released = destroy_task_space(space, private, private_generation, asid_of(root));
+    #[cfg(feature = "fog-paint")]
+    crate::fog::stage_mark(20); // scratch space torn down
 
     first_read == FIRST_VALUE && second_read == SECOND_VALUE && safe_to_free && released
 }

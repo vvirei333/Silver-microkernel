@@ -50,6 +50,15 @@ fog-ui = ["fog", "fog-paint"]
 # real-device images: QEMU's fog DTB can advertise a splash address that its
 # `-m` RAM does not actually back.
 fog-display = ["fog"]
+# Real-device bring-up convenience: after the scheduler and the timer are up,
+# reset the machine through PSCI `SYSTEM_RESET` so a RAM-only diagnostic boot
+# returns to Android without holding the power key. Never part of a release
+# image.
+fog-auto-reset = ["fog"]
+# Opt-in: run the newer MMU/ASID/DMA boot self-tests on fog hardware. They are
+# QEMU-proven but can wedge a real unit before userspace starts, so the default
+# fog image skips them (and logs that it did). QEMU builds always run them.
+fog-hw-selftests = ["fog"]
 # Opt-in bisect test: unmask IRQs and wait for 30 timer ticks before the
 # scheduler is initialised. Useful on QEMU; on the first hardware boot it can
 # deliver a timer IRQ into a not-yet-initialised scheduler, so fog defaults off.

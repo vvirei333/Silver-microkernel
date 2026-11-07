@@ -403,6 +403,14 @@ pub fn reset() {
 
 /// Claims the device and installs queue 0.
 pub fn init() -> bool {
+    // virtio-blk is a QEMU `virt` PCI device reached through the high ECAM
+    // window at 0x40_1000_0000. That address is not mapped on a phone or the
+    // tablet: probing it takes a synchronous external abort before the first
+    // config read can fail. Only the QEMU platform may touch PCI config space;
+    // a phone port gets its storage from an eMMC/UFS driver instead.
+    if crate::platform::detect() != crate::platform::Kind::Qemu {
+        return false;
+    }
     let Some((bus, device, function)) = find_device() else {
         console::write_str("KBLK: no virtio-blk device\r\n");
         return false;

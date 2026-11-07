@@ -20,18 +20,37 @@ use framebuffer::Framebuffer;
 
 use core::panic::PanicInfo;
 
-const SCREEN_WIDTH: u32 = 640;
-const SCREEN_HEIGHT: u32 = 1136;
+/// Reference design size, used on QEMU's ramfb. A real panel replaces these
+/// at startup with the geometry reported by `SYS_DISPLAY_INFO`, so the layout
+/// follows the phone instead of assuming a 640x1136 iPhone-5-sized screen.
+static mut PANEL_WIDTH: u32 = 640;
+static mut PANEL_HEIGHT: u32 = 1136;
+
+#[inline(always)]
+fn sw() -> u32 {
+    unsafe { PANEL_WIDTH }
+}
+
+#[inline(always)]
+fn sh() -> u32 {
+    unsafe { PANEL_HEIGHT }
+}
 
 const ICON_SIZE: u32 = 118;
 const ICON_GAP_X: u32 = 26;
 const ICON_ROW_STEP: u32 = 174;
 const GRID_COLUMNS: usize = 4;
-const GRID_X: u32 =
-    (SCREEN_WIDTH - (GRID_COLUMNS as u32 * ICON_SIZE + (GRID_COLUMNS as u32 - 1) * ICON_GAP_X)) / 2;
 const GRID_Y: u32 = 96;
-const DOCK_Y: u32 = 962;
 const DOCK_ICON: u32 = 108;
+
+fn grid_x() -> u32 {
+    let width = GRID_COLUMNS as u32 * ICON_SIZE + (GRID_COLUMNS as u32 - 1) * ICON_GAP_X;
+    sw().saturating_sub(width) / 2
+}
+
+fn dock_y() -> u32 {
+    sh().saturating_sub(174)
+}
 const DOCK_APPS: [usize; 4] = [0, 1, 2, 3];
 
 const APP_LABELS: [&str; 20] = [
@@ -102,7 +121,7 @@ fn init_zero_copy(gpu: u64) {
     let mut frames = [None; 2];
     let mut count = 0;
     for slot in 0..2 {
-        let Some((id, vaddr)) = syscall::surface_create(SCREEN_WIDTH, SCREEN_HEIGHT) else {
+        let Some((id, vaddr)) = syscall::surface_create(sw(), sh()) else {
             syscall::print("HOME: SURFACE CREATE FAILED\r\n");
             break;
         };
@@ -114,9 +133,9 @@ fn init_zero_copy(gpu: u64) {
             id,
             fb: Framebuffer {
                 vaddr,
-                width: SCREEN_WIDTH,
-                height: SCREEN_HEIGHT,
-                stride: SCREEN_WIDTH,
+                width: sw(),
+                height: sh(),
+                stride: sw(),
             },
         });
         count += 1;
@@ -354,22 +373,22 @@ fn grid_position(index: usize) -> (u32, u32) {
     let column = (index % GRID_COLUMNS) as u32;
     let row = (index / GRID_COLUMNS) as u32;
     (
-        GRID_X + column * (ICON_SIZE + ICON_GAP_X),
+        grid_x() + column * (ICON_SIZE + ICON_GAP_X),
         GRID_Y + row * ICON_ROW_STEP,
     )
 }
 
 fn dock_position(slot: usize) -> (u32, u32) {
     let total = DOCK_APPS.len() as u32 * DOCK_ICON + (DOCK_APPS.len() as u32 - 1) * 30;
-    let x = (SCREEN_WIDTH - total) / 2 + slot as u32 * (DOCK_ICON + 30);
-    (x, DOCK_Y + 20)
+    let x = (sw() - total) / 2 + slot as u32 * (DOCK_ICON + 30);
+    (x, dock_y() + 20)
 }
 
 fn draw_status_bar(gpu: u64) {
-    rect(gpu, 0, 0, SCREEN_WIDTH, 48, COLOR_BLACK);
+    rect(gpu, 0, 0, sw(), 48, COLOR_BLACK);
     text(gpu, 12, 16, COLOR_WHITE, "9:41");
-    text_centered(gpu, SCREEN_WIDTH / 2, 16, COLOR_WHITE, "Silver");
-    rect(gpu, SCREEN_WIDTH - 60, 16, 44, 16, 0xFF30D158);
+    text_centered(gpu, sw() / 2, 16, COLOR_WHITE, "Silver");
+    rect(gpu, sw() - 60, 16, 44, 16, 0xFF30D158);
 }
 
 /// Sends a kernel surface to the compositor for direct scanout. Payload:
@@ -405,18 +424,18 @@ fn draw_home_surface(pressed: Option<usize>) -> bool {
         let color = 0xFF00_0000 | ((12 + t / 6) << 16) | ((48 + t / 3) << 8) | (96 + t / 2);
         fb.fill_rect(
             0,
-            band * SCREEN_HEIGHT / bands,
-            SCREEN_WIDTH,
-            SCREEN_HEIGHT / bands + 1,
+            band * sh() / bands,
+            sw(),
+            sh() / bands + 1,
             color,
         );
     }
 
     // Status bar.
-    fb.fill_rect(0, 0, SCREEN_WIDTH, 48, COLOR_BLACK);
+    fb.fill_rect(0, 0, sw(), 48, COLOR_BLACK);
     fb.text(12, 16, COLOR_WHITE, "9:41");
-    fb.text_centered(SCREEN_WIDTH / 2, 16, COLOR_WHITE, "Silver");
-    fb.fill_rect(SCREEN_WIDTH - 60, 16, 44, 16, 0xFF30D158);
+    fb.text_centered(sw() / 2, 16, COLOR_WHITE, "Silver");
+    fb.fill_rect(sw() - 60, 16, 44, 16, 0xFF30D158);
 
     // App grid.
     for index in 0..APP_LABELS.len() {
@@ -437,7 +456,7 @@ fn draw_home_surface(pressed: Option<usize>) -> bool {
     }
 
     // Dock.
-    fb.fill_rect(0, DOCK_Y, SCREEN_WIDTH, SCREEN_HEIGHT - DOCK_Y, 0xFF10_1A2A);
+    fb.fill_rect(0, dock_y(), sw(), sh() - dock_y(), 0xFF10_1A2A);
     for (slot, &app) in DOCK_APPS.iter().enumerate() {
         let (x, y) = dock_position(slot);
         let face = if pressed == Some(app) {
@@ -469,9 +488,9 @@ fn draw_home(gpu: u64, pressed: Option<usize>) {
         rect(
             gpu,
             0,
-            band * SCREEN_HEIGHT / bands,
-            SCREEN_WIDTH,
-            SCREEN_HEIGHT / bands + 1,
+            band * sh() / bands,
+            sw(),
+            sh() / bands + 1,
             color,
         );
     }
@@ -496,7 +515,7 @@ fn draw_home(gpu: u64, pressed: Option<usize>) {
         );
     }
 
-    rect(gpu, 0, DOCK_Y, SCREEN_WIDTH, SCREEN_HEIGHT - DOCK_Y, 0xFF10_1A2A);
+    rect(gpu, 0, dock_y(), sw(), sh() - dock_y(), 0xFF10_1A2A);
     for (slot, &app) in DOCK_APPS.iter().enumerate() {
         let (x, y) = dock_position(slot);
         let face = if pressed == Some(app) {
@@ -551,7 +570,7 @@ fn calc_key_rect(index: usize) -> (u32, u32, u32, u32) {
     let row = (index / 4) as u32;
     let size = 130;
     let gap = 12;
-    let x = (SCREEN_WIDTH - (4 * size + 3 * gap)) / 2 + column * (size + gap);
+    let x = (sw() - (4 * size + 3 * gap)) / 2 + column * (size + gap);
     let y = 470 + row * (size + gap);
     (x, y, size, size)
 }
@@ -559,7 +578,7 @@ fn calc_key_rect(index: usize) -> (u32, u32, u32, u32) {
 fn draw_calc(gpu: u64, calc: &Calc) {
     clear(gpu, COLOR_PANEL);
     draw_status_bar(gpu);
-    text_centered_scaled(gpu, SCREEN_WIDTH / 2, 80, COLOR_WHITE, 2, "Calculator");
+    text_centered_scaled(gpu, sw() / 2, 80, COLOR_WHITE, 2, "Calculator");
 
     rect(gpu, 40, 130, 560, 180, 0xFF20_20_26);
     let digits = core::str::from_utf8(&calc.display[..calc.len]).unwrap_or("0");
@@ -611,7 +630,7 @@ fn gallery_rect(index: usize) -> (u32, u32, u32, u32) {
     let row = (index / 3) as u32;
     let size = 170;
     let gap = 20;
-    let x = (SCREEN_WIDTH - (3 * size + 2 * gap)) / 2 + column * (size + gap);
+    let x = (sw() - (3 * size + 2 * gap)) / 2 + column * (size + gap);
     let y = 200 + row * (size + gap);
     (x, y, size, size)
 }
@@ -622,8 +641,8 @@ fn draw_gallery(gpu: u64, selected: Option<usize>) {
         draw_status_bar(gpu);
         text_centered_scaled(
             gpu,
-            SCREEN_WIDTH / 2,
-            SCREEN_HEIGHT / 2,
+            sw() / 2,
+            sh() / 2,
             COLOR_WHITE,
             3,
             "Tap to return",
@@ -632,7 +651,7 @@ fn draw_gallery(gpu: u64, selected: Option<usize>) {
     }
     clear(gpu, 0xFF0A_0A_0E);
     draw_status_bar(gpu);
-    text_centered_scaled(gpu, SCREEN_WIDTH / 2, 110, COLOR_WHITE, 2, "Gallery");
+    text_centered_scaled(gpu, sw() / 2, 110, COLOR_WHITE, 2, "Gallery");
     for index in 0..GALLERY_COLORS.len() {
         let (x, y, w, h) = gallery_rect(index);
         rect(gpu, x, y, w, h, shade(GALLERY_COLORS[index]));
@@ -663,14 +682,14 @@ const NOTE_STEP: u32 = 78;
 fn note_key_rect(row: usize, index: usize) -> (u32, u32, u32, u32) {
     let text = NOTE_ROWS[row].as_bytes();
     let width = text.len() as u32 * (NOTE_KEY + NOTE_GAP) - NOTE_GAP;
-    let x = (SCREEN_WIDTH - width) / 2 + index as u32 * (NOTE_KEY + NOTE_GAP);
+    let x = (sw() - width) / 2 + index as u32 * (NOTE_KEY + NOTE_GAP);
     (x, NOTE_Y + row as u32 * NOTE_STEP, NOTE_KEY, NOTE_KEY)
 }
 
 fn note_extra_rect(index: usize) -> (u32, u32, u32, u32) {
     let widths = [240_u32, 150, 150];
     let total: u32 = widths.iter().sum::<u32>() + 2 * NOTE_GAP;
-    let mut x = (SCREEN_WIDTH - total) / 2;
+    let mut x = (sw() - total) / 2;
     for slot in 0..index {
         x += widths[slot] + NOTE_GAP;
     }
@@ -680,7 +699,7 @@ fn note_extra_rect(index: usize) -> (u32, u32, u32, u32) {
 fn draw_notes(gpu: u64, note: &[u8]) {
     clear(gpu, 0xFF17_14_0E);
     draw_status_bar(gpu);
-    text_centered_scaled(gpu, SCREEN_WIDTH / 2, 80, COLOR_WHITE, 2, "Notes");
+    text_centered_scaled(gpu, sw() / 2, 80, COLOR_WHITE, 2, "Notes");
     rect(gpu, 30, 130, 580, 330, 0xFFF7_E8_B0);
 
     let visible = core::str::from_utf8(note).unwrap_or("");
@@ -761,11 +780,11 @@ fn notes_tap(note: &mut [u8], len: &mut usize, x: u32, y: u32) {
 fn draw_app(gpu: u64, app: usize) {
     clear(gpu, shade(APP_COLORS[app]));
     draw_status_bar(gpu);
-    rect(gpu, 0, 48, SCREEN_WIDTH, SCREEN_HEIGHT - 48, APP_COLORS[app]);
-    text_centered_scaled(gpu, SCREEN_WIDTH / 2, 110, COLOR_WHITE, 2, APP_LABELS[app]);
-    rect(gpu, (SCREEN_WIDTH - 200) / 2, 360, 200, 200, shade(APP_COLORS[app]));
-    rect(gpu, (SCREEN_WIDTH - 196) / 2, 362, 196, 196, APP_COLORS[app]);
-    text_centered_scaled(gpu, SCREEN_WIDTH / 2, 760, COLOR_WHITE, 2, "Tap to return");
+    rect(gpu, 0, 48, sw(), sh() - 48, APP_COLORS[app]);
+    text_centered_scaled(gpu, sw() / 2, 110, COLOR_WHITE, 2, APP_LABELS[app]);
+    rect(gpu, (sw() - 200) / 2, 360, 200, 200, shade(APP_COLORS[app]));
+    rect(gpu, (sw() - 196) / 2, 362, 196, 196, APP_COLORS[app]);
+    text_centered_scaled(gpu, sw() / 2, 760, COLOR_WHITE, 2, "Tap to return");
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +834,16 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     let Some(gpu) = gpu else {
         syscall::exit();
     };
+    // Follow the real panel geometry when the kernel exposes one. QEMU's
+    // ramfb path has no platform display, so the 640x1136 reference stays.
+    if let Some(info) = syscall::display_info() {
+        if info.present() {
+            unsafe {
+                PANEL_WIDTH = info.width as u32;
+                PANEL_HEIGHT = info.height as u32;
+            }
+        }
+    }
     init_zero_copy(gpu);
 
     draw_home(gpu, None);

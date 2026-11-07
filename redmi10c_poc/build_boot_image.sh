@@ -18,13 +18,24 @@ FEATURES="no_std,fog"
 IMAGE_NAME="boot.img"
 RELOC=0
 UI=0
+DISPLAY=0
+PAINT=0
+AUTORESET=0
 for argument in "$@"; do
     case "$argument" in
         --reloc) RELOC=1 ;;
         --ui) UI=1 ;;
-        *) echo "usage: $0 [--reloc] [--ui]" >&2; exit 1 ;;
+        --display) DISPLAY=1 ;;
+        --paint) PAINT=1 ;;
+        --autoreset) AUTORESET=1 ;;
+        *) echo "usage: $0 [--reloc] [--ui|--display] [--paint] [--autoreset]" >&2; exit 1 ;;
     esac
 done
+
+if [ "$UI" -eq 1 ] && [ "$DISPLAY" -eq 1 ]; then
+    echo "error: --ui and --display both own cont_splash; pick one" >&2
+    exit 1
+fi
 
 if [ "$RELOC" -eq 1 ]; then
     FEATURES="${FEATURES},fog-reloc"
@@ -35,6 +46,18 @@ fi
 if [ "$UI" -eq 1 ]; then
     FEATURES="${FEATURES},fog-ui"
     IMAGE_NAME="${IMAGE_NAME}-ui"
+fi
+if [ "$DISPLAY" -eq 1 ]; then
+    FEATURES="${FEATURES},fog-display"
+    IMAGE_NAME="${IMAGE_NAME}-display"
+fi
+if [ "$PAINT" -eq 1 ]; then
+    FEATURES="${FEATURES},fog-paint"
+    IMAGE_NAME="${IMAGE_NAME}-paint"
+fi
+if [ "$AUTORESET" -eq 1 ]; then
+    FEATURES="${FEATURES},fog-auto-reset"
+    IMAGE_NAME="${IMAGE_NAME}-reset"
 fi
 IMAGE_NAME="${IMAGE_NAME}.img"
 

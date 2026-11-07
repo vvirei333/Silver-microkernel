@@ -2493,6 +2493,7 @@ pub fn current_task_id() -> u64 {
         .unwrap_or(0)
 }
 
+
 /// True when an online CPU is currently executing a task in `ttbr0`'s
 /// address space. The kernel lock must be held. `ttbr0 == 0` is the kernel
 /// context and never owns user tables.
@@ -5010,10 +5011,14 @@ extern "C" fn idle_task() -> ! {
     if smp::bkl_depth() > 0 {
         smp::bkl_release();
     }
-    #[cfg(feature = "fog-paint")]
+    // The full-screen ladder must not run once userspace owns the panel: IRQs
+    // are enabled between these two paints, so the compositor can draw the UI
+    // before the second paint and the idle colour would erase it. A
+    // `fog-display` build keeps only the small stage marker below.
+    #[cfg(all(feature = "fog-paint", not(feature = "fog-display")))]
     crate::fog::paint(0xFF00_FF00); // green: idle task entered
     interrupts::enable_irq();
-    #[cfg(feature = "fog-paint")]
+    #[cfg(all(feature = "fog-paint", not(feature = "fog-display")))]
     crate::fog::paint(0xFF00_00FF); // blue: idle waiting for an IRQ
     #[cfg(feature = "fog-ui")]
     {
