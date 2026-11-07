@@ -160,6 +160,27 @@ pub trait FileSystem {
     fn len(&self, path: &str) -> Result<usize, ()>;
     /// Bootstrap-only whole-file write (initramfs seeding).
     fn seed_file(&mut self, path: &str, contents: &[u8]) -> Result<(), ()>;
+    /// Resources owned by `path` and everything below it, for quota checks.
+    /// Backends that cannot account precisely return `None`; callers must
+    /// treat that as "quota unknown" and fail closed where a quota applies.
+    fn usage(&self, path: &str) -> Option<FsUsage> {
+        let _ = path;
+        None
+    }
+}
+
+/// Backend-independent resource accounting for one managed subtree.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct FsUsage {
+    pub inodes: u32,
+    pub data_blocks: u32,
+    pub metadata_blocks: u32,
+}
+
+impl FsUsage {
+    pub fn blocks(self) -> u32 {
+        self.data_blocks.saturating_add(self.metadata_blocks)
+    }
 }
 
 struct Node {
@@ -842,6 +863,13 @@ impl Vfs {
         self.mounts[mount].fs.len(&relative)
     }
 
+    /// Resource accounting for the backend that owns `path`.
+    fn usage(&self, cwd: &str, path: &str) -> Option<FsUsage> {
+        let resolved = resolve_path(cwd, path).ok()?;
+        let (mount, relative) = self.resolve(&resolved);
+        self.mounts[mount].fs.usage(&relative)
+    }
+
     /// Creates (or overwrites) a file at `path` with `contents`. Bootstrap-only:
     /// the dynamic loader needs an executable in the tree before any program
     /// can write files into it.
@@ -1024,6 +1052,12 @@ pub fn read_file(cwd: &str, path: &str) -> Result<Vec<u8>, ()> {
 /// `SYS_SPAWN_PATH` target before kernel memory is allocated.
 pub fn file_len(cwd: &str, path: &str) -> Result<usize, ()> {
     with_vfs(|vfs| vfs.file_len(cwd, path))
+}
+
+/// Resource usage of `path` in whichever backend owns it. `None` means the
+/// backend cannot account for that subtree.
+pub fn usage(cwd: &str, path: &str) -> Option<FsUsage> {
+    with_vfs(|vfs| vfs.usage(cwd, path))
 }
 
 /// Seeds a bootstrap file into the tree (initramfs-style, boot-time only).

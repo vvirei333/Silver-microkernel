@@ -382,6 +382,17 @@ impl FileSystem for Sfs {
         sfs_format::flush_bitmap(image, &superblock, &mut Disk);
         Ok(())
     }
+
+    fn usage(&self, path: &str) -> Option<crate::vfs::FsUsage> {
+        let image = image().ok()?;
+        let superblock = sfs_format::superblock(image).ok()?;
+        let usage = sfs_format::usage_under(image, &superblock, path)?;
+        Some(crate::vfs::FsUsage {
+            inodes: usage.inodes,
+            data_blocks: usage.data_blocks,
+            metadata_blocks: usage.metadata_blocks,
+        })
+    }
 }
 
 /// Undo of a cross-parent rename's first half: removes the entry `add_entry`

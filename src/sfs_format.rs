@@ -162,6 +162,25 @@ pub fn block_start(image: &[u8], superblock: &Superblock, block: u32) -> Option<
 
 pub type InodeTuple = (u32, u32, [u32; DIRECT_BLOCKS], u32, u32);
 
+/// Resources owned by one inode tree. `inodes` counts the inode itself, so an
+/// empty file is `{ inodes: 1, ..0 }`. Data and metadata blocks are counted
+/// separately: an indirect table is metadata, a data block is payload.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub inodes: u32,
+    pub data_blocks: u32,
+    pub metadata_blocks: u32,
+}
+
+impl Usage {
+    fn add(&mut self, other: Usage) -> Option<()> {
+        self.inodes = self.inodes.checked_add(other.inodes)?;
+        self.data_blocks = self.data_blocks.checked_add(other.data_blocks)?;
+        self.metadata_blocks = self.metadata_blocks.checked_add(other.metadata_blocks)?;
+        Some(())
+    }
+}
+
 pub fn inode_get(
     image: &[u8],
     superblock: &Superblock,
@@ -179,6 +198,96 @@ pub fn inode_get(
     let indirect = u32_at(image, offset + 8 + DIRECT_BLOCKS * 4);
     let double = u32_at(image, offset + 8 + (DIRECT_BLOCKS + 1) * 4);
     Some((kind, size, blocks, indirect, double))
+}
+
+/// Resources owned by a single inode: the inode itself, its data blocks and
+/// its indirect/double-indirect tables. Directory payload blocks are counted
+/// as data; `usage_under` adds the entries reachable from them.
+pub fn usage_of_inode(
+    image: &[u8],
+    superblock: &Superblock,
+    index: u32,
+) -> Option<Usage> {
+    let (kind, size, blocks, indirect, double) = inode_get(image, superblock, index)?;
+    let limit = if kind == INODE_KIND_DIR {
+        MAX_FILE_BLOCKS
+    } else {
+        (size as usize).div_ceil(BLOCK_SIZE)
+    };
+    let mut usage = Usage {
+        inodes: 1,
+        data_blocks: 0,
+        metadata_blocks: usize::from(indirect != 0) as u32,
+    };
+
+    for slot in 0..limit {
+        match inode_slot_block(image, superblock, &blocks, indirect, double, slot) {
+            Some(_) => {
+                usage.data_blocks = usage.data_blocks.checked_add(1)?;
+            }
+            None if kind == INODE_KIND_DIR => break,
+            None => return None,
+        }
+    }
+
+    if double != 0 {
+        // The double node and every sub-table are metadata.
+        let start = block_start(image, superblock, double)?;
+        usage.metadata_blocks = usage.metadata_blocks.checked_add(1)?;
+        for table_index in 0..INDIRECT_POINTERS {
+            if u32_at(image, start + table_index * 4) != 0 {
+                usage.metadata_blocks = usage.metadata_blocks.checked_add(1)?;
+            }
+        }
+    }
+    Some(usage)
+}
+
+/// Recursive accounting for `path` and everything below it. The working set is
+/// bounded by `inode_count`; a directory cycle is rejected instead of looping
+/// forever on a corrupt image.
+pub fn usage_under(image: &[u8], superblock: &Superblock, path: &str) -> Option<Usage> {
+    let parts = split_path(path).ok()?;
+    let root = if parts.is_empty() {
+        superblock.root_inode
+    } else {
+        lookup(image, superblock, path)?.0
+    };
+    let mut stack = Vec::new();
+    usage_tree(image, superblock, root, &mut stack)
+}
+
+fn usage_tree(
+    image: &[u8],
+    superblock: &Superblock,
+    index: u32,
+    stack: &mut Vec<u32>,
+) -> Option<Usage> {
+    if stack.len() as u32 >= superblock.inode_count || stack.contains(&index) {
+        return None;
+    }
+    stack.push(index);
+    let (kind, _, blocks, indirect, _) = inode_get(image, superblock, index)?;
+    let mut usage = usage_of_inode(image, superblock, index)?;
+    if kind == INODE_KIND_DIR {
+        for slot in 0..MAX_FILE_BLOCKS {
+            let Some(block) = inode_slot_block(image, superblock, &blocks, indirect, 0, slot)
+            else {
+                break;
+            };
+            let start = block_start(image, superblock, block)?;
+            for entry_slot in 0..DIR_ENTRIES_PER_BLOCK {
+                let entry = start + entry_slot * DIR_ENTRY_SIZE;
+                let child = u32_at(image, entry);
+                if child == 0 {
+                    continue;
+                }
+                usage.add(usage_tree(image, superblock, child, stack)?)?;
+            }
+        }
+    }
+    stack.pop();
+    Some(usage)
 }
 
 /// Writes the inode fields into the image and flushes the owning block.
@@ -1519,6 +1628,42 @@ mod tests {
         let mut disk2 = MemDisk::new(128);
         assert!(inode_put(&mut image, &sb, &mut disk2, a, INODE_KIND_FILE, 3 * BLOCK_SIZE as u32, &padded, 0, 0));
         assert!(fsck(&image, &sb).is_err());
+    }
+
+    #[test]
+    fn usage_counts_nested_files_and_directories() {
+        let (mut image, mut disk, sb) = make_image(128);
+        seed_root(&mut image, &sb, &mut disk);
+        let empty = [0_u32; DIRECT_BLOCKS];
+        let a = create_inode(&mut image, &sb, &mut disk, sb.root_inode, "a", INODE_KIND_FILE).unwrap();
+        assert!(store(&mut image, &sb, &mut disk, a, &vec![1_u8; 1000], &empty, 0, 0, 0));
+        let sub = create_inode(&mut image, &sb, &mut disk, sb.root_inode, "sub", INODE_KIND_DIR).unwrap();
+        let b = create_inode(&mut image, &sb, &mut disk, sub, "b", INODE_KIND_FILE).unwrap();
+        assert!(store(&mut image, &sb, &mut disk, b, &vec![2_u8; 10], &empty, 0, 0, 0));
+
+        // root + a + sub + b; root block + sub block + two a blocks + one b block.
+        let usage = usage_under(&image, &sb, "").unwrap();
+        assert_eq!(usage.inodes, 4);
+        assert_eq!(usage.data_blocks, 5);
+        assert_eq!(usage.metadata_blocks, 0);
+
+        let only_a = usage_under(&image, &sb, "a").unwrap();
+        assert_eq!(only_a, Usage { inodes: 1, data_blocks: 2, metadata_blocks: 0 });
+    }
+
+    #[test]
+    fn usage_counts_indirect_and_double_metadata() {
+        let (mut image, mut disk, sb) = make_image(512);
+        seed_root(&mut image, &sb, &mut disk);
+        let empty = [0_u32; DIRECT_BLOCKS];
+        let big = create_inode(&mut image, &sb, &mut disk, sb.root_inode, "big", INODE_KIND_FILE).unwrap();
+        assert!(store(&mut image, &sb, &mut disk, big, &vec![7_u8; 72 * 1024], &empty, 0, 0, 0));
+
+        let usage = usage_under(&image, &sb, "big").unwrap();
+        assert_eq!(usage.inodes, 1);
+        assert_eq!(usage.data_blocks, 144);
+        // One single-indirect table, one double node and one sub-table.
+        assert_eq!(usage.metadata_blocks, 3);
     }
 
     #[test]
