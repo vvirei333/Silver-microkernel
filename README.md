@@ -483,8 +483,9 @@ prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 (opt-in QEMU SMP, up to 8 CPU slots; verified on `-smp 4` and `-smp 6`), `smp-selftest` (SMP plus 64 boot-time SGI1
 quiescence rounds, a cross-CPU visibility check and a per-CPU timer check),
 `demo-tasks` (opt-in regression programs), `tablet` (SM8650), `fog`
-(SM6225 RAM-only bring-up) and `fog-reloc` (explicit opt-in for the fog
-self-relocation copy). Normal bare-metal boot starts only
+(SM6225 RAM-only bring-up), `fog-reloc` (explicit opt-in for the fog
+self-relocation copy) and `fog-ui` (framebuffer status panel; implies
+`fog-paint`). Normal bare-metal boot starts only
 silverd, which then starts Scout, the block driver, the network driver, the SFS
 server, the network server, the graphics and input drivers, Howl and Howler in
 that order. No component depends
