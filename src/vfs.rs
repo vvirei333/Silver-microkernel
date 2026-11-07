@@ -1188,6 +1188,8 @@ pub fn run_self_test() {
     let mut stage = 0_u32;
     let passed = self_test_inner(&mut stage);
     // Always return the tree to its pre-test shape.
+    close_task(101);
+    close_task(102);
     let _ = unlink("/", "/tmp/vfs_compat");
     let _ = umount("/", "/tmp/vfs_selftest/sub", |_| false);
     let _ = umount("/", "/tmp/vfs_selftest", |_| false);
@@ -1239,6 +1241,28 @@ fn self_test_inner(stage: &mut u32) -> bool {
         _ => return false,
     }
     *stage = 7;
+    // Per-task handle quota: one owner may hold at most 32 descriptors, but
+    // another owner must still be able to open a descriptor. This also
+    // exercises the owner check in `close_task` during cleanup above.
+    let mut quota_fds = Vec::new();
+    for _ in 0..MAX_OPEN_FILES_PER_TASK {
+        match open(101, "/", "/tmp/vfs_selftest/file", 0) {
+            Ok(fd) => quota_fds.push(fd),
+            Err(_) => return false,
+        }
+    }
+    if open(101, "/", "/tmp/vfs_selftest/file", 0).is_ok()
+        || open(102, "/", "/tmp/vfs_selftest/file", 0).is_err()
+    {
+        return false;
+    }
+    for fd in quota_fds {
+        if close(101, fd).is_err() {
+            return false;
+        }
+    }
+    close_task(102);
+    *stage = 8;
     if mkdir("/", "/tmp/vfs_selftest/sub").is_err()
         || mount("/", "/tmp/vfs_selftest/sub", "ramfs", "selftest", 0, |_| false).is_err()
         || create("/", "/tmp/vfs_selftest/sub/nested").is_err()
