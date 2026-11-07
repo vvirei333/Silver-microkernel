@@ -224,6 +224,7 @@ fn execute(command: &str) {
             syscall::print("  pwd        Print current working directory\r\n");
             syscall::print("  clear      Clear the terminal screen\r\n");
             syscall::print("  uname      Print kernel name, version and architecture\r\n");
+            syscall::print("  health     Kernel resource and leak snapshot\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
             syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server> [arg]\r\n");
             syscall::print("  bg <program> [arg]\r\n");
@@ -277,7 +278,8 @@ fn execute(command: &str) {
         Some("cd") => change_directory(words.next()),
         Some("pwd") => print_working_directory(),
         Some("clear") => clear_screen(),
-        Some("uname") => syscall::print("Silver Microkernel v0.1.0 aarch64\r\n"),
+        Some("uname") => syscall::print("Silver Kernel v0.1.0 aarch64 (WerewolfOS)\r\n"),
+        Some("health") => show_health(),
         Some("ps") => show_tasks(),
         Some("spawn") | Some("bg") => spawn_program(words.next(), words.next()),
         Some("fg") => foreground_task(words.next()),
@@ -1005,6 +1007,40 @@ fn wait_task(cap_id: Option<&str>) {
     } else {
         syscall::print("wait: unknown capability or status already consumed\r\n");
     }
+}
+
+fn show_health() {
+    let Some(info) = syscall::health_info() else {
+        syscall::print("health: unavailable\r\n");
+        return;
+    };
+    let used_pages = info.total_pages.saturating_sub(info.free_pages);
+    let used_kib = used_pages.saturating_mul(4);
+    syscall::print("WerewolfOS health v");
+    syscall::print_dec_u64(info.version);
+    syscall::print("\r\n");
+    syscall::print("  frames: used ");
+    syscall::print_dec_u64(used_pages);
+    syscall::print(" / ");
+    syscall::print_dec_u64(info.total_pages);
+    syscall::print(" (");
+    syscall::print_dec_u64(used_kib);
+    syscall::print(" KiB)\r\n");
+    syscall::print("  tasks:  live ");
+    syscall::print_dec_u64(info.live_tasks);
+    syscall::print(" zombie ");
+    syscall::print_dec_u64(info.zombies);
+    syscall::print("\r\n");
+    syscall::print("  files:  open ");
+    syscall::print_dec_u64(info.open_files);
+    syscall::print("\r\n");
+    syscall::print("  dma:    leaked ");
+    syscall::print_dec_u64(info.dma_leaked_pages);
+    syscall::print(" quarantined ");
+    syscall::print_dec_u64(info.dma_quarantined_pages);
+    syscall::print("\r\n  uptime: ");
+    syscall::print_dec_u64(info.uptime_ticks);
+    syscall::print(" ticks\r\n");
 }
 
 fn show_tasks() {

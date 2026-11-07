@@ -63,6 +63,7 @@ const SYS_GETPPID: u64 = 82;
 const SYS_WAITPID: u64 = 83;
 const SYS_SPAWN_ARGSV: u64 = 84;
 const SYS_MEMINFO_V2: u64 = 85;
+const SYS_HEALTH: u64 = 86;
 
 /// `prot` bits for `mmap`: read / write / execute.
 pub const PROT_READ: u64 = 1;
@@ -134,6 +135,21 @@ pub struct MemoryInfoV2 {
     pub dma_pages: u64,
     pub capabilities: u64,
     pub open_files: u64,
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct HealthInfo {
+    pub version: u64,
+    pub size: u64,
+    pub total_pages: u64,
+    pub free_pages: u64,
+    pub live_tasks: u64,
+    pub zombies: u64,
+    pub open_files: u64,
+    pub dma_leaked_pages: u64,
+    pub dma_quarantined_pages: u64,
+    pub uptime_ticks: u64,
 }
 
 #[derive(Copy, Clone)]
@@ -220,6 +236,26 @@ pub fn memory_info_v2() -> Option<MemoryInfoV2> {
         open_files: 0,
     };
     if unsafe { syscall1(SYS_MEMINFO_V2, &mut info as *mut MemoryInfoV2 as u64) } == 0 {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+pub fn health_info() -> Option<HealthInfo> {
+    let mut info = HealthInfo {
+        version: 0,
+        size: 0,
+        total_pages: 0,
+        free_pages: 0,
+        live_tasks: 0,
+        zombies: 0,
+        open_files: 0,
+        dma_leaked_pages: 0,
+        dma_quarantined_pages: 0,
+        uptime_ticks: 0,
+    };
+    if unsafe { syscall1(SYS_HEALTH, &mut info as *mut HealthInfo as u64) } == 0 {
         Some(info)
     } else {
         None

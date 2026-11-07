@@ -3214,6 +3214,32 @@ pub fn fs_quota_limits() -> Option<(u32, u32)> {
     current_task_mut().and_then(|task| task.fs_quota)
 }
 
+/// Global task-table snapshot for health reporting: `(live, zombies)`.
+pub fn task_counts() -> (usize, usize) {
+    scheduler_manager().map_or((0, 0), |manager| {
+        let mut live = 0;
+        let mut zombies = 0;
+        for task in &manager.tasks {
+            match task.state {
+                TaskState::Zombie => zombies += 1,
+                TaskState::Dead => {}
+                _ => live += 1,
+            }
+        }
+        (live, zombies)
+    })
+}
+
+/// DMA pages that could not be proven safe to free (leaked by policy).
+pub fn dma_leaked_pages() -> usize {
+    DMA_LEAKED_FRAMES.load(Ordering::Relaxed)
+}
+
+/// DMA pages waiting out the quarantine window.
+pub fn dma_quarantined_pages() -> usize {
+    DMA_QUARANTINED_FRAMES.load(Ordering::Relaxed)
+}
+
 /// Consults the current task's quota before a mutation that would grow its
 /// write-prefix subtree. Trusted tasks with their own `CAP_FS_WRITE` are never
 /// limited. A quota that cannot be accounted (`None` from the backend) fails

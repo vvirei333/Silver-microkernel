@@ -77,6 +77,7 @@ pub const SYS_GETPPID: u64 = 82;
 pub const SYS_WAITPID: u64 = 83;
 pub const SYS_SPAWN_ARGSV: u64 = 84;
 pub const SYS_MEMINFO_V2: u64 = 85;
+pub const SYS_HEALTH: u64 = 86;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -135,6 +136,20 @@ struct MemoryInfoV2 {
     dma_pages: u64,
     capabilities: u64,
     open_files: u64,
+}
+
+#[repr(C)]
+struct HealthInfo {
+    version: u64,
+    size: u64,
+    total_pages: u64,
+    free_pages: u64,
+    live_tasks: u64,
+    zombies: u64,
+    open_files: u64,
+    dma_leaked_pages: u64,
+    dma_quarantined_pages: u64,
+    uptime_ticks: u64,
 }
 
 /// Kernel objects the demo tasks share. They live behind the syscall
@@ -209,6 +224,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_UPTIME => timer::ticks(),
         SYS_MEMINFO => sys_meminfo(frame[0]),
         SYS_MEMINFO_V2 => sys_meminfo_v2(frame[0]),
+        SYS_HEALTH => sys_health(frame[0]),
         SYS_TASK_LIST => sys_task_list(frame[0], frame[1]),
         SYS_SPAWN_ARGS => sys_spawn_with_args(frame[0], frame[1], frame[2], frame[3]),
         SYS_ARGS => sys_arguments(frame[0], frame[1]),
@@ -951,6 +967,32 @@ fn sys_meminfo_v2(info_ptr: u64) -> u64 {
         core::slice::from_raw_parts(
             (&info as *const MemoryInfoV2).cast::<u8>(),
             core::mem::size_of::<MemoryInfoV2>(),
+        )
+    };
+    if user_memory::copy_to_user(bytes, info_ptr).is_err() {
+        return SYSCALL_ERROR;
+    }
+    0
+}
+
+fn sys_health(info_ptr: u64) -> u64 {
+    let (live_tasks, zombies) = scheduler::task_counts();
+    let info = HealthInfo {
+        version: 1,
+        size: core::mem::size_of::<HealthInfo>() as u64,
+        total_pages: frame_allocator::total_pages() as u64,
+        free_pages: frame_allocator::free_pages() as u64,
+        live_tasks: live_tasks as u64,
+        zombies: zombies as u64,
+        open_files: vfs::open_total() as u64,
+        dma_leaked_pages: scheduler::dma_leaked_pages() as u64,
+        dma_quarantined_pages: scheduler::dma_quarantined_pages() as u64,
+        uptime_ticks: timer::ticks(),
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&info as *const HealthInfo).cast::<u8>(),
+            core::mem::size_of::<HealthInfo>(),
         )
     };
     if user_memory::copy_to_user(bytes, info_ptr).is_err() {
