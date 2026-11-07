@@ -748,6 +748,10 @@ impl Vfs {
         self.open_files.retain(|file| file.owner != owner);
     }
 
+    fn open_count(&self, owner: u64) -> usize {
+        self.open_files.iter().filter(|file| file.owner == owner).count()
+    }
+
     /// Reads at the descriptor's current offset and commits the new offset
     /// only after `consume` succeeded. A copyout fault or a short/error path
     /// therefore leaves the descriptor unchanged, so the caller can retry the
@@ -985,6 +989,10 @@ pub fn close_task(owner: u64) {
         vfs.close_task(owner);
     }
     interrupts::restore_irq(saved);
+}
+
+pub fn open_count(owner: u64) -> usize {
+    with_vfs(|vfs| vfs.open_count(owner))
 }
 
 /// Transactional read: `consume` (the copyout) runs under the VFS lock and the

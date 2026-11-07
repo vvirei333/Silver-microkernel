@@ -62,6 +62,7 @@ const SYS_UMOUNT: u64 = 81;
 const SYS_GETPPID: u64 = 82;
 const SYS_WAITPID: u64 = 83;
 const SYS_SPAWN_ARGSV: u64 = 84;
+const SYS_MEMINFO_V2: u64 = 85;
 
 /// `prot` bits for `mmap`: read / write / execute.
 pub const PROT_READ: u64 = 1;
@@ -117,6 +118,22 @@ pub struct MemoryInfo {
     pub total_bytes: u64,
     pub used_bytes: u64,
     pub free_bytes: u64,
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct MemoryInfoV2 {
+    pub version: u64,
+    pub size: u64,
+    pub total_bytes: u64,
+    pub used_bytes: u64,
+    pub free_bytes: u64,
+    pub task_frames: u64,
+    pub heap_pages: u64,
+    pub mmap_bytes: u64,
+    pub dma_pages: u64,
+    pub capabilities: u64,
+    pub open_files: u64,
 }
 
 #[derive(Copy, Clone)]
@@ -182,6 +199,27 @@ pub fn memory_info() -> Option<MemoryInfo> {
         free_bytes: 0,
     };
     if unsafe { syscall1(SYS_MEMINFO, &mut info as *mut MemoryInfo as u64) } == 0 {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+pub fn memory_info_v2() -> Option<MemoryInfoV2> {
+    let mut info = MemoryInfoV2 {
+        version: 0,
+        size: 0,
+        total_bytes: 0,
+        used_bytes: 0,
+        free_bytes: 0,
+        task_frames: 0,
+        heap_pages: 0,
+        mmap_bytes: 0,
+        dma_pages: 0,
+        capabilities: 0,
+        open_files: 0,
+    };
+    if unsafe { syscall1(SYS_MEMINFO_V2, &mut info as *mut MemoryInfoV2 as u64) } == 0 {
         Some(info)
     } else {
         None

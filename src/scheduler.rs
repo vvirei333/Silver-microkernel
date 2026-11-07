@@ -3167,6 +3167,13 @@ pub fn current_task_has_rights(rights: u32) -> bool {
         .unwrap_or(false)
 }
 
+pub fn current_resource_counts() -> Option<(usize, usize, usize, usize, usize)> {
+    current_task_mut().map(|task| {
+        let dma_pages = task.dma_pages.iter().map(|&(_, pages, _)| pages).sum();
+        (task.mem_frames, task.heap_pages.len(), task.mmap_bytes, dma_pages, task.cap_table.len())
+    })
+}
+
 /// True when the current task may write `path`: it either holds the global
 /// `CAP_FS_WRITE`, or its bundle manifest granted a matching prefix.
 pub fn fs_write_allowed(path: &str) -> bool {

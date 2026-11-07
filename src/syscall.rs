@@ -76,6 +76,7 @@ pub const SYS_UMOUNT: u64 = 81;
 pub const SYS_GETPPID: u64 = 82;
 pub const SYS_WAITPID: u64 = 83;
 pub const SYS_SPAWN_ARGSV: u64 = 84;
+pub const SYS_MEMINFO_V2: u64 = 85;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -117,6 +118,21 @@ struct MemoryInfo {
     total_bytes: u64,
     used_bytes: u64,
     free_bytes: u64,
+}
+
+#[repr(C)]
+struct MemoryInfoV2 {
+    version: u64,
+    size: u64,
+    total_bytes: u64,
+    used_bytes: u64,
+    free_bytes: u64,
+    task_frames: u64,
+    heap_pages: u64,
+    mmap_bytes: u64,
+    dma_pages: u64,
+    capabilities: u64,
+    open_files: u64,
 }
 
 /// Kernel objects the demo tasks share. They live behind the syscall
@@ -190,6 +206,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         }
         SYS_UPTIME => timer::ticks(),
         SYS_MEMINFO => sys_meminfo(frame[0]),
+        SYS_MEMINFO_V2 => sys_meminfo_v2(frame[0]),
         SYS_TASK_LIST => sys_task_list(frame[0], frame[1]),
         SYS_SPAWN_ARGS => sys_spawn_with_args(frame[0], frame[1], frame[2], frame[3]),
         SYS_ARGS => sys_arguments(frame[0], frame[1]),
@@ -835,6 +852,38 @@ fn sys_meminfo(info_ptr: u64) -> u64 {
         core::slice::from_raw_parts(
             (&info as *const MemoryInfo).cast::<u8>(),
             core::mem::size_of::<MemoryInfo>(),
+        )
+    };
+    if user_memory::copy_to_user(bytes, info_ptr).is_err() {
+        return SYSCALL_ERROR;
+    }
+    0
+}
+
+fn sys_meminfo_v2(info_ptr: u64) -> u64 {
+    let total_bytes = memory::DRAM_SIZE as u64;
+    let managed_total_bytes = (frame_allocator::total_pages() * memory::PAGE_SIZE) as u64;
+    let managed_used_bytes = (frame_allocator::used_pages() * memory::PAGE_SIZE) as u64;
+    let task_id = scheduler::current_task_id();
+    let (task_frames, heap_pages, mmap_bytes, dma_pages, capabilities) =
+        scheduler::current_resource_counts().unwrap_or((0, 0, 0, 0, 0));
+    let info = MemoryInfoV2 {
+        version: 2,
+        size: core::mem::size_of::<MemoryInfoV2>() as u64,
+        total_bytes,
+        used_bytes: total_bytes - managed_total_bytes + managed_used_bytes,
+        free_bytes: (frame_allocator::free_pages() * memory::PAGE_SIZE) as u64,
+        task_frames: task_frames as u64,
+        heap_pages: heap_pages as u64,
+        mmap_bytes: mmap_bytes as u64,
+        dma_pages: dma_pages as u64,
+        capabilities: capabilities as u64,
+        open_files: vfs::open_count(task_id) as u64,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&info as *const MemoryInfoV2).cast::<u8>(),
+            core::mem::size_of::<MemoryInfoV2>(),
         )
     };
     if user_memory::copy_to_user(bytes, info_ptr).is_err() {

@@ -83,6 +83,10 @@ impl CapTable {
         self.caps.len() < MAX_CAPS_PER_TASK
     }
 
+    pub fn len(&self) -> usize {
+        self.caps.len()
+    }
+
     /// True when `count` more records fit. A mixed global|scoped grant adds
     /// two records, so a single-slot check is not enough.
     pub fn has_capacity_for(&self, count: usize) -> bool {
