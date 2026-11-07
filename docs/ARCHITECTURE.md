@@ -169,6 +169,8 @@ API — C++ с C-обёрткой, чтобы приложения на друг
 - virtio-blk в ядре, SFS с чтением/записью, VFS-монтирование `/sfs`;
 - драйверы GPU (ramfb), ввода, сети; nameserver; shell (Howl);
 - композитор в `gpu_driver` (clear/rect/text/text-scaled, pointer-forwarding);
+- offscreen surface + атомарный `PRESENT`: клиент рисует кадр в отдельный
+  DMA-буфер, публикация одним проходом; SilverHome уже использует этот режим;
 - SilverHome: сетка 4×5, док, подсветка нажатия, экраны-заглушки;
 - встроенные приложения: Calc, Gallery, Notes — отдельные EL0-процессы,
   лежат в `/sfs/apps` и запускаются SilverHome через `SYS_SPAWN_PATH`;
@@ -185,11 +187,14 @@ API — C++ с C-обёрткой, чтобы приложения на друг
 - per-task FD quota: максимум 32 открытых файлов на процесс и 128 на VFS;
 - `SYS_MEMINFO_V2`: versioned resource snapshot (frames, heap, mmap, DMA,
   capabilities, open files);
+- `SYS_HEALTH` и команда `health`: свободные frames, live/zombie tasks,
++  открытые файлы, DMA leaks/quarantine, uptime;
 - lifecycle cleanup для address space, DMA, heap, mmap, descriptors и caps.
 
 Нет (следующие шаги):
 
-1. поверхность (surface) как объект IPC и `PRESENT` вместо потока draw-ops;
+1. surface как объект IPC с检出 владельца; offscreen + `PRESENT` уже есть,
+   осталась zero-copy передача DMA-поверхности между процессами;
 2. сервис событий: очередь событий, фокус, запуск приложений;
 3. квоты SFS по bundle/prefix и metadata journal;
 4. фреймворк-слой: `View/Layer`, ресурсы, шрифты;
