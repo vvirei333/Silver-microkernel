@@ -15,7 +15,8 @@ pub const REGPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/regpro
 /// Manifest-scope probe: installed under `/sfs/apps` with a write grant.
 pub const SCOPEPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scopeprobe.elf"));
 /// The write prefix the probe's manifest grants, and the manifest itself.
-const SCOPEPROBE_MANIFEST: &[u8] = b"# scopeprobe: only this subtree is writable\nwrite=/sfs/probe-scope\n";
+const SCOPEPROBE_MANIFEST: &[u8] =
+    b"# scopeprobe: scoped writes and a small per-bundle quota\nwrite=/sfs/probe-scope\nquota=8:5\n";
 /// The `crash` EL0 (userspace) program, loaded dynamically by `run bin/crash`. It writes
 /// to `0x0` so the EL0 fault handler has a deterministic way to be exercised.
 pub const CRASH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/crash.elf"));

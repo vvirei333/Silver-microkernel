@@ -393,6 +393,10 @@ impl FileSystem for Sfs {
             metadata_blocks: usage.metadata_blocks,
         })
     }
+
+    fn usage_supported(&self) -> bool {
+        true
+    }
 }
 
 /// Undo of a cross-parent rename's first half: removes the entry `add_entry`

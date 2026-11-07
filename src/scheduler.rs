@@ -201,6 +201,9 @@ pub struct Task {
     /// Path prefix this task may write under, taken from the bundle manifest.
     /// Only meaningful when the task has no global `CAP_FS_WRITE`.
     fs_write_prefix: Option<String>,
+    /// Optional `(block limit, inode limit)` for the write prefix. `None`
+    /// means no per-bundle quota; trusted tasks are never limited.
+    fs_quota: Option<(u32, u32)>,
     pub bound_irq: Option<u32>,
     irq_pending: bool,
     arguments: Vec<u8>,
@@ -3035,6 +3038,18 @@ pub fn spawn_elf_with_scope(
     argument: u64,
     fs_write_prefix: Option<String>,
 ) -> Option<capability::CapId> {
+    spawn_elf_with_policy(image, argument, fs_write_prefix, None)
+}
+
+/// [`spawn_elf_with_scope`] with an optional block/inode quota for the write
+/// prefix. The quota is enforced by the syscall write paths; a trusted task
+/// with its own `CAP_FS_WRITE` is never restricted by it.
+pub fn spawn_elf_with_policy(
+    image: LoadedImage,
+    argument: u64,
+    fs_write_prefix: Option<String>,
+    fs_quota: Option<(u32, u32)>,
+) -> Option<capability::CapId> {
     if scheduler_manager().map_or(true, |manager| !has_task_capacity(manager)) {
         // Dropping `image` releases its frames (RAII).
         return None;
@@ -3045,7 +3060,7 @@ pub fn spawn_elf_with_scope(
     if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
         return None;
     }
-    let task_id = spawn_elf_task(image, argument, fs_write_prefix)?;
+    let task_id = spawn_elf_task(image, argument, fs_write_prefix, fs_quota)?;
     let parent = current_task_mut()?;
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
 }
@@ -3054,6 +3069,7 @@ fn spawn_elf_task(
     image: LoadedImage,
     argument: u64,
     fs_write_prefix: Option<String>,
+    fs_quota: Option<(u32, u32)>,
 ) -> Option<u64> {
     let manager = scheduler_manager()?;
     if !has_task_capacity(manager) {
@@ -3075,6 +3091,7 @@ fn spawn_elf_task(
         Vec::new(),
         current_task_pid(),
         fs_write_prefix,
+        fs_quota,
     )?;
     task.cwd = cwd;
     manager.tasks.push(task);
@@ -3190,6 +3207,42 @@ pub fn fs_write_allowed(path: &str) -> bool {
                 || (path.starts_with(scope) && path.as_bytes().get(scope.len()) == Some(&b'/'))
         })
         .unwrap_or(false)
+}
+
+/// Current task's per-bundle quota `(blocks, inodes)`, if its manifest set one.
+pub fn fs_quota_limits() -> Option<(u32, u32)> {
+    current_task_mut().and_then(|task| task.fs_quota)
+}
+
+/// Consults the current task's quota before a mutation that would grow its
+/// write-prefix subtree. Trusted tasks with their own `CAP_FS_WRITE` are never
+/// limited. A quota that cannot be accounted (`None` from the backend) fails
+/// closed so an unsupported backend cannot silently bypass it.
+pub fn fs_quota_allows(add_blocks: u32, add_inodes: u32) -> bool {
+    let Some(task) = current_task_mut() else {
+        return false;
+    };
+    let id = task.id;
+    if task.cap_table.has_self_rights(id, capability::CAP_FS_WRITE) {
+        return true;
+    }
+    let Some((max_blocks, max_inodes)) = task.fs_quota else {
+        return true;
+    };
+    let Some(prefix) = task.fs_write_prefix.as_deref() else {
+        return false;
+    };
+    let Some(usage) = vfs::usage("/", prefix) else {
+        return false;
+    };
+    usage
+        .blocks()
+        .checked_add(add_blocks)
+        .is_some_and(|total| total <= max_blocks)
+        && usage
+            .inodes
+            .checked_add(add_inodes)
+            .is_some_and(|total| total <= max_inodes)
 }
 
 pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
@@ -3400,7 +3453,7 @@ fn spawn_inner(
         .get(smp::current_index())
         .map(|task| task.cwd.clone())
         .unwrap_or_else(|| String::from("/"));
-    let mut task = Task::new(id, entry, user, image, arguments, argv, envp, ppid, None)?;
+    let mut task = Task::new(id, entry, user, image, arguments, argv, envp, ppid, None, None)?;
     task.cwd = cwd;
 
     manager.tasks.push(task);
@@ -3952,6 +4005,7 @@ impl Task {
         envp: Vec<Vec<u8>>,
         ppid: Option<u64>,
         fs_write_prefix: Option<String>,
+        fs_quota: Option<(u32, u32)>,
     ) -> Option<Self> {
         // Build the argv/envp stack image before allocating anything: a
         // malformed or oversized argument list must fail without leaking.
@@ -4083,6 +4137,7 @@ impl Task {
 
         Some(Self {
             fs_write_prefix,
+            fs_quota,
             id,
             state: TaskState::Ready,
             resume_state: None,

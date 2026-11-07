@@ -160,6 +160,10 @@ pub trait FileSystem {
     fn len(&self, path: &str) -> Result<usize, ()>;
     /// Bootstrap-only whole-file write (initramfs seeding).
     fn seed_file(&mut self, path: &str, contents: &[u8]) -> Result<(), ()>;
+    /// Whether this backend can account resources for quota checks.
+    fn usage_supported(&self) -> bool {
+        false
+    }
     /// Resources owned by `path` and everything below it, for quota checks.
     /// Backends that cannot account precisely return `None`; callers must
     /// treat that as "quota unknown" and fail closed where a quota applies.
@@ -867,7 +871,18 @@ impl Vfs {
     fn usage(&self, cwd: &str, path: &str) -> Option<FsUsage> {
         let resolved = resolve_path(cwd, path).ok()?;
         let (mount, relative) = self.resolve(&resolved);
-        self.mounts[mount].fs.usage(&relative)
+        let fs = &self.mounts[mount].fs;
+        if !fs.usage_supported() {
+            return None;
+        }
+        if let Some(usage) = fs.usage(&relative) {
+            return Some(usage);
+        }
+        // A quota prefix may not exist yet: the app is allowed to create it.
+        // Treat it as empty only when its parent is an existing directory; a
+        // missing parent or a backend error still fails closed.
+        let parent = relative.rfind('/').map_or("", |index| &relative[..index]);
+        fs.is_directory(parent).ok()?.then(FsUsage::default)
     }
 
     /// Creates (or overwrites) a file at `path` with `contents`. Bootstrap-only:
@@ -1067,6 +1082,13 @@ pub fn seed_file(cwd: &str, path: &str, contents: &[u8]) -> Result<(), ()> {
 
 pub fn resolve_directory(cwd: &str, path: &str) -> Result<String, ()> {
     with_vfs(|vfs| vfs.resolve_directory(cwd, path))
+}
+
+/// Normalizes `path` against `cwd` without touching the filesystem. Used by
+/// security checks that must authorize the same absolute path the backend will
+/// later see (a raw `..` must not bypass a prefix check).
+pub fn resolve(cwd: &str, path: &str) -> Result<String, ()> {
+    resolve_path(cwd, path)
 }
 
 /// Mounts a `ramfs` backend at `target`. `source` is accepted for ABI

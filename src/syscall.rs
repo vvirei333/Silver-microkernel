@@ -81,6 +81,8 @@ pub const SYS_MEMINFO_V2: u64 = 85;
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
 const IO_LIMIT: usize = 4096;
+/// SFS allocation granularity, used for conservative quota forecasts.
+const FS_BLOCK_SIZE: usize = 512;
 /// Upper bound on a file loaded for execution, so a huge VFS blob cannot be
 /// cloned into kernel memory before `elf::load_elf` rejects its segments. This
 /// matches the VFS file cap: the heap is only 2 MiB.
@@ -449,11 +451,20 @@ fn sys_spawn_with_argsv(program: u64, argument: u64, block_ptr: u64, block_len: 
 /// Bundle manifest: `write=<absolute prefix>` (one directive per line, `#`
 /// starts a comment). It grants a dynamic ELF a path-scoped write window when
 /// it has no global `CAP_FS_WRITE`.
-fn bundle_write_scope(cwd: &str, elf_path: &str) -> Option<String> {
+struct BundlePolicy {
+    write_prefix: Option<String>,
+    quota: Option<(u32, u32)>,
+}
+
+fn bundle_write_scope(cwd: &str, elf_path: &str) -> BundlePolicy {
     const MANIFEST_MAX: usize = 512;
     const SCOPE_MAX: usize = 96;
+    let none = BundlePolicy {
+        write_prefix: None,
+        quota: None,
+    };
     if elf_path.len() + ".manifest".len() > vfs::MAX_PATH_LEN {
-        return None;
+        return none;
     }
     // `notes.elf` is described by `notes.manifest`; anything else gets
     // `.manifest` appended verbatim.
@@ -463,28 +474,57 @@ fn bundle_write_scope(cwd: &str, elf_path: &str) -> Option<String> {
     };
     match vfs::file_len(cwd, &manifest) {
         Ok(length) if length != 0 && length <= MANIFEST_MAX => {}
-        _ => return None,
+        _ => return none,
     }
-    let bytes = vfs::read_file(cwd, &manifest).ok()?;
-    let text = core::str::from_utf8(&bytes).ok()?;
+    let Ok(bytes) = vfs::read_file(cwd, &manifest) else {
+        return none;
+    };
+    let Ok(text) = core::str::from_utf8(&bytes) else {
+        return none;
+    };
+    let mut policy = none;
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some(scope) = line.strip_prefix("write=") else {
+        if let Some(scope) = line.strip_prefix("write=") {
+            let scope = scope.trim();
+            if scope.len() <= SCOPE_MAX
+                && scope.starts_with('/')
+                && !scope.contains("..")
+                && !scope.ends_with('/')
+            {
+                policy.write_prefix = Some(String::from(scope));
+            }
             continue;
-        };
-        let scope = scope.trim();
-        if scope.len() <= SCOPE_MAX
-            && scope.starts_with('/')
-            && !scope.contains("..")
-            && !scope.ends_with('/')
-        {
-            return Some(String::from(scope));
+        }
+        if let Some(quota) = line.strip_prefix("quota=") {
+            // `quota=<blocks>:<inodes>` bounds the whole write-prefix subtree.
+            let mut parts = quota.trim().split(':');
+            let (Some(blocks), Some(inodes), None) =
+                (parts.next(), parts.next(), parts.next())
+            else {
+                continue;
+            };
+            let Ok(blocks) = blocks.parse::<u32>() else {
+                continue;
+            };
+            let Ok(inodes) = inodes.parse::<u32>() else {
+                continue;
+            };
+            if blocks > 0 && inodes > 0 {
+                policy.quota = Some((blocks, inodes));
+            }
         }
     }
-    None
+    // A quota without a write prefix is meaningless and must not be silently
+    // ignored: refuse the bundle policy rather than grant an unbounded app.
+    if policy.quota.is_some() && policy.write_prefix.is_none() {
+        policy.quota = None;
+        policy.write_prefix = None;
+    }
+    policy
 }
 
 fn sys_spawn_path(path_ptr: u64) -> u64 {
@@ -506,8 +546,9 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
             Ok(image) => image,
             Err(_) => return SYSCALL_ERROR,
         };
-        let scope = bundle_write_scope(&cwd, path);
-        scheduler::spawn_elf_with_scope(image, 0, scope).unwrap_or(SYSCALL_ERROR)
+        let policy = bundle_write_scope(&cwd, path);
+        scheduler::spawn_elf_with_policy(image, 0, policy.write_prefix, policy.quota)
+            .unwrap_or(SYSCALL_ERROR)
     })
 }
 
@@ -573,7 +614,7 @@ fn sys_fs_open(path_ptr: u64, flags: u64) -> u64 {
         // Opening for write is the consent point for later `SYS_FS_WRITE` on
         // this descriptor, so the scope check happens here once.
         if flags & (vfs::OPEN_WRITE | vfs::OPEN_APPEND) != 0
-            && !scheduler::fs_write_allowed(path)
+            && !write_path_allowed(&cwd, path)
         {
             return SYSCALL_ERROR;
         }
@@ -581,10 +622,25 @@ fn sys_fs_open(path_ptr: u64, flags: u64) -> u64 {
     })
 }
 
+/// Authorizes a write-side path after resolving it against the task cwd. The
+/// manifest prefix must be compared with the same absolute path the backend
+/// will operate on; a raw `..` component must never walk out of the scope.
+fn write_path_allowed(cwd: &str, path: &str) -> bool {
+    match vfs::resolve(cwd, path) {
+        Ok(resolved) => scheduler::fs_write_allowed(&resolved),
+        Err(_) => false,
+    }
+}
+
 fn sys_fs_create(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
-        if !scheduler::fs_write_allowed(path) {
+        if !write_path_allowed(&cwd, path) {
+            return SYSCALL_ERROR;
+        }
+        // Worst case for a create: one inode plus possible parent directory
+        // growth. An overwrite only shrinks, so this over-estimate is safe.
+        if !scheduler::fs_quota_allows(1, 1) {
             return SYSCALL_ERROR;
         }
         if vfs::create(&cwd, path).is_ok() {
@@ -598,7 +654,11 @@ fn sys_fs_create(path_ptr: u64) -> u64 {
 fn sys_fs_mkdir(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
-        if !scheduler::fs_write_allowed(path) {
+        if !write_path_allowed(&cwd, path) {
+            return SYSCALL_ERROR;
+        }
+        // New directory inode, its first data block and possible parent growth.
+        if !scheduler::fs_quota_allows(2, 1) {
             return SYSCALL_ERROR;
         }
         if vfs::mkdir(&cwd, path).is_ok() {
@@ -612,7 +672,7 @@ fn sys_fs_mkdir(path_ptr: u64) -> u64 {
 fn sys_fs_unlink(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
-        if !scheduler::fs_write_allowed(path) {
+        if !write_path_allowed(&cwd, path) {
             return SYSCALL_ERROR;
         }
         if vfs::unlink(&cwd, path).is_ok() {
@@ -626,7 +686,7 @@ fn sys_fs_unlink(path_ptr: u64) -> u64 {
 fn sys_fs_rmdir(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
-        if !scheduler::fs_write_allowed(path) {
+        if !write_path_allowed(&cwd, path) {
             return SYSCALL_ERROR;
         }
         if vfs::rmdir(&cwd, path, scheduler::cwd_in_use).is_ok() {
@@ -641,8 +701,8 @@ fn sys_fs_rename(source_ptr: u64, destination_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(source_ptr, |source| {
         with_path(destination_ptr, |destination| {
-            if !scheduler::fs_write_allowed(source)
-                || !scheduler::fs_write_allowed(destination)
+            if !write_path_allowed(&cwd, source)
+                || !write_path_allowed(&cwd, destination)
             {
                 return SYSCALL_ERROR;
             }
@@ -764,6 +824,13 @@ fn sys_fs_write(fd: u64, buffer_ptr: u64, len: u64) -> u64 {
     }
     let mut bytes = vec![0_u8; len as usize];
     if user_memory::copy_from_user(buffer_ptr, &mut bytes).is_err() {
+        return SYSCALL_ERROR;
+    }
+    // Conservative growth check: every payload block plus at most two metadata
+    // levels. Existing usage is re-read on each call, so the over-estimate is
+    // per-operation and cannot accumulate across writes.
+    let blocks = (bytes.len().div_ceil(FS_BLOCK_SIZE) + 2) as u32;
+    if !scheduler::fs_quota_allows(blocks, 0) {
         return SYSCALL_ERROR;
     }
     vfs::write(scheduler::current_task_id(), fd, &bytes)
