@@ -1,4 +1,4 @@
-# Silver Microkernel — Redmi 10C bring-up
+# WerewolfOS / Silver Kernel — Redmi 10C bring-up
 
 Minimal RAM-only path for booting Silver on a Xiaomi Redmi 10C and reaching the
 Howl shell prompt:
@@ -7,7 +7,7 @@ Howl shell prompt:
 howl>
 ```
 
-This is a focused hardware bring-up, not a full WerewolfOS port. SFS, SMP,
+This is a focused hardware bring-up, not a full WerewolfOS phone port. SFS, SMP,
 Wi-Fi, GPU, display, audio, the full driver set and the rest of the normal
 desktop boot are out of scope for the first hardware milestone.
 

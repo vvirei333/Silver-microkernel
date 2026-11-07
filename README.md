@@ -1,9 +1,10 @@
-# silver_microkernel
+# WerewolfOS / Silver Kernel
 
-A hobby microkernel for AArch64 (ARM64) written in Rust. The foundation is
-bare-metal Rust (`no_std`), with drivers and services in C/C++ planned on top
-of it. Cross-platform development: Windows and Linux (Arch) share the same
-code — only the build commands and toolchain setup differ.
+WerewolfOS is an open mobile operating system built around the Silver Kernel:
+an AArch64 microkernel written in Rust. The kernel stays small and security-
+focused; drivers, services, Howl and applications run in isolated EL0 tasks.
+The architecture is inspired by XNU, Redox and other proven systems, but the
+interfaces, capability model, SFS format and userspace are original.
 
 Primary target: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
 Hardware bring-up target: Xiaomi Redmi 10C (`fog`, Qualcomm SM6225 / khaje),
@@ -70,6 +71,7 @@ userspace.
 - [x] No kernel image, kernel data, heap, kernel stacks or unauthorized MMIO in user TTBR0
 - [x] Tasks in EL0 (userspace): user stacks and SVC-only kernel access
 - [x] Capability-protected kill/wait/console/IRQ/MMIO operations and capability delegation
+- [x] Capability split between target rights and process-wide rights; child handles cannot become parent privileges
 - [x] Userspace UART driver: IRQ-bound RX plus IPC-routed input and output
 - [x] DMA infrastructure: contiguous frames and Normal Non-Cacheable user mappings
 - [x] PCI ECAM access plus a Virtio-PCI block driver: modern capabilities, split virtqueue and `read_sector`
@@ -90,13 +92,16 @@ userspace.
 - [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation with pre-copy FDT destination validation (QEMU-verified, and booted on a physical `rain` unit)
 - [x] Real Redmi 10C boot: RAM-only `fastboot boot` reaches the scheduler and the Howl task, with live GICv3 timer interrupts (verified on a `rain` unit)
 - [x] Boot-time MMU TLB proof: read through TTBR0, remap the same VA, read again (fails the boot if the `tlbi` broadcast is missing)
-- [x] Per-task anonymous-mapping quota (16 MiB) and a DMA quarantine window before revoked frames are recycled
-- [ ] SFS write path, block-path interrupts, remaining resource quotas and persistent storage
+- [x] Per-task anonymous-mapping quota (16 MiB), DMA quarantine and per-task memory ledger
+- [x] Kernel-owned persistent SFS: read/write, positioned writes, directories, single/double-indirect files and fsck
+- [x] SFS manifest write scopes, per-task open-file quota (32), global VFS budget and lifecycle cleanup
+- [x] Versioned `SYS_MEMINFO_V2` resource diagnostics for the current task
+- [ ] SFS per-bundle inode/block quotas and metadata journal
 - [ ] SMP (`-smp 4`): **QEMU-only, opt-in** — see `SMP_STATUS.md`. `no_std,smp` brings up to three APs online (CPU1–CPU3), runs tasks on every CPU and passes the `demo-tasks` regression on `-smp 4` (68 PASS / 0 PANIC). Dispatch uses per-CPU FIFO ready queues (local queue → steal from a peer → full-scan fallback), with entries carrying `(id, index)` so an index shift can only discard an entry. Every address space carries a unique 8-bit ASID, so a context switch no longer flushes the domain-wide TLB and a PTE edit invalidates only the edited ASID. `no_std,smp-selftest` additionally runs a cross-PE TLB probe (every AP reads a VA, the boot CPU re-points the same PTE, every AP must observe the new frame), 64 back-to-back SGI1 stop-the-world rounds, a per-CPU timer-tick check, a `running_on`/`current_index` pairing check on every scheduling pass, a FIFO-order probe, a priority/aging probe, a push-migration probe, the BKL stall detector, the stall-watchdog policy and heartbeat checks, and a one-shot `ready queues local/steal/scan/push` report. An opt-in `smp-churn` diagnostic spawns short-lived kernel tasks while the APs run/reap them, with the per-pass invariant audit active; it found and now regression-tests three scheduler bugs (preemptible passes, kernel-task lock imbalance, IRQ window in lock acquisition). It also injects a real masked-IRQ stall and requires another PE to report it (`watchdog stall PASS`). It stays opt-in because it is a stress/injection suite, not a correctness prerequisite; both parts pass on `-smp 2`, `-smp 3` and `-smp 4`. Console writes are serialized across CPUs; whole-line interleaving at call boundaries is still possible. Device-DMA quiescence is enforced for in-kernel `DmaLease` holders (a live lease makes revoke leak instead of reuse); userspace drivers still rely on the quarantine window. Physical SMP and in-flight-MMAP stress remain unverified; fog/tablet stay single-core. Do not boot on hardware expecting SMP.
 
 ## Design references
 
-This kernel is not a port of another OS. Two systems are used as **conceptual**
+WerewolfOS is not a port of another OS. Two systems are used as **conceptual**
 references, not as source:
 
 - **XNU (aarch64)** — `pmap`-style batched page-table publication with a single
@@ -108,6 +113,15 @@ references, not as source:
 Where a reference design conflicts with this kernel's microkernel boundaries,
 capability model or hardware profiles, the kernel's own invariants and tests
 win. No XNU or Redox code is copied.
+
+## Project naming
+
+- **WerewolfOS** — the complete operating system and userspace platform.
+- **Silver Kernel** — the Rust microkernel.
+- **Howl** — the interactive shell and console-facing userspace.
+- **silverd** — the service manager.
+- **gpu_driver**, **input_driver**, **net_driver**, **net_server** — isolated
+  wolf-themed system components; they communicate through IPC and capabilities.
 
 ## Redmi 10C (`fog`, SM6225) — RAM-only bring-up
 
@@ -675,11 +689,11 @@ This is not yet a complete security model. Kill, wait, console, resume, MMIO,
 IRQ and PCI operations check capability rights; `SYS_CAP_GRANT` delegates only a
 subset of the caller's rights, and task death revokes or downgrades affected
 capabilities. Page-table walks are owner-checked and DMA revocation is bounded
-to DRAM, so a corrupted descriptor cannot redirect a walk into a foreign table
-or below `DRAM_BASE`. Anonymous mappings are capped per task (16 MiB) so one
-EL0 task cannot claim the whole machine, and VFS, open-file, DMA-window, task
-and capability counts have explicit bounds; heap and wait-queue growth still
-lack a per-task quota, so denial-of-service resistance remains incomplete.
+    to DRAM, so a corrupted descriptor cannot redirect a walk into a foreign table
+    or below `DRAM_BASE`. Anonymous mappings are capped per task (16 MiB), the
+    task frame ledger bounds heap/ELF/stack/mmap/DMA frames, and VFS, open-file,
+    DMA-window, task and capability counts have explicit bounds. SFS per-bundle
+    block/inode quotas and metadata journaling remain future work.
 A shared-DMA physical address is a bearer capability. `safe_to_free` proves
 only that CPU mappings are gone; revoked ranges are additionally quarantined
 for a bounded drain window, but that is a mitigation rather than a
@@ -693,7 +707,7 @@ device-quiescence proof — stopping the queue remains the driver's contract.
 | [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU bring-up of up to four CPUs behind the `smp` feature, round-qualified quiescence, FIFO ready queues, per-CPU timer checks, a stall watchdog and boot selftests; true cross-PE TLB stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 
-Current verification snapshot (2026-11-05): **182 host tests** pass; the fog
+Current verification snapshot (2026-11-08): **199 host tests** pass; the fog
 QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 `howl>`; the demo regression reports 69 PASS / 0 PANIC under `no_std,smp` with
