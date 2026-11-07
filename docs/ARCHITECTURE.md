@@ -171,6 +171,8 @@ API — C++ с C-обёрткой, чтобы приложения на друг
 - композитор в `gpu_driver` (clear/rect/text/text-scaled, pointer-forwarding);
 - offscreen surface + атомарный `PRESENT`: клиент рисует кадр в отдельный
   DMA-буфер, публикация одним проходом; SilverHome уже использует этот режим;
+- fence: `PRESENT` несёт sequence number, compositor отвечает `FENCE_DONE`
+  после фактической публикации кадра;
 - SilverHome: сетка 4×5, док, подсветка нажатия, экраны-заглушки;
 - встроенные приложения: Calc, Gallery, Notes — отдельные EL0-процессы,
   лежат в `/sfs/apps` и запускаются SilverHome через `SYS_SPAWN_PATH`;
