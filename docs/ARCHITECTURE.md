@@ -70,7 +70,8 @@ SFS с чтением и записью, VFS с монтированием бэ�
 для выдачи и сканирования поверхностей). Общение с остальной системой —
 только IPC.
 
-- `gpu_driver` — virtio-gpu/ramfb (QEMU), позже MSM DSI/GPU;
+- `gpu_driver` — virtio-gpu/ramfb (QEMU), платформенный `cont_splash`
+  backend на телефоне, позже MSM DSI/GPU;
 - `input_driver` — virtio-tablet/тач;
 - `net_driver` + `net_server` — virtio-net + smoltcp;
 - `block_driver` — **выведен из эксплуатации**: диск теперь у ядра;
@@ -187,6 +188,10 @@ API — C++ с C-обёрткой, чтобы приложения на друг
   (Normal Non-Cacheable, без копирования), композитор переключает ramfb на
   неё через `GUI_SURFACE_ATTACH`; приложения по-прежнему используют
   command-stream + blit;
+- платформенный дисплей (`fog-display`): ядро находит `cont_splash` в живом
+  FDT и отдаёт его через `SYS_DISPLAY_INFO/MAP`; композитор рисует прямо в
+  панель, SilverHome идёт command-stream путём (client attach невозможен,
+  панель сканирует фиксированный диапазон);
 - SilverHome: сетка 4×5, док, подсветка нажатия, экраны-заглушки;
 - встроенные приложения: Calc, Gallery, Notes — отдельные EL0-процессы,
   лежат в `/sfs/apps` и запускаются SilverHome через `SYS_SPAWN_PATH`;
@@ -222,7 +227,9 @@ API — C++ с C-обёрткой, чтобы приложения на друг
 3. квоты SFS по bundle/prefix и metadata journal;
 4. фреймворк-слой: `View/Layer`, ресурсы, шрифты;
 5. `SYS_SURFACE_DESTROY` и повторное использование поверхностей приложениями;
-6. C++-shim для драйверов и сервисов.
+6. порт на телефон: touch (GENI I2C), eMMC/UFS, питание/термалка, потом
+   MSM DSI/GPU; текущий `cont_splash` — bring-up backend, не драйвер дисплея;
+7. C++-shim для драйверов и сервисов.
 
 ## 7. Дорожная карта
 

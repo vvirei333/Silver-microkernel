@@ -88,6 +88,7 @@ userspace.
 - [x] Compositor offscreen surface with atomic `PRESENT`; SilverHome publishes each frame in one pass
 - [x] Kernel surface objects (`SYS_SURFACE_CREATE/GRANT/MAP/REVOKE/SCANOUT`): owner-checked, read-only cross-task mapping, and scanout pinning so frames are never recycled under a display controller
 - [x] Zero-copy home screen: SilverHome draws pixels into its own 640×1136 kernel surface; the compositor points `ramfb` at that buffer (`GUI_SURFACE_ATTACH`) instead of blitting
+- [x] Phone display groundwork (`fog-display`): the live-FDT `cont_splash` carve-out is registered as a platform framebuffer (`SYS_DISPLAY_INFO/MAP`), and the compositor + SilverHome run on it; QEMU-verified, hardware pending
 - [x] Kernel health snapshot (`SYS_HEALTH`, `health`) for frames, tasks, open files and DMA leak counters
 - [x] Input driver: `virtio-tablet-pci` absolute pointer over a virtio event queue, IPC to the graphics driver, live cursor, button press/release and console click notifications (`GUI: Button '<name>' pressed!`)
 - [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh EL0 task with its own W^X address space
@@ -243,6 +244,12 @@ There are now two present paths:
 - **Command stream (installed apps).** Calc/Gallery/Notes send
   `GUI_CLEAR`/`RECT`/`TEXT`/`TEXT_SCALED` into an offscreen surface; `PRESENT`
   copies it to the compositor framebuffer and returns a fence sequence.
+
+The compositor has a second framebuffer backend for the phone port: with
+`fog-display`, the kernel registers the bootloader's `cont_splash` panel and
+`gpu_driver` maps it through `SYS_DISPLAY_MAP` instead of using `fw_cfg`/`ramfb`.
+The panel scans that fixed range, so zero-copy client attach is refused and the
+command-stream path is used. See [`docs/PORTING_FOG.md`](docs/PORTING_FOG.md).
 
 Surfaces are kernel objects, not bare addresses: the owner keeps the writable
 alias, a grantee maps read-only, scanout is a separate right, and frames that a
@@ -484,8 +491,10 @@ prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 quiescence rounds, a cross-CPU visibility check and a per-CPU timer check),
 `demo-tasks` (opt-in regression programs), `tablet` (SM8650), `fog`
 (SM6225 RAM-only bring-up), `fog-reloc` (explicit opt-in for the fog
-self-relocation copy) and `fog-ui` (framebuffer status panel; implies
-`fog-paint`). Normal bare-metal boot starts only
+self-relocation copy), `fog-ui` (framebuffer status panel; implies
+`fog-paint`) and `fog-display` (experimental: start the compositor and
+SilverHome on the bootloader's `cont_splash` panel; real-device only). Normal
+bare-metal boot starts only
 silverd, which then starts Scout, the block driver, the network driver, the SFS
 server, the network server, the graphics and input drivers, Howl and Howler in
 that order. No component depends
@@ -778,19 +787,23 @@ driver's contract.
 | [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU bring-up of up to eight CPU slots (verified on four and six) behind the `smp` feature, round-qualified quiescence, FIFO ready queues, per-CPU timer checks, a stall watchdog and boot selftests; true cross-PE TLB stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 | [docs/FINAL_AUDIT.md](docs/FINAL_AUDIT.md) | Final audit: DMA window, surface objects/zero-copy, Ed25519 signing, evidence and known limitations |
+| [docs/PORTING_FOG.md](docs/PORTING_FOG.md) | Redmi 10C port plan: platform framebuffer seam, staged touch/storage/power/DSI work, hardware unknowns and regression matrix |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
 
-Current verification snapshot (2026-11-07): **217 host tests** pass; the fog
+Current verification snapshot (2026-11-07): **218 host tests** pass; the fog
 QEMU suite covers relocation, at-link boot, default fail-closed park and an
 FDT-reserved-destination rejection; normal QEMU release and debug builds reach
 `howl>`; the demo regression reports 69 PASS / 0 PANIC under `no_std,smp` with
 QEMU `-smp 4` (and `-smp 2`); the `no_std`, `fog`, `fog-reloc`, `fog-ui`,
-`tablet`, `smp`, `smp-selftest`, `smp-churn` and `demo-tasks` configurations
-all build. The surface/signing checkpoint additionally verifies: zero-copy
-SilverHome frame (640×1136, non-black screenshot), QMP click into Calc and back
-to home, `SURFACE READY`, `MMU TLB/ASID/HEAP`, `DMA ZERO` and `DMA WINDOW`,
-`scopeprobe` status 0 with no leaks, `sfs_fsck` clean, and the three signing
-cases (unsigned refused, valid `sig=` accepted, tampered signature refused).
+`fog-display`, `tablet`, `smp`, `smp-selftest`, `smp-churn` and `demo-tasks`
+configurations all build. The surface/signing checkpoint additionally verifies:
+zero-copy SilverHome frame (640×1136, non-black screenshot), QMP click into Calc
+and back to home, `SURFACE READY`, `MMU TLB/ASID/HEAP`, `DMA ZERO` and
+`DMA WINDOW`, `scopeprobe` status 0 with no leaks, `sfs_fsck` clean, and the
+three signing cases (unsigned refused, valid `sig=` accepted, tampered
+signature refused). With `fog-display` and a 1 GiB synthetic khaje tree, the
+kernel registers `cont_splash`, the compositor maps it, and SilverHome pixels
+appear at `0x5C000000`; default `fog` still boots without a display line.
 The opt-in `smp-churn` profile passes `churn PASS`, `push PASS`,
 `watchdog stall PASS`, `bkl stall PASS` and `priority PASS` on `-smp 2`,
 `-smp 3` and `-smp 4` with the per-pass invariant audit active. Caches are on

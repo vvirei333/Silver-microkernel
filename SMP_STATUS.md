@@ -3,7 +3,7 @@
 > **Current project status (2026-11-07):** this file remains the authoritative
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
-> test suite is now **217/217**; the 13/13 figure below is the checkpoint from
+> test suite is now **218/218**; the 13/13 figure below is the checkpoint from
 > the earlier SMP session. The surface/signing checkpoint (`8b5158a`,
 > `f6ee824`) re-ran `no_std,smp-selftest` on QEMU `-smp 4`: 15 PASS / 0 FAIL,
 > including cross-PE TLB, 64 quiescence rounds, per-CPU ticks and the BKL
@@ -566,7 +566,7 @@ DMA leak, and `-smp 2` still reports one peer.
 
 ## Проверки на текущем состоянии
 
-- `cargo test --lib`: **217/217** (2026-11-07, surface/signing checkpoint).
+- `cargo test --lib`: **218/218** (2026-11-07, surface/signing checkpoint).
 - Default `no_std` build, QEMU `-smp 4`: single-core, reaches `howl>`.
 - `no_std,smp-selftest` build, QEMU `-smp 4`: **15 PASS / 0 FAIL**, CPU1–CPU3
   online (GIC/timer/IPI), all four CPUs execute tasks; `howl ready`/prompt and

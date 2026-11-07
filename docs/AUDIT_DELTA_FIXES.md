@@ -474,7 +474,7 @@ tree has since moved beyond the original userspace storage-server design:
 - Display surfaces are kernel objects (`CAP_SURFACE`); SilverHome presents
   zero-copy via `GUI_SURFACE_ATTACH`, and scanout frames are pinned/leaked
   instead of recycled.
-- Current host test baseline: **217 passing tests**. QEMU SMP self-tests and
+- Current host test baseline: **218 passing tests**. QEMU SMP self-tests and
   the `no_std`, `fog`, `fog-reloc`, `fog-ui` and `tablet` builds remain
   required before merging kernel changes.
 

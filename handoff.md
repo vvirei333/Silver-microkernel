@@ -8,13 +8,18 @@ debt and recommended next steps. Update after every significant kernel change.
 Four roadmap holes are closed: the fog DMA window, kernel surface objects with
 zero-copy present, Ed25519 bundle signatures, and the final audit.
 
-- **Host tests:** 217/217 (`cargo test --lib`).
+- **Host tests:** 218/218 (`cargo test --lib`).
 - **Builds:** `no_std`, `no_std,smp-selftest`, `no_std,tablet`,
-  `no_std,fog,fog-reloc`, `no_std,fog,fog-ui`.
+  `no_std,fog,fog-reloc`, `no_std,fog,fog-ui`,
+  `no_std,fog,fog-reloc,fog-display`.
 - **QEMU:** 640x1136 SilverHome frame, pointer click into Calc, back to home;
   `MMU TLB/ASID/HEAP`, `DMA ZERO`, `DMA WINDOW`, `SURFACE READY`,
   `howl ready`, no panic; `scopeprobe` status 0 with no leaks; `sfs_fsck`
   clean. SMP `-smp 4` selftest: 15 PASS / 0 FAIL.
+- **Phone groundwork:** `fog-display` registers the live-FDT `cont_splash`
+  carve-out (`SYS_DISPLAY_INFO/MAP`) and starts compositor + SilverHome on it.
+  With a 1 GiB synthetic khaje tree, pixels appear at `0x5C000000`; default
+  `fog` is unchanged. See [`docs/PORTING_FOG.md`](docs/PORTING_FOG.md).
 - **Signing:** unsigned bundle under a provisioned key is refused; a valid
   `sig=` runs (status 0); a tampered signature is refused.
 - **Latest commits:** `d0ac546` DMA window, `9bf3b8b` Ed25519 signatures,
@@ -23,8 +28,10 @@ zero-copy present, Ed25519 bundle signatures, and the final audit.
 
 Immediate next steps are a kernel fence object (guaranteed present
 completion), `SYS_SURFACE_DESTROY`/surface reuse, app-side zero-copy, and
-hardware (rain/fog) execution of the now-enabled cache/DMA self-tests.
-Existing signed-key provisioning is manual; there is no rotation yet.
+hardware (rain/fog) execution of the now-enabled cache/DMA self-tests. For the
+Redmi port, the next seam after the platform framebuffer is touch input, then
+storage; the full staged plan is in `docs/PORTING_FOG.md`. Existing signed-key
+provisioning is manual; there is no rotation yet.
 
 ## 2026-11-06 — SFS moves toward the kernel
 
@@ -2148,7 +2155,11 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 - The compositor still has two presentation paths. SilverHome is zero-copy:
   it owns a kernel surface and `ramfb` scans that buffer. Installed apps use
   the legacy command stream and a full-frame blit; the compositor's own
-  engineer menu is a fallback when no client is attached. Present fences are
+  engineer menu is a fallback when no client is attached. The `fog-display`
+  build adds a third backend: the bootloader's `cont_splash` panel, mapped via
+  `SYS_DISPLAY_MAP`, where client-surface attach is impossible and the command
+  stream is used. There is no touch driver yet, no DSI/GPU handoff, and the
+  panel mode is a configured 720x1650/stride-720 assumption. Present fences are
   best-effort `try_send` (no kernel fence object, no wait), and there is no
   `SYS_SURFACE_DESTROY`: a surface lives until its owner exits. The input
   driver still polls the virtio event queue at ~100 Hz and assumes QEMU's
@@ -2222,7 +2233,7 @@ and the full-mailbox selective-receive limitation recorded above.
 Host logic and crypto:
 
 ```bash
-cargo test --lib                     # 217 tests
+cargo test --lib                     # 218 tests
 ```
 
 Required build profiles (all must stay green):
@@ -2233,6 +2244,7 @@ cargo build --release --target aarch64-unknown-none --no-default-features --feat
 cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,tablet
 cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog,fog-reloc
 cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog,fog-ui
+cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog,fog-reloc,fog-display
 ```
 
 QEMU smoke: boot to `howl ready`, require `MMU TLB OK`, `MMU ASID OK`,
@@ -2241,6 +2253,17 @@ QEMU smoke: boot to `howl ready`, require `MMU TLB OK`, `MMU ASID OK`,
 `input-send-event`, confirm the app frame, click its back button and confirm the
 home frame returns. Run `run /sfs/apps/scopeprobe.elf` (status 0), `health`
 (DMA leaked 0) and `du /sfs/apps`; finish with `scripts/sfs_fsck.py`.
+
+Platform display (QEMU, requires a synthetic 1 GiB khaje DTB with a
+`cont_splash` node; the stock fog test DTB is 128 MiB and must not enable this):
+
+```bash
+# build no_std,fog,fog-reloc,fog-display, objcopy to a raw Image and patch
+# text_offset=0x80000, then boot with -m 1G -dtb <tree with cont_splash>
+# require: SILVER DISPLAY OK base=0x5C000000 mode=720x1650
+#          non-zero pixels at 0x5C000000 (monitor: xp /16xw 0x5C000000)
+#          howl ready
+```
 
 Bundle signing check (needs a throwaway key):
 

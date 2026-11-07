@@ -33,6 +33,13 @@ exact `fog-ui` layout; the on-device photograph is kept with the task notes.
 
 ## Status
 
+- **New: `fog-display` groundwork (experimental).** The kernel can find the
+  bootloader's `cont_splash` carve-out in the live FDT, register it as the
+  platform framebuffer (`SYS_DISPLAY_INFO`/`SYS_DISPLAY_MAP`), and start the
+  real compositor + SilverHome on it. QEMU-verified with a 1 GiB synthetic
+  khaje tree (720x1650 panel pixels at `0x5C000000`); real-device execution is
+  still pending. Default `fog` remains unchanged and does not spawn
+  userspace graphics. See [`../docs/PORTING_FOG.md`](../docs/PORTING_FOG.md).
 - The `fog` build compiles and links against `linker_fog.ld`.
 - The boot stub captures the hand-over state and records the address ABL
   actually used. A standard `fog` build does **not** relocate: if the entry

@@ -45,10 +45,15 @@ kernel surface objects/zero-copy, bundle signatures, full audit).
 
 ## Evidence
 
-- `cargo test --lib`: **217/217** (adds Ed25519 RFC 8032, signature policy,
-  malformed-policy and SHA-256 vectors).
+- `cargo test --lib`: **218/218** (adds Ed25519 RFC 8032, signature policy,
+  malformed-policy, SHA-256 and named-reserved-region vectors).
 - Builds: `no_std`, `no_std,smp-selftest`, `no_std,tablet`,
-  `no_std,fog,fog-reloc`, `no_std,fog,fog-ui` — all pass.
+  `no_std,fog,fog-reloc`, `no_std,fog,fog-ui`,
+  `no_std,fog,fog-reloc,fog-display` — all pass.
+- Phone display groundwork: with a 1 GiB synthetic khaje tree, the kernel logs
+  `SILVER DISPLAY OK base=0x5C000000 mode=720x1650`, maps the panel through
+  `SYS_DISPLAY_MAP`, and SilverHome pixels appear at `0x5C000000`; default
+  `fog` boots without a display line.
 - QEMU 640x1136: home screen 700/730 non-black samples; click Calc renders a
   different frame (730/730); back returns to the home frame; no panic.
 - Boot log: `MMU TLB OK`, `MMU ASID OK`, `MMU HEAP OK`, `DMA ZERO OK`,
