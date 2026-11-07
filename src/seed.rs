@@ -14,9 +14,8 @@ pub const WRITEPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/writ
 pub const REGPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/regprobe.elf"));
 /// Manifest-scope probe: installed under `/sfs/apps` with a write grant.
 pub const SCOPEPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scopeprobe.elf"));
-/// The write prefix the probe's manifest grants, and the manifest itself.
-const SCOPEPROBE_MANIFEST: &[u8] =
-    b"# scopeprobe: scoped writes and a small per-bundle quota\nwrite=/sfs/probe-scope\nquota=8:5\n";
+/// The write prefix the probe's manifest grants. The manifest is generated at
+/// boot so its `sha256=` line always covers the exact embedded ELF bytes.
 /// The `crash` EL0 (userspace) program, loaded dynamically by `run bin/crash`. It writes
 /// to `0x0` so the EL0 fault handler has a deterministic way to be exercised.
 pub const CRASH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/crash.elf"));
@@ -37,7 +36,6 @@ pub fn seed_apps() {
         ("/sfs/apps/gallery.elf", GALLERY_ELF),
         ("/sfs/apps/notes.elf", NOTES_ELF),
         ("/sfs/apps/scopeprobe.elf", SCOPEPROBE_ELF),
-        ("/sfs/apps/scopeprobe.manifest", SCOPEPROBE_MANIFEST),
     ] {
         match crate::vfs::file_len("/", path) {
             Ok(length) if length == image.len() => continue,
@@ -46,6 +44,22 @@ pub fn seed_apps() {
         if crate::vfs::seed_file("/", path, image).is_err() {
             crate::console::write_str("SEED: failed to install app into /sfs\r\n");
         }
+    }
+
+    // The manifest is regenerated so the digest always matches the embedded
+    // probe. A stale manifest would make `run` fail closed, which is visible
+    // immediately and safer than trusting an old hash.
+    use core::fmt::Write as _;
+    let digest = silver_microkernel::sha256::digest(SCOPEPROBE_ELF);
+    let mut manifest = alloc::string::String::from(
+        "# scopeprobe: scoped writes, quota and integrity\nwrite=/sfs/probe-scope\nquota=8:5\nsha256=",
+    );
+    for byte in digest {
+        let _ = write!(&mut manifest, "{byte:02x}");
+    }
+    manifest.push('\n');
+    if crate::vfs::seed_file("/", "/sfs/apps/scopeprobe.manifest", manifest.as_bytes()).is_err() {
+        crate::console::write_str("SEED: failed to install scopeprobe manifest\r\n");
     }
 }
 

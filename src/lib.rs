@@ -18,6 +18,7 @@ pub mod phys_range;
 pub mod reloc;
 pub mod sched_policy;
 pub mod sfs_format;
+pub mod sha256;
 pub mod table_registry;
 pub mod wait_queue;
 pub mod watchdog_policy;

@@ -472,6 +472,7 @@ fn sys_spawn_with_argsv(program: u64, argument: u64, block_ptr: u64, block_len: 
 struct BundlePolicy {
     write_prefix: Option<String>,
     quota: Option<(u32, u32)>,
+    hash: Option<[u8; 32]>,
 }
 
 fn bundle_write_scope(cwd: &str, elf_path: &str) -> BundlePolicy {
@@ -480,6 +481,7 @@ fn bundle_write_scope(cwd: &str, elf_path: &str) -> BundlePolicy {
     let none = BundlePolicy {
         write_prefix: None,
         quota: None,
+        hash: None,
     };
     if elf_path.len() + ".manifest".len() > vfs::MAX_PATH_LEN {
         return none;
@@ -514,6 +516,12 @@ fn bundle_write_scope(cwd: &str, elf_path: &str) -> BundlePolicy {
                 && !scope.ends_with('/')
             {
                 policy.write_prefix = Some(String::from(scope));
+            }
+            continue;
+        }
+        if let Some(hash) = line.strip_prefix("sha256=") {
+            if let Some(digest) = silver_microkernel::sha256::parse_hex(hash.trim()) {
+                policy.hash = Some(digest);
             }
             continue;
         }
@@ -565,6 +573,11 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
             Err(_) => return SYSCALL_ERROR,
         };
         let policy = bundle_write_scope(&cwd, path);
+        if let Some(expected) = policy.hash {
+            if silver_microkernel::sha256::digest(&bytes) != expected {
+                return SYSCALL_ERROR;
+            }
+        }
         scheduler::spawn_elf_with_policy(image, 0, policy.write_prefix, policy.quota)
             .unwrap_or(SYSCALL_ERROR)
     })
