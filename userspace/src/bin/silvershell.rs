@@ -227,6 +227,7 @@ fn execute(command: &str) {
             syscall::print("  clear      Clear the terminal screen\r\n");
             syscall::print("  uname      Print kernel name, version and architecture\r\n");
             syscall::print("  health     Kernel resource and leak snapshot\r\n");
+            syscall::print("  du [path]  SFS inode/block usage of a subtree\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
             syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server> [arg]\r\n");
             syscall::print("  bg <program> [arg]\r\n");
@@ -283,6 +284,7 @@ fn execute(command: &str) {
         Some("clear") => clear_screen(),
         Some("uname") => syscall::print("Silver Kernel v0.1.0 aarch64 (WerewolfOS)\r\n"),
         Some("health") => show_health(),
+        Some("du") => show_usage(words.next()),
         Some("ps") => show_tasks(),
         Some("spawn") | Some("bg") => spawn_program(words.next(), words.next()),
         Some("fg") => foreground_task(words.next()),
@@ -1020,6 +1022,26 @@ fn wait_task(cap_id: Option<&str>) {
     } else {
         syscall::print("wait: unknown capability or status already consumed\r\n");
     }
+}
+
+fn show_usage(path: Option<&str>) {
+    let path = path.unwrap_or(".");
+    let Some(usage) = syscall::fs_usage(path) else {
+        syscall::print("du: cannot account for that path\r\n");
+        return;
+    };
+    syscall::print(path);
+    syscall::print(": inodes ");
+    syscall::print_dec_u64(usage.inodes);
+    syscall::print(", blocks ");
+    syscall::print_dec_u64(usage.blocks);
+    syscall::print(" (data ");
+    syscall::print_dec_u64(usage.data_blocks);
+    syscall::print(", metadata ");
+    syscall::print_dec_u64(usage.metadata_blocks);
+    syscall::print("), bytes ");
+    syscall::print_dec_u64(usage.blocks.saturating_mul(512));
+    syscall::print("\r\n");
 }
 
 fn show_health() {

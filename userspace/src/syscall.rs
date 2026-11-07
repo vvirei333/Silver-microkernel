@@ -41,6 +41,7 @@ const SYS_FS_UNLINK: u64 = 36;
 const SYS_FS_RMDIR: u64 = 37;
 const SYS_FS_RENAME: u64 = 38;
 const SYS_FS_REPLACE: u64 = 87;
+const SYS_FS_USAGE: u64 = 88;
 const SYS_CONSOLE_SET: u64 = 39;
 const SYS_TASK_RESUME: u64 = 40;
 const SYS_WAIT_EVENT: u64 = 41;
@@ -136,6 +137,15 @@ pub struct MemoryInfoV2 {
     pub dma_pages: u64,
     pub capabilities: u64,
     pub open_files: u64,
+}
+
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct FsUsage {
+    pub inodes: u64,
+    pub data_blocks: u64,
+    pub metadata_blocks: u64,
+    pub blocks: u64,
 }
 
 #[derive(Copy, Clone)]
@@ -648,6 +658,23 @@ pub fn fs_replace(source: &str, destination: &str) -> bool {
             syscall2(SYS_FS_REPLACE, source_ptr, destination_ptr)
         })
     }) == 0
+}
+
+pub fn fs_usage(path: &str) -> Option<FsUsage> {
+    let mut usage = FsUsage {
+        inodes: 0,
+        data_blocks: 0,
+        metadata_blocks: 0,
+        blocks: 0,
+    };
+    let result = with_path(path, |path_ptr| unsafe {
+        syscall2(SYS_FS_USAGE, path_ptr, &mut usage as *mut FsUsage as u64)
+    });
+    if result == 0 {
+        Some(usage)
+    } else {
+        None
+    }
 }
 
 /// Mounts the in-kernel `ramfs` backend at `target` (must be an existing

@@ -79,6 +79,7 @@ pub const SYS_SPAWN_ARGSV: u64 = 84;
 pub const SYS_MEMINFO_V2: u64 = 85;
 pub const SYS_HEALTH: u64 = 86;
 pub const SYS_FS_REPLACE: u64 = 87;
+pub const SYS_FS_USAGE: u64 = 88;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -137,6 +138,14 @@ struct MemoryInfoV2 {
     dma_pages: u64,
     capabilities: u64,
     open_files: u64,
+}
+
+#[repr(C)]
+struct FsUsageInfo {
+    inodes: u64,
+    data_blocks: u64,
+    metadata_blocks: u64,
+    blocks: u64,
 }
 
 #[repr(C)]
@@ -284,6 +293,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_FS_RMDIR => sys_fs_rmdir(frame[0]),
         SYS_FS_RENAME => sys_fs_rename(frame[0], frame[1]),
         SYS_FS_REPLACE => sys_fs_replace(frame[0], frame[1]),
+        SYS_FS_USAGE => sys_fs_usage(frame[0], frame[1]),
         SYS_CAP_GET_TASK_ID => scheduler::capability_task_id(frame[0]).unwrap_or(SYSCALL_ERROR),
         SYS_CAP_GRANT => {
             if scheduler::grant_capability(frame[0], frame[1], frame[2] as u32) {
@@ -745,6 +755,32 @@ fn sys_fs_rename(source_ptr: u64, destination_ptr: u64) -> u64 {
                 SYSCALL_ERROR
             }
         })
+    })
+}
+
+fn sys_fs_usage(path_ptr: u64, out_ptr: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
+    with_path(path_ptr, |path| {
+        let Some(usage) = vfs::usage(&cwd, path) else {
+            return SYSCALL_ERROR;
+        };
+        let info = FsUsageInfo {
+            inodes: u64::from(usage.inodes),
+            data_blocks: u64::from(usage.data_blocks),
+            metadata_blocks: u64::from(usage.metadata_blocks),
+            blocks: u64::from(usage.blocks()),
+        };
+        let bytes = unsafe {
+            core::slice::from_raw_parts(
+                (&info as *const FsUsageInfo).cast::<u8>(),
+                core::mem::size_of::<FsUsageInfo>(),
+            )
+        };
+        if user_memory::copy_to_user(bytes, out_ptr).is_err() {
+            SYSCALL_ERROR
+        } else {
+            0
+        }
     })
 }
 
