@@ -20,6 +20,13 @@ use core::panic::PanicInfo;
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(_argument: u64) -> ! {
+    let Some(before) = syscall::memory_info_v2() else {
+        syscall::exit_with_status(2);
+    };
+    let Some(health_before) = syscall::health_info() else {
+        syscall::exit_with_status(2);
+    };
+
     let _ = syscall::fs_mkdir("/sfs/probe-scope");
 
     let inside = syscall::fs_create("/sfs/probe-scope/ok");
@@ -71,10 +78,26 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         let _ = syscall::fs_unlink(path);
     }
 
-    if inside && !outside && !escape && quota_ok && created == 4 && replaced_ok {
+    let leaks_ok = match syscall::memory_info_v2() {
+        Some(after) => {
+            after.open_files == 0
+                && after.dma_pages == before.dma_pages
+                && after.task_frames == before.task_frames
+        }
+        None => false,
+    } && match syscall::health_info() {
+        Some(health_after) => {
+            health_after.dma_leaked_pages == health_before.dma_leaked_pages
+                && health_after.dma_quarantined_pages == health_before.dma_quarantined_pages
+                && health_after.open_files == health_before.open_files
+        }
+        None => false,
+    };
+
+    if inside && !outside && !escape && quota_ok && created == 4 && replaced_ok && leaks_ok {
         syscall::exit();
     }
-    syscall::exit_with_status(2);
+    syscall::exit_with_status(3);
 }
 
 fn write_file(path: &str, contents: &[u8]) -> bool {
