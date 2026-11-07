@@ -14,6 +14,30 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 OUT="$ROOT/redmi10c_poc/out"
 mkdir -p "$OUT"
 
+FEATURES="no_std,fog"
+IMAGE_NAME="boot.img"
+RELOC=0
+UI=0
+for argument in "$@"; do
+    case "$argument" in
+        --reloc) RELOC=1 ;;
+        --ui) UI=1 ;;
+        *) echo "usage: $0 [--reloc] [--ui]" >&2; exit 1 ;;
+    esac
+done
+
+if [ "$RELOC" -eq 1 ]; then
+    FEATURES="${FEATURES},fog-reloc"
+    IMAGE_NAME="boot-reloc"
+else
+    IMAGE_NAME="boot"
+fi
+if [ "$UI" -eq 1 ]; then
+    FEATURES="${FEATURES},fog-ui"
+    IMAGE_NAME="${IMAGE_NAME}-ui"
+fi
+IMAGE_NAME="${IMAGE_NAME}.img"
+
 CARGO="${CARGO:-cargo}"
 OBJCOPY="${OBJCOPY:-}"
 if [ -z "$OBJCOPY" ]; then
@@ -29,7 +53,7 @@ fi
 
 cd "$ROOT"
 "$CARGO" build --release --target aarch64-unknown-none \
-    --no-default-features --features no_std,fog
+    --no-default-features --features "$FEATURES"
 
 ELF="target/aarch64-unknown-none/release/silver_microkernel"
 IMAGE="$OUT/Image"
@@ -85,13 +109,14 @@ mkbootimg \
     --os_version 0.0.0 \
     --os_patch_level 0 \
     --cmdline "console=ttyMSM0,115200n8" \
-    -o "$OUT/boot.img"
+    -o "$OUT/$IMAGE_NAME"
 
 echo
-echo "Built: $OUT/boot.img"
+echo "Built: $OUT/$IMAGE_NAME"
+echo "Features: $FEATURES"
 echo "Verified: raw arm64 Image header and boot image v3."
 echo
 echo "This script performed no device operation."
 echo "To try it in RAM only (requires an unlocked bootloader):"
-echo "  fastboot boot $OUT/boot.img"
+echo "  fastboot boot $OUT/$IMAGE_NAME"
 echo "That command is deliberately NOT run here; it is a device operation."

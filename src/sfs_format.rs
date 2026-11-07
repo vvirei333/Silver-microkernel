@@ -1522,8 +1522,6 @@ mod tests {
     }
 
     #[test]
-
-    #[test]
     fn device_failure_leaves_allocator_consistent() {
         let (mut image, mut disk, sb) = make_image(128);
         seed_root(&mut image, &sb, &mut disk);
