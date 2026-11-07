@@ -2205,3 +2205,25 @@ and the full-mailbox selective-receive limitation recorded above.
    `SECURITY MUTEX NONOWNER=PASS`, `SECURITY MUTEX OWNER=PASS` and
    `SECURITY SLEEP OVERFLOW=PASS`.
 6. Update the README checklist and this file.
+
+## 2026-11-08 — boot-stack root cause, 6 CPUs, SFS stage 1 (commits 4f0f5e3, 0bd0347, 85f90b2)
+
+The "layout-flaky boot panic" was **not** miscompilation: `kernel_main`
+overflowed the 16 KiB boot stack by ≥1 KiB before `sfs::load`, and the
+overwrite hit whatever static sat at the `.bss` tail (`DMA_QUARANTINE`
+slots in the repro) — so unrelated code changes flipped the panic on and
+off. Proven with a gdb hardware watchpoint (`memset` from
+`console::write_dec_u64`, SP 1 KiB below `__stack_bottom`). Fix: the boot
+stack is 64 KiB (`linker.ld`). The O3 `b .` self-loop findings need
+re-examination in this light.
+
+With the fix: `MAX_CPUS=8`, QEMU `-smp 6` fully green (churn and
+push-migration included). SFS stage 1: format logic extracted to
+`sfs_format.rs` (host-testable, `SfsDisk` trait), fsck at mount
+(fail-closed on cross-links/dangling entries, leaks tolerated), in-place
+positioned overwrites, rename rollback, `virtio_blk::sector_count()`,
+adaptive image load up to 8 MiB, `scripts/make_sfs.py` formatter.
+200/200 host tests; `-smp 2/4/6` boots with 1 MiB and 8 MiB disks; fsck
+clean; shell write/append/rename/mkdir/rm/rmdir smoke PASS.
+Next: fog/Redmi 10C boot PoC (see SMP_STATUS and the T20.1 review), then
+drivers: GCC/pinctrl → GENI I2C → touch.
