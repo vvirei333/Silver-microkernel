@@ -55,9 +55,12 @@ pub fn surface_begin(gpu: u64, color: u32) {
     send(gpu, &payload);
 }
 
-/// Publishes the buffered frame atomically.
-pub fn surface_present(gpu: u64) {
-    send(gpu, &[GUI_SURFACE_PRESENT]);
+/// Publishes the buffered frame atomically and returns its fence sequence.
+pub fn surface_present(gpu: u64, seq: u64) {
+    let mut payload = [0_u8; 9];
+    payload[0] = GUI_SURFACE_PRESENT;
+    payload[1..9].copy_from_slice(&seq.to_le_bytes());
+    send(gpu, &payload);
 }
 
 /// Drops the buffered frame without publishing it.

@@ -176,6 +176,8 @@ const GUI_SURFACE_BEGIN: u8 = 0x16;
 const GUI_SURFACE_PRESENT: u8 = 0x17;
 /// Discard the offscreen surface and return to immediate drawing.
 const GUI_SURFACE_ABORT: u8 = 0x18;
+/// Compositor -> client: the frame with this sequence is visible.
+const GUI_FENCE_DONE: u8 = 0x19;
 
 
 #[no_mangle]
@@ -369,7 +371,12 @@ fn handle_compositor_request(message: &ipc::Message) -> bool {
             true
         }
         GUI_SURFACE_PRESENT => {
-            present_surface();
+            let seq = u64::from_le_bytes([
+                payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7],
+                payload[8],
+            ]);
+            let ok = present_surface();
+            send_fence(message.sender, seq, ok);
             true
         }
         GUI_SURFACE_ABORT => {
@@ -443,6 +450,18 @@ fn handle_pointer(input: input_proto::InputMsg) {
         // instead of forwarding samples into a void forever.
         release_ui(client);
     }
+}
+
+/// Acknowledges a present sequence to the client that requested it.
+fn send_fence(client: u64, seq: u64, ok: bool) {
+    if client == 0 {
+        return;
+    }
+    let mut payload = [0_u8; 10];
+    payload[0] = GUI_FENCE_DONE;
+    payload[1..9].copy_from_slice(&seq.to_le_bytes());
+    payload[9] = u8::from(ok);
+    let _ = syscall::try_send(client, &ipc::Message::new(0, &payload));
 }
 
 /// Reports a completed button click to the shell (Howl), which owns the console.

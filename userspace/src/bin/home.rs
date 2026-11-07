@@ -201,8 +201,20 @@ fn surface_begin(gpu: u64, color: u32) {
     send(gpu, &payload);
 }
 
-fn surface_present(gpu: u64) {
-    send(gpu, &[GUI_SURFACE_PRESENT]);
+fn surface_present(gpu: u64, seq: u64) {
+    let mut payload = [0_u8; 9];
+    payload[0] = GUI_SURFACE_PRESENT;
+    payload[1..9].copy_from_slice(&seq.to_le_bytes());
+    send(gpu, &payload);
+}
+
+static mut FRAME_SEQ: u64 = 0;
+
+fn next_frame_seq() -> u64 {
+    unsafe {
+        FRAME_SEQ = FRAME_SEQ.wrapping_add(1);
+        FRAME_SEQ
+    }
 }
 
 fn rect(gpu: u64, x: u32, y: u32, w: u32, h: u32, color: u32) {
@@ -334,7 +346,7 @@ fn draw_home(gpu: u64, pressed: Option<usize>) {
         rect(gpu, x, y, DOCK_ICON, DOCK_ICON, shade(APP_COLORS[app]));
         rect(gpu, x + 2, y + 2, DOCK_ICON - 4, DOCK_ICON - 4, face);
     }
-    surface_present(gpu);
+    surface_present(gpu, next_frame_seq());
 }
 
 fn app_at(x: u32, y: u32) -> Option<usize> {
