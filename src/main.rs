@@ -1574,6 +1574,11 @@ pub extern "C" fn kernel_main() -> ! {
     vfs::run_self_test();
     ram_log::log("VFS+SEED OK");
     ram_log::fb_progress();
+    if silver_microkernel::bundle_sig::signatures_enabled() {
+        console::write_str("BUNDLE SIGNATURES: ENFORCED\r\n");
+    } else {
+        console::write_str("BUNDLE SIGNATURES: none (integrity only)\r\n");
+    }
 
     #[cfg(feature = "fog")]
     {

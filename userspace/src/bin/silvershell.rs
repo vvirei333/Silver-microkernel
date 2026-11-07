@@ -11,7 +11,9 @@ mod syscall;
 
 use core::panic::PanicInfo;
 
-const LINE_CAPACITY: usize = 96;
+/// One command line. 256 bytes are needed for `echo sig=<128 hex> >> <path>`;
+/// the older 96-byte limit silently truncated signing commands.
+const LINE_CAPACITY: usize = 256;
 const TICKS_PER_SECOND: u64 = 100;
 const MIB: u64 = 1024 * 1024;
 /// IPC opcode for a button press reported by `gpu_driver` (the shell owns the
@@ -24,7 +26,9 @@ const SFS_OP_TOUCH: u8 = 1;
 const SFS_OP_WRITE_FILE: u8 = 2;
 const SFS_OP_READ_FILE: u8 = 3;
 /// Longest filename and combined name+data the single-shot SFS IPC carries.
-const SFS_NAME_MAX: usize = 27;
+/// Full-path bound, not a component bound: `/sfs/apps/scopeprobe.manifest`
+/// is longer than one name yet perfectly valid.
+const SFS_PATH_MAX: usize = 191;
 const SFS_NAME_DATA_LIMIT: usize = 29;
 
 const TASK_LIST_CAPACITY: usize = 32;
@@ -788,7 +792,7 @@ fn unquote(text: &str) -> &str {
 }
 
 fn write_file(path: &str, text: &str, append: bool) {
-    if path.is_empty() || path.len() > SFS_NAME_MAX {
+    if path.is_empty() || path.len() > SFS_PATH_MAX {
         syscall::print("echo: invalid destination\r\n");
         return;
     }
@@ -828,7 +832,7 @@ fn touch_command(path: Option<&str>) {
         syscall::print("Usage: touch <file>\r\n");
         return;
     };
-    if path.is_empty() || path.len() > SFS_NAME_MAX {
+    if path.is_empty() || path.len() > SFS_PATH_MAX {
         syscall::print("touch: invalid path\r\n");
         return;
     }

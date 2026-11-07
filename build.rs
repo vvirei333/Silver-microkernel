@@ -20,6 +20,23 @@ fn main() {
     println!("cargo:rustc-link-arg=-T{linker}");
 
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
+
+    // Bundle signing key. `SILVER_BUNDLE_PUBKEY` wins; otherwise a checked-in
+    // `keys/bundle_ed25519.pub` (64 hex characters) is used. No key means the
+    // kernel stays in integrity-only mode, so default builds keep working.
+    println!("cargo:rerun-if-changed=keys/bundle_ed25519.pub");
+    println!("cargo:rerun-if-env-changed=SILVER_BUNDLE_PUBKEY");
+    let key = env::var("SILVER_BUNDLE_PUBKEY")
+        .ok()
+        .or_else(|| fs::read_to_string(root.join("keys").join("bundle_ed25519.pub")).ok());
+    if let Some(text) = key {
+        let text = text.trim();
+        assert!(
+            text.len() == 64 && text.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "bundle public key must be 64 hex characters"
+        );
+        println!("cargo:rustc-env=SILVER_BUNDLE_PUBKEY={text}");
+    }
     let profile = env::var("PROFILE").unwrap();
     let target_dir = root.join("target").join("userspace");
     let cargo = env::var_os("CARGO").unwrap();

@@ -52,6 +52,9 @@ fog-timer-test = ["fog"]
 
 [dependencies]
 linked_list_allocator = "0.10.6"
+# Ed25519 verification for bundle manifests. `alloc` keeps the kernel build
+# no_std; signing is done by the host-only `sign_bundle` tool.
+ed25519-dalek = { version = "2.2", default-features = false, features = ["alloc"] }
 
 [profile.dev]
 panic = "abort"

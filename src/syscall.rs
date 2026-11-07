@@ -479,20 +479,9 @@ fn sys_spawn_with_argsv(program: u64, argument: u64, block_ptr: u64, block_len: 
 /// Bundle manifest: `write=<absolute prefix>` (one directive per line, `#`
 /// starts a comment). It grants a dynamic ELF a path-scoped write window when
 /// it has no global `CAP_FS_WRITE`.
-struct BundlePolicy {
-    write_prefix: Option<String>,
-    quota: Option<(u32, u32)>,
-    hash: Option<[u8; 32]>,
-}
-
-fn bundle_write_scope(cwd: &str, elf_path: &str) -> BundlePolicy {
+fn bundle_write_scope(cwd: &str, elf_path: &str) -> silver_microkernel::bundle::BundlePolicy {
     const MANIFEST_MAX: usize = 512;
-    const SCOPE_MAX: usize = 96;
-    let none = BundlePolicy {
-        write_prefix: None,
-        quota: None,
-        hash: None,
-    };
+    let none = silver_microkernel::bundle::BundlePolicy::default();
     if elf_path.len() + ".manifest".len() > vfs::MAX_PATH_LEN {
         return none;
     }
@@ -512,55 +501,7 @@ fn bundle_write_scope(cwd: &str, elf_path: &str) -> BundlePolicy {
     let Ok(text) = core::str::from_utf8(&bytes) else {
         return none;
     };
-    let mut policy = none;
-    for line in text.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if let Some(scope) = line.strip_prefix("write=") {
-            let scope = scope.trim();
-            if scope.len() <= SCOPE_MAX
-                && scope.starts_with('/')
-                && !scope.contains("..")
-                && !scope.ends_with('/')
-            {
-                policy.write_prefix = Some(String::from(scope));
-            }
-            continue;
-        }
-        if let Some(hash) = line.strip_prefix("sha256=") {
-            if let Some(digest) = silver_microkernel::sha256::parse_hex(hash.trim()) {
-                policy.hash = Some(digest);
-            }
-            continue;
-        }
-        if let Some(quota) = line.strip_prefix("quota=") {
-            // `quota=<blocks>:<inodes>` bounds the whole write-prefix subtree.
-            let mut parts = quota.trim().split(':');
-            let (Some(blocks), Some(inodes), None) =
-                (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let Ok(blocks) = blocks.parse::<u32>() else {
-                continue;
-            };
-            let Ok(inodes) = inodes.parse::<u32>() else {
-                continue;
-            };
-            if blocks > 0 && inodes > 0 {
-                policy.quota = Some((blocks, inodes));
-            }
-        }
-    }
-    // A quota without a write prefix is meaningless and must not be silently
-    // ignored: refuse the bundle policy rather than grant an unbounded app.
-    if policy.quota.is_some() && policy.write_prefix.is_none() {
-        policy.quota = None;
-        policy.write_prefix = None;
-    }
-    policy
+    silver_microkernel::bundle::parse_manifest(text)
 }
 
 fn sys_spawn_path(path_ptr: u64) -> u64 {
@@ -583,10 +524,17 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
             Err(_) => return SYSCALL_ERROR,
         };
         let policy = bundle_write_scope(&cwd, path);
-        if let Some(expected) = policy.hash {
-            if silver_microkernel::sha256::digest(&bytes) != expected {
-                return SYSCALL_ERROR;
-            }
+        // Integrity first, then authenticity. A keyed build requires both;
+        // an unkeyed build accepts integrity-only bundles but refuses any
+        // manifest that claims a signature it cannot check.
+        if silver_microkernel::bundle::verify(
+            &bytes,
+            &policy,
+            silver_microkernel::bundle_sig::trusted_key(),
+        )
+        .is_err()
+        {
+            return SYSCALL_ERROR;
         }
         scheduler::spawn_elf_with_policy(image, 0, policy.write_prefix, policy.quota)
             .unwrap_or(SYSCALL_ERROR)
