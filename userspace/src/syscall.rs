@@ -42,6 +42,11 @@ const SYS_FS_RMDIR: u64 = 37;
 const SYS_FS_RENAME: u64 = 38;
 const SYS_FS_REPLACE: u64 = 87;
 const SYS_FS_USAGE: u64 = 88;
+const SYS_SURFACE_CREATE: u64 = 89;
+const SYS_SURFACE_GRANT: u64 = 90;
+const SYS_SURFACE_MAP: u64 = 91;
+const SYS_SURFACE_REVOKE: u64 = 92;
+const SYS_SURFACE_SCANOUT: u64 = 93;
 const SYS_CONSOLE_SET: u64 = 39;
 const SYS_TASK_RESUME: u64 = 40;
 const SYS_WAIT_EVENT: u64 = 41;
@@ -382,6 +387,58 @@ pub fn alloc_dma(size: u64) -> Option<(u64, u64)> {
     } else {
         Some((virtual_address, physical_address))
     }
+}
+
+/// A surface mapped into this task. `virtual_address` is read-only for a
+/// grantee; `physical_address` is zero unless the task has the scanout right.
+#[derive(Copy, Clone)]
+pub struct SurfaceMap {
+    pub virtual_address: u64,
+    pub physical_address: u64,
+    pub owner: u64,
+    pub width: u32,
+    pub height: u32,
+}
+
+/// Creates a writable display surface owned by the caller.
+pub fn surface_create(width: u32, height: u32) -> Option<(u64, u64)> {
+    let (virtual_address, id) =
+        unsafe { syscall2_pair(SYS_SURFACE_CREATE, u64::from(width), u64::from(height)) };
+    if virtual_address == SYSCALL_ERROR {
+        None
+    } else {
+        Some((id, virtual_address))
+    }
+}
+
+/// Grants `target` rights (`1` read, `2` scanout) on a surface we own.
+pub fn surface_grant(id: u64, target: u64, rights: u64) -> bool {
+    unsafe { syscall3(SYS_SURFACE_GRANT, id, target, rights) == 0 }
+}
+
+/// Maps a surface owned by, or granted to, the caller.
+pub fn surface_map(id: u64) -> Option<SurfaceMap> {
+    let (virtual_address, physical_address, owner, dimensions) =
+        unsafe { syscall1_quad(SYS_SURFACE_MAP, id) };
+    if virtual_address == SYSCALL_ERROR {
+        return None;
+    }
+    Some(SurfaceMap {
+        virtual_address,
+        physical_address,
+        owner,
+        width: (dimensions >> 32) as u32,
+        height: dimensions as u32,
+    })
+}
+
+pub fn surface_revoke(id: u64, target: u64) -> bool {
+    unsafe { syscall2(SYS_SURFACE_REVOKE, id, target) == 0 }
+}
+
+/// Declares or releases a surface as the display scanout buffer.
+pub fn surface_scanout(id: u64, enable: bool) -> bool {
+    unsafe { syscall2(SYS_SURFACE_SCANOUT, id, u64::from(enable)) == 0 }
 }
 
 pub fn pci_read32(offset: u64) -> Option<u32> {
@@ -822,6 +879,38 @@ unsafe fn syscall1_pair(number: u64, arg0: u64) -> (u64, u64) {
     );
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
     (result0, result1)
+}
+
+unsafe fn syscall2_pair(number: u64, arg0: u64, arg1: u64) -> (u64, u64) {
+    let result0: u64;
+    let result1: u64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") number,
+        inlateout("x0") arg0 => result0,
+        inlateout("x1") arg1 => result1,
+        options(nostack),
+    );
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    (result0, result1)
+}
+
+unsafe fn syscall1_quad(number: u64, arg0: u64) -> (u64, u64, u64, u64) {
+    let result0: u64;
+    let result1: u64;
+    let result2: u64;
+    let result3: u64;
+    core::arch::asm!(
+        "svc #0",
+        in("x8") number,
+        inlateout("x0") arg0 => result0,
+        inlateout("x1") 0_u64 => result1,
+        lateout("x2") result2,
+        lateout("x3") result3,
+        options(nostack),
+    );
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    (result0, result1, result2, result3)
 }
 
 unsafe fn syscall2(number: u64, arg0: u64, arg1: u64) -> u64 {

@@ -11,7 +11,7 @@
 //! integrity-only mode and a manifest that claims a signature is rejected:
 //! it cannot be authenticated, so trusting it would be worse than refusing it.
 
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+use ed25519_dalek::{Signature, VerifyingKey};
 
 /// The compile-time trusted public key, if this build was provisioned with one.
 pub fn trusted_key() -> Option<[u8; 32]> {

@@ -86,6 +86,8 @@ userspace.
 - [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
 - [x] Graphics driver: `ramfb` framebuffer through `fw_cfg` DMA, a 640x480 ARGB engineer menu with an 8x8 font
 - [x] Compositor offscreen surface with atomic `PRESENT`; SilverHome publishes each frame in one pass
+- [x] Kernel surface objects (`SYS_SURFACE_CREATE/GRANT/MAP/REVOKE/SCANOUT`): owner-checked, read-only cross-task mapping, and scanout pinning so frames are never recycled under a display controller
+- [x] Zero-copy home screen: SilverHome draws pixels into its own 640×1136 kernel surface; the compositor points `ramfb` at that buffer (`GUI_SURFACE_ATTACH`) instead of blitting
 - [x] Kernel health snapshot (`SYS_HEALTH`, `health`) for frames, tasks, open files and DMA leak counters
 - [x] Input driver: `virtio-tablet-pci` absolute pointer over a virtio event queue, IPC to the graphics driver, live cursor, button press/release and console click notifications (`GUI: Button '<name>' pressed!`)
 - [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh EL0 task with its own W^X address space

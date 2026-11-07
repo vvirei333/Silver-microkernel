@@ -191,6 +191,46 @@ struct MmapRegion {
     generation: u32,
 }
 
+pub const SURFACE_RIGHT_READ: u32 = 1;
+/// The grantee may ask the kernel to declare this surface as display
+/// scanout, and `SYS_SURFACE_MAP` returns the physical address to it.
+pub const SURFACE_RIGHT_SCANOUT: u32 = 2;
+pub const SURFACE_RIGHTS_ALL: u32 = SURFACE_RIGHT_READ | SURFACE_RIGHT_SCANOUT;
+
+/// One task-to-surface grant. The owner keeps the writable alias; a grantee
+/// can only map the surface read-only.
+#[derive(Copy, Clone)]
+pub struct SurfaceGrant {
+    pub task: u64,
+    pub rights: u32,
+}
+
+/// A kernel-owned display surface. Its frames are also recorded in
+/// `dma_pages`, so ordinary task teardown revokes every CPU alias; the
+/// additional fields add owner/grant checks and scanout lifetime safety.
+pub struct SurfaceRecord {
+    pub id: u64,
+    physical: usize,
+    page_count: usize,
+    width: u32,
+    height: u32,
+    owner_va: usize,
+    grants: Vec<SurfaceGrant>,
+    /// Task that declared this surface as display scanout, if any.
+    scanout_holder: Option<u64>,
+    /// The frames must never return to the allocator (a device may still be
+    /// scanning them). Set when a scanout holder dies or a grant is revoked.
+    leaked: bool,
+}
+
+/// A read-only mapping of a foreign surface in this task's address space.
+struct SurfaceMapping {
+    surface: u64,
+    virtual_address: usize,
+}
+
+static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
+
 pub struct Task {
     pub id: u64,
     pub state: TaskState,
@@ -244,6 +284,10 @@ pub struct Task {
     /// address space. A stale token is refused by the page-table registry.
     space_token: TableToken,
     dma_pages: Vec<(usize, usize, u32)>,
+    /// Surfaces this task owns (created through `SYS_SURFACE_CREATE`).
+    surfaces: Vec<SurfaceRecord>,
+    /// Read-only foreign-surface mappings installed in this address space.
+    surface_maps: Vec<SurfaceMapping>,
     mmap_regions: Vec<MmapRegion>,
     /// Sum of `mmap_regions` spans, bounded by [`MAX_MMAP_BYTES_PER_TASK`].
     /// Kept separately so the quota check is O(1), not a walk per request.
@@ -3313,7 +3357,14 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
     result
 }
 
-pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
+pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize, u32)> {
+    alloc_dma_run(size, capability::CAP_MMIO)
+}
+
+/// Shared implementation for explicit DMA allocation (`CAP_MMIO`) and display
+/// surfaces (`CAP_SURFACE`). The capability is checked before any frame is
+/// charged, so a refused request has no side effects.
+fn alloc_dma_run(size: usize, right: u32) -> Option<(usize, usize, u32)> {
     if size == 0 || size > mmu::USER_DMA_MAX_SIZE {
         return None;
     }
@@ -3325,9 +3376,9 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
         let task_id = task.id;
         if !task
             .cap_table
-            .has_self_rights(task_id, capability::CAP_MMIO)
+            .has_self_rights(task_id, right)
         {
-            console::write_str("DMA: FAIL - no CAP_MMIO rights\r\n");
+            console::write_str("DMA: FAIL - missing MMIO/surface right\r\n");
             return None;
         }
         if !task.charge_frames(page_count) {
@@ -3354,7 +3405,244 @@ pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize)> {
             return None;
         };
         task.dma_pages.push((physical, page_count, generation));
-        Some((virtual_address, physical))
+        Some((virtual_address, physical, generation))
+    });
+    interrupts::restore_irq(saved_daif);
+    result
+}
+
+fn surface_owner_index(manager: &TaskManager, id: u64) -> Option<usize> {
+    manager
+        .tasks
+        .iter()
+        .position(|task| task.surfaces.iter().any(|surface| surface.id == id))
+}
+
+/// Allocates a display surface owned by the caller and maps it writable into
+/// the caller's DMA window. Returns `(surface id, virtual address)`.
+pub fn create_surface(width: u32, height: u32) -> Option<(u64, usize)> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let size = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(4)?;
+    if size == 0 || size > mmu::USER_DMA_MAX_SIZE {
+        return None;
+    }
+    let id = NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed);
+    // `alloc_dma_for_current` validates CAP_MMIO, charges the ledger, zeroes
+    // and publishes the NC mapping, and records the run for teardown.
+    let (virtual_address, physical, _generation) =
+        alloc_dma_run(size, capability::CAP_SURFACE)?;
+    let manager = scheduler_manager()?;
+    let task = manager.tasks.get_mut(smp::current_index())?;
+    task.surfaces.push(SurfaceRecord {
+        id,
+        physical,
+        page_count: size.div_ceil(PAGE_SIZE),
+        width,
+        height,
+        owner_va: virtual_address,
+        grants: Vec::new(),
+        scanout_holder: None,
+        leaked: false,
+    });
+    Some((id, virtual_address))
+}
+
+/// Grants `target` read (and optionally scanout) access to a surface the
+/// caller owns. Granting requires the target to hold `CAP_MMIO`, because that
+/// is the right a later `SYS_SURFACE_MAP` needs anyway.
+pub fn grant_surface(id: u64, target: u64, rights: u32) -> bool {
+    if rights == 0 || rights & !SURFACE_RIGHTS_ALL != 0 {
+        return false;
+    }
+    let saved_daif = interrupts::save_and_disable_irq();
+    let result = scheduler_manager().map_or(false, |manager| {
+        let Some(caller) = manager.tasks.get(smp::current_index()).map(|task| task.id) else {
+            return false;
+        };
+        let Some(owner_index) = surface_owner_index(manager, id) else {
+            return false;
+        };
+        if manager.tasks[owner_index].id != caller || target == caller {
+            return false;
+        }
+        let Some(target_task) = manager.tasks.iter().find(|task| task.id == target) else {
+            return false;
+        };
+        if !target_task
+            .cap_table
+            .has_self_rights(target, capability::CAP_SURFACE)
+        {
+            return false;
+        }
+        let Some(surface) = manager.tasks[owner_index]
+            .surfaces
+            .iter_mut()
+            .find(|surface| surface.id == id)
+        else {
+            return false;
+        };
+        surface.grants.retain(|grant| grant.task != target);
+        surface.grants.push(SurfaceGrant { task: target, rights });
+        true
+    });
+    interrupts::restore_irq(saved_daif);
+    result
+}
+
+/// Maps a surface owned by the caller or granted to it. Returns
+/// `(va, pa, owner task id, packed dimensions)`; `pa` is zero unless the
+/// caller has the scanout right (the owner always does).
+pub fn map_surface(id: u64) -> Option<(usize, usize, u64, u64)> {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let result = scheduler_manager().and_then(|manager| {
+        let current_index = smp::current_index();
+        let caller = manager.tasks.get(current_index)?.id;
+        let owner_index = surface_owner_index(manager, id)?;
+        let (physical, page_count, width, height, owner_va, owner, rights) = {
+            let owner_task = &manager.tasks[owner_index];
+            let surface = owner_task
+                .surfaces
+                .iter()
+                .find(|surface| surface.id == id)?;
+            let rights = if owner_task.id == caller {
+                SURFACE_RIGHTS_ALL
+            } else {
+                surface
+                    .grants
+                    .iter()
+                    .find(|grant| grant.task == caller)?
+                    .rights
+            };
+            (
+                surface.physical,
+                surface.page_count,
+                surface.width,
+                surface.height,
+                surface.owner_va,
+                owner_task.id,
+                rights,
+            )
+        };
+        let packed = (u64::from(width) << 32) | u64::from(height);
+        let physical_address = if rights & SURFACE_RIGHT_SCANOUT != 0 {
+            physical
+        } else {
+            0
+        };
+        if owner == caller {
+            return Some((owner_va, physical_address, owner, packed));
+        }
+        let task = &manager.tasks[current_index];
+        if !task
+            .cap_table
+            .has_self_rights(caller, capability::CAP_SURFACE)
+        {
+            return None;
+        }
+        if let Some(mapping) = task.surface_maps.iter().find(|map| map.surface == id) {
+            return Some((mapping.virtual_address, physical_address, owner, packed));
+        }
+        let span = page_count.checked_mul(PAGE_SIZE)?;
+        let virtual_address = mmu::map_shared_dma_ro_to_user(task, physical, span)?;
+        let task = manager.tasks.get_mut(current_index)?;
+        task.surface_maps.push(SurfaceMapping {
+            surface: id,
+            virtual_address,
+        });
+        Some((virtual_address, physical_address, owner, packed))
+    });
+    interrupts::restore_irq(saved_daif);
+    result
+}
+
+/// Revokes `target`'s grant and removes its mapping. Frames are not freed;
+/// they stay owned by the surface (and are never reused if a device may still
+/// be scanning). Returns true when a grant existed.
+pub fn revoke_surface(id: u64, target: u64) -> bool {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let result = scheduler_manager().map_or(false, |manager| {
+        let Some(caller) = manager.tasks.get(smp::current_index()).map(|task| task.id) else {
+            return false;
+        };
+        let Some(owner_index) = surface_owner_index(manager, id) else {
+            return false;
+        };
+        if manager.tasks[owner_index].id != caller {
+            return false;
+        }
+        let (physical, page_count) = {
+            let surface = manager.tasks[owner_index]
+                .surfaces
+                .iter_mut()
+                .find(|surface| surface.id == id)
+                .expect("surface index was found above");
+            if !surface.grants.iter().any(|grant| grant.task == target) {
+                return false;
+            }
+            surface.grants.retain(|grant| grant.task != target);
+            if surface.scanout_holder == Some(target) {
+                // The display may still be reading this range; never recycle.
+                surface.scanout_holder = None;
+                surface.leaked = true;
+            }
+            (surface.physical, surface.page_count)
+        };
+        let Some(target_task) = manager.tasks.iter_mut().find(|task| task.id == target) else {
+            return true;
+        };
+        let Some(span) = page_count.checked_mul(PAGE_SIZE) else {
+            return true;
+        };
+        // Physical-range revoke covers every alias of these frames in the
+        // target's MMIO window, not just the recorded VA.
+        let _ = mmu::revoke_phys_range(target_task.ttbr0, physical, physical + span);
+        target_task
+            .surface_maps
+            .retain(|mapping| mapping.surface != id);
+        true
+    });
+    interrupts::restore_irq(saved_daif);
+    result
+}
+
+/// Declares (or releases) a surface as the display scanout buffer. Only the
+/// owner or a grantee with [`SURFACE_RIGHT_SCANOUT`] may do this.
+pub fn set_surface_scanout(id: u64, enable: bool) -> bool {
+    let saved_daif = interrupts::save_and_disable_irq();
+    let result = scheduler_manager().map_or(false, |manager| {
+        let Some(caller) = manager.tasks.get(smp::current_index()).map(|task| task.id) else {
+            return false;
+        };
+        let Some(owner_index) = surface_owner_index(manager, id) else {
+            return false;
+        };
+        let owner = manager.tasks[owner_index].id;
+        let Some(surface) = manager.tasks[owner_index]
+            .surfaces
+            .iter_mut()
+            .find(|surface| surface.id == id)
+        else {
+            return false;
+        };
+        if owner != caller {
+            let allowed = surface
+                .grants
+                .iter()
+                .any(|grant| grant.task == caller && grant.rights & SURFACE_RIGHT_SCANOUT != 0);
+            if !allowed {
+                return false;
+            }
+        }
+        if enable {
+            surface.scanout_holder = Some(caller);
+        } else if surface.scanout_holder == Some(caller) {
+            surface.scanout_holder = None;
+        }
+        true
     });
     interrupts::restore_irq(saved_daif);
     result
@@ -3798,6 +4086,31 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     let needs_quiesce = manager.tasks.iter().any(|task| {
         task.state == TaskState::Dead && task.running_on.is_none() && !task.dma_pages.is_empty()
     });
+    // Surface bookkeeping for dying tasks: drop their grants everywhere, and
+    // if a dying task was the scanout holder, pin the frames (the display may
+    // still read them) instead of letting teardown recycle them.
+    let dead_ids: Vec<u64> = manager
+        .tasks
+        .iter()
+        .filter(|task| task.state == TaskState::Dead)
+        .map(|task| task.id)
+        .collect();
+    if !dead_ids.is_empty() {
+        for owner in manager.tasks.iter_mut() {
+            for surface in owner.surfaces.iter_mut() {
+                if let Some(holder) = surface.scanout_holder {
+                    if dead_ids.contains(&holder) {
+                        surface.scanout_holder = None;
+                        surface.leaked = true;
+                        console::write_str("SURFACE: scanout holder died, pinning surface ");
+                        console::write_dec_u64(surface.id);
+                        console::write_str("\r\n");
+                    }
+                }
+                surface.grants.retain(|grant| !dead_ids.contains(&grant.task));
+            }
+        }
+    }
     let quiesced = needs_quiesce && smp::quiesce_begin();
     let mut dma_revokes: Vec<(usize, usize, mmu::RevokeResult)> = Vec::new();
     for dead in manager
@@ -4013,8 +4326,14 @@ fn initial_self_rights(program: u64) -> Option<u32> {
         // Trusted filesystem stress helper (not an installed app bundle).
         user_program::BIGDIR | user_program::BIGFILE => capability::CAP_FS_WRITE,
         // The graphics driver owns the on-screen Power button; only this
-        // trusted component receives the power privilege.
-        user_program::GPU_DRIVER => capability::CAP_MMIO | capability::CAP_POWER,
+        // trusted component receives the power privilege. It also owns the
+        // display: it needs CAP_SURFACE to map and scan out client buffers.
+        user_program::GPU_DRIVER => {
+            capability::CAP_MMIO | capability::CAP_POWER | capability::CAP_SURFACE
+        }
+        // The home screen renders directly into a kernel surface and shares it
+        // with the compositor, but it never touches device registers.
+        user_program::HOME => capability::CAP_SURFACE,
         _ => return None,
     };
     Some(rights)
@@ -4193,6 +4512,8 @@ impl Task {
             user_image,
             heap_pages: Vec::new(),
             dma_pages: Vec::new(),
+            surfaces: Vec::new(),
+            surface_maps: Vec::new(),
             mmap_regions: Vec::new(),
             mmap_bytes: 0,
             mem_frames: ledger_frames,
@@ -4536,6 +4857,21 @@ impl Task {
             console::write_str("MMU: address space teardown was refused\r\n");
         }
         for &(physical, page_count, generation) in &self.dma_pages {
+            // A surface pinned as scanout (or already marked leaked) must keep
+            // its frames forever: a display controller may still read them
+            // even though every CPU mapping is gone.
+            let scanout_pinned = self.surfaces.iter().any(|surface| {
+                surface.physical == physical
+                    && surface.page_count == page_count
+                    && (surface.leaked || surface.scanout_holder.is_some())
+            });
+            if scanout_pinned {
+                DMA_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
+                console::write_str("SURFACE LEAK: scanout range 0x");
+                console::write_hex_u64(physical as u64);
+                console::write_str(" kept out of the allocator\r\n");
+                continue;
+            }
             // Exact (physical, page_count) match: allocator ranges never
             // overlap, so a dead task's own range cannot be confused with
             // another dead task's range in the same reap pass.
@@ -4587,6 +4923,8 @@ impl Task {
         self.user_image = None;
         self.heap_pages.clear();
         self.dma_pages.clear();
+        self.surfaces.clear();
+        self.surface_maps.clear();
         self.mmap_regions.clear();
         self.mmap_bytes = 0;
         // The ledger is only meaningful while the task can allocate; a zombie

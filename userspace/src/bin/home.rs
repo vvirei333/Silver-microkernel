@@ -13,6 +13,10 @@
 mod ipc;
 #[path = "../syscall.rs"]
 mod syscall;
+#[path = "../framebuffer.rs"]
+mod framebuffer;
+
+use framebuffer::Framebuffer;
 
 use core::panic::PanicInfo;
 
@@ -61,7 +65,70 @@ const GUI_POINTER: u8 = 0x13;
 const GUI_HANDOFF: u8 = 0x15;
 const GUI_SURFACE_BEGIN: u8 = 0x16;
 const GUI_SURFACE_PRESENT: u8 = 0x17;
+const GUI_SURFACE_ATTACH: u8 = 0x1A;
 const GUI_BUTTON_PRESSED: u8 = 2;
+
+const SURFACE_RIGHT_READ: u64 = 1;
+const SURFACE_RIGHT_SCANOUT: u64 = 2;
+
+/// One client-owned surface and its direct pixel mapping.
+#[derive(Copy, Clone)]
+struct ZeroFrame {
+    id: u64,
+    fb: Framebuffer,
+}
+
+/// Zero-copy home rendering: SilverHome draws pixels into a kernel surface
+/// and asks the compositor to scan that buffer out. Two surfaces are used
+/// when the ledger allows it, so the displayed frame is never drawn into.
+struct ZeroCopy {
+    gpu: u64,
+    frames: [Option<ZeroFrame>; 2],
+    count: usize,
+    back: usize,
+    seq: u64,
+}
+
+static mut ZERO_COPY: Option<ZeroCopy> = None;
+
+/// Allocates and shares the home surfaces. Failure is non-fatal: the caller
+/// falls back to the command-stream compositor path.
+fn init_zero_copy(gpu: u64) {
+    let mut frames = [None; 2];
+    let mut count = 0;
+    for slot in 0..2 {
+        let Some((id, vaddr)) = syscall::surface_create(SCREEN_WIDTH, SCREEN_HEIGHT) else {
+            syscall::print("HOME: SURFACE CREATE FAILED\r\n");
+            break;
+        };
+        if !syscall::surface_grant(id, gpu, SURFACE_RIGHT_READ | SURFACE_RIGHT_SCANOUT) {
+            syscall::print("HOME: SURFACE GRANT FAILED\r\n");
+            break;
+        }
+        frames[slot] = Some(ZeroFrame {
+            id,
+            fb: Framebuffer {
+                vaddr,
+                width: SCREEN_WIDTH,
+                height: SCREEN_HEIGHT,
+            },
+        });
+        count += 1;
+    }
+    if count == 0 {
+        return;
+    }
+    unsafe {
+        ZERO_COPY = Some(ZeroCopy {
+            gpu,
+            frames,
+            count,
+            back: 0,
+            seq: 0,
+        });
+    }
+    syscall::print("HOME: ZERO-COPY SURFACE READY\r\n");
+}
 
 #[derive(Copy, Clone)]
 struct Screen {
@@ -299,7 +366,89 @@ fn draw_status_bar(gpu: u64) {
     rect(gpu, SCREEN_WIDTH - 60, 16, 44, 16, 0xFF30D158);
 }
 
+/// Sends a kernel surface to the compositor for direct scanout. Payload:
+/// opcode, surface id (u64 LE), fence sequence (u64 LE).
+fn attach_surface(gpu: u64, id: u64, seq: u64) {
+    let mut payload = [0_u8; 17];
+    payload[0] = GUI_SURFACE_ATTACH;
+    payload[1..9].copy_from_slice(&id.to_le_bytes());
+    payload[9..17].copy_from_slice(&seq.to_le_bytes());
+    send(gpu, &payload);
+}
+
+/// Paints the home screen directly into a client-owned surface and presents
+/// it with zero copies. Returns false when surfaces are unavailable.
+fn draw_home_surface(pressed: Option<usize>) -> bool {
+    let Some(zero) = (unsafe { &mut *core::ptr::addr_of_mut!(ZERO_COPY) }).as_mut() else {
+        return false;
+    };
+    let Some(frame) = zero.frames[zero.back] else {
+        return false;
+    };
+    let fb = frame.fb;
+
+    let bands = 16_u32;
+    for band in 0..bands {
+        let t = band * 255 / bands;
+        let color = 0xFF00_0000 | ((12 + t / 6) << 16) | ((48 + t / 3) << 8) | (96 + t / 2);
+        fb.fill_rect(
+            0,
+            band * SCREEN_HEIGHT / bands,
+            SCREEN_WIDTH,
+            SCREEN_HEIGHT / bands + 1,
+            color,
+        );
+    }
+
+    // Status bar.
+    fb.fill_rect(0, 0, SCREEN_WIDTH, 48, COLOR_BLACK);
+    fb.text(12, 16, COLOR_WHITE, "9:41");
+    fb.text_centered(SCREEN_WIDTH / 2, 16, COLOR_WHITE, "Silver");
+    fb.fill_rect(SCREEN_WIDTH - 60, 16, 44, 16, 0xFF30D158);
+
+    // App grid.
+    for index in 0..APP_LABELS.len() {
+        let (x, y) = grid_position(index);
+        let face = if pressed == Some(index) {
+            shade(APP_COLORS[index])
+        } else {
+            APP_COLORS[index]
+        };
+        fb.fill_rect(x, y, ICON_SIZE, ICON_SIZE, shade(APP_COLORS[index]));
+        fb.fill_rect(x + 2, y + 2, ICON_SIZE - 4, ICON_SIZE - 4, face);
+        fb.text_centered(
+            x + ICON_SIZE / 2,
+            y + ICON_SIZE + 12,
+            COLOR_WHITE,
+            APP_LABELS[index],
+        );
+    }
+
+    // Dock.
+    fb.fill_rect(0, DOCK_Y, SCREEN_WIDTH, SCREEN_HEIGHT - DOCK_Y, 0xFF10_1A2A);
+    for (slot, &app) in DOCK_APPS.iter().enumerate() {
+        let (x, y) = dock_position(slot);
+        let face = if pressed == Some(app) {
+            shade(APP_COLORS[app])
+        } else {
+            APP_COLORS[app]
+        };
+        fb.fill_rect(x, y, DOCK_ICON, DOCK_ICON, shade(APP_COLORS[app]));
+        fb.fill_rect(x + 2, y + 2, DOCK_ICON - 4, DOCK_ICON - 4, face);
+    }
+
+    zero.seq = zero.seq.wrapping_add(1);
+    attach_surface(zero.gpu, frame.id, zero.seq);
+    if zero.count > 1 {
+        zero.back = 1 - zero.back;
+    }
+    true
+}
+
 fn draw_home(gpu: u64, pressed: Option<usize>) {
+    if draw_home_surface(pressed) {
+        return;
+    }
     surface_begin(gpu, COLOR_BLACK);
     let bands = 16_u32;
     for band in 0..bands {
@@ -654,6 +803,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     let Some(gpu) = gpu else {
         syscall::exit();
     };
+    init_zero_copy(gpu);
 
     draw_home(gpu, None);
 

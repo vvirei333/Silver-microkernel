@@ -204,12 +204,12 @@ const _: () = assert!(USER_STACK_VA % GRANULE == 0);
 const _: () = assert!(USER_STACK_GUARD_VA % GRANULE == 0);
 
 /// A multi-group first-fit window for explicitly authorized user MMIO and DMA
-/// mappings. Four L2 groups (8 MiB) are required by the display path: the
-/// visible framebuffer and one offscreen surface are ~2.8 MiB each, so a
-/// single 2 MiB group cannot hold even the framebuffer alone.
+/// mappings. Eight L2 groups (16 MiB) cover the display path with headroom:
+/// the compositor owns a ~2.8 MiB framebuffer, a ~2.8 MiB legacy offscreen
+/// surface, and maps a ~2.8 MiB client surface for zero-copy scanout.
 pub const USER_MMIO_VA: usize = USER_IMAGE_VA + 0x4000_0000;
-const USER_MMIO_L2_GROUPS: usize = 4;
-const _: () = assert!(USER_MMIO_L2_GROUPS >= 4);
+const USER_MMIO_L2_GROUPS: usize = 8;
+const _: () = assert!(USER_MMIO_L2_GROUPS >= 8);
 pub const USER_DMA_MAX_SIZE: usize = ENTRIES * GRANULE * USER_MMIO_L2_GROUPS;
 const USER_MMIO_L1_INDEX: usize = (USER_MMIO_VA >> 30) & 0x1FF;
 const USER_MMIO_L2_INDEX: usize = 0;
@@ -1594,7 +1594,7 @@ pub fn map_shared_dma_to_user(
     checked_range_end(phys_addr, size, DRAM_BASE, DRAM_END)?;
     let (physical_start, physical_offset, page_count) =
         aligned_page_span(phys_addr, size, GRANULE)?;
-    // Shared mappings use the same four-group window as owner mappings. The
+    // Shared mappings use the same multi-group window as owner mappings. The
     // earlier one-group bound silently rejected every full-size display
     // surface (710 pages), so cross-task sharing could never work.
     if page_count > ENTRIES * USER_MMIO_L2_GROUPS {
@@ -1606,6 +1606,29 @@ pub fn map_shared_dma_to_user(
         page_count,
         physical_offset,
         user_dma_page,
+    )
+}
+
+/// Read-only variant of [`map_shared_dma_to_user`] for surfaces. The grantee
+/// can read the pixels (and a display controller can scan them out) but an
+/// EL0 store faults instead of silently corrupting the owner's buffer.
+pub fn map_shared_dma_ro_to_user(
+    task: &crate::scheduler::Task,
+    phys_addr: usize,
+    size: usize,
+) -> Option<usize> {
+    checked_range_end(phys_addr, size, DRAM_BASE, DRAM_END)?;
+    let (physical_start, physical_offset, page_count) =
+        aligned_page_span(phys_addr, size, GRANULE)?;
+    if page_count > ENTRIES * USER_MMIO_L2_GROUPS {
+        return None;
+    }
+    map_user_pages(
+        task.ttbr0,
+        physical_start,
+        page_count,
+        physical_offset,
+        user_dma_ro_page,
     )
 }
 
@@ -1919,7 +1942,7 @@ pub fn run_self_test() -> bool {
 /// Proves the enlarged user DMA window really spans more than one 2 MiB L2
 /// group and that an oversized request is refused without side effects. The
 /// display path needs two ~2.8 MiB surfaces, which only fits because the
-/// first-fit allocator walks all four groups.
+/// first-fit allocator walks every group.
 ///
 /// This runs on every platform, including fog, so a device boot that reaches
 /// this point has exercised the same multi-group mapping arithmetic the
@@ -2464,6 +2487,20 @@ fn user_dma_page(output_address: usize) -> u64 {
         | DESC_PAGE
         | (ATTR_NORMAL_NC << 2)
         | AP_EL0_RW
+        | SH_INNER
+        | AF
+        | UXN
+        | PXN
+}
+
+/// Read-only DMA alias for a surface shared with another task (for example a
+/// compositor scanning a client-owned buffer). EL0 may read the pixels but
+/// cannot modify them; the owner keeps its writable alias.
+fn user_dma_ro_page(output_address: usize) -> u64 {
+    descriptor_address(output_address as u64)
+        | DESC_PAGE
+        | (ATTR_NORMAL_NC << 2)
+        | AP_BOTH_RO
         | SH_INNER
         | AF
         | UXN

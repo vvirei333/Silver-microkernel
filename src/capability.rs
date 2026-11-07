@@ -27,11 +27,17 @@ pub const CAP_FS_WRITE: u32 = 1 << 9;
 /// [`CapTable::has_target_rights`] / [`CapTable::grant`].
 pub const CAP_TARGET_BITS: u32 = CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME;
 
+/// Create and share kernel display surfaces (`SYS_SURFACE_*`). Deliberately
+/// separate from `CAP_MMIO`: a UI process needs a scanout buffer, not raw
+/// device registers. Kept out of [`CAP_ALL`] like the other trusted-only
+/// rights, so a spawn handle never becomes this privilege.
+pub const CAP_SURFACE: u32 = 1 << 10;
+
 /// Rights that describe a process-wide/system privilege of the holder. Such a
 /// right is held only by a self-capability (`target_task == own id`), never by
 /// a handle on another task.
 pub const CAP_GLOBAL_BITS: u32 =
-    CAP_MMIO | CAP_IRQ | CAP_PCI | CAP_MOUNT | CAP_POWER | CAP_FS_WRITE;
+    CAP_MMIO | CAP_IRQ | CAP_PCI | CAP_MOUNT | CAP_POWER | CAP_FS_WRITE | CAP_SURFACE;
 
 pub const CAP_ALL: u32 = CAP_KILL
     | CAP_WAIT

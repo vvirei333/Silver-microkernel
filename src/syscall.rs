@@ -9,7 +9,7 @@
 //! exceptions that overwrite the CPU-global ELR_EL1/SPSR_EL1 registers.
 //! The per-task stack copy is what makes eret land back in the right task.
 
-use alloc::{format, string::String, vec, vec::Vec};
+use alloc::{format, vec, vec::Vec};
 
 use crate::{
     capability, channel, elf, frame_allocator, ipc, memory, mmu, mutex, console, scheduler, timer,
@@ -80,6 +80,11 @@ pub const SYS_MEMINFO_V2: u64 = 85;
 pub const SYS_HEALTH: u64 = 86;
 pub const SYS_FS_REPLACE: u64 = 87;
 pub const SYS_FS_USAGE: u64 = 88;
+pub const SYS_SURFACE_CREATE: u64 = 89;
+pub const SYS_SURFACE_GRANT: u64 = 90;
+pub const SYS_SURFACE_MAP: u64 = 91;
+pub const SYS_SURFACE_REVOKE: u64 = 92;
+pub const SYS_SURFACE_SCANOUT: u64 = 93;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -294,6 +299,43 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_FS_RENAME => sys_fs_rename(frame[0], frame[1]),
         SYS_FS_REPLACE => sys_fs_replace(frame[0], frame[1]),
         SYS_FS_USAGE => sys_fs_usage(frame[0], frame[1]),
+        SYS_SURFACE_CREATE => match scheduler::create_surface(frame[0] as u32, frame[1] as u32) {
+            Some((id, virtual_address)) => {
+                frame[1] = id;
+                virtual_address as u64
+            }
+            None => SYSCALL_ERROR,
+        },
+        SYS_SURFACE_GRANT => {
+            if scheduler::grant_surface(frame[0], frame[1], frame[2] as u32) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
+        SYS_SURFACE_MAP => match scheduler::map_surface(frame[0]) {
+            Some((virtual_address, physical_address, owner, dimensions)) => {
+                frame[1] = physical_address as u64;
+                frame[2] = owner;
+                frame[3] = dimensions;
+                virtual_address as u64
+            }
+            None => SYSCALL_ERROR,
+        },
+        SYS_SURFACE_REVOKE => {
+            if scheduler::revoke_surface(frame[0], frame[1]) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
+        SYS_SURFACE_SCANOUT => {
+            if scheduler::set_surface_scanout(frame[0], frame[1] != 0) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
         SYS_CAP_GET_TASK_ID => scheduler::capability_task_id(frame[0]).unwrap_or(SYSCALL_ERROR),
         SYS_CAP_GRANT => {
             if scheduler::grant_capability(frame[0], frame[1], frame[2] as u32) {
@@ -328,7 +370,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             }
         }
         SYS_ALLOC_DMA => match scheduler::alloc_dma_for_current(frame[0] as usize) {
-            Some((virtual_address, physical_address)) => {
+            Some((virtual_address, physical_address, _generation)) => {
                 frame[1] = physical_address as u64;
                 virtual_address as u64
             }

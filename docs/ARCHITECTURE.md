@@ -148,8 +148,11 @@ API — C++ с C-обёрткой, чтобы приложения на друг
 | менеджер сервисов        | silverd                                  |
 
 Ядро уже умеет: capability на MMIO/PCI, проверку прав в syscall, изоляцию
-адресных пространств и проверку Ed25519-подписи бандла. Дальше — профили
-(например, «приложение не может в `CAP_PCI`») и ротация ключей.
+адресных пространств и проверку Ed25519-подписи бандла. Surface-объекты
+выдаются отдельной capability `CAP_SURFACE` (не `CAP_MMIO`); чужая
+поверхность маппится только read-only и только после явного grant, а кадры,
+которые может сканировать дисплей, ядро не возвращает в аллокатор. Дальше —
+профили (например, «приложение не может в `CAP_PCI`») и ротация ключей.
 
 ## 5. Цепочка загрузки
 
@@ -173,7 +176,15 @@ API — C++ с C-обёрткой, чтобы приложения на друг
   DMA-буфер, публикация одним проходом; SilverHome уже использует этот режим;
 - fence: `PRESENT` несёт sequence number, compositor отвечает `FENCE_DONE`
   после публикации кадра; доставка сейчас best-effort через `try_send`,
-  для zero-copy понадобится kernel fence-объект;
+  отдельный kernel fence-объект остаётся следующим шагом;
+- kernel surface object: `SYS_SURFACE_CREATE/GRANT/MAP/REVOKE/SCANOUT` —
+  поверхность принадлежит процессу, выдаётся другому только на чтение,
+  владелец проверяется ядром, кадры нельзя вернуть в аллокатор, пока
+  устройство может их сканировать (`SCANOUT` + pin/leak при смерти);
+- zero-copy present: SilverHome рисует пиксели прямо в свою поверхность
+  (Normal Non-Cacheable, без копирования), композитор переключает ramfb на
+  неё через `GUI_SURFACE_ATTACH`; приложения по-прежнему используют
+  command-stream + blit;
 - SilverHome: сетка 4×5, док, подсветка нажатия, экраны-заглушки;
 - встроенные приложения: Calc, Gallery, Notes — отдельные EL0-процессы,
   лежат в `/sfs/apps` и запускаются SilverHome через `SYS_SPAWN_PATH`;
@@ -197,33 +208,33 @@ API — C++ с C-обёрткой, чтобы приложения на друг
 - `SYS_MEMINFO_V2`: versioned resource snapshot (frames, heap, mmap, DMA,
   capabilities, open files);
 - `SYS_HEALTH` и команда `health`: свободные frames, live/zombie tasks,
-+  открытые файлы, DMA leaks/quarantine, uptime;
+  открытые файлы, DMA leaks/quarantine, uptime;
 - lifecycle cleanup для address space, DMA, heap, mmap, descriptors и caps.
 
 Нет (следующие шаги):
 
-1. surface как объект IPC с检出 владельца; offscreen + `PRESENT` уже есть,
-   осталась zero-copy передача DMA-поверхности между процессами;
+1. kernel fence-объект с гарантированной доставкой и ожиданием;
 2. сервис событий: очередь событий, фокус, запуск приложений;
 3. квоты SFS по bundle/prefix и metadata journal;
 4. фреймворк-слой: `View/Layer`, ресурсы, шрифты;
-5. подпись ELF-бандлов, проверка хэша и безопасные atomic updates;
+5. `SYS_SURFACE_DESTROY` и повторное использование поверхностей приложениями;
 6. C++-shim для драйверов и сервисов.
 
 ## 7. Дорожная карта
 
 - **M1 (сделано):** SFS в ядре, монтирование `/sfs`, запись и персистентность.
-- **M2 (сделано, v1):** композитор в `gpu_driver`: draw-ops от клиента,
-  forward тач-сэмплов владельцу экрана. Следующая версия — поверхность как
-  объект IPC и один `PRESENT` на кадр.
+- **M2 (сделано, v2):** композитор в `gpu_driver`: draw-ops от клиента,
+  forward тач-сэмплов владельцу экрана, kernel surface objects и zero-copy
+  present для SilverHome. Приложения пока рисуют через command-stream.
 - **M3:** сервис событий: очередь событий, фокус, запуск/остановка задач.
 - **M4 (сделано, v1):** SilverHome: сетка 4×5, док, подсветка, экраны
   приложений, встроенные Calc/Gallery/Notes.
-- **M5 (частично):** `app.elf` грузится из VFS по пути и живёт отдельным
-  процессом; write-scope манифеста уже работает, остаются подпись и обновления.
+- **M5 (сделано, v2):** `app.elf` грузится из VFS по пути и живёт отдельным
+  процессом; write-scope, квоты, SHA-256, Ed25519-подпись и atomic replace
+  работают.
 - **M6:** C++-фреймворк (View/Layer/таймеры) и первый сторонний апплет.
-- **M7 (частично):** capability + manifest write-scope + resource diagnostics;
-  остаются SFS quotas, расширенные профили и подпись.
+- **M7 (частично):** capability + manifest policy + resource diagnostics +
+  surface capability; остаются расширенные профили и ротация ключей.
 
 ### Инварианты SFS (ядро)
 

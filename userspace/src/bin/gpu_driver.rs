@@ -99,6 +99,14 @@ static mut FRAMEBUFFER: Option<Framebuffer> = None;
 static mut SURFACE: Option<Framebuffer> = None;
 static SURFACE_ACTIVE: AtomicU64 = AtomicU64::new(0);
 
+/// fw_cfg handles needed to re-point ramfb at a client-owned surface.
+/// `(fw_cfg_vaddr, scratch_vaddr, scratch_paddr, selector)`.
+static mut FW_CFG: Option<(u64, u64, u64, u16)> = None;
+/// Physical address of the compositor's own framebuffer.
+static mut FRAMEBUFFER_PADDR: u64 = 0;
+/// Surface id currently scanned out by ramfb (0 = the compositor framebuffer).
+static SCANOUT_SURFACE: AtomicU64 = AtomicU64::new(0);
+
 /// Live pointer state, updated from [`input_proto::InputMsg`] samples.
 #[derive(Copy, Clone)]
 struct UiState {
@@ -178,6 +186,9 @@ const GUI_SURFACE_PRESENT: u8 = 0x17;
 const GUI_SURFACE_ABORT: u8 = 0x18;
 /// Compositor -> client: the frame with this sequence is visible.
 const GUI_FENCE_DONE: u8 = 0x19;
+/// Present a client-owned kernel surface directly (zero-copy scanout).
+/// Payload: surface id (u64 LE) then sequence (u64 LE).
+const GUI_SURFACE_ATTACH: u8 = 0x1A;
 
 
 #[no_mangle]
@@ -234,6 +245,10 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         ramfb_selector,
         fb_paddr,
     );
+    unsafe {
+        FW_CFG = Some((fw_vaddr, scratch_vaddr, scratch_paddr, ramfb_selector));
+        FRAMEBUFFER_PADDR = fb_paddr;
+    }
 
     syscall::print("GPU DRIVER: FRAMEBUFFER 0x");
     syscall::print_hex_u64(fb_paddr);
@@ -318,6 +333,9 @@ fn handoff_ui(sender: u64, target: u64) {
         return;
     }
     SURFACE_ACTIVE.store(0, Ordering::Relaxed);
+    // The app that receives the screen draws through the legacy path, which
+    // blits into the compositor framebuffer.
+    switch_to_framebuffer();
     UI_OWNER.store(if target == 0 { host } else { target }, Ordering::Release);
 }
 
@@ -325,6 +343,66 @@ fn release_ui(sender: u64) {
     let host = UI_HOST.load(Ordering::Acquire);
     SURFACE_ACTIVE.store(0, Ordering::Relaxed);
     let _ = UI_OWNER.compare_exchange(sender, host, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// Re-points ramfb at the compositor's own framebuffer if a client surface
+/// was the scanout buffer. Legacy draw ops and app handoffs need this so they
+/// are not painted into memory the display is no longer reading.
+fn switch_to_framebuffer() {
+    let previous = SCANOUT_SURFACE.swap(0, Ordering::AcqRel);
+    if previous == 0 {
+        return;
+    }
+    let _ = syscall::surface_scanout(previous, false);
+    if let Some((fw, scratch, scratch_paddr, selector)) = unsafe { FW_CFG } {
+        let paddr = unsafe { FRAMEBUFFER_PADDR };
+        configure_ramfb(fw, scratch, scratch_paddr, selector, paddr);
+    }
+}
+
+/// Makes a client-owned surface the scanout buffer. The surface must have
+/// been granted to the compositor with the scanout right; its owner must be
+/// the task that sent the attach, and its geometry must match the panel.
+fn attach_surface(sender: u64, id: u64, seq: u64) {
+    if SCANOUT_SURFACE.load(Ordering::Acquire) == id {
+        // Already scanning this surface; a redraw needs no fw_cfg write.
+        send_fence(sender, seq, true);
+        return;
+    }
+    let Some(mapping) = syscall::surface_map(id) else {
+        send_fence(sender, seq, false);
+        return;
+    };
+    if mapping.owner != sender
+        || mapping.width != SCREEN_WIDTH
+        || mapping.height != SCREEN_HEIGHT
+        || mapping.physical_address == 0
+    {
+        send_fence(sender, seq, false);
+        return;
+    }
+    let previous = SCANOUT_SURFACE.load(Ordering::Acquire);
+    if previous != 0 && previous != id {
+        let _ = syscall::surface_scanout(previous, false);
+    }
+    if !syscall::surface_scanout(id, true) {
+        send_fence(sender, seq, false);
+        return;
+    }
+    let Some((fw, scratch, scratch_paddr, selector)) = (unsafe { FW_CFG }) else {
+        let _ = syscall::surface_scanout(id, false);
+        send_fence(sender, seq, false);
+        return;
+    };
+    configure_ramfb(
+        fw,
+        scratch,
+        scratch_paddr,
+        selector,
+        mapping.physical_address,
+    );
+    SCANOUT_SURFACE.store(id, Ordering::Release);
+    send_fence(sender, seq, true);
 }
 
 /// Handles one compositor request. Returns true when the message was a draw
@@ -354,13 +432,31 @@ fn handle_compositor_request(message: &ipc::Message) -> bool {
             | GUI_SURFACE_BEGIN
             | GUI_SURFACE_PRESENT
             | GUI_SURFACE_ABORT
+            | GUI_SURFACE_ATTACH
     ) {
         return false;
     }
     if !claim_ui(message.sender) {
         return true;
     }
+    // Any legacy draw or present means the compositor framebuffer is the
+    // target again; re-point ramfb before writing pixels.
+    if payload[0] != GUI_SURFACE_ATTACH {
+        switch_to_framebuffer();
+    }
     match payload[0] {
+        GUI_SURFACE_ATTACH => {
+            let id = u64::from_le_bytes([
+                payload[1], payload[2], payload[3], payload[4], payload[5], payload[6], payload[7],
+                payload[8],
+            ]);
+            let seq = u64::from_le_bytes([
+                payload[9], payload[10], payload[11], payload[12], payload[13], payload[14],
+                payload[15], payload[16],
+            ]);
+            attach_surface(message.sender, id, seq);
+            true
+        }
         GUI_SURFACE_BEGIN => {
             if unsafe { (*core::ptr::addr_of!(SURFACE)).is_some() } {
                 SURFACE_ACTIVE.store(1, Ordering::Relaxed);
