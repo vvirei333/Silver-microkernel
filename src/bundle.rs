@@ -20,10 +20,16 @@ pub struct BundlePolicy {
     pub quota: Option<(u32, u32)>,
     pub hash: Option<[u8; 32]>,
     pub signature: Option<[u8; 64]>,
+    /// A recognised directive was malformed. The bundle is refused rather
+    /// than silently dropping the constraint (a bad `quota=` must never turn
+    /// into an unbounded app).
+    pub invalid: bool,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum VerifyError {
+    /// A recognised directive could not be parsed.
+    InvalidPolicy,
     /// A trusted key is provisioned but the manifest has no digest at all.
     MissingDigest,
     /// The ELF bytes do not match `sha256=`.
@@ -59,14 +65,16 @@ pub fn parse_manifest(text: &str) -> BundlePolicy {
             continue;
         }
         if let Some(hash) = line.strip_prefix("sha256=") {
-            if let Some(digest) = sha256::parse_hex(hash.trim()) {
-                policy.hash = Some(digest);
+            match sha256::parse_hex(hash.trim()) {
+                Some(digest) => policy.hash = Some(digest),
+                None => policy.invalid = true,
             }
             continue;
         }
         if let Some(signature) = line.strip_prefix("sig=") {
-            if let Some(bytes) = bundle_sig::parse_signature(signature.trim()) {
-                policy.signature = Some(bytes);
+            match bundle_sig::parse_signature(signature.trim()) {
+                Some(bytes) => policy.signature = Some(bytes),
+                None => policy.invalid = true,
             }
             continue;
         }
@@ -75,13 +83,17 @@ pub fn parse_manifest(text: &str) -> BundlePolicy {
             let (Some(blocks), Some(inodes), None) =
                 (parts.next(), parts.next(), parts.next())
             else {
+                policy.invalid = true;
                 continue;
             };
             let (Ok(blocks), Ok(inodes)) = (blocks.parse::<u32>(), inodes.parse::<u32>()) else {
+                policy.invalid = true;
                 continue;
             };
             if blocks > 0 && inodes > 0 {
                 policy.quota = Some((blocks, inodes));
+            } else {
+                policy.invalid = true;
             }
         }
     }
@@ -103,6 +115,9 @@ pub fn verify(
     policy: &BundlePolicy,
     trusted: Option<[u8; 32]>,
 ) -> Result<(), VerifyError> {
+    if policy.invalid {
+        return Err(VerifyError::InvalidPolicy);
+    }
     match trusted {
         Some(key) => {
             let Some(expected) = policy.hash else {
@@ -187,13 +202,26 @@ mod tests {
     #[test]
     fn unsigned_bundle_is_accepted_without_a_key() {
         let bundle = b"elf";
-        let policy = parse_manifest("sha256=");
-        assert_eq!(verify(bundle, &policy, None), Ok(()));
+        assert_eq!(verify(bundle, &BundlePolicy::default(), None), Ok(()));
         let hashed = parse_manifest(&alloc::format!(
             "sha256={}\n",
             hex(&sha256::digest(bundle))
         ));
         assert_eq!(verify(bundle, &hashed, None), Ok(()));
+    }
+
+    #[test]
+    fn malformed_policy_directives_are_refused() {
+        // A broken quota must never degrade into "no quota".
+        let policy = parse_manifest("write=/sfs/demo\nquota=8\n");
+        assert!(policy.invalid);
+        assert_eq!(
+            verify(b"elf", &policy, None),
+            Err(VerifyError::InvalidPolicy)
+        );
+        // Malformed digest and signature claims are refused even unkeyed.
+        assert!(parse_manifest("sha256=xyz\n").invalid);
+        assert!(parse_manifest(&alloc::format!("sig={}\n", "0".repeat(127))).invalid);
     }
 
     #[test]

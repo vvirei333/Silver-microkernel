@@ -369,6 +369,12 @@ fn draw_status_bar(gpu: u64) {
 /// Sends a kernel surface to the compositor for direct scanout. Payload:
 /// opcode, surface id (u64 LE), fence sequence (u64 LE).
 fn attach_surface(gpu: u64, id: u64, seq: u64) {
+    // Publish the pixels before the compositor points the display at them.
+    // The surface is Normal Non-Cacheable, but a DSB still orders the stores
+    // against the later fw_cfg scanout update on real hardware.
+    unsafe {
+        core::arch::asm!("dsb sy", options(nostack));
+    }
     let mut payload = [0_u8; 17];
     payload[0] = GUI_SURFACE_ATTACH;
     payload[1..9].copy_from_slice(&id.to_le_bytes());

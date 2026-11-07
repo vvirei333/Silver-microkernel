@@ -1432,7 +1432,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     // TLB proof: read through TTBR0, remap the same VA to another frame and
     // read again. Fails closed if the flush did not change the translation.
-    if false && !mmu::run_tlb_self_test() {
+    if !mmu::run_tlb_self_test() {
         exceptions::silver_handle_exception(9, 0, 0, 0);
     }
     ram_log::log("MMU TLB OK");
@@ -1440,7 +1440,7 @@ pub extern "C" fn kernel_main() -> ! {
 
     // ASID isolation: two spaces map the same VA to different frames; two
     // switches without any flush must still return each space's own value.
-    if false && !mmu::run_asid_self_test() {
+    if !mmu::run_asid_self_test() {
         exceptions::silver_handle_exception(9, 0, 0, 0);
     }
     console::write_str("MMU ASID OK\r\n");
@@ -1450,7 +1450,7 @@ pub extern "C" fn kernel_main() -> ! {
     // Heap-L3 persistence: emptying the heap through the generic unmap must
     // not free the table, and the next heap map must land in the same slot
     // instead of writing through a zero descriptor.
-    if false && !mmu::run_heap_table_self_test() {
+    if !mmu::run_heap_table_self_test() {
         exceptions::silver_handle_exception(9, 0, 0, 0);
     }
     console::write_str("MMU HEAP OK\r\n");
@@ -1458,7 +1458,7 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::fb_progress();
 
     // Recycled DMA frames must be zero before EL0 can read them.
-    if false && !mmu::run_dma_zero_self_test() {
+    if !mmu::run_dma_zero_self_test() {
         exceptions::silver_handle_exception(9, 0, 0, 0);
     }
     console::write_str("DMA ZERO OK\r\n");

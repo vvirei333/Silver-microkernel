@@ -715,7 +715,7 @@ fn configure_ramfb(
     write_be32(config + 20, SCREEN_HEIGHT);
     write_be32(config + 24, SCREEN_WIDTH * BYTES_PER_PIXEL); // stride (bytes)
 
-    unsafe { core::arch::asm!("dmb sy", options(nostack)) };
+    unsafe { core::arch::asm!("dsb sy", options(nostack)) };
     if !fw_cfg_write(fw_vaddr, scratch_vaddr, scratch_paddr, selector, 28) {
         syscall::print("GPU DRIVER: RAMFB CONFIG WRITE REJECTED\r\n");
     }
