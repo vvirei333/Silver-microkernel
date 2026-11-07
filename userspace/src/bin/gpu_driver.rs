@@ -93,6 +93,12 @@ struct Framebuffer {
 
 static mut FRAMEBUFFER: Option<Framebuffer> = None;
 
+/// Optional offscreen frame used by `GUI_SURFACE_BEGIN`/`PRESENT`. When
+/// present, draw opcodes target this buffer; `PRESENT` copies it to the
+/// visible framebuffer in one pass.
+static mut SURFACE: Option<Framebuffer> = None;
+static SURFACE_ACTIVE: AtomicU64 = AtomicU64::new(0);
+
 /// Live pointer state, updated from [`input_proto::InputMsg`] samples.
 #[derive(Copy, Clone)]
 struct UiState {
@@ -164,6 +170,12 @@ const GUI_POINTER: u8 = 0x13;
 /// Host -> compositor: hand the screen to another task (u64 task id, 0 = the
 /// host itself). Only the host may send this.
 const GUI_HANDOFF: u8 = 0x15;
+/// Start recording draw ops into the offscreen surface (payload: colour).
+const GUI_SURFACE_BEGIN: u8 = 0x16;
+/// Publish the offscreen surface to the visible framebuffer.
+const GUI_SURFACE_PRESENT: u8 = 0x17;
+/// Discard the offscreen surface and return to immediate drawing.
+const GUI_SURFACE_ABORT: u8 = 0x18;
 
 
 #[no_mangle]
@@ -185,6 +197,18 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     let Some((scratch_vaddr, scratch_paddr)) = syscall::alloc_dma(SCRATCH_SIZE) else {
         fail("GPU DRIVER: SCRATCH ALLOCATION FAILED\r\n");
     };
+    // Offscreen surface for atomic PRESENT. A second full-size DMA buffer is
+    // optional: if the ledger refuses it, drawing stays immediate and correct.
+    if let Some((surface_vaddr, _)) = syscall::alloc_dma(SCREEN_BYTES) {
+        unsafe {
+            SURFACE = Some(Framebuffer {
+                vaddr: surface_vaddr,
+                width: SCREEN_WIDTH,
+                height: SCREEN_HEIGHT,
+            });
+        }
+        syscall::print("COMPOSITOR: SURFACE READY\r\n");
+    }
 
     unsafe {
         FRAMEBUFFER = Some(Framebuffer {
@@ -291,11 +315,13 @@ fn handoff_ui(sender: u64, target: u64) {
     if host == 0 || sender != host {
         return;
     }
+    SURFACE_ACTIVE.store(0, Ordering::Relaxed);
     UI_OWNER.store(if target == 0 { host } else { target }, Ordering::Release);
 }
 
 fn release_ui(sender: u64) {
     let host = UI_HOST.load(Ordering::Acquire);
+    SURFACE_ACTIVE.store(0, Ordering::Relaxed);
     let _ = UI_OWNER.compare_exchange(sender, host, Ordering::AcqRel, Ordering::Acquire);
 }
 
@@ -319,7 +345,13 @@ fn handle_compositor_request(message: &ipc::Message) -> bool {
     // shell notifications keep their own paths.
     if !matches!(
         payload[0],
-        GUI_CLEAR | GUI_RECT | GUI_TEXT | GUI_TEXT_SCALED
+        GUI_CLEAR
+            | GUI_RECT
+            | GUI_TEXT
+            | GUI_TEXT_SCALED
+            | GUI_SURFACE_BEGIN
+            | GUI_SURFACE_PRESENT
+            | GUI_SURFACE_ABORT
     ) {
         return false;
     }
@@ -327,6 +359,23 @@ fn handle_compositor_request(message: &ipc::Message) -> bool {
         return true;
     }
     match payload[0] {
+        GUI_SURFACE_BEGIN => {
+            if unsafe { (*core::ptr::addr_of!(SURFACE)).is_some() } {
+                SURFACE_ACTIVE.store(1, Ordering::Relaxed);
+                let color =
+                    u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
+                clear_screen(color);
+            }
+            true
+        }
+        GUI_SURFACE_PRESENT => {
+            present_surface();
+            true
+        }
+        GUI_SURFACE_ABORT => {
+            SURFACE_ACTIVE.store(0, Ordering::Relaxed);
+            true
+        }
         GUI_CLEAR => {
             let color = u32::from_le_bytes([payload[1], payload[2], payload[3], payload[4]]);
             clear_screen(color);
@@ -365,7 +414,7 @@ fn handle_compositor_request(message: &ipc::Message) -> bool {
 }
 
 fn fill_solid(x: u32, y: u32, w: u32, h: u32, color: u32) {
-    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+    let Some(framebuffer) = target() else {
         return;
     };
     let end_x = x.saturating_add(w).min(framebuffer.width);
@@ -605,9 +654,42 @@ fn write_be64(addr: u64, value: u64) {
 // Drawing
 // ---------------------------------------------------------------------------
 
+/// The buffer draw opcodes should target: the offscreen surface while a
+/// surface transaction is active, otherwise the visible framebuffer.
+fn target() -> Option<Framebuffer> {
+    if SURFACE_ACTIVE.load(Ordering::Relaxed) != 0 {
+        if let Some(surface) = unsafe { *core::ptr::addr_of!(SURFACE) } {
+            return Some(surface);
+        }
+    }
+    unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }
+}
+
+/// Publishes the offscreen surface. Returns false when no surface exists.
+fn present_surface() -> bool {
+    let Some(surface) = (unsafe { *core::ptr::addr_of!(SURFACE) }) else {
+        return false;
+    };
+    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+        return false;
+    };
+    if surface.width != framebuffer.width || surface.height != framebuffer.height {
+        return false;
+    }
+    let pixels = framebuffer.width as usize * framebuffer.height as usize;
+    for index in 0..pixels {
+        let color = unsafe { core::ptr::read_volatile((surface.vaddr as *const u32).add(index)) };
+        unsafe {
+            core::ptr::write_volatile((framebuffer.vaddr as *mut u32).add(index), color);
+        }
+    }
+    SURFACE_ACTIVE.store(0, Ordering::Relaxed);
+    true
+}
+
 /// Fills the whole screen with `color`.
 fn clear_screen(color: u32) {
-    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+    let Some(framebuffer) = target() else {
         return;
     };
     for py in 0..framebuffer.height {
@@ -620,7 +702,7 @@ fn clear_screen(color: u32) {
 /// Draws a rectangle with a 1-pixel border. The interior is `fill_color` and
 /// the perimeter is `border_color`.
 fn draw_rect(x: u32, y: u32, w: u32, h: u32, fill_color: u32, border_color: u32) {
-    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+    let Some(framebuffer) = target() else {
         return;
     };
     if w == 0 || h == 0 {
@@ -652,7 +734,7 @@ fn draw_text_centered(center_x: u32, y: u32, text: &str, color: u32) {
 }
 
 fn draw_text_scaled(x: u32, y: u32, text: &str, color: u32, scale: u32) {
-    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+    let Some(framebuffer) = target() else {
         return;
     };
     for (index, byte) in text.bytes().enumerate() {
@@ -683,7 +765,7 @@ fn draw_text_centered_scaled(center_x: u32, y: u32, text: &str, color: u32, scal
 }
 
 fn draw_char(x: u32, y: u32, byte: u8, color: u32) {
-    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+    let Some(framebuffer) = target() else {
         return;
     };
     let index = match byte {
@@ -718,7 +800,7 @@ fn plot(framebuffer: Framebuffer, x: u32, y: u32, color: u32) {
 
 /// Draws one rounded square (radius corners) with a 2 px darker border.
 fn draw_icon(x: u32, y: u32, size: u32, color: u32) {
-    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+    let Some(framebuffer) = target() else {
         return;
     };
     let radius = 18_i32;
@@ -760,7 +842,7 @@ fn dock_rect(slot: usize) -> (u32, u32) {
 
 /// Paints the home screen: wallpaper, status bar, app grid and dock.
 fn draw_home(pressed_app: Option<usize>) {
-    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+    let Some(framebuffer) = target() else {
         return;
     };
 
@@ -853,7 +935,7 @@ fn draw_cursor(x: u16, y: u16) {
         0b1111_1110,
         0b1111_1111,
     ];
-    let Some(framebuffer) = (unsafe { *core::ptr::addr_of!(FRAMEBUFFER) }) else {
+    let Some(framebuffer) = target() else {
         return;
     };
     for row in 0..8_u32 {

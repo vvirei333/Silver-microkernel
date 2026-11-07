@@ -59,6 +59,8 @@ const GUI_TEXT: u8 = 0x12;
 const GUI_TEXT_SCALED: u8 = 0x14;
 const GUI_POINTER: u8 = 0x13;
 const GUI_HANDOFF: u8 = 0x15;
+const GUI_SURFACE_BEGIN: u8 = 0x16;
+const GUI_SURFACE_PRESENT: u8 = 0x17;
 const GUI_BUTTON_PRESSED: u8 = 2;
 
 #[derive(Copy, Clone)]
@@ -192,6 +194,17 @@ fn clear(gpu: u64, color: u32) {
     send(gpu, &payload);
 }
 
+fn surface_begin(gpu: u64, color: u32) {
+    let mut payload = [0_u8; 5];
+    payload[0] = GUI_SURFACE_BEGIN;
+    payload[1..5].copy_from_slice(&color.to_le_bytes());
+    send(gpu, &payload);
+}
+
+fn surface_present(gpu: u64) {
+    send(gpu, &[GUI_SURFACE_PRESENT]);
+}
+
 fn rect(gpu: u64, x: u32, y: u32, w: u32, h: u32, color: u32) {
     let mut payload = [0_u8; 13];
     payload[0] = GUI_RECT;
@@ -275,6 +288,7 @@ fn draw_status_bar(gpu: u64) {
 }
 
 fn draw_home(gpu: u64, pressed: Option<usize>) {
+    surface_begin(gpu, COLOR_BLACK);
     let bands = 16_u32;
     for band in 0..bands {
         let t = band * 255 / bands;
@@ -320,6 +334,7 @@ fn draw_home(gpu: u64, pressed: Option<usize>) {
         rect(gpu, x, y, DOCK_ICON, DOCK_ICON, shade(APP_COLORS[app]));
         rect(gpu, x + 2, y + 2, DOCK_ICON - 4, DOCK_ICON - 4, face);
     }
+    surface_present(gpu);
 }
 
 fn app_at(x: u32, y: u32) -> Option<usize> {

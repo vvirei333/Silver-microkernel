@@ -205,7 +205,7 @@ const _: () = assert!(USER_STACK_GUARD_VA % GRANULE == 0);
 
 /// A 2 MB first-fit window for explicitly authorized user MMIO and DMA mappings.
 pub const USER_MMIO_VA: usize = USER_IMAGE_VA + 0x4000_0000;
-const USER_MMIO_L2_GROUPS: usize = 2;
+const USER_MMIO_L2_GROUPS: usize = 4;
 pub const USER_DMA_MAX_SIZE: usize = ENTRIES * GRANULE * USER_MMIO_L2_GROUPS;
 const USER_MMIO_L1_INDEX: usize = (USER_MMIO_VA >> 30) & 0x1FF;
 const USER_MMIO_L2_INDEX: usize = 0;

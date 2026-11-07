@@ -13,6 +13,10 @@ pub const GUI_POINTER: u8 = 0x13;
 pub const GUI_TEXT_SCALED: u8 = 0x14;
 /// Host -> compositor: hand the screen to a task id (0 = back to the host).
 pub const GUI_HANDOFF: u8 = 0x15;
+/// Begin an offscreen frame; draw ops are buffered until PRESENT.
+pub const GUI_SURFACE_BEGIN: u8 = 0x16;
+pub const GUI_SURFACE_PRESENT: u8 = 0x17;
+pub const GUI_SURFACE_ABORT: u8 = 0x18;
 
 pub const COLOR_BLACK: u32 = 0xFF00_0000;
 pub const COLOR_WHITE: u32 = 0xFFFF_FFFF;
@@ -41,6 +45,24 @@ fn send(server: u64, payload: &[u8]) {
     let len = payload.len().min(ipc::PAYLOAD_SIZE);
     data[..len].copy_from_slice(&payload[..len]);
     let _ = syscall::try_send(server, &ipc::Message::new(0, &data[..len]));
+}
+
+/// Starts an offscreen frame with a solid background.
+pub fn surface_begin(gpu: u64, color: u32) {
+    let mut payload = [0_u8; 5];
+    payload[0] = GUI_SURFACE_BEGIN;
+    payload[1..5].copy_from_slice(&color.to_le_bytes());
+    send(gpu, &payload);
+}
+
+/// Publishes the buffered frame atomically.
+pub fn surface_present(gpu: u64) {
+    send(gpu, &[GUI_SURFACE_PRESENT]);
+}
+
+/// Drops the buffered frame without publishing it.
+pub fn surface_abort(gpu: u64) {
+    send(gpu, &[GUI_SURFACE_ABORT]);
 }
 
 pub fn clear(gpu: u64, color: u32) {
