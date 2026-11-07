@@ -1783,6 +1783,33 @@ mod tests {
     }
 
     #[test]
+    fn failed_store_keeps_usage_and_allocator_consistent() {
+        let (mut image, mut disk, sb) = make_image(128);
+        seed_root(&mut image, &sb, &mut disk);
+        let empty = [0_u32; DIRECT_BLOCKS];
+        let a = create_inode(&mut image, &sb, &mut disk, sb.root_inode, "a", INODE_KIND_FILE).unwrap();
+        assert!(store(&mut image, &sb, &mut disk, a, &vec![1_u8; 1000], &empty, 0, 0, 0));
+        let before = usage_under(&image, &sb, "").unwrap();
+
+        // Device dies while publishing a larger replacement.
+        disk.fail_from = Some(sb.data_block_start as u64 + 2);
+        let payload = vec![2_u8; 5 * BLOCK_SIZE];
+        assert!(!store(&mut image, &sb, &mut disk, a, &payload, &empty, 0, 0, 0));
+
+        // The published inode is still the old one; failed allocations are
+        // either released or leaked, never charged to the live file.
+        let after = usage_under(&image, &sb, "").unwrap();
+        assert_eq!(after, before);
+        assert!(fsck(&image, &sb).is_ok());
+
+        // Recovery: the same allocator can still publish a new version.
+        disk.fail_from = None;
+        assert!(store(&mut image, &sb, &mut disk, a, &payload, &empty, 0, 0, 0));
+        assert!(fsck(&image, &sb).is_ok());
+        assert_eq!(read_inode_bytes(&image, &sb, a).unwrap(), payload);
+    }
+
+    #[test]
     fn device_failure_leaves_allocator_consistent() {
         let (mut image, mut disk, sb) = make_image(128);
         seed_root(&mut image, &sb, &mut disk);
