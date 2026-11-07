@@ -172,7 +172,8 @@ API — C++ с C-обёрткой, чтобы приложения на друг
 - offscreen surface + атомарный `PRESENT`: клиент рисует кадр в отдельный
   DMA-буфер, публикация одним проходом; SilverHome уже использует этот режим;
 - fence: `PRESENT` несёт sequence number, compositor отвечает `FENCE_DONE`
-  после фактической публикации кадра;
+  после публикации кадра; доставка сейчас best-effort через `try_send`,
+  для zero-copy понадобится kernel fence-объект;
 - SilverHome: сетка 4×5, док, подсветка нажатия, экраны-заглушки;
 - встроенные приложения: Calc, Gallery, Notes — отдельные EL0-процессы,
   лежат в `/sfs/apps` и запускаются SilverHome через `SYS_SPAWN_PATH`;
