@@ -47,6 +47,8 @@ const SYS_SURFACE_GRANT: u64 = 90;
 const SYS_SURFACE_MAP: u64 = 91;
 const SYS_SURFACE_REVOKE: u64 = 92;
 const SYS_SURFACE_SCANOUT: u64 = 93;
+const SYS_DISPLAY_INFO: u64 = 94;
+const SYS_DISPLAY_MAP: u64 = 95;
 const SYS_CONSOLE_SET: u64 = 39;
 const SYS_TASK_RESUME: u64 = 40;
 const SYS_WAIT_EVENT: u64 = 41;
@@ -439,6 +441,58 @@ pub fn surface_revoke(id: u64, target: u64) -> bool {
 /// Declares or releases a surface as the display scanout buffer.
 pub fn surface_scanout(id: u64, enable: bool) -> bool {
     unsafe { syscall2(SYS_SURFACE_SCANOUT, id, u64::from(enable)) == 0 }
+}
+
+/// A platform framebuffer supplied by the bootloader (phone panel). On QEMU
+/// `available` is 0 and the compositor uses `ramfb` instead.
+#[derive(Copy, Clone)]
+#[repr(C)]
+pub struct DisplayInfo {
+    pub version: u64,
+    pub size: u64,
+    pub available: u64,
+    pub base: u64,
+    pub width: u64,
+    pub height: u64,
+    pub stride: u64,
+    pub bytes_per_pixel: u64,
+}
+
+impl DisplayInfo {
+    pub fn present(&self) -> bool {
+        self.available != 0 && self.width != 0 && self.height != 0 && self.stride != 0
+    }
+}
+
+pub fn display_info() -> Option<DisplayInfo> {
+    let mut info = DisplayInfo {
+        version: 0,
+        size: 0,
+        available: 0,
+        base: 0,
+        width: 0,
+        height: 0,
+        stride: 0,
+        bytes_per_pixel: 0,
+    };
+    let result = unsafe {
+        syscall1(
+            SYS_DISPLAY_INFO,
+            &mut info as *mut DisplayInfo as u64,
+        )
+    };
+    if result == 0 {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+/// Maps the platform framebuffer into this task and returns its NC virtual
+/// address. Requires `CAP_SURFACE`; only the registered display carve-out is
+/// accepted by the kernel.
+pub fn display_map() -> Option<u64> {
+    optional_id(unsafe { syscall0(SYS_DISPLAY_MAP) })
 }
 
 pub fn pci_read32(offset: u64) -> Option<u32> {

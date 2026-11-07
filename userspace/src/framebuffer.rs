@@ -10,6 +10,9 @@ pub struct Framebuffer {
     pub vaddr: u64,
     pub width: u32,
     pub height: u32,
+    /// Pixels per row in the backing buffer (surface buffers are contiguous,
+    /// so this normally equals `width`).
+    pub stride: u32,
 }
 
 impl Framebuffer {
@@ -17,7 +20,7 @@ impl Framebuffer {
         if x >= self.width || y >= self.height {
             return;
         }
-        let offset = (u64::from(y) * u64::from(self.width) + u64::from(x)) * 4;
+        let offset = (u64::from(y) * u64::from(self.stride) + u64::from(x)) * 4;
         unsafe {
             core::ptr::write_volatile((self.vaddr + offset) as *mut u32, color);
         }

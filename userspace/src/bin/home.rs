@@ -94,6 +94,11 @@ static mut ZERO_COPY: Option<ZeroCopy> = None;
 /// Allocates and shares the home surfaces. Failure is non-fatal: the caller
 /// falls back to the command-stream compositor path.
 fn init_zero_copy(gpu: u64) {
+    // A platform panel scans one fixed buffer owned by the compositor, so
+    // client-surface scanout is unavailable. Use the command-stream path.
+    if syscall::display_info().is_some_and(|info| info.present()) {
+        return;
+    }
     let mut frames = [None; 2];
     let mut count = 0;
     for slot in 0..2 {
@@ -111,6 +116,7 @@ fn init_zero_copy(gpu: u64) {
                 vaddr,
                 width: SCREEN_WIDTH,
                 height: SCREEN_HEIGHT,
+                stride: SCREEN_WIDTH,
             },
         });
         count += 1;

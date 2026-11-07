@@ -1106,6 +1106,17 @@ pub fn init_fog() {
     let howl_id = spawn_user(user_program::HOWL, 0).expect("howl must start on fog");
     let _ = set_console_owner(howl_id);
 
+    // Experimental phone UI: the compositor takes the bootloader's registered
+    // panel buffer and SilverHome draws through the command stream. Input is
+    // not spawned until a real touch driver exists.
+    #[cfg(feature = "fog-display")]
+    {
+        let _gpu_id = spawn_user(user_program::GPU_DRIVER, 0)
+            .expect("gpu_driver must start on fog-display");
+        let _home_id =
+            spawn_user(user_program::HOME, howl_id).expect("home must start on fog-display");
+    }
+
     finish_init(0);
 }
 
@@ -3643,6 +3654,27 @@ pub fn set_surface_scanout(id: u64, enable: bool) -> bool {
             surface.scanout_holder = None;
         }
         true
+    });
+    interrupts::restore_irq(saved_daif);
+    result
+}
+
+/// Maps the registered platform display buffer into the caller. The frames do
+/// not belong to the frame allocator (they are the bootloader's scanout
+/// carve-out), so no DMA ledger entry is created; task teardown only drops the
+/// page-table aliases.
+pub fn map_display_for_current() -> Option<usize> {
+    let info = crate::display::info()?;
+    let saved_daif = interrupts::save_and_disable_irq();
+    let result = scheduler_manager().and_then(|manager| {
+        let task = manager.tasks.get_mut(smp::current_index())?;
+        if !task
+            .cap_table
+            .has_self_rights(task.id, capability::CAP_SURFACE)
+        {
+            return None;
+        }
+        mmu::map_display_to_user(task, info.base, info.byte_len())
     });
     interrupts::restore_irq(saved_daif);
     result

@@ -89,6 +89,8 @@ struct Framebuffer {
     vaddr: u64,
     width: u32,
     height: u32,
+    /// Pixels per row in the backing buffer (may exceed `width` on a panel).
+    stride: u32,
 }
 
 static mut FRAMEBUFFER: Option<Framebuffer> = None;
@@ -106,6 +108,10 @@ static mut FW_CFG: Option<(u64, u64, u64, u16)> = None;
 static mut FRAMEBUFFER_PADDR: u64 = 0;
 /// Surface id currently scanned out by ramfb (0 = the compositor framebuffer).
 static SCANOUT_SURFACE: AtomicU64 = AtomicU64::new(0);
+/// Non-zero when the display is the bootloader's platform framebuffer. In that
+/// mode the panel scans a fixed physical range and cannot be re-pointed at a
+/// client surface, so `GUI_SURFACE_ATTACH` is refused.
+static PLATFORM_DISPLAY: AtomicU64 = AtomicU64::new(0);
 
 /// Live pointer state, updated from [`input_proto::InputMsg`] samples.
 #[derive(Copy, Clone)]
@@ -201,15 +207,6 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("GPU DRIVER: REGISTER FAILED\r\n");
     }
 
-    let Some((fb_vaddr, fb_paddr)) = syscall::alloc_dma(SCREEN_BYTES) else {
-        fail("GPU DRIVER: FRAMEBUFFER ALLOCATION FAILED\r\n");
-    };
-    let Some(fw_vaddr) = syscall::map_phys(FW_CFG_BASE, 0x1000) else {
-        fail("GPU DRIVER: FW_CFG MAP FAILED\r\n");
-    };
-    let Some((scratch_vaddr, scratch_paddr)) = syscall::alloc_dma(SCRATCH_SIZE) else {
-        fail("GPU DRIVER: SCRATCH ALLOCATION FAILED\r\n");
-    };
     // Offscreen surface for atomic PRESENT. A second full-size DMA buffer is
     // optional: if the ledger refuses it, drawing stays immediate and correct.
     if let Some((surface_vaddr, _)) = syscall::alloc_dma(SCREEN_BYTES) {
@@ -218,45 +215,98 @@ pub extern "C" fn _start(_argument: u64) -> ! {
                 vaddr: surface_vaddr,
                 width: SCREEN_WIDTH,
                 height: SCREEN_HEIGHT,
+                stride: SCREEN_WIDTH,
             });
         }
         syscall::print("COMPOSITOR: SURFACE READY\r\n");
     }
 
-    unsafe {
-        FRAMEBUFFER = Some(Framebuffer {
+    // Two backends: QEMU's `ramfb` (the guest owns the buffer and points the
+    // device at it) or a platform panel buffer registered by the kernel. The
+    // latter is the phone path: the bootloader already configured the panel and
+    // left `cont_splash` in reserved memory.
+    let platform = syscall::display_info().filter(|info| info.present());
+    if let Some(info) = platform {
+        let Some(fb_vaddr) = syscall::display_map() else {
+            fail("GPU DRIVER: PLATFORM DISPLAY MAP FAILED\r\n");
+        };
+        PLATFORM_DISPLAY.store(1, Ordering::Release);
+        // Clear the whole panel once so the bootloader splash does not frame
+        // the 640x1136 UI area. The compositor still draws the app at
+        // SCREEN_WIDTH/HEIGHT; only this initial wipe uses the panel mode.
+        let panel = Framebuffer {
             vaddr: fb_vaddr,
-            width: SCREEN_WIDTH,
-            height: SCREEN_HEIGHT,
-        });
+            width: info.width as u32,
+            height: info.height as u32,
+            stride: info.stride as u32,
+        };
+        for y in 0..panel.height {
+            for x in 0..panel.width {
+                plot(panel, x, y, COLOR_BLACK);
+            }
+        }
+        unsafe {
+            FRAMEBUFFER = Some(Framebuffer {
+                vaddr: fb_vaddr,
+                width: SCREEN_WIDTH,
+                height: SCREEN_HEIGHT,
+                stride: info.stride as u32,
+            });
+        }
+        syscall::print("COMPOSITOR: PLATFORM FRAMEBUFFER ");
+        syscall::print_dec_u64(info.width);
+        syscall::print("x");
+        syscall::print_dec_u64(info.height);
+        syscall::print(" stride=");
+        syscall::print_dec_u64(info.stride);
+        syscall::print("\r\n");
+    } else {
+        let Some((fb_vaddr, fb_paddr)) = syscall::alloc_dma(SCREEN_BYTES) else {
+            fail("GPU DRIVER: FRAMEBUFFER ALLOCATION FAILED\r\n");
+        };
+        let Some(fw_vaddr) = syscall::map_phys(FW_CFG_BASE, 0x1000) else {
+            fail("GPU DRIVER: FW_CFG MAP FAILED\r\n");
+        };
+        let Some((scratch_vaddr, scratch_paddr)) = syscall::alloc_dma(SCRATCH_SIZE) else {
+            fail("GPU DRIVER: SCRATCH ALLOCATION FAILED\r\n");
+        };
+        unsafe {
+            FRAMEBUFFER = Some(Framebuffer {
+                vaddr: fb_vaddr,
+                width: SCREEN_WIDTH,
+                height: SCREEN_HEIGHT,
+                stride: SCREEN_WIDTH,
+            });
+        }
+
+        let Some(ramfb_selector) = find_ramfb_selector(fw_vaddr, scratch_vaddr, scratch_paddr)
+        else {
+            fail("GPU DRIVER: etc/ramfb NOT FOUND\r\n");
+        };
+        syscall::print("GPU DRIVER: etc/ramfb selector 0x");
+        syscall::print_hex_u64(u64::from(ramfb_selector));
+        syscall::print("\r\n");
+
+        configure_ramfb(
+            fw_vaddr,
+            scratch_vaddr,
+            scratch_paddr,
+            ramfb_selector,
+            fb_paddr,
+        );
+        unsafe {
+            FW_CFG = Some((fw_vaddr, scratch_vaddr, scratch_paddr, ramfb_selector));
+            FRAMEBUFFER_PADDR = fb_paddr;
+        }
+
+        syscall::print("GPU DRIVER: FRAMEBUFFER 0x");
+        syscall::print_hex_u64(fb_paddr);
+        syscall::print(" (");
+        syscall::print_dec_u64(u64::from(SCREEN_WIDTH));
+        syscall::print("x");
+        syscall::print_dec_u64(u64::from(SCREEN_HEIGHT));
+        syscall::print(")\r\n");
     }
-
-    let Some(ramfb_selector) = find_ramfb_selector(fw_vaddr, scratch_vaddr, scratch_paddr) else {
-        fail("GPU DRIVER: etc/ramfb NOT FOUND\r\n");
-    };
-    syscall::print("GPU DRIVER: etc/ramfb selector 0x");
-    syscall::print_hex_u64(u64::from(ramfb_selector));
-    syscall::print("\r\n");
-
-    configure_ramfb(
-        fw_vaddr,
-        scratch_vaddr,
-        scratch_paddr,
-        ramfb_selector,
-        fb_paddr,
-    );
-    unsafe {
-        FW_CFG = Some((fw_vaddr, scratch_vaddr, scratch_paddr, ramfb_selector));
-        FRAMEBUFFER_PADDR = fb_paddr;
-    }
-
-    syscall::print("GPU DRIVER: FRAMEBUFFER 0x");
-    syscall::print_hex_u64(fb_paddr);
-    syscall::print(" (");
-    syscall::print_dec_u64(u64::from(SCREEN_WIDTH));
-    syscall::print("x");
-    syscall::print_dec_u64(u64::from(SCREEN_HEIGHT));
-    syscall::print(")\r\n");
 
     clear_screen(COLOR_BLACK);
     syscall::print("COMPOSITOR: READY\r\n");
@@ -364,6 +414,12 @@ fn switch_to_framebuffer() {
 /// been granted to the compositor with the scanout right; its owner must be
 /// the task that sent the attach, and its geometry must match the panel.
 fn attach_surface(sender: u64, id: u64, seq: u64) {
+    // A platform panel scans a fixed physical buffer; the compositor cannot
+    // re-point it at a client surface, so advertise the attach as unsupported.
+    if PLATFORM_DISPLAY.load(Ordering::Acquire) != 0 {
+        send_fence(sender, seq, false);
+        return;
+    }
     if SCANOUT_SURFACE.load(Ordering::Acquire) == id {
         // Already scanning this surface; a redraw needs no fw_cfg write.
         send_fence(sender, seq, true);
@@ -902,7 +958,7 @@ fn plot(framebuffer: Framebuffer, x: u32, y: u32, color: u32) {
     if x >= framebuffer.width || y >= framebuffer.height {
         return;
     }
-    let offset = (u64::from(y) * u64::from(framebuffer.width) + u64::from(x))
+    let offset = (u64::from(y) * u64::from(framebuffer.stride) + u64::from(x))
         * u64::from(BYTES_PER_PIXEL);
     unsafe {
         core::ptr::write_volatile((framebuffer.vaddr + offset) as *mut u32, color);

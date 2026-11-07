@@ -1570,6 +1570,43 @@ pub fn map_dma_to_user_space(ttbr0: usize, phys_addr: usize, size: usize) -> Opt
     map_user_pages(ttbr0, phys_addr, page_count, 0, user_dma_page)
 }
 
+/// Maps a platform display buffer (the bootloader's scanout memory) into a
+/// task as Normal Non-Cacheable. Unlike [`map_dma_to_user_space`] this does not
+/// zero or clean the range: the pixels are not a recycled allocator frame, and
+/// a zero would blank the panel before the compositor redraws it.
+///
+/// The caller must have validated the range against the registered display
+/// region; this function only checks the architectural bounds.
+pub fn map_display_to_user(
+    task: &crate::scheduler::Task,
+    phys_addr: usize,
+    size: usize,
+) -> Option<usize> {
+    if phys_addr % GRANULE != 0 || size == 0 {
+        return None;
+    }
+    checked_range_end(phys_addr, size, DRAM_BASE, DRAM_END)?;
+    let (physical_start, physical_offset, page_count) =
+        aligned_page_span(phys_addr, size, GRANULE)?;
+    if page_count > ENTRIES * USER_MMIO_L2_GROUPS {
+        return None;
+    }
+    // Drop any dirty bootloader cache lines in this range before EL0 starts
+    // writing through the NC alias; otherwise a later writeback could
+    // overwrite fresh pixels with stale splash data.
+    invalidate_range(
+        phys_to_virt(phys_addr),
+        phys_to_virt(phys_addr.saturating_add(size)),
+    );
+    map_user_pages(
+        task.ttbr0,
+        physical_start,
+        page_count,
+        physical_offset,
+        user_dma_page,
+    )
+}
+
 /// Maps a registered DMA allocation shared by another task. The scheduler
 /// validates that the physical range lies inside some task's `dma_pages` run
 /// before calling this function.

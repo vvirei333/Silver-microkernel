@@ -94,6 +94,10 @@ pub struct FogInfo {
     pub gic_node: bool,
     pub gic_cells_len: usize,
     pub gic_cells: [u32; crate::fdt::RAW_CELLS],
+    /// `cont_splash`/`splash` reserved region when the platform framebuffer
+    /// feature is enabled and the live FDT describes a usable buffer.
+    pub display: Region,
+    pub display_present: bool,
 }
 
 impl FogInfo {
@@ -130,6 +134,8 @@ impl FogInfo {
             gic_node: false,
             gic_cells_len: 0,
             gic_cells: [0; crate::fdt::RAW_CELLS],
+            display: Region { start: 0, end: 0 },
+            display_present: false,
         }
     }
 
@@ -279,6 +285,37 @@ pub fn probe(params: &BootParams) -> FogInfo {
         result.memreserve_first = reserved[reserved_count];
     }
     reserved_count += memreserve_count;
+
+    // Platform display (opt-in `fog-display`). The bootloader leaves the panel
+    // scanning `cont_splash`; the live FDT names the carve-out, so no physical
+    // address is hardcoded. The buffer must be inside a `/memory` region and
+    // large enough for the configured panel mode; otherwise it stays
+    // unavailable and the display syscalls fail closed.
+    #[cfg(feature = "fog-display")]
+    {
+        let named = tree
+            .reserved_region_named("cont_splash")
+            .or_else(|| tree.reserved_region_named("splash"));
+        if let Some(region) = named {
+            let info = crate::display::DisplayInfo {
+                base: region.start as usize,
+                width: crate::display::FOG_PANEL_WIDTH,
+                height: crate::display::FOG_PANEL_HEIGHT,
+                stride: crate::display::FOG_PANEL_STRIDE,
+                bytes_per_pixel: crate::display::BYTES_PER_PIXEL,
+            };
+            let inside_memory = memory[..memory_count]
+                .iter()
+                .any(|memory| region.start >= memory.start && region.end <= memory.end);
+            if inside_memory
+                && region.size() >= info.byte_len() as u64
+                && crate::display::register(info)
+            {
+                result.display = region;
+                result.display_present = true;
+            }
+        }
+    }
 
     // The fixed arrays are deliberately larger than a normal khaje tree. If
     // one is full, the parser may have dropped entries, so the placement
@@ -438,6 +475,24 @@ pub fn log_banner(params: &BootParams, info: &FogInfo) {
         console("+0x");
         crate::console::write_hex_u64(info.dtb_region.size());
         console("\r\n");
+    }
+
+    #[cfg(feature = "fog-display")]
+    {
+        console("SILVER DISPLAY ");
+        if info.display_present {
+            console("OK base=0x");
+            crate::console::write_hex_u64(info.display.start);
+            console(" size=0x");
+            crate::console::write_hex_u64(info.display.size());
+            console(" mode=");
+            crate::console::write_dec_u64(u64::from(crate::display::FOG_PANEL_WIDTH));
+            console("x");
+            crate::console::write_dec_u64(u64::from(crate::display::FOG_PANEL_HEIGHT));
+            console("\r\n");
+        } else {
+            console("UNAVAILABLE\r\n");
+        }
     }
 
     console("SILVER GIC ");

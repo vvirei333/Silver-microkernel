@@ -20,6 +20,8 @@ mod channel;
 mod condvar;
 #[cfg(not(feature = "std"))]
 mod console;
+#[cfg_attr(not(feature = "fog-display"), allow(dead_code))]
+mod display;
 #[cfg(not(feature = "std"))]
 mod elf;
 #[cfg(not(feature = "std"))]
@@ -110,6 +112,12 @@ pub unsafe extern "C" fn fog_validate_relocation(
 
 #[cfg(all(feature = "std", feature = "no_std"))]
 compile_error!("Features 'std' and 'no_std' are mutually exclusive");
+
+#[cfg(all(feature = "fog-display", any(feature = "fog-ui", feature = "fog-diag")))]
+compile_error!(
+    "'fog-display' starts the userspace compositor on cont_splash; \
+     'fog-ui'/'fog-diag' paint a kernel status panel on the same buffer"
+);
 
 #[cfg(all(not(feature = "std"), not(target_arch = "aarch64")))]
 compile_error!("The bare-metal kernel currently supports only AArch64");

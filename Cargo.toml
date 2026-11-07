@@ -45,6 +45,11 @@ fog-diag = ["fog", "fog-paint"]
 # scheduler and the Howl task are running on a UART-less unit. Presentation
 # only; it reads state and never touches a device register.
 fog-ui = ["fog", "fog-paint"]
+# Experimental phone UI path: register the bootloader's `cont_splash` buffer as
+# a platform framebuffer and start the compositor + SilverHome on it. Only for
+# real-device images: QEMU's fog DTB can advertise a splash address that its
+# `-m` RAM does not actually back.
+fog-display = ["fog"]
 # Opt-in bisect test: unmask IRQs and wait for 30 timer ticks before the
 # scheduler is initialised. Useful on QEMU; on the first hardware boot it can
 # deliver a timer IRQ into a not-yet-initialised scheduler, so fog defaults off.
