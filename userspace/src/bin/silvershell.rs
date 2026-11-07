@@ -220,6 +220,8 @@ fn execute(command: &str) {
             syscall::print("             Remove an empty, unused directory\r\n");
             syscall::print("  mv <old> <new>\r\n");
             syscall::print("             Rename or move a closed file/unused directory\r\n");
+            syscall::print("  replace <src> <dst>\r\n");
+            syscall::print("             Atomically replace dst with src (files)\r\n");
             syscall::print("  cd <path>  Change current working directory\r\n");
             syscall::print("  pwd        Print current working directory\r\n");
             syscall::print("  clear      Clear the terminal screen\r\n");
@@ -275,6 +277,7 @@ fn execute(command: &str) {
         Some("rm") => remove_file(words.next()),
         Some("rmdir") => remove_directory(words.next()),
         Some("mv") => rename_node(words.next(), words.next()),
+        Some("replace") => replace_node(words.next(), words.next()),
         Some("cd") => change_directory(words.next()),
         Some("pwd") => print_working_directory(),
         Some("clear") => clear_screen(),
@@ -927,6 +930,16 @@ fn rename_node(source: Option<&str>, destination: Option<&str>) {
     };
     if !syscall::fs_rename(source, destination) {
         syscall::print("mv: cannot rename (missing, same, open, busy, or bad destination)\r\n");
+    }
+}
+
+fn replace_node(source: Option<&str>, destination: Option<&str>) {
+    let (Some(source), Some(destination)) = (source, destination) else {
+        syscall::print("Usage: replace <source> <destination>\r\n");
+        return;
+    };
+    if !syscall::fs_replace(source, destination) {
+        syscall::print("replace: cannot replace (missing, open, busy, or bad path)\r\n");
     }
 }
 

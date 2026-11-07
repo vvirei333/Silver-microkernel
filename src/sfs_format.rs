@@ -1105,6 +1105,100 @@ pub fn remove_dir_entry(
     true
 }
 
+/// Atomically replaces `destination` with `source` (both files). The source
+/// entry is removed first, then the destination entry is re-pointed at the
+/// source inode, and only then is the old destination inode released. A crash
+/// between the steps loses the update, never the old destination.
+pub fn replace_entry(
+    image: &mut [u8],
+    superblock: &Superblock,
+    disk: &mut dyn SfsDisk,
+    source: &str,
+    destination: &str,
+) -> bool {
+    if source == destination {
+        return true;
+    }
+    let Ok(source_parts) = split_path(source) else {
+        return false;
+    };
+    let Ok(destination_parts) = split_path(destination) else {
+        return false;
+    };
+    let (Some((&source_name, source_parent_parts)), Some((&destination_name, destination_parent_parts))) =
+        (source_parts.split_last(), destination_parts.split_last())
+    else {
+        return false;
+    };
+    let Some(source_parent) = resolve_dir(image, superblock, source_parent_parts) else {
+        return false;
+    };
+    let Some(destination_parent) = resolve_dir(image, superblock, destination_parent_parts) else {
+        return false;
+    };
+    let Some((source_block, source_slot)) = find_entry(image, superblock, source_parent, source_name)
+    else {
+        return false;
+    };
+    let Some((destination_block, destination_slot)) =
+        find_entry(image, superblock, destination_parent, destination_name)
+    else {
+        return false;
+    };
+    let source_index =
+        u32_at(image, source_block * BLOCK_SIZE + source_slot * DIR_ENTRY_SIZE);
+    let destination_index =
+        u32_at(image, destination_block * BLOCK_SIZE + destination_slot * DIR_ENTRY_SIZE);
+    let Some((source_kind, _, _, _, _)) = inode_get(image, superblock, source_index) else {
+        return false;
+    };
+    let Some((destination_kind, destination_size, destination_blocks, destination_indirect, destination_double)) =
+        inode_get(image, superblock, destination_index)
+    else {
+        return false;
+    };
+    if source_kind != INODE_KIND_FILE || destination_kind != INODE_KIND_FILE {
+        return false;
+    }
+    if !remove_dir_entry(image, superblock, disk, source_parent, source_block, source_slot) {
+        return false;
+    }
+    // Publish the new inode under the old destination name.
+    put_u32(
+        image,
+        destination_block * BLOCK_SIZE + destination_slot * DIR_ENTRY_SIZE,
+        source_index,
+    );
+    if !flush_block(image, disk, destination_block) {
+        return false;
+    }
+    // The old destination inode is no longer reachable; release it.
+    let empty = [0_u32; DIRECT_BLOCKS];
+    if !inode_put(
+        image,
+        superblock,
+        disk,
+        destination_index,
+        INODE_KIND_FREE,
+        0,
+        &empty,
+        0,
+        0,
+    ) {
+        return false;
+    }
+    free_inode_blocks(
+        image,
+        superblock,
+        INODE_KIND_FILE,
+        destination_size,
+        &destination_blocks,
+        destination_indirect,
+        destination_double,
+    );
+    flush_bitmap(image, superblock, disk)
+}
+
 /// Overwrites the name of an entry in place (same-parent rename).
 pub fn rename_entry_in_place(
     image: &mut [u8],
@@ -1664,6 +1758,28 @@ mod tests {
         assert_eq!(usage.data_blocks, 144);
         // One single-indirect table, one double node and one sub-table.
         assert_eq!(usage.metadata_blocks, 3);
+    }
+
+    #[test]
+    fn replace_entry_moves_source_over_destination() {
+        let (mut image, mut disk, sb) = make_image(128);
+        seed_root(&mut image, &sb, &mut disk);
+        let empty = [0_u32; DIRECT_BLOCKS];
+        let a = create_inode(&mut image, &sb, &mut disk, sb.root_inode, "a", INODE_KIND_FILE).unwrap();
+        let b = create_inode(&mut image, &sb, &mut disk, sb.root_inode, "b", INODE_KIND_FILE).unwrap();
+        assert!(store(&mut image, &sb, &mut disk, a, b"new-content", &empty, 0, 0, 0));
+        assert!(store(&mut image, &sb, &mut disk, b, &vec![9_u8; 3 * BLOCK_SIZE], &empty, 0, 0, 0));
+        let before = usage_under(&image, &sb, "").unwrap();
+        assert!(replace_entry(&mut image, &sb, &mut disk, "a", "b"));
+        assert!(lookup(&image, &sb, "a").is_none());
+        let (index, kind, size) = lookup(&image, &sb, "b").unwrap();
+        assert_eq!(kind, INODE_KIND_FILE);
+        assert_eq!(size, b"new-content".len() as u32);
+        assert_eq!(read_inode_bytes(&image, &sb, index).unwrap(), b"new-content");
+        let after = usage_under(&image, &sb, "").unwrap();
+        assert_eq!(after.inodes, before.inodes - 1);
+        assert!(after.data_blocks < before.data_blocks);
+        assert!(fsck(&image, &sb).is_ok());
     }
 
     #[test]

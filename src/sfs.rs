@@ -185,6 +185,16 @@ impl FileSystem for Sfs {
         Ok(())
     }
 
+    fn replace(&mut self, source: &str, destination: &str) -> Result<(), ()> {
+        let image = image_mut()?;
+        let superblock = sfs_format::superblock(image)?;
+        if sfs_format::replace_entry(image, &superblock, &mut Disk, source, destination) {
+            Ok(())
+        } else {
+            Err(())
+        }
+    }
+
     fn is_directory(&self, path: &str) -> Result<bool, ()> {
         let image = image()?;
         let superblock = sfs_format::superblock(image)?;

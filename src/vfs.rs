@@ -144,6 +144,11 @@ pub trait FileSystem {
     fn remove_file(&mut self, path: &str) -> Result<(), ()>;
     fn remove_directory(&mut self, path: &str) -> Result<(), ()>;
     fn rename(&mut self, source: &str, destination: &str) -> Result<(), ()>;
+    /// Replaces `destination` with `source`, releasing the old destination.
+    fn replace(&mut self, source: &str, destination: &str) -> Result<(), ()> {
+        let _ = (source, destination);
+        Err(())
+    }
     fn is_directory(&self, path: &str) -> Result<bool, ()>;
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, ()>;
     /// Reads at most `limit` bytes starting at `offset` (clamped to EOF).
@@ -711,6 +716,37 @@ impl Vfs {
             .rename(&source_relative, &destination_relative)
     }
 
+    /// Replaces a file's contents with another file, atomically at the inode
+    /// level. Both names must be writable by the caller; open handles and mount
+    /// points pin the operation exactly like `rename`.
+    fn replace(&mut self, cwd: &str, source: &str, destination: &str) -> Result<(), ()> {
+        let source = resolve_path(cwd, source)?;
+        let destination = resolve_path(cwd, destination)?;
+        if source == destination {
+            return Ok(());
+        }
+        let (source_mount, source_relative) = self.resolve(&source);
+        let (destination_mount, destination_relative) = self.resolve(&destination);
+        if source_mount != destination_mount {
+            return Err(());
+        }
+        if self.mounts.iter().any(|mount| {
+            mount.point == source || mount.point == destination
+        }) {
+            return Err(());
+        }
+        if self
+            .open_files
+            .iter()
+            .any(|file| file.path == source || file.path == destination)
+        {
+            return Err(());
+        }
+        self.mounts[source_mount]
+            .fs
+            .replace(&source_relative, &destination_relative)
+    }
+
     fn open(&mut self, owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {
         if flags & !(OPEN_WRITE | OPEN_APPEND) != 0
             || (flags & OPEN_APPEND != 0 && flags & OPEN_WRITE == 0)
@@ -1020,6 +1056,10 @@ pub fn rename(
     in_use: impl FnOnce(&str) -> bool,
 ) -> Result<(), ()> {
     with_vfs(|vfs| vfs.rename(cwd, source, destination, in_use))
+}
+
+pub fn replace(cwd: &str, source: &str, destination: &str) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.replace(cwd, source, destination))
 }
 
 pub fn open(owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {

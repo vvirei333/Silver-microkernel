@@ -78,6 +78,7 @@ pub const SYS_WAITPID: u64 = 83;
 pub const SYS_SPAWN_ARGSV: u64 = 84;
 pub const SYS_MEMINFO_V2: u64 = 85;
 pub const SYS_HEALTH: u64 = 86;
+pub const SYS_FS_REPLACE: u64 = 87;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -282,6 +283,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_FS_UNLINK => sys_fs_unlink(frame[0]),
         SYS_FS_RMDIR => sys_fs_rmdir(frame[0]),
         SYS_FS_RENAME => sys_fs_rename(frame[0], frame[1]),
+        SYS_FS_REPLACE => sys_fs_replace(frame[0], frame[1]),
         SYS_CAP_GET_TASK_ID => scheduler::capability_task_id(frame[0]).unwrap_or(SYSCALL_ERROR),
         SYS_CAP_GRANT => {
             if scheduler::grant_capability(frame[0], frame[1], frame[2] as u32) {
@@ -654,9 +656,11 @@ fn sys_fs_create(path_ptr: u64) -> u64 {
         if !write_path_allowed(&cwd, path) {
             return SYSCALL_ERROR;
         }
-        // Worst case for a create: one inode plus possible parent directory
-        // growth. An overwrite only shrinks, so this over-estimate is safe.
-        if !scheduler::fs_quota_allows(1, 1) {
+        // A create over an existing file truncates it: no new inode and no
+        // growth. Only a genuinely new name needs the conservative allowance.
+        let existing = vfs::file_len(&cwd, path).is_ok();
+        let (blocks, inodes) = if existing { (0, 0) } else { (1, 1) };
+        if !scheduler::fs_quota_allows(blocks, inodes) {
             return SYSCALL_ERROR;
         }
         if vfs::create(&cwd, path).is_ok() {
@@ -723,6 +727,24 @@ fn sys_fs_rename(source_ptr: u64, destination_ptr: u64) -> u64 {
                 return SYSCALL_ERROR;
             }
             if vfs::rename(&cwd, source, destination, scheduler::cwd_in_use).is_ok() {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        })
+    })
+}
+
+fn sys_fs_replace(source_ptr: u64, destination_ptr: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
+    with_path(source_ptr, |source| {
+        with_path(destination_ptr, |destination| {
+            if !write_path_allowed(&cwd, source)
+                || !write_path_allowed(&cwd, destination)
+            {
+                return SYSCALL_ERROR;
+            }
+            if vfs::replace(&cwd, source, destination).is_ok() {
                 0
             } else {
                 SYSCALL_ERROR

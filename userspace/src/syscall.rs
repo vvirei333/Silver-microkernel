@@ -40,6 +40,7 @@ const SYS_GETCWD: u64 = 35;
 const SYS_FS_UNLINK: u64 = 36;
 const SYS_FS_RMDIR: u64 = 37;
 const SYS_FS_RENAME: u64 = 38;
+const SYS_FS_REPLACE: u64 = 87;
 const SYS_CONSOLE_SET: u64 = 39;
 const SYS_TASK_RESUME: u64 = 40;
 const SYS_WAIT_EVENT: u64 = 41;
@@ -637,6 +638,14 @@ pub fn fs_rename(source: &str, destination: &str) -> bool {
     with_path(source, |source_ptr| {
         with_path(destination, |destination_ptr| unsafe {
             syscall2(SYS_FS_RENAME, source_ptr, destination_ptr)
+        })
+    }) == 0
+}
+
+pub fn fs_replace(source: &str, destination: &str) -> bool {
+    with_path(source, |source_ptr| {
+        with_path(destination, |destination_ptr| unsafe {
+            syscall2(SYS_FS_REPLACE, source_ptr, destination_ptr)
         })
     }) == 0
 }

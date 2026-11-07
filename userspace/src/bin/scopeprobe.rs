@@ -59,14 +59,44 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     if syscall::fs_create("/sfs/probe-scope/f4") {
         quota_ok = false;
     }
+
+    // Atomic replacement: f1 must end up with f0's bytes and f0 must vanish.
+    let replaced_ok = write_file("/sfs/probe-scope/f0", b"AAA")
+        && write_file("/sfs/probe-scope/f1", b"BBBB")
+        && syscall::fs_replace("/sfs/probe-scope/f0", "/sfs/probe-scope/f1")
+        && read_matches("/sfs/probe-scope/f1", b"AAA")
+        && syscall::fs_open("/sfs/probe-scope/f0", 0).is_none();
+
     for path in paths {
         let _ = syscall::fs_unlink(path);
     }
 
-    if inside && !outside && !escape && quota_ok && created == 4 {
+    if inside && !outside && !escape && quota_ok && created == 4 && replaced_ok {
         syscall::exit();
     }
     syscall::exit_with_status(2);
+}
+
+fn write_file(path: &str, contents: &[u8]) -> bool {
+    if !syscall::fs_create(path) {
+        return false;
+    }
+    let Some(fd) = syscall::fs_open(path, 1) else {
+        return false;
+    };
+    let ok = syscall::fs_write(fd, contents) == Some(contents.len());
+    let _ = syscall::fs_close(fd);
+    ok
+}
+
+fn read_matches(path: &str, expected: &[u8]) -> bool {
+    let Some(fd) = syscall::fs_open(path, 0) else {
+        return false;
+    };
+    let mut buffer = [0_u8; 16];
+    let read = syscall::fs_read(fd, &mut buffer);
+    let _ = syscall::fs_close(fd);
+    matches!(read, Some(len) if len == expected.len() && &buffer[..len] == expected)
 }
 
 #[panic_handler]
