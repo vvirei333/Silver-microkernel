@@ -106,6 +106,9 @@ Redmi port is parked. The reference checklist is
   tiles and the pages saved by `Ctrl+D`; the list is reloaded from SFS at
   startup. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
   repaints on `frame_seq` and sends keys, wheel and clicks through the ring.
+  The sequence is a seqlock (odd while the guest paints); the host skips odd
+  values and re-checks after the copy, so a repaint cannot tear into a white
+  flash.
   Verified headlessly: DDG results with links, clicking the first result through
   a DDG meta-refresh redirect to the Wikipedia reader view, Alt+Left back to
   the results, typed `http://github.com/` redirecting to HTTPS, scrolling and

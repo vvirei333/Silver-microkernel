@@ -607,7 +607,7 @@ and a Qt program on the host maps the same file.
 | Region | Contents |
 | --- | --- |
 | `0x000` | magic `WIN1`, version, width, height, stride, format |
-| `0x018` | `frame_seq`; the host repaints when it changes |
+| `0x018` | `frame_seq`; odd while the guest repaints, even when the frame is complete |
 | `0x01C` | state: blank / ready / loading / error |
 | `0x020` | input ring head/tail; 64 eight-byte entries |
 | `0x030` | host web-proxy request/done sequence, status, body/URL lengths |
@@ -633,10 +633,12 @@ startup). `Ctrl+G` opens the first text field of the page's form in the footer;
 Enter submits it with the form's GET/POST method, including hidden fields, and
 Esc cancels. A session cookie jar makes form flows such as DuckDuckGo's POST
 search work. While a page loads the previous document (or the start page) stays
-visible with a spinner instead of flashing white; the host viewer copies each
-completed frame before painting, so it never reads a half-drawn surface. The guest repaints and bumps
-`frame_seq` only after a memory barrier, so the host never sees a half-drawn
-frame. `tools/window-viewer` is a Qt6 Widgets + Network program and has a
+visible with a spinner instead of flashing white. Frame publication is a
+seqlock: the guest bumps `frame_seq` to an odd value before touching pixels
+and to the next even value after a barrier, and the host only copies an even
+sequence that is still unchanged when the copy finishes. Without the odd
+marker the 2.3 MiB copy could overlap a repaint and briefly show the white
+background fill, which looked like the window flickering while scrolling. `tools/window-viewer` is a Qt6 Widgets + Network program and has a
 `--snapshot OUT.png` mode that works with `QT_QPA_PLATFORM=offscreen`, which is
 how the QEMU test checks a frame without a display.
 

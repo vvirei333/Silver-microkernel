@@ -4869,6 +4869,7 @@ fn pixels_before(line: usize) -> u32 {
 
 fn paint(app: &App) {
     let base = app.window;
+    begin_frame(base);
     fill(base, 0, 0, WIDTH, HEIGHT, COLOR_BACKGROUND);
     fill(base, 0, 0, WIDTH, HEADER_HEIGHT, COLOR_HEADER);
 
@@ -5539,6 +5540,16 @@ fn draw_styled_line(
             break;
         }
     }
+}
+
+/// Starts a frame: the sequence becomes odd, so the host knows the surface is
+/// being repainted and must not copy it yet. Without this the viewer could
+/// memcpy the 2.3 MiB surface between the white background fill and the page
+/// draw, which looked like a white flash/flicker while scrolling.
+fn begin_frame(base: u64) {
+    let sequence = window::read_u32(base, window::FIELD_FRAME_SEQ).wrapping_add(1);
+    window::write_u32(base, window::FIELD_FRAME_SEQ, sequence);
+    net_ipc::fence();
 }
 
 fn publish(base: u64, state: u32) {

@@ -417,30 +417,38 @@ public:
                 m_sized = true;
             }
             const uint32_t sequence = m_shared.u32(kFieldFrameSeq);
-            if (sequence != m_lastSequence) {
-                m_lastSequence = sequence;
+            // The guest makes the sequence odd while it repaints (seqlock).
+            // Copying during that window is what produced the white flashes;
+            // an odd value means "come back next tick".
+            if ((sequence & 1u) == 0 && sequence != m_lastSequence) {
                 std::atomic_thread_fence(std::memory_order_acquire);
                 const uint32_t width = m_shared.u32(kFieldWidth);
                 const uint32_t height = m_shared.u32(kFieldHeight);
                 const uint32_t stride = m_shared.u32(kFieldStride);
                 if (width != 0 && height != 0 && stride >= width * 4) {
-                    // Snapshot the guest's finished frame. Repainting a live
-                    // shared buffer could catch the guest mid-fill and show a
-                    // white flash.
+                    // Snapshot the guest's finished frame instead of painting
+                    // the live buffer, which the guest is writing.
+                    const QImage live(m_shared.data + kPixels, static_cast<int>(width),
+                                      static_cast<int>(height), static_cast<int>(stride),
+                                      QImage::Format_RGBA8888);
                     if (m_frame.width() != static_cast<int>(width) ||
                         m_frame.height() != static_cast<int>(height)) {
                         m_frame = QImage(static_cast<int>(width), static_cast<int>(height),
                                          QImage::Format_RGBA8888);
                     }
-                    const QImage live(m_shared.data + kPixels, static_cast<int>(width),
-                                      static_cast<int>(height), static_cast<int>(stride),
-                                      QImage::Format_RGBA8888);
                     for (uint32_t row = 0; row < height; ++row) {
                         std::memcpy(m_frame.scanLine(static_cast<int>(row)),
                                     live.constScanLine(static_cast<int>(row)),
                                     static_cast<size_t>(width) * 4);
                     }
+                    std::atomic_thread_fence(std::memory_order_acquire);
+                    if (m_shared.u32(kFieldFrameSeq) != sequence) {
+                        // The guest started the next frame while we copied:
+                        // drop this one and try again on the next tick.
+                        return;
+                    }
                 }
+                m_lastSequence = sequence;
                 update();
             }
             const bool overLink = m_shared.u32(kFieldCursor) != 0;
@@ -666,8 +674,9 @@ int snapshot(Shared &shared, const QString &path, int timeoutSeconds) {
     QElapsedTimer timer;
     timer.start();
     while (timer.elapsed() < timeoutSeconds * 1000) {
+        const uint32_t sequence = shared.u32(kFieldFrameSeq);
         if (shared.u32(kFieldMagic) == kMagic &&
-            shared.u32(kFieldFrameSeq) != 0 &&
+            sequence != 0 && (sequence & 1u) == 0 &&
             shared.u32(kFieldFormat) == kFormatRgba8888) {
             const uint32_t width = shared.u32(kFieldWidth);
             const uint32_t height = shared.u32(kFieldHeight);
@@ -677,8 +686,21 @@ int snapshot(Shared &shared, const QString &path, int timeoutSeconds) {
                 return 2;
             }
             std::atomic_thread_fence(std::memory_order_acquire);
-            QImage frame(shared.data + kPixels, static_cast<int>(width), static_cast<int>(height),
-                         static_cast<int>(stride), QImage::Format_RGBA8888);
+            QImage frame(static_cast<int>(width), static_cast<int>(height),
+                         QImage::Format_RGBA8888);
+            const QImage live(shared.data + kPixels, static_cast<int>(width),
+                              static_cast<int>(height), static_cast<int>(stride),
+                              QImage::Format_RGBA8888);
+            for (uint32_t row = 0; row < height; ++row) {
+                std::memcpy(frame.scanLine(static_cast<int>(row)),
+                            live.constScanLine(static_cast<int>(row)),
+                            static_cast<size_t>(width) * 4);
+            }
+            std::atomic_thread_fence(std::memory_order_acquire);
+            if (shared.u32(kFieldFrameSeq) != sequence) {
+                QCoreApplication::processEvents();
+                continue;
+            }
             if (!frame.save(path)) {
                 std::fprintf(stderr, "viewer: cannot write %s\n", path.toUtf8().constData());
                 return 2;
