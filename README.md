@@ -561,8 +561,12 @@ or a query. Enter resolves the input: an explicit URL is used as-is, a bare
 host gets `https://`, anything else becomes a DuckDuckGo HTML search
 (`https://html.duckduckgo.com/html/?q=...`). Both schemes are fetched by `net_server` over smoltcp: `https://` runs a
 TLS 1.3 client in the guest (`third_party/embedded-tls`) with six embedded
-roots, RSA/ECDSA-P256/P384/Ed25519 verification and a 1 MiB client body. If a
-site needs something the small root store or TLS 1.3-only client cannot do,
+roots, RSA/ECDSA-P256/P384/Ed25519 verification and a 1 MiB client body. The
+verifier keeps up to 32 subject-alternative names per certificate: Wikimedia's
+wildcard lists 40 and `thumb.wikimedia.org` matches `*.wikimedia.org` at index
+17, so the stock three-name limit rejected every thumbnail while the article
+itself passed through the CN `*.wikipedia.org`. If a site needs something the
+small root store or TLS 1.3-only client cannot do,
 Wolfser retries the URL through the host viewer's Qt TLS proxy. Redirects (3xx
 and `<meta http-equiv=refresh>`) are followed by the guest, so a page may move
 between the two paths freely. `wget https://...` uses the same guest TLS path.
@@ -591,7 +595,10 @@ page is reflowed (scroll preserved) as decoded images land. The RGBA cache is
 shared across document rebuilds and evicts old sites, so switching back to a
 tab reuses its images without another network fetch.
 
-The reader slice is capped at 48 KiB and the engine heap at 20 MiB; both are
+Reader extraction keeps a few `<img>` elements from the layout tables it
+otherwise drops, so a Wikipedia infobox still contributes the article's lead
+picture. The reader slice is capped at 48 KiB and the engine heap at 20 MiB;
+both are
 deliberate current limits, not architectural ones. Six tabs keep their own URL,
 history, scroll position and rendered page, so switching is instant and does
 not refetch. There is no guest compositor: the surface lives in an ivshmem BAR,

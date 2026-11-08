@@ -1147,6 +1147,15 @@ fn copy_reader(source: &[u8], out: &mut [u8]) -> usize {
             }
             let (name, full, after) = read_tag_quoted(source, index);
             let closing = source.get(index + 1) == Some(&b'/');
+            if tag_eq(name, b"table") && !closing {
+                // Infoboxes are layout tables and their text is noise, but the
+                // picture inside is usually the article's lead image. Keep a
+                // few images from the table and drop everything else.
+                let end = skip_reader_element(source, after, name);
+                copy_table_images(source, after, end, out, &mut length);
+                index = end;
+                continue;
+            }
             if tag_eq(name, b"script") || tag_eq(name, b"style") || tag_eq(name, b"table") {
                 if !closing {
                     index = skip_reader_element(source, after, name);
@@ -1176,26 +1185,7 @@ fn copy_reader(source: &[u8], out: &mut [u8]) -> usize {
                 push_bytes(out, &mut length, name);
                 push_bytes(out, &mut length, b">");
             } else {
-                push_bytes(out, &mut length, b"<");
-                push_bytes(out, &mut length, name);
-                for attribute in [
-                    b"href".as_slice(),
-                    b"src".as_slice(),
-                    b"alt".as_slice(),
-                    b"width".as_slice(),
-                    b"height".as_slice(),
-                ] {
-                    if let Some(value) = tag_attribute(full, attribute) {
-                        let mut decoded = [0u8; URL_CAPACITY];
-                        let decoded_len = decode_attribute(value, &mut decoded);
-                        push_bytes(out, &mut length, b" ");
-                        push_bytes(out, &mut length, attribute);
-                        push_bytes(out, &mut length, b"=\"");
-                        push_bytes(out, &mut length, &decoded[..decoded_len]);
-                        push_bytes(out, &mut length, b"\"");
-                    }
-                }
-                push_bytes(out, &mut length, b">");
+                push_tag_with_attributes(name, full, out, &mut length);
             }
             index = after;
         } else {
@@ -1207,6 +1197,51 @@ fn copy_reader(source: &[u8], out: &mut [u8]) -> usize {
         }
     }
     length
+}
+
+/// Emits `<name attr="value" ...>` keeping only the attributes the renderer
+/// understands: links, image sources and explicit dimensions.
+fn push_tag_with_attributes(name: &[u8], full: &[u8], out: &mut [u8], length: &mut usize) {
+    push_bytes(out, length, b"<");
+    push_bytes(out, length, name);
+    for attribute in [
+        b"href".as_slice(),
+        b"src".as_slice(),
+        b"alt".as_slice(),
+        b"width".as_slice(),
+        b"height".as_slice(),
+    ] {
+        if let Some(value) = tag_attribute(full, attribute) {
+            let mut decoded = [0u8; URL_CAPACITY];
+            let decoded_len = decode_attribute(value, &mut decoded);
+            push_bytes(out, length, b" ");
+            push_bytes(out, length, attribute);
+            push_bytes(out, length, b"=\"");
+            push_bytes(out, length, &decoded[..decoded_len]);
+            push_bytes(out, length, b"\"");
+        }
+    }
+    push_bytes(out, length, b">");
+}
+
+/// Keeps the pictures of a skipped layout table. The reader drops the table
+/// itself (its cells are not readable in a linear column), but the lead image
+/// of an article usually lives in the infobox.
+fn copy_table_images(source: &[u8], start: usize, end: usize, out: &mut [u8], length: &mut usize) {
+    let mut index = start;
+    let mut kept = 0usize;
+    while index + 4 <= end && kept < 4 {
+        if &source[index..index + 4] == b"<img" {
+            let (name, full, after) = read_tag_quoted(source, index);
+            if tag_eq(name, b"img") && tag_attribute(full, b"src").is_some() {
+                push_tag_with_attributes(name, full, out, length);
+                kept += 1;
+            }
+            index = after;
+        } else {
+            index += 1;
+        }
+    }
 }
 
 fn copy_page(source: &[u8], out: &mut [u8], sanitize: bool) -> usize {

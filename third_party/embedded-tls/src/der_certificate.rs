@@ -8,7 +8,10 @@ use der::{
 };
 use heapless::Vec;
 
-pub const MAX_SAN_DNS_NAMES: usize = 3;
+// Real certificates list dozens of names: Wikimedia's wildcard has 40, and
+// the host can match one late in the list (thumb.wikimedia.org matches
+// *.wikimedia.org at index 17). Three entries only matched the CN.
+pub const MAX_SAN_DNS_NAMES: usize = 32;
 pub const HOSTNAME_MAXLEN: usize = 64;
 
 const DNS_NAME_TAG: u8 = 0x82;

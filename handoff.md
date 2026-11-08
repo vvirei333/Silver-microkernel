@@ -35,7 +35,10 @@ Redmi port is parked. The reference checklist is
   returns in the neighbour path; without them DHCP boots intermittently hit
   the cache's unicast assertion. See `third_party/smoltcp/PATCH.md`.
 - **TLS:** `net_server` now runs a TLS 1.3 client (`third_party/embedded-tls`
-  with three local verifier fixes) and fetches HTTPS itself. Six roots cover the
+  with four local verifier fixes) and fetches HTTPS itself. The SAN DNS-name
+  limit grew from 3 to 32: the Wikimedia wildcard carries 40 names and
+  `thumb.wikimedia.org` only matches `*.wikimedia.org` at index 17, so image
+  hosts failed while article hosts matched the CN. Six roots cover the
   current search engine, Wikipedia, example.com, Microsoft and Sectigo; RSA,
   ECDSA P-256/P-384 and Ed25519 are enabled. `wget https://...` works, and the
   browser uses guest TLS first. The viewer's Qt proxy remains the fallback for

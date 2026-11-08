@@ -75,4 +75,6 @@ The linked browser image is ~6 MiB, so the kernel was widened accordingly:
   the cache, so the page reflows with the images but the scroll offset stays.
   The cache keeps at most eight decoded images / 3M pixels and evicts the
   oldest site, so a second page is not blocked by the first page's images.
+- Reader extraction keeps up to four images from dropped layout tables, which
+  is where Wikipedia hides the article's lead picture.
 - There is no JavaScript or media pipeline.
