@@ -188,10 +188,14 @@ const USER_HEAP_L2_INDEX: usize = (USER_HEAP_VA - DRAM_BASE) / BLOCK_2M;
 /// The lowest stack VA page is deliberately left unmapped as a guard. The
 /// stack itself starts one page above it, so a downward overflow faults
 /// instead of silently landing in the mmap window below.
+///
+/// Eight pages (32 KiB) leave room for the guest TLS handshake (RSA
+/// verification and the embedded-tls state machine) in `net_server`; the old
+/// two-page stack faulted on the guard page during the first HTTPS request.
 pub const USER_STACK_GUARD_VA: usize = USER_IMAGE_VA + 0x3FE0_0000;
 /// Every task's own stack appears at this user VA, backed by different PAs.
 pub const USER_STACK_VA: usize = USER_STACK_GUARD_VA + GRANULE;
-pub const USER_STACK_PAGES: usize = 2;
+pub const USER_STACK_PAGES: usize = 16;
 pub const USER_STACK_SIZE: usize = USER_STACK_PAGES * GRANULE;
 const USER_STACK_L2_INDEX: usize = (USER_STACK_VA - DRAM_BASE) / BLOCK_2M;
 /// L3 slot of the first mapped stack page. Slot 0 is the guard page; the

@@ -52,6 +52,9 @@ pub const FIELD_IMG_HEIGHT: u64 = 0x60;
 pub const FIELD_IMG_LEN: u64 = 0x64;
 pub const FIELD_IMG_ERROR: u64 = 0x68;
 pub const FIELD_IMG_REQUEST_LEN: u64 = 0x6C;
+/// Maximum decoded image size requested by the guest (0 = host default).
+pub const FIELD_IMG_MAX_WIDTH: u64 = 0x70;
+pub const FIELD_IMG_MAX_HEIGHT: u64 = 0x74;
 
 pub const FORMAT_RGBA8888: u32 = 1;
 

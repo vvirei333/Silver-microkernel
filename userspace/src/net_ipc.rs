@@ -60,7 +60,7 @@ pub const OP_PING_REPLY: u8 = 6;
 // answers with a small `OP_*_REPLY` message; the payload stays in the window.
 
 /// Size of the shared client window. 128 KiB keeps a typical text page whole.
-pub const CLIENT_SIZE: u64 = 128 * 1024;
+pub const CLIENT_SIZE: u64 = 1024 * 1024;
 /// Where the request (length-prefixed) starts.
 pub const CLIENT_REQUEST: u64 = 0x0000;
 /// Where the server writes the HTTP body.

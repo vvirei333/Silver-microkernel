@@ -3490,7 +3490,28 @@ fn spawn_inner(
         .get(smp::current_index())
         .map(|task| task.cwd.clone())
         .unwrap_or_else(|| String::from("/"));
-    let mut task = Task::new(id, entry, user, image, arguments, argv, envp, ppid, None, None)?;
+    // Wolfser persists its bookmarks in one root-level file. Give it a
+    // path-scoped write window instead of the global CAP_FS_WRITE: the kernel
+    // resolves the path and only `/sfs/wolfser.bookmarks` passes the check.
+    let fs_write_prefix = user.and_then(|(program, _)| {
+        if program == user_program::WOLFSER {
+            Some(String::from("/sfs/wolfser.bookmarks"))
+        } else {
+            None
+        }
+    });
+    let mut task = Task::new(
+        id,
+        entry,
+        user,
+        image,
+        arguments,
+        argv,
+        envp,
+        ppid,
+        fs_write_prefix,
+        None,
+    )?;
     task.cwd = cwd;
 
     manager.tasks.push(task);

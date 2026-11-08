@@ -24,10 +24,15 @@ with Qt's TLS stack and writes the body back (respecting the body cap). A
 viewer without Network support leaves `FIELD_WEB_CAPABLE` at 0, and the guest
 reports that HTTPS needs a rebuilt viewer.
 
-It also decodes the page's lead image: the guest publishes an image URL, the
-viewer fetches it, lets Qt decode PNG/JPEG/WebP, scales it to at most 480x360
-and writes tightly packed RGBA into the shared body. If Qt lacks a codec the
-guest simply shows the text page without the image.
+It also decodes page images: the guest publishes an image URL and a maximum
+size (up to 240x180 for inline pictures), the viewer fetches it, lets Qt decode
+PNG/JPEG/WebP, scales it and writes tightly packed RGBA into the shared body.
+If Qt lacks a codec the guest simply leaves that picture out.
+
+`Ctrl++` / `Ctrl+-` / `Ctrl+0` zoom the host window between 50% and 200%; the
+guest still renders 900x640 and pointer coordinates are scaled back, so links
+and tabs keep working. `--zoom PCT` sets the initial level; `--snapshot`
+remains a raw 900x640 frame.
 
 ## Run
 

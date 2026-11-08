@@ -13,6 +13,16 @@ tablet = []
 # smoltcp's `socket` feature, which only compiles with a concrete socket type.
 # The console product needs ICMP (ping), DHCP (address lease), DNS (name
 # resolution) and TCP (HTTP). UDP remains for the DNS transport underneath.
+embedded-tls = { path = "../third_party/embedded-tls", default-features = false, features = [
+    "rustpki",
+    "rsa",
+    "p384",
+    "ed25519",
+] }
+rand_core = { version = "0.6", default-features = false }
+embedded-io = { version = "0.7", default-features = false }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "arithmetic"] }
+
 smoltcp = { path = "../third_party/smoltcp", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",

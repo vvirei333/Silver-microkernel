@@ -85,11 +85,11 @@ const COLOR_FIND: u32 = 0xFFFF_F3C4;
 const COLOR_TILE: u32 = 0xFFF4_EFE9;
 const COLOR_TILE_BORDER: u32 = 0xFFD8_C7B6;
 
-const TAB_MAX: usize = 4;
+const TAB_MAX: usize = 6;
 const TAB_HISTORY: usize = 12;
 const TAB_TITLE: usize = 80;
 const TAB_START_X: u32 = 6;
-const TAB_WIDTH: u32 = 148;
+const TAB_WIDTH: u32 = 130;
 const TAB_GAP: u32 = 3;
 const TAB_Y: u32 = 3;
 const TAB_BAR_HEIGHT: u32 = 22;
@@ -97,6 +97,15 @@ const TAB_TEXT_Y: u32 = 9;
 const TAB_CLOSE_WIDTH: u32 = 18;
 const FIND_CAPACITY: usize = 64;
 const BOOKMARK_MAX: usize = 8;
+const BOOKMARK_PATH: &str = "/sfs/wolfser.bookmarks";
+const BOOKMARK_FILE_LIMIT: usize = 4096;
+
+const IMAGE_MAX: usize = 3;
+const IMAGE_MAX_WIDTH: u32 = 240;
+const IMAGE_MAX_HEIGHT: u32 = 180;
+const IMAGE_SLOT_BYTES: usize = (IMAGE_MAX_WIDTH * IMAGE_MAX_HEIGHT * 4) as usize;
+const IMAGE_MIN_WIDTH: u32 = 120;
+const IMAGE_MIN_HEIGHT: u32 = 80;
 const BOOKMARK_TITLE: usize = 80;
 const TOAST_TICKS: u64 = 2 * TICKS_PER_SECOND;
 
@@ -152,9 +161,8 @@ struct App {
     image_pending: bool,
     image_seq: u32,
     image_started: u64,
-    image_ready: bool,
-    image_w: u32,
-    image_h: u32,
+    image_cursor: usize,
+    image_index: usize,
     find_mode: bool,
     find_query: [u8; FIND_CAPACITY],
     find_len: usize,
@@ -183,6 +191,7 @@ struct Pending {
     host_seq: u32,
     from_history: bool,
     retries: u8,
+    fallback_host: bool,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -198,6 +207,42 @@ struct LinkRun {
     line: u16,
     start: u16,
     end: u16,
+}
+
+#[derive(Copy, Clone)]
+struct TabImage {
+    url: [u8; URL_CAPACITY],
+    url_len: usize,
+    line: u16,
+}
+
+impl TabImage {
+    const EMPTY: TabImage = TabImage {
+        url: [0; URL_CAPACITY],
+        url_len: 0,
+        line: 0,
+    };
+}
+
+#[derive(Copy, Clone)]
+struct PageImage {
+    url: [u8; URL_CAPACITY],
+    url_len: usize,
+    line: u16,
+    width: u32,
+    height: u32,
+    ready: bool,
+}
+
+impl PageImage {
+    const EMPTY: PageImage = PageImage {
+        url: [0; URL_CAPACITY],
+        url_len: 0,
+        line: 0,
+        width: 0,
+        height: 0,
+        ready: false,
+    };
 }
 
 /// One tab owns its URL, title, scroll position, history and a cache of the
@@ -228,8 +273,8 @@ struct Tab {
     link_count: usize,
     link_pool: [u8; LINK_POOL],
     link_pool_len: usize,
-    image_url: [u8; URL_CAPACITY],
-    image_len: usize,
+    images: [TabImage; IMAGE_MAX],
+    image_count: usize,
 }
 
 impl Tab {
@@ -262,8 +307,8 @@ impl Tab {
         link_count: 0,
         link_pool: [0; LINK_POOL],
         link_pool_len: 0,
-        image_url: [0; URL_CAPACITY],
-        image_len: 0,
+        images: [TabImage::EMPTY; IMAGE_MAX],
+        image_count: 0,
     };
 
     fn title_text(&self) -> &str {
@@ -290,6 +335,7 @@ impl Bookmark {
 
 static mut BOOKMARKS: [Bookmark; BOOKMARK_MAX] = [Bookmark::EMPTY; BOOKMARK_MAX];
 static mut BOOKMARK_COUNT: usize = 0;
+static mut BOOKMARK_FILE: [u8; BOOKMARK_FILE_LIMIT] = [0; BOOKMARK_FILE_LIMIT];
 
 static mut TABS: [Tab; TAB_MAX] = [Tab::EMPTY; TAB_MAX];
 
@@ -324,8 +370,10 @@ static mut HOST_FINAL: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
 static mut BASE_URL: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
 static mut CLICK_HREF: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
 static mut CLICK_TARGET: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
-static mut IMAGE_URL: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
-static mut IMAGE_URL_LEN: usize = 0;
+static mut PAGE_IMAGES: [PageImage; IMAGE_MAX] = [PageImage::EMPTY; IMAGE_MAX];
+static mut PAGE_IMAGE_COUNT: usize = 0;
+static mut IMAGE_PIXELS: [[u8; IMAGE_SLOT_BYTES]; IMAGE_MAX] =
+    [[0; IMAGE_SLOT_BYTES]; IMAGE_MAX];
 static mut IMAGE_HREF: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
 
 #[no_mangle]
@@ -336,6 +384,8 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     let initial = core::str::from_utf8(&arguments[..length])
         .unwrap_or("")
         .trim();
+
+    load_bookmarks();
 
     let server = find_task_id(syscall::PROGRAM_NET_SERVER).unwrap_or(0);
     let window_base = match open_window() {
@@ -365,9 +415,8 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         image_pending: false,
         image_seq: 0,
         image_started: 0,
-        image_ready: false,
-        image_w: 0,
-        image_h: 0,
+        image_cursor: 0,
+        image_index: 0,
         find_mode: false,
         find_query: [0; FIND_CAPACITY],
         find_len: 0,
@@ -888,8 +937,9 @@ fn hit_link(app: &App, x: u32, y: u32) -> Option<(u32, u16)> {
     let length = unsafe { *core::ptr::addr_of!(TEXT_LEN) };
     let runs = unsafe { &*core::ptr::addr_of!(LINK_RUNS) };
     let run_count = unsafe { *core::ptr::addr_of!(LINK_RUN_COUNT) };
-    let scroll_pixels = pixels_before(app.scroll);
-    let mut top = BODY_TOP as i32 + image_height(app) as i32 - scroll_pixels as i32;
+    let scroll_pixels =
+        (pixels_before(app.scroll) + image_blocks_before(app.scroll as u32)) as usize;
+    let mut top = BODY_TOP as i32 - scroll_pixels as i32;
     let mut line = 0u32;
     let mut start = 0usize;
     while start <= length {
@@ -897,6 +947,8 @@ fn hit_link(app: &App, x: u32, y: u32) -> Option<(u32, u16)> {
         while end < length && text[end] != b'\n' {
             end += 1;
         }
+        // Images at this line sit above its text.
+        top += image_block_at(line) as i32;
         let flags = if start < end { styles[start] } else { 0 };
         let height = line_height(flags);
         if y as i32 >= top && (y as i32) < top + height as i32 {
@@ -1058,39 +1110,86 @@ fn reset_active_view(app: &mut App) {
     }
 }
 
-fn clear_image(app: &mut App) {
+fn clear_image_view(app: &mut App) {
     app.image_pending = false;
-    app.image_ready = false;
-    app.image_w = 0;
-    app.image_h = 0;
+    app.image_cursor = 0;
+    app.image_index = 0;
+    unsafe {
+        let images = &mut *core::ptr::addr_of_mut!(PAGE_IMAGES);
+        for image in images.iter_mut() {
+            image.ready = false;
+            image.width = 0;
+            image.height = 0;
+        }
+    }
 }
 
-fn start_image_from_global(app: &mut App) {
-    let url = unsafe {
-        let image = &*core::ptr::addr_of!(IMAGE_URL);
-        let len = *core::ptr::addr_of!(IMAGE_URL_LEN);
-        core::str::from_utf8(&image[..len]).unwrap_or("")
-    };
-    start_image(app, url);
+fn clear_images(app: &mut App) {
+    clear_image_view(app);
+    unsafe {
+        *core::ptr::addr_of_mut!(PAGE_IMAGE_COUNT) = 0;
+    }
 }
 
-fn start_image(app: &mut App, url: &str) {
-    clear_image(app);
-    if url.is_empty() || window::read_u32(app.window, window::FIELD_WEB_CAPABLE) == 0 {
+fn clamp_image_lines() {
+    let last = line_count().saturating_sub(1).min(u32::from(u16::MAX)) as u16;
+    unsafe {
+        let images = &mut *core::ptr::addr_of_mut!(PAGE_IMAGES);
+        for image in images.iter_mut() {
+            if image.line > last {
+                image.line = last;
+            }
+        }
+    }
+}
+
+fn start_image_queue(app: &mut App) {
+    clamp_image_lines();
+    clear_image_view(app);
+    request_next_image(app);
+}
+
+fn request_next_image(app: &mut App) {
+    if app.image_pending || window::read_u32(app.window, window::FIELD_WEB_CAPABLE) == 0 {
         return;
     }
-    let length = url.len().min(window::IMG_URL_MAX);
-    unsafe {
-        let base = app.window + window::IMG_URL;
-        core::ptr::copy_nonoverlapping(url.as_ptr(), base as *mut u8, length);
+    let count = unsafe { *core::ptr::addr_of!(PAGE_IMAGE_COUNT) };
+    while app.image_cursor < count {
+        let index = app.image_cursor;
+        app.image_cursor += 1;
+        let (url_len, ready) = unsafe {
+            let images = &*core::ptr::addr_of!(PAGE_IMAGES);
+            (images[index].url_len, images[index].ready)
+        };
+        if url_len == 0 || ready {
+            continue;
+        }
+        let url = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
+        unsafe {
+            let images = &*core::ptr::addr_of!(PAGE_IMAGES);
+            url[..url_len].copy_from_slice(&images[index].url[..url_len]);
+        }
+        let text = unsafe {
+            let url = &*core::ptr::addr_of!(BASE_URL);
+            core::str::from_utf8(&url[..url_len]).unwrap_or("")
+        };
+        let length = text.len().min(window::IMG_URL_MAX);
+        unsafe {
+            let base = app.window + window::IMG_URL;
+            core::ptr::copy_nonoverlapping(text.as_ptr(), base as *mut u8, length);
+        }
+        window::write_u32(app.window, window::FIELD_IMG_REQUEST_LEN, length as u32);
+        window::write_u32(app.window, window::FIELD_IMG_MAX_WIDTH, IMAGE_MAX_WIDTH);
+        window::write_u32(app.window, window::FIELD_IMG_MAX_HEIGHT, IMAGE_MAX_HEIGHT);
+        net_ipc::fence();
+        let seq = window::read_u32(app.window, window::FIELD_IMG_REQUEST_SEQ).wrapping_add(1);
+        window::write_u32(app.window, window::FIELD_IMG_REQUEST_SEQ, seq);
+        app.image_seq = seq;
+        app.image_index = index;
+        app.image_started = syscall::uptime_ticks();
+        app.image_pending = true;
+        return;
     }
-    window::write_u32(app.window, window::FIELD_IMG_REQUEST_LEN, length as u32);
-    net_ipc::fence();
-    let seq = window::read_u32(app.window, window::FIELD_IMG_REQUEST_SEQ).wrapping_add(1);
-    window::write_u32(app.window, window::FIELD_IMG_REQUEST_SEQ, seq);
-    app.image_seq = seq;
-    app.image_started = syscall::uptime_ticks();
-    app.image_pending = true;
 }
 
 fn poll_image(app: &mut App) -> bool {
@@ -1099,6 +1198,7 @@ fn poll_image(app: &mut App) -> bool {
     }
     if syscall::uptime_ticks().saturating_sub(app.image_started) > 15 * TICKS_PER_SECOND {
         app.image_pending = false;
+        request_next_image(app);
         return true;
     }
     if window::read_u32(app.window, window::FIELD_IMG_DONE_SEQ) != app.image_seq {
@@ -1110,25 +1210,53 @@ fn poll_image(app: &mut App) -> bool {
     let error = window::read_u32(app.window, window::FIELD_IMG_ERROR);
     app.image_pending = false;
     if error == 0
-        && width >= 160
-        && height >= 100
-        && width <= 480
-        && height <= 360
+        && width >= IMAGE_MIN_WIDTH
+        && height >= IMAGE_MIN_HEIGHT
+        && width <= IMAGE_MAX_WIDTH
+        && height <= IMAGE_MAX_HEIGHT
         && length == width.saturating_mul(height).saturating_mul(4)
     {
-        app.image_ready = true;
-        app.image_w = width;
-        app.image_h = height;
+        let length = length as usize;
+        unsafe {
+            let destination = &mut *core::ptr::addr_of_mut!(IMAGE_PIXELS);
+            let source = (app.window + window::WEB_BODY) as *const u8;
+            core::ptr::copy_nonoverlapping(
+                source,
+                destination[app.image_index].as_mut_ptr(),
+                length.min(IMAGE_SLOT_BYTES),
+            );
+            let images = &mut *core::ptr::addr_of_mut!(PAGE_IMAGES);
+            images[app.image_index].width = width;
+            images[app.image_index].height = height;
+            images[app.image_index].ready = true;
+        }
     }
+    request_next_image(app);
     true
 }
 
-fn image_height(app: &App) -> u32 {
-    if app.image_ready {
-        app.image_h + 10
-    } else {
-        0
+fn image_blocks_before(line: u32) -> u32 {
+    let count = unsafe { *core::ptr::addr_of!(PAGE_IMAGE_COUNT) };
+    let images = unsafe { &*core::ptr::addr_of!(PAGE_IMAGES) };
+    let mut pixels = 0u32;
+    for image in &images[..count] {
+        if image.ready && u32::from(image.line) < line {
+            pixels = pixels.saturating_add(image.height + 8);
+        }
     }
+    pixels
+}
+
+fn image_block_at(line: u32) -> u32 {
+    let count = unsafe { *core::ptr::addr_of!(PAGE_IMAGE_COUNT) };
+    let images = unsafe { &*core::ptr::addr_of!(PAGE_IMAGES) };
+    let mut pixels = 0u32;
+    for image in &images[..count] {
+        if image.ready && u32::from(image.line) == line {
+            pixels = pixels.saturating_add(image.height + 8);
+        }
+    }
+    pixels
 }
 
 #[derive(Copy, Clone)]
@@ -1189,9 +1317,115 @@ fn execute_start_action(app: &mut App, action: StartAction) {
     }
 }
 
+fn load_bookmarks() {
+    let Some(fd) = syscall::fs_open(BOOKMARK_PATH, syscall::OPEN_READ) else {
+        return;
+    };
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BOOKMARK_FILE) };
+    let mut total = 0usize;
+    while total < buffer.len() {
+        match syscall::fs_read(fd, &mut buffer[total..]) {
+            Some(0) | None => break,
+            Some(count) => total += count,
+        }
+    }
+    let _ = syscall::fs_close(fd);
+
+    let mut count = 0usize;
+    for line in buffer[..total].split(|&byte| byte == b'\n') {
+        if line.is_empty() || count >= BOOKMARK_MAX {
+            continue;
+        }
+        let Some(tab) = line.iter().position(|&byte| byte == b'\t') else {
+            continue;
+        };
+        let url = &line[..tab];
+        let title = &line[tab + 1..];
+        if url.is_empty() {
+            continue;
+        }
+        unsafe {
+            let bookmarks = &mut *core::ptr::addr_of_mut!(BOOKMARKS);
+            let slot = &mut bookmarks[count];
+            let length = url.len().min(URL_CAPACITY - 1);
+            slot.url[..length].copy_from_slice(&url[..length]);
+            slot.url_len = length;
+            let length = title.len().min(BOOKMARK_TITLE);
+            slot.title[..length].copy_from_slice(&title[..length]);
+            slot.title_len = length;
+        }
+        count += 1;
+    }
+    unsafe {
+        *core::ptr::addr_of_mut!(BOOKMARK_COUNT) = count;
+    }
+}
+
+fn save_bookmarks() -> u8 {
+    if !syscall::fs_create(BOOKMARK_PATH) {
+        return 1;
+    }
+    let Some(fd) = syscall::fs_open(BOOKMARK_PATH, syscall::OPEN_WRITE) else {
+        return 2;
+    };
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(BOOKMARK_FILE) };
+    let mut length = 0usize;
+    let count = unsafe { *core::ptr::addr_of!(BOOKMARK_COUNT) };
+    unsafe {
+        let bookmarks = &*core::ptr::addr_of!(BOOKMARKS);
+        for index in 0..count {
+            let bookmark = &bookmarks[index];
+            if length + bookmark.url_len + bookmark.title_len + 2 > buffer.len() {
+                break;
+            }
+            buffer[length..length + bookmark.url_len]
+                .copy_from_slice(&bookmark.url[..bookmark.url_len]);
+            length += bookmark.url_len;
+            buffer[length] = b'\t';
+            length += 1;
+            for &byte in &bookmark.title[..bookmark.title_len] {
+                buffer[length] = if byte == b'\n' || byte == b'\r' || byte == b'\t' {
+                    b' '
+                } else {
+                    byte
+                };
+                length += 1;
+            }
+            buffer[length] = b'\n';
+            length += 1;
+        }
+    }
+    if length == 0 {
+        let _ = syscall::fs_close(fd);
+        return 3;
+    }
+    let mut written = 0usize;
+    while written < length {
+        match syscall::fs_write(fd, &buffer[written..length]) {
+            Some(0) | None => {
+                let _ = syscall::fs_close(fd);
+                return 4;
+            }
+            Some(count) => written += count,
+        }
+    }
+    let _ = syscall::fs_close(fd);
+    let Some(fd) = syscall::fs_open(BOOKMARK_PATH, syscall::OPEN_READ) else {
+        return 5;
+    };
+    let mut check = [0_u8; 16];
+    let read = syscall::fs_read(fd, &mut check).unwrap_or(0);
+    let _ = syscall::fs_close(fd);
+    if read == 0 {
+        6
+    } else {
+        0
+    }
+}
+
 fn show_start(app: &mut App) {
     cancel_load(app);
-    clear_image(app);
+    clear_images(app);
     clear_hover(app);
     app.find_mode = false;
     app.page.loaded = false;
@@ -1211,7 +1445,7 @@ fn show_start(app: &mut App) {
         tab.url_len = 0;
         tab.address_len = 0;
         tab.title_len = 0;
-        tab.image_len = 0;
+        tab.image_count = 0;
     }
     unsafe {
         *core::ptr::addr_of_mut!(TEXT_LEN) = 0;
@@ -1260,7 +1494,16 @@ fn bookmark_current(app: &mut App) {
                 slot.url_len = tab.url_len;
                 *core::ptr::addr_of_mut!(BOOKMARK_COUNT) = count + 1;
             }
-            app.toast = "SAVED TO THE START PAGE";
+            app.toast = match save_bookmarks() {
+                0 => "SAVED TO THE START PAGE",
+                1 => "SAVE FAILED: CREATE",
+                2 => "SAVE FAILED: OPEN",
+                3 => "SAVE FAILED: EMPTY",
+                4 => "SAVE FAILED: WRITE",
+                5 => "SAVE FAILED: VERIFY OPEN",
+                6 => "SAVE FAILED: VERIFY EMPTY",
+                _ => "SAVE FAILED",
+            };
         }
     }
     app.toast_until = syscall::uptime_ticks().saturating_add(TOAST_TICKS);
@@ -1282,31 +1525,41 @@ fn cancel_load(app: &mut App) {
     }
 }
 
+fn restore_images_from_tab(app: &mut App, slot: usize) {
+    let tab = tab_ref(slot);
+    let count = tab.image_count.min(IMAGE_MAX);
+    let images = tab.images;
+    clear_image_view(app);
+    unsafe {
+        *core::ptr::addr_of_mut!(PAGE_IMAGE_COUNT) = count;
+        let page = &mut *core::ptr::addr_of_mut!(PAGE_IMAGES);
+        for index in 0..count {
+            page[index] = PageImage {
+                url: images[index].url,
+                url_len: images[index].url_len,
+                line: images[index].line,
+                width: 0,
+                height: 0,
+                ready: false,
+            };
+        }
+    }
+    start_image_queue(app);
+}
+
 fn switch_tab(app: &mut App, slot: usize) {
     if slot >= TAB_MAX || !tab_ref(slot).open || slot == app.active {
         return;
     }
     cancel_load(app);
     clear_hover(app);
-    clear_image(app);
+    clear_images(app);
     app.find_mode = false;
     save_active(app);
     restore_active(app, slot);
     app.focused = !tab_ref(slot).loaded;
     paint(app);
-    let image_len = tab_ref(slot).image_len;
-    if image_len > 0 {
-        let source = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
-        unsafe {
-            let tab = tab_ref(slot);
-            source[..image_len].copy_from_slice(&tab.image_url[..image_len]);
-        }
-        let text = unsafe {
-            let source = &*core::ptr::addr_of!(BASE_URL);
-            core::str::from_utf8(&source[..image_len]).unwrap_or("")
-        };
-        start_image(app, text);
-    }
+    restore_images_from_tab(app, slot);
 }
 
 fn new_tab(app: &mut App) -> bool {
@@ -1319,7 +1572,7 @@ fn new_tab(app: &mut App) -> bool {
     tabs[slot] = Tab::EMPTY;
     tabs[slot].open = true;
     clear_hover(app);
-    clear_image(app);
+    clear_images(app);
     restore_active(app, slot);
     reset_active_view(app);
     paint(app);
@@ -1334,7 +1587,7 @@ fn close_tab(app: &mut App, slot: usize) {
     if was_active {
         cancel_load(app);
         clear_hover(app);
-        clear_image(app);
+        clear_images(app);
     }
     {
         let tabs = tabs();
@@ -1357,19 +1610,7 @@ fn close_tab(app: &mut App, slot: usize) {
         if let Some(next) = next {
             restore_active(app, next);
             app.focused = !tab_ref(next).loaded;
-            let image_len = tab_ref(next).image_len;
-            if image_len > 0 {
-                let source = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
-                unsafe {
-                    let tab = tab_ref(next);
-                    source[..image_len].copy_from_slice(&tab.image_url[..image_len]);
-                }
-                let text = unsafe {
-                    let source = &*core::ptr::addr_of!(BASE_URL);
-                    core::str::from_utf8(&source[..image_len]).unwrap_or("")
-                };
-                start_image(app, text);
-            }
+            restore_images_from_tab(app, next);
         }
     }
     paint(app);
@@ -1505,7 +1746,7 @@ fn go_history(app: &mut App, delta: i32) {
 }
 
 fn begin_navigation(app: &mut App, url: &str, from_history: bool, keep_address: bool) {
-    clear_image(app);
+    clear_images(app);
     app.find_mode = false;
     app.hover_len = 0;
     window::write_u32(app.window, window::FIELD_CURSOR, 0);
@@ -1535,41 +1776,19 @@ fn start_fetch(
         return;
     }
     if url.starts_with("https://") {
-        if window::read_u32(app.window, window::FIELD_WEB_CAPABLE) == 0 {
+        // Prefer the guest TLS stack, but keep the viewer's Qt proxy as the
+        // fallback for TLS 1.2-only sites and certificate chains the small
+        // root store does not know.
+        if app.server != 0 && app.net_base != 0 {
+            let fallback = window::read_u32(app.window, window::FIELD_WEB_CAPABLE) != 0;
+            start_guest_fetch(app, url, hops, from_history, retries, fallback);
+        } else if window::read_u32(app.window, window::FIELD_WEB_CAPABLE) != 0 {
+            start_host_fetch(app, url, hops, from_history, retries);
+        } else {
             fail_page(
                 app,
-                "HTTPS NEEDS THE HOST WINDOW (REBUILD tools/wolfser-host.sh)",
+                "HTTPS NEEDS THE NETWORK SERVER OR THE HOST WINDOW",
             );
-            return;
-        }
-        let request = unsafe {
-            let old = window::read_u32(app.window, window::FIELD_WEB_REQUEST_SEQ);
-            let base = app.window + window::WEB_REQUEST;
-            core::ptr::copy_nonoverlapping(
-                url.as_ptr(),
-                base as *mut u8,
-                url.len(),
-            );
-            window::write_u32(app.window, window::FIELD_WEB_REQUEST_LEN, url.len() as u32);
-            net_ipc::fence();
-            let next = old.wrapping_add(1);
-            window::write_u32(app.window, window::FIELD_WEB_REQUEST_SEQ, next);
-            next
-        };
-        app.pending = Some(Pending {
-            backend: Backend::Host,
-            url: [0; URL_CAPACITY],
-            url_len: 0,
-            started: syscall::uptime_ticks(),
-            hops,
-            request_id: 0,
-            host_seq: request,
-            from_history,
-            retries,
-        });
-        if let Some(pending) = app.pending.as_mut() {
-            pending.url[..url.len()].copy_from_slice(url.as_bytes());
-            pending.url_len = url.len();
         }
         return;
     }
@@ -1577,15 +1796,21 @@ fn start_fetch(
         fail_page(app, "ONLY http:// AND https:// URLS ARE SUPPORTED");
         return;
     }
+    start_guest_fetch(app, url, hops, from_history, retries, false);
+}
+
+fn start_guest_fetch(
+    app: &mut App,
+    url: &str,
+    hops: u8,
+    from_history: bool,
+    retries: u8,
+    fallback_host: bool,
+) {
     if app.server == 0 || app.net_base == 0 {
         fail_page(app, "NETWORK SERVER IS NOT RUNNING");
         return;
     }
-    // A browser can be launched immediately after `howl ready`, before DHCP
-    // has installed a lease. Starting the TCP fetch then makes smoltcp race
-    // the interface reconfiguration (the request times out). Wait briefly for
-    // the network server to report a configured address; the static QEMU
-    // fallback means this never blocks forever.
     wait_for_network(app);
     if !write_request(app.net_base, url) {
         fail_page(app, "URL IS TOO LONG FOR THE NETWORK SERVER");
@@ -1610,6 +1835,49 @@ fn start_fetch(
         host_seq: 0,
         from_history,
         retries,
+        fallback_host,
+    });
+    if let Some(pending) = app.pending.as_mut() {
+        pending.url[..url.len()].copy_from_slice(url.as_bytes());
+        pending.url_len = url.len();
+    }
+}
+
+fn start_host_fetch(
+    app: &mut App,
+    url: &str,
+    hops: u8,
+    from_history: bool,
+    retries: u8,
+) {
+    if window::read_u32(app.window, window::FIELD_WEB_CAPABLE) == 0 {
+        fail_page(
+            app,
+            "HTTPS NEEDS THE HOST WINDOW (REBUILD tools/wolfser-host.sh)",
+        );
+        return;
+    }
+    let request = unsafe {
+        let old = window::read_u32(app.window, window::FIELD_WEB_REQUEST_SEQ);
+        let base = app.window + window::WEB_REQUEST;
+        core::ptr::copy_nonoverlapping(url.as_ptr(), base as *mut u8, url.len());
+        window::write_u32(app.window, window::FIELD_WEB_REQUEST_LEN, url.len() as u32);
+        net_ipc::fence();
+        let next = old.wrapping_add(1);
+        window::write_u32(app.window, window::FIELD_WEB_REQUEST_SEQ, next);
+        next
+    };
+    app.pending = Some(Pending {
+        backend: Backend::Host,
+        url: [0; URL_CAPACITY],
+        url_len: 0,
+        started: syscall::uptime_ticks(),
+        hops,
+        request_id: 0,
+        host_seq: request,
+        from_history,
+        retries,
+        fallback_host: false,
     });
     if let Some(pending) = app.pending.as_mut() {
         pending.url[..url.len()].copy_from_slice(url.as_bytes());
@@ -1705,7 +1973,29 @@ fn retry_host(app: &mut App) -> bool {
     };
     app.page.loading = true;
     app.page.error = "";
-    start_fetch(app, text, hops, from_history, retries + 1);
+    start_host_fetch(app, text, hops, from_history, retries + 1);
+    true
+}
+
+fn fallback_to_host(app: &mut App) -> bool {
+    let Some(pending) = app.pending.as_ref() else {
+        return false;
+    };
+    if !pending.fallback_host || pending.url_len == 0 {
+        return false;
+    }
+    let hops = pending.hops;
+    let from_history = pending.from_history;
+    let retries = pending.retries;
+    let length = pending.url_len;
+    let url = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
+    url[..length].copy_from_slice(&pending.url[..length]);
+    app.pending = None;
+    let text = unsafe {
+        let url = &*core::ptr::addr_of!(BASE_URL);
+        core::str::from_utf8(&url[..length]).unwrap_or("")
+    };
+    start_host_fetch(app, text, hops, from_history, retries);
     true
 }
 
@@ -1830,6 +2120,9 @@ fn handle_guest_reply(app: &mut App, code: u8, status: u16, body_len: usize) {
         return;
     }
     if code != net_ipc::NET_OK {
+        if code == net_ipc::NET_ERR_TLS && fallback_to_host(app) {
+            return;
+        }
         if retryable(code) && retry_guest(app) {
             return;
         }
@@ -1920,10 +2213,16 @@ fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
         tab.loaded = true;
         tab.status = status;
         tab.error = "";
-        let image = unsafe { &*core::ptr::addr_of!(IMAGE_URL) };
-        let image_len = unsafe { *core::ptr::addr_of!(IMAGE_URL_LEN) };
-        tab.image_len = image_len.min(URL_CAPACITY);
-        tab.image_url[..tab.image_len].copy_from_slice(&image[..tab.image_len]);
+        let images = unsafe { &*core::ptr::addr_of!(PAGE_IMAGES) };
+        let image_count = unsafe { *core::ptr::addr_of!(PAGE_IMAGE_COUNT) };
+        tab.image_count = image_count.min(IMAGE_MAX);
+        for index in 0..tab.image_count {
+            tab.images[index] = TabImage {
+                url: images[index].url,
+                url_len: images[index].url_len,
+                line: images[index].line,
+            };
+        }
     }
 
     let from_history = app
@@ -1937,7 +2236,7 @@ fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
     } else {
         history_push(app.active, url);
     }
-    start_image_from_global(app);
+    start_image_queue(app);
 }
 
 fn history_push(active: usize, url: &str) {
@@ -2189,7 +2488,7 @@ fn extract(body: &[u8], page_url: &str) {
         *core::ptr::addr_of_mut!(LINK_RUN_COUNT) = 0;
         *core::ptr::addr_of_mut!(LINK_POOL_LEN) = 0;
         *core::ptr::addr_of_mut!(PAGE_REDIRECT_LEN) = 0;
-        *core::ptr::addr_of_mut!(IMAGE_URL_LEN) = 0;
+        *core::ptr::addr_of_mut!(PAGE_IMAGE_COUNT) = 0;
     }
 
     let mut writer = Writer {
@@ -2248,7 +2547,7 @@ fn extract(body: &[u8], page_url: &str) {
                     // but their lead image is often the best picture on the
                     // page, so look inside before dropping the block.
                     if tag_eq(name, b"table") {
-                        scan_images(body, index, end, page_url);
+                        scan_images(body, index, end, page_url, writer.line);
                     }
                     index = end;
                 }
@@ -2276,7 +2575,7 @@ fn extract(body: &[u8], page_url: &str) {
                 continue;
             }
             if tag_eq(name, b"img") && !closing {
-                store_image(tag, page_url);
+                store_image(tag, page_url, writer.line);
                 continue;
             }
             if tag_eq(name, b"a") {
@@ -2636,13 +2935,19 @@ fn content_region(body: &[u8]) -> (usize, usize) {
     (0, body.len())
 }
 
-fn scan_images(body: &[u8], start: usize, end: usize, page_url: &str) {
+fn scan_images(body: &[u8], start: usize, end: usize, page_url: &str, line: u16) {
     let mut index = start;
     while index < end && index < body.len() {
         if body[index] == b'<' {
             let (name, tag, after) = read_tag(body, index);
             if tag_eq(name, b"img") {
-                store_image(tag, page_url);
+                let before = unsafe { *core::ptr::addr_of!(PAGE_IMAGE_COUNT) };
+                store_image(tag, page_url, line);
+                // One image per skipped table: the infobox lead picture.
+                // Further slots belong to images in the article flow.
+                if unsafe { *core::ptr::addr_of!(PAGE_IMAGE_COUNT) } > before {
+                    break;
+                }
             }
             index = after;
         } else {
@@ -2651,9 +2956,9 @@ fn scan_images(body: &[u8], start: usize, end: usize, page_url: &str) {
     }
 }
 
-fn store_image(tag: &[u8], page_url: &str) {
-    let already = unsafe { *core::ptr::addr_of!(IMAGE_URL_LEN) };
-    if already > 0 {
+fn store_image(tag: &[u8], page_url: &str, line: u16) {
+    let count = unsafe { *core::ptr::addr_of!(PAGE_IMAGE_COUNT) };
+    if count >= IMAGE_MAX {
         return;
     }
     let Some(src) = tag_attribute(tag, b"src")
@@ -2665,12 +2970,12 @@ fn store_image(tag: &[u8], page_url: &str) {
         return;
     }
     if let Some(width) = tag_attribute(tag, b"width").and_then(attribute_number) {
-        if width < 120 {
+        if width < IMAGE_MIN_WIDTH {
             return;
         }
     }
     if let Some(height) = tag_attribute(tag, b"height").and_then(attribute_number) {
-        if height < 80 {
+        if height < IMAGE_MIN_HEIGHT {
             return;
         }
     }
@@ -2695,11 +3000,27 @@ fn store_image(tag: &[u8], page_url: &str) {
     if !looks_like_image_url(text) {
         return;
     }
-    let output = unsafe { &mut *core::ptr::addr_of_mut!(IMAGE_URL) };
-    if let Some(resolved) = resolve_link(page_url, text, output) {
-        unsafe {
-            *core::ptr::addr_of_mut!(IMAGE_URL_LEN) = resolved;
+    let mut resolved = [0_u8; URL_CAPACITY];
+    let Some(resolved_len) = resolve_link(page_url, text, &mut resolved) else {
+        return;
+    };
+    unsafe {
+        let images = &mut *core::ptr::addr_of_mut!(PAGE_IMAGES);
+        for image in &images[..count] {
+            if image.url_len == resolved_len
+                && image.url[..resolved_len] == resolved[..resolved_len]
+            {
+                return;
+            }
         }
+        let slot = &mut images[count];
+        slot.url[..resolved_len].copy_from_slice(&resolved[..resolved_len]);
+        slot.url_len = resolved_len;
+        slot.line = line;
+        slot.width = 0;
+        slot.height = 0;
+        slot.ready = false;
+        *core::ptr::addr_of_mut!(PAGE_IMAGE_COUNT) = count + 1;
     }
 }
 
@@ -3283,7 +3604,7 @@ fn paint(app: &App) {
     publish(base, window::STATE_READY);
 }
 
-fn draw_start_page(base: u64, app: &App) {
+fn draw_start_page(base: u64, _app: &App) {
     draw_text(base, 24, BODY_TOP + 12, 3, "WOLFSER", COLOR_TEXT);
     draw_text(
         base,
@@ -3602,15 +3923,14 @@ fn draw_body(base: u64, app: &App) {
         draw_text(base, 24, BODY_TOP + 20, 2, "EMPTY PAGE", COLOR_TEXT);
         return;
     }
-    let scroll_pixels = pixels_before(app.scroll);
+    let scroll_pixels =
+        (pixels_before(app.scroll) + image_blocks_before(app.scroll as u32)) as usize;
     let offset = BODY_TOP as i32 - scroll_pixels as i32;
-    let mut match_cursor = 0usize;
-    if app.image_ready {
-        let x = MARGIN as i32 + ((WIDTH - 2 * MARGIN - app.image_w) / 2) as i32;
-        draw_image(base, x, offset, app.image_w, app.image_h);
-    }
-    let mut y = offset + image_height(app) as i32;
+    let mut y = offset;
     let bottom = (HEIGHT - FOOTER_HEIGHT) as i32;
+    let mut match_cursor = 0usize;
+    let image_count = unsafe { *core::ptr::addr_of!(PAGE_IMAGE_COUNT) };
+    let images = unsafe { &*core::ptr::addr_of!(PAGE_IMAGES) };
     let mut line = 0u32;
     let mut start = 0usize;
     while start <= length {
@@ -3618,13 +3938,24 @@ fn draw_body(base: u64, app: &App) {
         while end < length && text[end] != b'\n' {
             end += 1;
         }
+        // Images belong before their text line and scroll with it.
+        for index in 0..image_count {
+            let image = &images[index];
+            if !image.ready || u32::from(image.line) != line {
+                continue;
+            }
+            let x = MARGIN as i32 + ((WIDTH - 2 * MARGIN - image.width) / 2) as i32;
+            if y + image.height as i32 > BODY_TOP as i32 && y < bottom {
+                let pixels = unsafe {
+                    let slots = &*core::ptr::addr_of!(IMAGE_PIXELS);
+                    &slots[index][..]
+                };
+                draw_inline_image(base, x, y, image.width, image.height, pixels);
+            }
+            y += image.height as i32 + 8;
+        }
         let flags = if start < end { styles[start] } else { 0 };
         let height = line_height(flags);
-        // The lead image occupies space before line 0, so a line with a
-        // smaller index than `scroll` can still be visible when the image is
-        // scrolling away; decide by position, not by index.
-        // Draw only fully visible lines. Clamping a partially scrolled line
-        // to BODY_TOP would overlap the next line.
         if y >= BODY_TOP as i32 && y < bottom {
             let needle = if app.find_mode {
                 &app.find_query[..app.find_len]
@@ -3660,9 +3991,10 @@ fn draw_body(base: u64, app: &App) {
     }
 }
 
-fn draw_image(base: u64, x: i32, y: i32, width: u32, height: u32) {
+fn draw_inline_image(base: u64, x: i32, y: i32, width: u32, height: u32, pixels: &[u8]) {
     let top = BODY_TOP as i32;
     let bottom = (HEIGHT - FOOTER_HEIGHT) as i32;
+    let stride = (width * 4) as usize;
     let mut row = 0u32;
     while row < height {
         let destination_y = y + row as i32;
@@ -3671,25 +4003,33 @@ fn draw_image(base: u64, x: i32, y: i32, width: u32, height: u32) {
             while column < width {
                 let destination_x = x + column as i32;
                 if destination_x >= 0 && destination_x < WIDTH as i32 {
-                    let source = (base
-                        + window::WEB_BODY
-                        + u64::from((row * width + column) * 4))
-                        as *const u32;
-                    let pixel = unsafe { core::ptr::read_volatile(source) };
-                    let alpha = (pixel >> 24) & 0xFF;
-                    if alpha == 0xFF {
-                        put_pixel(base, destination_x as u32, destination_y as u32, pixel);
-                    } else if alpha != 0 {
-                        // Blend transparent pixels against the white page.
-                        let inverse = 255 - alpha;
-                        let red = (pixel & 0xFF) * alpha + 255 * inverse;
-                        let green = ((pixel >> 8) & 0xFF) * alpha + 255 * inverse;
-                        let blue = ((pixel >> 16) & 0xFF) * alpha + 255 * inverse;
-                        let blended = (red / 255)
-                            | ((green / 255) << 8)
-                            | ((blue / 255) << 16)
-                            | 0xFF00_0000;
-                        put_pixel(base, destination_x as u32, destination_y as u32, blended);
+                    let offset = row as usize * stride + column as usize * 4;
+                    if offset + 4 <= pixels.len() {
+                        let pixel = u32::from_le_bytes([
+                            pixels[offset],
+                            pixels[offset + 1],
+                            pixels[offset + 2],
+                            pixels[offset + 3],
+                        ]);
+                        let alpha = (pixel >> 24) & 0xFF;
+                        if alpha == 0xFF {
+                            put_pixel(base, destination_x as u32, destination_y as u32, pixel);
+                        } else if alpha != 0 {
+                            let inverse = 255 - alpha;
+                            let red = (pixel & 0xFF) * alpha + 255 * inverse;
+                            let green = ((pixel >> 8) & 0xFF) * alpha + 255 * inverse;
+                            let blue = ((pixel >> 16) & 0xFF) * alpha + 255 * inverse;
+                            let blended = (red / 255)
+                                | ((green / 255) << 8)
+                                | ((blue / 255) << 16)
+                                | 0xFF00_0000;
+                            put_pixel(
+                                base,
+                                destination_x as u32,
+                                destination_y as u32,
+                                blended,
+                            );
+                        }
                     }
                 }
                 column += 1;

@@ -101,7 +101,7 @@ userspace.
 - [x] DNS: `dns <name>` resolves through the DHCP-provided resolver
 - [x] HTTP: `wget <url> [file]` fetches an `http://` document through a real TCP connection into SFS; `ip` shows the lease
 - [x] Vendored `smoltcp` 0.14 with a two-line neighbour fix for broadcast DHCP traffic (`third_party/smoltcp/PATCH.md`)
-- [x] **Wolfser**: `wolfser [query|url]` opens a search/address bar; pages render into an ivshmem RGBA surface with clickable links, back/forward history, word wrap, headings and a reader mode. `http://` uses the guest smoltcp stack, `https://` uses the host viewer's Qt TLS proxy
+- [x] **Wolfser**: `wolfser [query|url]` opens a search/address bar; pages render into an ivshmem RGBA surface with clickable links, back/forward history, word wrap, headings, a reader mode, up to three inline images, find-in-page, a start page with persistent bookmarks, six tabs and window zoom. `http://` and `https://` use the guest stack (TLS 1.3); the host viewer's Qt TLS proxy is the fallback
 - [x] Qt window viewer (`tools/window-viewer`) that maps the same surface, repaints on `frame_seq`, and sends keys/wheel through an input ring; `--snapshot` mode for headless checks
 - [x] `SYS_MAP_PHYS_NC`: maps a non-DRAM window (ivshmem) as Normal Non-Cacheable user memory
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
@@ -544,22 +544,25 @@ Wolfser is a normal guest program (`wolfser` in Howl). With no argument it
 opens an empty search bar; with an argument it treats the text as an address
 or a query. Enter resolves the input: an explicit URL is used as-is, a bare
 host gets `https://`, anything else becomes a DuckDuckGo HTML search
-(`https://html.duckduckgo.com/html/?q=...`). Plain `http://` is fetched by
-`net_server` over smoltcp; `https://` is handed to the host viewer, which
-fetches it with Qt's TLS stack and writes the response into the shared buffer.
-Redirects (3xx and `<meta http-equiv=refresh>`) are followed by the guest, so a
-page may move between the two paths freely.
+(`https://html.duckduckgo.com/html/?q=...`). Both schemes are fetched by `net_server` over smoltcp: `https://` runs a
+TLS 1.3 client in the guest (`third_party/embedded-tls`) with six embedded
+roots, RSA/ECDSA-P256/P384/Ed25519 verification and a 1 MiB client body. If a
+site needs something the small root store or TLS 1.3-only client cannot do,
+Wolfser retries the URL through the host viewer's Qt TLS proxy. Redirects (3xx
+and `<meta http-equiv=refresh>`) are followed by the guest, so a page may move
+between the two paths freely. `wget https://...` uses the same guest TLS path.
 
 The page is reduced to readable content (scripts/styles/tables/navigation
 stripped, entities decoded, word-wrapped paragraphs, headings scaled up) and
 drawn into one 900x640 RGBA surface. A `<main>`, `<article>` or MediaWiki
 content container selects the article region, so Wikipedia opens on the text
 instead of its menus. Links are blue and underlined; clicking one navigates.
-A lead image (usually the article's infobox picture) is fetched and decoded by
-the host viewer's Qt image stack, then shown centred above the text; the image
-scrolls with the page and is re-fetched when its tab comes back. Four tabs keep
-their own URL, history, scroll position and rendered page, so switching is
-instant and does not refetch. There is no guest compositor: the
+Up to three page images are fetched and decoded by the host viewer's Qt image
+stack (PNG/JPEG/WebP), scaled to at most 240x180, then placed inline before
+their text line; the infobox contributes the lead picture and later article
+figures follow in the flow. They scroll with the text and are re-fetched when
+their tab comes back. Six tabs keep their own URL, history, scroll position and
+rendered page, so switching is instant and does not refetch. There is no guest compositor: the
 surface lives in an ivshmem BAR, and a Qt program on the host maps the same
 file.
 
@@ -576,8 +579,9 @@ file.
 
 Keys from the host (`Ctrl+L` edit the address, `Enter` go, `Ctrl+T` new tab,
 `Ctrl+W` close tab, `Ctrl+Tab` next tab, `Ctrl+F` find in page, `Ctrl+D`
-bookmark, `Alt+Home` start page, `Ctrl+Q` quit, `Ctrl+R`/`F5` reload,
-`Alt+Left`/`Alt+Right` history, arrows and PageUp/PageDown/Home/End scroll) and
+bookmark, `Alt+Home` start page, `Ctrl++`/`Ctrl+-`/`Ctrl+0` zoom the host
+window, `Ctrl+Q` quit, `Ctrl+R`/`F5` reload, `Alt+Left`/`Alt+Right` history,
+arrows and PageUp/PageDown/Home/End scroll) and
 mouse clicks/wheel travel through the ring;
 clicking a tab switches, `+` opens one and the small `x` closes it; typing
 anywhere starts a new search. Hovering a link shows its target in the footer

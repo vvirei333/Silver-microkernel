@@ -19,6 +19,10 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
+#[path = "../allocator.rs"]
+mod allocator;
 #[allow(dead_code)]
 #[path = "../ipc.rs"]
 mod ipc;
@@ -27,6 +31,13 @@ mod ipc;
 mod net_ipc;
 #[path = "../syscall.rs"]
 mod syscall;
+#[path = "../tls_client.rs"]
+mod tls_client;
+#[path = "../tls_roots.rs"]
+mod tls_roots;
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: allocator::UserAllocator = allocator::UserAllocator;
 
 use core::panic::PanicInfo;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
@@ -58,8 +69,8 @@ const PING_TIMEOUT_MILLIS: u64 = 2000;
 
 /// TCP receive window. HTTP responses are drained into the shared window every
 /// poll, so this only has to smooth over one scheduling delay.
-const TCP_RX_SIZE: usize = 8192;
-const TCP_TX_SIZE: usize = 2048;
+const TCP_RX_SIZE: usize = 32 * 1024;
+const TCP_TX_SIZE: usize = 8192;
 
 const DNS_QUERY_SLOTS: usize = 2;
 /// Standalone `dns` lookups are bounded so a lost query cannot hang a client.
@@ -102,6 +113,64 @@ static mut DEVICE: FrameDevice = FrameDevice::new();
 static mut TCP_RX_PAYLOAD: [u8; TCP_RX_SIZE] = [0; TCP_RX_SIZE];
 static mut TCP_TX_PAYLOAD: [u8; TCP_TX_SIZE] = [0; TCP_TX_SIZE];
 static mut FETCH: Fetch = Fetch::empty();
+
+/// Small positive DNS cache. Repeated navigation (search result -> article ->
+/// back) otherwise pays a UDP round trip per host; five minutes is short
+/// enough for QEMU/desktop use and long enough to matter.
+const DNS_CACHE_SLOTS: usize = 8;
+const DNS_CACHE_TTL_MILLIS: i64 = 5 * 60 * 1000;
+
+#[derive(Copy, Clone)]
+struct DnsCacheEntry {
+    host: [u8; HOST_MAX],
+    host_len: usize,
+    address: [u8; 4],
+    expires_millis: i64,
+}
+
+impl DnsCacheEntry {
+    const EMPTY: DnsCacheEntry = DnsCacheEntry {
+        host: [0; HOST_MAX],
+        host_len: 0,
+        address: [0; 4],
+        expires_millis: 0,
+    };
+}
+
+static mut DNS_CACHE: [DnsCacheEntry; DNS_CACHE_SLOTS] = [DnsCacheEntry::EMPTY; DNS_CACHE_SLOTS];
+static mut DNS_CACHE_NEXT: usize = 0;
+
+fn dns_cache_lookup(host: &str, now_millis: i64) -> Option<[u8; 4]> {
+    unsafe {
+        let cache = &*core::ptr::addr_of!(DNS_CACHE);
+        for entry in cache.iter() {
+            if entry.host_len == host.len()
+                && entry.expires_millis > now_millis
+                && entry.host[..entry.host_len].eq_ignore_ascii_case(host.as_bytes())
+            {
+                return Some(entry.address);
+            }
+        }
+    }
+    None
+}
+
+fn dns_cache_store(host: &str, address: [u8; 4], now_millis: i64) {
+    if host.is_empty() || host.len() >= HOST_MAX {
+        return;
+    }
+    unsafe {
+        let cache = &mut *core::ptr::addr_of_mut!(DNS_CACHE);
+        let slot = *core::ptr::addr_of!(DNS_CACHE_NEXT) % DNS_CACHE_SLOTS;
+        *core::ptr::addr_of_mut!(DNS_CACHE_NEXT) = slot + 1;
+        cache[slot].host_len = host.len();
+        cache[slot].host[..host.len()].copy_from_slice(host.as_bytes());
+        cache[slot].address = address;
+        cache[slot].expires_millis = now_millis.saturating_add(DNS_CACHE_TTL_MILLIS);
+    }
+}
+static mut TLS_READ_BUFFER: [u8; 16640] = [0; 16640];
+static mut TLS_WRITE_BUFFER: [u8; 16640] = [0; 16640];
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -436,11 +505,15 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
         drive_fetch(
             fetch,
             &mut interface,
+            device,
             &mut sockets,
             dns_handle,
             tcp_handle,
             client_vaddr,
-            now_millis,
+            dma_vaddr,
+            dma_paddr,
+            driver,
+            &mut now_millis,
             &mut outbox,
         );
 
@@ -599,6 +672,7 @@ enum FetchStage {
     Resolving,
     Connecting,
     Connected,
+    Tls,
     Sending,
     Receiving,
 }
@@ -621,6 +695,7 @@ struct Fetch {
     request_len: usize,
     sent: usize,
     received: usize,
+    tls: bool,
     started_millis: i64,
     connect_started: bool,
     local_port: u16,
@@ -643,6 +718,7 @@ impl Fetch {
             request_len: 0,
             sent: 0,
             received: 0,
+            tls: false,
             started_millis: 0,
             connect_started: false,
             local_port: 0,
@@ -689,13 +765,6 @@ fn start_http(
         );
         return;
     };
-    if parsed.tls {
-        outbox.push(
-            message.sender,
-            net_ipc::http_reply_id(request_id, net_ipc::NET_ERR_TLS, 0, 0),
-        );
-        return;
-    }
     if parsed.host.len() > HOST_MAX - 1 || parsed.path.len() > PATH_MAX - 1 {
         outbox.push(
             message.sender,
@@ -709,6 +778,7 @@ fn start_http(
     fetch.path[..parsed.path.len()].copy_from_slice(parsed.path.as_bytes());
     fetch.path_len = parsed.path.len();
     fetch.port = parsed.port;
+    fetch.tls = parsed.tls;
     fetch.requester = message.sender;
     fetch.request_id = request_id;
     fetch.sent = 0;
@@ -721,6 +791,9 @@ fn start_http(
     fetch.local_port = 49152 + (now_millis as u16 % 16384);
 
     if let Some(address) = parse_ipv4(parsed.host) {
+        fetch.remote = address;
+        fetch.stage = FetchStage::Connecting;
+    } else if let Some(address) = dns_cache_lookup(parsed.host, now_millis) {
         fetch.remote = address;
         fetch.stage = FetchStage::Connecting;
     } else {
@@ -745,21 +818,203 @@ fn start_http(
     }
 }
 
+/// Blocking `embedded-io` adapter over the smoltcp socket. It pumps the
+/// interface and the virtio-net mailbox while TLS waits for a record, so the
+/// handshake cannot stall behind the normal polling loop.
+struct TlsTransport<'a, 'b> {
+    interface: *mut Interface,
+    device: *mut FrameDevice,
+    sockets: *mut SocketSet<'a>,
+    handle: SocketHandle,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    driver: Option<u64>,
+    now: &'b mut i64,
+    deadline: i64,
+    spin: u32,
+}
+
+impl TlsTransport<'_, '_> {
+    fn pump(&mut self) {
+        unsafe {
+            let length = read_u32(self.dma_vaddr, net_ipc::RX_LENGTH) as usize;
+            if length > 0 {
+                let length = length.min(net_ipc::MAX_FRAME);
+                net_ipc::fence();
+                (*self.device).read_dma_frame(self.dma_vaddr, net_ipc::RX_FRAME, length);
+                net_ipc::fence();
+                write_u32(self.dma_vaddr, net_ipc::RX_LENGTH, 0);
+            }
+            let now = Instant::from_millis(*self.now);
+            (*self.interface).poll(now, &mut *self.device, &mut *self.sockets);
+            let device = &mut *self.device;
+            let tx_length = device.tx_len;
+            if tx_length > 0 && read_u32(self.dma_vaddr, net_ipc::TX_LENGTH) == 0 {
+                write_dma_frame(
+                    self.dma_vaddr,
+                    net_ipc::TX_FRAME,
+                    &device.tx[..tx_length],
+                );
+                net_ipc::fence();
+                write_u32(self.dma_vaddr, net_ipc::TX_LENGTH, tx_length as u32);
+                if let Some(driver) = self.driver {
+                    let _ = syscall::try_send(
+                        driver,
+                        &net_ipc::tx_doorbell(tx_length as u16),
+                    );
+                }
+                device.tx_len = 0;
+            }
+        }
+        // The kernel timer is 100 Hz, so sleeping every poll would cap the
+        // TLS stream at a few KiB per tick. Spin and yield only occasionally.
+        if self.spin % 16 == 0 {
+            syscall::sleep(1);
+        }
+        self.spin = self.spin.wrapping_add(1);
+        *self.now += 1;
+    }
+}
+
+impl embedded_io::ErrorType for TlsTransport<'_, '_> {
+    type Error = embedded_io::ErrorKind;
+}
+
+impl embedded_io::Read for TlsTransport<'_, '_> {
+    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, Self::Error> {
+        loop {
+            {
+                let socket =
+                    unsafe { (&mut *self.sockets).get_mut::<tcp::Socket>(self.handle) };
+                if socket.can_recv() {
+                    match socket.recv_slice(buffer) {
+                        Ok(count) if count > 0 => return Ok(count),
+                        Ok(_) => {}
+                        Err(_) => return Err(embedded_io::ErrorKind::BrokenPipe),
+                    }
+                } else if matches!(
+                    socket.state(),
+                    tcp::State::Closed | tcp::State::TimeWait
+                ) {
+                    return Err(embedded_io::ErrorKind::BrokenPipe);
+                }
+            }
+            if *self.now >= self.deadline {
+                return Err(embedded_io::ErrorKind::TimedOut);
+            }
+            self.pump();
+        }
+    }
+}
+
+impl embedded_io::Write for TlsTransport<'_, '_> {
+    fn write(&mut self, buffer: &[u8]) -> Result<usize, Self::Error> {
+        loop {
+            {
+                let socket =
+                    unsafe { (&mut *self.sockets).get_mut::<tcp::Socket>(self.handle) };
+                if socket.may_send() {
+                    match socket.send_slice(buffer) {
+                        Ok(count) if count > 0 => return Ok(count),
+                        Ok(_) => {}
+                        Err(_) => return Err(embedded_io::ErrorKind::BrokenPipe),
+                    }
+                }
+                if matches!(socket.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                    return Err(embedded_io::ErrorKind::BrokenPipe);
+                }
+            }
+            if *self.now >= self.deadline {
+                return Err(embedded_io::ErrorKind::TimedOut);
+            }
+            self.pump();
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tls_fetch(
+    fetch: &mut Fetch,
+    interface: &mut Interface,
+    device: &mut FrameDevice,
+    sockets: &mut SocketSet<'_>,
+    tcp_handle: SocketHandle,
+    client_base: u64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    driver: Option<u64>,
+    now_millis: &mut i64,
+    outbox: &mut Outbox,
+) {
+    build_request(fetch);
+    let host = core::str::from_utf8(&fetch.host[..fetch.host_len]).unwrap_or("");
+    let read_buffer = unsafe { &mut *core::ptr::addr_of_mut!(TLS_READ_BUFFER) };
+    let write_buffer = unsafe { &mut *core::ptr::addr_of_mut!(TLS_WRITE_BUFFER) };
+    let response = unsafe {
+        core::slice::from_raw_parts_mut(
+            (client_base + net_ipc::CLIENT_BODY) as *mut u8,
+            net_ipc::CLIENT_BODY_MAX,
+        )
+    };
+    let deadline = *now_millis + HTTP_TIMEOUT_MILLIS;
+    let transport = TlsTransport {
+        interface: interface as *mut Interface,
+        device: device as *mut FrameDevice,
+        sockets: sockets as *mut SocketSet<'_>,
+        handle: tcp_handle,
+        dma_vaddr,
+        dma_paddr,
+        driver,
+        deadline,
+        now: &mut *now_millis,
+        spin: 0,
+    };
+    let result = tls_client::fetch(
+        transport,
+        host,
+        &fetch.request[..fetch.request_len],
+        read_buffer,
+        write_buffer,
+        response,
+    );
+    {
+        let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+        if socket.state() != tcp::State::Closed {
+            socket.abort();
+        }
+    }
+    match result {
+        Ok(length) if length > 0 => {
+            fetch.received = length.min(net_ipc::CLIENT_BODY_MAX);
+            finish_fetch(fetch, client_base, outbox);
+        }
+        _ => fail_fetch(fetch, net_ipc::NET_ERR_TLS, 0, outbox),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn drive_fetch(
     fetch: &mut Fetch,
     interface: &mut Interface,
+    device: &mut FrameDevice,
     sockets: &mut SocketSet<'_>,
     dns_handle: SocketHandle,
     tcp_handle: SocketHandle,
     client_base: u64,
-    now_millis: i64,
+    dma_vaddr: u64,
+    dma_paddr: u64,
+    driver: Option<u64>,
+    now_millis: &mut i64,
     outbox: &mut Outbox,
 ) {
     if fetch.stage == FetchStage::Idle {
         return;
     }
-    if now_millis - fetch.started_millis > HTTP_TIMEOUT_MILLIS {
+    if *now_millis - fetch.started_millis > HTTP_TIMEOUT_MILLIS {
         let stage = fetch.stage as u16;
         fail_fetch(fetch, net_ipc::NET_ERR_TIMEOUT, stage, outbox);
         return;
@@ -784,6 +1039,12 @@ fn drive_fetch(
                         _ => None,
                     }) {
                         Some(address) => {
+                            let mut host = [0_u8; HOST_MAX];
+                            let length = fetch.host_len.min(HOST_MAX);
+                            host[..length].copy_from_slice(&fetch.host[..length]);
+                            if let Ok(host) = core::str::from_utf8(&host[..length]) {
+                                dns_cache_store(host, address, *now_millis);
+                            }
                             fetch.remote = address;
                             fetch.stage = FetchStage::Connecting;
                         }
@@ -825,13 +1086,34 @@ fn drive_fetch(
             } else {
                 let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
                 match socket.state() {
-                    tcp::State::Established => fetch.stage = FetchStage::Connected,
+                    tcp::State::Established => {
+                        fetch.stage = if fetch.tls {
+                            FetchStage::Tls
+                        } else {
+                            FetchStage::Connected
+                        }
+                    }
                     tcp::State::Closed | tcp::State::TimeWait => {
                         fail_fetch(fetch, net_ipc::NET_ERR_CONNECT, 0, outbox);
                     }
                     _ => {}
                 }
             }
+        }
+        FetchStage::Tls => {
+            run_tls_fetch(
+                fetch,
+                interface,
+                device,
+                sockets,
+                tcp_handle,
+                client_base,
+                dma_vaddr,
+                dma_paddr,
+                driver,
+                now_millis,
+                outbox,
+            );
         }
         FetchStage::Connected => {
             build_request(fetch);

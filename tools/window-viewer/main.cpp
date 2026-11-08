@@ -60,6 +60,8 @@ constexpr uint64_t kFieldImgHeight = 0x60;
 constexpr uint64_t kFieldImgLen = 0x64;
 constexpr uint64_t kFieldImgError = 0x68;
 constexpr uint64_t kFieldImgRequestLen = 0x6C;
+constexpr uint64_t kFieldImgMaxWidth = 0x70;
+constexpr uint64_t kFieldImgMaxHeight = 0x74;
 constexpr uint64_t kPixels = 0x1000;
 constexpr uint64_t kWebRequest = 0x240000;
 constexpr int kWebRequestMax = 1024;
@@ -318,9 +320,18 @@ private:
             publishImage(seq, 0, 0, 0, 2); // decode error
             return;
         }
-        if (image.width() > kImageMaxWidth || image.height() > kImageMaxHeight) {
-            image = image.scaled(kImageMaxWidth, kImageMaxHeight, Qt::KeepAspectRatio,
-                                 Qt::SmoothTransformation);
+        uint32_t maxWidth = m_shared.u32(kFieldImgMaxWidth);
+        uint32_t maxHeight = m_shared.u32(kFieldImgMaxHeight);
+        if (maxWidth == 0 || maxWidth > kImageMaxWidth) {
+            maxWidth = kImageMaxWidth;
+        }
+        if (maxHeight == 0 || maxHeight > kImageMaxHeight) {
+            maxHeight = kImageMaxHeight;
+        }
+        if (image.width() > static_cast<int>(maxWidth) ||
+            image.height() > static_cast<int>(maxHeight)) {
+            image = image.scaled(static_cast<int>(maxWidth), static_cast<int>(maxHeight),
+                                 Qt::KeepAspectRatio, Qt::SmoothTransformation);
         }
         image = image.convertToFormat(QImage::Format_RGBA8888);
         const uint32_t width = static_cast<uint32_t>(image.width());
@@ -383,6 +394,8 @@ class Viewer : public QWidget {
 public:
     Viewer(Shared &shared, QWidget *parent = nullptr) : QWidget(parent), m_shared(shared) {
         setWindowTitle("Wolfser — WerewolfOS");
+        m_frameWidth = 900;
+        m_frameHeight = 640;
         resize(900, 640);
         setMouseTracking(true);
         m_lastSequence = 0;
@@ -398,7 +411,9 @@ public:
             const uint32_t width = m_shared.u32(kFieldWidth);
             const uint32_t height = m_shared.u32(kFieldHeight);
             if (!m_sized && width != 0 && height != 0) {
-                resize(static_cast<int>(width), static_cast<int>(height));
+                m_frameWidth = static_cast<int>(width);
+                m_frameHeight = static_cast<int>(height);
+                applyZoom(m_zoom);
                 m_sized = true;
             }
             const uint32_t sequence = m_shared.u32(kFieldFrameSeq);
@@ -414,6 +429,8 @@ public:
         });
         timer->start(16);
     }
+
+    void setZoom(int percent) { applyZoom(percent); }
 
 protected:
     void paintEvent(QPaintEvent *) override {
@@ -448,10 +465,27 @@ protected:
         QImage frame(m_shared.data + kPixels, static_cast<int>(width), static_cast<int>(height),
                      static_cast<int>(stride), QImage::Format_RGBA8888);
         QPainter painter(this);
+        painter.setRenderHint(QPainter::SmoothPixmapTransform, m_zoom > 100);
         painter.drawImage(rect(), frame);
     }
 
     void keyPressEvent(QKeyEvent *event) override {
+        if (event->modifiers() & Qt::ControlModifier) {
+            switch (event->key()) {
+            case Qt::Key_Plus:
+            case Qt::Key_Equal:
+                applyZoom(m_zoom + 10);
+                return;
+            case Qt::Key_Minus:
+                applyZoom(m_zoom - 10);
+                return;
+            case Qt::Key_0:
+                applyZoom(100);
+                return;
+            default:
+                break;
+            }
+        }
         uint16_t key = 0;
         switch (event->key()) {
         case Qt::Key_Up: key = 1; break;
@@ -535,7 +569,7 @@ protected:
         } else {
             return;
         }
-        const QPoint point = event->position().toPoint();
+        const QPoint point = guestPoint(event->position().toPoint());
         pushInput(m_shared.data, kInputClick, value, 0,
                   static_cast<uint16_t>(qBound(0, point.x(), 65535)),
                   static_cast<uint16_t>(qBound(0, point.y(), 65535)));
@@ -551,9 +585,10 @@ protected:
         }
         m_lastHover = point;
         m_hoverClock.restart();
+        const QPoint guest = guestPoint(point);
         pushInput(m_shared.data, kInputMove, 0, 0,
-                  static_cast<uint16_t>(qBound(0, point.x(), 65535)),
-                  static_cast<uint16_t>(qBound(0, point.y(), 65535)));
+                  static_cast<uint16_t>(qBound(0, guest.x(), 65535)),
+                  static_cast<uint16_t>(qBound(0, guest.y(), 65535)));
     }
 
     void leaveEvent(QEvent *event) override {
@@ -572,12 +607,27 @@ protected:
     }
 
 private:
+    void applyZoom(int percent) {
+        m_zoom = qBound(50, percent, 200);
+        resize(m_frameWidth * m_zoom / 100, m_frameHeight * m_zoom / 100);
+    }
+
+    QPoint guestPoint(const QPoint &point) const {
+        const int width = this->width() > 0 ? this->width() : m_frameWidth;
+        const int height = this->height() > 0 ? this->height() : m_frameHeight;
+        return QPoint(point.x() * m_frameWidth / width,
+                      point.y() * m_frameHeight / height);
+    }
+
     Shared &m_shared;
     uint32_t m_lastSequence = 0;
     bool m_sized = false;
     bool m_overLink = false;
     QPoint m_lastHover{-1, -1};
     QElapsedTimer m_hoverClock;
+    int m_zoom = 100;
+    int m_frameWidth = 900;
+    int m_frameHeight = 640;
 };
 
 int snapshot(Shared &shared, const QString &path, int timeoutSeconds) {
@@ -642,7 +692,7 @@ int main(int argc, char **argv) {
             headless = true;
         } else if (arg == "--timeout" && i + 1 < argc) {
             timeout = std::atoi(argv[++i]);
-        } else if (arg == "--scale" && i + 1 < argc) {
+        } else if ((arg == "--scale" || arg == "--zoom") && i + 1 < argc) {
             scalePercent = std::atoi(argv[++i]);
         } else if (arg == "--watch") {
             watchMode = true;
@@ -674,6 +724,7 @@ int main(int argc, char **argv) {
 
     if (!waitingSnapshotPath.isEmpty()) {
         Viewer viewer(shared);
+        viewer.setZoom(scalePercent);
         viewer.show();
         QCoreApplication::processEvents();
         if (!viewer.grab().save(waitingSnapshotPath)) {
@@ -692,6 +743,7 @@ int main(int argc, char **argv) {
         auto *proxy = new WebProxy(shared, &app);
         Q_UNUSED(proxy);
         auto *viewer = new Viewer(shared);
+        viewer->setZoom(scalePercent);
         auto *timer = new QTimer(&app);
         QObject::connect(timer, &QTimer::timeout, [&app, &shared, viewer, timer] {
             if (shared.u32(kFieldMagic) == kMagic &&
@@ -713,11 +765,7 @@ int main(int argc, char **argv) {
     Q_UNUSED(proxy);
 
     Viewer viewer(shared);
-    if (scalePercent != 100) {
-        const int width = static_cast<int>(shared.u32(kFieldWidth)) * scalePercent / 100;
-        const int height = static_cast<int>(shared.u32(kFieldHeight)) * scalePercent / 100;
-        viewer.resize(width, height);
-    }
+    viewer.setZoom(scalePercent);
     viewer.show();
     viewer.raise();
     viewer.activateWindow();

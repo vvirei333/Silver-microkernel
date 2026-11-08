@@ -34,11 +34,21 @@ Redmi port is parked. The reference checklist is
 - **smoltcp patch:** `third_party/smoltcp` vendors 0.14.0 with two guarded
   returns in the neighbour path; without them DHCP boots intermittently hit
   the cache's unicast assertion. See `third_party/smoltcp/PATCH.md`.
+- **TLS:** `net_server` now runs a TLS 1.3 client (`third_party/embedded-tls`
+  with three local verifier fixes) and fetches HTTPS itself. Six roots cover the
+  current search engine, Wikipedia, example.com, Microsoft and Sectigo; RSA,
+  ECDSA P-256/P-384 and Ed25519 are enabled. `wget https://...` works, and the
+  browser uses guest TLS first. The viewer's Qt proxy remains the fallback for
+  sites outside the root store or TLS 1.2-only servers. Certificate time is a
+  fixed 2026-11-08 until an RTC exists; the RNG is a seeded xorshift, not a
+  hardware entropy source. The user stack grew from 8 to 64 KiB because the
+  handshake and RSA state machine overflowed the old one, and the client body
+  window grew to 1 MiB so the article content of real pages is not truncated.
 - **Wolfser:** `wolfser` opens with an empty search bar (or `wolfser <query|url>`
   navigates immediately). Input resolves to an `https://` URL (bare hosts) or a
-  DuckDuckGo HTML search. Plain `http://` goes through `net_server`/smoltcp;
-  `https://` goes through the host viewer's Qt Network proxy in the same
-  ivshmem buffer, so real TLS sites work without a guest TLS stack. Redirects
+  DuckDuckGo HTML search. `http://` and `https://` both go through
+  `net_server`/smoltcp; the Qt viewer proxy is only the fallback and the image
+  decoder. Redirects
   (3xx and meta refresh) are resolved by the guest and may switch backends.
   The renderer extracts links with their screen runs (blue/underlined, click
   to navigate), keeps a per-tab 12-entry back/forward history, word-wraps,
@@ -54,13 +64,20 @@ Redmi port is parked. The reference checklist is
   most 480x360 and writes RGBA into `WEB_BODY`; the guest blends alpha, scrolls
   it with the text and re-fetches it when its tab is restored. The first line
   of every page used to lose its spaces because the wrap buffer had not flushed
-  yet; a `line_len` check fixed it. `Ctrl+F` searches the rendered text,
+  yet; a `line_len` check fixed it. Up to three inline images are decoded into
+  240x180 slots: the infobox contributes one lead picture, later article
+  figures are placed before their text line and scroll with it. Bookmarks are
+  persisted in `/sfs/wolfser.bookmarks` using a path-scoped write window
+  (no global CAP_FS_WRITE). Six tabs fit the strip, and `Ctrl++`/`Ctrl+-`/
+  `Ctrl+0` resize/zoom the host window (input coordinates are scaled back).
+  A small DNS cache in net_server keeps repeated navigation from re-resolving
+  every host. `Ctrl+F` searches the rendered text,
   highlights all hits yellow and the current hit orange, shows `n/total` in the
   footer and Enter advances (wrapping). Partially scrolled lines are skipped
   rather than clamped to the body top, which used to overlap the next line.
   A new tab or `Alt+Home`/the `H` button opens a start page with three quick
-  tiles and the pages saved by `Ctrl+D`; bookmarks live in a static array for
-  the session and need the future profile/SFS layer to persist. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
+  tiles and the pages saved by `Ctrl+D`; the list is reloaded from SFS at
+  startup. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
   repaints on `frame_seq` and sends keys, wheel and clicks through the ring.
   Verified headlessly: DDG results with links, clicking the first result through
   a DDG meta-refresh redirect to the Wikipedia reader view, Alt+Left back to
@@ -94,7 +111,7 @@ Redmi port is parked. The reference checklist is
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
 - **Next steps:** native TLS/`https://` (rustls/embedded-tls) for `wget` and a
-  viewer-independent browser; Wolfser inline images, persistent bookmarks and
+  TLS hardening (roots, RTC, RNG, TLS 1.2); Wolfser forms/POST, keep-alive and
   damage rectangles; Linux ABI for static musl binaries; headless
   Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB proof, GENI
   UART on `rain`, tablet, Redmi storage/power.
