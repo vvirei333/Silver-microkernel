@@ -57,6 +57,8 @@ const SYS_ALLOC_DMA: u64 = 67;
 const SYS_PCI_READ: u64 = 68;
 const SYS_PCI_WRITE: u64 = 69;
 const SYS_SPAWN_PATH: u64 = 70;
+/// Spawns an ELF with the AArch64 Linux syscall personality.
+const SYS_SPAWN_LINUX_PATH: u64 = 98;
 const SYS_POWER_OFF: u64 = 71;
 const SYS_POWER_RESET: u64 = 97;
 const SYS_MMAP: u64 = 72;
@@ -469,6 +471,13 @@ pub fn spawn_with_args(program: u64, argument: u64, arguments: &str) -> Option<u
 /// passes only the path.
 pub fn spawn_path(path: &str) -> Option<u64> {
     let cap_id = with_path(path, |ptr| unsafe { syscall1(SYS_SPAWN_PATH, ptr) });
+    optional_id(cap_id)
+}
+
+/// Spawns a foreign ELF with the Linux ABI personality; the child's `svc #0`
+/// uses Linux syscall numbers instead of the Silver table.
+pub fn spawn_linux_path(path: &str) -> Option<u64> {
+    let cap_id = with_path(path, |ptr| unsafe { syscall1(SYS_SPAWN_LINUX_PATH, ptr) });
     optional_id(cap_id)
 }
 

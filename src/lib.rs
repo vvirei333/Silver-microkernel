@@ -112,6 +112,35 @@ pub fn build_argv_envp(
     stack_top: usize,
     max_bytes: usize,
 ) -> Option<ArgvEnvBlock> {
+    build_stack(argv, envp, &[], stack_top, max_bytes)
+}
+
+/// Builds the Linux initial stack: the same `argc/argv/envp` prefix plus an
+/// `auxv` array. Linux `_start` reads `argc` at `sp`, then `argv[argc + 1]`
+/// terminated by NULL, then `envp`, then `(AT_type, AT_value)` pairs ending in
+/// `AT_NULL`.
+///
+/// The 16 bytes below `sp` are reserved for `AT_RANDOM` (the stack canary
+/// seed), and the entry for `AT_RANDOM` is appended automatically — callers
+/// must not pass it. The bytes are a deterministic pseudo-random stream, not
+/// entropy; they only need to differ per task.
+pub fn build_linux_stack(
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    auxv: &[(u64, u64)],
+    stack_top: usize,
+    max_bytes: usize,
+) -> Option<ArgvEnvBlock> {
+    build_stack(argv, envp, auxv, stack_top, max_bytes)
+}
+
+fn build_stack(
+    argv: &[Vec<u8>],
+    envp: &[Vec<u8>],
+    auxv: &[(u64, u64)],
+    stack_top: usize,
+    max_bytes: usize,
+) -> Option<ArgvEnvBlock> {
     if argv.len() > MAX_SPAWN_ARGS || envp.len() > MAX_SPAWN_ARGS {
         return None;
     }
@@ -122,33 +151,68 @@ pub fn build_argv_envp(
     for text in argv.iter().chain(envp.iter()) {
         strings_len = strings_len.checked_add(text.len().checked_add(1)?)?;
     }
-    let pointers = (argv.len() + 1 + envp.len() + 1).checked_mul(8)?;
-    let raw = 8usize.checked_add(pointers)?.checked_add(strings_len)?;
+    // A non-empty auxv adds the AT_RANDOM reservation, its entry, and AT_NULL.
+    let random_prefix: usize = if auxv.is_empty() { 0 } else { 16 };
+    let auxv_entries: usize = if auxv.is_empty() { 0 } else { auxv.len() + 2 };
+    let pointers = (argv.len() + 1 + envp.len() + 1)
+        .checked_mul(8)?
+        .checked_add(auxv_entries.checked_mul(16)?)?;
+    let raw = random_prefix
+        .checked_add(8)?
+        .checked_add(pointers)?
+        .checked_add(strings_len)?;
     let total = raw.checked_add(15)? & !15;
     if total == 0 || total > max_bytes {
         return None;
     }
-    let sp = stack_top.checked_sub(total)?;
+    let block_start = stack_top.checked_sub(total)?;
+    let sp = block_start.checked_add(random_prefix)?;
     let mut block = alloc::vec![0u8; total];
-    block[0..8].copy_from_slice(&(argv.len() as u64).to_le_bytes());
+    if random_prefix != 0 {
+        // AT_RANDOM points at these bytes. A deterministic xorshift keeps the
+        // host tests reproducible while still differing per stack address.
+        let mut state = (block_start as u64) ^ 0x9E37_79B9_7F4A_7C15;
+        for byte in &mut block[..random_prefix] {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            *byte = state as u8;
+        }
+    }
+    block[random_prefix..random_prefix + 8]
+        .copy_from_slice(&(argv.len() as u64).to_le_bytes());
 
-    let argv_ptrs = 8usize;
+    let argv_ptrs = random_prefix + 8;
     let envp_ptrs = argv_ptrs.checked_add((argv.len() + 1).checked_mul(8)?)?;
-    let strings = envp_ptrs.checked_add((envp.len() + 1).checked_mul(8)?)?;
+    let auxv_offset = envp_ptrs.checked_add((envp.len() + 1).checked_mul(8)?)?;
+    let strings = auxv_offset.checked_add(auxv_entries.checked_mul(16)?)?;
     let mut cursor = strings;
     for (index, text) in argv.iter().enumerate() {
-        let virtual_address = sp.checked_add(cursor)?;
+        let virtual_address = block_start.checked_add(cursor)?;
         let slot = argv_ptrs.checked_add(index.checked_mul(8)?)?;
         block[slot..slot + 8].copy_from_slice(&(virtual_address as u64).to_le_bytes());
         block[cursor..cursor + text.len()].copy_from_slice(text);
         cursor = cursor.checked_add(text.len().checked_add(1)?)?;
     }
     for (index, text) in envp.iter().enumerate() {
-        let virtual_address = sp.checked_add(cursor)?;
+        let virtual_address = block_start.checked_add(cursor)?;
         let slot = envp_ptrs.checked_add(index.checked_mul(8)?)?;
         block[slot..slot + 8].copy_from_slice(&(virtual_address as u64).to_le_bytes());
         block[cursor..cursor + text.len()].copy_from_slice(text);
         cursor = cursor.checked_add(text.len().checked_add(1)?)?;
+    }
+    if !auxv.is_empty() {
+        for (index, (kind, value)) in auxv.iter().enumerate() {
+            let slot = auxv_offset + index * 16;
+            block[slot..slot + 8].copy_from_slice(&kind.to_le_bytes());
+            block[slot + 8..slot + 16].copy_from_slice(&value.to_le_bytes());
+        }
+        // AT_RANDOM points at the 16 bytes reserved below `sp`.
+        const AT_RANDOM: u64 = 25;
+        let slot = auxv_offset + auxv.len() * 16;
+        block[slot..slot + 8].copy_from_slice(&AT_RANDOM.to_le_bytes());
+        block[slot + 8..slot + 16].copy_from_slice(&(block_start as u64).to_le_bytes());
+        // The final AT_NULL pair is already zero in the fresh block.
     }
     Some(ArgvEnvBlock { block, sp })
 }
@@ -429,10 +493,9 @@ impl DmaLeaseTable {
 #[cfg(test)]
 mod tests {
     use super::{
-        align_range, build_argv_envp, clear_frame_bit, mmap_place, mmap_quota_ok, mmap_remove,
-        mount_match,
-        parse_spawn_args, path_is_under, DmaLeaseTable, DMA_LEASE_CAPACITY, MAX_SPAWN_ARGS,
-        SPAWN_ARGS_VERSION,
+        align_range, build_argv_envp, build_linux_stack, clear_frame_bit, mmap_place, mmap_quota_ok,
+        mmap_remove, mount_match, parse_spawn_args, path_is_under, DmaLeaseTable, DMA_LEASE_CAPACITY,
+        MAX_SPAWN_ARGS, SPAWN_ARGS_VERSION,
     };
 
     const PAGE: usize = 4096;
@@ -715,6 +778,50 @@ mod tests {
         // Both NULL terminators stay zero.
         assert_eq!(&layout.block[24..32], &[0u8; 8]);
         assert_eq!(&layout.block[40..48], &[0u8; 8]);
+    }
+
+    #[test]
+    fn linux_stack_adds_auxv_and_random() {
+        let argv = vec![b"prog".to_vec()];
+        let envp = vec![b"K=V".to_vec()];
+        let auxv = [(6u64, 4096u64)];
+        let top = 0x7FE0_1000usize;
+        let layout =
+            build_linux_stack(&argv, &envp, &auxv, top, 8192).expect("fits");
+        let block_start = layout.sp - 16;
+        assert_eq!(block_start + layout.block.len(), top);
+        assert_eq!(layout.sp % 16, 0);
+        // argc at sp, then argv[0], NULL, envp[0], NULL.
+        assert_eq!(
+            u64::from_le_bytes(layout.block[16..24].try_into().unwrap()),
+            1
+        );
+        let argv0 = u64::from_le_bytes(layout.block[24..32].try_into().unwrap()) as usize;
+        let envp0 = u64::from_le_bytes(layout.block[40..48].try_into().unwrap()) as usize;
+        assert_eq!(argv0, block_start + 104);
+        assert_eq!(envp0, block_start + 109);
+        assert_eq!(&layout.block[104..109], b"prog\0");
+        assert_eq!(&layout.block[109..113], b"K=V\0");
+        // auxv: (AT_PAGESZ, 4096), (AT_RANDOM, block_start), AT_NULL.
+        assert_eq!(
+            u64::from_le_bytes(layout.block[56..64].try_into().unwrap()),
+            6
+        );
+        assert_eq!(
+            u64::from_le_bytes(layout.block[64..72].try_into().unwrap()),
+            4096
+        );
+        assert_eq!(
+            u64::from_le_bytes(layout.block[72..80].try_into().unwrap()),
+            25
+        );
+        assert_eq!(
+            u64::from_le_bytes(layout.block[80..88].try_into().unwrap()) as usize,
+            block_start
+        );
+        assert_eq!(&layout.block[88..104], &[0u8; 16]);
+        // The AT_RANDOM seed is not all zero.
+        assert!(layout.block[..16].iter().any(|&byte| byte != 0));
     }
 
     #[test]

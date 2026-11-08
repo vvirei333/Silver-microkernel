@@ -73,6 +73,9 @@ pub const SYS_SPAWN_PATH: u64 = 70;
 pub const SYS_POWER_OFF: u64 = 71;
 /// Reset through PSCI `SYSTEM_RESET`; requires `CAP_POWER`, same as power-off.
 pub const SYS_POWER_RESET: u64 = 97;
+/// Spawns a dynamically loaded ELF with the AArch64 **Linux** syscall
+/// personality (`x8` = Linux syscall number) instead of the Silver table.
+pub const SYS_SPAWN_LINUX_PATH: u64 = 98;
 pub const SYS_MMAP: u64 = 72;
 pub const SYS_MUNMAP: u64 = 73;
 pub const SYS_MOUNT: u64 = 80;
@@ -119,7 +122,7 @@ pub const SYSCALL_STOPPED: u64 = u64::MAX - 2;
 pub const SYSCALL_ECHILD: u64 = u64::MAX - 3;
 
 /// Frame layout built by the SVC trampoline: x0-x30, then ELR, then SPSR.
-const FRAME_QUADWORDS: usize = 33;
+pub(crate) const FRAME_QUADWORDS: usize = 33;
 
 /// Stable userspace ABI for SYS_MEMINFO. All values are byte counts.
 #[repr(C)]
@@ -192,7 +195,12 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
     let number = frame[8]; // x8 carries the call number
     crate::smp::probe(22);
 
-    let result = match number {
+    // The task's personality is fixed at spawn, so a Linux binary can never
+    // reach the Silver table by picking a colliding number.
+    let result = if scheduler::current_personality() == scheduler::Personality::Linux {
+        crate::linux_abi::dispatch(frame)
+    } else {
+        match number {
         SYS_SLEEP => {
             scheduler::sleep(frame[0]);
             0
@@ -347,6 +355,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_PCI_READ => sys_pci_read(frame[0]),
         SYS_PCI_WRITE => sys_pci_write(frame[0], frame[1]),
         SYS_SPAWN_PATH => sys_spawn_path(frame[0]),
+        SYS_SPAWN_LINUX_PATH => sys_spawn_linux_path(frame[0]),
         SYS_POWER_OFF => sys_power_off(),
         SYS_POWER_RESET => sys_power_reset(),
         SYS_MMAP => scheduler::mmap_anonymous(frame[1] as usize, frame[2])
@@ -365,6 +374,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_WAITPID => sys_waitpid(frame[0], frame[1]),
         SYS_SPAWN_ARGSV => sys_spawn_with_argsv(frame[0], frame[1], frame[2], frame[3]),
         _ => SYSCALL_ERROR,
+        }
     };
 
     frame[0] = result;
@@ -549,6 +559,54 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
         }
         scheduler::spawn_elf_with_policy(image, 0, policy.write_prefix, policy.quota)
             .unwrap_or(SYSCALL_ERROR)
+    })
+}
+
+/// Loads and runs a foreign (Linux ABI) ELF from the filesystem.
+fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
+    with_path(path_ptr, |path| {
+        match vfs::file_len(&cwd, path) {
+            Ok(length) if length <= EXEC_FILE_LIMIT => {}
+            _ => return SYSCALL_ERROR,
+        }
+        let Ok(bytes) = vfs::read_file(&cwd, path) else {
+            return SYSCALL_ERROR;
+        };
+        if bytes.len() > EXEC_FILE_LIMIT {
+            return SYSCALL_ERROR;
+        }
+        let Ok(image) = elf::load_elf(&bytes) else {
+            return SYSCALL_ERROR;
+        };
+        // The same bundle policy applies: an unkeyed plain ELF has no digest
+        // and passes, while a signed manifest still has to verify.
+        let policy = bundle_write_scope(&cwd, path);
+        if silver_microkernel::bundle::verify(
+            &bytes,
+            &policy,
+            silver_microkernel::bundle_sig::trusted_key(),
+        )
+        .is_err()
+        {
+            return SYSCALL_ERROR;
+        }
+        let argv = vec![path.as_bytes().to_vec()];
+        let envp = vec![
+            b"PATH=/bin:/sbin:/usr/bin:/usr/sbin".to_vec(),
+            b"HOME=/".to_vec(),
+            b"TERM=vt100".to_vec(),
+        ];
+        scheduler::spawn_elf_with_policy_and_args(
+            image,
+            0,
+            policy.write_prefix,
+            policy.quota,
+            scheduler::Personality::Linux,
+            argv,
+            envp,
+        )
+        .unwrap_or(SYSCALL_ERROR)
     })
 }
 
@@ -1029,6 +1087,28 @@ fn sys_print(ptr: u64, len: u64) -> u64 {
         return SYSCALL_ERROR;
     }
     write_console_bytes(&bytes);
+    0
+}
+
+/// Writes `len` bytes from a user buffer to the console. Unlike `SYS_PRINT`
+/// this has no 4 KiB cap; the buffer is copied in bounded chunks. Used by the
+/// Linux ABI's `write(1|2, ...)`.
+pub(crate) fn write_user_output(ptr: u64, len: u64) -> u64 {
+    if !scheduler::current_task_owns_console() {
+        return 0;
+    }
+    let mut remaining = len as usize;
+    let mut address = ptr;
+    while remaining != 0 {
+        let chunk = remaining.min(4096);
+        let mut bytes = vec![0_u8; chunk];
+        if user_memory::copy_from_user(address, &mut bytes).is_err() {
+            return SYSCALL_ERROR;
+        }
+        write_console_bytes(&bytes);
+        remaining -= chunk;
+        address = address.wrapping_add(chunk as u64);
+    }
     0
 }
 

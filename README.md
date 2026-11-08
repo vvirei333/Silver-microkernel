@@ -282,6 +282,35 @@ program table, so `run bin/hello` is the only way to execute it — proving the
 loader path end-to-end. The embedded `spawn` path is unchanged and shares the
 same `elf::load_elf` (via the thin `elf_loader` shim).
 
+### Linux ABI personality (first slice)
+
+`linuxrun <path>` loads the same way but spawns the task with the **AArch64
+Linux** syscall personality: `x8` carries a Linux syscall number and
+`src/linux_abi.rs` translates it. The initial stack is the Linux layout
+(`argc/argv/envp/auxv`, including `AT_PAGESZ`, `AT_ENTRY`, `AT_PHDR`,
+`AT_RANDOM`). Implemented so far: `write` (stdout/stderr), `read` (fd 0 as
+EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
+`clock_gettime`, `rt_sigprocmask`, `uname`, `getpid`/`getppid`/`gettid`,
+`brk`, `mmap`, `munmap`, `mprotect`, `prlimit64` and `getrandom`; anything
+else returns `-ENOSYS`. There is no file-descriptor table or signal delivery
+yet.
+
+The personality is fixed at spawn, so a foreign binary can never reach the
+Silver syscall table by choosing a colliding number. `tests/linux/` and
+`tools/linux-test.sh` build a freestanding raw-syscall program, install it with
+`scripts/sfs_inject.py`, and verify the path in QEMU:
+
+```text
+howl> linuxrun /sfs/linux-hello
+hello from linux abi
+Program exited with status 42
+```
+
+Limit of this slice: a foreign image must currently link into the native image
+window (`0x4000_0000..0x4080_0000`), because the loader maps one contiguous run
+at `USER_IMAGE_VA`. A real distro binary links at `0x40_0000`; arbitrary
+`p_vaddr` mappings are the next slice.
+
 ## Bundle manifests and signing — complete
 
 An ELF loaded through `SYS_SPAWN_PATH` may have a sibling manifest

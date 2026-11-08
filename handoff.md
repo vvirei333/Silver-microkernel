@@ -124,6 +124,30 @@ Redmi port is parked. The reference checklist is
   `USER_IMAGE_VA + 8 MiB`, anonymous mmap at `+10 MiB`, and the user stack is
   64 pages (256 KiB). The per-task mmap quota is 24 MiB; litehtml's newlib heap
   is one 20 MiB mapping, separate from the Rust `SYS_BRK` arena.
+- **Linux ABI personality, slice 1 (2026-11-09).** `linuxrun <path>`
+  (`SYS_SPAWN_LINUX_PATH = 98`) spawns a dynamically loaded ELF with the
+  AArch64 Linux syscall ABI: `x8` is a Linux number and `src/linux_abi.rs`
+  translates it onto kernel services. The personality is fixed at spawn
+  (`scheduler::Personality`), so a Linux task can never fall into the Silver
+  table and a native task cannot accidentally use Linux numbers. Implemented:
+  `write` (1/2), `read` (fd 0 reports EOF), `exit`/`exit_group`,
+  `set_tid_address`, `set_robust_list`, `clock_gettime`, `rt_sigprocmask`,
+  `uname`, `getpid`/`getppid`/`gettid`, `brk`, `mmap` (hint ignored, `MAP_FIXED`
+  refused), `munmap`, `mprotect` (no-op), `prlimit64`, `getrandom`; `rseq` and
+  unknown numbers return `-ENOSYS`. Errors use `-errno`, never the Silver
+  sentinels. The initial stack is the real Linux layout
+  (`argc/argv/envp/auxv`) built by `build_linux_stack`, with `AT_PAGESZ`,
+  `AT_ENTRY`, `AT_PHDR` when the program headers sit inside a `PT_LOAD`,
+  `AT_PHENT`/`AT_PHNUM`, identity entries and `AT_RANDOM` (16 bytes below `sp`).
+  `scripts/sfs_inject.py` writes a file into `disk.img` offline (direct,
+  indirect and double-indirect blocks), so a foreign-toolchain binary does not
+  have to be embedded in the kernel. `tools/linux-test.sh` builds a
+  freestanding raw-syscall program (`tests/linux/hello.c`, one RX segment at
+  `0x4000_0000`) and installs it; QEMU prints `hello from linux abi` and
+  `EXIT: task=7 ... status=42`. Scope: the loader still maps one contiguous
+  run at `USER_IMAGE_VA`, so a distro binary at `0x40_0000` is not loadable
+  yet; arbitrary `p_vaddr` is the next slice. There is no file-descriptor
+  table, signal delivery or thread creation: those calls are EOF/no-op.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -150,7 +174,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** larger reader/CSS budgets, full-page layout and keep-alive;
+- **Next steps:** Linux ABI slice 2 (arbitrary `p_vaddr` mappings so a real
+  `0x40_0000` binary loads, then a file-descriptor table and `openat/read/close`
+  for static busybox/musl); larger reader/CSS budgets, full-page layout and
+  keep-alive;
   TLS hardening (roots, RTC, RNG, TLS 1.2); **YouTube/JS/media still require a
   WebKit/Gecko-class engine, i.e. the Linux ABI + Phosh track**, not another
   reader increment;

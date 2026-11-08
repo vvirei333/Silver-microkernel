@@ -214,6 +214,7 @@ fn execute(command: &str) {
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  run <path>  Load and run an ELF file from the filesystem\r\n");
+            syscall::print("  linuxrun <path>  Run a Linux ABI ELF (x8 = Linux syscall)\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
             syscall::print("             Print, truncate/write, or append to a file\r\n");
             syscall::print("  touch <file>\r\n");
@@ -262,6 +263,7 @@ fn execute(command: &str) {
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("touch") => touch_command(words.next()),
         Some("run") => run_elf(words.next().unwrap_or("")),
+        Some("linuxrun") => run_linux_elf(words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
         Some("mkdir") => make_directory(words.next()),
         Some("rm") => remove_file(words.next()),
@@ -785,11 +787,22 @@ fn run_utility(program: u64, arguments: &str) {
 /// shell lends it the console and waits — mirroring `run_utility`, but with the
 /// executable resolved from the VFS instead of the embedded program table.
 fn run_elf(path: &str) {
+    run_elf_with(path, syscall::spawn_path);
+}
+
+/// Loads a foreign ELF (`linuxrun <path>`) and runs it with the Linux syscall
+/// personality. The shell still owns the console and hands it to the child for
+/// the duration, exactly like `run`.
+fn run_linux_elf(path: &str) {
+    run_elf_with(path, syscall::spawn_linux_path);
+}
+
+fn run_elf_with(path: &str, spawn: fn(&str) -> Option<u64>) {
     if path.is_empty() {
         syscall::print("Usage: run <path>\r\n");
         return;
     }
-    let Some(cap_id) = syscall::spawn_path(path) else {
+    let Some(cap_id) = spawn(path) else {
         syscall::print("run: cannot load '");
         syscall::print(path);
         syscall::print("'\r\n");

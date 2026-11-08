@@ -72,6 +72,7 @@ mod semaphore;
 mod smp;
 #[cfg(not(feature = "std"))]
 mod syscall;
+mod linux_abi;
 #[cfg(not(feature = "std"))]
 mod timer;
 #[cfg(not(feature = "std"))]

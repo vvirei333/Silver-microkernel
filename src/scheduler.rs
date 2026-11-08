@@ -191,12 +191,26 @@ struct MmapRegion {
     generation: u32,
 }
 
+/// Syscall ABI a task is running on.
+///
+/// `Native` is the Silver ABI (`x8` = `SYS_*`). `Linux` is the AArch64 Linux
+/// ABI: `x8` carries a Linux syscall number and the kernel translates it. The
+/// personality is fixed when the task is spawned from its ELF image; it is not
+/// switchable by the task itself.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum Personality {
+    Native,
+    Linux,
+}
+
 pub struct Task {
     pub id: u64,
     pub state: TaskState,
     resume_state: Option<TaskState>,
     pub program: u64,
     pub argument: u64,
+    /// Syscall ABI this task entered userspace on.
+    personality: Personality,
     pub cap_table: capability::CapTable,
     /// Path prefix this task may write under, taken from the bundle manifest.
     /// Only meaningful when the task has no global `CAP_FS_WRITE`.
@@ -2441,6 +2455,14 @@ pub fn current_task_id() -> u64 {
         .unwrap_or(0)
 }
 
+/// Syscall ABI of the running task. Kernel tasks (no user image) are Native.
+pub fn current_personality() -> Personality {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
+        .map(|task| task.personality)
+        .unwrap_or(Personality::Native)
+}
+
 
 /// True when an online CPU is currently executing a task in `ttbr0`'s
 /// address space. The kernel lock must be held. `ttbr0 == 0` is the kernel
@@ -3046,6 +3068,29 @@ pub fn spawn_elf_with_policy(
     fs_write_prefix: Option<String>,
     fs_quota: Option<(u32, u32)>,
 ) -> Option<capability::CapId> {
+    spawn_elf_with_policy_and_args(
+        image,
+        argument,
+        fs_write_prefix,
+        fs_quota,
+        Personality::Native,
+        Vec::new(),
+        Vec::new(),
+    )
+}
+
+/// [`spawn_elf_with_policy`] with an explicit syscall personality and initial
+/// `argv`/`envp`. A Linux image must pass at least `argv[0]`, because Linux
+/// `_start` reads `argc` from the initial stack.
+pub fn spawn_elf_with_policy_and_args(
+    image: LoadedImage,
+    argument: u64,
+    fs_write_prefix: Option<String>,
+    fs_quota: Option<(u32, u32)>,
+    personality: Personality,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> Option<capability::CapId> {
     if scheduler_manager().map_or(true, |manager| !has_task_capacity(manager)) {
         // Dropping `image` releases its frames (RAII).
         return None;
@@ -3056,7 +3101,15 @@ pub fn spawn_elf_with_policy(
     if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
         return None;
     }
-    let task_id = spawn_elf_task(image, argument, fs_write_prefix, fs_quota)?;
+    let task_id = spawn_elf_task(
+        image,
+        argument,
+        fs_write_prefix,
+        fs_quota,
+        personality,
+        argv,
+        envp,
+    )?;
     let parent = current_task_mut()?;
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
 }
@@ -3066,6 +3119,9 @@ fn spawn_elf_task(
     argument: u64,
     fs_write_prefix: Option<String>,
     fs_quota: Option<(u32, u32)>,
+    personality: Personality,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
 ) -> Option<u64> {
     let manager = scheduler_manager()?;
     if !has_task_capacity(manager) {
@@ -3083,11 +3139,12 @@ fn spawn_elf_task(
         Some((user_program::PROGRAM_DYNAMIC, argument)),
         Some(image),
         Vec::new(),
-        Vec::new(),
-        Vec::new(),
+        argv,
+        envp,
         current_task_pid(),
         fs_write_prefix,
         fs_quota,
+        personality,
     )?;
     task.cwd = cwd;
     manager.tasks.push(task);
@@ -3511,6 +3568,7 @@ fn spawn_inner(
         ppid,
         fs_write_prefix,
         None,
+        Personality::Native,
     )?;
     task.cwd = cwd;
 
@@ -4057,6 +4115,42 @@ fn initial_self_rights(program: u64) -> Option<u32> {
     Some(rights)
 }
 
+/// Linux `auxv` entries for an image loaded into the native image window.
+///
+/// `AT_RANDOM` and the terminating `AT_NULL` are appended by
+/// `build_linux_stack`, so they are not listed here. `AT_PHDR` is zero when
+/// the program headers are not covered by a `PT_LOAD`; static binaries that do
+/// not consult it (musl's `_start`) are unaffected.
+fn linux_auxv(image: &LoadedImage) -> Vec<(u64, u64)> {
+    const AT_NULL: u64 = 0;
+    const AT_PHDR: u64 = 3;
+    const AT_PHENT: u64 = 4;
+    const AT_PHNUM: u64 = 5;
+    const AT_PAGESZ: u64 = 6;
+    const AT_BASE: u64 = 7;
+    const AT_FLAGS: u64 = 8;
+    const AT_ENTRY: u64 = 9;
+    const AT_UID: u64 = 11;
+    const AT_EUID: u64 = 12;
+    const AT_GID: u64 = 13;
+    const AT_EGID: u64 = 14;
+    const AT_SECURE: u64 = 23;
+    let mut entries = Vec::new();
+    entries.push((AT_PHDR, image.phdr_address as u64));
+    entries.push((AT_PHENT, image.phentsize));
+    entries.push((AT_PHNUM, image.phnum));
+    entries.push((AT_PAGESZ, PAGE_SIZE as u64));
+    entries.push((AT_BASE, 0));
+    entries.push((AT_FLAGS, 0));
+    entries.push((AT_ENTRY, image.entry as u64));
+    entries.push((AT_UID, 0));
+    entries.push((AT_EUID, 0));
+    entries.push((AT_GID, 0));
+    entries.push((AT_EGID, 0));
+    entries.push((AT_SECURE, 0));
+    entries
+}
+
 impl Task {
     fn new(
         id: u64,
@@ -4069,6 +4163,7 @@ impl Task {
         ppid: Option<u64>,
         fs_write_prefix: Option<String>,
         fs_quota: Option<(u32, u32)>,
+        personality: Personality,
     ) -> Option<Self> {
         // Build the argv/envp stack image before allocating anything: a
         // malformed or oversized argument list must fail without leaking.
@@ -4078,12 +4173,28 @@ impl Task {
             if user.is_none() {
                 return None;
             }
-            Some(silver_microkernel::build_argv_envp(
-                &argv,
-                &envp,
-                mmu::USER_STACK_VA + mmu::USER_STACK_SIZE,
-                mmu::USER_STACK_SIZE - 1024,
-            )?)
+            // Linux wants the same argc/argv/envp prefix plus auxv. The values
+            // are derivable from the loaded image, so a foreign ELF starts with
+            // a stack its libc understands.
+            let linux_auxv = match (&image, personality) {
+                (Some(image), Personality::Linux) => linux_auxv(image),
+                _ => Vec::new(),
+            };
+            Some(match personality {
+                Personality::Native => silver_microkernel::build_argv_envp(
+                    &argv,
+                    &envp,
+                    mmu::USER_STACK_VA + mmu::USER_STACK_SIZE,
+                    mmu::USER_STACK_SIZE - 1024,
+                )?,
+                Personality::Linux => silver_microkernel::build_linux_stack(
+                    &argv,
+                    &envp,
+                    &linux_auxv,
+                    mmu::USER_STACK_VA + mmu::USER_STACK_SIZE,
+                    mmu::USER_STACK_SIZE - 1024,
+                )?,
+            })
         };
         // Charge the fixed footprint before allocating anything: the image
         // pages already exist (RAII releases them if this returns None), and
@@ -4208,6 +4319,7 @@ impl Task {
             priority: sched_policy::PRIORITY_NORMAL,
             program: user.map_or(u64::MAX, |(program, _)| program),
             argument: user.map_or(0, |(_, argument)| argument),
+            personality,
             cap_table,
             bound_irq: None,
             irq_pending: false,

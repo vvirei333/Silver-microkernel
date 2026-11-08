@@ -192,6 +192,12 @@ struct Segment {
 pub struct LoadedImage {
     /// Program entry point (a virtual address in the image window).
     pub entry: usize,
+    /// Virtual address of the ELF program headers when a `PT_LOAD` covers
+    /// them; `0` otherwise. Linux `auxv` exposes this as `AT_PHDR`.
+    pub phdr_address: usize,
+    /// Program-header entry size and count, for `AT_PHENT` / `AT_PHNUM`.
+    pub phentsize: u64,
+    pub phnum: u64,
     /// Top of the used image window: the highest `p_vaddr + p_memsz`.
     pub upper_bound: usize,
     /// Physical address of the first image page.
@@ -335,6 +341,25 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedImage, ElfError> {
         return Err(ElfError::EntryOutsideText);
     }
 
+    // Locate the program headers in the loaded image. `AT_PHDR` must point at
+    // their in-memory copy, so it is only valid when a PT_LOAD covers them.
+    let phdr_file_end = program_offset
+        .checked_add(program_count.checked_mul(program_size).ok_or(ElfError::Truncated)?)
+        .ok_or(ElfError::Truncated)?;
+    let mut phdr_address = 0usize;
+    for segment in &segments {
+        let segment_file_end = segment
+            .file_offset
+            .checked_add(segment.file_size)
+            .ok_or(ElfError::SegmentOutOfRange)?;
+        if program_offset >= segment.file_offset && phdr_file_end <= segment_file_end {
+            phdr_address = segment
+                .virtual_address
+                .checked_add(program_offset - segment.file_offset)
+                .ok_or(ElfError::SegmentOutOfRange)?;
+        }
+    }
+
     let image_size = image_end
         .checked_sub(USER_IMAGE_VA)
         .ok_or(ElfError::SegmentOutOfRange)?;
@@ -385,6 +410,9 @@ pub fn load_elf(elf_data: &[u8]) -> Result<LoadedImage, ElfError> {
 
     Ok(LoadedImage {
         entry,
+        phdr_address,
+        phentsize: program_size as u64,
+        phnum: program_count as u64,
         upper_bound: image_end,
         physical_start,
         page_count,
