@@ -1,3 +1,7 @@
+> **Статус (2026-11-08): припарковано.** Активный вектор — QEMU/десктоп +
+> host-окно + Linux ABI/Phosh. Этот документ сохраняет план и находки
+> аппаратного порта Redmi 10C для более позднего возврата.
+
 # Porting the console OS to the Redmi 10C (`fog`)
 
 This is the working plan between "kernel boots on the phone" and "the phone

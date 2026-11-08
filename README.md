@@ -6,21 +6,32 @@ focused; drivers, services, Howl and applications run in isolated EL0 tasks.
 The architecture is inspired by XNU, Redox and other proven systems, but the
 interfaces, capability model, SFS format and userspace are original.
 
-Primary target: QEMU `virt` machine (ARM Virt Board), Cortex-A72 CPU.
-Hardware bring-up target: Xiaomi Redmi 10C (`fog`, Qualcomm SM6225 / khaje),
-RAM-only boot. The path is verified on a physical `rain` unit (same
-khaje/SM6225 family) up to the scheduler and the Howl task; see
-[redmi10c_poc/README.md](redmi10c_poc/README.md).
+Active target: QEMU `virt` (ARM Virt Board), Cortex-A72, developed from a
+Linux desktop. The product is a **console OS**; the browser is a separate
+window rendered on the host. **Linux ABI + Phosh is the active long-term
+goal** (owner decision: months, not years). The Legion Y700 tablet target is
+forgotten; the Redmi 10C hardware port is parked until the OS layer is ready
+(see [redmi10c_poc/README.md](redmi10c_poc/README.md)).
 
 ## Project direction (2026-11-08)
 
-The project moved to a **console-first OS**. The earlier compositor, home
-screen, input driver, kernel surfaces and every framebuffer profile were
-removed on purpose: they pulled the project toward a full graphical OS that is
-outside the chosen development vector and cannot be finished well in this
-scope. The product is now the Silver kernel plus a small Unix-like console
-system. A window will return later only as a host for a basic browser; it is
-not a general desktop.
+The project is a **console-first OS**. The compositor, home screen, input
+driver, kernel surfaces and every framebuffer profile were removed on purpose:
+they pulled the project toward a full graphical OS outside the chosen vector.
+
+Active vector:
+
+1. **Console OS**: Silver kernel + SFS + network + Howl + Unix toolbox.
+2. **Browser in a separate window**: the guest draws into one shared RGBA
+   surface; a Qt window on the host displays it and forwards input. No guest
+   compositor.
+3. **Linux ABI + Phosh**: a kernel personality layer for Linux syscalls,
+   then a software-rendered headless Wayland stack exported into the same host
+   window. This is the active goal; see
+   [`docs/VECTOR.md`](docs/VECTOR.md).
+
+The tablet is out. Hardware phones are parked behind the QEMU/desktop
+milestone.
 
 ## Community
 
@@ -97,8 +108,8 @@ userspace.
 - [x] EL0 fault containment: a crashed EL0 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
 - [x] Unix-style toolbox: a multi-call `utils` ELF with `grep`, `wc`, `head`, `tail`, `cp`, `find`, `seq`, `basename`, `dirname`, `true`, `false` and `sleep`; `echo` redirection is line-terminated and the shell input queue no longer drops bursts
 - [x] Power control: `poweroff` and `reboot` shell commands through PSCI (`SMC` on hardware, `HVC` on QEMU with `virtualization=on`)
-- [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation with pre-copy FDT destination validation (QEMU-verified, and booted on a physical `rain` unit)
-- [x] Real Redmi 10C boot: RAM-only `fastboot boot` reaches the scheduler and the Howl task, with live GICv3 timer interrupts (verified on a `rain` unit)
+- [x] *(parked)* Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation with pre-copy FDT destination validation (QEMU-verified, and booted on a physical `rain` unit)
+- [x] *(parked)* Real Redmi 10C boot: RAM-only `fastboot boot` reaches the scheduler and the Howl task, with live GICv3 timer interrupts (verified on a `rain` unit)
 - [x] Boot-time MMU TLB proof: read through TTBR0, remap the same VA, read again (fails the boot if the `tlbi` broadcast is missing)
 - [x] Per-task anonymous-mapping quota (16 MiB), DMA quarantine and per-task memory ledger
 - [x] Kernel-owned persistent SFS: read/write, positioned writes, directories, single/double-indirect files and fsck
@@ -135,7 +146,10 @@ win. No XNU or Redox code is copied.
 - **gpu_driver**, **input_driver**, **net_driver**, **net_server** — isolated
   wolf-themed system components; they communicate through IPC and capabilities.
 
-## Redmi 10C (`fog`, SM6225) — RAM-only bring-up
+## Redmi 10C (`fog`, SM6225) — RAM-only bring-up (parked)
+
+> The active vector is QEMU/desktop + Linux ABI/Phosh. This hardware port is
+> kept as a documented later milestone, not an active deliverable.
 
 Status as of 2026-11-03 (TASK №19–№23). The authoritative port document is
 [redmi10c_poc/README.md](redmi10c_poc/README.md).
@@ -451,7 +465,7 @@ prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
 
 `Cargo.toml` has `std` (default host stub), `no_std` (bare metal), `smp`
 (opt-in QEMU SMP, verified on `-smp 4`), `smp-selftest`, `demo-tasks` (opt-in
-regression programs), `tablet` (SM8650), `fog` (SM6225 RAM-only bring-up),
+regression programs), `tablet` (SM8650, **parked**), `fog` (SM6225 RAM-only bring-up, parked),
 `fog-reloc` (explicit opt-in for the fog self-relocation copy),
 `fog-auto-reset` (diagnostic PSCI reset), `fog-hw-selftests` (run the newer
 MMU proofs on hardware) and `fog-timer-test`. Normal bare-metal boot starts
@@ -735,7 +749,7 @@ driver's contract.
 | [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU bring-up of up to eight CPU slots (verified on four and six) behind the `smp` feature, round-qualified quiescence, FIFO ready queues, per-CPU timer checks, a stall watchdog and boot selftests; true cross-PE TLB stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 | [docs/FINAL_AUDIT.md](docs/FINAL_AUDIT.md) | Historical audit: DMA window, Ed25519 signing, evidence and known limitations (surface/graphics parts superseded by the graphics removal) |
-| [docs/PORTING_FOG.md](docs/PORTING_FOG.md) | Redmi 10C port plan: platform framebuffer seam, staged touch/storage/power/DSI work, hardware unknowns and regression matrix |
+| [docs/PORTING_FOG.md](docs/PORTING_FOG.md) | Redmi 10C port plan (parked): console-over-UART/storage/power path, hardware unknowns and regression matrix |
 | [docs/REFERENCE.md](docs/REFERENCE.md) | Reference console product: definition, acceptance checklist, current status, known gaps and next work |
 | [docs/VECTOR.md](docs/VECTOR.md) | Direction: console OS, host-rendered browser window, Linux ABI/Phosh assessment and staged plan |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
@@ -746,8 +760,9 @@ fail-closed park and an FDT-reserved-destination rejection; normal QEMU
 release and debug builds reach `howl>`; the console OS answers `help`,
 `uname`, `ls /` and `health` over the serial line with no graphics task in the
 boot chain; SMP `-smp 4` selftest reports 15 PASS / 0 FAIL; the `no_std`,
-`fog`, `fog-reloc`, `fog-auto-reset`, `fog-hw-selftests`, `tablet`,
-`smp-selftest` and `demo-tasks` configurations all build. `scopeprobe` exits 0
+`fog`, `fog-reloc`, `fog-auto-reset`, `fog-hw-selftests`, `smp-selftest`
+and `demo-tasks` configurations all build (`tablet` still compiles but is
+parked). `scopeprobe` exits 0
 with no leaks, `sfs_fsck` is clean, and the three signing cases (unsigned
 refused, valid `sig=` accepted, tampered signature refused) still hold. The opt-in `smp-churn` profile passes `churn PASS`, `push PASS`,
 `watchdog stall PASS`, `bkl stall PASS` and `priority PASS` on `-smp 2`,

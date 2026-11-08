@@ -13,10 +13,16 @@ Silver kernel
 
 No compositor, no framebuffer backend, no input tablet driver, no home screen
 and no kernel surface objects. The graphics subsystem was removed on
-2026-11-08 after reconsidering the project's development vector: a full
-graphical OS is outside the scope that can be finished well here. A single
-window will return later only as a host for a basic browser, with its own
-minimal display path; it is not a desktop.
+2026-11-08 after reconsidering the project's development vector.
+
+Active vector (see [`VECTOR.md`](VECTOR.md)):
+
+- console OS on QEMU/desktop;
+- a browser in a separate window rendered by a Qt host over a shared surface;
+- **Linux ABI + Phosh** as the active long-term goal (owner decision:
+  months, not years), with a software-rendered headless Wayland path.
+
+The Legion Y700 tablet target is forgotten. The Redmi port is parked.
 
 ## Build and run
 
@@ -40,7 +46,7 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 | Area | Criterion | Status |
 | --- | --- | --- |
 | Host tests | `cargo test --lib` all pass | **217/217** |
-| Builds | `no_std`, `fog`, `fog-reloc`, `fog-auto-reset`, `fog-hw-selftests`, `tablet`, `smp-selftest`, `demo-tasks` | **all pass** |
+| Builds | `no_std`, `fog`, `fog-reloc`, `fog-auto-reset`, `fog-hw-selftests`, `smp-selftest`, `demo-tasks` (tablet compiles, parked) | **all pass** |
 | Console boot | SFS mounts, `howl ready`, no graphics tasks | **pass** |
 | Shell | `help`, `uname`, `ls /`, `health`, file commands | **pass** |
 | Init | Silverd resolves task ids (not cap ids) before grants | **pass** |
@@ -77,7 +83,12 @@ describes a supported build.
    blocker for a console OS on the phone.
 4. **Network tools are still thin.** The stack has ARP/IPv4/ICMP; DHCP, DNS,
    TCP sockets and user tools (`wget`-like) are the next layer.
-5. **Unix toolbox, first layer done.** A multi-call `utils` ELF provides
+5. **Host window + browser are not built yet.** The shared-surface protocol
+   (ivshmem + Qt viewer) and the guest browser are the next product milestone.
+6. **Linux ABI/Phosh are not started.** The kernel personality layer, static
+   musl binaries, headless Wayland and the Phosh stack are the active
+   long-term track; see [`VECTOR.md`](VECTOR.md).
+7. **Unix toolbox, first layer done.** A multi-call `utils` ELF provides
    `grep`, `wc`, `head`, `tail`, `cp`, `find`, `seq`, `basename`, `dirname`,
    `true`, `false` and `sleep`; `ls`, `cat`, `echo`, `say`, `sl` remain
    separate programs. Next: `date` (needs RTC), `env`, a real pager, and
@@ -102,11 +113,9 @@ network driver reports a probe failure and the shell continues.
 
 ## Next work
 
-1. Root-cause the QEMU PSCI shutdown or document a hard requirement.
-2. Add the busybox-style Unix toolbox.
-3. Grow networking: DHCP, DNS, TCP sockets, a `wget`-style tool.
-4. Debug the fog TTBR0 TLB proof with `fog-hw-selftests`.
-5. Make the GENI UART console usable on `rain` (clock/pins), then run the
-   product console OS on the phone.
-6. Only then: a minimal window + browser as a separate, self-contained
-   deliverable.
+1. Grow networking: DHCP, DNS, TCP sockets, a `wget`-style tool.
+2. Host window: ivshmem + Qt viewer, damage/input protocol.
+3. Browser: HTTP + HTML subset in the guest, drawn into the shared surface.
+4. Linux ABI: static musl binaries, then busybox `sh`.
+5. Phosh: headless Wayland, GTK software render, D-Bus + logind stub, `phosh`.
+6. Parked: QEMU PSCI shutdown, fog TLB proof, GENI UART on `rain`, tablet.

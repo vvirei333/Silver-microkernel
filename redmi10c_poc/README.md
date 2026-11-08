@@ -6,6 +6,10 @@
 > historical; the port target is now the console OS over UART. See
 > [`../docs/PORTING_FOG.md`](../docs/PORTING_FOG.md).
 
+> **Статус (2026-11-08): припарковано.** Активный вектор — QEMU/десктоп,
+> host-окно браузера и Linux ABI/Phosh. Этот файл — запись аппаратного
+> bring-up Redmi 10C для более позднего возврата; не активная задача.
+
 Minimal RAM-only path for booting Silver on a Xiaomi Redmi 10C and reaching the
 Howl shell prompt:
 

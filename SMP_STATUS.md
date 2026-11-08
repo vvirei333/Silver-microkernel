@@ -3,11 +3,16 @@
 > **Current project status (2026-11-07):** this file remains the authoritative
 > SMP investigation record. The Redmi 10C / fog port is single-core and is
 > documented in [`redmi10c_poc/README.md`](redmi10c_poc/README.md). The host
-> test suite is now **218/218**; the 13/13 figure below is the checkpoint from
+> test suite is now **217/217**; the 13/13 figure below is the checkpoint from
 > the earlier SMP session. The surface/signing checkpoint (`8b5158a`,
 > `f6ee824`) re-ran `no_std,smp-selftest` on QEMU `-smp 4`: 15 PASS / 0 FAIL,
 > including cross-PE TLB, 64 quiescence rounds, per-CPU ticks and the BKL
 > stall probe.
+>
+> **Active vector (2026-11-08):** console OS on QEMU/desktop, browser window
+> rendered by a Qt host, then Linux ABI + Phosh. Graphics was removed; the
+> tablet is forgotten and the Redmi port is parked. See
+> [`docs/VECTOR.md`](docs/VECTOR.md).
 >
 > **Phases 1–2 are implemented as the opt-in `smp` feature (QEMU only).**
 > Default builds remain single-core. With `no_std,smp` and QEMU `-smp 4`,

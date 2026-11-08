@@ -5,18 +5,25 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## CURRENT STATUS (2026-11-08)
 
-The product is a **console OS** (kernel + kernel SFS + nameserver + network +
-Howl + Howler). The graphics subsystem was **removed** after reconsidering the
-project's development vector: compositor, framebuffer backends, kernel surface
-objects, input driver and home screen are gone, along with the
-`fog-paint`/`fog-ui`/`fog-diag`/`fog-display` features. A single window is a
-future, separate deliverable for a basic browser. The reference checklist is
+Active vector (see [`docs/VECTOR.md`](docs/VECTOR.md)):
+
+1. console OS on QEMU/desktop (kernel + SFS + network + Howl + toolbox);
+2. browser in a separate window rendered by a Qt host over one shared RGBA
+   surface (no guest compositor);
+3. **Linux ABI + Phosh** as the active long-term goal (owner decision:
+   months, not years), via a kernel personality layer and software-rendered
+   headless Wayland exported to the host window.
+
+The graphics subsystem was removed on 2026-11-08 (compositor, framebuffer
+backends, kernel surface objects, input driver, home screen, `fog-paint`/
+`fog-ui`/`fog-diag`/`fog-display`). The Legion Y700 tablet is forgotten; the
+Redmi port is parked. The reference checklist is
 [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 - **Host tests:** 217/217 (`cargo test --lib`).
 - **Builds:** `no_std` (product), `no_std,fog`, `no_std,fog,fog-reloc`,
   `no_std,fog,fog-auto-reset`, `no_std,fog,fog-hw-selftests`,
-  `no_std,tablet`, `no_std,smp-selftest`, `no_std,demo-tasks`.
+  `no_std,tablet` (parked), `no_std,smp-selftest`, `no_std,demo-tasks`.
 - **Console OS (QEMU serial):** boots to `howl ready` with no graphics tasks;
   `help`, `uname`, `ls /`, `health` all answer. `health` reports no DMA leaks.
 - **SMP:** `-smp 4` selftest 15 PASS / 0 FAIL.
@@ -31,9 +38,10 @@ future, separate deliverable for a basic browser. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** root-cause QEMU PSCI shutdown; busybox-style Unix toolbox;
-  DHCP/DNS/TCP + `wget`; debug the fog TTBR0 TLB proof; make the GENI UART
-  usable on `rain`; then storage/power and, later, the browser window.
+- **Next steps:** DHCP/DNS/TCP + `wget`; host window (ivshmem + Qt viewer);
+  guest browser (HTTP + HTML subset); Linux ABI for static musl binaries;
+  headless Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB
+  proof, GENI UART on `rain`, tablet, Redmi storage/power.
 
 ## 2026-11-06 — SFS moves toward the kernel
 
