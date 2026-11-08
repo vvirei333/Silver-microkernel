@@ -5,3 +5,4 @@
 # Bundle signing: never commit the private seed.
 keys/*.key
 /build
+.vscode/
