@@ -609,7 +609,7 @@ and a Qt program on the host maps the same file.
 | `0x000` | magic `WIN1`, version, width, height, stride, format |
 | `0x018` | `frame_seq`; odd while the guest repaints, even when the frame is complete |
 | `0x01C` | state: blank / ready / loading / error |
-| `0x020` | input ring head/tail; 64 eight-byte entries |
+| `0x020` | input ring head/tail; both wrap modulo 64, entries are eight bytes |
 | `0x030` | host web-proxy request/done sequence, status, body/URL lengths |
 | `0x100` | input ring entries |
 | `0x1000` | RGBA8888 pixels |

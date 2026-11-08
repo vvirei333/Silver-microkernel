@@ -576,8 +576,12 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     paint(&app);
 
     loop {
-        let head = window::read_u32(app.window, window::FIELD_INPUT_HEAD);
-        let mut tail = window::read_u32(app.window, window::FIELD_INPUT_TAIL);
+        // Both indices are ring positions, not counters: the host wraps `head`
+        // and the guest wraps `tail`. An unwrapped head used to stay ahead of
+        // the wrapped tail forever after 64 events, so the loop spun on stale
+        // entries and painted as fast as it could.
+        let head = window::read_u32(app.window, window::FIELD_INPUT_HEAD) % window::INPUT_SLOTS;
+        let mut tail = window::read_u32(app.window, window::FIELD_INPUT_TAIL) % window::INPUT_SLOTS;
         let mut dirty = false;
         while tail != head {
             let event = window::read_input(app.window, tail);

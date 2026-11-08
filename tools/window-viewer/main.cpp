@@ -94,9 +94,13 @@ void writeU32(uint8_t *base, uint64_t offset, uint32_t value) {
 }
 
 void pushInput(uint8_t *base, uint8_t kind, uint8_t value, uint16_t key, uint16_t x, uint16_t y) {
-    uint32_t head = readU32(base, kFieldInputHead);
-    uint32_t tail = readU32(base, kFieldInputTail);
-    if (head - tail >= kInputSlots) {
+    uint32_t head = readU32(base, kFieldInputHead) % kInputSlots;
+    uint32_t tail = readU32(base, kFieldInputTail) % kInputSlots;
+    // Both indices are positions in the ring. A plain subtraction underflows
+    // once head wraps behind tail, which used to look "full" and silently
+    // dropped every event after 64 of them.
+    const uint32_t queued = (head + kInputSlots - tail) % kInputSlots;
+    if (queued >= kInputSlots - 1) {
         return; // ring full: dropping input is better than stalling the UI
     }
     uint8_t entry[kInputEntry] = {
@@ -109,8 +113,8 @@ void pushInput(uint8_t *base, uint8_t kind, uint8_t value, uint16_t key, uint16_
         static_cast<uint8_t>(y & 0xFF),
         static_cast<uint8_t>(y >> 8),
     };
-    std::memcpy(base + kInputRing + (head % kInputSlots) * kInputEntry, entry, sizeof(entry));
-    writeU32(base, kFieldInputHead, head + 1);
+    std::memcpy(base + kInputRing + head * kInputEntry, entry, sizeof(entry));
+    writeU32(base, kFieldInputHead, (head + 1) % kInputSlots);
 }
 
 struct Shared {

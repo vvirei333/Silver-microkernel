@@ -108,7 +108,10 @@ Redmi port is parked. The reference checklist is
   repaints on `frame_seq` and sends keys, wheel and clicks through the ring.
   The sequence is a seqlock (odd while the guest paints); the host skips odd
   values and re-checks after the copy, so a repaint cannot tear into a white
-  flash.
+  flash. The input ring stores positions, not counters: both host and guest
+  wrap at 64. An unbounded `head` used to pin the guest in the `tail != head`
+  loop after 64 events (constant repaint) while the host's `head - tail`
+  underflowed and dropped every later event.
   Verified headlessly: DDG results with links, clicking the first result through
   a DDG meta-refresh redirect to the Wikipedia reader view, Alt+Left back to
   the results, typed `http://github.com/` redirecting to HTTPS, scrolling and
