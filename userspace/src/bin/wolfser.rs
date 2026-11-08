@@ -146,6 +146,7 @@ const RESPONSE_POLL_TICKS: u64 = 2;
 const STYLE_LINK: u8 = 0x01;
 const STYLE_HEADING: u8 = 0x02;
 const STYLE_CODE: u8 = 0x04;
+const STYLE_BOLD: u8 = 0x08;
 
 struct App {
     window: u64,
@@ -490,6 +491,11 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         while tail != head {
             let event = window::read_input(app.window, tail);
             tail = (tail + 1) % window::INPUT_SLOTS;
+            // Advance the consumer index before handling: a navigation or a
+            // blocking network wait must never leave the same key pending and
+            // let the host keep it in the ring.
+            window::write_u32(app.window, window::FIELD_INPUT_TAIL, tail);
+            net_ipc::fence();
             match event.kind {
                 window::INPUT_KEY => {
                     if handle_key(&mut app, event.key) {
@@ -528,10 +534,6 @@ pub extern "C" fn _start(_argument: u64) -> ! {
                 _ => {}
             }
         }
-        if tail != window::read_u32(app.window, window::FIELD_INPUT_TAIL) {
-            window::write_u32(app.window, window::FIELD_INPUT_TAIL, tail);
-        }
-
         if app.pending.is_some() {
             poll_pending(&mut app);
             // The spinner keeps moving, so repaint even without input.
@@ -2798,6 +2800,8 @@ fn extract(body: &[u8], page_url: &str) {
 
     let mut in_form = false;
     let mut form_has_field = false;
+    let mut ordered_list = false;
+    let mut list_index = 0u32;
     let mut index = 0usize;
     while index < body.len() && writer.len + 4 < TEXT_CAPACITY {
         let byte = body[index];
@@ -2886,6 +2890,33 @@ fn extract(body: &[u8], page_url: &str) {
                 }
                 continue;
             }
+            if tag_eq(name, b"b") || tag_eq(name, b"strong") {
+                if closing {
+                    writer.style_bits &= !STYLE_BOLD;
+                } else {
+                    writer.style_bits |= STYLE_BOLD;
+                }
+                continue;
+            }
+            if tag_eq(name, b"ol") || tag_eq(name, b"ul") {
+                if closing {
+                    ordered_list = false;
+                } else {
+                    ordered_list = tag_eq(name, b"ol");
+                    list_index = 0;
+                }
+                writer.pending_breaks = writer.pending_breaks.max(1);
+                continue;
+            }
+            if tag_eq(name, b"h4") || tag_eq(name, b"h5") || tag_eq(name, b"h6") {
+                if closing {
+                    writer.style_bits &= !STYLE_BOLD;
+                } else {
+                    writer.pending_breaks = 2;
+                    writer.style_bits |= STYLE_BOLD;
+                }
+                continue;
+            }
             if is_heading(name) {
                 if closing {
                     writer.style_bits &= !STYLE_HEADING;
@@ -2911,8 +2942,28 @@ fn extract(body: &[u8], page_url: &str) {
             }
             if tag_eq(name, b"li") && !closing {
                 writer.pending_breaks = writer.pending_breaks.max(1);
-                writer.write_byte(b'-');
-                writer.write_byte(b' ');
+                if ordered_list {
+                    list_index = list_index.saturating_add(1);
+                    let mut digits = [0_u8; 5];
+                    let mut count = 0usize;
+                    let mut value = list_index;
+                    loop {
+                        digits[count] = b'0' + (value % 10) as u8;
+                        value /= 10;
+                        count += 1;
+                        if value == 0 || count == digits.len() {
+                            break;
+                        }
+                    }
+                    for index in (0..count).rev() {
+                        writer.write_byte(digits[index]);
+                    }
+                    writer.write_byte(b'.');
+                    writer.write_byte(b' ');
+                } else {
+                    writer.write_byte(b'-');
+                    writer.write_byte(b' ');
+                }
                 continue;
             }
             if tag_eq(name, b"hr") {
@@ -3978,7 +4029,18 @@ fn paint(app: &App) {
     }
 
     if app.page.loading {
-        draw_loading(base, app);
+        // Keep the previous document (or the start page) visible while the
+        // next one is fetched: a full white loading frame on every search was
+        // the main source of flicker.
+        let text_len = unsafe { *core::ptr::addr_of!(TEXT_LEN) };
+        if app.page.loaded && text_len > 0 {
+            draw_body(base, app);
+        } else if !app.page.loaded && text_len == 0 {
+            draw_start_page(base, app);
+        } else {
+            draw_loading(base, app);
+        }
+        draw_footer(base, app, "LOADING");
         publish(base, window::STATE_LOADING);
         return;
     }
@@ -4321,7 +4383,14 @@ fn draw_footer(base: u64, app: &App, status: &str) {
             }
         }
     }
-    draw_text_bytes(base, 12, y, 1, &label[..length], COLOR_MUTED);
+    if app.page.loading {
+        let spin = b"|/-\\";
+        let index = (syscall::uptime_ticks() / 12) as usize % spin.len();
+        draw_char(base, 12, y, 1, spin[index] as char, COLOR_MUTED);
+        draw_text_bytes(base, 22, y, 1, &label[..length], COLOR_MUTED);
+    } else {
+        draw_text_bytes(base, 12, y, 1, &label[..length], COLOR_MUTED);
+    }
     if !app.toast.is_empty() {
         draw_text(base, 180, y, 1, app.toast, COLOR_MUTED);
         return;
@@ -4548,6 +4617,9 @@ fn draw_styled_line(
             COLOR_TEXT
         };
         draw_char(base, cursor, y, scale, byte as char, color);
+        if flags & STYLE_BOLD != 0 && cursor + 1 < WIDTH {
+            draw_char(base, cursor + 1, y, scale, byte as char, color);
+        }
         if flags & STYLE_LINK != 0 {
             fill(
                 base,

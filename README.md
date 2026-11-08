@@ -593,7 +593,10 @@ the current one orange, and Enter jumps to the next match. A new tab (or the
 saved with `Ctrl+D` (stored in `/sfs/wolfser.bookmarks` and reloaded at
 startup). `Ctrl+G` opens the first text field of the page's form in the footer;
 Enter submits it with the form's GET/POST method, including hidden fields, and
-Esc cancels. The guest repaints and bumps
+Esc cancels. A session cookie jar makes form flows such as DuckDuckGo's POST
+search work. While a page loads the previous document (or the start page) stays
+visible with a spinner instead of flashing white; the host viewer copies each
+completed frame before painting, so it never reads a half-drawn surface. The guest repaints and bumps
 `frame_seq` only after a memory barrier, so the host never sees a half-drawn
 frame. `tools/window-viewer` is a Qt6 Widgets + Network program and has a
 `--snapshot OUT.png` mode that works with `QT_QPA_PLATFORM=offscreen`, which is
@@ -628,11 +631,14 @@ with the arguments above (or use `./build_and_qemu.sh`). Starting `wolfser`
 twice reuses the running instance (one window per VM).
 
 The renderer deliberately has no CSS layout; three inline images, six tabs and
-one text field per form are the current limits. TLS runs in the guest and needs
+one text field per form are the current limits. It draws bold text, headings and
+ordered/unordered lists, but it is still a text/reader browser: there is no DOM,
+JavaScript, CSS engine, audio or video pipeline, so **YouTube cannot work here**.
+That needs a real engine (WebKit/Gecko-class), which is the Linux ABI + Phosh
+track, not an incremental text-renderer feature. TLS runs in the guest and needs
 no host, but the root store is intentionally small and certificate time is a
 fixed build date until the RTC lands; the viewer proxy remains the fallback.
-HTTP keep-alive and a full form/widget model are still ahead. The Linux
-ABI/Phosh track will eventually replace this renderer with a real engine.
+HTTP keep-alive and a full form/widget model are still ahead.
 DHCP or DNS. The driver assigns its 64 KiB BAR window at `0x1020_0000`; this
 assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 

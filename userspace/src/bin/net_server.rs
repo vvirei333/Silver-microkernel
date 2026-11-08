@@ -79,7 +79,7 @@ const DNS_TIMEOUT_MILLIS: i64 = 8000;
 /// Largest host name, request path and request line we accept.
 const HOST_MAX: usize = 128;
 const PATH_MAX: usize = 384;
-const REQUEST_MAX: usize = 1536;
+const REQUEST_MAX: usize = 2048;
 /// A whole fetch (DNS + connect + transfer) is bounded from the request time.
 const HTTP_TIMEOUT_MILLIS: i64 = 20000;
 
@@ -139,6 +139,124 @@ impl DnsCacheEntry {
 
 static mut DNS_CACHE: [DnsCacheEntry; DNS_CACHE_SLOTS] = [DnsCacheEntry::EMPTY; DNS_CACHE_SLOTS];
 static mut DNS_CACHE_NEXT: usize = 0;
+
+const COOKIE_SLOTS: usize = 16;
+const COOKIE_NAME_MAX: usize = 32;
+const COOKIE_VALUE_MAX: usize = 96;
+
+#[derive(Copy, Clone)]
+struct Cookie {
+    host: [u8; HOST_MAX],
+    host_len: usize,
+    name: [u8; COOKIE_NAME_MAX],
+    name_len: usize,
+    value: [u8; COOKIE_VALUE_MAX],
+    value_len: usize,
+}
+
+impl Cookie {
+    const EMPTY: Cookie = Cookie {
+        host: [0; HOST_MAX],
+        host_len: 0,
+        name: [0; COOKIE_NAME_MAX],
+        name_len: 0,
+        value: [0; COOKIE_VALUE_MAX],
+        value_len: 0,
+    };
+}
+
+static mut COOKIES: [Cookie; COOKIE_SLOTS] = [Cookie::EMPTY; COOKIE_SLOTS];
+static mut COOKIE_NEXT: usize = 0;
+
+fn cookie_store(host: &[u8], pair: &[u8]) {
+    let Some(equal) = pair.iter().position(|&byte| byte == b'=') else {
+        return;
+    };
+    let name = &pair[..equal];
+    let value = &pair[equal + 1..];
+    if name.is_empty() || host.len() >= HOST_MAX || name.len() >= COOKIE_NAME_MAX {
+        return;
+    }
+    unsafe {
+        let cookies = &mut *core::ptr::addr_of_mut!(COOKIES);
+        let mut slot = None;
+        for (index, cookie) in cookies.iter().enumerate() {
+            if cookie.host_len == host.len()
+                && cookie.host[..cookie.host_len].eq_ignore_ascii_case(host)
+                && cookie.name_len == name.len()
+                && cookie.name[..cookie.name_len].eq_ignore_ascii_case(name)
+            {
+                slot = Some(index);
+                break;
+            }
+        }
+        let index = slot.unwrap_or_else(|| {
+            let index = *core::ptr::addr_of!(COOKIE_NEXT) % COOKIE_SLOTS;
+            *core::ptr::addr_of_mut!(COOKIE_NEXT) = index + 1;
+            index
+        });
+        let cookie = &mut cookies[index];
+        cookie.host_len = host.len();
+        cookie.host[..host.len()].copy_from_slice(host);
+        cookie.name_len = name.len();
+        cookie.name[..name.len()].copy_from_slice(name);
+        let length = value.len().min(COOKIE_VALUE_MAX);
+        cookie.value_len = length;
+        cookie.value[..length].copy_from_slice(&value[..length]);
+    }
+}
+
+fn cookie_header(host: &[u8], output: &mut [u8]) -> usize {
+    let mut length = 0usize;
+    unsafe {
+        let cookies = &*core::ptr::addr_of!(COOKIES);
+        for cookie in cookies.iter() {
+            if cookie.host_len != host.len()
+                || !cookie.host[..cookie.host_len].eq_ignore_ascii_case(host)
+                || cookie.name_len == 0
+            {
+                continue;
+            }
+            let needed = cookie.name_len + cookie.value_len + 2;
+            if length + needed + 2 >= output.len() {
+                break;
+            }
+            if length > 0 {
+                output[length] = b';';
+                output[length + 1] = b' ';
+                length += 2;
+            }
+            output[length..length + cookie.name_len]
+                .copy_from_slice(&cookie.name[..cookie.name_len]);
+            length += cookie.name_len;
+            output[length] = b'=';
+            length += 1;
+            output[length..length + cookie.value_len]
+                .copy_from_slice(&cookie.value[..cookie.value_len]);
+            length += cookie.value_len;
+        }
+    }
+    length
+}
+
+fn store_response_cookies(host: &[u8], headers: &[u8]) {
+    for line in headers.split(|&byte| byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.len() > 11 && line[..11].eq_ignore_ascii_case(b"set-cookie:") {
+            let value = &line[11..];
+            let start = value
+                .iter()
+                .position(|byte| !byte.is_ascii_whitespace())
+                .unwrap_or(value.len());
+            let value = &value[start..];
+            let end = value
+                .iter()
+                .position(|&byte| byte == b';')
+                .unwrap_or(value.len());
+            cookie_store(host, &value[..end]);
+        }
+    }
+}
 
 fn dns_cache_lookup(host: &str, now_millis: i64) -> Option<[u8; 4]> {
     unsafe {
@@ -1213,6 +1331,9 @@ fn finish_fetch(fetch: &mut Fetch, client_base: u64, outbox: &mut Outbox) {
         )
     };
     let (code, status, body_len) = parse_response(buffer, fetch.received);
+    if let Some(header_end) = find_header_end(&buffer[..fetch.received]) {
+        store_response_cookies(&fetch.host[..fetch.host_len], &buffer[..header_end]);
+    }
     let requester = fetch.requester;
     let request_id = fetch.request_id;
     // Redirects are the client's decision: hand it the Location header and
@@ -1333,7 +1454,14 @@ fn build_request(fetch: &mut Fetch) {
     push(&fetch.path[..fetch.path_len]);
     push(b" HTTP/1.0\r\nHost: ");
     push(&fetch.host[..fetch.host_len]);
-    push(b"\r\nUser-Agent: WerewolfOS/0.1\r\nAccept: text/html,text/plain,*/*\r\nAccept-Encoding: identity\r\n");
+    push(b"\r\nUser-Agent: Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Wolfser/0.3\r\nAccept: text/html,application/xhtml+xml,text/plain;q=0.8,*/*;q=0.5\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: identity\r\n");
+    let mut cookie = [0_u8; 512];
+    let cookie_len = cookie_header(&fetch.host[..fetch.host_len], &mut cookie);
+    if cookie_len > 0 {
+        push(b"Cookie: ");
+        push(&cookie[..cookie_len]);
+        push(b"\r\n");
+    }
     if fetch.post {
         push(b"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: ");
         let mut digits = [0_u8; 6];

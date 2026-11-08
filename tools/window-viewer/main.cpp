@@ -230,7 +230,7 @@ private:
                              QNetworkRequest::ManualRedirectPolicy);
         request.setRawHeader("Accept-Encoding", "identity");
         request.setHeader(QNetworkRequest::UserAgentHeader,
-                          "Mozilla/5.0 (WerewolfOS) Wolfser/0.2");
+                          "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Wolfser/0.3");
         std::fprintf(stderr, "proxy: fetching %s\n", url.toString().toUtf8().constData());
         m_reply = m_manager.get(request);
         connect(m_reply, &QNetworkReply::finished, this, [this, seq] { finished(seq); });
@@ -293,7 +293,7 @@ private:
                              QNetworkRequest::NoLessSafeRedirectPolicy);
         request.setRawHeader("Accept-Encoding", "identity");
         request.setHeader(QNetworkRequest::UserAgentHeader,
-                          "Mozilla/5.0 (WerewolfOS) Wolfser/0.2");
+                          "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 (KHTML, like Gecko) Wolfser/0.3");
         std::fprintf(stderr, "proxy: image %s\n", url.toString().toUtf8().constData());
         m_imageSeq = seq;
         m_imageReply = m_manager.get(request);
@@ -419,6 +419,28 @@ public:
             const uint32_t sequence = m_shared.u32(kFieldFrameSeq);
             if (sequence != m_lastSequence) {
                 m_lastSequence = sequence;
+                std::atomic_thread_fence(std::memory_order_acquire);
+                const uint32_t width = m_shared.u32(kFieldWidth);
+                const uint32_t height = m_shared.u32(kFieldHeight);
+                const uint32_t stride = m_shared.u32(kFieldStride);
+                if (width != 0 && height != 0 && stride >= width * 4) {
+                    // Snapshot the guest's finished frame. Repainting a live
+                    // shared buffer could catch the guest mid-fill and show a
+                    // white flash.
+                    if (m_frame.width() != static_cast<int>(width) ||
+                        m_frame.height() != static_cast<int>(height)) {
+                        m_frame = QImage(static_cast<int>(width), static_cast<int>(height),
+                                         QImage::Format_RGBA8888);
+                    }
+                    const QImage live(m_shared.data + kPixels, static_cast<int>(width),
+                                      static_cast<int>(height), static_cast<int>(stride),
+                                      QImage::Format_RGBA8888);
+                    for (uint32_t row = 0; row < height; ++row) {
+                        std::memcpy(m_frame.scanLine(static_cast<int>(row)),
+                                    live.constScanLine(static_cast<int>(row)),
+                                    static_cast<size_t>(width) * 4);
+                    }
+                }
                 update();
             }
             const bool overLink = m_shared.u32(kFieldCursor) != 0;
@@ -456,20 +478,19 @@ protected:
         // The guest publishes frame_seq after the pixels; pair it with an
         // acquire fence so the QImage below sees the completed frame.
         std::atomic_thread_fence(std::memory_order_acquire);
-        const uint32_t width = m_shared.u32(kFieldWidth);
-        const uint32_t height = m_shared.u32(kFieldHeight);
-        const uint32_t stride = m_shared.u32(kFieldStride);
-        if (width == 0 || height == 0 || stride < width * 4) {
+        if (m_frame.isNull()) {
             return;
         }
-        QImage frame(m_shared.data + kPixels, static_cast<int>(width), static_cast<int>(height),
-                     static_cast<int>(stride), QImage::Format_RGBA8888);
         QPainter painter(this);
         painter.setRenderHint(QPainter::SmoothPixmapTransform, m_zoom > 100);
-        painter.drawImage(rect(), frame);
+        painter.drawImage(rect(), m_frame);
     }
 
     void keyPressEvent(QKeyEvent *event) override {
+        // Qt repeats a held key; the input ring must receive one press only.
+        if (event->isAutoRepeat()) {
+            return;
+        }
         if (event->modifiers() & Qt::ControlModifier) {
             switch (event->key()) {
             case Qt::Key_Plus:
@@ -559,6 +580,12 @@ protected:
                 return;
             }
         }
+        // A second identical event within 20 ms is a duplicate, not typing.
+        if (key == m_lastKey && m_keyClock.isValid() && m_keyClock.elapsed() < 20) {
+            return;
+        }
+        m_lastKey = key;
+        m_keyClock.restart();
         pushInput(m_shared.data, kInputKey, 0, key, 0, 0);
     }
 
@@ -627,6 +654,9 @@ private:
     bool m_overLink = false;
     QPoint m_lastHover{-1, -1};
     QElapsedTimer m_hoverClock;
+    uint16_t m_lastKey = 0;
+    QElapsedTimer m_keyClock;
+    QImage m_frame;
     int m_zoom = 100;
     int m_frameWidth = 900;
     int m_frameHeight = 640;
