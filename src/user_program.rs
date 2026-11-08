@@ -36,6 +36,11 @@ static SL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sl.elf"));
 static NET_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_driver.elf"));
 static NET_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_server.elf"));
 static UTILS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/utils.elf"));
+/// The fog image is console-only and its relocation proof has a 3.5 MiB
+/// source/destination gap. The litehtml-linked browser is ~3 MB, so embedding
+/// it would make the relocated image overlap its own source. QEMU and tablet
+/// builds still carry it.
+#[cfg(not(feature = "fog"))]
 static WOLFSER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wolfser.elf"));
 static BIGDIR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigdir.elf"));
 static BIGFILE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigfile.elf"));
@@ -57,6 +62,7 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         NET_DRIVER => Some(NET_DRIVER_ELF),
         NET_SERVER => Some(NET_SERVER_ELF),
         UTILS => Some(UTILS_ELF),
+        #[cfg(not(feature = "fog"))]
         WOLFSER => Some(WOLFSER_ELF),
         BIGDIR => Some(BIGDIR_ELF),
         BIGFILE => Some(BIGFILE_ELF),

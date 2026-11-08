@@ -34,7 +34,7 @@ use crate::{
     memory::{phys_to_virt, PAGE_SIZE},
 };
 
-/// Base of the 2 MiB user image window. `userspace/linker.ld` links to
+/// Base of the user image window. `userspace/linker.ld` links to
 /// `. = 0x40000000` (QEMU DRAM) and `userspace/linker_tablet.ld` to
 /// `. = 0x80000000` (tablet DRAM base); this const mirrors whichever script
 /// the current build selected (`feature = "tablet"` drives both).
@@ -42,8 +42,10 @@ use crate::{
 pub const USER_IMAGE_VA: usize = 0x8000_0000;
 #[cfg(not(feature = "tablet"))]
 pub const USER_IMAGE_VA: usize = 0x4000_0000;
-/// Size of the image window; `elf_loader` uses the same bound.
-pub const USER_IMAGE_SIZE: usize = 0x20_0000;
+/// Size of the image window; `elf_loader` uses the same bound. The
+/// litehtml-linked browser image is ~3.8 MiB, so the window is 8 MiB; the
+/// sparse heap starts exactly at the end of this window (`mmu::USER_HEAP_VA`).
+pub const USER_IMAGE_SIZE: usize = 0x80_0000;
 
 // ELF64 identification bytes.
 const EI_CLASS: usize = 4;

@@ -131,6 +131,12 @@ const IVSHMEM_BAR: u64 = 0x1040_0000;
 const WINDOW_MAX_SIZE: u64 = 8 * 1024 * 1024;
 
 const TEXT_CAPACITY: usize = 40 * 1024;
+const CSS_CAP: usize = 256 * 1024;
+const CSS_MAX_FILE: usize = 64 * 1024;
+const READER_CSS: &[u8] = b"body{margin:8px;color:#202122;background:#fff;font-size:16px;line-height:1.4;}h1,h2,h3,h4{color:#000;margin:0.7em 0 0.3em;}p{margin:0.5em 0;}a{color:#3366cc;text-decoration:underline;}li{margin-left:1.4em;}table{border-collapse:collapse;}td,th{border:1px solid #a2a9b1;padding:3px;}";
+const PAGE_BODY_CAP: usize = 48 * 1024;
+const PAGE_CAP: usize = CSS_CAP + PAGE_BODY_CAP;
+const CONTENT_HEIGHT: i32 = (HEIGHT - BODY_TOP - FOOTER_HEIGHT) as i32;
 const TITLE_CAPACITY: usize = 160;
 const ADDRESS_CAPACITY: usize = 512;
 const URL_CAPACITY: usize = 512;
@@ -148,6 +154,47 @@ const STYLE_HEADING: u8 = 0x02;
 const STYLE_CODE: u8 = 0x04;
 const STYLE_BOLD: u8 = 0x08;
 
+/// Opaque litehtml document (see userspace/engine/wolf_html.cpp).
+#[repr(C)]
+struct WolfHtml {
+    _private: [u8; 0],
+}
+
+extern "C" {
+    fn wolf_html_create(
+        html: *const u8,
+        len: i32,
+        width: i32,
+        height: i32,
+        base: *const u8,
+    ) -> *mut WolfHtml;
+    fn wolf_html_destroy(handle: *mut WolfHtml);
+    fn wolf_html_height(handle: *mut WolfHtml) -> i32;
+    fn wolf_html_width(handle: *mut WolfHtml) -> i32;
+    fn wolf_html_draw(
+        handle: *mut WolfHtml,
+        pixels: *mut u32,
+        stride: i32,
+        width: i32,
+        height: i32,
+        scroll_y: i32,
+    );
+    fn wolf_html_hover(
+        handle: *mut WolfHtml,
+        x: i32,
+        y: i32,
+        scroll_y: i32,
+        length: *mut i32,
+    ) -> *const u8;
+    fn wolf_html_click(
+        handle: *mut WolfHtml,
+        x: i32,
+        y: i32,
+        scroll_y: i32,
+        length: *mut i32,
+    ) -> *const u8;
+}
+
 struct App {
     window: u64,
     server: u64,
@@ -157,6 +204,9 @@ struct App {
     focused: bool,
     active: usize,
     scroll: usize,
+    engine: *mut WolfHtml,
+    engine_height: i32,
+    scroll_px: i32,
     hover: [u8; URL_CAPACITY],
     hover_len: usize,
     image_pending: bool,
@@ -280,6 +330,7 @@ struct Tab {
     link_pool_len: usize,
     images: [TabImage; IMAGE_MAX],
     image_count: usize,
+    page_len: usize,
 }
 
 impl Tab {
@@ -314,6 +365,7 @@ impl Tab {
         link_pool_len: 0,
         images: [TabImage::EMPTY; IMAGE_MAX],
         image_count: 0,
+        page_len: 0,
     };
 
     fn title_text(&self) -> &str {
@@ -371,6 +423,10 @@ static mut FORM_HIDDEN: [HiddenField; 8] = [HiddenField::EMPTY; 8];
 static mut FORM_HIDDEN_COUNT: usize = 0;
 
 static mut TABS: [Tab; TAB_MAX] = [Tab::EMPTY; TAB_MAX];
+static mut PAGE_HTML: [[u8; PAGE_CAP]; TAB_MAX] = [[0; PAGE_CAP]; TAB_MAX];
+static mut CSS_BUFFER: [u8; CSS_CAP] = [0; CSS_CAP];
+static mut PAGE_BODY: [u8; PAGE_BODY_CAP] = [0; PAGE_BODY_CAP];
+static mut ENGINE_BASE: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
 
 static mut TEXT: [u8; TEXT_CAPACITY] = [0; TEXT_CAPACITY];
 static mut STYLE: [u8; TEXT_CAPACITY] = [0; TEXT_CAPACITY];
@@ -443,6 +499,9 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         focused: true,
         active: 0,
         scroll: 0,
+        engine: core::ptr::null_mut(),
+        engine_height: 0,
+        scroll_px: 0,
         hover: [0; URL_CAPACITY],
         hover_len: 0,
         image_pending: false,
@@ -505,9 +564,9 @@ pub extern "C" fn _start(_argument: u64) -> ! {
                 window::INPUT_SCROLL => {
                     let delta = event.value as i8;
                     if delta >= 0 {
-                        app.scroll = app.scroll.saturating_add(delta as usize);
+                        scroll_down(&mut app, delta as usize * 3);
                     } else {
-                        app.scroll = app.scroll.saturating_sub((-delta) as usize);
+                        scroll_up(&mut app, (-delta) as usize * 3);
                     }
                     dirty = true;
                 }
@@ -559,11 +618,521 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     }
 }
 
+fn engine_max_scroll(app: &App) -> i32 {
+    if app.engine.is_null() {
+        return 0;
+    }
+    (app.engine_height - CONTENT_HEIGHT).max(0)
+}
+
+fn scroll_up(app: &mut App, lines: usize) {
+    if app.engine.is_null() {
+        app.scroll = app.scroll.saturating_sub(lines);
+    } else {
+        let delta = (lines as i32).saturating_mul(20);
+        app.scroll_px = (app.scroll_px - delta).max(0);
+    }
+}
+
+fn scroll_down(app: &mut App, lines: usize) {
+    if app.engine.is_null() {
+        app.scroll = app.scroll.saturating_add(lines);
+    } else {
+        let delta = (lines as i32).saturating_mul(20);
+        app.scroll_px = (app.scroll_px + delta).min(engine_max_scroll(app));
+    }
+}
+
+fn scroll_to_end(app: &mut App) {
+    if app.engine.is_null() {
+        app.scroll = line_count().saturating_sub(1) as usize;
+    } else {
+        app.scroll_px = engine_max_scroll(app);
+    }
+}
+
+fn destroy_engine(app: &mut App) {
+    if !app.engine.is_null() {
+        unsafe { wolf_html_destroy(app.engine) };
+        app.engine = core::ptr::null_mut();
+    }
+    app.engine_height = 0;
+    app.scroll_px = 0;
+}
+
+fn create_engine(app: &mut App, slot: usize, url: &str) {
+    destroy_engine(app);
+    let page_len = unsafe { (*core::ptr::addr_of!(TABS))[slot].page_len.min(PAGE_CAP) };
+    if page_len == 0 {
+        return;
+    }
+    let base = unsafe { &mut *core::ptr::addr_of_mut!(ENGINE_BASE) };
+    let count = url.len().min(base.len() - 1);
+    base[..count].copy_from_slice(&url.as_bytes()[..count]);
+    base[count] = 0;
+    let html = unsafe { &(*core::ptr::addr_of!(PAGE_HTML))[slot] };
+    let handle = unsafe {
+        wolf_html_create(
+            html.as_ptr(),
+            page_len as i32,
+            WIDTH as i32,
+            CONTENT_HEIGHT,
+            base.as_ptr(),
+        )
+    };
+    if handle.is_null() {
+        return;
+    }
+    app.engine = handle;
+    app.engine_height = unsafe { wolf_html_height(handle) };
+    app.scroll_px = 0;
+}
+
+fn save_page_html(slot: usize, body: &[u8], css: &[u8]) {
+    unsafe {
+        let page = &mut (*core::ptr::addr_of_mut!(PAGE_HTML))[slot];
+        let mut length = 0usize;
+        if page.len() > 32 {
+            let prefix = b"<style>\n";
+            let suffix = b"\n</style>\n";
+            let available = page.len().saturating_sub(prefix.len() + suffix.len());
+            let reader = READER_CSS.len().min(available);
+            page[..prefix.len()].copy_from_slice(prefix);
+            length = prefix.len();
+            page[length..length + reader].copy_from_slice(&READER_CSS[..reader]);
+            length += reader;
+            let count = css
+                .len()
+                .min(page.len().saturating_sub(length + suffix.len()));
+            if count > 0 {
+                page[length..length + count].copy_from_slice(&css[..count]);
+                length += count;
+            }
+            page[length..length + suffix.len()].copy_from_slice(suffix);
+            length += suffix.len();
+        }
+        let count = body.len().min(page.len() - length);
+        page[length..length + count].copy_from_slice(&body[..count]);
+        length += count;
+        (*core::ptr::addr_of_mut!(TABS))[slot].page_len = length;
+    }
+}
+
+fn next_request_id() -> u32 {
+    unsafe {
+        let next = (*core::ptr::addr_of!(REQUEST_ID)).wrapping_add(1);
+        *core::ptr::addr_of_mut!(REQUEST_ID) = next;
+        next
+    }
+}
+
+fn fetch_css_blocking(app: &App, url: &str, out: &mut [u8], max: usize) -> Option<usize> {
+    if app.server == 0 || app.net_base == 0 || url.is_empty() || out.is_empty() {
+        return None;
+    }
+    if !write_request(app.net_base, url) {
+        return None;
+    }
+    let request_id = next_request_id();
+    if !syscall::send(app.server, &net_ipc::http_request_id(request_id)) {
+        return None;
+    }
+    let deadline = syscall::uptime_ticks().saturating_add(12 * TICKS_PER_SECOND);
+    let mut message = ipc::Message::new(0, &[]);
+    loop {
+        if syscall::receive_timeout(&mut message, RESPONSE_POLL_TICKS).is_ok()
+            && message.sender == app.server
+            && message.payload[0] == net_ipc::OP_HTTP_REPLY
+            && net_ipc::http_id(&message) == request_id
+        {
+            let (code, _status, body_len) = net_ipc::http_fields(&message)?;
+            if code != net_ipc::NET_OK || body_len as usize > max {
+                return None;
+            }
+            let body = unsafe {
+                core::slice::from_raw_parts(
+                    (app.net_base + net_ipc::CLIENT_BODY) as *const u8,
+                    (body_len as usize).min(net_ipc::CLIENT_BODY_MAX),
+                )
+            };
+            let count = body.len().min(out.len());
+            out[..count].copy_from_slice(&body[..count]);
+            return Some(count);
+        }
+        if syscall::uptime_ticks() >= deadline {
+            return None;
+        }
+    }
+}
+
+fn collect_css_urls(
+    body: &[u8],
+    page_url: &str,
+    urls: &mut [[u8; URL_CAPACITY]; 4],
+    lengths: &mut [usize; 4],
+) -> usize {
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while index < body.len() && count < 4 {
+        if body[index] == b'<' {
+            let (name, tag, after) = read_tag_quoted(body, index);
+            if tag_eq(name, b"link") {
+                let rel = tag_attribute(tag, b"rel").unwrap_or(b"");
+                if contains_ignore_case(rel, b"stylesheet") {
+                    if let Some(href) = tag_attribute(tag, b"href") {
+                        let mut raw = [0u8; URL_CAPACITY];
+                        let raw_len = decode_attribute(href, &mut raw);
+                        let text = core::str::from_utf8(&raw[..raw_len]).unwrap_or("");
+                        let mut resolved = [0u8; URL_CAPACITY];
+                        if let Some(len) = resolve_link(page_url, text, &mut resolved) {
+                            let mut duplicate = false;
+                            for prior in 0..count {
+                                if lengths[prior] == len
+                                    && urls[prior][..len] == resolved[..len]
+                                {
+                                    duplicate = true;
+                                    break;
+                                }
+                            }
+                            if !duplicate {
+                                urls[count] = resolved;
+                                lengths[count] = len;
+                                count += 1;
+                            }
+                        }
+                    }
+                }
+            }
+            index = after;
+        } else {
+            index += 1;
+        }
+    }
+    count
+}
+
+fn element_range_by_id(body: &[u8], id: &[u8]) -> Option<(usize, usize)> {
+    let mut index = 0usize;
+    while index < body.len() {
+        if body[index] == b'<' {
+            let (name, full, after) = read_tag_quoted(body, index);
+            let closing = body.get(index + 1) == Some(&b'/');
+            if !closing {
+                if let Some(value) = tag_attribute(full, b"id") {
+                    if value.eq_ignore_ascii_case(id) {
+                        let mut depth = 1i32;
+                        let mut cursor = after;
+                        while cursor < body.len() {
+                            if body[cursor] == b'<' {
+                                let (inner, _inner_full, inner_after) = read_tag(body, cursor);
+                                let inner_closing = body.get(cursor + 1) == Some(&b'/');
+                                if tag_eq(inner, name) {
+                                    if inner_closing {
+                                        depth -= 1;
+                                        if depth == 0 {
+                                            return Some((after, cursor));
+                                        }
+                                    } else {
+                                        depth += 1;
+                                    }
+                                }
+                                cursor = inner_after;
+                            } else {
+                                cursor += 1;
+                            }
+                        }
+                        return Some((after, body.len()));
+                    }
+                }
+            }
+            index = after;
+        } else {
+            index += 1;
+        }
+    }
+    None
+}
+
+fn read_tag_quoted(source: &[u8], start: usize) -> (&[u8], &[u8], usize) {
+    let mut index = start + 1;
+    if source.get(index) == Some(&b'/') {
+        index += 1;
+    }
+    let name_start = index;
+    while index < source.len()
+        && !matches!(source[index], b' ' | b'\t' | b'\n' | b'\r' | b'>' | b'/')
+    {
+        index += 1;
+    }
+    let name = &source[name_start..index];
+    let mut quote = 0u8;
+    while index < source.len() {
+        let byte = source[index];
+        if quote != 0 {
+            if byte == quote {
+                quote = 0;
+            }
+        } else if byte == b'"' || byte == b'\'' {
+            quote = byte;
+        } else if byte == b'>' {
+            return (name, &source[start + 1..index], index + 1);
+        }
+        index += 1;
+    }
+    (name, &source[start + 1..source.len()], source.len())
+}
+
+fn push_bytes(out: &mut [u8], length: &mut usize, bytes: &[u8]) {
+    if *length >= out.len() {
+        return;
+    }
+    let count = bytes.len().min(out.len() - *length);
+    out[*length..*length + count].copy_from_slice(&bytes[..count]);
+    *length += count;
+}
+
+fn skip_reader_element(source: &[u8], mut index: usize, target: &[u8]) -> usize {
+    let mut depth = 1i32;
+    while index < source.len() {
+        if source[index] == b'<' {
+            let (name, _full, after) = read_tag_quoted(source, index);
+            let closing = source.get(index + 1) == Some(&b'/');
+            if tag_eq(name, target) {
+                if closing {
+                    depth -= 1;
+                    if depth == 0 {
+                        return after;
+                    }
+                } else {
+                    depth += 1;
+                }
+            }
+            index = after;
+        } else {
+            index += 1;
+        }
+    }
+    source.len()
+}
+
+fn dropped_reader_tag(name: &[u8]) -> bool {
+    for bad in [
+        b"script".as_slice(),
+        b"style".as_slice(),
+        b"table".as_slice(),
+        b"meta".as_slice(),
+        b"link".as_slice(),
+        b"base".as_slice(),
+        b"div".as_slice(),
+        b"span".as_slice(),
+        b"section".as_slice(),
+        b"figure".as_slice(),
+        b"figcaption".as_slice(),
+        b"tbody".as_slice(),
+        b"thead".as_slice(),
+        b"tfoot".as_slice(),
+        b"tr".as_slice(),
+        b"td".as_slice(),
+        b"th".as_slice(),
+        b"colgroup".as_slice(),
+        b"col".as_slice(),
+        b"caption".as_slice(),
+        b"nav".as_slice(),
+        b"header".as_slice(),
+        b"footer".as_slice(),
+        b"aside".as_slice(),
+        b"template".as_slice(),
+        b"noscript".as_slice(),
+        b"form".as_slice(),
+        b"input".as_slice(),
+        b"button".as_slice(),
+        b"select".as_slice(),
+        b"textarea".as_slice(),
+        b"svg".as_slice(),
+        b"math".as_slice(),
+        b"img".as_slice(),
+    ] {
+        if tag_eq(name, bad) {
+            return true;
+        }
+    }
+    false
+}
+
+fn attribute_contains(full: &[u8], name: &[u8], needle: &[u8]) -> bool {
+    tag_attribute(full, name)
+        .map(|value| contains_ignore_case(value, needle))
+        .unwrap_or(false)
+}
+
+fn copy_reader(source: &[u8], out: &mut [u8]) -> usize {
+    let mut length = 0usize;
+    let mut index = 0usize;
+    while index < source.len() && length < out.len() {
+        if source[index] == b'<' {
+            if source[index..].starts_with(b"<!--") {
+                if let Some(end) = source[index + 4..]
+                    .windows(3)
+                    .position(|window| window == b"-->")
+                {
+                    index += 4 + end + 3;
+                } else {
+                    break;
+                }
+                continue;
+            }
+            if source[index..].starts_with(b"<!") {
+                if let Some(end) = find_byte(&source[index..], b'>') {
+                    index += end + 1;
+                } else {
+                    break;
+                }
+                continue;
+            }
+            let (name, full, after) = read_tag_quoted(source, index);
+            let closing = source.get(index + 1) == Some(&b'/');
+            if tag_eq(name, b"script") || tag_eq(name, b"style") || tag_eq(name, b"table") {
+                if !closing {
+                    index = skip_reader_element(source, after, name);
+                } else {
+                    index = after;
+                }
+                continue;
+            }
+            if !closing
+                && (attribute_contains(full, b"style", b"display:none")
+                    || attribute_contains(full, b"class", b"shortdescription")
+                    || attribute_contains(full, b"class", b"mw-empty-elt")
+                    || attribute_contains(full, b"class", b"noprint")
+                    || attribute_contains(full, b"class", b"noexcerpt")
+                    || attribute_contains(full, b"class", b"navbox")
+                    || attribute_contains(full, b"class", b"metadata"))
+            {
+                index = skip_reader_element(source, after, name);
+                continue;
+            }
+            if dropped_reader_tag(name) {
+                index = after;
+                continue;
+            }
+            if closing {
+                push_bytes(out, &mut length, b"</");
+                push_bytes(out, &mut length, name);
+                push_bytes(out, &mut length, b">");
+            } else {
+                push_bytes(out, &mut length, b"<");
+                push_bytes(out, &mut length, name);
+                for attribute in [b"href".as_slice(), b"src".as_slice(), b"alt".as_slice()] {
+                    if let Some(value) = tag_attribute(full, attribute) {
+                        push_bytes(out, &mut length, b" ");
+                        push_bytes(out, &mut length, attribute);
+                        push_bytes(out, &mut length, b"=\"");
+                        push_bytes(out, &mut length, value);
+                        push_bytes(out, &mut length, b"\"");
+                    }
+                }
+                push_bytes(out, &mut length, b">");
+            }
+            index = after;
+        } else {
+            let start = index;
+            while index < source.len() && source[index] != b'<' {
+                index += 1;
+            }
+            push_bytes(out, &mut length, &source[start..index]);
+        }
+    }
+    length
+}
+
+fn copy_page(source: &[u8], out: &mut [u8], sanitize: bool) -> usize {
+    if !sanitize {
+        let count = source.len().min(out.len());
+        out[..count].copy_from_slice(&source[..count]);
+        return count;
+    }
+    copy_reader(source, out)
+}
+
+fn reader_range(body: &[u8]) -> Option<(usize, usize)> {
+    if let Some(range) = element_range_by_id(body, b"mw-content-text") {
+        if range.1 > range.0 + 16 {
+            return Some(range);
+        }
+    }
+    for target in [b"main".as_slice(), b"article".as_slice()] {
+        let mut depth = 0i32;
+        let mut content_start = None;
+        let mut index = 0usize;
+        while index < body.len() {
+            if body[index] == b'<' {
+                let (name, _full, after) = read_tag_quoted(body, index);
+                let closing = body.get(index + 1) == Some(&b'/');
+                if tag_eq(name, target) {
+                    if closing {
+                        if depth > 0 {
+                            depth -= 1;
+                            if depth == 0 {
+                                if let Some(start) = content_start {
+                                    return Some((start, index));
+                                }
+                            }
+                        }
+                    } else {
+                        if depth == 0 && content_start.is_none() {
+                            content_start = Some(after);
+                        }
+                        depth += 1;
+                    }
+                }
+                index = after;
+            } else {
+                index += 1;
+            }
+        }
+        // The net_server body window is 1 MiB; a very large article may be
+        // truncated before its closing tag. Keep the opening slice.
+        if let Some(start) = content_start {
+            if body.len() > start + 16 {
+                return Some((start, body.len()));
+            }
+        }
+    }
+    None
+}
+
+fn fetch_css_urls(
+    app: &App,
+    urls: &[[u8; URL_CAPACITY]; 4],
+    lengths: &[usize; 4],
+    count: usize,
+) -> usize {
+    let buffer = unsafe { &mut *core::ptr::addr_of_mut!(CSS_BUFFER) };
+    let mut total = 0usize;
+    for index in 0..count {
+        if total + 8 >= buffer.len() {
+            break;
+        }
+        let url = core::str::from_utf8(&urls[index][..lengths[index]]).unwrap_or("");
+        buffer[total] = b'\n';
+        total += 1;
+        let max = CSS_MAX_FILE.min(buffer.len() - total);
+        if let Some(copied) = fetch_css_blocking(app, url, &mut buffer[total..], max) {
+            total += copied;
+        }
+    }
+    total
+}
+
 fn clamp_scroll(app: &mut App) {
     let lines = line_count() as usize;
     let max = lines.saturating_sub(1);
     if app.scroll > max {
         app.scroll = max;
+    }
+    let max_px = engine_max_scroll(app);
+    if app.scroll_px > max_px {
+        app.scroll_px = max_px;
     }
 }
 
@@ -680,27 +1249,31 @@ fn handle_key(app: &mut App, key: u16) -> bool {
             true
         }
         window::KEY_UP => {
-            app.scroll = app.scroll.saturating_sub(1);
+            scroll_up(app, 1);
             true
         }
         window::KEY_DOWN => {
-            app.scroll = app.scroll.saturating_add(1);
+            scroll_down(app, 1);
             true
         }
         window::KEY_PAGE_UP => {
-            app.scroll = app.scroll.saturating_sub(22);
+            scroll_up(app, 22);
             true
         }
         window::KEY_PAGE_DOWN => {
-            app.scroll = app.scroll.saturating_add(22);
+            scroll_down(app, 22);
             true
         }
         window::KEY_HOME => {
-            app.scroll = 0;
+            if app.engine.is_null() {
+                app.scroll = 0;
+            } else {
+                app.scroll_px = 0;
+            }
             true
         }
         window::KEY_END => {
-            app.scroll = line_count().saturating_sub(1) as usize;
+            scroll_to_end(app);
             true
         }
         key if (0x20..0x7F).contains(&key) => {
@@ -1016,6 +1589,35 @@ fn handle_click(app: &mut App, x: u32, y: u32, button: u8) -> bool {
         return true;
     }
     if y >= BODY_TOP && y < HEIGHT - FOOTER_HEIGHT {
+        if !app.engine.is_null() {
+            let mut length = 0;
+            let pointer = unsafe {
+                wolf_html_click(
+                    app.engine,
+                    x as i32,
+                    (y - BODY_TOP) as i32,
+                    app.scroll_px,
+                    &mut length,
+                )
+            };
+            if !pointer.is_null() && length > 0 {
+                let href = unsafe { core::slice::from_raw_parts(pointer, length as usize) };
+                let target = unsafe { &mut *core::ptr::addr_of_mut!(CLICK_TARGET) };
+                let base = {
+                    let tab = tab_ref(app.active);
+                    core::str::from_utf8(&tab.url[..tab.url_len]).unwrap_or("")
+                };
+                let text = core::str::from_utf8(href).unwrap_or("");
+                if let Some(len) = resolve_link(base, text, target) {
+                    let url = core::str::from_utf8(&target[..len]).unwrap_or("");
+                    if button == 2 || button == 3 {
+                        new_tab(app);
+                    }
+                    begin_navigation(app, url, false, false);
+                }
+            }
+            return true;
+        }
         if !app.page.loaded {
             if let Some(action) = start_action_at(x, y) {
                 execute_start_action(app, action);
@@ -1088,6 +1690,35 @@ fn handle_move(app: &mut App, x: u32, y: u32, leave: bool) -> bool {
             None => None,
         };
         return apply_hover(app, text.unwrap_or(""));
+    }
+    if !app.engine.is_null() {
+        if y < BODY_TOP || y >= HEIGHT - FOOTER_HEIGHT {
+            return apply_hover(app, "");
+        }
+        let mut length = 0;
+        let pointer = unsafe {
+            wolf_html_hover(
+                app.engine,
+                x as i32,
+                (y - BODY_TOP) as i32,
+                app.scroll_px,
+                &mut length,
+            )
+        };
+        if pointer.is_null() || length <= 0 {
+            return apply_hover(app, "");
+        }
+        let href = unsafe { core::slice::from_raw_parts(pointer, length as usize) };
+        let target = unsafe { &mut *core::ptr::addr_of_mut!(CLICK_TARGET) };
+        let base = {
+            let tab = tab_ref(app.active);
+            core::str::from_utf8(&tab.url[..tab.url_len]).unwrap_or("")
+        };
+        let text = core::str::from_utf8(href).unwrap_or("");
+        if let Some(len) = resolve_link(base, text, target) {
+            return apply_hover(app, core::str::from_utf8(&target[..len]).unwrap_or(""));
+        }
+        return apply_hover(app, "");
     }
     let mut url = [0_u8; URL_CAPACITY];
     let mut length = 0usize;
@@ -1340,6 +1971,9 @@ fn clamp_image_lines() {
 }
 
 fn start_image_queue(app: &mut App) {
+    if !app.engine.is_null() {
+        return;
+    }
     clamp_image_lines();
     clear_image_view(app);
     request_next_image(app);
@@ -1621,6 +2255,7 @@ fn save_bookmarks() -> u8 {
 
 fn show_start(app: &mut App) {
     cancel_load(app);
+    destroy_engine(app);
     clear_images(app);
     clear_form(app);
     clear_hover(app);
@@ -1756,6 +2391,10 @@ fn switch_tab(app: &mut App, slot: usize) {
     save_active(app);
     restore_active(app, slot);
     app.focused = !tab_ref(slot).loaded;
+    let url = tab_ref(slot).url;
+    let url_len = tab_ref(slot).url_len;
+    let url_text = core::str::from_utf8(&url[..url_len]).unwrap_or("");
+    create_engine(app, slot, url_text);
     paint(app);
     restore_images_from_tab(app, slot);
 }
@@ -1770,6 +2409,7 @@ fn new_tab(app: &mut App) -> bool {
     tabs[slot] = Tab::EMPTY;
     tabs[slot].open = true;
     clear_hover(app);
+    destroy_engine(app);
     clear_images(app);
     clear_form(app);
     restore_active(app, slot);
@@ -1810,7 +2450,13 @@ fn close_tab(app: &mut App, slot: usize) {
         if let Some(next) = next {
             restore_active(app, next);
             app.focused = !tab_ref(next).loaded;
+            let url = tab_ref(next).url;
+            let url_len = tab_ref(next).url_len;
+            let url_text = core::str::from_utf8(&url[..url_len]).unwrap_or("");
+            create_engine(app, next, url_text);
             restore_images_from_tab(app, next);
+        } else {
+            destroy_engine(app);
         }
     }
     paint(app);
@@ -2466,6 +3112,41 @@ fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
         handle_redirect(app, url, &redirect[..meta_len]);
         return;
     }
+    // `body` points into the net_server's shared client window. A CSS fetch
+    // reuses that window, so collect the stylesheet URLs and copy the reader
+    // slice before any network request.
+    let mut css_urls = [[0u8; URL_CAPACITY]; 4];
+    let mut css_lengths = [0usize; 4];
+    let (render_start, render_end, reader_mode) = match reader_range(body) {
+        Some((start, end)) if end > start + 16 => (start, end, true),
+        _ => (0, body.len(), false),
+    };
+    // Reader mode uses the compact built-in stylesheet. The site's full CSS
+    // assumes flex/grid and produces large empty blocks when litehtml applies
+    // only part of it, so do not fetch it for an extracted article.
+    let css_count = if reader_mode {
+        0
+    } else {
+        collect_css_urls(body, url, &mut css_urls, &mut css_lengths)
+    };
+    let page_body = unsafe {
+        let destination = core::slice::from_raw_parts_mut(
+            core::ptr::addr_of_mut!(PAGE_BODY) as *mut u8,
+            PAGE_BODY_CAP,
+        );
+        let length = copy_page(
+            &body[render_start..render_end],
+            destination,
+            reader_mode,
+        );
+        core::slice::from_raw_parts(core::ptr::addr_of!(PAGE_BODY) as *const u8, length)
+    };
+    let css_len = fetch_css_urls(app, &css_urls, &css_lengths, css_count);
+    let css = unsafe {
+        core::slice::from_raw_parts(core::ptr::addr_of!(CSS_BUFFER) as *const u8, css_len)
+    };
+    save_page_html(app.active, page_body, css);
+    create_engine(app, app.active, url);
     app.page.loaded = true;
     app.page.loading = false;
     app.page.status = status;
@@ -4033,7 +4714,9 @@ fn paint(app: &App) {
         // next one is fetched: a full white loading frame on every search was
         // the main source of flicker.
         let text_len = unsafe { *core::ptr::addr_of!(TEXT_LEN) };
-        if app.page.loaded && text_len > 0 {
+        if !app.engine.is_null() {
+            draw_body(base, app);
+        } else if app.page.loaded && text_len > 0 {
             draw_body(base, app);
         } else if !app.page.loaded && text_len == 0 {
             draw_start_page(base, app);
@@ -4437,6 +5120,20 @@ fn digits(value: u16) -> ([u8; 5], usize) {
 }
 
 fn draw_body(base: u64, app: &App) {
+    if !app.engine.is_null() {
+        let pixels = (base + window::PIXELS + u64::from(BODY_TOP) * (STRIDE as u64)) as *mut u32;
+        unsafe {
+            wolf_html_draw(
+                app.engine,
+                pixels,
+                WIDTH as i32,
+                WIDTH as i32,
+                CONTENT_HEIGHT,
+                app.scroll_px,
+            );
+        }
+        return;
+    }
     let text = unsafe { &*core::ptr::addr_of!(TEXT) };
     let styles = unsafe { &*core::ptr::addr_of!(STYLE) };
     let length = unsafe { *core::ptr::addr_of!(TEXT_LEN) };
@@ -4861,4 +5558,137 @@ fn fatal(status: u64, message: &str) -> ! {
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
     syscall::exit_with_status(0xB0B0)
+}
+
+
+// ---------------------------------------------------------------------------
+// C ABI used by userspace/engine (litehtml container + newlib syscalls)
+
+fn utf8_next(bytes: &[u8], index: usize) -> (char, usize) {
+    let first = bytes[index];
+    if first < 0x80 {
+        return (first as char, index + 1);
+    }
+    let length = if first >> 5 == 0b110 {
+        2
+    } else if first >> 4 == 0b1110 {
+        3
+    } else if first >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    };
+    if index + length <= bytes.len() {
+        if let Ok(text) = core::str::from_utf8(&bytes[index..index + length]) {
+            if let Some(character) = text.chars().next() {
+                return (character, index + length);
+            }
+        }
+    }
+    ('?', index + 1)
+}
+
+#[no_mangle]
+pub extern "C" fn wolf_text_width(text: *const u8, len: u32, scale: u32) -> u32 {
+    if text.is_null() || len == 0 {
+        return 0;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(text, len as usize) };
+    let mut characters = 0u32;
+    for &byte in bytes {
+        if byte & 0xC0 != 0x80 {
+            characters += 1;
+        }
+    }
+    characters * (font5x7::GLYPH_WIDTH + 1) * scale.max(1)
+}
+
+#[no_mangle]
+pub extern "C" fn wolf_draw_text(
+    pixels: *mut u32,
+    stride: i32,
+    width: i32,
+    height: i32,
+    x: i32,
+    y: i32,
+    text: *const u8,
+    len: u32,
+    scale: u32,
+    color: u32,
+    clip_x: i32,
+    clip_y: i32,
+    clip_w: i32,
+    clip_h: i32,
+) {
+    if pixels.is_null() || text.is_null() || width <= 0 || height <= 0 || clip_w <= 0 || clip_h <= 0 {
+        return;
+    }
+    let scale = scale.max(1) as i32;
+    let bytes = unsafe { core::slice::from_raw_parts(text, len as usize) };
+    let clip_right = clip_x + clip_w;
+    let clip_bottom = clip_y + clip_h;
+    let mut cursor = x;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        let (character, next) = utf8_next(bytes, index);
+        index = next;
+        let glyph = font5x7::glyph(character);
+        for (column, bits) in glyph.iter().enumerate() {
+            for row in 0..font5x7::GLYPH_HEIGHT {
+                if bits & (1 << row) == 0 {
+                    continue;
+                }
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        let px = cursor + column as i32 * scale + dx;
+                        let py = y + row as i32 * scale + dy;
+                        if px >= clip_x
+                            && py >= clip_y
+                            && px < clip_right
+                            && py < clip_bottom
+                            && px >= 0
+                            && py >= 0
+                            && px < width
+                            && py < height
+                        {
+                            unsafe {
+                                core::ptr::write_volatile(
+                                    pixels.add(py as usize * stride as usize + px as usize),
+                                    color,
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cursor += (font5x7::GLYPH_WIDTH as i32 + 1) * scale;
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wolf_sys_write(data: *const u8, len: usize) {
+    if data.is_null() || len == 0 {
+        return;
+    }
+    let bytes = unsafe { core::slice::from_raw_parts(data, len) };
+    syscall::print_bytes(bytes);
+}
+
+#[no_mangle]
+pub extern "C" fn wolf_sys_mmap(len: usize) -> *mut u8 {
+    match syscall::mmap(0, len, syscall::PROT_READ | syscall::PROT_WRITE) {
+        Some(address) => address as *mut u8,
+        None => core::ptr::null_mut(),
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wolf_sys_exit(status: u64) -> ! {
+    syscall::exit_with_status(status)
+}
+
+#[no_mangle]
+pub extern "C" fn wolf_sys_uptime_ms() -> u64 {
+    syscall::uptime_ticks().saturating_mul(1000 / TICKS_PER_SECOND)
 }

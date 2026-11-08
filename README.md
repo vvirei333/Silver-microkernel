@@ -101,7 +101,7 @@ userspace.
 - [x] DNS: `dns <name>` resolves through the DHCP-provided resolver
 - [x] HTTP: `wget <url> [file]` fetches an `http://` document through a real TCP connection into SFS; `ip` shows the lease
 - [x] Vendored `smoltcp` 0.14 with a two-line neighbour fix for broadcast DHCP traffic (`third_party/smoltcp/PATCH.md`)
-- [x] **Wolfser**: `wolfser [query|url]` opens a search/address bar; pages render into an ivshmem RGBA surface with clickable links, back/forward history, word wrap, headings, a reader mode, up to three inline images, find-in-page, a start page with persistent bookmarks, six tabs and window zoom. `http://` and `https://` use the guest stack (TLS 1.3); the host viewer's Qt TLS proxy is the fallback
+- [x] **Wolfser**: `wolfser [query|url]` opens a search/address bar; pages render into an ivshmem RGBA surface with clickable links, back/forward history, find-in-page, a start page with persistent bookmarks, six tabs and window zoom. The primary renderer is **litehtml** (HTML5 + CSS layout, article reader extraction); the old text/inline-image renderer stays as a fallback. `http://` and `https://` use the guest stack (TLS 1.3); the host viewer's Qt TLS proxy is the fallback
 - [x] Qt window viewer (`tools/window-viewer`) that maps the same surface, repaints on `frame_seq`, and sends keys/wheel through an input ring; `--snapshot` mode for headless checks
 - [x] `SYS_MAP_PHYS_NC`: maps a non-DRAM window (ivshmem) as Normal Non-Cacheable user memory
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
@@ -540,6 +540,21 @@ compressed or chunked-specific browser features beyond the built-in dechunking.
 
 ## Wolfser (browser window)
 
+The HTML engine is built for `aarch64-none-elf` with the xPack GNU AArch64
+Embedded GCC (newlib + libstdc++), not the Linux cross compiler. Install it
+outside the repository and let `userspace/build.rs` find it:
+
+```bash
+curl -L -o /tmp/xpack.tar.gz \
+  https://github.com/xpack-dev-tools/aarch64-none-elf-gcc-xpack/releases/download/v15.2.1-1.1/xpack-aarch64-none-elf-gcc-15.2.1-1.1-linux-x64.tar.gz
+mkdir -p ~/.local/toolchains
+tar -xzf /tmp/xpack.tar.gz -C ~/.local/toolchains
+```
+
+Set `WOLF_ARM_TOOLCHAIN` to use a different prefix. The engine is only linked
+into `wolfser`; see `userspace/engine/README.md` for the bridge, kernel VA
+changes and current limits.
+
 Wolfser is a normal guest program (`wolfser` in Howl). With no argument it
 opens an empty search bar; with an argument it treats the text as an address
 or a query. Enter resolves the input: an explicit URL is used as-is, a bare
@@ -552,19 +567,26 @@ Wolfser retries the URL through the host viewer's Qt TLS proxy. Redirects (3xx
 and `<meta http-equiv=refresh>`) are followed by the guest, so a page may move
 between the two paths freely. `wget https://...` uses the same guest TLS path.
 
-The page is reduced to readable content (scripts/styles/tables/navigation
-stripped, entities decoded, word-wrapped paragraphs, headings scaled up) and
-drawn into one 900x640 RGBA surface. A `<main>`, `<article>` or MediaWiki
-content container selects the article region, so Wikipedia opens on the text
-instead of its menus. Links are blue and underlined; clicking one navigates.
-Up to three page images are fetched and decoded by the host viewer's Qt image
-stack (PNG/JPEG/WebP), scaled to at most 240x180, then placed inline before
-their text line; the infobox contributes the lead picture and later article
-figures follow in the flow. They scroll with the text and are re-fetched when
-their tab comes back. Six tabs keep their own URL, history, scroll position and
-rendered page, so switching is instant and does not refetch. There is no guest compositor: the
-surface lives in an ivshmem BAR, and a Qt program on the host maps the same
-file.
+HTML and CSS are laid out by **litehtml** (New BSD, with the bundled gumbo
+HTML5 parser). Its `document_container` is implemented in
+`userspace/engine/wolf_container.cpp`: text, fills, borders, list markers and
+clipping go straight into the 900x640 RGBA surface using the existing 5x7
+font. This is a real block/inline layout engine, so margins, colours, font
+sizes, lists and links look like a page rather than a flat text dump.
+
+For a page with a MediaWiki content container, a `<main>` or an `<article>`,
+Wolfser extracts that region and renders a compact reader view: scripts,
+styles, tables, hidden elements and `div`/`span` wrappers are dropped, while
+`p`, headings, lists, bold/italic and `href` links survive. A small built-in
+stylesheet supplies readable typography. Other pages render as-is with their
+inline `<style>` and small external stylesheets (up to 64 KiB). litehtml does
+the hit-testing too, so hovering and clicking links works through the engine.
+
+The reader slice is capped at 48 KiB and the engine heap at 20 MiB; both are
+deliberate current limits, not architectural ones. Six tabs keep their own URL,
+history, scroll position and rendered page, so switching is instant and does
+not refetch. There is no guest compositor: the surface lives in an ivshmem BAR,
+and a Qt program on the host maps the same file.
 
 | Region | Contents |
 | --- | --- |
@@ -630,14 +652,16 @@ If Wolfser exits with status 21, the VM has no ivshmem device: relaunch QEMU
 with the arguments above (or use `./build_and_qemu.sh`). Starting `wolfser`
 twice reuses the running instance (one window per VM).
 
-The renderer deliberately has no CSS layout; three inline images, six tabs and
-one text field per form are the current limits. It draws bold text, headings and
-ordered/unordered lists, but it is still a text/reader browser: there is no DOM,
-JavaScript, CSS engine, audio or video pipeline, so **YouTube cannot work here**.
-That needs a real engine (WebKit/Gecko-class), which is the Linux ABI + Phosh
-track, not an incremental text-renderer feature. TLS runs in the guest and needs
-no host, but the root store is intentionally small and certificate time is a
-fixed build date until the RTC lands; the viewer proxy remains the fallback.
+litehtml gives a genuine CSS layout, but it is not a full browser: there is no
+JavaScript, no DOM API, no audio or video pipeline, and images are not decoded
+in the engine path yet. Reader pages are limited to 48 KiB of sanitized HTML and
+external CSS to 64 KiB; modern 200 KiB stylesheets (Wikipedia Vector) are
+skipped in favour of the reader view. Six tabs and one text field per form are
+the current UI limits. **YouTube still cannot work here**; it needs a
+WebKit/Gecko-class engine with a media stack, which is the Linux ABI + Phosh
+track, not another reader-mode increment. TLS runs in the guest and needs no
+host, but the root store is intentionally small and certificate time is a fixed
+build date until the RTC lands; the viewer proxy remains the fallback.
 HTTP keep-alive and a full form/widget model are still ahead.
 DHCP or DNS. The driver assigns its 64 KiB BAR window at `0x1020_0000`; this
 assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.

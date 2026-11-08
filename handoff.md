@@ -41,21 +41,30 @@ Redmi port is parked. The reference checklist is
   browser uses guest TLS first. The viewer's Qt proxy remains the fallback for
   sites outside the root store or TLS 1.2-only servers. Certificate time is a
   fixed 2026-11-08 until an RTC exists; the RNG is a seeded xorshift, not a
-  hardware entropy source. The user stack grew from 8 to 64 KiB because the
-  handshake and RSA state machine overflowed the old one, and the client body
-  window grew to 1 MiB so the article content of real pages is not truncated.
+  hardware entropy source. The user stack grew from 8 KiB to 256 KiB because
+  the handshake, the TLS state machine and litehtml's layout recursion need
+  the headroom, and the client body window grew to 1 MiB so real pages are
+  not truncated.
 - **Wolfser:** `wolfser` opens with an empty search bar (or `wolfser <query|url>`
   navigates immediately). Input resolves to an `https://` URL (bare hosts) or a
   DuckDuckGo HTML search. `http://` and `https://` both go through
   `net_server`/smoltcp; the Qt viewer proxy is only the fallback and the image
   decoder. Redirects
   (3xx and meta refresh) are resolved by the guest and may switch backends.
-  The renderer extracts links with their screen runs (blue/underlined, click
-  to navigate), keeps a per-tab 12-entry back/forward history, word-wraps,
-  scales headings and uses `<main>`/`<article>`/MediaWiki content containers as
-  a reader mode. Six tabs keep URL, title, scroll, history and a full cache of
-  the extracted page (text, styles, links); switching is instant and does not
-  refetch. `Ctrl+T`/`Ctrl+W`/`Ctrl+Tab`, the tab strip, `+` and the close `x`
+  The primary renderer is **litehtml** (New BSD, bundled gumbo HTML5 parser),
+  built for `aarch64-none-elf` with the xPack newlib/libstdc++ toolchain and
+  linked only into `wolfser`. `userspace/engine/wolf_container.cpp` implements
+  the `document_container` over the RGBA surface and the 5x7 font, so litehtml
+  supplies real block/inline layout, margins, colours, lists, borders and
+  hit-testing. For pages with `<div id="mw-content-text">`, `<main>` or
+  `<article>`, Wolfser extracts that region, drops scripts/styles/tables,
+  hidden elements and `div`/`span` wrappers, keeps structural tags plus
+  `href`, and renders a compact reader view with a built-in stylesheet. Other
+  pages render as-is with inline CSS and external stylesheets up to 64 KiB.
+  The reader slice is capped at 48 KiB. Six tabs keep URL, title, scroll,
+  history and a full cache of the extracted page (text, styles, links);
+  switching is instant and does not refetch. The old text/inline-image
+  renderer remains as a fallback when litehtml cannot start. `Ctrl+T`/`Ctrl+W`/`Ctrl+Tab`, the tab strip, `+` and the close `x`
   manage them. Hovering a link publishes its target in the footer and sets
   `FIELD_CURSOR` so the viewer shows a hand; middle click/Ctrl+click opens the
   target in a new tab. The input ring now advances its consumer index before
@@ -63,13 +72,11 @@ Redmi port is parked. The reference checklist is
   drops Qt auto-repeat and identical events within 20 ms, and the host copies
   each completed frame into a QImage before painting. Loading keeps the old
   document or start page visible with a footer spinner, so searches do not
-  flash a white screen. Up to three page images are decoded by the viewer with
-  Qt (PNG/JPEG/WebP) into 240x180 RGBA slots: one comes from the infobox table
-  and later article figures are placed before their text line, scroll with the
-  text and are re-fetched when the tab is restored. The guest blends alpha and
-  includes image heights in layout, scrolling and link hit-testing. The first
-  line of every page used to lose its spaces because the wrap buffer had not
-  flushed yet; a `line_len` check fixed it. Bookmarks are
+  flash a white screen. The fallback text renderer still decodes up to three
+  images through the viewer into 240x180 RGBA slots; the litehtml path
+  currently drops `<img>` and will get in-guest decoding (stb_image) next.
+  The first line of every page used to lose its spaces because the wrap buffer
+  had not flushed yet; a `line_len` check fixed it. Bookmarks are
   persisted in `/sfs/wolfser.bookmarks` using a path-scoped write window
   (no global CAP_FS_WRITE). Six tabs fit the strip, and `Ctrl++`/`Ctrl+-`/
   `Ctrl+0` resize/zoom the host window (input coordinates are scaled back).
@@ -93,6 +100,13 @@ Redmi port is parked. The reference checklist is
   the results, typed `http://github.com/` redirecting to HTTPS, scrolling and
   reload. `SYS_MAP_PHYS_NC` maps the surface as Normal Non-Cacheable and the
   guest fences before publishing `frame_seq`.
+- **Browser-sized user layout:** the linked wolfser image is ~6 MiB, so
+  `elf::USER_IMAGE_SIZE` is 8 MiB and `mmu::create_task_space` maps the image
+  across multiple L3 tables (extra tables are registered with the space root
+  and freed by the existing teardown). The sparse heap starts at
+  `USER_IMAGE_VA + 8 MiB`, anonymous mmap at `+10 MiB`, and the user stack is
+  64 pages (256 KiB). The per-task mmap quota is 24 MiB; litehtml's newlib heap
+  is one 20 MiB mapping, separate from the Rust `SYS_BRK` arena.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -119,13 +133,13 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** native TLS/`https://` (rustls/embedded-tls) for `wget` and a
-  TLS hardening (roots, RTC, RNG, TLS 1.2); Wolfser full forms/widgets,
-  keep-alive and damage rectangles; **YouTube/JS/media are explicitly out of
-  scope for the text renderer and require the WebKit/Gecko-class engine on the
-  Linux ABI + Phosh track**; Linux ABI for static musl binaries; headless
-  Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB proof, GENI
-  UART on `rain`, tablet, Redmi storage/power.
+- **Next steps:** litehtml images (`stb_image` + a guest image fetch), larger
+  reader/CSS budgets, full-page layout and keep-alive; TLS hardening (roots,
+  RTC, RNG, TLS 1.2); **YouTube/JS/media still require a WebKit/Gecko-class
+  engine, i.e. the Linux ABI + Phosh track**, not another reader increment;
+  Linux ABI for static musl binaries; headless Wayland/GTK/D-Bus → Phosh.
+  Parked: QEMU PSCI shutdown, fog TLB proof, GENI UART on `rain`, tablet,
+  Redmi storage/power.
 
 ## 2026-11-06 — SFS moves toward the kernel
 

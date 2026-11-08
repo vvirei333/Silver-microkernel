@@ -178,9 +178,10 @@ const PRIVATE_WINDOW_L0_INDEX: usize = (PRIVATE_WINDOW_VA >> 39) & 0x1FF;
 /// Physical base of the user address space (the 2 MB user ELF image loads here).
 /// In QEMU this is the DRAM base (0x4000_0000); on the tablet it is 0x8000_0000.
 pub const USER_IMAGE_VA: usize = DRAM_BASE;
-/// A sparse, per-task heap window immediately after the 2 MB ELF image.
-/// Its L3 table is installed at spawn, while data pages are mapped by `brk`.
-pub const USER_HEAP_VA: usize = USER_IMAGE_VA + 0x20_0000;
+/// A sparse, per-task heap window after the ELF image. The engine-linked
+/// browser image is larger than 2 MiB now, so the window starts at 8 MiB;
+/// its L3 table is installed at spawn, while data pages are mapped by `brk`.
+pub const USER_HEAP_VA: usize = USER_IMAGE_VA + 0x80_0000;
 pub const USER_HEAP_MAX_PAGES: usize = 512;
 pub const USER_HEAP_MAX_SIZE: usize = USER_HEAP_MAX_PAGES * GRANULE;
 const USER_HEAP_L2_INDEX: usize = (USER_HEAP_VA - DRAM_BASE) / BLOCK_2M;
@@ -189,13 +190,13 @@ const USER_HEAP_L2_INDEX: usize = (USER_HEAP_VA - DRAM_BASE) / BLOCK_2M;
 /// stack itself starts one page above it, so a downward overflow faults
 /// instead of silently landing in the mmap window below.
 ///
-/// Eight pages (32 KiB) leave room for the guest TLS handshake (RSA
-/// verification and the embedded-tls state machine) in `net_server`; the old
-/// two-page stack faulted on the guard page during the first HTTPS request.
+/// Sixty-four pages (256 KiB) leave room for the guest TLS handshake and the
+/// litehtml layout recursion. The old two-page stack faulted on the guard page
+/// during the first HTTPS request; the browser engine needs even more.
 pub const USER_STACK_GUARD_VA: usize = USER_IMAGE_VA + 0x3FE0_0000;
 /// Every task's own stack appears at this user VA, backed by different PAs.
 pub const USER_STACK_VA: usize = USER_STACK_GUARD_VA + GRANULE;
-pub const USER_STACK_PAGES: usize = 16;
+pub const USER_STACK_PAGES: usize = 64;
 pub const USER_STACK_SIZE: usize = USER_STACK_PAGES * GRANULE;
 const USER_STACK_L2_INDEX: usize = (USER_STACK_VA - DRAM_BASE) / BLOCK_2M;
 /// L3 slot of the first mapped stack page. Slot 0 is the guard page; the
@@ -227,7 +228,7 @@ const PCI_ECAM_L2_BLOCKS: usize = PCI_ECAM_SIZE / BLOCK_2M;
 /// Anonymous `mmap` region: a large window between the sparse heap and the user
 /// stack where `SYS_MMAP` places kernel-chosen mappings. It spans the free
 /// `l2_user` slots, so page tables are only allocated once a mapping is placed.
-pub const USER_MMAP_VA: usize = USER_IMAGE_VA + 0x40_0000;
+pub const USER_MMAP_VA: usize = USER_IMAGE_VA + 0xA0_0000;
 /// Anonymous mappings stop below the stack guard page, so they can never
 /// fill the hole that makes a stack overflow fault.
 pub const USER_MMAP_MAX_VA: usize = USER_STACK_GUARD_VA;
@@ -778,6 +779,9 @@ fn clean_table_lines(table_start: usize, table_bytes: usize) {
 /// stack L3s, and the private L1/L2/L3 trio. Charged to the task's memory
 /// ledger as one flat cost; `mmap` adds its own L3 estimate separately.
 pub const SPACE_TABLE_FRAMES: usize = 9;
+/// One L3 table covers 2 MiB. The ELF loader's window is 8 MiB, so an image
+/// may need up to four image L3 tables (the first one is preallocated).
+const IMAGE_L3_TABLES: usize = crate::elf::USER_IMAGE_SIZE / BLOCK_2M;
 
 /// Builds a user TTBR0. `user_stack_start == 0` creates no stack mapping
 /// (used for the EL1 idle task). A loaded ELF supplies independently owned
@@ -792,7 +796,9 @@ pub fn create_task_space(
     user_stack_start: usize,
     image: Option<&crate::elf::LoadedImage>,
 ) -> Option<(usize, TableToken)> {
-    if image.is_some_and(|image| image.page_count == 0 || image.page_count > ENTRIES) {
+    if image.is_some_and(|image| {
+        image.page_count == 0 || image.page_count > ENTRIES * IMAGE_L3_TABLES
+    }) {
         return None;
     }
     let Some(asid) = alloc_asid() else {
@@ -831,11 +837,48 @@ pub fn create_task_space(
         };
         tokens[index] = token;
     }
+
+    // The image is larger than one 2 MiB L3 table. Allocate the remaining
+    // tables up front and register them with the same root owner, so the
+    // existing `retire_space` teardown walk frees them with the fixed nine.
+    let image_groups = image.map_or(0, |image| image.page_count.div_ceil(ENTRIES));
+    let extra_count = image_groups.saturating_sub(1);
+    let mut extra_frames = [0usize; IMAGE_L3_TABLES];
+    let mut extra_tokens = [TableToken::empty(); IMAGE_L3_TABLES];
+    for index in 0..extra_count {
+        let Some((page, generation)) = frame_allocator::alloc_page_tagged() else {
+            for prior in &extra_tokens[..index] {
+                let _ = free_table_frame(*prior);
+            }
+            for token in &tokens {
+                let _ = free_table_frame(*token);
+            }
+            release_asid(asid);
+            return None;
+        };
+        let Some(token) = page_table_register(page, generation, pages[0]) else {
+            frame_allocator::free_page_tagged(page, generation);
+            for prior in &extra_tokens[..index] {
+                let _ = free_table_frame(*prior);
+            }
+            for token in &tokens {
+                let _ = free_table_frame(*token);
+            }
+            release_asid(asid);
+            return None;
+        };
+        extra_frames[index] = page;
+        extra_tokens[index] = token;
+    }
+
     let [l0, l1_user, l2_user, l3_image, l3_heap, l3_stack, l1_priv, l2_priv, l3_priv] = pages;
 
     unsafe {
         for &page in &pages {
             zero_page(page);
+        }
+        for index in 0..extra_count {
+            zero_page(extra_frames[index]);
         }
 
         write_entry(l0, 0, l1_user as u64 | DESC_TABLE);
@@ -845,14 +888,25 @@ pub fn create_task_space(
         write_entry(l2_user, USER_HEAP_L2_INDEX, l3_heap as u64 | DESC_TABLE);
 
         if let Some(image) = image {
-            for index in 0..image.page_count {
-                let physical = image.physical_start + index * GRANULE;
-                let descriptor = match image.kinds[index] {
-                    crate::elf::PageKind::Text => user_text_page(physical),
-                    crate::elf::PageKind::ReadOnly => user_rodata_page(physical),
-                    crate::elf::PageKind::Data => user_data_page(physical),
+            for group in 0..image_groups {
+                let table = if group == 0 {
+                    l3_image
+                } else {
+                    let page = extra_frames[group - 1];
+                    write_entry(l2_user, group, page as u64 | DESC_TABLE);
+                    page
                 };
-                write_entry(l3_image, index, descriptor);
+                let start = group * ENTRIES;
+                let end = core::cmp::min(start + ENTRIES, image.page_count);
+                for index in start..end {
+                    let physical = image.physical_start + index * GRANULE;
+                    let descriptor = match image.kinds[index] {
+                        crate::elf::PageKind::Text => user_text_page(physical),
+                        crate::elf::PageKind::ReadOnly => user_rodata_page(physical),
+                        crate::elf::PageKind::Data => user_data_page(physical),
+                    };
+                    write_entry(table, index - start, descriptor);
+                }
             }
         }
 
@@ -887,6 +941,9 @@ pub fn create_task_space(
 
     for page in pages {
         flush_after_table_change(page, GRANULE);
+    }
+    for index in 0..extra_count {
+        flush_after_table_change(extra_frames[index], GRANULE);
     }
     // The space starts life with a unique ASID, so a later context switch can
     // install TTBR0 without flushing every CPU's TLB.

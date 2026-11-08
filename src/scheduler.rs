@@ -1843,7 +1843,7 @@ const MAX_MMAP_REGIONS: usize = 128;
 /// machine and starve the scheduler, IPC and the kernel heap. 16 MiB covers the
 /// demo/`memtest` workloads with room to spare while keeping the global frame
 /// allocator as the last line of defence rather than the first.
-const MAX_MMAP_BYTES_PER_TASK: usize = 16 * 1024 * 1024;
+const MAX_MMAP_BYTES_PER_TASK: usize = 24 * 1024 * 1024;
 
 pub fn exit_current() -> ! {
     exit_current_with_status(0)
