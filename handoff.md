@@ -26,6 +26,14 @@ Redmi port is parked. The reference checklist is
   `no_std,tablet` (parked), `no_std,smp-selftest`, `no_std,demo-tasks`.
 - **Console OS (QEMU serial):** boots to `howl ready` with no graphics tasks;
   `help`, `uname`, `ls /`, `health` all answer. `health` reports no DMA leaks.
+- **Network:** `net_server` runs DHCP (with the static fallback), DNS, TCP and
+  HTTP. `ip` prints the lease, `ping 10.0.2.2` is OK, `dns example.com`
+  resolves, `wget http://example.com/ /tmp/e.html` stores a 577-byte page, and
+  `https://` fails fast with a clear message. A client data window carries
+  URLs/names in and HTTP bodies out (the 32-byte mailbox is only doorbells).
+- **smoltcp patch:** `third_party/smoltcp` vendors 0.14.0 with two guarded
+  returns in the neighbour path; without them DHCP boots intermittently hit
+  the cache's unicast assertion. See `third_party/smoltcp/PATCH.md`.
 - **SMP:** `-smp 4` selftest 15 PASS / 0 FAIL.
 - **Fog QEMU:** relocation, at-link, fail-closed park and timer cases PASS.
 - **Init fix:** Silverd resolves the child **task id** before every grant
@@ -38,8 +46,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** DHCP/DNS/TCP + `wget`; host window (ivshmem + Qt viewer);
-  guest browser (HTTP + HTML subset); Linux ABI for static musl binaries;
+- **Next steps:** TLS/`https://` (rustls); host window (shared surface +
+  viewer); guest browser (HTTP + HTML subset); Linux ABI for static musl binaries;
   headless Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB
   proof, GENI UART on `rain`, tablet, Redmi storage/power.
 

@@ -205,6 +205,10 @@ fn execute(command: &str) {
             syscall::print("  sfsinfo    Show the mounted SFS superblock\r\n");
             syscall::print("  memtest    mmap 1 MiB, write/read it back\r\n");
             syscall::print("  ping <ip>  Send one ICMP echo request\r\n");
+            syscall::print("  ip         Show the IPv4 configuration (DHCP or static)\r\n");
+            syscall::print("  dns <name> Resolve a host name through the network server\r\n");
+            syscall::print("  wget <url> [file]\r\n");
+            syscall::print("             Fetch http:// into a file (/tmp/index.html)\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  run <path>  Load and run an ELF file from the filesystem\r\n");
@@ -246,6 +250,9 @@ fn execute(command: &str) {
         Some("sfsinfo") => sfs_info(),
         Some("memtest") => memtest(),
         Some("ping") => ping_command(words.next()),
+        Some("ip") | Some("ifconfig") => ip_command(),
+        Some("dns") => dns_command(words.next()),
+        Some("wget") => wget_command(words.next(), words.next()),
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("bigdir") => run_utility(syscall::PROGRAM_BIGDIR, words.next().unwrap_or("")),
         Some("bigfile") => run_utility(syscall::PROGRAM_BIGFILE, ""),
@@ -449,6 +456,262 @@ fn print_dotted(address: [u8; 4]) {
         }
         syscall::print_dec_u64(u64::from(*octet));
     }
+}
+
+// ---------------------------------------------------------------------------
+// Network client helpers
+//
+// The network server owns smoltcp. Everything larger than a 32-byte IPC
+// payload travels through the server's DMA window, which the shell maps once
+// per operation with `map_phys`.
+
+/// DNS and configuration replies are local and quick; HTTP gets a real
+/// transfer budget.
+const NET_LOOKUP_TICKS: u64 = 10 * TICKS_PER_SECOND;
+const NET_HTTP_TICKS: u64 = 40 * TICKS_PER_SECOND;
+
+/// Waits for one reply opcode from `server`, discarding unrelated traffic.
+fn net_wait_reply(server: u64, opcode: u8, timeout_ticks: u64) -> Option<ipc::Message> {
+    let deadline = syscall::uptime_ticks().saturating_add(timeout_ticks);
+    let mut response = ipc::Message::new(0, &[]);
+    loop {
+        if !syscall::task_alive(server) {
+            return None;
+        }
+        match syscall::receive_timeout(&mut response, RESPONSE_POLL_TICKS) {
+            Ok(()) if response.sender == server && response.payload[0] == opcode => {
+                return Some(response)
+            }
+            Ok(()) => {}
+            Err(_) if syscall::uptime_ticks() >= deadline => return None,
+            Err(_) => {}
+        }
+    }
+}
+
+/// Cached mapping of the server's data window. The shell is single threaded,
+/// and re-mapping 128 KiB per command would slowly exhaust the per-task MMIO
+/// capability table.
+static mut NET_WINDOW: Option<(u64, u64, u64)> = None;
+
+/// Maps the server's shared data window into this task (and caches it).
+fn net_window(server: u64) -> Option<u64> {
+    if !syscall::send(server, &net_ipc::share_request()) {
+        syscall::print("net: share send failed\r\n");
+        return None;
+    }
+    let Some(reply) = net_wait_reply(server, net_ipc::OP_SHARE_REPLY, RESPONSE_TIMEOUT_TICKS)
+    else {
+        syscall::print("net: no share reply\r\n");
+        return None;
+    };
+    let Some((paddr, size)) = net_ipc::share_fields(&reply) else {
+        syscall::print("net: bad share fields\r\n");
+        return None;
+    };
+    let cached = unsafe { *core::ptr::addr_of!(NET_WINDOW) };
+    if let Some((cached_paddr, cached_size, vaddr)) = cached {
+        if cached_paddr == paddr && cached_size == size {
+            return Some(vaddr);
+        }
+    }
+    let Some(vaddr) = syscall::map_phys(paddr, size) else {
+        syscall::print("net: map failed\r\n");
+        return None;
+    };
+    unsafe {
+        *core::ptr::addr_of_mut!(NET_WINDOW) = Some((paddr, size, vaddr));
+    }
+    Some(vaddr)
+}
+
+/// Writes a length-prefixed request string into the shared window.
+fn write_window_request(base: u64, text: &str) -> bool {
+    if text.is_empty() || text.len() > net_ipc::CLIENT_REQUEST_MAX {
+        return false;
+    }
+    unsafe {
+        core::ptr::write_volatile(base as *mut u16, text.len() as u16);
+        core::ptr::copy_nonoverlapping(
+            text.as_ptr(),
+            (base + net_ipc::CLIENT_REQUEST + 2) as *mut u8,
+            text.len(),
+        );
+    }
+    net_ipc::fence();
+    true
+}
+
+fn net_error_text(code: u8) -> &'static str {
+    match code {
+        net_ipc::NET_ERR_DNS => "name resolution failed",
+        net_ipc::NET_ERR_CONNECT => "connection failed",
+        net_ipc::NET_ERR_TIMEOUT => "timed out",
+        net_ipc::NET_ERR_URL => "invalid URL",
+        net_ipc::NET_ERR_TLS => "https is not supported yet (http:// only)",
+        net_ipc::NET_ERR_RESPONSE => "malformed HTTP response (or no A record)",
+        net_ipc::NET_ERR_BUSY => "network server busy",
+        _ => "network error",
+    }
+}
+
+/// `ip` / `ifconfig`: show the address the network server is using.
+fn ip_command() {
+    let Some(server) = find_task_id(syscall::PROGRAM_NET_SERVER) else {
+        syscall::print("NET SERVER NOT RUNNING\r\n");
+        return;
+    };
+    if !syscall::send(server, &net_ipc::ipconfig_request()) {
+        syscall::print("NET SERVER NOT RESPONDING\r\n");
+        return;
+    }
+    let Some(reply) = net_wait_reply(server, net_ipc::OP_IPCONFIG_REPLY, RESPONSE_TIMEOUT_TICKS)
+    else {
+        syscall::print("NET SERVER NOT RESPONDING\r\n");
+        return;
+    };
+    let Some((configured, address, prefix, gateway, dns)) =
+        net_ipc::ipconfig_fields(&reply)
+    else {
+        return;
+    };
+    syscall::print(if configured {
+        "eth0: DHCP lease\r\n"
+    } else {
+        "eth0: static fallback\r\n"
+    });
+    syscall::print("  inet ");
+    print_dotted(address);
+    syscall::print("/");
+    syscall::print_dec_u64(u64::from(prefix));
+    syscall::print("\r\n  gateway ");
+    print_dotted(gateway);
+    syscall::print("\r\n  dns     ");
+    print_dotted(dns);
+    syscall::print("\r\n");
+}
+
+/// `dns <name>`: resolve one name through the server's DNS socket.
+fn dns_command(name: Option<&str>) {
+    let Some(name) = name else {
+        syscall::print("usage: dns <name>\r\n");
+        return;
+    };
+    let Some(server) = find_task_id(syscall::PROGRAM_NET_SERVER) else {
+        syscall::print("NET SERVER NOT RUNNING\r\n");
+        return;
+    };
+    let Some(base) = net_window(server) else {
+        syscall::print("dns: cannot map the network window\r\n");
+        return;
+    };
+    if !write_window_request(base, name) {
+        syscall::print("dns: name is too long\r\n");
+        return;
+    }
+    if !syscall::send(server, &net_ipc::dns_request()) {
+        syscall::print("NET SERVER NOT RESPONDING\r\n");
+        return;
+    }
+    let Some(reply) = net_wait_reply(server, net_ipc::OP_DNS_REPLY, NET_LOOKUP_TICKS) else {
+        syscall::print("dns: no reply from the network server\r\n");
+        return;
+    };
+    let Some((code, address)) = net_ipc::dns_fields(&reply) else {
+        return;
+    };
+    if code == net_ipc::NET_OK {
+        syscall::print(name);
+        syscall::print(" -> ");
+        print_dotted(address);
+        syscall::print("\r\n");
+    } else {
+        syscall::print("dns: ");
+        syscall::print(net_error_text(code));
+        syscall::print("\r\n");
+    }
+}
+
+/// `wget <url> [file]`: fetch an `http://` document into SFS.
+fn wget_command(url: Option<&str>, destination: Option<&str>) {
+    let Some(url) = url else {
+        syscall::print("usage: wget <http://host/path> [file]\r\n");
+        return;
+    };
+    let destination = destination.unwrap_or("/tmp/index.html");
+    if destination.len() > SFS_PATH_MAX {
+        syscall::print("wget: destination path is too long\r\n");
+        return;
+    }
+    let Some(server) = find_task_id(syscall::PROGRAM_NET_SERVER) else {
+        syscall::print("NET SERVER NOT RUNNING\r\n");
+        return;
+    };
+    let Some(base) = net_window(server) else {
+        syscall::print("wget: cannot map the network window\r\n");
+        return;
+    };
+    if !write_window_request(base, url) {
+        syscall::print("wget: URL is too long\r\n");
+        return;
+    }
+    syscall::print("wget: fetching ");
+    syscall::print(url);
+    syscall::print("\r\n");
+    if !syscall::send(server, &net_ipc::http_request()) {
+        syscall::print("NET SERVER NOT RESPONDING\r\n");
+        return;
+    }
+    let Some(reply) = net_wait_reply(server, net_ipc::OP_HTTP_REPLY, NET_HTTP_TICKS) else {
+        syscall::print("wget: no reply from the network server\r\n");
+        return;
+    };
+    let Some((code, status, body_len)) = net_ipc::http_fields(&reply) else {
+        return;
+    };
+    if code != net_ipc::NET_OK {
+        syscall::print("wget: ");
+        syscall::print(net_error_text(code));
+        if status != 0 {
+            syscall::print(" (stage ");
+            syscall::print_dec_u64(u64::from(status));
+            syscall::print(")");
+        }
+        syscall::print("\r\n");
+        return;
+    }
+    let _ = syscall::fs_create(destination);
+    let Some(fd) = syscall::fs_open(destination, syscall::OPEN_WRITE) else {
+        syscall::print("wget: cannot open the destination\r\n");
+        return;
+    };
+    // FS write is capped at 4 KiB per syscall, so stream the body in chunks.
+    let body = unsafe {
+        core::slice::from_raw_parts(
+            (base + net_ipc::CLIENT_BODY) as *const u8,
+            body_len as usize,
+        )
+    };
+    let mut written = 0usize;
+    while written < body.len() {
+        let end = (written + 4096).min(body.len());
+        match syscall::fs_write(fd, &body[written..end]) {
+            Some(count) if count > 0 => written += count,
+            _ => {
+                let _ = syscall::fs_close(fd);
+                syscall::print("wget: write failed\r\n");
+                return;
+            }
+        }
+    }
+    let _ = syscall::fs_close(fd);
+    syscall::print("wget: HTTP ");
+    syscall::print_dec_u64(u64::from(status));
+    syscall::print(", ");
+    syscall::print_dec_u64(u64::from(body_len));
+    syscall::print(" bytes -> ");
+    syscall::print(destination);
+    syscall::print("\r\n");
 }
 
 /// Reads the SFS superblock through the filesystem server.

@@ -52,8 +52,9 @@
 
 ### L2. Драйверы
 
-- `net_driver` + `net_server` — virtio-net + smoltcp (ARP/IPv4/ICMP; TCP,
-  DHCP и DNS — следующие шаги);
+- `net_driver` + `net_server` — virtio-net + smoltcp: DHCP, ARP/IPv4, ICMP,
+  DNS и TCP; клиентские запросы идут через общий DMA-window, поверх него
+  работают `ping`, `dns`, `wget` и `ip`;
 - storage — ядро владеет virtio-blk на QEMU; для телефона нужен eMMC/UFS
   драйвер с тем же блочным контрактом;
 - `gpu`, `input`, `audio`, `camera` — **удалены/не входят в продукт**.
@@ -113,8 +114,8 @@
 SFS в ядре, capability-модель, подпись бандлов, сеть ARP/IPv4/ICMP, SMP,
 PSCI power-off/reset, консольные утилиты, `health`/`du`/`fsck`.
 
-Нет: UART-консоль на телефоне, eMMC/UFS, DHCP/DNS/TCP-сокеты, полный
-Unix-toolbox, окно и браузер.
+Нет: UART-консоль на телефоне, eMMC/UFS, TLS/HTTPS, полный Unix-toolbox,
+окно и браузер.
 
 ## 7. Linux ABI (активная цель)
 
@@ -128,8 +129,8 @@ Phosh запускается через **headless Wayland + software-ренде
 
 ## 8. Следующие шаги
 
-1. Сеть: DHCP, DNS, TCP, `wget`.
-2. Host-окно: ivshmem + Qt-viewer, damage/input.
+1. Сеть: TLS-клиент и `https://`.
+2. Host-окно: общий surface + viewer, damage/input.
 3. Браузер: HTTP + HTML-подмножество в общем surface.
 4. Linux ABI: статические musl, затем busybox `sh`.
 5. Phosh: headless Wayland → GTK → D-Bus → `phosh`.

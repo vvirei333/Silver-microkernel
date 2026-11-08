@@ -96,8 +96,11 @@ userspace.
 - [x] PCI ECAM access plus a Virtio-PCI block driver: modern capabilities, split virtqueue and `read_sector`
 - [x] VirtIO-Net driver: modern virtio-pci capabilities, split RX/TX virtqueues, 16 x 2 KiB buffers and MAC discovery
 - [x] Shared-memory frame transport: one 8 KiB DMA mailbox, `OP_ATTACH`/`OP_ATTACHED`, `OP_FRAME`/`OP_TX` doorbells, length-word fencing and backpressure
-- [x] `net_server`: `smoltcp` in a separate EL0 task with static 10.0.2.15/24 addressing, ARP and IPv4
+- [x] `net_server`: `smoltcp` in a separate EL0 task with DHCP, ARP, IPv4, DNS and TCP; a static 10.0.2.15/24 fallback keeps a NIC-less or DHCP-less boot usable
 - [x] ICMP ping end-to-end: `ping <ip>` shell command with strict IPv4 parsing and timeout, verified against 8.8.8.8
+- [x] DNS: `dns <name>` resolves through the DHCP-provided resolver
+- [x] HTTP: `wget <url> [file]` fetches an `http://` document through a real TCP connection into SFS; `ip` shows the lease
+- [x] Vendored `smoltcp` 0.14 with a two-line neighbour fix for broadcast DHCP traffic (`third_party/smoltcp/PATCH.md`)
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
 - [x] EL0 fault triage: `ESR_EL1`/`ELR_EL1`/`FAR_EL1` dump and a 16-entry context-switch trace before the guilty task dies
@@ -495,6 +498,14 @@ doorbells; frame bytes travel through the shared window.
 | `OP_TX` (4) | server -> driver | a frame to transmit is in the TX slot |
 | `OP_PING` (5) | shell -> server | request one ICMP echo; `payload[1..5]` is the IPv4 address |
 | `OP_PING_REPLY` (6) | server -> shell | `payload[1]` is success, `payload[2..6]` echoes the address |
+| `OP_SHARE` (7) | client -> server | ask for the client data window |
+| `OP_SHARE_REPLY` (8) | server -> client | `payload[1..9]` physical address, `payload[9..13]` size |
+| `OP_DNS` (9) | client -> server | resolve the length-prefixed name in the window |
+| `OP_DNS_REPLY` (10) | server -> client | `payload[1]` result code, `payload[2..6]` IPv4 |
+| `OP_HTTP` (11) | client -> server | `GET` the URL in the window request slot |
+| `OP_HTTP_REPLY` (12) | server -> client | result code, HTTP status, body length |
+| `OP_IPCONFIG` (13) | client -> server | current IPv4 configuration |
+| `OP_IPCONFIG_REPLY` (14) | server -> client | configured flag, address, prefix, gateway, DNS |
 
 The driver maps the window with `SYS_MAP_PHYS` (Normal Non-Cacheable), polls
 virtio RX on every IPC loop (10 ms idle timeout), and moves at most one frame in
@@ -504,20 +515,25 @@ then clears it. The server publishes TX only when the slot is free, so a slow
 driver cannot cause the server to overwrite a frame in flight. TX doorbells are
 accepted only from the server task that owns the window.
 
-`net_server` uses the MAC from `OP_ATTACHED` and configures `10.0.2.15/24` with
-default gateway `10.0.2.2`. It no longer pings at boot; instead it waits for an
-`OP_PING` from the shell, queues one ICMPv4 echo request, and answers
-`OP_PING_REPLY` with the outcome. smoltcp resolves the gateway (or any routed
-neighbor) with ARP and keeps the echo queued until that neighbor is usable.
-QEMU user-mode networking answers ARP and the echo, so `ping 8.8.8.8` exercises
-TX, RX, ARP, IPv4 and ICMP checksum verification in one path. Because
-`net_server` does not own the console, it relays the result to `howl`, which
-prints the human-readable `PING <ip>: OK` (or `TIMEOUT`).
+`net_server` uses the MAC from `OP_ATTACHED` and starts with the static
+`10.0.2.15/24`, gateway `10.0.2.2`, DNS `10.0.2.3` configuration. A DHCP client
+then runs in the same loop: a successful lease replaces the address, prefix,
+gateway and DNS server, and `ip` reports `eth0: DHCP lease` (without a lease it
+still reports `static fallback`). The server polls one ICMP echo at a time,
+answers `OP_PING_REPLY`, and relays the result to `howl`.
+
+DNS and HTTP requests travel through a second DMA window owned by the server.
+The client maps it with `SYS_MAP_PHYS` and writes a length-prefixed request
+(URL or host name); the server answers with a small status message and writes
+the HTTP body at offset `0x4000`, so a 32-byte IPC payload never has to carry a
+URL or a page. `wget` copies the body into SFS in 4 KiB chunks (the
+`SYS_FS_WRITE` limit) and reports the HTTP status and byte count.
 
 `build_and_qemu.sh` relies on QEMU's implicit default `virtio-net-pci` on the
-`virt` machine; no explicit network device is needed. The current limitations
-are deliberate: IPv4 only, a static address and gateway, one frame slot per
-direction, no virtio-net interrupts (RX is polled), and no TCP/UDP services,
+`virt` machine; no explicit network device is needed. The deliberate limits
+are: IPv4 only, one frame slot per direction, no virtio-net interrupts (RX is
+polled), one HTTP fetch at a time, `http://` only (no TLS yet), and no
+compressed or chunked-specific browser features beyond the built-in dechunking.
 DHCP or DNS. The driver assigns its 64 KiB BAR window at `0x1020_0000`; this
 assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 

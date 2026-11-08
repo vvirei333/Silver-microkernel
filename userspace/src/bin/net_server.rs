@@ -3,8 +3,18 @@
 //! `net_driver` owns virtio-net and moves raw Ethernet frames in and out of
 //! the NIC. This server owns smoltcp: it announces a DMA mailbox to the
 //! driver, feeds received frames to the interface, and hands generated frames
-//! back. An ICMP echo request to the QEMU slirp gateway exercises the whole
-//! path: ARP resolution, frame TX, frame RX, and checksum verification.
+//! back.
+//!
+//! Services exposed to other user tasks over IPC:
+//!
+//! - `ping` (ICMP echo);
+//! - `dns` (resolve a name, the name travels in the shared data window);
+//! - `http` (GET a `http://` URL and return the body in the shared window);
+//! - `ipconfig` (the current DHCP/static IPv4 configuration).
+//!
+//! The shared data window is a single DMA allocation owned by this task.
+//! Clients map it with `map_phys` and exchange request/response bytes there;
+//! the 32-byte mailbox only carries doorbells and small status replies.
 
 #![no_std]
 #![no_main]
@@ -21,11 +31,12 @@ mod syscall;
 use core::panic::PanicInfo;
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet, SocketStorage};
 use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
-use smoltcp::socket::icmp;
+use smoltcp::socket::{dhcpv4, dns, icmp, tcp};
 use smoltcp::storage::{PacketBuffer, PacketMetadata};
 use smoltcp::time::Instant;
 use smoltcp::wire::{
-    EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr, Ipv4Address,
+    DnsQueryType, EthernetAddress, HardwareAddress, Icmpv4Packet, Icmpv4Repr, IpAddress, IpCidr,
+    IpEndpoint, Ipv4Address,
 };
 
 /// Interface polling period. It is also the clock granularity smoltcp sees.
@@ -33,8 +44,8 @@ const POLL_MILLIS: u64 = 10;
 /// The driver may still be probing the NIC when this task starts, so the attach
 /// request is retried instead of assuming a boot order.
 const ATTACH_RETRY_MILLIS: u64 = 1000;
-/// Storage reserved for the ICMP socket and future TCP/UDP sockets.
-const SOCKET_COUNT: usize = 4;
+/// One socket each for ICMP, DHCP, DNS and TCP, plus slack.
+const SOCKET_COUNT: usize = 5;
 
 /// ICMP echo identifier; the stack only accepts replies carrying this one.
 const PING_IDENT: u16 = 0x5349;
@@ -44,6 +55,22 @@ const ICMP_PAYLOAD_SIZE: usize = 256;
 /// How long a shell-requested echo waits for its reply before the server
 /// reports a timeout to the shell.
 const PING_TIMEOUT_MILLIS: u64 = 2000;
+
+/// TCP receive window. HTTP responses are drained into the shared window every
+/// poll, so this only has to smooth over one scheduling delay.
+const TCP_RX_SIZE: usize = 8192;
+const TCP_TX_SIZE: usize = 2048;
+
+const DNS_QUERY_SLOTS: usize = 2;
+/// Standalone `dns` lookups are bounded so a lost query cannot hang a client.
+const DNS_TIMEOUT_MILLIS: i64 = 8000;
+
+/// Largest host name and request path we accept.
+const HOST_MAX: usize = 96;
+const PATH_MAX: usize = 192;
+const REQUEST_MAX: usize = 512;
+/// A whole fetch (DNS + connect + transfer) is bounded from the request time.
+const HTTP_TIMEOUT_MILLIS: i64 = 20000;
 
 const TASK_LIST_CAPACITY: usize = 32;
 const EMPTY_TASK: syscall::TaskInfo = syscall::TaskInfo {
@@ -62,41 +89,58 @@ const DEFAULT_MAC: [u8; 6] = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
 const GUEST_IP: [u8; 4] = [10, 0, 2, 15];
 const GUEST_PREFIX: u8 = 24;
 const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+/// QEMU slirp's built-in resolver. DHCP normally supplies the same address.
+const DEFAULT_DNS: [u8; 4] = [10, 0, 2, 3];
+const DEFAULT_HTTP_PORT: u16 = 80;
+const DEFAULT_HTTPS_PORT: u16 = 443;
 
 const EXIT_NO_DMA: u64 = 1;
 const EXIT_NO_ICMP: u64 = 2;
 
 /// The frame buffers live in `.bss`, not on the 8 KiB userspace stack.
 static mut DEVICE: FrameDevice = FrameDevice::new();
+static mut TCP_RX_PAYLOAD: [u8; TCP_RX_SIZE] = [0; TCP_RX_SIZE];
+static mut TCP_TX_PAYLOAD: [u8; TCP_TX_SIZE] = [0; TCP_TX_SIZE];
+static mut FETCH: Fetch = Fetch::empty();
 
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(driver_hint: u64) -> ! {
     syscall::print("NET SERVER STARTING\r\n");
 
+    // Driver mailbox.
     let Some((dma_vaddr, dma_paddr)) = syscall::alloc_dma(net_ipc::DMA_SIZE) else {
         fail(EXIT_NO_DMA, "NET SERVER: DMA ALLOCATION FAILED\r\n");
     };
     write_u32(dma_vaddr, net_ipc::RX_LENGTH, 0);
     write_u32(dma_vaddr, net_ipc::TX_LENGTH, 0);
 
+    // Client data window (URLs in, HTTP bodies out).
+    let Some((client_vaddr, client_paddr)) = syscall::alloc_dma(net_ipc::CLIENT_SIZE) else {
+        fail(EXIT_NO_DMA, "NET SERVER: CLIENT WINDOW FAILED\r\n");
+    };
+    write_u16(client_vaddr, net_ipc::CLIENT_REQUEST, 0);
+
     let device = unsafe { &mut *core::ptr::addr_of_mut!(DEVICE) };
+    let fetch = unsafe { &mut *core::ptr::addr_of_mut!(FETCH) };
 
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(DEFAULT_MAC)));
     config.random_seed = syscall::uptime_ticks();
     let mut interface = Interface::new(config, device, Instant::from_millis(0));
-    interface.update_ip_addrs(|addresses| {
-        let _ = addresses.push(IpCidr::new(
-            IpAddress::v4(GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3]),
-            GUEST_PREFIX,
-        ));
-    });
-    let _ = interface.routes_mut().add_default_ipv4_route(Ipv4Address::new(
-        GATEWAY_IP[0],
-        GATEWAY_IP[1],
-        GATEWAY_IP[2],
-        GATEWAY_IP[3],
-    ));
+
+    // Start from the static QEMU/slirp configuration so the stack works even
+    // if DHCP is unavailable; a successful lease replaces it below.
+    let mut local_ip = GUEST_IP;
+    let mut prefix = GUEST_PREFIX;
+    let mut gateway = GATEWAY_IP;
+    let mut dns_server = DEFAULT_DNS;
+    let mut dhcp_lease = false;
+    apply_ipv4(
+        &mut interface,
+        local_ip,
+        prefix,
+        Some(gateway),
+    );
 
     // `ManagedSlice` borrows this storage, so it must outlive the socket set.
     let mut socket_storage: [SocketStorage; SOCKET_COUNT] =
@@ -117,6 +161,27 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
         fail(EXIT_NO_ICMP, "NET SERVER: ICMP BIND FAILED\r\n");
     }
     let icmp_handle = sockets.add(icmp_socket);
+
+    let dhcp_handle = sockets.add(dhcpv4::Socket::new());
+
+    let mut dns_servers = [IpAddress::v4(
+        DEFAULT_DNS[0],
+        DEFAULT_DNS[1],
+        DEFAULT_DNS[2],
+        DEFAULT_DNS[3],
+    ); 4];
+    let mut dns_queries: [Option<dns::DnsQuery>; DNS_QUERY_SLOTS] = [None, None];
+    let mut dns_socket = dns::Socket::new(&dns_servers[..1], &mut dns_queries[..]);
+    let dns_handle = sockets.add(dns_socket);
+
+    let tcp_rx_payload = unsafe { &mut *core::ptr::addr_of_mut!(TCP_RX_PAYLOAD) };
+    let tcp_tx_payload = unsafe { &mut *core::ptr::addr_of_mut!(TCP_TX_PAYLOAD) };
+    let tcp_socket = tcp::Socket::new(
+        tcp::SocketBuffer::new(&mut tcp_rx_payload[..]),
+        tcp::SocketBuffer::new(&mut tcp_tx_payload[..]),
+    );
+    let tcp_handle = sockets.add(tcp_socket);
+
     let capabilities = device.capabilities();
 
     let mut driver = resolve_driver(driver_hint);
@@ -129,6 +194,10 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
     let mut pending_ping: Option<PendingPing> = None;
     /// Result waiting for the shell to accept it, if any.
     let mut ping_reply: Option<([u8; 4], bool)> = None;
+    /// A standalone DNS lookup started by a client.
+    let mut pending_dns: Option<PendingDns> = None;
+    /// Replies the loop still has to hand to their clients.
+    let mut outbox = Outbox::new();
 
     syscall::print("NET SERVER READY\r\n");
 
@@ -151,26 +220,72 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
 
         // Doorbells only say "look at the mailbox". Draining them keeps the
         // driver's mailbox from filling up; the frame itself is read below.
-        // Shell pings ride the same drain: `OP_PING` starts an echo request,
-        // everything else the shell sends is discarded.
+        // Client requests ride the same drain.
         let mut message = ipc::Message::new(0, &[]);
         while syscall::receive_timeout(&mut message, 0).is_ok() {
             if Some(message.sender) == driver {
                 handle_doorbell(&message, &mut interface, &mut attached);
-            } else if message.payload[0] == net_ipc::OP_PING {
-                if ping_reply.is_none() {
-                    let address = net_ipc::ping_address(&message);
-                    ping_reply = start_ping(
-                        address,
-                        attached,
-                        &mut pending_ping,
-                        &mut next_seq,
-                        now_millis,
-                        &mut sockets,
-                        icmp_handle,
-                        &capabilities.checksum,
+                continue;
+            }
+            match message.payload[0] {
+                net_ipc::OP_PING => {
+                    if ping_reply.is_none() {
+                        let address = net_ipc::ping_address(&message);
+                        ping_reply = start_ping(
+                            address,
+                            attached,
+                            &mut pending_ping,
+                            &mut next_seq,
+                            now_millis,
+                            &mut sockets,
+                            icmp_handle,
+                            &capabilities.checksum,
+                        );
+                    }
+                }
+                net_ipc::OP_SHARE => {
+                    outbox.push(
+                        message.sender,
+                        net_ipc::share_reply(client_paddr, net_ipc::CLIENT_SIZE),
                     );
                 }
+                net_ipc::OP_DNS => {
+                    start_dns(
+                        &mut message,
+                        client_vaddr,
+                        &mut interface,
+                        &mut sockets,
+                        dns_handle,
+                        &mut pending_dns,
+                        now_millis,
+                        &mut outbox,
+                    );
+                }
+                net_ipc::OP_HTTP => {
+                    start_http(
+                        &mut message,
+                        client_vaddr,
+                        &mut interface,
+                        &mut sockets,
+                        dns_handle,
+                        fetch,
+                        now_millis,
+                        &mut outbox,
+                    );
+                }
+                net_ipc::OP_IPCONFIG => {
+                    outbox.push(
+                        message.sender,
+                        net_ipc::ipconfig_reply(
+                            dhcp_lease,
+                            local_ip,
+                            prefix,
+                            gateway,
+                            dns_server,
+                        ),
+                    );
+                }
+                _ => {}
             }
         }
 
@@ -186,6 +301,62 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
         }
 
         let _ = interface.poll(now, device, &mut sockets);
+
+        // DHCP: apply a lease as soon as one arrives; renewals keep polling.
+        // Copy the lease out first so the socket borrow ends before the
+        // interface and DNS socket are updated.
+        let mut lease: Option<([u8; 4], u8, Option<[u8; 4]>)> = None;
+        let mut lease_dns = [Ipv4Address::new(0, 0, 0, 0); 4];
+        let mut lease_dns_count = 0usize;
+        {
+            let dhcp = sockets.get_mut::<dhcpv4::Socket>(dhcp_handle);
+            match dhcp.poll() {
+                Some(dhcpv4::Event::Configured(config)) => {
+                    lease = Some((
+                        config.address.address().octets(),
+                        config.address.prefix_len(),
+                        config.router.map(|router| router.octets()),
+                    ));
+                    for server in config.dns_servers.iter() {
+                        if lease_dns_count < lease_dns.len() {
+                            lease_dns[lease_dns_count] = *server;
+                            lease_dns_count += 1;
+                        }
+                    }
+                }
+                Some(dhcpv4::Event::Deconfigured) => {
+                    // Keep the last usable configuration: losing a lease must
+                    // not take the console offline mid-session.
+                }
+                None => {}
+            }
+        }
+        if let Some((address, leased_prefix, router)) = lease {
+            local_ip = address;
+            prefix = leased_prefix;
+            if let Some(router) = router {
+                if usable_unicast(router) {
+                    gateway = router;
+                }
+            }
+            apply_ipv4(&mut interface, local_ip, prefix, Some(gateway));
+            if lease_dns_count > 0 {
+                dns_server = lease_dns[0].octets();
+                for (slot, server) in dns_servers.iter_mut().zip(lease_dns[..lease_dns_count].iter()) {
+                    *slot = IpAddress::v4(
+                        server.octets()[0],
+                        server.octets()[1],
+                        server.octets()[2],
+                        server.octets()[3],
+                    );
+                }
+                sockets
+                    .get_mut::<dns::Socket>(dns_handle)
+                    .update_servers(&dns_servers[..lease_dns_count]);
+            }
+            dhcp_lease = true;
+        }
+
         if let Some(source) = receive_pings(&mut sockets, icmp_handle) {
             if let Some(pending) = &pending_ping {
                 if source == pending.address {
@@ -207,8 +378,7 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
             }
         }
 
-        // This task owns no console, so hand the result to the shell, which
-        // does. Retry until the shell exists and its mailbox accepts it.
+        // Store the ping result in the shared reply slot.
         if let Some((address, success)) = ping_reply {
             if let Some(shell) = resolve_task(syscall::PROGRAM_HOWL) {
                 if syscall::try_send(shell, &net_ipc::ping_reply(address, success)) {
@@ -218,6 +388,61 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
                 ping_reply = None;
             }
         }
+
+        // Standalone DNS lookups.
+        if let Some(request) = pending_dns {
+            let result = {
+                let socket = sockets.get_mut::<dns::Socket>(dns_handle);
+                socket.get_query_result(request.handle)
+            };
+            match result {
+                Ok(addresses) => {
+                    let address = addresses
+                        .iter()
+                        .find_map(|address| match address {
+                            IpAddress::Ipv4(v4) => Some(v4.octets()),
+                            #[allow(unreachable_patterns)]
+                            _ => None,
+                        })
+                        .unwrap_or([0; 4]);
+                    let code = if address == [0; 4] {
+                        net_ipc::NET_ERR_DNS
+                    } else {
+                        net_ipc::NET_OK
+                    };
+                    outbox.push(request.requester, net_ipc::dns_reply(code, address));
+                    pending_dns = None;
+                }
+                Err(dns::GetQueryResultError::Pending) => {
+                    if now_millis >= request.deadline_millis {
+                        outbox.push(
+                            request.requester,
+                            net_ipc::dns_reply(net_ipc::NET_ERR_TIMEOUT, [0; 4]),
+                        );
+                        pending_dns = None;
+                    }
+                }
+                Err(dns::GetQueryResultError::Failed) => {
+                    outbox.push(
+                        request.requester,
+                        net_ipc::dns_reply(net_ipc::NET_ERR_DNS, [0; 4]),
+                    );
+                    pending_dns = None;
+                }
+            }
+        }
+
+        // HTTP fetch state machine.
+        drive_fetch(
+            fetch,
+            &mut interface,
+            &mut sockets,
+            dns_handle,
+            tcp_handle,
+            client_vaddr,
+            now_millis,
+            &mut outbox,
+        );
 
         // smoltcp delivers at most one frame per poll (`max_burst_size`), so
         // one TX slot is enough. Wait until the driver has released the
@@ -232,9 +457,668 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
             device.tx_len = 0;
         }
 
+        // One reply at a time; retry until the target accepts it. A dead
+        // target is dropped so the queue cannot fill with zombies.
+        if let Some((target, message)) = outbox.front() {
+            if syscall::task_alive(target) {
+                if syscall::try_send(target, &message) {
+                    outbox.pop();
+                }
+            } else {
+                outbox.pop();
+            }
+        }
+
         syscall::sleep(POLL_MILLIS);
     }
 }
+
+// ---------------------------------------------------------------------------
+// DHCP / static configuration
+
+/// Whether an address can be used as a next hop / interface address.
+fn usable_unicast(address: [u8; 4]) -> bool {
+    address != [0, 0, 0, 0] && address != [255, 255, 255, 255] && address[0] < 224
+}
+
+fn apply_ipv4(interface: &mut Interface, address: [u8; 4], prefix: u8, router: Option<[u8; 4]>) {
+    if !usable_unicast(address) || prefix == 0 || prefix > 32 {
+        return;
+    }
+    interface.update_ip_addrs(|addresses| {
+        addresses.clear();
+        let _ = addresses.push(IpCidr::new(
+            IpAddress::v4(address[0], address[1], address[2], address[3]),
+            prefix,
+        ));
+    });
+    // A default route through 0.0.0.0 (an empty DHCP option) makes smoltcp ask
+    // its neighbour cache about a non-unicast address, which asserts. Only a
+    // real unicast next hop may become the default route.
+    if let Some(router) = router {
+        if usable_unicast(router) {
+            let _ = interface.routes_mut().add_default_ipv4_route(Ipv4Address::new(
+                router[0], router[1], router[2], router[3],
+            ));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DNS / HTTP requests
+
+/// Small FIFO of reply messages waiting for their target's mailbox. Replies
+/// for different clients must not overwrite one another when several requests
+/// arrive in the same drain.
+const OUTBOX_SLOTS: usize = 8;
+
+struct Outbox {
+    slots: [(u64, ipc::Message); OUTBOX_SLOTS],
+    head: usize,
+    tail: usize,
+}
+
+impl Outbox {
+    const fn new() -> Self {
+        Self {
+            slots: [(0, ipc::Message { sender: 0, payload: [0; ipc::PAYLOAD_SIZE] }); OUTBOX_SLOTS],
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    fn push(&mut self, target: u64, message: ipc::Message) -> bool {
+        let next = (self.tail + 1) % OUTBOX_SLOTS;
+        if next == self.head {
+            return false;
+        }
+        self.slots[self.tail] = (target, message);
+        self.tail = next;
+        true
+    }
+
+    fn front(&self) -> Option<(u64, ipc::Message)> {
+        if self.head == self.tail {
+            None
+        } else {
+            Some(self.slots[self.head])
+        }
+    }
+
+    fn pop(&mut self) {
+        if self.head != self.tail {
+            self.head = (self.head + 1) % OUTBOX_SLOTS;
+        }
+    }
+}
+
+/// One standalone name lookup.
+#[derive(Copy, Clone)]
+struct PendingDns {
+    requester: u64,
+    handle: dns::QueryHandle,
+    deadline_millis: i64,
+}
+
+fn start_dns(
+    message: &mut ipc::Message,
+    client_base: u64,
+    interface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    dns_handle: SocketHandle,
+    pending: &mut Option<PendingDns>,
+    now_millis: i64,
+    outbox: &mut Outbox,
+) {
+    if pending.is_some() {
+        outbox.push(message.sender, net_ipc::dns_reply(net_ipc::NET_ERR_BUSY, [0; 4]));
+        return;
+    }
+    let Some(name) = read_request(client_base) else {
+        outbox.push(message.sender, net_ipc::dns_reply(net_ipc::NET_ERR_URL, [0; 4]));
+        return;
+    };
+    let socket = sockets.get_mut::<dns::Socket>(dns_handle);
+    match socket.start_query(interface.context(), name, DnsQueryType::A) {
+        Ok(handle) => {
+            *pending = Some(PendingDns {
+                requester: message.sender,
+                handle,
+                deadline_millis: now_millis + DNS_TIMEOUT_MILLIS,
+            });
+        }
+        Err(_) => {
+            outbox.push(message.sender, net_ipc::dns_reply(net_ipc::NET_ERR_DNS, [0; 4]));
+        }
+    }
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum FetchStage {
+    Idle,
+    Resolving,
+    Connecting,
+    Connected,
+    Sending,
+    Receiving,
+}
+
+/// One in-flight HTTP fetch. Only one runs at a time: a single TCP socket and
+/// a single body window are reserved for it, which also makes the client
+/// protocol deterministic.
+struct Fetch {
+    stage: FetchStage,
+    requester: u64,
+    query: Option<dns::QueryHandle>,
+    host: [u8; HOST_MAX],
+    host_len: usize,
+    path: [u8; PATH_MAX],
+    path_len: usize,
+    port: u16,
+    remote: [u8; 4],
+    request: [u8; REQUEST_MAX],
+    request_len: usize,
+    sent: usize,
+    received: usize,
+    started_millis: i64,
+    connect_started: bool,
+    local_port: u16,
+}
+
+impl Fetch {
+    const fn empty() -> Self {
+        Self {
+            stage: FetchStage::Idle,
+            requester: 0,
+            query: None,
+            host: [0; HOST_MAX],
+            host_len: 0,
+            path: [0; PATH_MAX],
+            path_len: 0,
+            port: 0,
+            remote: [0; 4],
+            request: [0; REQUEST_MAX],
+            request_len: 0,
+            sent: 0,
+            received: 0,
+            started_millis: 0,
+            connect_started: false,
+            local_port: 0,
+        }
+    }
+}
+
+fn start_http(
+    message: &mut ipc::Message,
+    client_base: u64,
+    interface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    dns_handle: SocketHandle,
+    fetch: &mut Fetch,
+    now_millis: i64,
+    outbox: &mut Outbox,
+) {
+    if fetch.stage != FetchStage::Idle {
+        outbox.push(
+            message.sender,
+            net_ipc::http_reply(net_ipc::NET_ERR_BUSY, 0, 0),
+        );
+        return;
+    }
+    let Some(url) = read_request(client_base) else {
+        outbox.push(
+            message.sender,
+            net_ipc::http_reply(net_ipc::NET_ERR_URL, 0, 0),
+        );
+        return;
+    };
+    let Some(parsed) = parse_url(url) else {
+        outbox.push(
+            message.sender,
+            net_ipc::http_reply(net_ipc::NET_ERR_URL, 0, 0),
+        );
+        return;
+    };
+    if parsed.tls {
+        outbox.push(
+            message.sender,
+            net_ipc::http_reply(net_ipc::NET_ERR_TLS, 0, 0),
+        );
+        return;
+    }
+    if parsed.host.len() > HOST_MAX - 1 || parsed.path.len() > PATH_MAX - 1 {
+        outbox.push(
+            message.sender,
+            net_ipc::http_reply(net_ipc::NET_ERR_URL, 0, 0),
+        );
+        return;
+    }
+
+    fetch.host[..parsed.host.len()].copy_from_slice(parsed.host.as_bytes());
+    fetch.host_len = parsed.host.len();
+    fetch.path[..parsed.path.len()].copy_from_slice(parsed.path.as_bytes());
+    fetch.path_len = parsed.path.len();
+    fetch.port = parsed.port;
+    fetch.requester = message.sender;
+    fetch.sent = 0;
+    fetch.received = 0;
+    fetch.started_millis = now_millis;
+    fetch.query = None;
+    fetch.connect_started = false;
+    // smoltcp refuses `connect` with local port 0. Pick an ephemeral port in
+    // the IANA range; one fetch at a time means a simple rotation is enough.
+    fetch.local_port = 49152 + (now_millis as u16 % 16384);
+
+    if let Some(address) = parse_ipv4(parsed.host) {
+        fetch.remote = address;
+        fetch.stage = FetchStage::Connecting;
+    } else {
+        // Resolve through the DNS socket; `drive_fetch` picks up the result.
+        let handle = {
+            let socket = sockets.get_mut::<dns::Socket>(dns_handle);
+            socket.start_query(interface.context(), parsed.host, DnsQueryType::A)
+        };
+        match handle {
+            Ok(handle) => {
+                fetch.query = Some(handle);
+                fetch.stage = FetchStage::Resolving;
+            }
+            Err(_) => {
+                fetch.stage = FetchStage::Idle;
+                outbox.push(
+                    message.sender,
+                    net_ipc::http_reply(net_ipc::NET_ERR_BUSY, 0, 0),
+                );
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drive_fetch(
+    fetch: &mut Fetch,
+    interface: &mut Interface,
+    sockets: &mut SocketSet<'_>,
+    dns_handle: SocketHandle,
+    tcp_handle: SocketHandle,
+    client_base: u64,
+    now_millis: i64,
+    outbox: &mut Outbox,
+) {
+    if fetch.stage == FetchStage::Idle {
+        return;
+    }
+    if now_millis - fetch.started_millis > HTTP_TIMEOUT_MILLIS {
+        let stage = fetch.stage as u16;
+        fail_fetch(fetch, net_ipc::NET_ERR_TIMEOUT, stage, outbox);
+        return;
+    }
+
+    match fetch.stage {
+        FetchStage::Resolving => {
+            let Some(query) = fetch.query else {
+                fail_fetch(fetch, net_ipc::NET_ERR_DNS, 0, outbox);
+                return;
+            };
+            let result = {
+                let socket = sockets.get_mut::<dns::Socket>(dns_handle);
+                socket.get_query_result(query)
+            };
+            match result {
+                Ok(addresses) => {
+                    fetch.query = None;
+                    match addresses.iter().find_map(|address| match address {
+                        IpAddress::Ipv4(v4) => Some(v4.octets()),
+                        #[allow(unreachable_patterns)]
+                        _ => None,
+                    }) {
+                        Some(address) => {
+                            fetch.remote = address;
+                            fetch.stage = FetchStage::Connecting;
+                        }
+                        None => fail_fetch(fetch, net_ipc::NET_ERR_RESPONSE, 0, outbox),
+                    }
+                }
+                Err(dns::GetQueryResultError::Pending) => {}
+                Err(dns::GetQueryResultError::Failed) => {
+                    fail_fetch(fetch, net_ipc::NET_ERR_DNS, 0, outbox)
+                }
+            }
+        }
+        FetchStage::Connecting => {
+            if !fetch.connect_started {
+                let remote = IpEndpoint {
+                    addr: IpAddress::v4(
+                        fetch.remote[0],
+                        fetch.remote[1],
+                        fetch.remote[2],
+                        fetch.remote[3],
+                    ),
+                    port: fetch.port,
+                };
+                let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+                if socket
+                    .connect(interface.context(), remote, fetch.local_port)
+                    .is_err()
+                {
+                    fail_fetch(fetch, net_ipc::NET_ERR_CONNECT, 0, outbox);
+                    return;
+                }
+                fetch.connect_started = true;
+            } else {
+                let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+                match socket.state() {
+                    tcp::State::Established => fetch.stage = FetchStage::Connected,
+                    tcp::State::Closed | tcp::State::TimeWait => {
+                        fail_fetch(fetch, net_ipc::NET_ERR_CONNECT, 0, outbox);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        FetchStage::Connected => {
+            build_request(fetch);
+            fetch.stage = FetchStage::Sending;
+        }
+        FetchStage::Sending => {
+            let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            while fetch.sent < fetch.request_len && socket.may_send() {
+                match socket.send_slice(&fetch.request[fetch.sent..fetch.request_len]) {
+                    Ok(0) | Err(_) => break,
+                    Ok(count) => fetch.sent += count,
+                }
+            }
+            if fetch.sent >= fetch.request_len {
+                fetch.stage = FetchStage::Receiving;
+            } else if socket.state() == tcp::State::Closed {
+                fail_fetch(fetch, net_ipc::NET_ERR_CONNECT, 0, outbox);
+            }
+        }
+        FetchStage::Receiving => {
+            let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+            let mut progress = true;
+            while progress && fetch.received < net_ipc::CLIENT_BODY_MAX {
+                let available = net_ipc::CLIENT_BODY_MAX - fetch.received;
+                let slice = unsafe {
+                    core::slice::from_raw_parts_mut(
+                        (client_base + net_ipc::CLIENT_BODY) as *mut u8,
+                        net_ipc::CLIENT_BODY_MAX,
+                    )
+                };
+                match socket.recv_slice(&mut slice[fetch.received..fetch.received + available]) {
+                    Ok(0) => progress = false,
+                    Ok(count) => fetch.received += count,
+                    Err(_) => progress = false,
+                }
+            }
+            let finished = matches!(
+                socket.state(),
+                tcp::State::Closed | tcp::State::TimeWait
+            ) || (matches!(socket.state(), tcp::State::CloseWait) && !socket.may_recv())
+                || fetch.received >= net_ipc::CLIENT_BODY_MAX;
+            if finished {
+                finish_fetch(fetch, client_base, outbox);
+            }
+        }
+        FetchStage::Idle => {}
+    }
+}
+
+fn fail_fetch(fetch: &mut Fetch, code: u8, stage: u16, outbox: &mut Outbox) {
+    let requester = fetch.requester;
+    fetch.stage = FetchStage::Idle;
+    fetch.query = None;
+    outbox.push(requester, net_ipc::http_reply(code, stage, 0));
+}
+
+fn finish_fetch(fetch: &mut Fetch, client_base: u64, outbox: &mut Outbox) {
+    let buffer = unsafe {
+        core::slice::from_raw_parts_mut(
+            (client_base + net_ipc::CLIENT_BODY) as *mut u8,
+            net_ipc::CLIENT_BODY_MAX,
+        )
+    };
+    let (code, status, body_len) = parse_response(buffer, fetch.received);
+    // Move the body to the start of the body window: clients read it from
+    // `CLIENT_BODY`, not from after the header.
+    if code == net_ipc::NET_OK {
+        let header_end = find_header_end(&buffer[..fetch.received]).unwrap_or(0) + 4;
+        if header_end <= fetch.received {
+            let body = &mut buffer[header_end..fetch.received];
+            unsafe {
+                core::ptr::copy(body.as_ptr(), buffer.as_mut_ptr(), body_len);
+            }
+        }
+    }
+    let requester = fetch.requester;
+    fetch.stage = FetchStage::Idle;
+    outbox.push(requester, net_ipc::http_reply(code, status, body_len as u32));
+}
+
+// ---------------------------------------------------------------------------
+// HTTP parsing
+
+struct ParsedUrl<'a> {
+    tls: bool,
+    host: &'a str,
+    port: u16,
+    path: &'a str,
+}
+
+/// Byte search helpers. `core::str::find`/`rfind` with a `char` pattern
+/// misbehaves on this bare-metal target when the haystack lives in the
+/// non-cacheable shared window (the vectorised char search reports no match
+/// for a byte that is clearly present), so the network parser scans bytes.
+fn find_byte(bytes: &[u8], needle: u8) -> Option<usize> {
+    bytes.iter().position(|&byte| byte == needle)
+}
+
+fn rfind_byte(bytes: &[u8], needle: u8) -> Option<usize> {
+    bytes.iter().rposition(|&byte| byte == needle)
+}
+
+fn parse_url(url: &str) -> Option<ParsedUrl<'_>> {
+    let bytes = url.as_bytes();
+    let (tls, offset) = if bytes.starts_with(b"http://") {
+        (false, 7)
+    } else if bytes.starts_with(b"https://") {
+        (true, 8)
+    } else {
+        (false, 0)
+    };
+    if url.len() <= offset {
+        return None;
+    }
+    let rest = &url[offset..];
+    let (host_port, path) = match find_byte(rest.as_bytes(), b'/') {
+        Some(index) => (&rest[..index], &rest[index..]),
+        None => (rest, "/"),
+    };
+    if host_port.is_empty() {
+        return None;
+    }
+    let (host, port) = match rfind_byte(host_port.as_bytes(), b':') {
+        Some(index) if index + 1 < host_port.len() => {
+            let port = host_port[index + 1..].parse::<u16>().ok()?;
+            (&host_port[..index], port)
+        }
+        _ => (host_port, if tls { DEFAULT_HTTPS_PORT } else { DEFAULT_HTTP_PORT }),
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(ParsedUrl {
+        tls,
+        host,
+        port,
+        path,
+    })
+}
+
+fn build_request(fetch: &mut Fetch) {
+    let mut length = 0usize;
+    let pieces: [&[u8]; 8] = [
+        b"GET ",
+        &fetch.path[..fetch.path_len],
+        b" HTTP/1.0\r\nHost: ",
+        &fetch.host[..fetch.host_len],
+        b"\r\nUser-Agent: WerewolfOS/0.1\r\nAccept: text/html,text/plain,*/*\r\n\
+          Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
+        b"",
+        b"",
+        b"",
+    ];
+    for piece in pieces {
+        let count = piece.len().min(fetch.request.len() - length);
+        fetch.request[length..length + count].copy_from_slice(&piece[..count]);
+        length += count;
+    }
+    fetch.request_len = length;
+}
+
+fn find_header_end(buffer: &[u8]) -> Option<usize> {
+    buffer.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+/// Finds a header value (case-insensitive) after the status line.
+fn find_header<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
+    for line in headers.split(|&byte| byte == b'\n') {
+        let line = line.strip_suffix(b"\r").unwrap_or(line);
+        if line.len() > name.len()
+            && line[..name.len()].eq_ignore_ascii_case(name)
+            && line[name.len()] == b':'
+        {
+            let value = &line[name.len() + 1..];
+            let start = value.iter().position(|byte| !byte.is_ascii_whitespace())?;
+            return Some(&value[start..]);
+        }
+    }
+    None
+}
+
+fn parse_response(buffer: &mut [u8], received: usize) -> (u8, u16, usize) {
+    let Some(end) = find_header_end(&buffer[..received]) else {
+        return (net_ipc::NET_ERR_RESPONSE, 0, 0);
+    };
+    let headers = &buffer[..end];
+    let body_start = end + 4;
+
+    // "HTTP/1.1 200 OK"
+    let status = headers
+        .split(|&byte| byte == b' ')
+        .nth(1)
+        .and_then(|digits| core::str::from_utf8(digits).ok())
+        .and_then(|digits| digits.trim().parse::<u16>().ok())
+        .unwrap_or(0);
+
+    if let Some(value) = find_header(headers, b"transfer-encoding") {
+        if value.eq_ignore_ascii_case(b"chunked") {
+            let length = dechunk(&mut buffer[body_start..received]);
+            return (net_ipc::NET_OK, status, length);
+        }
+    }
+    if let Some(value) = find_header(headers, b"content-length") {
+        if let Ok(text) = core::str::from_utf8(value) {
+            if let Ok(length) = text.trim().parse::<usize>() {
+                let available = received - body_start;
+                return (net_ipc::NET_OK, status, length.min(available));
+            }
+        }
+    }
+    (net_ipc::NET_OK, status, received - body_start)
+}
+
+/// Decodes a chunked body in place. Returns the decoded length.
+fn dechunk(buffer: &mut [u8]) -> usize {
+    let mut input = 0usize;
+    let mut output = 0usize;
+    while input < buffer.len() {
+        // Parse the hex chunk size.
+        let mut size = 0usize;
+        let mut digits = 0usize;
+        while input < buffer.len() {
+            let byte = buffer[input];
+            let digit = match byte {
+                b'0'..=b'9' => Some(usize::from(byte - b'0')),
+                b'a'..=b'f' => Some(usize::from(byte - b'a') + 10),
+                b'A'..=b'F' => Some(usize::from(byte - b'A') + 10),
+                _ => None,
+            };
+            let Some(digit) = digit else { break };
+            size = size.saturating_mul(16).saturating_add(digit);
+            digits += 1;
+            input += 1;
+        }
+        if digits == 0 {
+            break;
+        }
+        // Skip the CRLF after the size.
+        while input < buffer.len() && buffer[input] != b'\n' {
+            input += 1;
+        }
+        input = (input + 1).min(buffer.len());
+        if size == 0 {
+            break;
+        }
+        let count = size.min(buffer.len() - input).min(buffer.len() - output);
+        buffer.copy_within(input..input + count, output);
+        input += size;
+        output += count;
+        // Skip the CRLF after the chunk data.
+        while input < buffer.len() && buffer[input] != b'\n' {
+            input += 1;
+        }
+        input = (input + 1).min(buffer.len());
+    }
+    output
+}
+
+fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
+    let bytes = text.as_bytes();
+    let mut address = [0_u8; 4];
+    let mut octet = 0usize;
+    let mut value = 0u16;
+    let mut digits = 0usize;
+    for &byte in bytes {
+        if byte == b'.' {
+            if digits == 0 || digits > 3 || value > 255 || octet >= 3 {
+                return None;
+            }
+            address[octet] = value as u8;
+            octet += 1;
+            value = 0;
+            digits = 0;
+        } else if byte.is_ascii_digit() {
+            if digits == 3 {
+                return None;
+            }
+            value = value * 10 + u16::from(byte - b'0');
+            digits += 1;
+        } else {
+            return None;
+        }
+    }
+    if digits == 0 || digits > 3 || value > 255 || octet != 3 {
+        return None;
+    }
+    address[3] = value as u8;
+    Some(address)
+}
+
+/// Reads the length-prefixed request string from the shared window.
+fn read_request(client_base: u64) -> Option<&'static str> {
+    let length = unsafe { core::ptr::read_volatile(client_base as *const u16) } as usize;
+    if length == 0 || length > net_ipc::CLIENT_REQUEST_MAX {
+        return None;
+    }
+    let bytes = unsafe {
+        core::slice::from_raw_parts((client_base + net_ipc::CLIENT_REQUEST + 2) as *const u8, length)
+    };
+    core::str::from_utf8(bytes).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Ping
 
 /// One shell-requested echo in flight.
 struct PendingPing {
@@ -320,7 +1204,6 @@ fn receive_pings(sockets: &mut SocketSet<'_>, handle: SocketHandle) -> Option<[u
 }
 
 fn print_ipv4(address: IpAddress) {
-    // Only `proto-ipv4` is enabled, so `IpAddress` has no other variant.
     let IpAddress::Ipv4(address) = address;
     for (index, byte) in address.octets().iter().enumerate() {
         if index > 0 {
@@ -383,6 +1266,10 @@ fn read_u32(base: u64, offset: u64) -> u32 {
 
 fn write_u32(base: u64, offset: u64, value: u32) {
     unsafe { core::ptr::write_volatile(base.wrapping_add(offset) as *mut u32, value) };
+}
+
+fn write_u16(base: u64, offset: u64, value: u16) {
+    unsafe { core::ptr::write_volatile(base.wrapping_add(offset) as *mut u16, value) };
 }
 
 fn write_dma_frame(base: u64, offset: u64, frame: &[u8]) {
@@ -496,7 +1383,17 @@ fn fail(status: u64, message: &str) -> ! {
 
 #[panic_handler]
 fn panic(_info: &PanicInfo) -> ! {
-    loop {
-        unsafe { core::arch::asm!("wfe", options(nomem, nostack)) };
-    }
+    // Surface a panic to the kernel's task-exit line: a `wfe` loop keeps the
+    // task looking alive, which makes a stuck network service indistinguishable
+    // from a busy one.
+    // The kernel's task-exit line carries the panic's source line, so an
+    // intermittent fault can be located from the serial log alone.
+    // A `wfe` loop would keep the task looking alive forever, so a panic
+    // always exits. The status names the source line (`0xDEAD_0000 | line`),
+    // which the kernel prints in the task-exit line on the serial console.
+    let line = _info
+        .location()
+        .map(|location| location.line() as u64)
+        .unwrap_or(0);
+    syscall::exit_with_status(0xDEAD_0000 | line)
 }

@@ -21,11 +21,12 @@
 
 ## 1. Консоль (база)
 
-Уже есть: Silver kernel, SFS, Scout, virtio-net + smoltcp (ARP/IPv4/ICMP),
-Howl, Howler, multi-call `utils` (`grep`, `wc`, `head`, `tail`, `cp`, `find`,
-`seq`, `basename`, `dirname`, `true`, `false`, `sleep`).
+Уже есть: Silver kernel, SFS, Scout, virtio-net + smoltcp (DHCP, ARP/IPv4,
+ICMP, DNS, TCP), Howl, Howler, multi-call `utils` (`grep`, `wc`, `head`,
+`tail`, `cp`, `find`, `seq`, `basename`, `dirname`, `true`, `false`,
+`sleep`), и сетевые команды `ping`, `ip`, `dns`, `wget` (HTTP в SFS).
 
-Дальше: DHCP, DNS, TCP-сокеты, `wget`/`http`, `date`, pager, больше applets.
+Дальше: TLS-клиент/`https://`, `date` (RTC), pager, больше applets.
 
 ## 2. Окно браузера на хосте
 
@@ -97,6 +98,25 @@ Silver-специфичных патчей.
 glibc-поведение, корректность futex/потоков, производительность software-
 рендера, ввод. Каждый риск закрывается своей вехой.
 
+## 4a. Референс: Veda (только архитектура)
+
+Публичный проект [Veda](https://github.com/vahmoh/Veda) — независимое
+подтверждение выбранного вектора: Rust-microkernel, сервисы в userspace,
+сеть отдельным сервисом на smoltcp, POSIX-слой, Linux-совместимость и
+браузер на портированном WebKit. Мы **не копируем** его код (GPL-3.0) и не
+берём ассеты; полезны только архитектурные решения:
+
+- ядро не знает про сеть: один сервис `network` поверх smoltcp;
+- DHCP/DNS/TCP — в этом сервисе; клиенты ходят через общий буфер/ring;
+- TLS — rustls + webpki-roots (no_std), HTTP — свой клиент поверх TCP;
+- браузер — отдельный процесс; у них это порт WebKit (месяцы работы), у нас
+  ближайший шаг — свой HTTP + HTML-подмножество в host-окно, WebKit/Phosh —
+  следующий трек;
+- POSIX-слой, затем Linux ABI — тот же порядок, что в нашем плане.
+
+Их `NETWORKING.md` и `BROWSER.md` — хорошая карта рисков (TLS, sandbox,
+потоки, D-Bus); реализация остаётся нашей.
+
 ## 5. Что паркуется
 
 - **Legion Y700 / SM8650**: профиль `tablet` собирается, но не развивается.
@@ -107,8 +127,8 @@ glibc-поведение, корректность futex/потоков, про�
 
 ## 6. Ближайший порядок работ
 
-1. Сеть: DHCP, DNS, TCP, `wget`.
-2. Host-окно: ivshmem + Qt-viewer + damage/input.
+1. Сеть: TLS-клиент и `https://` (rustls), затем HTTP/1.1 keep-alive.
+2. Host-окно: общий surface + viewer + damage/input.
 3. Linux ABI: статические musl-бинарники, затем busybox `sh`.
 4. Phosh: headless Wayland → GTK → D-Bus → `phosh`.
 5. По желанию: свой минимальный браузер в host-окне (или QtWebEngine как

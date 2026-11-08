@@ -10,13 +10,19 @@ tablet = []
 [dependencies]
 # Bare-metal TCP/IP stack. `std`/`alloc` stay off: the server uses fixed
 # static storage for sockets and frame buffers. `medium-ethernet` implies
-# smoltcp's `socket` feature, which only compiles with a concrete socket type;
-# ICMP provides the boot-time echo request, UDP is for later services.
-smoltcp = { version = "0.14", default-features = false, features = [
+# smoltcp's `socket` feature, which only compiles with a concrete socket type.
+# The console product needs ICMP (ping), DHCP (address lease), DNS (name
+# resolution) and TCP (HTTP). UDP remains for the DNS transport underneath.
+smoltcp = { path = "../third_party/smoltcp", default-features = false, features = [
     "medium-ethernet",
     "proto-ipv4",
+    "proto-dhcpv4",
+    "proto-dns",
     "socket-icmp",
     "socket-udp",
+    "socket-dhcpv4",
+    "socket-dns",
+    "socket-tcp",
 ] }
 
 [profile.dev]

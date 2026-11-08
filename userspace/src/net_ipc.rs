@@ -44,6 +44,61 @@ pub const OP_PING: u8 = 5;
 /// `payload[2..6]` echoes the address the request asked about.
 pub const OP_PING_REPLY: u8 = 6;
 
+// ---------------------------------------------------------------------------
+// Client data window
+//
+// A URL or an HTTP body does not fit in the 32-byte mailbox, so clients share
+// one DMA window with the server:
+//
+// | offset | contents                                                     |
+// |--------|--------------------------------------------------------------|
+// | 0x0000 | `u16` request length (LE), then the request bytes (URL/name) |
+// | 0x4000 | response body written by the server                          |
+//
+// The client asks for the window with `OP_SHARE`, maps it through
+// `map_phys`, writes its request and only then sends the opcode. The server
+// answers with a small `OP_*_REPLY` message; the payload stays in the window.
+
+/// Size of the shared client window. 128 KiB keeps a typical text page whole.
+pub const CLIENT_SIZE: u64 = 128 * 1024;
+/// Where the request (length-prefixed) starts.
+pub const CLIENT_REQUEST: u64 = 0x0000;
+/// Where the server writes the HTTP body.
+pub const CLIENT_BODY: u64 = 0x4000;
+/// Maximum request bytes we accept (host + path).
+pub const CLIENT_REQUEST_MAX: usize = CLIENT_BODY as usize - 2;
+/// Maximum body bytes the window can carry.
+pub const CLIENT_BODY_MAX: usize = CLIENT_SIZE as usize - CLIENT_BODY as usize;
+
+/// Client -> server: "map my buffer, tell me its physical address".
+pub const OP_SHARE: u8 = 7;
+/// Server -> client: `payload[1..9]` physical address, `payload[9..13]` size.
+pub const OP_SHARE_REPLY: u8 = 8;
+/// Client -> server: resolve the name in the window request slot.
+pub const OP_DNS: u8 = 9;
+/// Server -> client: `payload[1]` result code, `payload[2..6]` IPv4 address.
+pub const OP_DNS_REPLY: u8 = 10;
+/// Client -> server: fetch the `http://` URL in the window request slot.
+pub const OP_HTTP: u8 = 11;
+/// Server -> client: `payload[1]` result code, `payload[2..4]` HTTP status,
+/// `payload[4..8]` body length; the body is at `CLIENT_BODY`.
+pub const OP_HTTP_REPLY: u8 = 12;
+/// Client -> server: report the current IPv4 configuration.
+pub const OP_IPCONFIG: u8 = 13;
+/// Server -> client: `payload[1]` configured flag, `payload[2..6]` address,
+/// `payload[6]` prefix, `payload[7..11]` gateway, `payload[11..15]` DNS.
+pub const OP_IPCONFIG_REPLY: u8 = 14;
+
+// Result codes carried in the reply payload.
+pub const NET_OK: u8 = 0;
+pub const NET_ERR_DNS: u8 = 1;
+pub const NET_ERR_CONNECT: u8 = 2;
+pub const NET_ERR_TIMEOUT: u8 = 3;
+pub const NET_ERR_URL: u8 = 4;
+pub const NET_ERR_TLS: u8 = 5;
+pub const NET_ERR_RESPONSE: u8 = 6;
+pub const NET_ERR_BUSY: u8 = 7;
+
 /// Shell -> server: one echo request to `address`.
 pub fn ping(address: [u8; 4]) -> ipc::Message {
     let mut payload = [0_u8; 5];
@@ -134,6 +189,133 @@ pub fn attached_mac(message: &ipc::Message) -> Option<[u8; 6]> {
     } else {
         Some(mac)
     }
+}
+
+/// Client -> server: asks for the shared data window.
+pub fn share_request() -> ipc::Message {
+    ipc::Message::new(0, &[OP_SHARE])
+}
+
+/// Server -> client: the shared data window address and size.
+pub fn share_reply(paddr: u64, size: u64) -> ipc::Message {
+    let mut payload = [0_u8; 13];
+    payload[0] = OP_SHARE_REPLY;
+    payload[1..9].copy_from_slice(&paddr.to_le_bytes());
+    payload[9..13].copy_from_slice(&(size as u32).to_le_bytes());
+    ipc::Message::new(0, &payload)
+}
+
+/// Decodes [`share_reply`]. Returns `(paddr, size)`.
+pub fn share_fields(message: &ipc::Message) -> Option<(u64, u64)> {
+    if message.payload[0] != OP_SHARE_REPLY {
+        return None;
+    }
+    let mut address = [0_u8; 8];
+    address.copy_from_slice(&message.payload[1..9]);
+    let mut size = [0_u8; 4];
+    size.copy_from_slice(&message.payload[9..13]);
+    let paddr = u64::from_le_bytes(address);
+    let size = u64::from(u32::from_le_bytes(size));
+    if paddr == 0 || size == 0 {
+        None
+    } else {
+        Some((paddr, size))
+    }
+}
+
+/// Client -> server: resolve the name in the request slot.
+pub fn dns_request() -> ipc::Message {
+    ipc::Message::new(0, &[OP_DNS])
+}
+
+/// Server -> client: DNS outcome plus the first IPv4 result.
+pub fn dns_reply(code: u8, address: [u8; 4]) -> ipc::Message {
+    let mut payload = [0_u8; 6];
+    payload[0] = OP_DNS_REPLY;
+    payload[1] = code;
+    payload[2..6].copy_from_slice(&address);
+    ipc::Message::new(0, &payload)
+}
+
+/// Decodes [`dns_reply`]. The address is meaningful only when `code` is
+/// [`NET_OK`].
+pub fn dns_fields(message: &ipc::Message) -> Option<(u8, [u8; 4])> {
+    if message.payload[0] != OP_DNS_REPLY {
+        return None;
+    }
+    Some((
+        message.payload[1],
+        [message.payload[2], message.payload[3], message.payload[4], message.payload[5]],
+    ))
+}
+
+/// Client -> server: fetch the URL in the request slot.
+pub fn http_request() -> ipc::Message {
+    ipc::Message::new(0, &[OP_HTTP])
+}
+
+/// Server -> client: fetch outcome, HTTP status and body length.
+pub fn http_reply(code: u8, status: u16, body_len: u32) -> ipc::Message {
+    let mut payload = [0_u8; 8];
+    payload[0] = OP_HTTP_REPLY;
+    payload[1] = code;
+    payload[2..4].copy_from_slice(&status.to_le_bytes());
+    payload[4..8].copy_from_slice(&body_len.to_le_bytes());
+    ipc::Message::new(0, &payload)
+}
+
+/// Decodes [`http_reply`] into `(code, status, body_len)`.
+pub fn http_fields(message: &ipc::Message) -> Option<(u8, u16, u32)> {
+    if message.payload[0] != OP_HTTP_REPLY {
+        return None;
+    }
+    Some((
+        message.payload[1],
+        u16::from_le_bytes([message.payload[2], message.payload[3]]),
+        u32::from_le_bytes([
+            message.payload[4],
+            message.payload[5],
+            message.payload[6],
+            message.payload[7],
+        ]),
+    ))
+}
+
+/// Client -> server: ask for the current IPv4 configuration.
+pub fn ipconfig_request() -> ipc::Message {
+    ipc::Message::new(0, &[OP_IPCONFIG])
+}
+
+/// Server -> client: current IPv4 configuration.
+pub fn ipconfig_reply(
+    configured: bool,
+    address: [u8; 4],
+    prefix: u8,
+    gateway: [u8; 4],
+    dns: [u8; 4],
+) -> ipc::Message {
+    let mut payload = [0_u8; 15];
+    payload[0] = OP_IPCONFIG_REPLY;
+    payload[1] = u8::from(configured);
+    payload[2..6].copy_from_slice(&address);
+    payload[6] = prefix;
+    payload[7..11].copy_from_slice(&gateway);
+    payload[11..15].copy_from_slice(&dns);
+    ipc::Message::new(0, &payload)
+}
+
+/// Decodes [`ipconfig_reply`].
+pub fn ipconfig_fields(message: &ipc::Message) -> Option<(bool, [u8; 4], u8, [u8; 4], [u8; 4])> {
+    if message.payload[0] != OP_IPCONFIG_REPLY {
+        return None;
+    }
+    Some((
+        message.payload[1] == 1,
+        [message.payload[2], message.payload[3], message.payload[4], message.payload[5]],
+        message.payload[6],
+        [message.payload[7], message.payload[8], message.payload[9], message.payload[10]],
+        [message.payload[11], message.payload[12], message.payload[13], message.payload[14]],
+    ))
 }
 
 /// Orders payload writes before a published length word (and the matching

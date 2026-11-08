@@ -81,8 +81,9 @@ describes a supported build.
 3. **GENI UART root cause.** TX now fails fast after the first timeout, so boot
    no longer stalls, but the real clock/pin state is still unknown. This is the
    blocker for a console OS on the phone.
-4. **Network tools are still thin.** The stack has ARP/IPv4/ICMP; DHCP, DNS,
-   TCP sockets and user tools (`wget`-like) are the next layer.
+4. **Networking has its first full layer.** DHCP, DNS, TCP and an HTTP client
+   are working (`ip`, `dns`, `wget`); TLS/HTTPS, HTTP/2 and parallel fetches
+   remain. HTTPS is rejected with a clear error until a TLS client is added.
 5. **Host window + browser are not built yet.** The shared-surface protocol
    (ivshmem + Qt viewer) and the guest browser are the next product milestone.
 6. **Linux ABI/Phosh are not started.** The kernel personality layer, static
@@ -93,6 +94,13 @@ describes a supported build.
    `true`, `false` and `sleep`; `ls`, `cat`, `echo`, `say`, `sl` remain
    separate programs. Next: `date` (needs RTC), `env`, a real pager, and
    folding the remaining utilities into the same binary.
+
+## Third-party notes
+
+`smoltcp` 0.14.0 is vendored in `third_party/smoltcp` with two guarded early
+returns in the neighbour path (`PATCH.md`): a DHCP boot could otherwise ask the
+neighbour cache about `255.255.255.255` and hit its unicast assertion. The
+0BSD licence is kept beside the source.
 
 ## Verification commands
 
@@ -113,8 +121,8 @@ network driver reports a probe failure and the shell continues.
 
 ## Next work
 
-1. Grow networking: DHCP, DNS, TCP sockets, a `wget`-style tool.
-2. Host window: ivshmem + Qt viewer, damage/input protocol.
+1. TLS client (rustls) and `https://` for `wget` and the browser.
+2. Host window: shared surface + viewer, damage/input protocol.
 3. Browser: HTTP + HTML subset in the guest, drawn into the shared surface.
 4. Linux ABI: static musl binaries, then busybox `sh`.
 5. Phosh: headless Wayland, GTK software render, D-Bus + logind stub, `phosh`.
