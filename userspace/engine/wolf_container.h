@@ -60,6 +60,13 @@ class WolfContainer : public litehtml::document_container
 
     WolfContainer(int width, int height);
 
+    /// Tab switches reuse already decoded images but must not block on new
+    /// network requests.
+    void set_allow_image_fetch(bool allow)
+    {
+        m_allow_image_fetch = allow;
+    }
+
     void set_canvas(WolfCanvas* canvas)
     {
         m_canvas = canvas;
@@ -129,8 +136,8 @@ class WolfContainer : public litehtml::document_container
     WolfCanvas* m_canvas = nullptr;
     std::string m_base_url;
     std::string m_link;
-    std::vector<ImageEntry> m_images;
-    int m_image_fetches = 0;
+    int  m_image_fetches = 0;
+    bool m_allow_image_fetch = true;
 
     std::string image_key(const char* src, const char* baseurl) const;
     ImageEntry* find_image(const std::string& key);

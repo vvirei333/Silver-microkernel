@@ -65,5 +65,7 @@ The linked browser image is ~6 MiB, so the kernel was widened accordingly:
   used instead.
 - Images are fetched through the guest net_server and decoded in-guest by
   `stb_image` (PNG/JPEG/GIF). Up to four per page, 512 KiB encoded and 300k
-  pixels each; the RGBA cache is drawn scaled through litehtml's `<img>` box.
+  pixels each; the RGBA cache is shared across document rebuilds and drawn
+  scaled through litehtml's `<img>` box. A tab switch reuses cached images and
+  never starts a network fetch, so it cannot block on a slow image.
 - There is no JavaScript or media pipeline.

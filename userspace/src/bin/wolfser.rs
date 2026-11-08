@@ -94,7 +94,8 @@ const TAB_GAP: u32 = 3;
 const TAB_Y: u32 = 3;
 const TAB_BAR_HEIGHT: u32 = 22;
 const TAB_TEXT_Y: u32 = 9;
-const TAB_CLOSE_WIDTH: u32 = 18;
+const TAB_CLOSE_WIDTH: u32 = 22;
+const TAB_PLUS_WIDTH: u32 = 28;
 const FIND_CAPACITY: usize = 64;
 const BOOKMARK_MAX: usize = 8;
 const BOOKMARK_PATH: &str = "/sfs/wolfser.bookmarks";
@@ -167,6 +168,7 @@ extern "C" {
         width: i32,
         height: i32,
         base: *const u8,
+        allow_images: i32,
     ) -> *mut WolfHtml;
     fn wolf_html_destroy(handle: *mut WolfHtml);
     fn wolf_html_height(handle: *mut WolfHtml) -> i32;
@@ -662,7 +664,7 @@ fn destroy_engine(app: &mut App) {
     app.scroll_px = 0;
 }
 
-fn create_engine(app: &mut App, slot: usize, url: &str) {
+fn create_engine(app: &mut App, slot: usize, url: &str, allow_images: bool) {
     destroy_engine(app);
     let page_len = unsafe { (*core::ptr::addr_of!(TABS))[slot].page_len.min(PAGE_CAP) };
     if page_len == 0 {
@@ -684,6 +686,7 @@ fn create_engine(app: &mut App, slot: usize, url: &str) {
             WIDTH as i32,
             CONTENT_HEIGHT,
             base.as_ptr(),
+            i32::from(allow_images),
         )
     };
     if handle.is_null() {
@@ -1569,7 +1572,7 @@ fn handle_click(app: &mut App, x: u32, y: u32, button: u8) -> bool {
             }
             cursor += TAB_WIDTH + TAB_GAP;
         }
-        if x >= cursor && x < cursor + TAB_BAR_HEIGHT {
+        if x >= cursor && x < cursor + TAB_PLUS_WIDTH {
             new_tab(app);
             return true;
         }
@@ -2407,7 +2410,7 @@ fn switch_tab(app: &mut App, slot: usize) {
     let url = tab_ref(slot).url;
     let url_len = tab_ref(slot).url_len;
     let url_text = core::str::from_utf8(&url[..url_len]).unwrap_or("");
-    create_engine(app, slot, url_text);
+    create_engine(app, slot, url_text, false);
     paint(app);
     restore_images_from_tab(app, slot);
 }
@@ -2466,7 +2469,7 @@ fn close_tab(app: &mut App, slot: usize) {
             let url = tab_ref(next).url;
             let url_len = tab_ref(next).url_len;
             let url_text = core::str::from_utf8(&url[..url_len]).unwrap_or("");
-            create_engine(app, next, url_text);
+            create_engine(app, next, url_text, false);
             restore_images_from_tab(app, next);
         } else {
             destroy_engine(app);
@@ -3159,7 +3162,7 @@ fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
         core::slice::from_raw_parts(core::ptr::addr_of!(CSS_BUFFER) as *const u8, css_len)
     };
     save_page_html(app.active, page_body, css);
-    create_engine(app, app.active, url);
+    create_engine(app, app.active, url, true);
     app.page.loaded = true;
     app.page.loading = false;
     app.page.status = status;
@@ -4899,13 +4902,13 @@ fn draw_tabs(base: u64, app: &App) {
         base,
         cursor,
         TAB_Y,
-        TAB_BAR_HEIGHT,
+        TAB_PLUS_WIDTH,
         TAB_BAR_HEIGHT,
         COLOR_TAB,
     );
     draw_text(
         base,
-        cursor + 7,
+        cursor + (TAB_PLUS_WIDTH - 6) / 2,
         TAB_TEXT_Y,
         1,
         "+",
@@ -5696,7 +5699,7 @@ fn fetch_image_blocking(
     if !syscall::send(server, &net_ipc::http_request_id(request_id)) {
         return -1;
     }
-    let deadline = syscall::uptime_ticks().saturating_add(8 * TICKS_PER_SECOND);
+    let deadline = syscall::uptime_ticks().saturating_add(3 * TICKS_PER_SECOND);
     let mut message = ipc::Message::new(0, &[]);
     loop {
         if syscall::receive_timeout(&mut message, RESPONSE_POLL_TICKS).is_ok()

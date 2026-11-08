@@ -57,7 +57,8 @@ extern "C"
         }
     }
 
-    WolfHtml* wolf_html_create(const char* html, int len, int width, int height, const char* base_url)
+    WolfHtml* wolf_html_create(const char* html, int len, int width, int height,
+                               const char* base_url, int allow_images)
     {
         wolf_cpp_init();
         if(html == nullptr || len <= 0 || width <= 0 || height <= 0)
@@ -79,6 +80,7 @@ extern "C"
             return nullptr;
         }
         handle->container->set_base_url(handle->base_url.c_str());
+        handle->container->set_allow_image_fetch(allow_images != 0);
 
         try
         {

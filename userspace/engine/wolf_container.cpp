@@ -9,6 +9,15 @@
 
 namespace
 {
+    std::vector<WolfContainer::ImageEntry>& image_cache()
+    {
+        // One browser task, one document at a time. Keeping the RGBA cache
+        // across document rebuilds makes tab switches instant instead of
+        // re-fetching every <img> synchronously.
+        static std::vector<WolfContainer::ImageEntry> cache;
+        return cache;
+    }
+
     // The ivshmem surface is consumed as QImage::Format_RGBA8888, so a
     // native little-endian uint32 is 0xAABBGGRR, not 0xAARRGGBB.
     inline uint32_t argb(const litehtml::web_color& color)
@@ -256,14 +265,19 @@ void WolfContainer::draw_list_marker(litehtml::uint_ptr hdc, const litehtml::lis
 
 std::string WolfContainer::image_key(const char* src, const char* /*baseurl*/) const
 {
-    // One container belongs to one document, so the raw src is a sufficient
-    // cache key even when the page base changes between loads.
-    return src != nullptr ? src : "";
+    // litehtml passes nullptr for <img> base URLs, so use the document base
+    // remembered from set_base_url. This still shares images between the
+    // original render and a tab-switch rebuild, while distinguishing the same
+    // relative path on different sites.
+    std::string key = m_base_url;
+    key += '|';
+    key += src != nullptr ? src : "";
+    return key;
 }
 
 WolfContainer::ImageEntry* WolfContainer::find_image(const std::string& key)
 {
-    for(auto& image : m_images)
+    for(auto& image : image_cache())
     {
         if(image.key == key)
         {
@@ -275,12 +289,16 @@ WolfContainer::ImageEntry* WolfContainer::find_image(const std::string& key)
 
 void WolfContainer::load_image(const char* src, const char* baseurl, bool /*redraw_on_ready*/)
 {
-    if(src == nullptr || *src == '\0' || m_image_fetches >= 4)
+    if(src == nullptr || *src == '\0')
     {
         return;
     }
     const std::string key = image_key(src, baseurl);
     if(find_image(key) != nullptr)
+    {
+        return;
+    }
+    if(!m_allow_image_fetch || m_image_fetches >= 4 || image_cache().size() >= 4)
     {
         return;
     }
@@ -315,6 +333,11 @@ void WolfContainer::load_image(const char* src, const char* baseurl, bool /*redr
     {
         return;
     }
+    // Favicons, tracking pixels and spacers are not worth a cache slot.
+    if(width < 32 || height < 32)
+    {
+        return;
+    }
     unsigned char* rgba =
         stbi_load_from_memory(encoded.data(), length, &width, &height, &channels, 4);
     if(rgba == nullptr)
@@ -327,7 +350,7 @@ void WolfContainer::load_image(const char* src, const char* baseurl, bool /*redr
     entry.height = height;
     entry.pixels.assign(rgba, rgba + static_cast<size_t>(width) * height * 4);
     stbi_image_free(rgba);
-    m_images.push_back(std::move(entry));
+    image_cache().push_back(std::move(entry));
 }
 
 void WolfContainer::get_image_size(const char* src, const char* baseurl, litehtml::size& sz)
