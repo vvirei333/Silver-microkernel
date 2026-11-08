@@ -737,6 +737,7 @@ driver's contract.
 | [docs/FINAL_AUDIT.md](docs/FINAL_AUDIT.md) | Historical audit: DMA window, Ed25519 signing, evidence and known limitations (surface/graphics parts superseded by the graphics removal) |
 | [docs/PORTING_FOG.md](docs/PORTING_FOG.md) | Redmi 10C port plan: platform framebuffer seam, staged touch/storage/power/DSI work, hardware unknowns and regression matrix |
 | [docs/REFERENCE.md](docs/REFERENCE.md) | Reference console product: definition, acceptance checklist, current status, known gaps and next work |
+| [docs/VECTOR.md](docs/VECTOR.md) | Direction: console OS, host-rendered browser window, Linux ABI/Phosh assessment and staged plan |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
 
 Current verification snapshot (2026-11-08, console product): **217 host
