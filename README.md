@@ -301,8 +301,9 @@ EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 `clock_gettime`, `rt_sigprocmask`, `uname`, `getpid`/`getppid`/`gettid`,
 `brk`, `mmap`, `munmap`, `mprotect`, `prlimit64`, `getrandom`, `fstat`
 (console descriptors), `ioctl(TIOCGWINSZ)`, `writev`, `close`, `lseek`,
-`readlinkat` and `sched_yield`; anything else returns `-ENOSYS`. There is no
-file-descriptor table or signal delivery yet.
+`readlinkat`, `sched_yield`, `openat`, `getdents64` and `newfstatat`; anything
+else returns `-ENOSYS`. File descriptors 3+ are the VFS's own descriptors, so
+the Linux side has no second table; the filesystem view is read-only for now.
 
 The personality is fixed at spawn, so a foreign binary can never reach the
 Silver syscall table by choosing a colliding number. `linuxrun` is a
@@ -335,16 +336,31 @@ Program exited with status 11
 ```
 
 The last one is a **real static glibc binary** (libc initialisation, stdio,
-`exit`), which is the point of the track. The loader reads up to 1 MiB through
-`vfs::read_file_limit`; the general VFS cap stays 512 KiB, and the transient
-read is exactly file-sized. `fstat`, `ioctl(TIOCGWINSZ)`, `writev`, `close`,
-`lseek`, `readlinkat` and `sched_yield` are implemented, and
-`--features linux-abi-trace` logs any still-unsupported number (capped) so the
-next slice is driven by what a libc actually calls.
+`open`/`read`/`close`, `opendir`/`readdir`, `exit`), which is the point of the
+track. The loader reads up to 1 MiB through `vfs::read_file_limit`; the
+general VFS cap stays 512 KiB, and the transient read is exactly file-sized.
+`fstat`, `ioctl(TIOCGWINSZ)`, `writev`, `close`, `lseek`, `readlinkat` and
+`sched_yield` are implemented, and `--features linux-abi-trace` logs any
+still-unsupported number (capped) so the next slice is driven by what a libc
+actually calls.
 
-There is no file-descriptor table yet (`openat`/`read` of real files), no
-signal delivery and no thread creation, and `ET_DYN` (PIE) is not relocated —
-link with `-no-pie`.
+File descriptors 3+ are the Silver VFS's own descriptors (`vfs::open` already
+starts at 3, leaving 0-2 for stdin/stdout/stderr), so `openat`, `read`,
+`close`, `lseek`, `fstat`, `newfstatat` and `getdents64` are translations, not
+a second table. The Linux view of the filesystem is **read-only** for now:
+write intents fail with `-EROFS`. The test prints:
+
+```text
+howl> linuxrun /sfs/linux-libc
+hello from libc
+readme!!
+entries=5
+```
+
+Still missing: a per-task read scope (a Linux task can read any VFS path, which
+is acceptable on the single-user console but must be closed before untrusted
+apps), `/dev` nodes, signal delivery and thread creation, and `ET_DYN` (PIE)
+relocation — link with `-no-pie`.
 
 ## Bundle manifests and signing — complete
 

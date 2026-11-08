@@ -36,6 +36,8 @@ python3 scripts/sfs_inject.py "$IMAGE" build/rw.elf linux-rw
 
 # A real static libc binary (the SFS image is 1 MiB; all three together fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then
+    printf 'readme!!' > build/readme.txt
+    python3 scripts/sfs_inject.py "$IMAGE" build/readme.txt readme.txt
     python3 scripts/sfs_inject.py "$IMAGE" build/libc.elf linux-libc
     LIBC=" linuxrun /sfs/linux-libc"
 else

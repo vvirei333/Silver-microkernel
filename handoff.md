@@ -180,6 +180,18 @@ Redmi port is parked. The reference checklist is
   build the glibc run produces zero ENOSYS lines. Still missing: an fd table
   with `openat/read/close` of real files, signal delivery, thread creation,
   and ET_DYN relocation (link with `-no-pie`).
+  **Slice 4 (real files):** file descriptors are the Silver VFS's own (it
+  allocates from 3, reserving 0-2 for stdio), so the Linux side has no second
+  table and `vfs::close_task` already reaps them on exit. Added
+  `openat`, `read`, `close`, `lseek`, `fstat`, `newfstatat` and `getdents64`.
+  Supporting VFS additions: `open_dir`, `fd_len`, `fd_kind`, `fd_path`,
+  `lseek`, `dir_entries_from_fd`/`advance_dir_fd` (the descriptor offset
+  advances only by the entries serialized into the caller's buffer) and
+  `read_file_limit`. The Linux view is read-only (`-EROFS` for write intents).
+  Verified with static glibc: `linuxrun /sfs/linux-libc` prints
+  `hello from libc`, `readme!!`, `entries=5` and exits 0 (open/read/close and
+  opendir/readdir over `/sfs`). Follow-ups: per-task read scope, `/dev`
+  nodes, signals/threads, ET_DYN.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -206,10 +218,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 4 (a file-descriptor table with
-  `openat/read/close` and a read-only `/` mapping, `rt_sigaction`/`futex`,
-  then ET_DYN/PIE relocation and dynamic linker support); larger reader/CSS
-  budgets, full-page layout and keep-alive;
+- **Next steps:** Linux ABI slice 5 (per-task read scope, `/dev/null`/`zero`/
+  `random` nodes, `rt_sigaction`/`futex`, then ET_DYN/PIE and `ld.so` so
+  distro binaries and a real shell run); larger reader/CSS budgets, full-page
+  layout and keep-alive;
   TLS hardening (roots, RTC, RNG, TLS 1.2); **YouTube/JS/media still require a
   WebKit/Gecko-class engine, i.e. the Linux ABI + Phosh track**, not another
   reader increment;

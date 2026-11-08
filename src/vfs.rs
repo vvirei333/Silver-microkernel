@@ -23,6 +23,9 @@ pub const MAX_NAME_LEN: usize = 32;
 pub const MAX_PATH_LEN: usize = 191;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_APPEND: u64 = 2;
+/// `DirEntry::kind` and `vfs::fd_kind` values (shared with the on-disk SFS).
+pub const FD_KIND_FILE: u64 = 1;
+pub const FD_KIND_DIR: u64 = 2;
 
 /// Hard cap for a single file in the in-memory VFS. The kernel heap is only
 /// 2 MiB; a user-controlled file must never be able to consume an unbounded
@@ -587,6 +590,8 @@ struct OpenFile {
     offset: usize,
     writable: bool,
     append: bool,
+    /// Opened with `open_dir`: `read`/`write` are refused, `getdents` walks it.
+    directory: bool,
 }
 
 struct Vfs {
@@ -791,6 +796,45 @@ impl Vfs {
             offset,
             writable: flags & OPEN_WRITE != 0,
             append,
+            directory: false,
+        });
+        Ok(fd)
+    }
+
+    /// Opens a directory for `getdents`. Directories have no data stream, so
+    /// `offset` is the number of entries already returned.
+    fn open_dir(&mut self, owner: u64, cwd: &str, path: &str) -> Result<u64, ()> {
+        let resolved = resolve_path(cwd, path)?;
+        let (mount, relative) = self.resolve(&resolved);
+        if !self.mounts[mount].fs.is_directory(&relative)? {
+            return Err(());
+        }
+        if self
+            .open_files
+            .iter()
+            .filter(|file| file.owner == owner)
+            .count()
+            >= MAX_OPEN_FILES_PER_TASK
+            || self.open_files.len() >= MAX_OPEN_FILES
+        {
+            return Err(());
+        }
+        let mut fd = 3_u64;
+        while self
+            .open_files
+            .iter()
+            .any(|file| file.owner == owner && file.fd == fd)
+        {
+            fd = fd.checked_add(1).ok_or(())?;
+        }
+        self.open_files.push(OpenFile {
+            owner,
+            fd,
+            path: resolved,
+            offset: 0,
+            writable: false,
+            append: false,
+            directory: true,
         });
         Ok(fd)
     }
@@ -836,6 +880,9 @@ impl Vfs {
             .iter()
             .position(|file| file.owner == owner && file.fd == fd)
             .ok_or(())?;
+        if self.open_files[index].directory {
+            return Err(());
+        }
         let path = self.open_files[index].path.clone();
         let offset = self.open_files[index].offset;
         let (mount, relative) = self.resolve(&path);
@@ -866,6 +913,97 @@ impl Vfs {
             .write_at(&relative, offset, bytes, append)?;
         self.open_files[index].offset = new_offset;
         Ok(written)
+    }
+
+    /// `lseek(2)` on a plain file. Directories are not seekable in this VFS.
+    fn lseek(&mut self, owner: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, ()> {
+        let index = self
+            .open_files
+            .iter()
+            .position(|file| file.owner == owner && file.fd == fd)
+            .ok_or(())?;
+        if self.open_files[index].directory {
+            return Err(());
+        }
+        let path = self.open_files[index].path.clone();
+        let (mount, relative) = self.resolve(&path);
+        let size = self.mounts[mount].fs.len(&relative)? as i64;
+        let current = self.open_files[index].offset as i64;
+        let base = match whence {
+            0 => 0,
+            1 => current,
+            2 => size,
+            _ => return Err(()),
+        };
+        let new_offset = base.checked_add(offset).ok_or(())?;
+        if new_offset < 0 {
+            return Err(());
+        }
+        self.open_files[index].offset = new_offset as usize;
+        Ok(new_offset as u64)
+    }
+
+    fn fd_index(&self, owner: u64, fd: u64) -> Result<usize, ()> {
+        self.open_files
+            .iter()
+            .position(|file| file.owner == owner && file.fd == fd)
+            .ok_or(())
+    }
+
+    /// Size of an open file, or `0` for a directory.
+    fn fd_len(&self, owner: u64, fd: u64) -> Result<usize, ()> {
+        let index = self.fd_index(owner, fd)?;
+        if self.open_files[index].directory {
+            return Ok(0);
+        }
+        let path = self.open_files[index].path.clone();
+        let (mount, relative) = self.resolve(&path);
+        self.mounts[mount].fs.len(&relative)
+    }
+
+    fn fd_kind(&self, owner: u64, fd: u64) -> Option<u64> {
+        let index = self.fd_index(owner, fd).ok()?;
+        Some(if self.open_files[index].directory {
+            FD_KIND_DIR
+        } else {
+            FD_KIND_FILE
+        })
+    }
+
+    fn fd_path(&self, owner: u64, fd: u64) -> Option<String> {
+        let index = self.fd_index(owner, fd).ok()?;
+        Some(self.open_files[index].path.clone())
+    }
+
+    /// Returns up to `max` directory entries starting at the descriptor's
+    /// current index, plus that start index. The offset is not advanced; the
+    /// caller advances by exactly the number it serialized into its buffer.
+    fn dir_entries_from_fd(
+        &self,
+        owner: u64,
+        fd: u64,
+        max: usize,
+    ) -> Result<(Vec<DirEntry>, usize), ()> {
+        let index = self.fd_index(owner, fd)?;
+        if !self.open_files[index].directory {
+            return Err(());
+        }
+        let path = self.open_files[index].path.clone();
+        let (mount, relative) = self.resolve(&path);
+        let entries = self.mounts[mount].fs.read_dir(&relative)?;
+        let start = self.open_files[index].offset.min(entries.len());
+        let end = (start + max).min(entries.len());
+        Ok((entries[start..end].to_vec(), start))
+    }
+
+    fn advance_dir_fd(&mut self, owner: u64, fd: u64, count: usize) -> Result<(), ()> {
+        let index = self.fd_index(owner, fd)?;
+        let new_offset = self.open_files[index]
+            .offset
+            .checked_add(count)
+            .ok_or(())?;
+        self.open_files[index].offset = new_offset;
+        Ok(())
     }
 
     fn resolve_directory(&self, cwd: &str, path: &str) -> Result<String, ()> {
@@ -1103,6 +1241,39 @@ pub fn write(owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
 
 pub fn read_dir(cwd: &str, path: &str) -> Result<Vec<DirEntry>, ()> {
     with_vfs(|vfs| vfs.read_dir(cwd, path))
+}
+
+/// Opens a directory so `getdents` can walk it.
+pub fn open_dir(owner: u64, cwd: &str, path: &str) -> Result<u64, ()> {
+    with_vfs(|vfs| vfs.open_dir(owner, cwd, path))
+}
+
+pub fn lseek(owner: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, ()> {
+    with_vfs(|vfs| vfs.lseek(owner, fd, offset, whence))
+}
+
+pub fn fd_len(owner: u64, fd: u64) -> Result<usize, ()> {
+    with_vfs(|vfs| vfs.fd_len(owner, fd))
+}
+
+pub fn fd_kind(owner: u64, fd: u64) -> Option<u64> {
+    with_vfs(|vfs| vfs.fd_kind(owner, fd))
+}
+
+pub fn fd_path(owner: u64, fd: u64) -> Option<String> {
+    with_vfs(|vfs| vfs.fd_path(owner, fd))
+}
+
+pub fn dir_entries_from_fd(
+    owner: u64,
+    fd: u64,
+    max: usize,
+) -> Result<(Vec<DirEntry>, usize), ()> {
+    with_vfs(|vfs| vfs.dir_entries_from_fd(owner, fd, max))
+}
+
+pub fn advance_dir_fd(owner: u64, fd: u64, count: usize) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.advance_dir_fd(owner, fd, count))
 }
 
 /// Reads a whole file by path (dynamic ELF loader). Rejects files larger than
