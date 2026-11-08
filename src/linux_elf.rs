@@ -1,0 +1,345 @@
+//! Loader for foreign (Linux ABI) AArch64 ELF images.
+//!
+//! Unlike [`crate::elf::load_elf`], which serves the Silver userspace layout
+//! (three segments packed into one contiguous run at `USER_IMAGE_VA`), this
+//! loader honours the file's own `p_vaddr`: a normal Linux binary links at
+//! `0x40_0000` with separate text/data segments and gaps between them. Each
+//! `PT_LOAD` segment gets its own physical run; the runs are mapped into the
+//! child's address space at their virtual addresses by
+//! [`crate::mmu::install_linux_image`].
+//!
+//! Validation is complete before any frame is allocated, and every run is
+//! owned by the returned [`LinuxImage`], whose `Drop` releases it. The loader
+//! never maps anything: the address space does not exist yet.
+
+use alloc::vec;
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::{
+    elf::{self, Elf64Ehdr, Elf64Phdr, PageKind},
+    frame_allocator,
+    memory::{phys_to_virt, PAGE_SIZE},
+    mmu,
+};
+
+/// Upper bound on one image, in pages (16 MiB). Foreign binaries are loaded
+/// from the 512 KiB VFS file limit, so this is a defence against a crafted
+/// `p_memsz`, not a real constraint.
+const MAX_IMAGE_PAGES: usize = 4096;
+/// A normal ELF has a handful of `PT_LOAD` segments; more is suspicious.
+const MAX_SEGMENTS: usize = 16;
+
+/// Why a foreign image was rejected.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum LinuxElfError {
+    BadMagic,
+    BadClass,
+    BadDataEncoding,
+    NotExecutable,
+    WrongMachine,
+    Truncated,
+    NoProgramHeaders,
+    BadProgramHeader,
+    NoLoadSegments,
+    WritableExecutable,
+    NoReadPermission,
+    FileLargerThanMemory,
+    SegmentOutOfRange,
+    EntryOutsideText,
+    OverlappingSegments,
+    ImageTooLarge,
+    OutOfMemory,
+}
+
+/// One contiguous physical run mapped at `virtual_address`.
+pub struct LinuxRun {
+    /// Page-aligned start of the run in the child's virtual space.
+    pub virtual_address: usize,
+    pub physical_start: usize,
+    pub page_count: usize,
+    generation: u32,
+    /// Permission class per page, index `0` is `virtual_address`.
+    pub kinds: Vec<PageKind>,
+}
+
+/// A fully loaded Linux image plus the metadata the scheduler needs to map it
+/// and release its frames.
+pub struct LinuxImage {
+    pub entry: usize,
+    pub phdr_address: usize,
+    pub phentsize: u64,
+    pub phnum: u64,
+    /// Highest `p_vaddr + p_memsz` in the image.
+    pub upper_bound: usize,
+    pub runs: Vec<LinuxRun>,
+    released: AtomicBool,
+}
+
+impl LinuxImage {
+    /// Total frames held by the image, for the per-task memory ledger.
+    pub fn page_count(&self) -> usize {
+        self.runs.iter().map(|run| run.page_count).sum()
+    }
+
+    /// Returns every run to the allocator. Idempotent, like
+    /// [`crate::elf::LoadedImage::release`].
+    pub fn release(&self) {
+        if self.released.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        for run in &self.runs {
+            frame_allocator::free_contiguous_pages_tagged(
+                run.physical_start,
+                run.page_count,
+                run.generation,
+            );
+        }
+    }
+}
+
+impl Drop for LinuxImage {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+pub fn error_name(error: LinuxElfError) -> &'static str {
+    match error {
+        LinuxElfError::BadMagic => "bad magic",
+        LinuxElfError::BadClass => "bad class",
+        LinuxElfError::BadDataEncoding => "bad data encoding",
+        LinuxElfError::NotExecutable => "not ET_EXEC",
+        LinuxElfError::WrongMachine => "wrong machine",
+        LinuxElfError::Truncated => "truncated",
+        LinuxElfError::NoProgramHeaders => "no program headers",
+        LinuxElfError::BadProgramHeader => "bad program header",
+        LinuxElfError::NoLoadSegments => "no load segments",
+        LinuxElfError::WritableExecutable => "writable+executable segment",
+        LinuxElfError::NoReadPermission => "unreadable segment",
+        LinuxElfError::FileLargerThanMemory => "filesz > memsz",
+        LinuxElfError::SegmentOutOfRange => "segment out of range",
+        LinuxElfError::EntryOutsideText => "entry outside text",
+        LinuxElfError::OverlappingSegments => "overlapping segments",
+        LinuxElfError::ImageTooLarge => "image too large",
+        LinuxElfError::OutOfMemory => "out of memory",
+    }
+}
+
+struct Segment {
+    file_offset: usize,
+    virtual_address: usize,
+    file_size: usize,
+    memory_size: usize,
+    kind: PageKind,
+}
+
+/// Parses, validates, allocates and fills a Linux ABI image.
+pub fn load_linux_elf(bytes: &[u8]) -> Result<LinuxImage, LinuxElfError> {
+    let header = Elf64Ehdr::parse(bytes).map_err(map_error)?;
+    if &header.ident[..4] != b"\x7FELF" {
+        return Err(LinuxElfError::BadMagic);
+    }
+    if header.ident[4] != 2 {
+        return Err(LinuxElfError::BadClass);
+    }
+    if header.ident[5] != 1 {
+        return Err(LinuxElfError::BadDataEncoding);
+    }
+    if header.e_type != elf::ET_EXEC {
+        return Err(LinuxElfError::NotExecutable);
+    }
+    if header.e_machine != elf::EM_AARCH64 {
+        return Err(LinuxElfError::WrongMachine);
+    }
+
+    let entry = header.e_entry as usize;
+    let program_offset = header.e_phoff as usize;
+    let program_size = header.e_phentsize as usize;
+    let program_count = header.e_phnum as usize;
+    if program_size < elf::PHDR_SIZE || program_count == 0 {
+        return Err(LinuxElfError::NoProgramHeaders);
+    }
+    if program_count > MAX_SEGMENTS {
+        return Err(LinuxElfError::ImageTooLarge);
+    }
+
+    let mut segments = Vec::new();
+    let mut total_pages = 0usize;
+    for index in 0..program_count {
+        let header_offset = program_offset
+            .checked_add(index.checked_mul(program_size).ok_or(LinuxElfError::Truncated)?)
+            .ok_or(LinuxElfError::Truncated)?;
+        let ph = Elf64Phdr::parse(bytes, header_offset).map_err(map_error)?;
+        if ph.p_type != elf::PT_LOAD {
+            continue;
+        }
+        let flags = ph.p_flags;
+        if flags & elf::PF_W != 0 && flags & elf::PF_X != 0 {
+            return Err(LinuxElfError::WritableExecutable);
+        }
+        if flags & elf::PF_R == 0 {
+            return Err(LinuxElfError::NoReadPermission);
+        }
+        let kind = if flags & elf::PF_X != 0 {
+            PageKind::Text
+        } else if flags & elf::PF_W != 0 {
+            PageKind::Data
+        } else {
+            PageKind::ReadOnly
+        };
+        let file_offset = ph.p_offset as usize;
+        let virtual_address = ph.p_vaddr as usize;
+        let file_size = ph.p_filesz as usize;
+        let memory_size = ph.p_memsz as usize;
+        if memory_size == 0 {
+            continue;
+        }
+        if file_size > memory_size {
+            return Err(LinuxElfError::FileLargerThanMemory);
+        }
+        let memory_end = virtual_address
+            .checked_add(memory_size)
+            .ok_or(LinuxElfError::SegmentOutOfRange)?;
+        let file_end = file_offset
+            .checked_add(file_size)
+            .ok_or(LinuxElfError::SegmentOutOfRange)?;
+        if file_end > bytes.len()
+            || memory_end > mmu::USER_STACK_GUARD_VA
+            || virtual_address < PAGE_SIZE
+        {
+            return Err(LinuxElfError::SegmentOutOfRange);
+        }
+        // The file bytes of a segment must start on the same page offset as
+        // the segment itself, otherwise the first partial page cannot be
+        // filled from the file.
+        if file_offset % PAGE_SIZE != virtual_address % PAGE_SIZE {
+            return Err(LinuxElfError::BadProgramHeader);
+        }
+        let page_start = virtual_address & !(PAGE_SIZE - 1);
+        let pages = (memory_end.div_ceil(PAGE_SIZE)) - page_start / PAGE_SIZE;
+        total_pages = total_pages
+            .checked_add(pages)
+            .ok_or(LinuxElfError::ImageTooLarge)?;
+        if total_pages > MAX_IMAGE_PAGES {
+            return Err(LinuxElfError::ImageTooLarge);
+        }
+        segments.push(Segment {
+            file_offset,
+            virtual_address,
+            file_size,
+            memory_size,
+            kind,
+        });
+    }
+
+    if segments.is_empty() {
+        return Err(LinuxElfError::NoLoadSegments);
+    }
+    if !segments.iter().any(|segment| {
+        segment.kind == PageKind::Text
+            && entry >= segment.virtual_address
+            && entry < segment.virtual_address + segment.memory_size
+    }) {
+        return Err(LinuxElfError::EntryOutsideText);
+    }
+
+    // Sort by address. Two segments may not share a page: their permission
+    // classes would conflict and one copy would overwrite the other.
+    segments.sort_by_key(|segment| segment.virtual_address);
+    let mut previous_end = 0usize;
+    for segment in &segments {
+        let start = segment.virtual_address & !(PAGE_SIZE - 1);
+        if start < previous_end {
+            return Err(LinuxElfError::OverlappingSegments);
+        }
+        previous_end = (segment.virtual_address + segment.memory_size).div_ceil(PAGE_SIZE) * PAGE_SIZE;
+    }
+
+    // Compute auxv metadata before allocating anything.
+    let phdr_file_end = program_offset
+        .checked_add(program_count.checked_mul(program_size).ok_or(LinuxElfError::Truncated)?)
+        .ok_or(LinuxElfError::Truncated)?;
+    let mut phdr_address = 0usize;
+    for segment in &segments {
+        let segment_file_end = segment
+            .file_offset
+            .checked_add(segment.file_size)
+            .ok_or(LinuxElfError::SegmentOutOfRange)?;
+        if program_offset >= segment.file_offset && phdr_file_end <= segment_file_end {
+            phdr_address = segment
+                .virtual_address
+                .checked_add(program_offset - segment.file_offset)
+                .ok_or(LinuxElfError::SegmentOutOfRange)?;
+        }
+    }
+
+    let mut runs: Vec<LinuxRun> = Vec::with_capacity(segments.len());
+    let mut upper_bound = 0usize;
+    for segment in &segments {
+        let page_start = segment.virtual_address & !(PAGE_SIZE - 1);
+        let pages = (segment.virtual_address + segment.memory_size).div_ceil(PAGE_SIZE)
+            - page_start / PAGE_SIZE;
+        let Some((physical_start, generation)) =
+            frame_allocator::alloc_user_contiguous_pages_tagged(pages)
+        else {
+            // Release the runs allocated so far: they are not yet owned by a
+            // `LinuxImage`, so dropping the vector would leak their frames.
+            for run in &runs {
+                frame_allocator::free_contiguous_pages_tagged(
+                    run.physical_start,
+                    run.page_count,
+                    run.generation,
+                );
+            }
+            return Err(LinuxElfError::OutOfMemory);
+        };
+        let run = LinuxRun {
+            virtual_address: page_start,
+            physical_start,
+            page_count: pages,
+            generation,
+            kinds: vec![segment.kind; pages],
+        };
+        // Zero the whole run first (BSS is the tail the file does not cover),
+        // then copy the file bytes from the segment's page offset.
+        unsafe {
+            core::ptr::write_bytes(
+                phys_to_virt(physical_start) as *mut u8,
+                0,
+                pages * PAGE_SIZE,
+            );
+            let page_offset = segment.virtual_address - page_start;
+            let copy_len = (page_offset + segment.file_size)
+                .min(pages * PAGE_SIZE)
+                .min(bytes.len() - (segment.file_offset - page_offset));
+            if copy_len != 0 {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr().add(segment.file_offset - page_offset),
+                    phys_to_virt(physical_start) as *mut u8,
+                    copy_len,
+                );
+            }
+        }
+        upper_bound = upper_bound.max(segment.virtual_address + segment.memory_size);
+        runs.push(run);
+    }
+
+    Ok(LinuxImage {
+        entry,
+        phdr_address,
+        phentsize: program_size as u64,
+        phnum: program_count as u64,
+        upper_bound,
+        runs,
+        released: AtomicBool::new(false),
+    })
+}
+
+fn map_error(error: elf::ElfError) -> LinuxElfError {
+    match error {
+        elf::ElfError::Truncated => LinuxElfError::Truncated,
+        elf::ElfError::BadProgramHeader => LinuxElfError::BadProgramHeader,
+        _ => LinuxElfError::BadProgramHeader,
+    }
+}

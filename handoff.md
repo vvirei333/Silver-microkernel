@@ -141,13 +141,24 @@ Redmi port is parked. The reference checklist is
   `AT_PHENT`/`AT_PHNUM`, identity entries and `AT_RANDOM` (16 bytes below `sp`).
   `scripts/sfs_inject.py` writes a file into `disk.img` offline (direct,
   indirect and double-indirect blocks), so a foreign-toolchain binary does not
-  have to be embedded in the kernel. `tools/linux-test.sh` builds a
-  freestanding raw-syscall program (`tests/linux/hello.c`, one RX segment at
-  `0x4000_0000`) and installs it; QEMU prints `hello from linux abi` and
-  `EXIT: task=7 ... status=42`. Scope: the loader still maps one contiguous
-  run at `USER_IMAGE_VA`, so a distro binary at `0x40_0000` is not loadable
-  yet; arbitrary `p_vaddr` is the next slice. There is no file-descriptor
-  table, signal delivery or thread creation: those calls are EOF/no-op.
+  have to be embedded in the kernel. `tools/linux-test.sh` builds two
+  freestanding raw-syscall programs and installs them; QEMU prints `hello from
+  linux abi` (exit 42) and `RW data+bss ok` (exit 7).
+  **Slice 2 (arbitrary `p_vaddr`):** `src/linux_elf.rs` honours each
+  `PT_LOAD`'s own virtual address, so a normal `0x40_0000` binary loads. Every
+  segment gets its own physical run, gaps are allowed, text is RX, data is RW
+  and BSS is zeroed. `mmu::install_linux_run` allocates the per-2 MiB L3
+  tables (and a per-1 GiB L2 for the low window) on demand and registers them
+  with the space root, so `retire_space` frees them; `install_linux_image`
+  maps every run after `create_task_space`. Segment page ranges may not
+  overlap, W^X is rejected, and `ET_DYN`/PIE is not relocated yet. `linuxrun`
+  is now foreground: `spawn_elf_task(..., foreground = true)` assigns the
+  console before `enqueue_ready`, because on `-smp 2` an AP could otherwise
+  run and even exit the child between the shell's `spawn` and `console_set`
+  (observed as "could not assign the foreground console" plus lost output).
+  Remaining gap for a real libc: the VFS cap is 512 KiB and a static glibc
+  `hello` is ~800 KiB; `read_file` also allocates the full cap, and the kernel
+  heap is 2 MiB, so file loading and these first libc syscalls are next.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -174,10 +185,11 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 2 (arbitrary `p_vaddr` mappings so a real
-  `0x40_0000` binary loads, then a file-descriptor table and `openat/read/close`
-  for static busybox/musl); larger reader/CSS budgets, full-page layout and
-  keep-alive;
+- **Next steps:** Linux ABI slice 3 (raise the file/heap budget for an ~800 KiB
+  static libc binary, fix `vfs::read_file` to allocate by length, add a
+  file-descriptor table with `openat/read/close`, then `rt_sigaction` and
+  `futex` for real libc startup); larger reader/CSS budgets, full-page layout
+  and keep-alive;
   TLS hardening (roots, RTC, RNG, TLS 1.2); **YouTube/JS/media still require a
   WebKit/Gecko-class engine, i.e. the Linux ABI + Phosh track**, not another
   reader increment;

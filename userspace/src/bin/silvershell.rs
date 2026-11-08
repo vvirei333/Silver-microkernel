@@ -787,17 +787,17 @@ fn run_utility(program: u64, arguments: &str) {
 /// shell lends it the console and waits — mirroring `run_utility`, but with the
 /// executable resolved from the VFS instead of the embedded program table.
 fn run_elf(path: &str) {
-    run_elf_with(path, syscall::spawn_path);
+    run_elf_with(path, syscall::spawn_path, true);
 }
 
 /// Loads a foreign ELF (`linuxrun <path>`) and runs it with the Linux syscall
-/// personality. The shell still owns the console and hands it to the child for
-/// the duration, exactly like `run`.
+/// personality. The kernel assigns the console inside the spawn, before the
+/// child can run on any CPU, so no `console_set` round trip is needed.
 fn run_linux_elf(path: &str) {
-    run_elf_with(path, syscall::spawn_linux_path);
+    run_elf_with(path, syscall::spawn_linux_path, false);
 }
 
-fn run_elf_with(path: &str, spawn: fn(&str) -> Option<u64>) {
+fn run_elf_with(path: &str, spawn: fn(&str) -> Option<u64>, assign_console: bool) {
     if path.is_empty() {
         syscall::print("Usage: run <path>\r\n");
         return;
@@ -808,7 +808,7 @@ fn run_elf_with(path: &str, spawn: fn(&str) -> Option<u64>) {
         syscall::print("'\r\n");
         return;
     };
-    if !syscall::console_set(cap_id) {
+    if assign_console && !syscall::console_set(cap_id) {
         syscall::print("run: could not assign the foreground console.\r\n");
         let _ = syscall::kill(cap_id);
         let _ = syscall::wait(cap_id);

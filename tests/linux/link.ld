@@ -1,15 +1,15 @@
-/* The Linux ABI slice 1 loads foreign images through the native image window
- * (0x4000_0000), because the loader still maps one contiguous run at
- * USER_IMAGE_VA. A real distro binary links at 0x40_0000; supporting that is
- * the next slice (arbitrary p_vaddr mappings).
+/* Foreign test program linked at the address a normal Linux binary uses.
  *
- * Everything lives in one RX segment: the test writes no globals, and the
- * kernel loader rejects holes and W+X segments.
+ * `load_linux_elf` honours `p_vaddr`, so this no longer has to live in the
+ * native image window. Everything is one RX segment: the test writes no
+ * globals, and the loader rejects W+X segments.
+ *
+ * The kernel stack is built by the loader; `_start` never returns.
  */
 ENTRY(_start)
 SECTIONS
 {
-  . = 0x40000000;
+  . = 0x400000;
   .text : { *(.text*) *(.rodata*) *(.data*) }
   /DISCARD/ : { *(.comment) *(.note*) *(.eh_frame*) }
 }

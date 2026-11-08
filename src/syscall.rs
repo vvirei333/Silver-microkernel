@@ -576,7 +576,7 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
         if bytes.len() > EXEC_FILE_LIMIT {
             return SYSCALL_ERROR;
         }
-        let Ok(image) = elf::load_elf(&bytes) else {
+        let Ok(image) = crate::linux_elf::load_linux_elf(&bytes) else {
             return SYSCALL_ERROR;
         };
         // The same bundle policy applies: an unkeyed plain ELF has no digest
@@ -597,16 +597,8 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
             b"HOME=/".to_vec(),
             b"TERM=vt100".to_vec(),
         ];
-        scheduler::spawn_elf_with_policy_and_args(
-            image,
-            0,
-            policy.write_prefix,
-            policy.quota,
-            scheduler::Personality::Linux,
-            argv,
-            envp,
-        )
-        .unwrap_or(SYSCALL_ERROR)
+        scheduler::spawn_linux_elf_with_args(image, policy.write_prefix, policy.quota, argv, envp)
+            .unwrap_or(SYSCALL_ERROR)
     })
 }
 

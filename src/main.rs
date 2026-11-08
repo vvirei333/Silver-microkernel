@@ -22,6 +22,7 @@ mod condvar;
 mod console;
 #[cfg(not(feature = "std"))]
 mod elf;
+mod linux_elf;
 #[cfg(not(feature = "std"))]
 mod elf_loader;
 #[cfg(not(feature = "std"))]

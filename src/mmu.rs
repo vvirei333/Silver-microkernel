@@ -1316,6 +1316,162 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
     true
 }
 
+/// Maps one Linux image run into `ttbr0` at its own virtual address.
+///
+/// This is the spawn-time counterpart of [`map_user_pages_at`]: it accepts any
+/// user virtual address below the fixed stack window, allocates the per-2 MiB
+/// L3 tables (and a per-1 GiB L2 table) on demand, and registers them with the
+/// space root so the normal teardown frees them. It does **not** zero the
+/// pages: the Linux loader fills and zeroes the whole run before the space
+/// exists, and zeroing here would erase the code it just copied.
+///
+/// Runs under the kernel lock, for a space that is not executing. On failure
+/// the pages installed by this call are unmapped again; tables allocated by it
+/// stay registered with the space and are reclaimed if the space is destroyed.
+pub fn install_linux_run(
+    ttbr0: usize,
+    virtual_address: usize,
+    physical_start: usize,
+    page_count: usize,
+    kinds: &[crate::elf::PageKind],
+) -> bool {
+    if page_count == 0
+        || kinds.len() != page_count
+        || virtual_address % GRANULE != 0
+        || physical_start % GRANULE != 0
+    {
+        return false;
+    }
+    let Some(span) = page_count.checked_mul(GRANULE) else {
+        return false;
+    };
+    let Some(end) = virtual_address.checked_add(span) else {
+        return false;
+    };
+    if virtual_address < GRANULE || end > USER_STACK_GUARD_VA {
+        return false;
+    }
+    let root = root_of(ttbr0);
+    if !space_root_valid(root) {
+        return false;
+    }
+
+    unsafe {
+        let l1_user = follow_table(root, 0);
+        let mut installed = 0usize;
+        for index in 0..page_count {
+            let va = virtual_address + index * GRANULE;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_index = (va >> 21) & (ENTRIES - 1);
+            let l3_index = (va >> 12) & (ENTRIES - 1);
+
+            // The L2 table for this 1 GiB span, created on first use.
+            let l2_entry = read_entry(l1_user, l1_index);
+            let l2 = if l2_entry == 0 {
+                let Some(table) = alloc_registered_table(root) else {
+                    rollback_linux_run(ttbr0, virtual_address, installed);
+                    return false;
+                };
+                write_entry(l1_user, l1_index, table as u64 | DESC_TABLE);
+                clean_entry_line(l1_user, l1_index);
+                table
+            } else if l2_entry & DESC_TABLE == DESC_TABLE {
+                descriptor_address(l2_entry) as usize
+            } else {
+                rollback_linux_run(ttbr0, virtual_address, installed);
+                return false;
+            };
+
+            // The L3 table for this 2 MiB block, created on first use.
+            let l3_entry = read_entry(l2, l2_index);
+            let l3 = if l3_entry == 0 {
+                let Some(table) = alloc_registered_table(root) else {
+                    rollback_linux_run(ttbr0, virtual_address, installed);
+                    return false;
+                };
+                write_entry(l2, l2_index, table as u64 | DESC_TABLE);
+                clean_entry_line(l2, l2_index);
+                table
+            } else if l3_entry & DESC_TABLE == DESC_TABLE {
+                descriptor_address(l3_entry) as usize
+            } else {
+                rollback_linux_run(ttbr0, virtual_address, installed);
+                return false;
+            };
+
+            if read_entry(l3, l3_index) != 0 {
+                rollback_linux_run(ttbr0, virtual_address, installed);
+                return false;
+            }
+            let physical = physical_start + index * GRANULE;
+            let descriptor = match kinds[index] {
+                crate::elf::PageKind::Text => user_text_page(physical),
+                crate::elf::PageKind::ReadOnly => user_rodata_page(physical),
+                crate::elf::PageKind::Data => user_data_page(physical),
+            };
+            write_entry(l3, l3_index, descriptor);
+            clean_entry_line(l3, l3_index);
+            installed += 1;
+        }
+    }
+    finish_table_changes_for(ttbr0);
+    true
+}
+
+/// Maps every run of a foreign image. See [`install_linux_run`].
+pub fn install_linux_image(ttbr0: usize, image: &crate::linux_elf::LinuxImage) -> bool {
+    for run in &image.runs {
+        if !install_linux_run(
+            ttbr0,
+            run.virtual_address,
+            run.physical_start,
+            run.page_count,
+            &run.kinds,
+        ) {
+            return false;
+        }
+    }
+    true
+}
+
+fn alloc_registered_table(root: usize) -> Option<usize> {
+    let (page, generation) = frame_allocator::alloc_page_tagged()?;
+    unsafe {
+        zero_page(page);
+    }
+    if page_table_register(page, generation, root).is_none() {
+        frame_allocator::free_page_tagged(page, generation);
+        return None;
+    }
+    Some(page)
+}
+
+fn rollback_linux_run(ttbr0: usize, virtual_address: usize, installed: usize) {
+    unsafe {
+        let root = root_of(ttbr0);
+        let l1_user = follow_table(root, 0);
+        for index in 0..installed {
+            let va = virtual_address + index * GRANULE;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_index = (va >> 21) & (ENTRIES - 1);
+            let l3_index = (va >> 12) & (ENTRIES - 1);
+            let l2_entry = read_entry(l1_user, l1_index);
+            if l2_entry & DESC_TABLE != DESC_TABLE {
+                continue;
+            }
+            let l2 = descriptor_address(l2_entry) as usize;
+            let l3_entry = read_entry(l2, l2_index);
+            if l3_entry & DESC_TABLE != DESC_TABLE {
+                continue;
+            }
+            let l3 = descriptor_address(l3_entry) as usize;
+            write_entry(l3, l3_index, 0);
+            clean_entry_line(l3, l3_index);
+        }
+    }
+    finish_table_changes_for(ttbr0);
+}
+
 fn table_empty(table: usize) -> bool {
     unsafe {
         let entries = phys_to_virt(table) as *const u64;

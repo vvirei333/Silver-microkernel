@@ -53,13 +53,13 @@ const EI_DATA: usize = 5;
 const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
-const ET_EXEC: u16 = 2;
-const EM_AARCH64: u16 = 183;
-const PT_LOAD: u32 = 1;
-const PF_X: u32 = 1;
-const PF_W: u32 = 2;
-const PF_R: u32 = 4;
-const PHDR_SIZE: usize = 56;
+pub(crate) const ET_EXEC: u16 = 2;
+pub(crate) const EM_AARCH64: u16 = 183;
+pub(crate) const PT_LOAD: u32 = 1;
+pub(crate) const PF_X: u32 = 1;
+pub(crate) const PF_W: u32 = 2;
+pub(crate) const PF_R: u32 = 4;
+pub(crate) const PHDR_SIZE: usize = 56;
 
 /// Why a candidate image was rejected. Kept `Copy` so callers can report the
 /// exact stage that failed without allocating.
@@ -124,7 +124,7 @@ pub struct Elf64Ehdr {
 }
 
 impl Elf64Ehdr {
-    fn parse(bytes: &[u8]) -> Result<Self, ElfError> {
+    pub(crate) fn parse(bytes: &[u8]) -> Result<Self, ElfError> {
         let mut ident = [0_u8; 16];
         ident.copy_from_slice(bytes.get(..16).ok_or(ElfError::Truncated)?);
         Ok(Self {
@@ -161,7 +161,7 @@ pub struct Elf64Phdr {
 }
 
 impl Elf64Phdr {
-    fn parse(bytes: &[u8], offset: usize) -> Result<Self, ElfError> {
+    pub(crate) fn parse(bytes: &[u8], offset: usize) -> Result<Self, ElfError> {
         let end = offset.checked_add(PHDR_SIZE).ok_or(ElfError::Truncated)?;
         let ph = bytes.get(offset..end).ok_or(ElfError::Truncated)?;
         Ok(Self {

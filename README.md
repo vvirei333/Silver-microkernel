@@ -296,20 +296,35 @@ else returns `-ENOSYS`. There is no file-descriptor table or signal delivery
 yet.
 
 The personality is fixed at spawn, so a foreign binary can never reach the
-Silver syscall table by choosing a colliding number. `tests/linux/` and
-`tools/linux-test.sh` build a freestanding raw-syscall program, install it with
-`scripts/sfs_inject.py`, and verify the path in QEMU:
+Silver syscall table by choosing a colliding number. `linuxrun` is a
+foreground command: the kernel assigns it the console inside the spawn
+syscall, before the child can be dispatched on any CPU, then returns; the
+shell only waits. (Assigning the console from userspace after spawn is racy —
+an AP can run and even exit the child first.)
+
+`load_linux_elf` honours the file's own `p_vaddr`, so a normal Linux binary at
+`0x40_0000` loads: each `PT_LOAD` segment gets its own physical run, gaps are
+allowed, text is mapped RX, data RW and BSS is zero-filled. The per-2 MiB L3
+tables (and a per-1 GiB L2 table for the low window) are allocated on demand
+and registered with the space root, so the normal teardown frees them.
+
+`tests/linux/` and `tools/linux-test.sh` build two freestanding raw-syscall
+programs, install them with `scripts/sfs_inject.py`, and verify the path in
+QEMU:
 
 ```text
 howl> linuxrun /sfs/linux-hello
 hello from linux abi
 Program exited with status 42
+
+howl> linuxrun /sfs/linux-rw
+RW data+bss ok
+Program exited with status 7
 ```
 
-Limit of this slice: a foreign image must currently link into the native image
-window (`0x4000_0000..0x4080_0000`), because the loader maps one contiguous run
-at `USER_IMAGE_VA`. A real distro binary links at `0x40_0000`; arbitrary
-`p_vaddr` mappings are the next slice.
+Remaining gap before a real libc: the VFS file cap is 512 KiB and a static
+glibc `hello` is ~800 KiB; the kernel also needs these first calls to work.
+`ET_DYN` (PIE) images are not relocated yet — link with `-no-pie`.
 
 ## Bundle manifests and signing — complete
 

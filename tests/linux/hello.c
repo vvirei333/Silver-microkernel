@@ -1,7 +1,7 @@
 /* Freestanding AArch64 Linux program used by the Linux ABI self-test.
  *
- * It makes raw Linux syscalls (`svc #0` with x8 = number) and links into the
- * native image window so the current loader can map it:
+ * It makes raw Linux syscalls (`svc #0` with x8 = number) and links at the
+ * address a normal Linux binary uses:
  *
  *   linuxrun /sfs/linux-hello
  *

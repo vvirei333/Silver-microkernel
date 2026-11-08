@@ -15,6 +15,7 @@ use crate::{
     console,
     elf::LoadedImage,
     elf_loader, frame_allocator, interrupts, kernel_stack,
+    linux_elf::LinuxImage,
     memory::{phys_to_virt, virt_to_phys, MemoryRegion, PAGE_SIZE},
     mmu, mutex, smp, timer, user_program, vfs,
     wait_queue::WaitQueue,
@@ -247,6 +248,8 @@ pub struct Task {
     pub user_stack: MemoryRegion,
     pub ttbr0: usize,
     user_image: Option<LoadedImage>,
+    /// A foreign (Linux ABI) image, mapped at its own virtual addresses.
+    linux_image: Option<LinuxImage>,
     /// `(physical page, allocation generation)` for every `brk` page. The
     /// tag makes a stale teardown free fail instead of releasing a frame that
     /// was already recycled.
@@ -3102,26 +3105,61 @@ pub fn spawn_elf_with_policy_and_args(
         return None;
     }
     let task_id = spawn_elf_task(
-        image,
+        Some(image),
+        None,
         argument,
         fs_write_prefix,
         fs_quota,
         personality,
         argv,
         envp,
+        false,
+    )?;
+    let parent = current_task_mut()?;
+    Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
+}
+
+/// Spawns a foreign (Linux ABI) image. Same capability model as
+/// [`spawn_elf_with_policy_and_args`]: the child starts with no rights and the
+/// parent gets a handle it can delegate.
+pub fn spawn_linux_elf_with_args(
+    image: LinuxImage,
+    fs_write_prefix: Option<String>,
+    fs_quota: Option<(u32, u32)>,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> Option<capability::CapId> {
+    if scheduler_manager().map_or(true, |manager| !has_task_capacity(manager)) {
+        return None;
+    }
+    if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
+        return None;
+    }
+    let task_id = spawn_elf_task(
+        None,
+        Some(image),
+        0,
+        fs_write_prefix,
+        fs_quota,
+        Personality::Linux,
+        argv,
+        envp,
+        true,
     )?;
     let parent = current_task_mut()?;
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
 }
 
 fn spawn_elf_task(
-    image: LoadedImage,
+    user_image: Option<LoadedImage>,
+    linux_image: Option<LinuxImage>,
     argument: u64,
     fs_write_prefix: Option<String>,
     fs_quota: Option<(u32, u32)>,
     personality: Personality,
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
+    foreground: bool,
 ) -> Option<u64> {
     let manager = scheduler_manager()?;
     if !has_task_capacity(manager) {
@@ -3137,7 +3175,8 @@ fn spawn_elf_task(
         id,
         None,
         Some((user_program::PROGRAM_DYNAMIC, argument)),
-        Some(image),
+        user_image,
+        linux_image,
         Vec::new(),
         argv,
         envp,
@@ -3151,6 +3190,13 @@ fn spawn_elf_task(
     manager.next_id += 1;
     // A freshly spawned task starts Ready: queue it on the spawning CPU.
     let index = manager.tasks.len() - 1;
+    // A foreground child (the shell's `linuxrun`) gets the console before it
+    // can be dispatched. Assigning it from the shell *after* spawn is racy: on
+    // an SMP boot another CPU can run and even exit the child between the two
+    // syscalls, and its output would be discarded.
+    if foreground && current_task_owns_console() {
+        set_console_owner(id);
+    }
     enqueue_ready(manager, smp::this_cpu_id(), index);
     Some(id)
 }
@@ -3562,6 +3608,7 @@ fn spawn_inner(
         entry,
         user,
         image,
+        None,
         arguments,
         argv,
         envp,
@@ -4115,14 +4162,13 @@ fn initial_self_rights(program: u64) -> Option<u32> {
     Some(rights)
 }
 
-/// Linux `auxv` entries for an image loaded into the native image window.
+/// Linux `auxv` entries for a loaded image.
 ///
 /// `AT_RANDOM` and the terminating `AT_NULL` are appended by
 /// `build_linux_stack`, so they are not listed here. `AT_PHDR` is zero when
 /// the program headers are not covered by a `PT_LOAD`; static binaries that do
 /// not consult it (musl's `_start`) are unaffected.
-fn linux_auxv(image: &LoadedImage) -> Vec<(u64, u64)> {
-    const AT_NULL: u64 = 0;
+fn linux_auxv(image: AuxvImage) -> Vec<(u64, u64)> {
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
     const AT_PHNUM: u64 = 5;
@@ -4151,12 +4197,43 @@ fn linux_auxv(image: &LoadedImage) -> Vec<(u64, u64)> {
     entries
 }
 
+/// The subset of a loaded image that `auxv` needs, so the native and Linux
+/// loaders share one builder.
+#[derive(Copy, Clone)]
+struct AuxvImage {
+    entry: usize,
+    phdr_address: usize,
+    phentsize: u64,
+    phnum: u64,
+}
+
+impl AuxvImage {
+    fn native(image: &LoadedImage) -> Self {
+        Self {
+            entry: image.entry,
+            phdr_address: image.phdr_address,
+            phentsize: image.phentsize,
+            phnum: image.phnum,
+        }
+    }
+
+    fn linux(image: &LinuxImage) -> Self {
+        Self {
+            entry: image.entry,
+            phdr_address: image.phdr_address,
+            phentsize: image.phentsize,
+            phnum: image.phnum,
+        }
+    }
+}
+
 impl Task {
     fn new(
         id: u64,
         entry: Option<extern "C" fn() -> !>,
         user: Option<(u64, u64)>,
         image: Option<LoadedImage>,
+        linux_image: Option<LinuxImage>,
         arguments: Vec<u8>,
         argv: Vec<Vec<u8>>,
         envp: Vec<Vec<u8>>,
@@ -4176,9 +4253,13 @@ impl Task {
             // Linux wants the same argc/argv/envp prefix plus auxv. The values
             // are derivable from the loaded image, so a foreign ELF starts with
             // a stack its libc understands.
-            let linux_auxv = match (&image, personality) {
-                (Some(image), Personality::Linux) => linux_auxv(image),
-                _ => Vec::new(),
+            let linux_auxv: Vec<(u64, u64)> = match personality {
+                Personality::Linux => linux_image
+                    .as_ref()
+                    .map(|image| linux_auxv(AuxvImage::linux(image)))
+                    .or_else(|| image.as_ref().map(|image| linux_auxv(AuxvImage::native(image))))
+                    .unwrap_or_default(),
+                Personality::Native => Vec::new(),
             };
             Some(match personality {
                 Personality::Native => silver_microkernel::build_argv_envp(
@@ -4200,7 +4281,8 @@ impl Task {
         // pages already exist (RAII releases them if this returns None), and
         // every other frame is allocated below. Page tables beyond the fixed
         // space are not charged separately (at most one L3 per 2 MiB).
-        let image_frames = image.as_ref().map_or(0, |image| image.page_count);
+        let image_frames = image.as_ref().map_or(0, |image| image.page_count)
+            + linux_image.as_ref().map_or(0, |image| image.page_count());
         let ledger_frames = TASK_STACK_PAGES
             + mmu::SPACE_TABLE_FRAMES
             + 1 // private page
@@ -4253,6 +4335,9 @@ impl Task {
             if let Some(image) = &user_image {
                 image.release();
             }
+            if let Some(image) = &linux_image {
+                image.release();
+            }
             frame_allocator::free_page_tagged(private_page, private_page_generation);
             if !user_stack.is_empty() {
                 frame_allocator::free_contiguous_pages_tagged(
@@ -4264,6 +4349,33 @@ impl Task {
             kernel_stack::free(stack_start);
             return None;
         };
+
+        // A Linux image is mapped at its own p_vaddr after the base space
+        // exists; the loader cannot do it earlier because the space root is
+        // created here. `destroy_task_space` also frees the private page.
+        if let Some(image) = &linux_image {
+            if !mmu::install_linux_image(ttbr0, image) {
+                mmu::destroy_task_space(
+                    space_token,
+                    private_page,
+                    private_page_generation,
+                    mmu::asid_of(ttbr0),
+                );
+                if let Some(image) = &user_image {
+                    image.release();
+                }
+                image.release();
+                if !user_stack.is_empty() {
+                    frame_allocator::free_contiguous_pages_tagged(
+                        user_stack.start,
+                        TASK_USER_STACK_PAGES,
+                        user_stack_generation,
+                    );
+                }
+                kernel_stack::free(stack_start);
+                return None;
+            }
+        }
 
         // Publish the argv/envp block on the freshly mapped user stack before
         // the task can run. The stack VA range is backed by `user_stack`, so
@@ -4288,6 +4400,8 @@ impl Task {
         let stack = MemoryRegion::new(stack_start, stack_start + TASK_STACK_SIZE);
         let mut context = TaskContext::zero();
         context.registers[0] = if let Some(image) = &user_image {
+            image.entry as u64
+        } else if let Some(image) = &linux_image {
             image.entry as u64
         } else {
             entry.expect("kernel task entry is required") as usize as u64
@@ -4340,6 +4454,7 @@ impl Task {
             space_token,
             ttbr0,
             user_image,
+            linux_image,
             heap_pages: Vec::new(),
             dma_pages: Vec::new(),
             mmap_regions: Vec::new(),
@@ -4371,7 +4486,7 @@ impl Task {
         if requested == 0 {
             return Some(self.program_break);
         }
-        if self.user_image.is_none()
+        if (self.user_image.is_none() && self.linux_image.is_none())
             || requested < mmu::USER_HEAP_VA
             || requested > mmu::USER_HEAP_VA + mmu::USER_HEAP_MAX_SIZE
         {
@@ -4720,6 +4835,9 @@ impl Task {
         if let Some(image) = &self.user_image {
             image.release();
         }
+        if let Some(image) = &self.linux_image {
+            image.release();
+        }
     }
 
     /// Drops the last executable-resource references after teardown. The
@@ -4734,6 +4852,7 @@ impl Task {
         self.space_token = TableToken::empty();
         self.ttbr0 = 0;
         self.user_image = None;
+        self.linux_image = None;
         self.heap_pages.clear();
         self.dma_pages.clear();
         self.mmap_regions.clear();
