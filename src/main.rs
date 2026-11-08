@@ -120,6 +120,15 @@ compile_error!(
      'fog-ui'/'fog-diag' paint a kernel status panel on the same buffer"
 );
 
+#[cfg(all(
+    feature = "console",
+    any(feature = "fog-display", feature = "fog-ui", feature = "fog-diag")
+))]
+compile_error!(
+    "'console' is the headless product profile; it cannot be combined with a \
+     framebuffer/compositor profile"
+);
+
 #[cfg(all(not(feature = "std"), not(target_arch = "aarch64")))]
 compile_error!("The bare-metal kernel currently supports only AArch64");
 

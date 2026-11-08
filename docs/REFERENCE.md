@@ -46,6 +46,7 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 | Shell | `help`, `uname`, `ls /`, `health`, file commands | **pass** |
 | Init | Silverd resolves task ids (not cap ids) before grants | **fixed** |
 | Capabilities | `CAP_MOUNT`/`CAP_POWER` outside `CAP_ALL`; console shell gets `CAP_POWER` by kernel policy only | **pass** |
+| Console size | graphics programs compiled out of the console image | **pass** |
 | Power | `poweroff`/`reboot` commands; SMC on Qualcomm, HVC on QEMU | **implemented; fog path verified earlier, QEMU PSCI caveat below** |
 | SMP | QEMU `-smp 4` selftest | **15 PASS / 0 FAIL** |
 | Fog QEMU | relocation, at-link, fail-closed park, timer | **PASS** |
@@ -69,10 +70,10 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
    driver/server; a machine without a virtio-net device reports a probe failure
    and continues. A `console-net` split is the next cleanup if the product
    should not even embed the stack.
-5. **Graphics code stays in the kernel image.** `GPU_DRIVER`, `INPUT_DRIVER`
-   and `HOME` are still embedded by `user_program.rs` even in the console
-   build. They are not started, but a size-conscious console build should
-   compile them out.
+5. **Resolved: graphics programs are not embedded in the console image.**
+   `GPU_DRIVER`, `INPUT_DRIVER` and `HOME` are compiled out of `user_program`
+   under `console`; the console image is about 82 KiB smaller. Combining
+   `console` with `fog-display`/`fog-ui`/`fog-diag` is a compile error.
 
 ## Verification commands
 
