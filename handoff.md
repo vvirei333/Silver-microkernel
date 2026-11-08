@@ -75,10 +75,14 @@ Redmi port is parked. The reference checklist is
   flash a white screen. The litehtml path now fetches `<img>` sources through
   the guest net_server and decodes them in-guest with `stb_image`
   (PNG/JPEG/GIF): up to four per page, 512 KiB encoded and 300k pixels each,
-  cached as RGBA and drawn scaled. The cache survives document rebuilds, and
-  tab switches only reuse it (no network fetch), so returning to a page is
-  instant even if it has images. The old text renderer keeps its viewer-side
-  image path as a fallback.
+  cached as RGBA and drawn scaled. Images no longer block the first paint:
+  the document is created in collect mode, the browser fetches one image at a
+  time while the loop stays responsive, and rebuilds the document from the
+  cache when the queue drains (scroll offset preserved). The cache survives
+  document rebuilds, and tab switches only reuse it (no network fetch), so
+  returning to a page is instant even if it has images. It is capped at eight
+  images / 3M pixels and evicts the oldest site. The old text renderer keeps
+  its viewer-side image path as a fallback.
   The first line of every page used to lose its spaces because the wrap buffer
   had not flushed yet; a `line_len` check fixed it. Bookmarks are
   persisted in `/sfs/wolfser.bookmarks` using a path-scoped write window

@@ -68,4 +68,11 @@ The linked browser image is ~6 MiB, so the kernel was widened accordingly:
   pixels each; the RGBA cache is shared across document rebuilds and drawn
   scaled through litehtml's `<img>` box. A tab switch reuses cached images and
   never starts a network fetch, so it cannot block on a slow image.
+- A fresh navigation starts in collect mode: `load_image` records the sources
+  instead of fetching, the page paints at once, Rust fetches one image at a
+  time (non-blocking poll of the net_server reply) and calls
+  `wolf_html_cache_image`. When the queue drains the document is rebuilt from
+  the cache, so the page reflows with the images but the scroll offset stays.
+  The cache keeps at most eight decoded images / 3M pixels and evicts the
+  oldest site, so a second page is not blocked by the first page's images.
 - There is no JavaScript or media pipeline.

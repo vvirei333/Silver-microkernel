@@ -96,6 +96,12 @@ const TAB_BAR_HEIGHT: u32 = 22;
 const TAB_TEXT_Y: u32 = 9;
 const TAB_CLOSE_WIDTH: u32 = 22;
 const TAB_PLUS_WIDTH: u32 = 28;
+
+/// Image policy passed to `wolf_html_create`.
+const IMAGE_CACHE_ONLY: i32 = 0;
+const IMAGE_COLLECT: i32 = 2;
+const IMAGE_SRC_CAPACITY: usize = 512;
+const IMAGE_FETCH_TICKS: u64 = 6 * TICKS_PER_SECOND;
 const FIND_CAPACITY: usize = 64;
 const BOOKMARK_MAX: usize = 8;
 const BOOKMARK_PATH: &str = "/sfs/wolfser.bookmarks";
@@ -168,8 +174,15 @@ extern "C" {
         width: i32,
         height: i32,
         base: *const u8,
-        allow_images: i32,
+        image_mode: i32,
     ) -> *mut WolfHtml;
+    fn wolf_html_pending_image(handle: *mut WolfHtml, out: *mut u8, cap: i32) -> i32;
+    fn wolf_html_cache_image(
+        handle: *mut WolfHtml,
+        src: *const u8,
+        data: *const u8,
+        len: i32,
+    );
     fn wolf_html_destroy(handle: *mut WolfHtml);
     fn wolf_html_height(handle: *mut WolfHtml) -> i32;
     fn wolf_html_width(handle: *mut WolfHtml) -> i32;
@@ -226,6 +239,16 @@ struct App {
     form_editing: bool,
     page: PageState,
     pending: Option<Pending>,
+    image_request: Option<ImageRequest>,
+    image_reflow: bool,
+}
+
+/// One asynchronous <img> request produced by the litehtml document.
+struct ImageRequest {
+    /// NUL-terminated source attribute, as litehtml handed it to the engine.
+    src: [u8; IMAGE_SRC_CAPACITY],
+    request_id: u32,
+    started: u64,
 }
 
 struct PageState {
@@ -528,6 +551,8 @@ pub extern "C" fn _start(_argument: u64) -> ! {
             error: "",
         },
         pending: None,
+        image_request: None,
+        image_reflow: false,
     };
 
     unsafe {
@@ -605,6 +630,9 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         if app.image_pending && poll_image(&mut app) {
             dirty = true;
         }
+        if app.pending.is_none() && poll_engine_images(&mut app) {
+            dirty = true;
+        }
         if !app.toast.is_empty() && syscall::uptime_ticks() >= app.toast_until {
             app.toast = "";
             dirty = true;
@@ -664,8 +692,12 @@ fn destroy_engine(app: &mut App) {
     app.scroll_px = 0;
 }
 
-fn create_engine(app: &mut App, slot: usize, url: &str, allow_images: bool) {
+fn create_engine(app: &mut App, slot: usize, url: &str, image_mode: i32) {
     destroy_engine(app);
+    // A document rebuild invalidates any request answered against the old
+    // handle; the reply is simply dropped.
+    app.image_request = None;
+    app.image_reflow = false;
     let page_len = unsafe { (*core::ptr::addr_of!(TABS))[slot].page_len.min(PAGE_CAP) };
     if page_len == 0 {
         return;
@@ -686,7 +718,7 @@ fn create_engine(app: &mut App, slot: usize, url: &str, allow_images: bool) {
             WIDTH as i32,
             CONTENT_HEIGHT,
             base.as_ptr(),
-            i32::from(allow_images),
+            image_mode,
         )
     };
     if handle.is_null() {
@@ -695,6 +727,122 @@ fn create_engine(app: &mut App, slot: usize, url: &str, allow_images: bool) {
     app.engine = handle;
     app.engine_height = unsafe { wolf_html_height(handle) };
     app.scroll_px = 0;
+}
+
+/// Pumps the asynchronous <img> pipeline for the litehtml document.
+///
+/// The document was created in collect mode: missing images were recorded
+/// instead of fetched, so the page could paint at once. Here one request is
+/// in flight at a time (the net_server serves one window), replies are decoded
+/// into the shared cache, and the document is rebuilt once nothing is left.
+fn poll_engine_images(app: &mut App) -> bool {
+    if app.engine.is_null() {
+        return false;
+    }
+    let mut dirty = false;
+
+    if let Some(request) = app.image_request.as_ref() {
+        let request_id = request.request_id;
+        let started = request.started;
+        let mut message = ipc::Message::new(0, &[]);
+        let mut reply = None;
+        while syscall::receive_timeout(&mut message, 0).is_ok() {
+            if message.sender != app.server || message.payload[0] != net_ipc::OP_HTTP_REPLY {
+                continue;
+            }
+            if net_ipc::http_id(&message) != request_id {
+                continue;
+            }
+            reply = net_ipc::http_fields(&message);
+            break;
+        }
+        if let Some((code, _status, body_len)) = reply {
+            let stored = code == net_ipc::NET_OK && body_len > 0;
+            if stored {
+                let handle = app.engine;
+                let body_len = body_len.min(net_ipc::CLIENT_BODY_MAX as u32);
+                let src = {
+                    let request = app.image_request.as_ref().unwrap();
+                    request.src.as_ptr()
+                };
+                let body = (app.net_base + net_ipc::CLIENT_BODY) as *const u8;
+                unsafe {
+                    wolf_html_cache_image(handle, src, body, body_len as i32);
+                }
+                app.image_reflow = true;
+                dirty = true;
+            }
+            app.image_request = None;
+        } else if syscall::uptime_ticks().saturating_sub(started) > IMAGE_FETCH_TICKS {
+            app.image_request = None;
+        }
+    }
+
+    if app.image_request.is_none() && app.pending.is_none() {
+        let mut started = false;
+        for _ in 0..8 {
+            let mut src = [0u8; IMAGE_SRC_CAPACITY];
+            let handle = app.engine;
+            let length =
+                unsafe { wolf_html_pending_image(handle, src.as_mut_ptr(), src.len() as i32) };
+            if length <= 0 {
+                break;
+            }
+            let src_len = (length as usize).min(IMAGE_SRC_CAPACITY);
+            if start_image_request(app, &src[..src_len]) {
+                started = true;
+                break;
+            }
+        }
+        if !started && app.image_request.is_none() && app.image_reflow {
+            reflow_images(app);
+            dirty = true;
+        }
+    }
+    dirty
+}
+
+fn start_image_request(app: &mut App, src: &[u8]) -> bool {
+    if app.server == 0 || app.net_base == 0 || src.is_empty() {
+        return false;
+    }
+    let url_len = tab_ref(app.active).url_len;
+    let mut page_url = [0u8; URL_CAPACITY];
+    page_url[..url_len].copy_from_slice(&tab_ref(app.active).url[..url_len]);
+    let base = core::str::from_utf8(&page_url[..url_len]).unwrap_or("");
+    let raw = core::str::from_utf8(src).unwrap_or("");
+    let mut target = [0u8; URL_CAPACITY];
+    let Some(length) = resolve_link(base, raw, &mut target) else {
+        return false;
+    };
+    let url = core::str::from_utf8(&target[..length]).unwrap_or("");
+    if !write_request(app.net_base, url) {
+        return false;
+    }
+    let request_id = next_request_id();
+    if !syscall::send(app.server, &net_ipc::http_request_id(request_id)) {
+        return false;
+    }
+    let mut buffer = [0u8; IMAGE_SRC_CAPACITY];
+    let count = src.len().min(IMAGE_SRC_CAPACITY - 1);
+    buffer[..count].copy_from_slice(&src[..count]);
+    app.image_request = Some(ImageRequest {
+        src: buffer,
+        request_id,
+        started: syscall::uptime_ticks(),
+    });
+    true
+}
+
+fn reflow_images(app: &mut App) {
+    app.image_reflow = false;
+    let url_len = tab_ref(app.active).url_len;
+    let mut url = [0u8; URL_CAPACITY];
+    url[..url_len].copy_from_slice(&tab_ref(app.active).url[..url_len]);
+    let url_text = core::str::from_utf8(&url[..url_len]).unwrap_or("");
+    let scroll = app.scroll_px;
+    create_engine(app, app.active, url_text, IMAGE_CACHE_ONLY);
+    app.scroll_px = scroll.min(engine_max_scroll(app));
 }
 
 fn save_page_html(slot: usize, body: &[u8], css: &[u8]) {
@@ -2410,7 +2558,7 @@ fn switch_tab(app: &mut App, slot: usize) {
     let url = tab_ref(slot).url;
     let url_len = tab_ref(slot).url_len;
     let url_text = core::str::from_utf8(&url[..url_len]).unwrap_or("");
-    create_engine(app, slot, url_text, false);
+    create_engine(app, slot, url_text, IMAGE_CACHE_ONLY);
     paint(app);
     restore_images_from_tab(app, slot);
 }
@@ -2469,7 +2617,7 @@ fn close_tab(app: &mut App, slot: usize) {
             let url = tab_ref(next).url;
             let url_len = tab_ref(next).url_len;
             let url_text = core::str::from_utf8(&url[..url_len]).unwrap_or("");
-            create_engine(app, next, url_text, false);
+            create_engine(app, next, url_text, IMAGE_CACHE_ONLY);
             restore_images_from_tab(app, next);
         } else {
             destroy_engine(app);
@@ -2666,6 +2814,9 @@ fn start_fetch_inner(
         fail_page(app, "URL IS TOO LONG");
         return;
     }
+    // A navigation invalidates any image request from the previous document.
+    app.image_request = None;
+    app.image_reflow = false;
     if url.starts_with("https://") {
         // Prefer the guest TLS stack, but keep the viewer's Qt proxy as the
         // fallback for TLS 1.2-only sites and certificate chains the small
@@ -3162,7 +3313,9 @@ fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
         core::slice::from_raw_parts(core::ptr::addr_of!(CSS_BUFFER) as *const u8, css_len)
     };
     save_page_html(app.active, page_body, css);
-    create_engine(app, app.active, url, true);
+    // Paint the page immediately without images, then fetch them in the
+    // background and reflow once they are cached.
+    create_engine(app, app.active, url, IMAGE_COLLECT);
     app.page.loaded = true;
     app.page.loading = false;
     app.page.status = status;

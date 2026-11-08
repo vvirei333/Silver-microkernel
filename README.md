@@ -584,10 +584,12 @@ the hit-testing too, so hovering and clicking links works through the engine.
 
 Images are fetched by the guest's `net_server` and decoded in the guest by
 **stb_image**; up to four per page (512 KiB encoded, 300k pixels each) are
-cached as RGBA and drawn scaled through litehtml's `<img>` boxes. The RGBA
-cache is shared across document rebuilds, so switching back to a tab reuses
-the images without another network fetch; tab switching never blocks on
-images.
+cached as RGBA and drawn scaled through litehtml's `<img>` boxes. The first
+paint no longer waits for them: the document is created in *collect* mode,
+one `<img>` request is in flight while the loop keeps handling input, and the
+page is reflowed (scroll preserved) as decoded images land. The RGBA cache is
+shared across document rebuilds and evicts old sites, so switching back to a
+tab reuses its images without another network fetch.
 
 The reader slice is capped at 48 KiB and the engine heap at 20 MiB; both are
 deliberate current limits, not architectural ones. Six tabs keep their own URL,

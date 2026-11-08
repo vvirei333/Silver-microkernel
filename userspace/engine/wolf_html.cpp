@@ -58,7 +58,7 @@ extern "C"
     }
 
     WolfHtml* wolf_html_create(const char* html, int len, int width, int height,
-                               const char* base_url, int allow_images)
+                               const char* base_url, int image_mode)
     {
         wolf_cpp_init();
         if(html == nullptr || len <= 0 || width <= 0 || height <= 0)
@@ -80,7 +80,7 @@ extern "C"
             return nullptr;
         }
         handle->container->set_base_url(handle->base_url.c_str());
-        handle->container->set_allow_image_fetch(allow_images != 0);
+        handle->container->set_image_mode(image_mode);
 
         try
         {
@@ -100,6 +100,30 @@ extern "C"
         handle->doc->render(width);
         handle->height = static_cast<int>(handle->doc->height());
         return handle;
+    }
+
+    int wolf_html_pending_image(WolfHtml* handle, char* out, int cap)
+    {
+        if(handle == nullptr || handle->container == nullptr || out == nullptr || cap <= 0)
+        {
+            return -1;
+        }
+        std::string src;
+        if(!handle->container->pop_pending_image(src) || src.size() >= static_cast<size_t>(cap))
+        {
+            return -1;
+        }
+        std::memcpy(out, src.data(), src.size());
+        return static_cast<int>(src.size());
+    }
+
+    void wolf_html_cache_image(WolfHtml* handle, const char* src, const uint8_t* data, int len)
+    {
+        if(handle == nullptr || handle->container == nullptr)
+        {
+            return;
+        }
+        handle->container->store_image(src, data, len);
     }
 
     void wolf_html_destroy(WolfHtml* handle)

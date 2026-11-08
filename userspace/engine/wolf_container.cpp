@@ -9,13 +9,51 @@
 
 namespace
 {
+    // Decoded images are kept across document rebuilds: a tab switch reuses
+    // them instead of touching the network. The budget is deliberately small
+    // because the whole engine shares a 20 MiB heap with litehtml.
+    constexpr size_t  kMaxCachedImages = 8;
+    constexpr int64_t kMaxCachedPixels = 3 * 1000 * 1000;
+    constexpr size_t  kMaxImagesPerPage = 4;
+
     std::vector<WolfContainer::ImageEntry>& image_cache()
     {
-        // One browser task, one document at a time. Keeping the RGBA cache
-        // across document rebuilds makes tab switches instant instead of
-        // re-fetching every <img> synchronously.
         static std::vector<WolfContainer::ImageEntry> cache;
         return cache;
+    }
+
+    int64_t cached_pixels()
+    {
+        int64_t total = 0;
+        for(const auto& image : image_cache())
+        {
+            total += static_cast<int64_t>(image.width) * image.height;
+        }
+        return total;
+    }
+
+    void make_cache_room(int64_t pixels)
+    {
+        while(!image_cache().empty() &&
+              (image_cache().size() >= kMaxCachedImages ||
+               cached_pixels() + pixels > kMaxCachedPixels))
+        {
+            image_cache().erase(image_cache().begin());
+        }
+    }
+
+    size_t count_for_base(const std::string& base)
+    {
+        const std::string prefix = base + '|';
+        size_t count = 0;
+        for(const auto& image : image_cache())
+        {
+            if(image.key.compare(0, prefix.size(), prefix) == 0)
+            {
+                ++count;
+            }
+        }
+        return count;
     }
 
     // The ivshmem surface is consumed as QImage::Format_RGBA8888, so a
@@ -287,6 +325,83 @@ WolfContainer::ImageEntry* WolfContainer::find_image(const std::string& key)
     return nullptr;
 }
 
+int WolfContainer::image_slots() const
+{
+    const size_t used = count_for_base(m_base_url);
+    if(used >= kMaxImagesPerPage)
+    {
+        return 0;
+    }
+    return static_cast<int>(kMaxImagesPerPage - used);
+}
+
+bool WolfContainer::pop_pending_image(std::string& out)
+{
+    if(m_pending_images.empty() || image_slots() <= 0)
+    {
+        m_pending_images.clear();
+        return false;
+    }
+    out = std::move(m_pending_images.front());
+    m_pending_images.erase(m_pending_images.begin());
+    return true;
+}
+
+void WolfContainer::store_image(const char* src, const uint8_t* data, int len)
+{
+    if(src == nullptr || *src == '\0' || data == nullptr || len <= 0)
+    {
+        return;
+    }
+    const std::string key = image_key(src, nullptr);
+    if(find_image(key) != nullptr)
+    {
+        return;
+    }
+    decode_store(key, data, len);
+}
+
+bool WolfContainer::decode_store(const std::string& key, const uint8_t* data, int len)
+{
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    if(stbi_info_from_memory(data, len, &width, &height, &channels) == 0)
+    {
+        return false;
+    }
+    if(width <= 0 || height <= 0 ||
+       static_cast<int64_t>(width) * height > 300 * 1000)
+    {
+        return false;
+    }
+    // Favicons, tracking pixels and spacers are not worth a cache slot.
+    if(width < 32 || height < 32)
+    {
+        return false;
+    }
+    // Litehtml walks every <img> on the page; keep the first few that fit.
+    if(count_for_base(m_base_url) >= kMaxImagesPerPage)
+    {
+        return false;
+    }
+    make_cache_room(static_cast<int64_t>(width) * height);
+    unsigned char* rgba =
+        stbi_load_from_memory(data, len, &width, &height, &channels, 4);
+    if(rgba == nullptr)
+    {
+        return false;
+    }
+    ImageEntry entry;
+    entry.key    = key;
+    entry.width  = width;
+    entry.height = height;
+    entry.pixels.assign(rgba, rgba + static_cast<size_t>(width) * height * 4);
+    stbi_image_free(rgba);
+    image_cache().push_back(std::move(entry));
+    return true;
+}
+
 void WolfContainer::load_image(const char* src, const char* baseurl, bool /*redraw_on_ready*/)
 {
     if(src == nullptr || *src == '\0')
@@ -298,7 +413,26 @@ void WolfContainer::load_image(const char* src, const char* baseurl, bool /*redr
     {
         return;
     }
-    if(!m_allow_image_fetch || m_image_fetches >= 4 || image_cache().size() >= 4)
+    if(m_image_mode == images_collect)
+    {
+        if(m_pending_images.size() < 8)
+        {
+            for(const auto& pending : m_pending_images)
+            {
+                if(pending == src)
+                {
+                    return;
+                }
+            }
+            m_pending_images.emplace_back(src);
+        }
+        return;
+    }
+    if(m_image_mode != images_fetch_now)
+    {
+        return;
+    }
+    if(m_image_fetches >= static_cast<int>(kMaxImagesPerPage) || image_slots() <= 0)
     {
         return;
     }
@@ -320,37 +454,7 @@ void WolfContainer::load_image(const char* src, const char* baseurl, bool /*redr
     {
         return;
     }
-
-    int width = 0;
-    int height = 0;
-    int channels = 0;
-    if(stbi_info_from_memory(encoded.data(), length, &width, &height, &channels) == 0)
-    {
-        return;
-    }
-    if(width <= 0 || height <= 0 ||
-       static_cast<int64_t>(width) * height > 300 * 1000)
-    {
-        return;
-    }
-    // Favicons, tracking pixels and spacers are not worth a cache slot.
-    if(width < 32 || height < 32)
-    {
-        return;
-    }
-    unsigned char* rgba =
-        stbi_load_from_memory(encoded.data(), length, &width, &height, &channels, 4);
-    if(rgba == nullptr)
-    {
-        return;
-    }
-    ImageEntry entry;
-    entry.key    = key;
-    entry.width  = width;
-    entry.height = height;
-    entry.pixels.assign(rgba, rgba + static_cast<size_t>(width) * height * 4);
-    stbi_image_free(rgba);
-    image_cache().push_back(std::move(entry));
+    decode_store(key, encoded.data(), length);
 }
 
 void WolfContainer::get_image_size(const char* src, const char* baseurl, litehtml::size& sz)

@@ -60,12 +60,31 @@ class WolfContainer : public litehtml::document_container
 
     WolfContainer(int width, int height);
 
-    /// Tab switches reuse already decoded images but must not block on new
-    /// network requests.
-    void set_allow_image_fetch(bool allow)
+    /// How this document treats <img> sources.
+    enum ImageMode
     {
-        m_allow_image_fetch = allow;
+        /// Reuse the shared cache only; a tab switch must never block.
+        images_cache_only = 0,
+        /// Fetch during layout (legacy path, blocks the browser task).
+        images_fetch_now = 1,
+        /// Record the URLs; the browser fetches them asynchronously.
+        images_collect = 2,
+    };
+
+    void set_image_mode(int mode)
+    {
+        m_image_mode = mode;
     }
+
+    /// Pops the next image source that still needs a network fetch.
+    bool pop_pending_image(std::string& out);
+
+    /// Decodes `data` and stores it in the shared cache. Called by Rust when
+    /// an asynchronous image request completes.
+    void store_image(const char* src, const uint8_t* data, int len);
+
+    /// How many more images this document may add to the shared cache.
+    int image_slots() const;
 
     void set_canvas(WolfCanvas* canvas)
     {
@@ -137,10 +156,12 @@ class WolfContainer : public litehtml::document_container
     std::string m_base_url;
     std::string m_link;
     int  m_image_fetches = 0;
-    bool m_allow_image_fetch = true;
+    int  m_image_mode = images_fetch_now;
+    std::vector<std::string> m_pending_images;
 
     std::string image_key(const char* src, const char* baseurl) const;
     ImageEntry* find_image(const std::string& key);
+    bool        decode_store(const std::string& key, const uint8_t* data, int len);
 };
 
 #endif // WOLF_CONTAINER_H
