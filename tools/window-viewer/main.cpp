@@ -96,7 +96,7 @@ struct Shared {
 class Viewer : public QWidget {
 public:
     Viewer(Shared &shared, QWidget *parent = nullptr) : QWidget(parent), m_shared(shared) {
-        setWindowTitle("WerewolfOS Browser");
+        setWindowTitle("Wolfser — WerewolfOS");
         resize(static_cast<int>(m_shared.u32(kFieldWidth)),
                static_cast<int>(m_shared.u32(kFieldHeight)));
         m_lastSequence = m_shared.u32(kFieldFrameSeq);
@@ -134,9 +134,24 @@ protected:
         case Qt::Key_PageDown: key = 4; break;
         case Qt::Key_Home: key = 5; break;
         case Qt::Key_End: key = 6; break;
+        case Qt::Key_Return:
+        case Qt::Key_Enter: key = 10; break;
+        case Qt::Key_Backspace: key = 11; break;
+        case Qt::Key_Escape: key = 12; break;
+        case Qt::Key_L:
+            if (event->modifiers() & Qt::ControlModifier) {
+                key = 13; // focus the address bar
+                break;
+            }
+            if (event->text().size() == 1 && event->text().at(0).isPrint()) {
+                key = static_cast<uint16_t>(event->text().at(0).unicode());
+                break;
+            }
+            return;
         default:
             if (event->text().size() == 1 && event->text().at(0).isPrint()) {
-                key = static_cast<uint16_t>(event->text().at(0).toUpper().unicode());
+                // Keep the case: URLs and search queries are byte-exact.
+                key = static_cast<uint16_t>(event->text().at(0).unicode());
             } else {
                 return;
             }
@@ -194,7 +209,7 @@ int snapshot(Shared &shared, const QString &path, int timeoutSeconds) {
         }
         QCoreApplication::processEvents();
     }
-    std::fprintf(stderr, "viewer: no frame within %d s (is the guest browser running?)\n",
+    std::fprintf(stderr, "viewer: no frame within %d s (is Wolfser running?)\n",
                  timeoutSeconds);
     return 2;
 }

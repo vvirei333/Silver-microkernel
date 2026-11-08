@@ -1,11 +1,10 @@
-//! WerewolfOS browser: fetch a page and draw it into the shared window.
+//! Wolfser: WerewolfOS's network browser.
 //!
 //! The program owns no compositor: it writes one RGBA surface into an
 //! ivshmem BAR that the host viewer maps from the same file, and publishes
-//! frames through the header's `frame_seq`. HTML is reduced to readable text
-//! (scripts, styles and tags stripped, entities decoded, block tags become
-//! line breaks); this is deliberately a small first renderer, not a layout
-//! engine.
+//! frames through `frame_seq`. The address bar accepts a URL or a search
+//! query; HTML is reduced to readable text (scripts, styles and tags
+//! stripped, entities decoded, block tags become line breaks).
 
 #![no_std]
 #![no_main]
@@ -28,23 +27,31 @@ use core::panic::PanicInfo;
 const WIDTH: u32 = 900;
 const HEIGHT: u32 = 640;
 const STRIDE: u32 = WIDTH * 4;
-const HEADER_HEIGHT: u32 = 44;
+const HEADER_HEIGHT: u32 = 56;
 const FOOTER_HEIGHT: u32 = 14;
-const SCALE: u32 = 2;
-const CELL_WIDTH: u32 = 12; // (5 + 1) * scale
-const CELL_HEIGHT: u32 = 16; // (7 + 1) * scale
-const LINE_HEIGHT: u32 = 18;
 const MARGIN: u32 = 12;
+const ADDRESS_X: u32 = 12;
+const ADDRESS_Y: u32 = 20;
+const ADDRESS_WIDTH: u32 = WIDTH - 2 * ADDRESS_X;
+const ADDRESS_HEIGHT: u32 = 24;
+const ADDRESS_TEXT_Y: u32 = 28;
+const BODY_TOP: u32 = HEADER_HEIGHT + 6;
+const SCALE: u32 = 2;
+const CELL_WIDTH: u32 = 12;
+const LINE_HEIGHT: u32 = 18;
 const TEXT_COLUMNS: u32 = (WIDTH - 2 * MARGIN) / CELL_WIDTH;
-const BODY_ROWS: u32 = (HEIGHT - HEADER_HEIGHT - FOOTER_HEIGHT - MARGIN) / LINE_HEIGHT;
+const BODY_ROWS: u32 = (HEIGHT - BODY_TOP - FOOTER_HEIGHT - MARGIN) / LINE_HEIGHT;
 
 const COLOR_BACKGROUND: u32 = 0xFFFF_FFFF;
 const COLOR_HEADER: u32 = 0xFF5F_3A1E;
 const COLOR_HEADER_TEXT: u32 = 0xFFFF_FFFF;
+const COLOR_ADDRESS: u32 = 0xFFFF_FFFF;
+const COLOR_ADDRESS_BORDER: u32 = 0xFF3A_2412;
 const COLOR_TEXT: u32 = 0xFF20_2020;
+const COLOR_PLACEHOLDER: u32 = 0xFF90_9090;
 const COLOR_MUTED: u32 = 0xFF60_6060;
 
-const DEFAULT_URL: &str = "http://example.com/";
+const DEFAULT_SEARCH: &str = "http://www.bing.com/search?q=";
 const IVSHMEM_VENDOR: u16 = 0x1AF4;
 const IVSHMEM_DEVICE: u16 = 0x1110;
 const IVSHMEM_BAR: u64 = 0x1040_0000;
@@ -52,161 +59,309 @@ const WINDOW_MAX_SIZE: u64 = 8 * 1024 * 1024;
 
 const TEXT_CAPACITY: usize = 24 * 1024;
 const TITLE_CAPACITY: usize = 96;
-const URL_CAPACITY: usize = 160;
+const ADDRESS_CAPACITY: usize = 150;
+const URL_CAPACITY: usize = 512;
 
 const TICKS_PER_SECOND: u64 = 100;
 const FETCH_TIMEOUT_TICKS: u64 = 30 * TICKS_PER_SECOND;
 const RESPONSE_POLL_TICKS: u64 = 10;
-
-const KEY_UP: u16 = 1;
-const KEY_DOWN: u16 = 2;
-const KEY_PAGE_UP: u16 = 3;
-const KEY_PAGE_DOWN: u16 = 4;
-const KEY_HOME: u16 = 5;
-const KEY_END: u16 = 6;
 
 static mut TEXT: [u8; TEXT_CAPACITY] = [0; TEXT_CAPACITY];
 static mut TEXT_LEN: usize = 0;
 static mut TITLE: [u8; TITLE_CAPACITY] = [0; TITLE_CAPACITY];
 static mut TITLE_LEN: usize = 0;
 
+struct App {
+    window: u64,
+    server: u64,
+    net_base: u64,
+    address: [u8; ADDRESS_CAPACITY],
+    address_len: usize,
+    focused: bool,
+    scroll: usize,
+    page: PageState,
+}
+
+struct PageState {
+    loaded: bool,
+    status: u16,
+    body_len: usize,
+    error: &'static str,
+}
+
 #[no_mangle]
 #[link_section = ".text._start"]
 pub extern "C" fn _start(_argument: u64) -> ! {
     let mut arguments = [0_u8; 192];
     let length = syscall::arguments(&mut arguments).unwrap_or(0);
-    let url = core::str::from_utf8(&arguments[..length])
+    let initial = core::str::from_utf8(&arguments[..length])
         .unwrap_or("")
         .trim();
-    let url = if url.is_empty() { DEFAULT_URL } else { url };
 
     let Some(server) = find_task_id(syscall::PROGRAM_NET_SERVER) else {
         fatal(11, "NETWORK SERVER IS NOT RUNNING");
     };
     let window_base = match open_window() {
         Ok(base) => base,
-        Err(stage) => fatal(20 + stage, "NO IVSHMEM WINDOW (START QEMU WITH -device ivshmem-plain)"),
+        Err(stage) => fatal(
+            20 + stage,
+            "NO IVSHMEM WINDOW (START QEMU WITH -device ivshmem-plain)",
+        ),
     };
     let Some(net_base) = map_net_window(server) else {
         fatal(13, "CANNOT MAP THE NETWORK WINDOW");
     };
 
-    let mut state = PageState {
-        status: 0,
-        body_len: 0,
-        error: "",
+    let mut app = App {
+        window: window_base,
+        server,
+        net_base,
+        address: [0; ADDRESS_CAPACITY],
+        address_len: 0,
+        focused: initial.is_empty(),
+        scroll: 0,
+        page: PageState {
+            loaded: false,
+            status: 0,
+            body_len: 0,
+            error: "",
+        },
     };
-    load(server, net_base, url, &mut state);
-    let mut scroll = 0usize;
-    paint(window_base, url, &state, scroll);
+    if !initial.is_empty() {
+        set_address(&mut app, initial);
+        submit(&mut app);
+    }
+    paint(&app);
     let mut dirty = false;
 
     loop {
-        let head = window::read_u32(window_base, window::FIELD_INPUT_HEAD);
-        let mut tail = window::read_u32(window_base, window::FIELD_INPUT_TAIL);
+        let head = window::read_u32(app.window, window::FIELD_INPUT_HEAD);
+        let mut tail = window::read_u32(app.window, window::FIELD_INPUT_TAIL);
         while tail != head {
-            let event = window::read_input(window_base, tail);
+            let event = window::read_input(app.window, tail);
             tail = (tail + 1) % window::INPUT_SLOTS;
             match event.kind {
                 window::INPUT_KEY => {
-                    let key = event.key;
-                    if key == u16::from(b'Q') || key == u16::from(b'q') {
-                        syscall::exit();
-                    } else if key == u16::from(b'R') || key == u16::from(b'r') {
-                        load(server, net_base, url, &mut state);
-                        scroll = 0;
-                        dirty = true;
-                    } else if key == KEY_DOWN {
-                        scroll = scroll.saturating_add(1);
-                        dirty = true;
-                    } else if key == KEY_UP {
-                        scroll = scroll.saturating_sub(1);
-                        dirty = true;
-                    } else if key == KEY_PAGE_DOWN {
-                        scroll = scroll.saturating_add(BODY_ROWS as usize);
-                        dirty = true;
-                    } else if key == KEY_PAGE_UP {
-                        scroll = scroll.saturating_sub(BODY_ROWS as usize);
-                        dirty = true;
-                    } else if key == KEY_HOME {
-                        scroll = 0;
-                        dirty = true;
-                    } else if key == KEY_END {
-                        scroll = line_count() as usize;
+                    if handle_key(&mut app, event.key) {
                         dirty = true;
                     }
                 }
                 window::INPUT_SCROLL => {
                     let delta = event.value as i8;
                     if delta >= 0 {
-                        scroll = scroll.saturating_add(delta as usize);
+                        app.scroll = app.scroll.saturating_add(delta as usize);
                     } else {
-                        scroll = scroll.saturating_sub((-delta) as usize);
+                        app.scroll = app.scroll.saturating_sub((-delta) as usize);
                     }
                     dirty = true;
                 }
                 _ => {}
             }
         }
-        if tail != window::read_u32(window_base, window::FIELD_INPUT_TAIL) {
-            window::write_u32(window_base, window::FIELD_INPUT_TAIL, tail);
+        if tail != window::read_u32(app.window, window::FIELD_INPUT_TAIL) {
+            window::write_u32(app.window, window::FIELD_INPUT_TAIL, tail);
         }
 
         if dirty {
             let lines = line_count() as usize;
             let max_scroll = lines.saturating_sub(BODY_ROWS as usize);
-            if scroll > max_scroll {
-                scroll = max_scroll;
+            if app.scroll > max_scroll {
+                app.scroll = max_scroll;
             }
-            paint(window_base, url, &state, scroll);
+            paint(&app);
             dirty = false;
         }
         syscall::sleep(50);
     }
 }
 
-struct PageState {
-    status: u16,
-    body_len: usize,
-    error: &'static str,
+/// Returns true when the key changed something visible.
+fn handle_key(app: &mut App, key: u16) -> bool {
+    match key {
+        window::KEY_ENTER => {
+            submit(app);
+            true
+        }
+        window::KEY_BACKSPACE => {
+            if app.focused && app.address_len > 0 {
+                app.address_len -= 1;
+                app.address[app.address_len] = 0;
+                true
+            } else {
+                false
+            }
+        }
+        window::KEY_ESCAPE => {
+            app.focused = false;
+            true
+        }
+        window::KEY_FOCUS => {
+            // Ctrl+L behaves like a browser's address bar: select all, so the
+            // next typed character starts a new address.
+            app.focused = true;
+            app.address_len = 0;
+            app.address[0] = 0;
+            true
+        }
+        window::KEY_UP => {
+            app.scroll = app.scroll.saturating_sub(1);
+            true
+        }
+        window::KEY_DOWN => {
+            app.scroll = app.scroll.saturating_add(1);
+            true
+        }
+        window::KEY_PAGE_UP => {
+            app.scroll = app.scroll.saturating_sub(BODY_ROWS as usize);
+            true
+        }
+        window::KEY_PAGE_DOWN => {
+            app.scroll = app.scroll.saturating_add(BODY_ROWS as usize);
+            true
+        }
+        window::KEY_HOME => {
+            app.scroll = 0;
+            true
+        }
+        window::KEY_END => {
+            app.scroll = line_count() as usize;
+            true
+        }
+        key if app.focused && (0x20..0x7F).contains(&key) => {
+            if app.address_len < app.address.len() - 1 {
+                app.address[app.address_len] = key as u8;
+                app.address_len += 1;
+                app.address[app.address_len] = 0;
+                true
+            } else {
+                false
+            }
+        }
+        key if !app.focused && (key == u16::from(b'Q') || key == u16::from(b'q')) => {
+            syscall::exit();
+        }
+        key if !app.focused && (key == u16::from(b'R') || key == u16::from(b'r')) => {
+            let text = app.address_text();
+            let mut url = [0u8; URL_CAPACITY];
+            if let Some(length) = resolve_url(text, &mut url) {
+                let target = core::str::from_utf8(&url[..length]).unwrap_or("");
+                load(app, target);
+                app.scroll = 0;
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
-fn load(server: u64, net_base: u64, url: &str, state: &mut PageState) {
-    state.status = 0;
-    state.body_len = 0;
-    state.error = "";
-    if !write_request(net_base, url) {
-        state.error = "URL IS TOO LONG";
+impl App {
+    fn address_text(&self) -> &str {
+        core::str::from_utf8(&self.address[..self.address_len]).unwrap_or("")
+    }
+}
+
+fn set_address(app: &mut App, text: &str) {
+    let length = text.len().min(app.address.len() - 1);
+    app.address[..length].copy_from_slice(&text.as_bytes()[..length]);
+    app.address_len = length;
+    app.address[length] = 0;
+}
+
+/// Resolves the address-bar text to a URL: an explicit URL is used as-is, a
+/// bare host gets `http://`, anything else becomes a DuckDuckGo Lite search
+/// (plain HTTP so the console stack can fetch it without TLS).
+fn resolve_url(text: &str, buffer: &mut [u8; URL_CAPACITY]) -> Option<usize> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+    if text.starts_with("http://") || text.starts_with("https://") {
+        let length = text.len().min(URL_CAPACITY - 1);
+        buffer[..length].copy_from_slice(&text.as_bytes()[..length]);
+        return Some(length);
+    }
+    let looks_like_host = !text.contains(' ')
+        && text.contains('.')
+        && !text.contains('?')
+        && !text.contains('=');
+    if looks_like_host {
+        let prefix = b"http://";
+        let length = (prefix.len() + text.len()).min(URL_CAPACITY - 1);
+        buffer[..prefix.len()].copy_from_slice(prefix);
+        buffer[prefix.len()..length].copy_from_slice(&text.as_bytes()[..length - prefix.len()]);
+        return Some(length);
+    }
+
+    let prefix = DEFAULT_SEARCH.as_bytes();
+    let mut length = prefix.len();
+    buffer[..length].copy_from_slice(prefix);
+    for &byte in text.as_bytes() {
+        if length + 3 >= URL_CAPACITY {
+            break;
+        }
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            buffer[length] = byte;
+            length += 1;
+        } else {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            buffer[length] = b'%';
+            buffer[length + 1] = HEX[(byte >> 4) as usize];
+            buffer[length + 2] = HEX[(byte & 0xF) as usize];
+            length += 3;
+        }
+    }
+    Some(length)
+}
+
+fn submit(app: &mut App) {
+    let text = app.address_text();
+    let mut url = [0u8; URL_CAPACITY];
+    let Some(length) = resolve_url(text, &mut url) else {
+        return;
+    };
+    let target = core::str::from_utf8(&url[..length]).unwrap_or("");
+    load(app, target);
+    app.focused = false;
+    app.scroll = 0;
+}
+
+fn load(app: &mut App, url: &str) {
+    app.page.loaded = true;
+    app.page.status = 0;
+    app.page.body_len = 0;
+    app.page.error = "";
+    if !write_request(app.net_base, url) {
+        app.page.error = "URL IS TOO LONG";
         return;
     }
-    if !syscall::send(server, &net_ipc::http_request()) {
-        state.error = "NETWORK SERVER IS NOT RESPONDING";
+    if !syscall::send(app.server, &net_ipc::http_request()) {
+        app.page.error = "NETWORK SERVER IS NOT RESPONDING";
         return;
     }
-    let Some(reply) = wait_reply(server, net_ipc::OP_HTTP_REPLY, FETCH_TIMEOUT_TICKS) else {
-        state.error = "NO REPLY FROM THE NETWORK SERVER";
+    let Some(reply) = wait_reply(app.server, net_ipc::OP_HTTP_REPLY, FETCH_TIMEOUT_TICKS) else {
+        app.page.error = "NO REPLY FROM THE NETWORK SERVER";
         return;
     };
     let Some((code, status, body_len)) = net_ipc::http_fields(&reply) else {
-        state.error = "MALFORMED NETWORK REPLY";
+        app.page.error = "MALFORMED NETWORK REPLY";
         return;
     };
     if code != net_ipc::NET_OK {
-        state.error = match code {
+        app.page.error = match code {
             net_ipc::NET_ERR_DNS => "NAME RESOLUTION FAILED",
             net_ipc::NET_ERR_CONNECT => "CONNECTION FAILED",
             net_ipc::NET_ERR_TIMEOUT => "REQUEST TIMED OUT",
             net_ipc::NET_ERR_URL => "INVALID URL",
-            net_ipc::NET_ERR_TLS => "HTTPS IS NOT SUPPORTED YET (USE HTTP://)",
+            net_ipc::NET_ERR_TLS => "HTTPS IS NOT SUPPORTED YET (TRY HTTP://)",
             net_ipc::NET_ERR_RESPONSE => "MALFORMED HTTP RESPONSE",
             net_ipc::NET_ERR_BUSY => "NETWORK SERVER BUSY",
             _ => "NETWORK ERROR",
         };
         return;
     }
-    state.status = status;
-    state.body_len = body_len as usize;
-    extract(net_base, body_len as usize);
+    app.page.status = status;
+    app.page.body_len = body_len as usize;
+    extract(app.net_base, body_len as usize);
 }
 
 fn extract(net_base: u64, body_len: usize) {
@@ -315,7 +470,6 @@ fn push_char(
 
 fn read_tag<'a>(body: &'a [u8], start: usize) -> (&'a [u8], usize) {
     let mut index = start + 1;
-    // Skip a closing slash and leading spaces.
     while index < body.len() && body[index] == b' ' {
         index += 1;
     }
@@ -385,20 +539,13 @@ fn is_block_tag(tag: &[u8]) -> bool {
     false
 }
 
-/// Skips the body of a `<script>`/`<style>` element, returning the index after
-/// its closing tag.
 fn skip_element(body: &[u8], start: usize, tag: &[u8]) -> usize {
     let mut index = start;
     while index < body.len() {
         if body[index] == b'<' {
             let (name, after) = read_tag(body, index);
-            if tag_eq(name, tag) {
-                // `read_tag` returns `script` for both `<script>` and
-                // `</script>`; the closing tag is the one whose name is
-                // followed by `>`, and the opening one was already consumed.
-                if body.get(index + 1) == Some(&b'/') {
-                    return after;
-                }
+            if tag_eq(name, tag) && body.get(index + 1) == Some(&b'/') {
+                return after;
             }
             index = after;
         } else {
@@ -425,7 +572,11 @@ fn read_text_until<'a>(body: &'a [u8], start: usize, tag: &[u8]) -> (&'a [u8], u
 }
 
 fn decode_entity(body: &[u8], start: usize) -> Option<(u8, usize)> {
-    let end = body[start + 1..].iter().position(|&byte| byte == b';')? + start + 1;
+    let end = body[start + 1..]
+        .iter()
+        .position(|&byte| byte == b';')?
+        + start
+        + 1;
     let name = &body[start + 1..end];
     let character = match name {
         b"amp" => b'&',
@@ -462,47 +613,92 @@ fn line_count() -> u32 {
 // ---------------------------------------------------------------------------
 // Rendering
 
-fn paint(base: u64, url: &str, state: &PageState, scroll: usize) {
+fn paint(app: &App) {
+    let base = app.window;
     fill(base, 0, 0, WIDTH, HEIGHT, COLOR_BACKGROUND);
     fill(base, 0, 0, WIDTH, HEADER_HEIGHT, COLOR_HEADER);
-    let title = unsafe {
-        let length = core::ptr::read(core::ptr::addr_of!(TITLE_LEN));
-        let bytes = core::slice::from_raw_parts(
-            core::ptr::addr_of!(TITLE) as *const u8,
-            length,
-        );
-        core::str::from_utf8(bytes).unwrap_or("")
-    };
-    let heading = if title.is_empty() {
-        "WEREWOLFOS BROWSER"
-    } else {
-        title
-    };
-    draw_text(base, 12, 6, 1, heading, COLOR_HEADER_TEXT);
-    draw_text(base, 12, 22, 1, url, COLOR_HEADER_TEXT);
-    draw_text(
-        base,
-        12,
-        HEIGHT - 12,
-        1,
-        "Q QUIT   R RELOAD   ARROWS / WHEEL SCROLL",
-        COLOR_MUTED,
-    );
+    draw_text(base, 12, 6, 1, "WOLFSER", COLOR_HEADER_TEXT);
 
-    let text = unsafe { &*core::ptr::addr_of!(TEXT) };
-    let length = unsafe { *core::ptr::addr_of!(TEXT_LEN) };
-    if length == 0 || !state.error.is_empty() {
-        let message = if state.error.is_empty() {
-            "EMPTY PAGE"
+    // Address / search bar.
+    fill(base, ADDRESS_X, ADDRESS_Y, ADDRESS_WIDTH, ADDRESS_HEIGHT, COLOR_ADDRESS);
+    fill(base, ADDRESS_X, ADDRESS_Y, ADDRESS_WIDTH, 1, COLOR_ADDRESS_BORDER);
+    fill(base, ADDRESS_X, ADDRESS_Y + ADDRESS_HEIGHT - 1, ADDRESS_WIDTH, 1, COLOR_ADDRESS_BORDER);
+    fill(base, ADDRESS_X, ADDRESS_Y, 1, ADDRESS_HEIGHT, COLOR_ADDRESS_BORDER);
+    fill(
+        base,
+        ADDRESS_X + ADDRESS_WIDTH - 1,
+        ADDRESS_Y,
+        1,
+        ADDRESS_HEIGHT,
+        COLOR_ADDRESS_BORDER,
+    );
+    let address = app.address_text();
+    if address.is_empty() {
+        let placeholder = if app.focused {
+            "TYPE A SEARCH OR AN ADDRESS, THEN PRESS ENTER"
         } else {
-            state.error
+            "PRESS CTRL+L OR TYPE TO SEARCH"
         };
-        draw_text(base, 24, HEADER_HEIGHT + 28, 2, message, COLOR_TEXT);
-        publish(base, window::STATE_ERROR);
+        draw_text(
+            base,
+            ADDRESS_X + 6,
+            ADDRESS_TEXT_Y,
+            1,
+            placeholder,
+            COLOR_PLACEHOLDER,
+        );
+    } else {
+        draw_text(base, ADDRESS_X + 6, ADDRESS_TEXT_Y, 1, address, COLOR_TEXT);
+    }
+    if app.focused {
+        let caret = ADDRESS_X + 6 + address.len() as u32 * 6;
+        fill(base, caret, ADDRESS_TEXT_Y - 1, 1, 10, COLOR_TEXT);
+    }
+
+    if !app.page.loaded {
+        draw_text(base, 24, BODY_TOP + 28, 2, "WOLFSER", COLOR_TEXT);
+        draw_text(
+            base,
+            24,
+            BODY_TOP + 60,
+            1,
+            "A SMALL BROWSER FOR WEREWOLFOS",
+            COLOR_MUTED,
+        );
+        draw_text(
+            base,
+            24,
+            BODY_TOP + 78,
+            1,
+            "TYPE A SEARCH OR AN ADDRESS ABOVE AND PRESS ENTER",
+            COLOR_MUTED,
+        );
+        draw_text(
+            base,
+            24,
+            BODY_TOP + 96,
+            1,
+            "CTRL+L EDIT   R RELOAD   Q QUIT   ARROWS SCROLL",
+            COLOR_MUTED,
+        );
+        publish(base, window::STATE_READY);
         return;
     }
 
-    let mut y = HEADER_HEIGHT + 6;
+    let text = unsafe { &*core::ptr::addr_of!(TEXT) };
+    let length = unsafe { *core::ptr::addr_of!(TEXT_LEN) };
+    if !app.page.error.is_empty() {
+        draw_text(base, 24, BODY_TOP + 20, 2, app.page.error, COLOR_TEXT);
+        publish(base, window::STATE_ERROR);
+        return;
+    }
+    if length == 0 {
+        draw_text(base, 24, BODY_TOP + 20, 2, "EMPTY PAGE", COLOR_TEXT);
+        publish(base, window::STATE_READY);
+        return;
+    }
+
+    let mut y = BODY_TOP;
     let mut line = 0usize;
     let mut columns = 0u32;
     let mut line_start = 0usize;
@@ -510,7 +706,7 @@ fn paint(base: u64, url: &str, state: &PageState, scroll: usize) {
     while index < length {
         let byte = text[index];
         if byte == b'\n' {
-            if line >= scroll && line < scroll + BODY_ROWS as usize {
+            if line >= app.scroll && line < app.scroll + BODY_ROWS as usize {
                 draw_text_bytes(base, 12, y, 2, &text[line_start..index], COLOR_TEXT);
                 y += LINE_HEIGHT;
             }
@@ -522,7 +718,7 @@ fn paint(base: u64, url: &str, state: &PageState, scroll: usize) {
         }
         columns += 1;
         if columns > TEXT_COLUMNS {
-            if line >= scroll && line < scroll + BODY_ROWS as usize {
+            if line >= app.scroll && line < app.scroll + BODY_ROWS as usize {
                 draw_text_bytes(base, 12, y, 2, &text[line_start..index], COLOR_TEXT);
                 y += LINE_HEIGHT;
             }
@@ -532,9 +728,18 @@ fn paint(base: u64, url: &str, state: &PageState, scroll: usize) {
         }
         index += 1;
     }
-    if line_start < length && line >= scroll && line < scroll + BODY_ROWS as usize {
+    if line_start < length && line >= app.scroll && line < app.scroll + BODY_ROWS as usize {
         draw_text_bytes(base, 12, y, 2, &text[line_start..length], COLOR_TEXT);
     }
+
+    draw_text(
+        base,
+        12,
+        HEIGHT - 12,
+        1,
+        "CTRL+L EDIT   R RELOAD   Q QUIT   ARROWS / WHEEL SCROLL",
+        COLOR_MUTED,
+    );
     publish(base, window::STATE_READY);
 }
 
@@ -658,14 +863,11 @@ fn open_window() -> Result<u64, u64> {
     let size = (!mask).wrapping_add(1);
     let used = window::PIXELS + u64::from(STRIDE) * u64::from(HEIGHT);
     if size < used || size > WINDOW_MAX_SIZE {
-        return Err(6u64);
+        return Err(6);
     }
     write_u32(bar, IVSHMEM_BAR as u32 | flags);
     write_u32(high, (IVSHMEM_BAR >> 32) as u32);
 
-    // Map only the header and the pixels we use: the kernel's non-cacheable
-    // window is bounded per mapping, and the BAR may be larger than the
-    // surface.
     let base = syscall::map_phys_nc(IVSHMEM_BAR, used).ok_or(7u64)?;
     window::write_u32(base, window::FIELD_MAGIC, window::MAGIC);
     window::write_u32(base, window::FIELD_VERSION, window::VERSION);
@@ -682,7 +884,7 @@ fn open_window() -> Result<u64, u64> {
 }
 
 // ---------------------------------------------------------------------------
-// Network client (same window contract as the shell's `wget`)
+// Network client
 
 fn map_net_window(server: u64) -> Option<u64> {
     if !syscall::send(server, &net_ipc::share_request()) {
@@ -738,16 +940,12 @@ fn find_task_id(program: u64) -> Option<u64> {
     tasks[..count.min(32)]
         .iter()
         .rev()
-        .find(|task| {
-            task.program == program && task.state != 6 && task.state != 7
-        })
+        .find(|task| task.program == program && task.state != 6 && task.state != 7)
         .map(|task| task.id)
 }
 
 fn fatal(status: u64, message: &str) -> ! {
-    // The browser owns no console, so an early failure exits and the kernel's
-    // task-exit line names it. Once the window exists, `paint` shows errors.
-    syscall::print("BROWSER: ");
+    syscall::print("WOLFSER: ");
     syscall::print(message);
     syscall::print("\r\n");
     syscall::exit_with_status(status)

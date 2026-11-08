@@ -52,7 +52,7 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 | Init | Silverd resolves task ids (not cap ids) before grants | **pass** |
 | Capabilities | `CAP_MOUNT`/`CAP_POWER` outside `CAP_ALL`; shell owns `CAP_POWER` by kernel policy | **pass** |
 | Toolbox | multi-call `utils`: grep/wc/head/tail/cp/find/seq/dirname/sleep/true/false | **pass** |
-| Browser window | guest `browser` + ivshmem surface + Qt viewer; `--snapshot` sees a frame with text | **pass** |
+| Wolfser | `wolfser [query|url]`, search/address bar, ivshmem surface + Qt viewer; `--snapshot` sees a frame with text | **pass** |
 | Power | `poweroff`/`reboot`; SMC on Qualcomm, HVC on QEMU | **implemented; QEMU PSCI caveat below** |
 | SMP | QEMU `-smp 4` selftest | **15 PASS / 0 FAIL** |
 | Fog QEMU | relocation, at-link, fail-closed park, timer | **PASS** |
@@ -85,10 +85,10 @@ describes a supported build.
 4. **Networking has its first full layer.** DHCP, DNS, TCP and an HTTP client
    are working (`ip`, `dns`, `wget`); TLS/HTTPS, HTTP/2 and parallel fetches
    remain. HTTPS is rejected with a clear error until a TLS client is added.
-5. **The browser is a text renderer.** The shared surface, Qt viewer, input
-   ring, scrolling and reload work; CSS layout, images, HTML forms, TLS and
-   parallel fetches do not. The Linux ABI/Phosh track replaces it with a real
-   engine later.
+5. **Wolfser is a text renderer.** The search/address bar, shared surface,
+   Qt viewer, input ring, scrolling, reload and search work; CSS layout,
+   images, HTML forms, TLS and parallel fetches do not. The Linux ABI/Phosh
+   track replaces it with a real engine later.
 6. **Linux ABI/Phosh are not started.** The kernel personality layer, static
    musl binaries, headless Wayland and the Phosh stack are the active
    long-term track; see [`VECTOR.md`](VECTOR.md).
@@ -125,7 +125,7 @@ network driver reports a probe failure and the shell continues.
 ## Next work
 
 1. TLS client (rustls) and `https://` for `wget` and the browser.
-2. Browser: richer HTML (headings, links, images), damage rectangles, more input.
+2. Wolfser: richer HTML (headings, links, images), damage rectangles, redirects, more input.
 3. Window transport on real hardware (host-side streaming or a local console).
 4. Linux ABI: static musl binaries, then busybox `sh`.
 5. Phosh: headless Wayland, GTK software render, D-Bus + logind stub, `phosh`.

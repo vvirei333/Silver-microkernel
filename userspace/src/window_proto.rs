@@ -1,4 +1,4 @@
-//! Shared layout of the browser window.
+//! Shared layout of the Wolfser window.
 //!
 //! The guest draws one RGBA surface and publishes it through an ivshmem BAR
 //! that the host maps from the same file. The header carries the geometry,
@@ -35,6 +35,18 @@ pub const STATE_ERROR: u32 = 3;
 pub const INPUT_RING: u64 = 0x0040;
 pub const INPUT_SLOTS: u32 = 64;
 pub const INPUT_ENTRY: u64 = 8;
+
+// Key codes the host sends. Printable keys carry their ASCII/Unicode value.
+pub const KEY_UP: u16 = 1;
+pub const KEY_DOWN: u16 = 2;
+pub const KEY_PAGE_UP: u16 = 3;
+pub const KEY_PAGE_DOWN: u16 = 4;
+pub const KEY_HOME: u16 = 5;
+pub const KEY_END: u16 = 6;
+pub const KEY_ENTER: u16 = 10;
+pub const KEY_BACKSPACE: u16 = 11;
+pub const KEY_ESCAPE: u16 = 12;
+pub const KEY_FOCUS: u16 = 13; // Ctrl+L
 
 pub const INPUT_KEY: u8 = 1;
 pub const INPUT_SCROLL: u8 = 2;

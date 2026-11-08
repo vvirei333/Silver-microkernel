@@ -1,4 +1,4 @@
-# Author a 5x7 uppercase pixel font for the browser. Each glyph is seven
+# Author a 5x7 uppercase pixel font for Wolfser. Each glyph is seven
 # rows of five cells; '#' is ink. Lowercase maps to uppercase at render time.
 glyphs = {
 ' ': ["     "]*7,

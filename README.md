@@ -101,7 +101,7 @@ userspace.
 - [x] DNS: `dns <name>` resolves through the DHCP-provided resolver
 - [x] HTTP: `wget <url> [file]` fetches an `http://` document through a real TCP connection into SFS; `ip` shows the lease
 - [x] Vendored `smoltcp` 0.14 with a two-line neighbour fix for broadcast DHCP traffic (`third_party/smoltcp/PATCH.md`)
-- [x] `browser`: guest-side HTTP browser that renders a page into an ivshmem RGBA surface (title/URL bar, wrapped text, error page)
+- [x] **Wolfser**: `wolfser [query|url]` opens a search/address bar; the guest fetches HTTP and renders the page into an ivshmem RGBA surface (title bar, address bar, wrapped text, error page)
 - [x] Qt window viewer (`tools/window-viewer`) that maps the same surface, repaints on `frame_seq`, and sends keys/wheel through an input ring; `--snapshot` mode for headless checks
 - [x] `SYS_MAP_PHYS_NC`: maps a non-DRAM window (ivshmem) as Normal Non-Cacheable user memory
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
@@ -538,13 +538,17 @@ are: IPv4 only, one frame slot per direction, no virtio-net interrupts (RX is
 polled), one HTTP fetch at a time, `http://` only (no TLS yet), and no
 compressed or chunked-specific browser features beyond the built-in dechunking.
 
-## Browser window
+## Wolfser (browser window)
 
-The browser is a normal guest program (`browser [url]` in Howl). It fetches
-the page through `net_server`, reduces HTML to text (scripts/styles/tags
-stripped, entities decoded, block tags become line breaks) and draws into one
-900x640 RGBA surface. There is no guest compositor: the surface lives in an
-ivshmem BAR, and a Qt program on the host maps the same file.
+Wolfser is a normal guest program (`wolfser` in Howl). With no argument it
+opens an empty search bar; with an argument it treats the text as an address
+or a query. Enter resolves the input: an explicit `http://` URL is used as-is,
+a bare host gets `http://`, anything else becomes a Bing search over plain
+HTTP (`http://www.bing.com/search?q=...`), which the console stack can fetch
+without TLS. The page is reduced to text (scripts/styles/tags stripped,
+entities decoded, block tags become line breaks) and drawn into one 900x640
+RGBA surface. There is no guest compositor: the surface lives in an ivshmem
+BAR, and a Qt program on the host maps the same file.
 
 | Region | Contents |
 | --- | --- |
@@ -554,9 +558,9 @@ ivshmem BAR, and a Qt program on the host maps the same file.
 | `0x020` | input ring head/tail; 64 eight-byte entries |
 | `0x1000` | RGBA8888 pixels |
 
-Keys from the host (`q` quit, `r` reload, arrows/PageUp/PageDown/Home/End) and
-wheel events travel through the ring; the guest repaints and bumps
-`frame_seq`. `tools/window-viewer` runs a window with Qt6 and has a
+Keys from the host (`Ctrl+L` edit the address, `Enter` go, `Backspace`,
+`q` quit, `r` reload, arrows/PageUp/PageDown/Home/End) and wheel events travel
+through the ring; the guest repaints and bumps `frame_seq`. `tools/window-viewer` runs a window with Qt6 and has a
 `--snapshot OUT.png` mode that works with `QT_QPA_PLATFORM=offscreen`, which is
 how the QEMU test checks a frame without a display.
 
@@ -564,7 +568,7 @@ how the QEMU test checks a frame without a display.
 qemu-system-aarch64 ... \
   -object memory-backend-file,id=ivshmem0,share=on,mem-path=/dev/shm/werewolf-window,size=4M \
   -device ivshmem-plain,memdev=ivshmem0
-# guest: browser http://example.com/
+# guest: wolfser
 # host:  build/window-viewer/werewolf-window --shm /dev/shm/werewolf-window
 ```
 

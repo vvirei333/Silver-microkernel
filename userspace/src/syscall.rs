@@ -93,7 +93,7 @@ pub const PROGRAM_NET_SERVER: u64 = 13;
 pub const PROGRAM_BIGDIR: u64 = 17;
 pub const PROGRAM_BIGFILE: u64 = 18;
 pub const PROGRAM_UTILS: u64 = 19;
-pub const PROGRAM_BROWSER: u64 = 20;
+pub const PROGRAM_WOLFSER: u64 = 20;
 /// Sentinel program ID for tasks spawned from a dynamically loaded ELF.
 pub const PROGRAM_DYNAMIC: u64 = u64::MAX - 1;
 pub const CAP_MMIO: u32 = 1 << 4;

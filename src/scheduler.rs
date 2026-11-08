@@ -3271,7 +3271,7 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
     map_phys_to_current_mode(phys_addr, size, false)
 }
 
-/// Maps a device-window range as Normal Non-Cacheable. Used by the browser's
+/// Maps a device-window range as Normal Non-Cacheable. Used by Wolfser's
 /// ivshmem surface, which is host RAM rather than a register bank.
 pub fn map_phys_nc_to_current(phys_addr: usize, size: usize) -> Option<usize> {
     map_phys_to_current_mode(phys_addr, size, true)
@@ -4028,9 +4028,9 @@ fn initial_self_rights(program: u64) -> Option<u32> {
         user_program::BIGDIR | user_program::BIGFILE => capability::CAP_FS_WRITE,
         // Multi-call Unix toolbox: `cp` writes, the rest only reads.
         user_program::UTILS => capability::CAP_FS_WRITE,
-        // The browser scans PCI for ivshmem, maps that surface and the
-        // network data window.
-        user_program::BROWSER => capability::CAP_MMIO | capability::CAP_PCI,
+        // Wolfser scans PCI for ivshmem, maps that surface and the network
+        // data window.
+        user_program::WOLFSER => capability::CAP_MMIO | capability::CAP_PCI,
         _ => return None,
     };
     Some(rights)

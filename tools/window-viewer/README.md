@@ -26,7 +26,9 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp 1 -m 256M \
   -display none -serial mon:stdio
 
 # in the guest
-howl> browser http://example.com/
+howl> wolfser            # search bar
+howl> wolfser example.com
+howl> wolfser build a bear
 ```
 
 Then, on the host:
@@ -35,8 +37,9 @@ Then, on the host:
 build/window-viewer/werewolf-window --shm /dev/shm/werewolf-window
 ```
 
-Keys: `q` quits the guest browser, `r` reloads, arrows/PageUp/PageDown/Home/
-End and the wheel scroll. The viewer ignores shortcuts so the guest sees them.
+Keys: printable text goes to the search bar, `Enter` navigates, `Backspace`
+edits, `Ctrl+L` starts a new address, `r` reloads, `q` quits, and
+arrows/PageUp/PageDown/Home/End plus the wheel scroll.
 
 ## Headless check
 

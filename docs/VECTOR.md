@@ -25,13 +25,13 @@
 ICMP, DNS, TCP), Howl, Howler, multi-call `utils` (`grep`, `wc`, `head`,
 `tail`, `cp`, `find`, `seq`, `basename`, `dirname`, `true`, `false`,
 `sleep`), сетевые команды `ping`, `ip`, `dns`, `wget` (HTTP в SFS) и
-**браузер**: гость рисует страницу в ivshmem-surface, Qt-viewer на хосте
-показывает кадр и шлёт клавиши/колесо через input ring (прокрутка, reload,
-quit).
+**Wolfser**: `wolfser` открывает поисковую строку; гость рисует страницу в
+ivshmem-surface, Qt-viewer на хосте показывает кадр и шлёт клавиши/колесо
+через input ring (поиск, адрес, Ctrl+L, прокрутка, reload, quit).
 
 Дальше: TLS-клиент/`https://`, `date` (RTC), pager, больше applets.
 
-## 2. Окно браузера на хосте — работает (первый срез)
+## 2. Wolfser — окно браузера на хосте (первый срез)
 
 ```
 гость (browser)                          хост (Qt)
@@ -45,11 +45,12 @@ quit).
   ассайнится гостем и мапится как Normal Non-Cacheable.
 - Протокол: заголовок (magic/width/height/stride/format/frame_seq/state),
   input ring (64 записи: key/scroll/click), пиксели с `0x1000`.
-- Гость: `browser` — HTTP через `net_server`, HTML → текст, отрисовка
-  5x7-шрифтом, скролл/перезагрузка/выход.
+- Гость: `wolfser` — поисковая строка/адрес, HTTP через `net_server`,
+  HTML → текст, отрисовка 5x7-шрифтом, Ctrl+L, скролл/перезагрузка/выход.
 - Хост: `tools/window-viewer` (Qt6), плюс `--snapshot` для headless-проверки.
 - Никакого DRM/GPU в госте: один surface, программный рендер.
-- Следующее: изображения, ссылки, damage-прямоугольники, TLS.
+- Поиск по умолчанию — Bing over HTTP (без TLS). Следующее: редиректы,
+  изображения, ссылки, damage-прямоугольники, TLS.
 
 Браузерная логика — в госте: HTTP-клиент, HTML-токенизатор, простая
 раскладка. HTTPS на первом этапе — host-proxy (хост забирает URL по TLS и
@@ -135,7 +136,7 @@ glibc-поведение, корректность futex/потоков, про�
 ## 6. Ближайший порядок работ
 
 1. Сеть: TLS-клиент и `https://` (rustls), затем HTTP/1.1 keep-alive.
-2. Браузер: изображения/ссылки, damage, больше ввода; затем Linux ABI.
+2. Wolfser: редиректы, изображения/ссылки, damage, больше ввода; затем Linux ABI.
 3. Linux ABI: статические musl-бинарники, затем busybox `sh`.
 4. Phosh: headless Wayland → GTK → D-Bus → `phosh`.
 5. По желанию: свой минимальный браузер в host-окне (или QtWebEngine как

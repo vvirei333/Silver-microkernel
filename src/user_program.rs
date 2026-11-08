@@ -15,8 +15,8 @@ pub const NET_SERVER: u64 = 13;
 pub const BIGDIR: u64 = 17;
 pub const BIGFILE: u64 = 18;
 pub const UTILS: u64 = 19;
-/// Network browser that draws into the host-shared ivshmem surface.
-pub const BROWSER: u64 = 20;
+/// Wolfser: the network browser that draws into the host-shared ivshmem surface.
+pub const WOLFSER: u64 = 20;
 
 /// Sentinel program ID for tasks spawned from a dynamically loaded ELF (the
 /// `run <path>` path). Distinct from `u64::MAX`, which marks kernel tasks.
@@ -36,7 +36,7 @@ static SL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sl.elf"));
 static NET_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_driver.elf"));
 static NET_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_server.elf"));
 static UTILS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/utils.elf"));
-static BROWSER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/browser.elf"));
+static WOLFSER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wolfser.elf"));
 static BIGDIR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigdir.elf"));
 static BIGFILE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigfile.elf"));
 
@@ -57,7 +57,7 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         NET_DRIVER => Some(NET_DRIVER_ELF),
         NET_SERVER => Some(NET_SERVER_ELF),
         UTILS => Some(UTILS_ELF),
-        BROWSER => Some(BROWSER_ELF),
+        WOLFSER => Some(WOLFSER_ELF),
         BIGDIR => Some(BIGDIR_ELF),
         BIGFILE => Some(BIGFILE_ELF),
         _ => None,
