@@ -14,10 +14,15 @@
 //! descriptors, signals and threads are deliberate no-ops or `-ENOSYS`; each
 //! one is called out at its match arm.
 
-use crate::{scheduler, syscall, timer, user_memory};
+use crate::{linux_fd, scheduler, timer, user_memory};
 
 // Linux AArch64 syscall numbers (asm-generic/unistd.h).
+const SYS_DUP: u64 = 23;
+const SYS_DUP3: u64 = 24;
 const SYS_IOCTL: u64 = 29;
+const SYS_FCNTL: u64 = 25;
+const SYS_GETCWD: u64 = 17;
+const SYS_CHDIR: u64 = 49;
 const SYS_OPENAT: u64 = 56;
 const SYS_CLOSE: u64 = 57;
 const SYS_LSEEK: u64 = 62;
@@ -33,10 +38,21 @@ const SYS_EXIT_GROUP: u64 = 94;
 const SYS_SET_TID_ADDRESS: u64 = 96;
 const SYS_SET_ROBUST_LIST: u64 = 99;
 const SYS_CLOCK_GETTIME: u64 = 113;
+const SYS_CLOCK_GETRES: u64 = 114;
+const SYS_CLOCK_NANOSLEEP: u64 = 115;
+const SYS_NANOSLEEP: u64 = 101;
+const SYS_GETTIMEOFDAY: u64 = 169;
 const SYS_RT_SIGPROCMASK: u64 = 135;
 const SYS_UNAME: u64 = 160;
 const SYS_GETPID: u64 = 172;
 const SYS_GETPPID: u64 = 173;
+const SYS_GETUID: u64 = 174;
+const SYS_GETEUID: u64 = 175;
+const SYS_GETGID: u64 = 176;
+const SYS_GETEGID: u64 = 177;
+const SYS_GETRLIMIT: u64 = 163;
+const SYS_PRCTL: u64 = 167;
+const SYS_SCHED_GETAFFINITY: u64 = 123;
 const SYS_GETTID: u64 = 178;
 const SYS_SCHED_YIELD: u64 = 124;
 const SYS_BRK: u64 = 214;
@@ -51,6 +67,7 @@ const EPERM: u64 = 1;
 const ENOENT: u64 = 2;
 const EBADF: u64 = 9;
 const ENOMEM: u64 = 12;
+const EACCES: u64 = 13;
 const EFAULT: u64 = 14;
 const ENOTDIR: u64 = 20;
 const EISDIR: u64 = 21;
@@ -58,6 +75,7 @@ const EINVAL: u64 = 22;
 const ENOTTY: u64 = 25;
 const ESPIPE: u64 = 29;
 const EROFS: u64 = 30;
+const ERANGE: u64 = 34;
 const ENOSYS: u64 = 38;
 
 /// Linux returns `-errno`; sign-extend so `(long)x0 < 0` works in libc.
@@ -71,12 +89,6 @@ const MAP_FIXED: u64 = 0x10;
 /// `openat` / `newfstatat` conventions.
 const AT_FDCWD: i64 = -100;
 const AT_EMPTY_PATH: u64 = 0x1000;
-const O_WRONLY: u64 = 0o1;
-const O_RDWR: u64 = 0o2;
-const O_CREAT: u64 = 0o100;
-const O_TRUNC: u64 = 0o1000;
-const O_APPEND: u64 = 0o2000;
-const O_DIRECTORY: u64 = 0o200000;
 /// `struct stat` mode classes.
 const S_IFCHR: u32 = 0o020000;
 const S_IFDIR: u32 = 0o040000;
@@ -90,15 +102,38 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
     match number {
         SYS_WRITE => linux_write(args[0], args[1], args[2]),
         SYS_WRITEV => linux_writev(args[0], args[1], args[2]),
-        SYS_READ => linux_read(args[0], args[1], args[2]),
+        SYS_READ => finish(linux_fd::read(scheduler::current_task_id(), args[0], args[1], args[2])),
         SYS_OPENAT => linux_openat(args[0], args[1], args[2], args[3]),
-        SYS_CLOSE => linux_close(args[0]),
-        SYS_LSEEK => linux_lseek(args[0], args[1], args[2]),
+        SYS_CLOSE => finish(linux_fd::close(scheduler::current_task_id(), args[0]).map(|_| 0)),
+        SYS_LSEEK => finish(linux_fd::lseek(
+            scheduler::current_task_id(),
+            args[0],
+            args[1] as i64,
+            args[2],
+        )),
+        SYS_DUP => finish(linux_fd::dup(scheduler::current_task_id(), args[0])),
+        SYS_DUP3 => finish(linux_fd::dup2(
+            scheduler::current_task_id(),
+            args[0],
+            args[1],
+        )),
+        SYS_FCNTL => linux_fcntl(args[0], args[1], args[2]),
+        SYS_GETCWD => linux_getcwd(args[0], args[1]),
+        SYS_CHDIR => linux_chdir(args[0]),
         SYS_IOCTL => linux_ioctl(args[0], args[1], args[2]),
-        SYS_FSTAT => linux_fstat(args[0], args[1]),
+        SYS_FSTAT => finish(linux_fd::fstat(scheduler::current_task_id(), args[0], args[1]).map(|_| 0)),
         SYS_NEWFSTATAT => linux_newfstatat(args[0], args[1], args[2], args[3]),
-        SYS_GETDENTS64 => linux_getdents64(args[0], args[1], args[2]),
+        SYS_GETDENTS64 => finish(linux_fd::getdents64(
+            scheduler::current_task_id(),
+            args[0],
+            args[1],
+            args[2],
+        )),
         SYS_READLINKAT => errno(ENOENT),
+        SYS_NANOSLEEP => linux_nanosleep(args[0], args[1]),
+        SYS_CLOCK_NANOSLEEP => linux_nanosleep(args[2], args[3]),
+        SYS_CLOCK_GETRES => linux_clock_getres(args[1]),
+        SYS_GETTIMEOFDAY => linux_gettimeofday(args[0]),
         SYS_SCHED_YIELD => {
             scheduler::yield_current();
             0
@@ -111,6 +146,10 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_UNAME => linux_uname(args[0]),
         SYS_GETPID | SYS_GETTID => scheduler::current_task_id(),
         SYS_GETPPID => scheduler::current_task_ppid().unwrap_or(0),
+        SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => 0,
+        SYS_GETRLIMIT => linux_getrlimit(args[0], args[1]),
+        SYS_SCHED_GETAFFINITY => linux_sched_getaffinity(args[1], args[2]),
+        SYS_PRCTL => 0,
         SYS_BRK => linux_brk(args[0]),
         SYS_MUNMAP => linux_munmap(args[0], args[1]),
         SYS_MMAP => linux_mmap(args[0], args[1], args[2], args[3]),
@@ -146,72 +185,19 @@ fn trace_unsupported(number: u64) {
 }
 
 fn linux_write(fd: u64, buffer: u64, count: u64) -> u64 {
-    match fd {
-        1 | 2 => {
-            let result = syscall::write_user_output(buffer, count);
-            if result == syscall::SYSCALL_ERROR {
-                errno(EFAULT)
-            } else {
-                count
-            }
-        }
-        _ => errno(EBADF),
-    }
-}
-
-/// `read(2)`: fd 0 reports end-of-file (no tty input yet), fds 1/2 are
-/// write-only, and fd 3+ reads from the VFS at the descriptor's offset.
-fn linux_read(fd: u64, buffer: u64, count: u64) -> u64 {
-    if count == 0 {
-        return 0;
-    }
-    if fd == 0 {
-        return 0;
-    }
-    if fd < 3 {
-        return errno(EBADF);
-    }
-    let owner = scheduler::current_task_id();
-    if crate::vfs::fd_kind(owner, fd) == Some(crate::vfs::FD_KIND_DIR) {
-        return errno(EISDIR);
-    }
-    let limit = (count as usize).min(1 << 20);
-    match crate::vfs::read_with(owner, fd, limit, |bytes| {
-        if bytes.is_empty() {
-            Ok(())
-        } else {
-            user_memory::copy_to_user(bytes, buffer).map_err(|_| ())
-        }
-    }) {
-        Ok(read) => read as u64,
-        Err(()) => errno(EBADF),
-    }
-}
-
-fn linux_close(fd: u64) -> u64 {
-    // The console descriptors are process-lifetime objects; "closing" them is
-    // accepted but changes nothing. A VFS descriptor is really released.
-    if fd <= 2 {
-        0
-    } else if crate::vfs::close(scheduler::current_task_id(), fd).is_ok() {
-        0
-    } else {
-        errno(EBADF)
-    }
-}
-
-fn linux_lseek(fd: u64, offset: u64, whence: u64) -> u64 {
-    if fd <= 2 {
-        return errno(ESPIPE);
-    }
-    match crate::vfs::lseek(
+    finish(linux_fd::write(
         scheduler::current_task_id(),
         fd,
-        offset as i64,
-        whence,
-    ) {
-        Ok(position) => position,
-        Err(()) => errno(EINVAL),
+        buffer,
+        count,
+    ))
+}
+
+/// Maps the fd layer's positive errno code onto a Linux `-errno` result.
+fn finish(result: Result<u64, u64>) -> u64 {
+    match result {
+        Ok(value) => value,
+        Err(code) => errno(code),
     }
 }
 
@@ -263,42 +249,8 @@ fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
     0
 }
 
-/// `fstat(2)`. The layout is the aarch64 `struct stat` (128 bytes); glibc
-/// uses `st_mode` to decide whether stdout is a terminal and `st_size` /
-/// `st_blksize` for buffering and file operations.
-fn linux_fstat(fd: u64, buffer: u64) -> u64 {
-    if fd <= 2 {
-        return write_stat(buffer, S_IFCHR | 0o620, 0, fd.max(1));
-    }
-    let owner = scheduler::current_task_id();
-    let Ok(size) = crate::vfs::fd_len(owner, fd) else {
-        return errno(EBADF);
-    };
-    let kind = crate::vfs::fd_kind(owner, fd).unwrap_or(crate::vfs::FD_KIND_FILE);
-    let mode = if kind == crate::vfs::FD_KIND_DIR {
-        S_IFDIR | 0o755
-    } else {
-        S_IFREG | 0o644
-    };
-    write_stat(buffer, mode, size as u64, fd)
-}
-
-fn write_stat(buffer: u64, mode: u32, size: u64, ino: u64) -> u64 {
-    let mut stat = [0_u8; 128];
-    stat[8..16].copy_from_slice(&ino.to_le_bytes()); // st_ino
-    stat[16..20].copy_from_slice(&mode.to_le_bytes()); // st_mode
-    stat[20..24].copy_from_slice(&1_u32.to_le_bytes()); // st_nlink
-    stat[48..56].copy_from_slice(&size.to_le_bytes()); // st_size
-    stat[56..60].copy_from_slice(&1024_u32.to_le_bytes()); // st_blksize
-    stat[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes()); // st_blocks
-    if user_memory::copy_to_user(&stat, buffer).is_err() {
-        return errno(EFAULT);
-    }
-    0
-}
-
-/// `openat(2)`. The Silver VFS is read-only from the Linux personality for
-/// now, so any write intent fails with `-EROFS` before a descriptor exists.
+/// `openat(2)`: delegates to the process fd table, which also recognizes the
+/// synthetic `/dev` nodes before touching the VFS.
 fn linux_openat(dirfd: u64, path_ptr: u64, flags: u64, _mode: u64) -> u64 {
     let Some(path) = user_string(path_ptr) else {
         return errno(EFAULT);
@@ -306,26 +258,16 @@ fn linux_openat(dirfd: u64, path_ptr: u64, flags: u64, _mode: u64) -> u64 {
     if path.is_empty() {
         return errno(ENOENT);
     }
-    if flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND) != 0 {
-        return errno(EROFS);
-    }
     let cwd = match dirfd_cwd(dirfd) {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
-    let owner = scheduler::current_task_id();
-    if flags & O_DIRECTORY != 0 {
-        return crate::vfs::open_dir(owner, &cwd, &path)
-            .map(|fd| fd)
-            .unwrap_or_else(|_| errno(ENOENT));
-    }
-    // Linux allows opening a directory without O_DIRECTORY.
-    if let Ok(fd) = crate::vfs::open(owner, &cwd, &path, 0) {
-        return fd;
-    }
-    crate::vfs::open_dir(owner, &cwd, &path)
-        .map(|fd| fd)
-        .unwrap_or_else(|_| errno(ENOENT))
+    finish(linux_fd::open(
+        scheduler::current_task_id(),
+        &cwd,
+        &path,
+        flags,
+    ))
 }
 
 /// `newfstatat(2)`: stat by path, or by descriptor with `AT_EMPTY_PATH`.
@@ -333,78 +275,80 @@ fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
     let Some(path) = user_string(path_ptr) else {
         return errno(EFAULT);
     };
+    let task = scheduler::current_task_id();
     if path.is_empty() {
         if flags & AT_EMPTY_PATH == 0 {
             return errno(ENOENT);
         }
-        return linux_fstat(dirfd, buffer);
+        return finish(linux_fd::fstat(task, dirfd, buffer).map(|_| 0));
     }
     let cwd = match dirfd_cwd(dirfd) {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
     if let Ok(size) = crate::vfs::file_len(&cwd, &path) {
-        return write_stat(buffer, S_IFREG | 0o644, size as u64, 0);
+        return match linux_fd::write_stat(buffer, S_IFREG | 0o644, size as u64, 0) {
+            Ok(()) => 0,
+            Err(code) => errno(code),
+        };
     }
     if crate::vfs::read_dir(&cwd, &path).is_ok() {
-        return write_stat(buffer, S_IFDIR | 0o755, 0, 0);
+        return match linux_fd::write_stat(buffer, S_IFDIR | 0o755, 0, 0) {
+            Ok(()) => 0,
+            Err(code) => errno(code),
+        };
     }
     errno(ENOENT)
 }
 
-/// `getdents64(2)`: serializes up to `count` bytes of directory entries. The
-/// descriptor offset advances only by the entries that fit, so a short buffer
-/// neither loses nor repeats an entry.
-fn linux_getdents64(fd: u64, buffer: u64, count: u64) -> u64 {
-    const DIRENT_HEADER: usize = 19; // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1)
-    if fd <= 2 {
-        return errno(ENOTDIR);
+/// `fcntl(2)`: descriptor duplication plus the flags queries every libc probes.
+fn linux_fcntl(fd: u64, command: u64, argument: u64) -> u64 {
+    const F_DUPFD: u64 = 0;
+    const F_GETFD: u64 = 1;
+    const F_SETFD: u64 = 2;
+    const F_GETFL: u64 = 3;
+    const F_SETFL: u64 = 4;
+    const F_DUPFD_CLOEXEC: u64 = 1030;
+    let task = scheduler::current_task_id();
+    match command {
+        F_DUPFD | F_DUPFD_CLOEXEC => finish(linux_fd::dup_from(task, fd, argument)),
+        // We do not model descriptor or status flags yet; report "none" and
+        // accept changes as no-ops.
+        F_GETFD | F_GETFL => 0,
+        F_SETFD | F_SETFL => 0,
+        _ => errno(EINVAL),
     }
-    if count == 0 {
-        return 0;
+}
+
+fn linux_getcwd(buffer: u64, capacity: u64) -> u64 {
+    let cwd = scheduler::current_task_cwd();
+    let bytes = cwd.as_bytes();
+    if bytes.len() + 1 > capacity as usize {
+        return errno(ERANGE);
     }
-    let owner = scheduler::current_task_id();
-    let Ok((entries, start)) = crate::vfs::dir_entries_from_fd(owner, fd, 128) else {
-        return errno(ENOTDIR);
-    };
-    if entries.is_empty() {
-        return 0;
-    }
-    let limit = (count as usize).min(64 * 1024);
-    let mut output = alloc::vec![0_u8; limit];
-    let mut used = 0usize;
-    let mut serialized = 0usize;
-    for entry in &entries {
-        let name_len = (entry.name_len as usize).min(entry.name.len());
-        let record = (DIRENT_HEADER + name_len + 1 + 7) & !7;
-        if used + record > limit {
-            break;
-        }
-        output[used..used + 8].copy_from_slice(&((start + serialized + 1) as u64).to_le_bytes());
-        output[used + 8..used + 16]
-            .copy_from_slice(&((start + serialized + 1) as i64).to_le_bytes());
-        output[used + 16..used + 18].copy_from_slice(&(record as u16).to_le_bytes());
-        output[used + 18] = if entry.kind == crate::vfs::FD_KIND_DIR {
-            4 // DT_DIR
-        } else {
-            8 // DT_REG
-        };
-        output[used + DIRENT_HEADER..used + DIRENT_HEADER + name_len]
-            .copy_from_slice(&entry.name[..name_len]);
-        used += record;
-        serialized += 1;
-    }
-    if serialized == 0 {
-        // The first entry does not fit: Linux reports EINVAL rather than EOF.
-        return errno(EINVAL);
-    }
-    if user_memory::copy_to_user(&output[..used], buffer).is_err() {
+    if user_memory::copy_to_user(bytes, buffer).is_err() {
         return errno(EFAULT);
     }
-    if crate::vfs::advance_dir_fd(owner, fd, serialized).is_err() {
-        return errno(EBADF);
+    let nul = [0_u8; 1];
+    if user_memory::copy_to_user(&nul, buffer + bytes.len() as u64).is_err() {
+        return errno(EFAULT);
     }
-    used as u64
+    (bytes.len() + 1) as u64
+}
+
+fn linux_chdir(path_ptr: u64) -> u64 {
+    let Some(path) = user_string(path_ptr) else {
+        return errno(EFAULT);
+    };
+    let cwd = scheduler::current_task_cwd();
+    let Ok(resolved) = crate::vfs::resolve_directory(&cwd, &path) else {
+        return errno(ENOENT);
+    };
+    if scheduler::set_current_task_cwd(resolved) {
+        0
+    } else {
+        errno(EACCES)
+    }
 }
 
 /// Resolves `dirfd` to a working directory: `AT_FDCWD` uses the process cwd,
@@ -413,13 +357,7 @@ fn dirfd_cwd(dirfd: u64) -> Result<alloc::string::String, u64> {
     if dirfd as i64 == AT_FDCWD {
         return Ok(scheduler::current_task_cwd());
     }
-    let owner = scheduler::current_task_id();
-    match crate::vfs::fd_kind(owner, dirfd) {
-        Some(crate::vfs::FD_KIND_DIR) => {
-            crate::vfs::fd_path(owner, dirfd).ok_or_else(|| errno(EBADF))
-        }
-        _ => Err(errno(EBADF)),
-    }
+    linux_fd::directory_path(scheduler::current_task_id(), dirfd).ok_or_else(|| errno(EBADF))
 }
 
 /// Copies a NUL-terminated user string (bounded to 255 bytes).
@@ -443,7 +381,7 @@ fn user_string(pointer: u64) -> Option<alloc::string::String> {
 
 fn linux_clock_gettime(_clock: u64, timespec: u64) -> u64 {
     // `timer::ticks()` is 100 Hz; report it as whole seconds plus the
-    // remaining tenth-of-a-second fraction.
+    // remaining fraction.
     let ticks = timer::ticks();
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&(ticks / 100).to_le_bytes());
@@ -452,6 +390,86 @@ fn linux_clock_gettime(_clock: u64, timespec: u64) -> u64 {
         return errno(EFAULT);
     }
     0
+}
+
+/// `clock_getres(2)`: the scheduler tick is the resolution.
+fn linux_clock_getres(resolution: u64) -> u64 {
+    if resolution == 0 {
+        return 0;
+    }
+    let mut bytes = [0_u8; 16];
+    bytes[8..].copy_from_slice(&10_000_000_u64.to_le_bytes());
+    if user_memory::copy_to_user(&bytes, resolution).is_err() {
+        return errno(EFAULT);
+    }
+    0
+}
+
+fn linux_gettimeofday(time: u64) -> u64 {
+    if time == 0 {
+        return 0;
+    }
+    let ticks = timer::ticks();
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&(ticks / 100).to_le_bytes());
+    bytes[8..16].copy_from_slice(&((ticks % 100) * 10_000).to_le_bytes());
+    if user_memory::copy_to_user(&bytes, time).is_err() {
+        return errno(EFAULT);
+    }
+    0
+}
+
+/// `nanosleep`/`clock_nanosleep`: blocking is a scheduler sleep, clamped so a
+/// program cannot wedge the kernel with an absurd timeout.
+fn linux_nanosleep(request: u64, remaining: u64) -> u64 {
+    let mut bytes = [0_u8; 16];
+    if user_memory::copy_from_user(request, &mut bytes).is_err() {
+        return errno(EFAULT);
+    }
+    let seconds = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+    let nanoseconds = u64::from_le_bytes(bytes[8..].try_into().unwrap());
+    let millis = seconds
+        .saturating_mul(1000)
+        .saturating_add(nanoseconds / 1_000_000)
+        .min(60_000);
+    if millis != 0 {
+        scheduler::sleep(millis);
+    } else {
+        scheduler::yield_current();
+    }
+    if remaining != 0 {
+        let zero = [0_u8; 16];
+        let _ = user_memory::copy_to_user(&zero, remaining);
+    }
+    0
+}
+
+fn linux_getrlimit(resource: u64, buffer: u64) -> u64 {
+    const RLIMIT_NOFILE: u64 = 7;
+    let limit: u64 = if resource == RLIMIT_NOFILE {
+        256
+    } else {
+        1 << 30
+    };
+    let mut bytes = [0_u8; 16];
+    bytes[..8].copy_from_slice(&limit.to_le_bytes());
+    bytes[8..].copy_from_slice(&limit.to_le_bytes());
+    if user_memory::copy_to_user(&bytes, buffer).is_err() {
+        return errno(EFAULT);
+    }
+    0
+}
+
+fn linux_sched_getaffinity(size: u64, mask: u64) -> u64 {
+    if size < 8 {
+        return errno(EINVAL);
+    }
+    let mut bytes = [0_u8; 8];
+    bytes[0] = 1; // one CPU
+    if user_memory::copy_to_user(&bytes, mask).is_err() {
+        return errno(EFAULT);
+    }
+    8
 }
 
 fn linux_uname(buffer: u64) -> u64 {

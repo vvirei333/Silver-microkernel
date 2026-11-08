@@ -190,8 +190,21 @@ Redmi port is parked. The reference checklist is
   `read_file_limit`. The Linux view is read-only (`-EROFS` for write intents).
   Verified with static glibc: `linuxrun /sfs/linux-libc` prints
   `hello from libc`, `readme!!`, `entries=5` and exits 0 (open/read/close and
-  opendir/readdir over `/sfs`). Follow-ups: per-task read scope, `/dev`
-  nodes, signals/threads, ET_DYN.
+  opendir/readdir over `/sfs`).
+  **Slice 5 (fd process model + small syscalls):** Linux descriptors are now a
+  real per-process table (`src/linux_fd.rs`) instead of direct VFS fds:
+  0/1/2 are console handles and can be redirected with `dup2`, `/dev/null`,
+  `/dev/zero`, `/dev/full` and `/dev/urandom` are synthetic devices, and
+  entries 3+ wrap Silver VFS handles (released by `vfs::close_task` on exit;
+  the table is dropped in `exit_current_with_status`/`kill_task`).
+  Added `dup`/`dup3`, `fcntl` (F_DUPFD/F_DUPFD_CLOEXEC and flag no-ops),
+  `getcwd`, `chdir`, `nanosleep`/`clock_nanosleep` (scheduler sleep),
+  `clock_getres`, `gettimeofday`, `getrlimit`, `getuid`/`geteuid`/`getgid`/
+  `getegid`, `sched_getaffinity` and `prctl`. The glibc test now also checks
+  `fstat` size, `/dev/null` stdout redirection, `/dev/urandom`, `chdir`/
+  `getcwd` and `nanosleep`, still exiting 0 with the console output above.
+  Still open: per-task read scope, signals/threads, `pipe`/`poll`/`eventfd`,
+  ET_DYN.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -218,9 +231,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 5 (per-task read scope, `/dev/null`/`zero`/
-  `random` nodes, `rt_sigaction`/`futex`, then ET_DYN/PIE and `ld.so` so
-  distro binaries and a real shell run); larger reader/CSS budgets, full-page
+- **Next steps:** Linux ABI slice 6 (`pipe2`/`ppoll`/`eventfd`/`memfd`, a
+  per-task read scope, `rt_sigaction`/`futex`), then ET_DYN/PIE and `ld.so` so
+  distro binaries and a real shell run; larger reader/CSS budgets, full-page
   layout and keep-alive;
   TLS hardening (roots, RTC, RNG, TLS 1.2); **YouTube/JS/media still require a
   WebKit/Gecko-class engine, i.e. the Linux ABI + Phosh track**, not another

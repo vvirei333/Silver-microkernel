@@ -85,6 +85,8 @@ mod smp;
 mod syscall;
 #[cfg(feature = "linux-abi")]
 mod linux_abi;
+#[cfg(feature = "linux-abi")]
+mod linux_fd;
 #[cfg(not(feature = "std"))]
 mod timer;
 #[cfg(not(feature = "std"))]

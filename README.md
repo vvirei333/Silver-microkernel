@@ -299,11 +299,14 @@ layout (`argc/argv/envp/auxv`, including `AT_PAGESZ`, `AT_ENTRY`, `AT_PHDR`,
 `AT_RANDOM`). Implemented so far: `write` (stdout/stderr), `read` (fd 0 as
 EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 `clock_gettime`, `rt_sigprocmask`, `uname`, `getpid`/`getppid`/`gettid`,
-`brk`, `mmap`, `munmap`, `mprotect`, `prlimit64`, `getrandom`, `fstat`
-(console descriptors), `ioctl(TIOCGWINSZ)`, `writev`, `close`, `lseek`,
-`readlinkat`, `sched_yield`, `openat`, `getdents64` and `newfstatat`; anything
-else returns `-ENOSYS`. File descriptors 3+ are the VFS's own descriptors, so
-the Linux side has no second table; the filesystem view is read-only for now.
+`brk`, `mmap`, `munmap`, `mprotect`, `prlimit64`, `getrandom`, `fstat`,
+`ioctl(TIOCGWINSZ)`, `writev`, `close`, `lseek`, `readlinkat`, `sched_yield`,
+`openat`, `getdents64`, `newfstatat`, `dup`/`dup2`/`dup3`, `fcntl`, `getcwd`,
+`chdir`, `nanosleep`/`clock_nanosleep`, `clock_getres`, `gettimeofday`,
+`getrlimit`, `getuid`/`geteuid`/`getgid`/`getegid`, `sched_getaffinity` and
+`prctl`; anything else returns `-ENOSYS`. File descriptors are a per-process
+table in `src/linux_fd.rs` (console, synthetic `/dev` devices, or VFS
+handles), so `dup2` redirects work; the filesystem view is read-only.
 
 The personality is fixed at spawn, so a foreign binary can never reach the
 Silver syscall table by choosing a colliding number. `linuxrun` is a
@@ -344,11 +347,16 @@ general VFS cap stays 512 KiB, and the transient read is exactly file-sized.
 still-unsupported number (capped) so the next slice is driven by what a libc
 actually calls.
 
-File descriptors 3+ are the Silver VFS's own descriptors (`vfs::open` already
-starts at 3, leaving 0-2 for stdin/stdout/stderr), so `openat`, `read`,
-`close`, `lseek`, `fstat`, `newfstatat` and `getdents64` are translations, not
-a second table. The Linux view of the filesystem is **read-only** for now:
-write intents fail with `-EROFS`. The test prints:
+File descriptors are a real **process table** in the Linux layer
+(`src/linux_fd.rs`), because Linux semantics need more than the VFS exposes:
+0/1/2 start as console handles, `dup2` can redirect stdout to a file, and
+`/dev/null`, `/dev/zero`, `/dev/full` and `/dev/urandom` are synthetic devices
+with no inode. Entries 3+ point at real Silver VFS descriptors, so the storage
+layer stays ours and `vfs::close_task` releases the handles on exit. The table
+is dropped with the task; with the `linux-abi` feature off it does not exist.
+
+The Linux view of the filesystem is **read-only** for now: write intents on
+real files fail with `-EROFS` (devices still accept writes). The test prints:
 
 ```text
 howl> linuxrun /sfs/linux-libc
@@ -357,10 +365,13 @@ readme!!
 entries=5
 ```
 
+It also redirects stdout to `/dev/null` through `dup`/`dup2`, reads
+`/dev/urandom`, checks `chdir`/`getcwd` and sleeps with `nanosleep`.
+
 Still missing: a per-task read scope (a Linux task can read any VFS path, which
 is acceptable on the single-user console but must be closed before untrusted
-apps), `/dev` nodes, signal delivery and thread creation, and `ET_DYN` (PIE)
-relocation — link with `-no-pie`.
+apps), signal delivery and thread creation, `pipe`/`poll`/`eventfd`, and
+`ET_DYN` (PIE) relocation — link with `-no-pie`.
 
 ## Bundle manifests and signing — complete
 

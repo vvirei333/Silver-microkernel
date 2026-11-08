@@ -1899,6 +1899,8 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
         console::write_str(")\r\n");
     }
     crate::ipc::remove_task(id);
+    #[cfg(feature = "linux-abi")]
+    crate::linux_fd::close_task(id);
     vfs::close_task(id);
     let saved_daif = interrupts::save_and_disable_irq();
     if let Some(task) = current_task_mut() {
@@ -1954,6 +1956,8 @@ pub fn kill_task(id: u64) -> bool {
     // Side effects only after the target is proven live: a bogus CAP_KILL
     // target must not broadcast mailbox/console wakeups across the system.
     crate::ipc::remove_task(id);
+    #[cfg(feature = "linux-abi")]
+    crate::linux_fd::close_task(id);
     vfs::close_task(id);
     manager.tasks[index].state = TaskState::Dead;
     manager.tasks[index].bound_irq = None;
