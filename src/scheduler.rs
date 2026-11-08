@@ -4018,6 +4018,8 @@ fn initial_self_rights(program: u64) -> Option<u32> {
         }
         // Trusted filesystem stress helper (not an installed app bundle).
         user_program::BIGDIR | user_program::BIGFILE => capability::CAP_FS_WRITE,
+        // Multi-call Unix toolbox: `cp` writes, the rest only reads.
+        user_program::UTILS => capability::CAP_FS_WRITE,
         _ => return None,
     };
     Some(rights)

@@ -238,6 +238,9 @@ fn execute(command: &str) {
             syscall::print("  wait <cap> Wait for a task and print its exit status\r\n");
             syscall::print("  poweroff   Power the machine down through PSCI\r\n");
             syscall::print("  reboot     Reset the machine through PSCI\r\n");
+            syscall::print("  grep <pattern> <file> | wc <file> | head/tail [n] <file>\r\n");
+            syscall::print("  cp <src> <dst> | find [path] | seq N | basename/dirname <path>\r\n");
+            syscall::print("  true | false | sleep <seconds>\r\n");
         }
         Some("fastfetch") => fastfetch(),
         Some("sfsinfo") => sfs_info(),
@@ -268,6 +271,11 @@ fn execute(command: &str) {
         Some("wait") => wait_task(words.next()),
         Some("poweroff") => syscall::power_off(),
         Some("reboot") => syscall::power_reset(),
+        Some("grep") | Some("wc") | Some("head") | Some("tail") | Some("cp")
+        | Some("find") | Some("seq") | Some("basename") | Some("dirname")
+        | Some("true") | Some("false") | Some("sleep") => {
+            run_utility(syscall::PROGRAM_UTILS, command);
+        }
         Some(_) => syscall::print("Unknown command. Type 'help'.\r\n"),
     }
 }
@@ -603,13 +611,23 @@ fn write_file(path: &str, text: &str, append: bool) {
         syscall::print("echo: cannot open destination\r\n");
         return;
     };
-    if syscall::fs_write(fd, text.as_bytes()).is_none() {
-        syscall::print("echo: write failed\r\n");
-    } else {
-        syscall::print("SFS: wrote ");
-        syscall::print_dec_u64(text.len() as u64);
-        syscall::print(" bytes\r\n");
+    // Unix `echo` terminates the line. Without it, `echo a >> f; echo b >> f`
+    // produces one concatenated line and every line-oriented tool (grep, wc,
+    // head, tail) sees a single blob.
+    let mut wrote = match syscall::fs_write(fd, text.as_bytes()) {
+        Some(count) => count,
+        None => {
+            syscall::print("echo: write failed\r\n");
+            let _ = syscall::fs_close(fd);
+            return;
+        }
+    };
+    if syscall::fs_write(fd, b"\n").is_some() {
+        wrote += 1;
     }
+    syscall::print("SFS: wrote ");
+    syscall::print_dec_u64(wrote as u64);
+    syscall::print(" bytes\r\n");
     let _ = syscall::fs_close(fd);
 }
 
@@ -900,6 +918,7 @@ fn program_name(program: u64) -> &'static str {
         syscall::PROGRAM_ECHO => "echo        ",
         syscall::PROGRAM_SAY => "say         ",
         syscall::PROGRAM_SL => "sl          ",
+        syscall::PROGRAM_UTILS => "utils       ",
         syscall::PROGRAM_NET_DRIVER => "net_driver  ",
         syscall::PROGRAM_NET_SERVER => "net_server  ",
         syscall::PROGRAM_DYNAMIC => "elf         ",
@@ -945,7 +964,7 @@ fn grant_device_rights(cap_id: u64, task_id: u64, program: u64) {
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
         syscall::print(
-            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|net_driver|net_server> [arg]\r\n",
+            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|utils|net_driver|net_server> [arg]\r\n",
         );
         return;
     };
@@ -960,6 +979,7 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
         "echo" => syscall::PROGRAM_ECHO,
         "say" => syscall::PROGRAM_SAY,
         "sl" => syscall::PROGRAM_SL,
+        "utils" => syscall::PROGRAM_UTILS,
         "net_driver" => syscall::PROGRAM_NET_DRIVER,
         "net_server" => syscall::PROGRAM_NET_SERVER,
         _ => {

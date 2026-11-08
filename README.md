@@ -95,6 +95,7 @@ userspace.
 - [x] Kernel health snapshot (`SYS_HEALTH`, `health`) for frames, tasks, open files and DMA leak counters
 - [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh EL0 task with its own W^X address space
 - [x] EL0 fault containment: a crashed EL0 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
+- [x] Unix-style toolbox: a multi-call `utils` ELF with `grep`, `wc`, `head`, `tail`, `cp`, `find`, `seq`, `basename`, `dirname`, `true`, `false` and `sleep`; `echo` redirection is line-terminated and the shell input queue no longer drops bursts
 - [x] Power control: `poweroff` and `reboot` shell commands through PSCI (`SMC` on hardware, `HVC` on QEMU with `virtualization=on`)
 - [x] Redmi 10C (`fog`, SM6225) RAM-only path: live-FDT probe, memory planner, GENI UART, GICv3/timer selection and fail-closed relocation with pre-copy FDT destination validation (QEMU-verified, and booted on a physical `rain` unit)
 - [x] Real Redmi 10C boot: RAM-only `fastboot boot` reaches the scheduler and the Howl task, with live GICv3 timer interrupts (verified on a `rain` unit)

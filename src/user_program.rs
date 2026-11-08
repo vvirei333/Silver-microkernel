@@ -14,6 +14,7 @@ pub const NET_DRIVER: u64 = 12;
 pub const NET_SERVER: u64 = 13;
 pub const BIGDIR: u64 = 17;
 pub const BIGFILE: u64 = 18;
+pub const UTILS: u64 = 19;
 
 /// Sentinel program ID for tasks spawned from a dynamically loaded ELF (the
 /// `run <path>` path). Distinct from `u64::MAX`, which marks kernel tasks.
@@ -32,6 +33,7 @@ static SAY_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/say.elf"));
 static SL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sl.elf"));
 static NET_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_driver.elf"));
 static NET_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_server.elf"));
+static UTILS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/utils.elf"));
 static BIGDIR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigdir.elf"));
 static BIGFILE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigfile.elf"));
 
@@ -51,6 +53,7 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         SL => Some(SL_ELF),
         NET_DRIVER => Some(NET_DRIVER_ELF),
         NET_SERVER => Some(NET_SERVER_ELF),
+        UTILS => Some(UTILS_ELF),
         BIGDIR => Some(BIGDIR_ELF),
         BIGFILE => Some(BIGFILE_ELF),
         _ => None,

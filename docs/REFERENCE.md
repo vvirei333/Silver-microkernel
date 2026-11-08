@@ -45,6 +45,7 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 | Shell | `help`, `uname`, `ls /`, `health`, file commands | **pass** |
 | Init | Silverd resolves task ids (not cap ids) before grants | **pass** |
 | Capabilities | `CAP_MOUNT`/`CAP_POWER` outside `CAP_ALL`; shell owns `CAP_POWER` by kernel policy | **pass** |
+| Toolbox | multi-call `utils`: grep/wc/head/tail/cp/find/seq/dirname/sleep/true/false | **pass** |
 | Power | `poweroff`/`reboot`; SMC on Qualcomm, HVC on QEMU | **implemented; QEMU PSCI caveat below** |
 | SMP | QEMU `-smp 4` selftest | **15 PASS / 0 FAIL** |
 | Fog QEMU | relocation, at-link, fail-closed park, timer | **PASS** |
@@ -76,10 +77,11 @@ describes a supported build.
    blocker for a console OS on the phone.
 4. **Network tools are still thin.** The stack has ARP/IPv4/ICMP; DHCP, DNS,
    TCP sockets and user tools (`wget`-like) are the next layer.
-5. **Unix-like toolbox is incomplete.** `ls`, `cat`, `echo`, `say`, `sl`,
-   `bigdir`, `bigfile` exist; the plan is a busybox-style multi-call binary
-   with `grep`, `wc`, `head`, `tail`, `find`, `cp`, `mv`, `rm`, `date`, `env`,
-   `seq`, `true`, `false`, `basename`, `dirname`, `sleep`, `kill`, `ps`.
+5. **Unix toolbox, first layer done.** A multi-call `utils` ELF provides
+   `grep`, `wc`, `head`, `tail`, `cp`, `find`, `seq`, `basename`, `dirname`,
+   `true`, `false` and `sleep`; `ls`, `cat`, `echo`, `say`, `sl` remain
+   separate programs. Next: `date` (needs RTC), `env`, a real pager, and
+   folding the remaining utilities into the same binary.
 
 ## Verification commands
 

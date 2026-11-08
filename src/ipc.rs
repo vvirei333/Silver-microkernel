@@ -11,7 +11,7 @@ use alloc::vec::Vec;
 use crate::{condvar::Condvar, mutex::Mutex, scheduler, timer};
 
 pub const PAYLOAD_SIZE: usize = 32;
-pub const MAILBOX_CAPACITY: usize = 16;
+pub const MAILBOX_CAPACITY: usize = 256;
 pub const INFINITE_TIMEOUT: u64 = u64::MAX;
 
 #[derive(Copy, Clone)]

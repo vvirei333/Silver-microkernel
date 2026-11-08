@@ -81,6 +81,7 @@ fn main() {
         ("echo", "echo.elf"),
         ("say", "say.elf"),
         ("sl", "sl.elf"),
+        ("utils", "utils.elf"),
         ("uart_driver", "uart_driver.elf"),
         ("net_driver", "net_driver.elf"),
         ("net_server", "net_server.elf"),
