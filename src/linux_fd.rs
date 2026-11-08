@@ -34,8 +34,15 @@ pub struct PipeState {
     write_ends: usize,
 }
 
-/// Linux fd targets. `Clone` (not `Copy`) because a pipe target shares an
-/// `Arc`; cloning is what `dup`/`fork` do deliberately.
+/// Shared state of one `memfd_create` file. The offset lives in the shared
+/// object, so `dup` shares it exactly like a real file description.
+pub struct MemFdState {
+    data: Vec<u8>,
+    offset: usize,
+}
+
+/// Linux fd targets. `Clone` (not `Copy`) because a pipe/eventfd/memfd target
+/// shares an `Arc`; cloning is what `dup`/`fork` do deliberately.
 #[derive(Clone)]
 enum Target {
     Console,
@@ -44,7 +51,15 @@ enum Target {
     Full,
     Random,
     Vfs(u64),
-    Pipe { state: Arc<Mutex<PipeState>>, read: bool },
+    Pipe {
+        state: Arc<Mutex<PipeState>>,
+        read: bool,
+    },
+    EventFd {
+        state: Arc<Mutex<u64>>,
+        nonblock: bool,
+    },
+    MemFd(Arc<Mutex<MemFdState>>),
 }
 
 struct Table {
@@ -292,6 +307,8 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             }
             pipe_read(&state, buffer, count)
         }
+        Target::EventFd { state, nonblock } => eventfd_read(&state, nonblock, buffer),
+        Target::MemFd(state) => memfd_read(&state, buffer, count),
     }
 }
 
@@ -322,12 +339,29 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             }
             pipe_write(&state, buffer, count)
         }
+        Target::EventFd { state, .. } => eventfd_write(&state, buffer),
+        Target::MemFd(state) => memfd_write(&state, buffer, count),
     }
 }
 
 pub fn lseek(task: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, u64> {
     match lookup(task, fd).ok_or(EBADF)? {
         Target::Vfs(vfs_fd) => vfs::lseek(task, vfs_fd, offset, whence).map_err(|_| EINVAL),
+        Target::MemFd(state) => {
+            let mut file = state.lock();
+            let base = match whence {
+                0 => 0,
+                1 => file.offset as i64,
+                2 => file.data.len() as i64,
+                _ => return Err(EINVAL),
+            };
+            let position = base.checked_add(offset).ok_or(EINVAL)?;
+            if position < 0 {
+                return Err(EINVAL);
+            }
+            file.offset = position as usize;
+            Ok(position as u64)
+        }
         _ => Err(ESPIPE),
     }
 }
@@ -351,6 +385,11 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
             write_stat(buffer, mode, size as u64, fd)
         }
         Target::Pipe { .. } => write_stat(buffer, S_IFIFO | 0o600, 0, fd.max(1)),
+        Target::EventFd { .. } => write_stat(buffer, S_IFREG | 0o600, 0, fd.max(1)),
+        Target::MemFd(state) => {
+            let size = state.lock().data.len() as u64;
+            write_stat(buffer, S_IFREG | 0o600, size, fd.max(1))
+        }
     }
 }
 
@@ -404,8 +443,7 @@ pub fn getdents64(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u6
 }
 
 /// Creates a pipe and installs both ends into `task`'s table.
-pub fn pipe(task: u64) -> Result<(u64, u64), u64> {
-    let state = Arc::new(Mutex::new(PipeState {
+pub fn pipe(task: u64) -> Result<(u64, u64), u64> {    let state = Arc::new(Mutex::new(PipeState {
         buffer: VecDeque::new(),
         read_ends: 1,
         write_ends: 1,
@@ -431,6 +469,107 @@ pub fn pipe(task: u64) -> Result<(u64, u64), u64> {
             Err(EMFILE)
         }
     }
+}
+
+/// Creates an eventfd with an initial counter.
+pub fn eventfd(task: u64, initial: u64, nonblock: bool) -> Result<u64, u64> {
+    insert(
+        task,
+        Target::EventFd {
+            state: Arc::new(Mutex::new(initial)),
+            nonblock,
+        },
+    )
+    .ok_or(EMFILE)
+}
+
+/// Creates an anonymous in-memory file (`memfd_create`). File-backed `mmap`
+/// is not implemented yet, so this is useful for read/write scratch storage.
+pub fn memfd(task: u64) -> Result<u64, u64> {
+    insert(
+        task,
+        Target::MemFd(Arc::new(Mutex::new(MemFdState {
+            data: Vec::new(),
+            offset: 0,
+        }))),
+    )
+    .ok_or(EMFILE)
+}
+
+fn eventfd_read(
+    state: &Arc<Mutex<u64>>,
+    nonblock: bool,
+    buffer: u64,
+) -> Result<u64, u64> {
+    loop {
+        let value = {
+            let mut counter = state.lock();
+            if *counter == 0 {
+                None
+            } else {
+                let value = *counter;
+                *counter = 0;
+                Some(value)
+            }
+        };
+        if let Some(value) = value {
+            user_memory::copy_to_user(&value.to_le_bytes(), buffer).map_err(|_| EFAULT)?;
+            return Ok(8);
+        }
+        if nonblock {
+            return Err(EAGAIN);
+        }
+        scheduler::sleep(1);
+    }
+}
+
+fn eventfd_write(state: &Arc<Mutex<u64>>, buffer: u64) -> Result<u64, u64> {
+    let mut raw = [0_u8; 8];
+    user_memory::copy_from_user(buffer, &mut raw).map_err(|_| EFAULT)?;
+    let add = u64::from_le_bytes(raw);
+    let mut counter = state.lock();
+    if u64::MAX - *counter < add {
+        return Err(EAGAIN);
+    }
+    *counter += add;
+    Ok(8)
+}
+
+fn memfd_read(
+    state: &Arc<Mutex<MemFdState>>,
+    buffer: u64,
+    count: u64,
+) -> Result<u64, u64> {
+    let mut file = state.lock();
+    let available = file.data.len().saturating_sub(file.offset);
+    let take = (count as usize).min(available);
+    if take == 0 {
+        return Ok(0);
+    }
+    let chunk = file.data[file.offset..file.offset + take].to_vec();
+    file.offset += take;
+    drop(file);
+    user_memory::copy_to_user(&chunk, buffer).map_err(|_| EFAULT)?;
+    Ok(take as u64)
+}
+
+fn memfd_write(
+    state: &Arc<Mutex<MemFdState>>,
+    buffer: u64,
+    count: u64,
+) -> Result<u64, u64> {
+    let total = (count as usize).min(1 << 20);
+    let mut bytes = alloc::vec![0_u8; total];
+    user_memory::copy_from_user(buffer, &mut bytes).map_err(|_| EFAULT)?;
+    let mut file = state.lock();
+    let start = file.offset;
+    let end = start.checked_add(total).ok_or(EINVAL)?;
+    if end > file.data.len() {
+        file.data.resize(end, 0);
+    }
+    file.data[start..end].copy_from_slice(&bytes);
+    file.offset = end;
+    Ok(total as u64)
 }
 
 /// Blocking `read` on a pipe. EOF only when every write end is closed.
@@ -517,6 +656,14 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
                 ready
             }
         }
+        Target::EventFd { state, .. } => {
+            let mut ready = POLLOUT;
+            if *state.lock() != 0 {
+                ready |= POLLIN;
+            }
+            ready
+        }
+        Target::MemFd(_) => POLLIN | POLLOUT,
     })
 }
 
@@ -561,6 +708,7 @@ pub(crate) fn write_stat(buffer: u64, mode: u32, size: u64, ino: u64) -> Result<
 
 const ENOENT: u64 = 2;
 const EBADF: u64 = 9;
+const EAGAIN: u64 = 11;
 const EFAULT: u64 = 14;
 const ENOTDIR: u64 = 20;
 const EISDIR: u64 = 21;

@@ -20,6 +20,9 @@ use alloc::vec::Vec;
 // Linux AArch64 syscall numbers (asm-generic/unistd.h).
 const SYS_DUP: u64 = 23;
 const SYS_DUP3: u64 = 24;
+const SYS_EVENTFD2: u64 = 19;
+const SYS_FUTEX: u64 = 98;
+const SYS_MEMFD_CREATE: u64 = 279;
 const SYS_IOCTL: u64 = 29;
 const SYS_FCNTL: u64 = 25;
 const SYS_GETCWD: u64 = 17;
@@ -113,6 +116,13 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_WRITEV => linux_writev(args[0], args[1], args[2]),
         SYS_READ => finish(linux_fd::read(scheduler::current_task_id(), args[0], args[1], args[2])),
         SYS_OPENAT => linux_openat(args[0], args[1], args[2], args[3]),
+        SYS_EVENTFD2 => finish(linux_fd::eventfd(
+            scheduler::current_task_id(),
+            args[0],
+            args[1] & 0x800 != 0,
+        )),
+        SYS_MEMFD_CREATE => finish(linux_fd::memfd(scheduler::current_task_id())),
+        SYS_FUTEX => linux_futex(args[0], args[1], args[2], args[3]),
         SYS_PIPE2 => linux_pipe2(args[0], args[1]),
         SYS_PPOLL => finish(linux_ppoll(args[0], args[1], args[2])),
         SYS_CLOSE => finish(linux_fd::close(scheduler::current_task_id(), args[0]).map(|_| 0)),
@@ -717,9 +727,59 @@ fn linux_brk(requested: u64) -> u64 {
         .unwrap_or(current)
 }
 
+/// `futex(2)`: without thread support a contended wait cannot be woken by
+/// another task in the same address space. `FUTEX_WAIT` therefore validates
+/// the value, sleeps for the requested timeout (or 10 ms when none is given)
+/// and reports `-ETIMEDOUT`; `FUTEX_WAKE` reports zero waiters. This keeps
+/// single-threaded libc paths working without pretending threads exist.
+fn linux_futex(address: u64, operation: u64, value: u64, timeout: u64) -> u64 {
+    const FUTEX_WAIT: u64 = 0;
+    const FUTEX_WAKE: u64 = 1;
+    const ETIMEDOUT: u64 = 110;
+    match operation & 0x7f {
+        FUTEX_WAIT => {
+            let mut raw = [0_u8; 4];
+            if user_memory::copy_from_user(address, &mut raw).is_err() {
+                return errno(EFAULT);
+            }
+            if u32::from_le_bytes(raw) != value as u32 {
+                return errno(EAGAIN);
+            }
+            let millis = if timeout == 0 {
+                10
+            } else {
+                let mut bytes = [0_u8; 16];
+                if user_memory::copy_from_user(timeout, &mut bytes).is_err() {
+                    return errno(EFAULT);
+                }
+                let seconds = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+                let nanoseconds = i64::from_le_bytes(bytes[8..].try_into().unwrap());
+                if seconds < 0 {
+                    10
+                } else {
+                    ((seconds as u64).saturating_mul(1000)
+                        + nanoseconds.max(0) as u64 / 1_000_000)
+                        .min(1000)
+                }
+            };
+            scheduler::sleep(millis.max(1));
+            errno(ETIMEDOUT)
+        }
+        FUTEX_WAKE => 0,
+        _ => errno(ENOSYS),
+    }
+}
+
 fn linux_mmap(address: u64, length: u64, prot: u64, flags: u64) -> u64 {
+    const MAP_ANONYMOUS: u64 = 0x20;
+    const ENODEV: u64 = 19;
     if length == 0 {
         return errno(EINVAL);
+    }
+    if flags & MAP_ANONYMOUS == 0 {
+        // File-backed mappings need page-cache/`mprotect` support; fail
+        // honestly instead of handing back zeroed anonymous memory.
+        return errno(ENODEV);
     }
     // An address hint is ignored; MAP_FIXED is refused rather than silently
     // placing the mapping elsewhere (a caller that asked for a fixed address
