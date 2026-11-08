@@ -53,20 +53,18 @@ Redmi port is parked. The reference checklist is
   The renderer extracts links with their screen runs (blue/underlined, click
   to navigate), keeps a per-tab 12-entry back/forward history, word-wraps,
   scales headings and uses `<main>`/`<article>`/MediaWiki content containers as
-  a reader mode. Four tabs keep URL, title, scroll, history and a full cache of
+  a reader mode. Six tabs keep URL, title, scroll, history and a full cache of
   the extracted page (text, styles, links); switching is instant and does not
   refetch. `Ctrl+T`/`Ctrl+W`/`Ctrl+Tab`, the tab strip, `+` and the close `x`
   manage them. Hovering a link publishes its target in the footer and sets
   `FIELD_CURSOR` so the viewer shows a hand; middle click/Ctrl+click opens the
-  target in a new tab. The first image found in the article (including images
-  inside an infobox table, which is skipped as text) becomes a centred lead
-  image: the viewer fetches it with Qt, decodes PNG/JPEG/WebP, scales it to at
-  most 480x360 and writes RGBA into `WEB_BODY`; the guest blends alpha, scrolls
-  it with the text and re-fetches it when its tab is restored. The first line
-  of every page used to lose its spaces because the wrap buffer had not flushed
-  yet; a `line_len` check fixed it. Up to three inline images are decoded into
-  240x180 slots: the infobox contributes one lead picture, later article
-  figures are placed before their text line and scroll with it. Bookmarks are
+  target in a new tab. Up to three page images are decoded by the viewer with
+  Qt (PNG/JPEG/WebP) into 240x180 RGBA slots: one comes from the infobox table
+  and later article figures are placed before their text line, scroll with the
+  text and are re-fetched when the tab is restored. The guest blends alpha and
+  includes image heights in layout, scrolling and link hit-testing. The first
+  line of every page used to lose its spaces because the wrap buffer had not
+  flushed yet; a `line_len` check fixed it. Bookmarks are
   persisted in `/sfs/wolfser.bookmarks` using a path-scoped write window
   (no global CAP_FS_WRITE). Six tabs fit the strip, and `Ctrl++`/`Ctrl+-`/
   `Ctrl+0` resize/zoom the host window (input coordinates are scaled back).
@@ -1045,8 +1043,8 @@ is restart-tolerant: a restarted `net_server` re-attaches, and a restarted
   virtqueue.
 - RX: only when `RX_LENGTH == 0`; copy one frame into `RX_FRAME`, `dmb ish`,
   publish the length and send `OP_FRAME`.
-- RX and TX copies use static frame buffers because the userspace stack is only
-  8 KiB.
+- RX and TX copies use static frame buffers; the userspace stack was 8 KiB at
+  the time and is 64 KiB now (the TLS client needs the headroom).
 
 ### Shared-memory frame protocol (`userspace/src/net_ipc.rs`)
 

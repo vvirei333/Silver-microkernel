@@ -627,11 +627,12 @@ If Wolfser exits with status 21, the VM has no ivshmem device: relaunch QEMU
 with the arguments above (or use `./build_and_qemu.sh`). Starting `wolfser`
 twice reuses the running instance (one window per VM).
 
-The renderer deliberately has no CSS layout and shows one lead image per page;
-four tabs are the current limit. HTTPS works only when the Qt viewer is running (it
-terminates TLS on the host); a native guest TLS stack is the next network
-milestone. The Linux ABI/Phosh track will
-eventually replace this renderer with a real engine.
+The renderer deliberately has no CSS layout; three inline images, six tabs and
+one text field per form are the current limits. TLS runs in the guest and needs
+no host, but the root store is intentionally small and certificate time is a
+fixed build date until the RTC lands; the viewer proxy remains the fallback.
+HTTP keep-alive and a full form/widget model are still ahead. The Linux
+ABI/Phosh track will eventually replace this renderer with a real engine.
 DHCP or DNS. The driver assigns its 64 KiB BAR window at `0x1020_0000`; this
 assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 

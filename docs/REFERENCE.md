@@ -89,12 +89,12 @@ describes a supported build.
    fetches and a DNS TTL from the wire remain. The client body window is 1 MiB
    and the user stack is now 64 KiB to fit the TLS state machine.
 5. **Wolfser is a real text browser.** Search/address bar, clickable links,
-   back/forward history, four tabs with cached pages, 3xx and meta-refresh
-   redirects, word wrap, headings, reader-mode content selection, a
-   three inline images, find-in-page, a start page with persistent bookmarks,
-   six tabs, host zoom and one-field GET/POST forms work. CSS layout, full
-   forms/widgets, keep-alive and more tabs do not yet; the Linux ABI/Phosh
-   track replaces the renderer with a real engine later.
+   back/forward history, six tabs with cached pages, 3xx and meta-refresh
+   redirects, word wrap, headings, reader-mode content selection, three inline
+   images, find-in-page, a start page with persistent bookmarks, host zoom and
+   one-field GET/POST forms work. CSS layout, full forms/widgets, keep-alive
+   and more tabs do not yet; the Linux ABI/Phosh track replaces the renderer
+   with a real engine later.
 6. **Linux ABI/Phosh are not started.** The kernel personality layer, static
    musl binaries, headless Wayland and the Phosh stack are the active
    long-term track; see [`VECTOR.md`](VECTOR.md).
