@@ -128,6 +128,7 @@ struct Pending {
     request_id: u32,
     host_seq: u32,
     from_history: bool,
+    retries: u8,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -633,11 +634,18 @@ fn begin_navigation(app: &mut App, url: &str, from_history: bool, keep_address: 
         set_address(app, url);
     }
     app.focused = false;
-    start_fetch(app, url, 0, from_history);
+    // Show the loading frame before a possible DHCP wait or a host round trip.
     paint(app);
+    start_fetch(app, url, 0, from_history, 0);
 }
 
-fn start_fetch(app: &mut App, url: &str, hops: u8, from_history: bool) {
+fn start_fetch(
+    app: &mut App,
+    url: &str,
+    hops: u8,
+    from_history: bool,
+    retries: u8,
+) {
     if url.len() >= URL_CAPACITY {
         fail_page(app, "URL IS TOO LONG");
         return;
@@ -673,6 +681,7 @@ fn start_fetch(app: &mut App, url: &str, hops: u8, from_history: bool) {
             request_id: 0,
             host_seq: request,
             from_history,
+            retries,
         });
         if let Some(pending) = app.pending.as_mut() {
             pending.url[..url.len()].copy_from_slice(url.as_bytes());
@@ -716,6 +725,7 @@ fn start_fetch(app: &mut App, url: &str, hops: u8, from_history: bool) {
         request_id,
         host_seq: 0,
         from_history,
+        retries,
     });
     if let Some(pending) = app.pending.as_mut() {
         pending.url[..url.len()].copy_from_slice(url.as_bytes());
@@ -753,6 +763,66 @@ fn cancel_pending(app: &mut App) {
     app.page.error = "";
     // The previous document (if any) is still in TEXT: keeping `loaded` lets
     // Escape return to it instead of blanking the window.
+}
+
+fn retryable(code: u8) -> bool {
+    matches!(
+        code,
+        net_ipc::NET_ERR_TIMEOUT | net_ipc::NET_ERR_CONNECT | net_ipc::NET_ERR_DNS
+    )
+}
+
+/// Re-sends the current navigation once or twice. The first request can race
+/// DHCP/the DNS server right after boot, and a transient TLS reset looks the
+/// same; a silent retry is what a browser does.
+fn retry_guest(app: &mut App) -> bool {
+    let Some(pending) = app.pending.as_ref() else {
+        return false;
+    };
+    if pending.retries >= 2 {
+        return false;
+    }
+    let retries = pending.retries;
+    let hops = pending.hops;
+    let from_history = pending.from_history;
+    let length = pending.url_len;
+    let url = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
+    url[..length].copy_from_slice(&pending.url[..length]);
+    app.pending = None;
+    syscall::sleep(40);
+    let text = unsafe {
+        let url = &*core::ptr::addr_of!(BASE_URL);
+        core::str::from_utf8(&url[..length]).unwrap_or("")
+    };
+    app.page.loading = true;
+    app.page.error = "";
+    paint(app);
+    start_fetch(app, text, hops, from_history, retries + 1);
+    true
+}
+
+fn retry_host(app: &mut App) -> bool {
+    let Some(pending) = app.pending.as_ref() else {
+        return false;
+    };
+    if pending.retries >= 1 {
+        return false;
+    }
+    let retries = pending.retries;
+    let hops = pending.hops;
+    let from_history = pending.from_history;
+    let length = pending.url_len;
+    let url = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
+    url[..length].copy_from_slice(&pending.url[..length]);
+    app.pending = None;
+    let text = unsafe {
+        let url = &*core::ptr::addr_of!(BASE_URL);
+        core::str::from_utf8(&url[..length]).unwrap_or("")
+    };
+    app.page.loading = true;
+    app.page.error = "";
+    start_fetch(app, text, hops, from_history, retries + 1);
+    true
 }
 
 fn fail_page(app: &mut App, message: &'static str) {
@@ -813,6 +883,9 @@ fn poll_pending(app: &mut App) {
                 &*core::ptr::addr_of!(HOST_FINAL)
             };
             if error != 0 {
+                if error == window::WEB_ERROR_NETWORK && retry_host(app) {
+                    return;
+                }
                 fail_page(
                     app,
                     match error {
@@ -873,6 +946,9 @@ fn handle_guest_reply(app: &mut App, code: u8, status: u16, body_len: usize) {
         return;
     }
     if code != net_ipc::NET_OK {
+        if retryable(code) && retry_guest(app) {
+            return;
+        }
         fail_page(
             app,
             match code {
@@ -926,7 +1002,7 @@ fn handle_redirect(app: &mut App, base: &str, location: &[u8]) {
     let url = core::str::from_utf8(&target[..len]).unwrap_or("");
     set_address(app, url);
     app.pending = None;
-    start_fetch(app, url, hops + 1, from_history);
+    start_fetch(app, url, hops + 1, from_history, 0);
 }
 
 fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
