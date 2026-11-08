@@ -15,6 +15,7 @@
 //! one is called out at its match arm.
 
 use crate::{linux_fd, scheduler, timer, user_memory};
+use alloc::vec::Vec;
 
 // Linux AArch64 syscall numbers (asm-generic/unistd.h).
 const SYS_DUP: u64 = 23;
@@ -34,6 +35,7 @@ const SYS_FSTAT: u64 = 80;
 const SYS_NEWFSTATAT: u64 = 79;
 const SYS_GETDENTS64: u64 = 61;
 const SYS_EXIT: u64 = 93;
+const SYS_EXECVE: u64 = 221;
 const SYS_EXIT_GROUP: u64 = 94;
 const SYS_SET_TID_ADDRESS: u64 = 96;
 const SYS_SET_ROBUST_LIST: u64 = 99;
@@ -65,6 +67,7 @@ const SYS_RSEQ: u64 = 293;
 
 const EPERM: u64 = 1;
 const ENOENT: u64 = 2;
+const ENOEXEC: u64 = 8;
 const EBADF: u64 = 9;
 const ENOMEM: u64 = 12;
 const EACCES: u64 = 13;
@@ -139,6 +142,7 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
             0
         }
         SYS_EXIT | SYS_EXIT_GROUP => scheduler::exit_current_with_status(args[0]),
+        SYS_EXECVE => linux_execve(frame, args[0], args[1], args[2]),
         SYS_SET_TID_ADDRESS => scheduler::current_task_id(),
         SYS_SET_ROBUST_LIST => 0, // single-threaded: nothing to register
         SYS_CLOCK_GETTIME => linux_clock_gettime(args[0], args[1]),
@@ -182,6 +186,51 @@ fn trace_unsupported(number: u64) {
             crate::console::write_str("\r\n");
         }
     }
+}
+
+/// `execve(2)`: replace the process image. On success the syscall trampoline
+/// must return to a different EL0 entry and stack, so this mutates the saved
+/// frame (ELR) and SP_EL0 instead of returning normally.
+fn linux_execve(
+    frame: &mut [u64; crate::syscall::FRAME_QUADWORDS],
+    path_pointer: u64,
+    argv_pointer: u64,
+    envp_pointer: u64,
+) -> u64 {
+    const EXEC_LIMIT: usize = 1024 * 1024;
+    let Some(path) = user_string(path_pointer) else {
+        return errno(EFAULT);
+    };
+    if path.is_empty() {
+        return errno(ENOENT);
+    }
+    let Some(argv) = user_string_array(argv_pointer) else {
+        return errno(EFAULT);
+    };
+    let Some(envp) = user_string_array(envp_pointer) else {
+        return errno(EFAULT);
+    };
+    let cwd = scheduler::current_task_cwd();
+    match crate::vfs::file_len(&cwd, &path) {
+        Ok(length) if length <= EXEC_LIMIT => {}
+        _ => return errno(ENOENT),
+    }
+    let Ok(bytes) = crate::vfs::read_file_limit(&cwd, &path, EXEC_LIMIT) else {
+        return errno(ENOENT);
+    };
+    let Ok(image) = crate::linux_elf::load_linux_elf(&bytes) else {
+        return errno(ENOEXEC);
+    };
+    let Some(result) = scheduler::exec_linux_current(image, argv, envp) else {
+        return errno(ENOMEM);
+    };
+    // ELR is frame word 31 (x0-x30, ELR, SPSR). The user stack pointer lives
+    // in SP_EL0, which the trampoline does not touch.
+    frame[31] = result.entry as u64;
+    unsafe {
+        core::arch::asm!("msr sp_el0, {}", in(reg) result.stack_pointer);
+    }
+    0
 }
 
 fn linux_write(fd: u64, buffer: u64, count: u64) -> u64 {
@@ -377,6 +426,25 @@ fn user_string(pointer: u64) -> Option<alloc::string::String> {
     core::str::from_utf8(&bytes)
         .ok()
         .map(alloc::string::String::from)
+}
+
+/// Copies a `char *const argv[]`/`envp[]` array: up to 64 NUL-terminated
+/// strings, bounded like `user_string`. A null pointer means an empty array.
+fn user_string_array(pointer: u64) -> Option<Vec<Vec<u8>>> {
+    let mut result = Vec::new();
+    if pointer == 0 {
+        return Some(result);
+    }
+    for index in 0..64u64 {
+        let mut raw = [0_u8; 8];
+        user_memory::copy_from_user(pointer.wrapping_add(index * 8), &mut raw).ok()?;
+        let entry = u64::from_le_bytes(raw);
+        if entry == 0 {
+            return Some(result);
+        }
+        result.push(user_string(entry)?.into_bytes());
+    }
+    None
 }
 
 fn linux_clock_gettime(_clock: u64, timespec: u64) -> u64 {

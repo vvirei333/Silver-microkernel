@@ -310,10 +310,10 @@ EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 `ioctl(TIOCGWINSZ)`, `writev`, `close`, `lseek`, `readlinkat`, `sched_yield`,
 `openat`, `getdents64`, `newfstatat`, `dup`/`dup2`/`dup3`, `fcntl`, `getcwd`,
 `chdir`, `nanosleep`/`clock_nanosleep`, `clock_getres`, `gettimeofday`,
-`getrlimit`, `getuid`/`geteuid`/`getgid`/`getegid`, `sched_getaffinity` and
-`prctl`; anything else returns `-ENOSYS`. File descriptors are a per-process
-table in `src/linux_fd.rs` (console, synthetic `/dev` devices, or VFS
-handles), so `dup2` redirects work; the filesystem view is read-only.
+`getrlimit`, `getuid`/`geteuid`/`getgid`/`getegid`, `sched_getaffinity`,
+`prctl` and `execve`; anything else returns `-ENOSYS`. File descriptors are a
+per-process table in `src/linux_fd.rs` (console, synthetic `/dev` devices, or
+VFS handles), so `dup2` redirects work; the filesystem view is read-only.
 
 The personality is fixed at spawn, so a foreign binary can never reach the
 Silver syscall table by choosing a colliding number. `linuxrun` is a
@@ -374,6 +374,18 @@ entries=5
 
 It also redirects stdout to `/dev/null` through `dup`/`dup2`, reads
 `/dev/urandom`, checks `chdir`/`getcwd` and sleeps with `nanosleep`.
+
+`execve` is implemented as a real image replacement: a new address space and
+user stack are built while the old one is still current, then the CPU switches
+over and the old space, heap, mappings, image and stack are released. The task
+id, capabilities, cwd and fd table survive. A freestanding test replaces
+itself with the hello binary:
+
+```text
+howl> linuxrun /sfs/linux-chain
+hello from linux abi
+Program exited with status 42
+```
 
 Still missing: a per-task read scope (a Linux task can read any VFS path, which
 is acceptable on the single-user console but must be closed before untrusted

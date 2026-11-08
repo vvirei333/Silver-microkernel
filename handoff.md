@@ -207,6 +207,18 @@ Redmi port is parked. The reference checklist is
   `getcwd` and `nanosleep`, still exiting 0 with the console output above.
   Still open: per-task read scope, signals/threads, `pipe`/`poll`/`eventfd`,
   ET_DYN.
+  **Slice 6 (`execve`):** `execve` replaces the current Linux image without
+  changing the task id, capabilities, cwd or fd table. The new space/user
+  stack are built while the old space is current, the CPU switches TTBR0, and
+  only then is the old space released — `destroy_task_space` refuses a space
+  that is still current. Teardown was factored into
+  `SpaceResources`/`release_space_resources` so the superseded and a dead
+  task's space share one release path (mmap, heap, tables, private page, DMA,
+  images). The trampoline is retargeted by writing ELR (frame word 31) and
+  SP_EL0. New test `tests/linux/chain.c` execs `/sfs/linux-hello`; QEMU keeps
+  task 7, prints `hello from linux abi` and exits 42. Three consecutive execs
+  followed by the glibc test and `health` show no frame/DMA leak (used 2171 of
+  31615 frames, leaked 0).
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -233,10 +245,11 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 6 (`pipe2`/`ppoll`/`eventfd`/`memfd`, a
-  per-task read scope, `rt_sigaction`/`futex`), then ET_DYN/PIE and `ld.so` so
-  distro binaries and a real shell run; then headless Wayland/GTK/D-Bus →
-  Phosh. Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 7 (`clone`/`fork` with an eager address-space
+  copy, `wait4`, `kill`/signals; then `pipe2`/`ppoll`/`eventfd`/`memfd` and a
+  per-task read scope), then ET_DYN/PIE and `ld.so` so distro binaries and a
+  real shell run; then headless Wayland/GTK/D-Bus → Phosh. Network base
+  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

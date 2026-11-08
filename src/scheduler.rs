@@ -3156,6 +3156,149 @@ pub fn spawn_linux_elf_with_args(
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
 }
 
+/// Result of a successful `execve`: the EL0 entry point and stack pointer the
+/// syscall trampoline must resume at.
+#[cfg(feature = "linux-abi")]
+pub struct ExecResult {
+    pub entry: usize,
+    pub stack_pointer: u64,
+}
+
+/// Replaces the current task's Linux image and address space (`execve`).
+///
+/// The kernel stack, task id, capabilities, cwd and fd table are preserved;
+/// the executable image, heap, anonymous mappings, user stack and page tables
+/// are replaced. The new space is built and populated while the old one is
+/// still current, then the CPU switches over and the old resources are
+/// released — `destroy_task_space` refuses a space that is still current, so
+/// the switch must happen first.
+#[cfg(feature = "linux-abi")]
+pub fn exec_linux_current(
+    image: LinuxImage,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> Option<ExecResult> {
+    let auxv = linux_auxv(AuxvImage::linux(&image));
+    let layout = silver_microkernel::build_linux_stack(
+        &argv,
+        &envp,
+        &auxv,
+        mmu::USER_STACK_VA + mmu::USER_STACK_SIZE,
+        mmu::USER_STACK_SIZE - 1024,
+    )?;
+    let entry = image.entry;
+    let image_frames = image.page_count();
+    // The task keeps its kernel stack, fixed tables, private page and user
+    // stack; only the image (and the heap/mmap tables, now empty) is charged.
+    let ledger_frames = TASK_STACK_PAGES
+        + mmu::SPACE_TABLE_FRAMES
+        + 1
+        + TASK_USER_STACK_PAGES
+        + image_frames;
+    if !mem_policy::task_charge_ok(0, ledger_frames, task_frame_limit()) {
+        return None;
+    }
+
+    let (new_stack_start, new_stack_generation) =
+        frame_allocator::alloc_user_contiguous_pages_tagged(TASK_USER_STACK_PAGES)?;
+    let Some((new_private, new_private_generation)) = frame_allocator::alloc_user_page_tagged()
+    else {
+        frame_allocator::free_contiguous_pages_tagged(
+            new_stack_start,
+            TASK_USER_STACK_PAGES,
+            new_stack_generation,
+        );
+        return None;
+    };
+    let Some((new_ttbr0, new_token)) =
+        mmu::create_task_space(new_private, new_stack_start, None)
+    else {
+        frame_allocator::free_page_tagged(new_private, new_private_generation);
+        frame_allocator::free_contiguous_pages_tagged(
+            new_stack_start,
+            TASK_USER_STACK_PAGES,
+            new_stack_generation,
+        );
+        return None;
+    };
+    if !mmu::install_linux_image(new_ttbr0, &image) {
+        mmu::destroy_task_space(
+            new_token,
+            new_private,
+            new_private_generation,
+            mmu::asid_of(new_ttbr0),
+        );
+        frame_allocator::free_contiguous_pages_tagged(
+            new_stack_start,
+            TASK_USER_STACK_PAGES,
+            new_stack_generation,
+        );
+        return None;
+    }
+
+    // Publish the new initial stack before the task can run on it.
+    let offset = mmu::USER_STACK_SIZE - layout.block.len();
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            layout.block.as_ptr(),
+            phys_to_virt(new_stack_start + offset) as *mut u8,
+            layout.block.len(),
+        );
+    }
+
+    let (old_resources, old_stack, old_stack_generation) = {
+        let task = current_task_mut()?;
+        let old_resources = SpaceResources {
+            ttbr0: task.ttbr0,
+            space_token: task.space_token,
+            private_page: task.private_page,
+            private_page_generation: task.private_page_generation,
+            mmap_regions: core::mem::take(&mut task.mmap_regions),
+            heap_pages: core::mem::take(&mut task.heap_pages),
+            dma_pages: core::mem::take(&mut task.dma_pages),
+            user_image: task.user_image.take(),
+            linux_image: task.linux_image.take(),
+        };
+        let old_stack = task.user_stack;
+        let old_stack_generation = task.user_stack_generation;
+
+        task.ttbr0 = new_ttbr0;
+        task.space_token = new_token;
+        task.private_page = new_private;
+        task.private_page_generation = new_private_generation;
+        task.user_stack = MemoryRegion::new(
+            new_stack_start,
+            new_stack_start + TASK_USER_STACK_SIZE,
+        );
+        task.user_stack_generation = new_stack_generation;
+        task.linux_image = Some(image);
+        task.user_image = None;
+        task.mmap_bytes = 0;
+        task.program_break = mmu::USER_HEAP_VA;
+        task.mem_frames = ledger_frames;
+        task.resources_released = false;
+        task.argv = argv;
+        task.envp = envp;
+        (old_resources, old_stack, old_stack_generation)
+    };
+
+    // TTBR0 must point at the new space before the old tables are retired.
+    mmu::switch_address_space(new_ttbr0);
+    release_space_resources(&old_resources, &[]);
+    if !old_stack.is_empty() {
+        frame_allocator::free_contiguous_pages_tagged(
+            old_stack.start,
+            TASK_USER_STACK_PAGES,
+            old_stack_generation,
+        );
+    }
+
+    Some(ExecResult {
+        entry,
+        stack_pointer: layout.sp as u64,
+    })
+}
+
 fn spawn_elf_task(
     user_image: Option<LoadedImage>,
     linux_image: Option<LinuxImage>,
@@ -4785,81 +4928,21 @@ impl Task {
         if self.resources_released || self.ttbr0 == 0 {
             return;
         }
-        for region in &self.mmap_regions {
-            if mmu::unmap_user_pages_at(self.ttbr0, region.virtual_address, region.page_count) {
-                frame_allocator::free_contiguous_pages_tagged(
-                    region.physical_start,
-                    region.page_count,
-                    region.generation,
-                );
-            } else {
-                // A live PTE still references these frames; leaking is the
-                // only safe outcome.
-                MMAP_LEAKED_FRAMES.fetch_add(region.page_count, Ordering::Relaxed);
-                console::write_str("MMAP LEAK: teardown could not unmap range 0x");
-                console::write_hex_u64(region.physical_start as u64);
-                console::write_str(" (");
-                console::write_dec_u64(region.page_count as u64);
-                console::write_str(" pages)\r\n");
-            }
-        }
-        // Heap data pages carry their own tags; the address-space teardown
-        // frees only the page tables and the private page.
-        for (page, generation) in self.heap_pages.drain(..) {
-            if !frame_allocator::free_page_tagged(page, generation) {
-                console::write_str("HEAP: release refused for page 0x");
-                console::write_hex_u64(page as u64);
-                console::write_str(" - leaked\r\n");
-            }
-        }
-        if !mmu::destroy_task_space(
-            self.space_token,
-            self.private_page,
-            self.private_page_generation,
-            mmu::asid_of(self.ttbr0),
-        ) {
-            console::write_str("MMU: address space teardown was refused\r\n");
-        }
-        for &(physical, page_count, generation) in &self.dma_pages {
-            // Exact (physical, page_count) match: allocator ranges never
-            // overlap, so a dead task's own range cannot be confused with
-            // another dead task's range in the same reap pass.
-            let record = dma_revokes
-                .iter()
-                .find(|(base, pages, _)| *base == physical && *pages == page_count);
-            match record {
-                Some((_, _, result)) if result.safe_to_free => {
-                    // Quarantine instead of freeing immediately: a device
-                    // queue may still be draining even though every CPU
-                    // mapping is gone. See `DMA_QUARANTINE_EPOCHS`.
-                    if !quarantine_dma_run(physical, page_count, generation) {
-                        DMA_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
-                        console::write_str("DMA LEAK: quarantine full, range 0x");
-                        console::write_hex_u64(physical as u64);
-                        console::write_str(" (");
-                        console::write_dec_u64(page_count as u64);
-                        console::write_str(" pages)\r\n");
-                    }
-                }
-                _ => {
-                    DMA_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
-                    console::write_str("DMA LEAK: range 0x");
-                    console::write_hex_u64(physical as u64);
-                    console::write_str(" orphaned (");
-                    console::write_dec_u64(page_count as u64);
-                    console::write_str(" pages, total leaked frames ");
-                    console::write_dec_u64(DMA_LEAKED_FRAMES.load(Ordering::Relaxed) as u64);
-                    console::write_str(")\r\n");
-                }
-            }
-        }
-        if let Some(image) = &self.user_image {
-            image.release();
-        }
-        #[cfg(feature = "linux-abi")]
-        if let Some(image) = &self.linux_image {
-            image.release();
-        }
+        // Take ownership so the release logic has exactly one source of truth
+        // and can also be reused by `execve` for a superseded address space.
+        let resources = SpaceResources {
+            ttbr0: self.ttbr0,
+            space_token: self.space_token,
+            private_page: self.private_page,
+            private_page_generation: self.private_page_generation,
+            mmap_regions: core::mem::take(&mut self.mmap_regions),
+            heap_pages: core::mem::take(&mut self.heap_pages),
+            dma_pages: core::mem::take(&mut self.dma_pages),
+            user_image: self.user_image.take(),
+            #[cfg(feature = "linux-abi")]
+            linux_image: self.linux_image.take(),
+        };
+        release_space_resources(&resources, dma_revokes);
     }
 
     /// Drops the last executable-resource references after teardown. The
@@ -4890,6 +4973,106 @@ impl Task {
         self.waiting_on = None;
         self.context = TaskContext::zero();
         self.resources_released = true;
+    }
+}
+
+/// Owned executable resources for one teardown. Split out of `Task` so
+/// `execve` can release the *old* address space after the task already points
+/// at the new one (the space must no longer be current when its tables are
+/// retired).
+struct SpaceResources {
+    ttbr0: usize,
+    space_token: TableToken,
+    private_page: usize,
+    private_page_generation: u32,
+    mmap_regions: Vec<MmapRegion>,
+    heap_pages: Vec<(usize, u32)>,
+    dma_pages: Vec<(usize, usize, u32)>,
+    user_image: Option<LoadedImage>,
+    #[cfg(feature = "linux-abi")]
+    linux_image: Option<LinuxImage>,
+}
+
+/// Releases an address space and everything owned by it. The caller must have
+/// stopped running on `resources.ttbr0` already.
+fn release_space_resources(
+    resources: &SpaceResources,
+    dma_revokes: &[(usize, usize, mmu::RevokeResult)],
+) {
+    for region in &resources.mmap_regions {
+        if mmu::unmap_user_pages_at(resources.ttbr0, region.virtual_address, region.page_count) {
+            frame_allocator::free_contiguous_pages_tagged(
+                region.physical_start,
+                region.page_count,
+                region.generation,
+            );
+        } else {
+            // A live PTE still references these frames; leaking is the only
+            // safe outcome.
+            MMAP_LEAKED_FRAMES.fetch_add(region.page_count, Ordering::Relaxed);
+            console::write_str("MMAP LEAK: teardown could not unmap range 0x");
+            console::write_hex_u64(region.physical_start as u64);
+            console::write_str(" (");
+            console::write_dec_u64(region.page_count as u64);
+            console::write_str(" pages)\r\n");
+        }
+    }
+    // Heap data pages carry their own tags; the address-space teardown frees
+    // only the page tables and the private page.
+    for &(page, generation) in &resources.heap_pages {
+        if !frame_allocator::free_page_tagged(page, generation) {
+            console::write_str("HEAP: release refused for page 0x");
+            console::write_hex_u64(page as u64);
+            console::write_str(" - leaked\r\n");
+        }
+    }
+    if !mmu::destroy_task_space(
+        resources.space_token,
+        resources.private_page,
+        resources.private_page_generation,
+        mmu::asid_of(resources.ttbr0),
+    ) {
+        console::write_str("MMU: address space teardown was refused\r\n");
+    }
+    for &(physical, page_count, generation) in &resources.dma_pages {
+        // Exact (physical, page_count) match: allocator ranges never overlap,
+        // so a dead task's own range cannot be confused with another dead
+        // task's range in the same reap pass.
+        let record = dma_revokes
+            .iter()
+            .find(|(base, pages, _)| *base == physical && *pages == page_count);
+        match record {
+            Some((_, _, result)) if result.safe_to_free => {
+                // Quarantine instead of freeing immediately: a device queue
+                // may still be draining even though every CPU mapping is
+                // gone. See `DMA_QUARANTINE_EPOCHS`.
+                if !quarantine_dma_run(physical, page_count, generation) {
+                    DMA_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
+                    console::write_str("DMA LEAK: quarantine full, range 0x");
+                    console::write_hex_u64(physical as u64);
+                    console::write_str(" (");
+                    console::write_dec_u64(page_count as u64);
+                    console::write_str(" pages)\r\n");
+                }
+            }
+            _ => {
+                DMA_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
+                console::write_str("DMA LEAK: range 0x");
+                console::write_hex_u64(physical as u64);
+                console::write_str(" orphaned (");
+                console::write_dec_u64(page_count as u64);
+                console::write_str(" pages, total leaked frames ");
+                console::write_dec_u64(DMA_LEAKED_FRAMES.load(Ordering::Relaxed) as u64);
+                console::write_str(")\r\n");
+            }
+        }
+    }
+    if let Some(image) = &resources.user_image {
+        image.release();
+    }
+    #[cfg(feature = "linux-abi")]
+    if let Some(image) = &resources.linux_image {
+        image.release();
     }
 }
 
