@@ -239,6 +239,19 @@ Redmi port is parked. The reference checklist is
   `write_user_output_shared` (the Silver console owner is a single task; a
   process tree shares the terminal). Threads (`CLONE_VM`) are still `-ENOSYS`
   and COW is a later optimisation.
+  **Slice 8 (`pipe2` + `ppoll`):** a pipe is a shared
+  `Arc<Mutex<PipeState>>` (4 KiB deque + read/write endpoint counts) in
+  `linux_fd`. `fork`/`dup` clone the `Arc` and bump an endpoint count;
+  `close`/task teardown decrement it, so a read returns EOF only after every
+  write end is gone. A blocking read/write sleeps 1 ms while it has no data /
+  no space (the lock is dropped around the sleep), and `write` returns
+  `-EPIPE` with no reader. `ppoll` (up to 32 fds, `POLLIN`/`POLLOUT`/
+  `POLLHUP`/`POLLNVAL`, timespec timeout or 60 s cap for an infinite wait)
+  re-checks readiness after each sleep. `tests/linux/pipe.c` forks, the child
+  writes `ping`, the parent `ppoll`s and reads it; QEMU prints `pipe: ping`
+  and both tasks exit 0. Three consecutive runs plus the glibc test and
+  `health` stay at 2171/31612 frames with no zombies, open files or DMA
+  leaks.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -265,8 +278,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 8 (COW fork, `SIGCHLD`/`rt_sigaction` delivery,
-  `pipe2`/`ppoll`/`eventfd`/`memfd` and a per-task read scope), then
+- **Next steps:** Linux ABI slice 9 (`rt_sigaction`/`SIGCHLD` delivery,
+  `eventfd2`, `memfd_create` + `futex`, a per-task read scope), then
   ET_DYN/PIE and `ld.so` so distro binaries and a real shell run; then headless
   Wayland/GTK/D-Bus → Phosh. Network base maintenance (keep-alive, TLS
   roots/RTC/RNG, TLS 1.2).

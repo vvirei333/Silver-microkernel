@@ -311,10 +311,10 @@ EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 `openat`, `getdents64`, `newfstatat`, `dup`/`dup2`/`dup3`, `fcntl`, `getcwd`,
 `chdir`, `nanosleep`/`clock_nanosleep`, `clock_getres`, `gettimeofday`,
 `getrlimit`, `getuid`/`geteuid`/`getgid`/`getegid`, `sched_getaffinity`,
-`prctl`, `execve`, `clone` (fork semantics) and `wait4`; anything else returns
-`-ENOSYS`. File descriptors are a per-process table in `src/linux_fd.rs`
-(console, synthetic `/dev` devices, or VFS handles), so `dup2` redirects work;
-the filesystem view is read-only.
+`prctl`, `execve`, `clone` (fork semantics), `wait4`, `pipe2` and `ppoll`;
+anything else returns `-ENOSYS`. File descriptors are a per-process table in
+`src/linux_fd.rs` (console, synthetic `/dev` devices, VFS handles or pipes), so
+`dup2` redirects work; the filesystem view is read-only.
 
 The personality is fixed at spawn, so a foreign binary can never reach the
 Silver syscall table by choosing a colliding number. `linuxrun` is a
@@ -405,6 +405,18 @@ parent saw child 42
 Forked Linux children may write to the console even though only the foreground
 task owns it in the Silver model; that matches a terminal shared by a process
 tree.
+
+`pipe2` creates a real 4 KiB kernel pipe shared by both descriptors and
+inherited across `fork`; a blocking read/write sleeps and re-checks the buffer
+(EOF when every write end closes), and `ppoll` reports
+`POLLIN`/`POLLOUT`/`POLLHUP` for pipes, files, `/dev` nodes and the console,
+with a timeout. A raw test forks, the child writes, and the parent polls and
+reads:
+
+```text
+howl> linuxrun /sfs/linux-pipe
+pipe: ping
+```
 
 Still missing: a per-task read scope (a Linux task can read any VFS path, which
 is acceptable on the single-user console but must be closed before untrusted

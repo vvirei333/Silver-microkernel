@@ -15,14 +15,28 @@
 //! The table is per task and is dropped when the task exits; the VFS's own
 //! `close_task` releases the underlying handles.
 
+use alloc::collections::VecDeque;
 use alloc::string::String;
+use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use crate::{mutex::Mutex, scheduler, user_memory, vfs};
 
-/// Linux fd targets. `Copy` so a lookup can release the table lock before any
-/// blocking I/O (console writes go through IPC and must not hold this lock).
-#[derive(Copy, Clone, Eq, PartialEq)]
+/// Kernel pipe buffer. Linux guarantees atomic writes up to `PIPE_BUF`; 4 KiB
+/// is the usual capacity and is enough for the console OS.
+const PIPE_CAPACITY: usize = 4096;
+
+/// Shared state of one pipe. Both descriptors and every fork/dup refer to the
+/// same `Arc`, so data written by one end is seen by the other.
+pub struct PipeState {
+    buffer: VecDeque<u8>,
+    read_ends: usize,
+    write_ends: usize,
+}
+
+/// Linux fd targets. `Clone` (not `Copy`) because a pipe target shares an
+/// `Arc`; cloning is what `dup`/`fork` do deliberately.
+#[derive(Clone)]
 enum Target {
     Console,
     Null,
@@ -30,6 +44,7 @@ enum Target {
     Full,
     Random,
     Vfs(u64),
+    Pipe { state: Arc<Mutex<PipeState>>, read: bool },
 }
 
 struct Table {
@@ -59,8 +74,34 @@ fn with_table<R>(task: u64, action: impl FnOnce(&mut Table) -> R) -> R {
 
 fn lookup(task: u64, fd: u64) -> Option<Target> {
     with_table(task, |table| {
-        table.slots.get(fd as usize).copied().flatten()
+        table.slots.get(fd as usize).cloned().flatten()
     })
+}
+
+impl Target {
+    /// A new descriptor referring to the same pipe end.
+    fn retain_endpoint(&self) {
+        if let Target::Pipe { state, read } = self {
+            let mut pipe = state.lock();
+            if *read {
+                pipe.read_ends += 1;
+            } else {
+                pipe.write_ends += 1;
+            }
+        }
+    }
+
+    /// One descriptor of this pipe end went away.
+    fn release_endpoint(&self) {
+        if let Target::Pipe { state, read } = self {
+            let mut pipe = state.lock();
+            if *read {
+                pipe.read_ends = pipe.read_ends.saturating_sub(1);
+            } else {
+                pipe.write_ends = pipe.write_ends.saturating_sub(1);
+            }
+        }
+    }
 }
 
 /// Installs `target` at the lowest free slot, growing the table.
@@ -153,6 +194,7 @@ pub fn close(task: u64, fd: u64) -> Result<(), u64> {
         slot.take()
     })
     .ok_or(EBADF)?;
+    target.release_endpoint();
     if let Target::Vfs(vfs_fd) = target {
         let _ = vfs::close(task, vfs_fd);
     }
@@ -161,12 +203,16 @@ pub fn close(task: u64, fd: u64) -> Result<(), u64> {
 
 pub fn dup(task: u64, fd: u64) -> Result<u64, u64> {
     let target = lookup(task, fd).ok_or(EBADF)?;
-    insert(task, target).ok_or(EMFILE)
+    let new_fd = insert(task, target.clone()).ok_or(EMFILE)?;
+    target.retain_endpoint();
+    Ok(new_fd)
 }
 
 pub fn dup_from(task: u64, fd: u64, minimum: u64) -> Result<u64, u64> {
     let target = lookup(task, fd).ok_or(EBADF)?;
-    insert_from(task, target, minimum).ok_or(EMFILE)
+    let new_fd = insert_from(task, target.clone(), minimum).ok_or(EMFILE)?;
+    target.retain_endpoint();
+    Ok(new_fd)
 }
 
 pub fn dup2(task: u64, oldfd: u64, newfd: u64) -> Result<u64, u64> {
@@ -187,9 +233,13 @@ pub fn dup2(task: u64, oldfd: u64, newfd: u64) -> Result<u64, u64> {
         }
         table.slots[newfd as usize].take()
     });
-    if let Some(Target::Vfs(vfs_fd)) = displaced {
-        let _ = vfs::close(task, vfs_fd);
+    if let Some(displaced) = displaced {
+        displaced.release_endpoint();
+        if let Target::Vfs(vfs_fd) = displaced {
+            let _ = vfs::close(task, vfs_fd);
+        }
     }
+    target.retain_endpoint();
     with_table(task, |table| table.slots[newfd as usize] = Some(target));
     Ok(newfd)
 }
@@ -236,6 +286,12 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             .map(|read| read as u64)
             .map_err(|_| EBADF)
         }
+        Target::Pipe { state, read } => {
+            if !read {
+                return Err(EBADF);
+            }
+            pipe_read(&state, buffer, count)
+        }
     }
 }
 
@@ -259,6 +315,12 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             vfs::write(task, vfs_fd, &bytes)
                 .map(|written| written as u64)
                 .map_err(|_| EBADF)
+        }
+        Target::Pipe { state, read } => {
+            if read {
+                return Err(EBADF);
+            }
+            pipe_write(&state, buffer, count)
         }
     }
 }
@@ -288,6 +350,7 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
             };
             write_stat(buffer, mode, size as u64, fd)
         }
+        Target::Pipe { .. } => write_stat(buffer, S_IFIFO | 0o600, 0, fd.max(1)),
     }
 }
 
@@ -340,24 +403,147 @@ pub fn getdents64(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u6
     Ok(used as u64)
 }
 
+/// Creates a pipe and installs both ends into `task`'s table.
+pub fn pipe(task: u64) -> Result<(u64, u64), u64> {
+    let state = Arc::new(Mutex::new(PipeState {
+        buffer: VecDeque::new(),
+        read_ends: 1,
+        write_ends: 1,
+    }));
+    let read_fd = insert(
+        task,
+        Target::Pipe {
+            state: state.clone(),
+            read: true,
+        },
+    )
+    .ok_or(EMFILE)?;
+    match insert(
+        task,
+        Target::Pipe {
+            state,
+            read: false,
+        },
+    ) {
+        Some(write_fd) => Ok((read_fd, write_fd)),
+        None => {
+            let _ = close(task, read_fd);
+            Err(EMFILE)
+        }
+    }
+}
+
+/// Blocking `read` on a pipe. EOF only when every write end is closed.
+fn pipe_read(state: &Arc<Mutex<PipeState>>, buffer: u64, count: u64) -> Result<u64, u64> {
+    let request = (count as usize).min(PIPE_CAPACITY);
+    loop {
+        let mut chunk = Vec::new();
+        {
+            let mut pipe = state.lock();
+            if !pipe.buffer.is_empty() {
+                let take = request.min(pipe.buffer.len());
+                chunk.extend(pipe.buffer.drain(..take));
+            } else if pipe.write_ends == 0 {
+                return Ok(0);
+            }
+        }
+        if !chunk.is_empty() {
+            user_memory::copy_to_user(&chunk, buffer).map_err(|_| EFAULT)?;
+            return Ok(chunk.len() as u64);
+        }
+        // Wait for the writer. Sleeping releases the kernel lock, so the other
+        // end can run; the loop re-checks the buffer.
+        scheduler::sleep(1);
+    }
+}
+
+fn pipe_write(state: &Arc<Mutex<PipeState>>, buffer: u64, count: u64) -> Result<u64, u64> {
+    let total = (count as usize).min(PIPE_CAPACITY);
+    let mut bytes = alloc::vec![0_u8; total];
+    user_memory::copy_from_user(buffer, &mut bytes).map_err(|_| EFAULT)?;
+    let mut written = 0;
+    while written < total {
+        let progress: usize;
+        {
+            let mut pipe = state.lock();
+            if pipe.read_ends == 0 {
+                return Err(EPIPE);
+            }
+            let space = PIPE_CAPACITY - pipe.buffer.len();
+            progress = space.min(total - written);
+            for &byte in &bytes[written..written + progress] {
+                pipe.buffer.push_back(byte);
+            }
+        }
+        written += progress;
+        if written < total {
+            scheduler::sleep(1);
+        }
+    }
+    Ok(total as u64)
+}
+
+/// Readiness bits for `ppoll`. `None` means the descriptor is not open.
+pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
+    const POLLIN: i16 = 0x001;
+    const POLLOUT: i16 = 0x004;
+    const POLLERR: i16 = 0x008;
+    const POLLHUP: i16 = 0x010;
+    let target = lookup(task, fd)?;
+    Some(match target {
+        Target::Console | Target::Null => POLLIN | POLLOUT,
+        Target::Zero | Target::Random => POLLIN,
+        Target::Full => POLLOUT | POLLERR,
+        Target::Vfs(_) => POLLIN,
+        Target::Pipe { state, read } => {
+            let pipe = state.lock();
+            if read {
+                let mut ready = 0;
+                if !pipe.buffer.is_empty() {
+                    ready |= POLLIN;
+                }
+                if pipe.write_ends == 0 {
+                    ready |= POLLHUP;
+                }
+                ready
+            } else {
+                let mut ready = 0;
+                if pipe.buffer.len() < PIPE_CAPACITY {
+                    ready |= POLLOUT;
+                }
+                if pipe.read_ends == 0 {
+                    ready |= POLLERR;
+                }
+                ready
+            }
+        }
+    })
+}
+
 /// Drops the table when a task exits. The VFS handles are released by
 /// `vfs::close_task`, which runs in the same teardown path.
 pub fn close_task(task: u64) {
     let mut tables = TABLES.lock();
     if let Some(index) = tables.iter().position(|table| table.task == task) {
-        tables.remove(index);
+        let table = tables.remove(index);
+        for slot in table.slots.iter().flatten() {
+            slot.release_endpoint();
+        }
     }
 }
 
 /// Copies the parent's descriptor table to a forked child. VFS handle numbers
 /// were duplicated with the same numbers by `vfs::dup_owner`, so the targets
-/// stay valid.
+/// stay valid. Pipe targets share their `Arc` and gain one endpoint each.
 pub fn fork_table(parent: u64, child: u64) {
     let mut tables = TABLES.lock();
     let Some(source) = tables.iter().find(|table| table.task == parent) else {
         return;
     };
     let slots = source.slots.clone();
+    for slot in slots.iter().flatten() {
+        slot.retain_endpoint();
+    }
     tables.retain(|table| table.task != child);
     tables.push(Table { task: child, slots });
 }
@@ -382,9 +568,11 @@ const EINVAL: u64 = 22;
 const ENOSPC: u64 = 28;
 const ESPIPE: u64 = 29;
 const EROFS: u64 = 30;
+const EPIPE: u64 = 32;
 const EMFILE: u64 = 24;
 
 const S_IFCHR: u32 = 0o020000;
+const S_IFIFO: u32 = 0o010000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 

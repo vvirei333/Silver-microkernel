@@ -25,6 +25,8 @@ const SYS_FCNTL: u64 = 25;
 const SYS_GETCWD: u64 = 17;
 const SYS_CHDIR: u64 = 49;
 const SYS_OPENAT: u64 = 56;
+const SYS_PIPE2: u64 = 59;
+const SYS_PPOLL: u64 = 73;
 const SYS_CLOSE: u64 = 57;
 const SYS_LSEEK: u64 = 62;
 const SYS_READ: u64 = 63;
@@ -79,8 +81,8 @@ const EFAULT: u64 = 14;
 const ENOTDIR: u64 = 20;
 const EISDIR: u64 = 21;
 const EINVAL: u64 = 22;
-const ENOTTY: u64 = 25;
-const ESPIPE: u64 = 29;
+const EMFILE: u64 = 24;
+const ENOTTY: u64 = 25;const ESPIPE: u64 = 29;
 const EROFS: u64 = 30;
 const ERANGE: u64 = 34;
 const ENOSYS: u64 = 38;
@@ -111,6 +113,8 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_WRITEV => linux_writev(args[0], args[1], args[2]),
         SYS_READ => finish(linux_fd::read(scheduler::current_task_id(), args[0], args[1], args[2])),
         SYS_OPENAT => linux_openat(args[0], args[1], args[2], args[3]),
+        SYS_PIPE2 => linux_pipe2(args[0], args[1]),
+        SYS_PPOLL => finish(linux_ppoll(args[0], args[1], args[2])),
         SYS_CLOSE => finish(linux_fd::close(scheduler::current_task_id(), args[0]).map(|_| 0)),
         SYS_LSEEK => finish(linux_fd::lseek(
             scheduler::current_task_id(),
@@ -280,6 +284,98 @@ fn linux_wait4(pid: i64, status_pointer: u64, options: u64) -> Result<u64, u64> 
         }
         scheduler::WaitChild::StillRunning => Ok(0),
         scheduler::WaitChild::NoChild => Err(ECHILD),
+    }
+}
+
+/// `pipe2(2)`: installs a read and a write descriptor.
+fn linux_pipe2(fds_pointer: u64, _flags: u64) -> u64 {
+    let task = scheduler::current_task_id();
+    let Ok((read_fd, write_fd)) = linux_fd::pipe(task) else {
+        return errno(EMFILE);
+    };
+    let mut pair = [0_u8; 8];
+    pair[..4].copy_from_slice(&(read_fd as u32).to_le_bytes());
+    pair[4..].copy_from_slice(&(write_fd as u32).to_le_bytes());
+    if user_memory::copy_to_user(&pair, fds_pointer).is_err() {
+        let _ = linux_fd::close(task, read_fd);
+        let _ = linux_fd::close(task, write_fd);
+        return errno(EFAULT);
+    }
+    0
+}
+
+/// `ppoll(2)`: readiness for up to 32 descriptors, with a timeout. A null
+/// timeout blocks, but is capped at 60 s so a stuck poll cannot wedge the
+/// kernel forever (there is no signal delivery to break it yet).
+fn linux_ppoll(
+    fds_pointer: u64,
+    nfds: u64,
+    timeout_pointer: u64,
+) -> Result<u64, u64> {
+    const POLLERR: i16 = 0x008;
+    const POLLHUP: i16 = 0x010;
+    const POLLNVAL: i16 = 0x020;
+    if nfds > 32 {
+        return Err(EINVAL);
+    }
+    let count = nfds as usize;
+    let timeout_ms = if timeout_pointer == 0 {
+        None
+    } else {
+        let mut bytes = [0_u8; 16];
+        user_memory::copy_from_user(timeout_pointer, &mut bytes).map_err(|_| EFAULT)?;
+        let seconds = i64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let nanoseconds = i64::from_le_bytes(bytes[8..].try_into().unwrap());
+        if seconds < 0 || nanoseconds < 0 {
+            None
+        } else {
+            Some(
+                (seconds as u64)
+                    .saturating_mul(1000)
+                    .saturating_add(nanoseconds as u64 / 1_000_000),
+            )
+        }
+    };
+    let start = timer::ticks();
+    let deadline = timeout_ms.map(|ms| start + timer::milliseconds_to_ticks(ms));
+    loop {
+        let mut ready = 0u64;
+        let mut entries: Vec<(i32, i16, i16)> = Vec::with_capacity(count);
+        for index in 0..count {
+            let address = fds_pointer + (index * 8) as u64;
+            let mut raw = [0_u8; 8];
+            user_memory::copy_from_user(address, &mut raw).map_err(|_| EFAULT)?;
+            let fd = i32::from_le_bytes(raw[0..4].try_into().unwrap());
+            let events = i16::from_le_bytes(raw[4..6].try_into().unwrap());
+            let revents = if fd < 0 {
+                0
+            } else {
+                match linux_fd::poll_ready(scheduler::current_task_id(), fd as u64) {
+                    Some(bits) => bits & (events | POLLERR | POLLHUP),
+                    None => POLLNVAL,
+                }
+            };
+            if revents != 0 {
+                ready += 1;
+            }
+            entries.push((fd, events, revents));
+        }
+        let expired = match deadline {
+            Some(deadline) => timer::ticks() >= deadline,
+            None => timer::ticks().saturating_sub(start) >= 6000,
+        };
+        if ready != 0 || expired || timeout_ms == Some(0) {
+            for (index, &(fd, events, revents)) in entries.iter().enumerate() {
+                let mut raw = [0_u8; 8];
+                raw[0..4].copy_from_slice(&fd.to_le_bytes());
+                raw[4..6].copy_from_slice(&events.to_le_bytes());
+                raw[6..8].copy_from_slice(&revents.to_le_bytes());
+                user_memory::copy_to_user(&raw, fds_pointer + (index * 8) as u64)
+                    .map_err(|_| EFAULT)?;
+            }
+            return Ok(ready);
+        }
+        scheduler::sleep(1);
     }
 }
 

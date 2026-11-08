@@ -11,6 +11,7 @@
 #   linuxrun /sfs/linux-rw      # text RX + data RW/BSS, exit 7
 #   linuxrun /sfs/linux-chain   # execve's linux-hello, exit 42
 #   linuxrun /sfs/linux-fork    # fork+exec+wait4, parent exits 0
+#   linuxrun /sfs/linux-pipe    # pipe2+ppoll+fork, prints 'pipe: ping'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -36,11 +37,13 @@ build hello
 build rw
 build chain
 build fork
+build pipe
 
 python3 scripts/sfs_inject.py "$IMAGE" build/hello.elf linux-hello
 python3 scripts/sfs_inject.py "$IMAGE" build/rw.elf linux-rw
 python3 scripts/sfs_inject.py "$IMAGE" build/chain.elf linux-chain
 python3 scripts/sfs_inject.py "$IMAGE" build/fork.elf linux-fork
+python3 scripts/sfs_inject.py "$IMAGE" build/pipe.elf linux-pipe
 
 # A real static libc binary (the SFS image is 1 MiB; all three together fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then
