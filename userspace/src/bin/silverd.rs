@@ -17,7 +17,9 @@ const SFS_POLL_TICKS: u64 = 50;
 #[link_section = ".text._start"]
 pub extern "C" fn _start(argument: u64) -> ! {
     // 1 = headless console OS (no compositor, input driver or home screen).
-    let console_only = argument == 1;
+    // 2 = console OS plus the network stack (`console-net`).
+    let console_only = argument == 1 || argument == 2;
+    let with_net = argument == 2 || !console_only;
     syscall::print(if console_only {
         "SILVERD: BOOTING (CONSOLE)\r\n"
     } else {
@@ -38,39 +40,44 @@ pub extern "C" fn _start(argument: u64) -> ! {
 
     // 2. Block driver — retired: the kernel owns virtio-blk and SFS now.
 
-    // 3. Network driver
-    let net_cap = syscall::spawn(syscall::PROGRAM_NET_DRIVER, syscall::task_id())
-        .unwrap_or_else(|| fail("SILVERD: NET DRIVER SPAWN FAILED\r\n"));
-    // `spawn` returns a capability id, not the task id, so resolve it before
-    // granting: `cap_grant` addresses the recipient by task id.
-    let net_id = syscall::cap_get_task_id(net_cap)
-        .unwrap_or_else(|| fail("SILVERD: NET DRIVER CAP LOOKUP FAILED\r\n"));
-    if !syscall::cap_grant(net_cap, net_id, syscall::CAP_PCI | syscall::CAP_MMIO) {
-        fail("SILVERD: NET DRIVER CAP GRANT FAILED\r\n");
-    }
-    // Lend the driver the console for one second while it probes PCI and
-    // prints; it delays its first line so this handoff wins even if the
-    // scheduler preempts us. Its MAC reaches the network server over IPC later.
-    if syscall::console_set(net_cap) {
-        syscall::sleep(1000);
-        if !syscall::console_set(syscall::task_id()) {
-            fail("SILVERD: CONSOLE RECLAIM FAILED\r\n");
+    // 3-5. Network stack. Optional in the console product: `console-net`
+    // selects it; a machine without a NIC then boots deterministically.
+    if with_net {
+        // 3. Network driver
+        let net_cap = syscall::spawn(syscall::PROGRAM_NET_DRIVER, syscall::task_id())
+            .unwrap_or_else(|| fail("SILVERD: NET DRIVER SPAWN FAILED\r\n"));
+        // `spawn` returns a capability id, not the task id, so resolve it before
+        // granting: `cap_grant` addresses the recipient by task id.
+        let net_id = syscall::cap_get_task_id(net_cap)
+            .unwrap_or_else(|| fail("SILVERD: NET DRIVER CAP LOOKUP FAILED\r\n"));
+        if !syscall::cap_grant(net_cap, net_id, syscall::CAP_PCI | syscall::CAP_MMIO) {
+            fail("SILVERD: NET DRIVER CAP GRANT FAILED\r\n");
         }
-    } else {
-        syscall::print("SILVERD: NET DRIVER CONSOLE LEND FAILED\r\n");
-    }
+        // Lend the driver the console for one second while it probes PCI and
+        // prints; it delays its first line so this handoff wins even if the
+        // scheduler preempts us. Its MAC reaches the network server over IPC later.
+        if syscall::console_set(net_cap) {
+            syscall::sleep(1000);
+            if !syscall::console_set(syscall::task_id()) {
+                fail("SILVERD: CONSOLE RECLAIM FAILED\r\n");
+            }
+        } else {
+            syscall::print("SILVERD: NET DRIVER CONSOLE LEND FAILED\r\n");
+        }
 
-    // 4. Filesystem server — retired: SFS lives in the kernel and is mounted
-    // by `main` at `/sfs`.
+        // 4. Filesystem server — retired: SFS lives in the kernel and is mounted
+        // by `main` at `/sfs`.
 
-    // 5. Network server (smoltcp). It receives the driver's task ID so it can
-    // attach its DMA mailbox; the attach is retried, so no readiness wait.
-    let net_server_cap = syscall::spawn(syscall::PROGRAM_NET_SERVER, net_id)
-        .unwrap_or_else(|| fail("SILVERD: NET SERVER SPAWN FAILED\r\n"));
-    let net_server_id = syscall::cap_get_task_id(net_server_cap)
-        .unwrap_or_else(|| fail("SILVERD: NET SERVER CAP LOOKUP FAILED\r\n"));
-    if !syscall::cap_grant(net_server_cap, net_server_id, syscall::CAP_MMIO) {
-        fail("SILVERD: NET SERVER CAP GRANT FAILED\r\n");
+        // 5. Network server (smoltcp). It receives the driver's task ID so it can
+        // attach its DMA mailbox; the attach is retried, so no readiness wait.
+        let net_server_cap = syscall::spawn(syscall::PROGRAM_NET_SERVER, net_id)
+            .unwrap_or_else(|| fail("SILVERD: NET SERVER SPAWN FAILED\r\n"));
+        let net_server_id = syscall::cap_get_task_id(net_server_cap)
+            .unwrap_or_else(|| fail("SILVERD: NET SERVER CAP LOOKUP FAILED\r\n"));
+        if !syscall::cap_grant(net_server_cap, net_server_id, syscall::CAP_MMIO) {
+            fail("SILVERD: NET SERVER CAP GRANT FAILED\r\n");
+        }
+
     }
 
     // 6-7. Graphics stack: compositor + input. Skipped in the console OS.

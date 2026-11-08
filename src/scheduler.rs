@@ -1003,7 +1003,10 @@ pub fn init() {
     #[cfg(not(feature = "demo-tasks"))]
     {
         // 1 = headless console OS: Silverd skips the graphics stack.
-        #[cfg(feature = "console")]
+        // 2 = console OS plus the network stack.
+        #[cfg(feature = "console-net")]
+        const SILVERD_ARGUMENT: u64 = 2;
+        #[cfg(all(feature = "console", not(feature = "console-net")))]
         const SILVERD_ARGUMENT: u64 = 1;
         #[cfg(not(feature = "console"))]
         const SILVERD_ARGUMENT: u64 = 0;

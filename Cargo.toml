@@ -64,6 +64,9 @@ fog-hw-selftests = ["fog"]
 # input driver or SilverHome. This is the supported product profile now; the
 # graphics path stays available for experiments behind its own flags.
 console = []
+# Console OS with the network stack. Without it the product image contains no
+# network driver/server and boots deterministically on a machine without a NIC.
+console-net = ["console"]
 # Opt-in bisect test: unmask IRQs and wait for 30 timer ticks before the
 # scheduler is initialised. Useful on QEMU; on the first hardware boot it can
 # deliver a timer IRQ into a not-yet-initialised scheduler, so fog defaults off.

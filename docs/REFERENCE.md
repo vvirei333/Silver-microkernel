@@ -7,9 +7,9 @@ console OS:
 Silver kernel
   + kernel SFS (/sfs, read-write)
   + nameserver (Scout)
-  + network driver/server (optional device)
   + Howl shell + coreutils
   + Howler UART input
+  + network driver/server only with `console-net`
 ```
 
 No compositor, no input tablet driver, no home screen. The graphics profiles
@@ -22,9 +22,13 @@ merely implemented.
 ## Build and run
 
 ```bash
-# product image (headless console)
+# product image (headless console, no network)
 cargo build --release --target aarch64-unknown-none \
   --no-default-features --features no_std,console
+
+# product image with the network stack
+cargo build --release --target aarch64-unknown-none \
+  --no-default-features --features no_std,console-net
 
 # QEMU smoke test
 qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
@@ -46,7 +50,8 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 | Shell | `help`, `uname`, `ls /`, `health`, file commands | **pass** |
 | Init | Silverd resolves task ids (not cap ids) before grants | **fixed** |
 | Capabilities | `CAP_MOUNT`/`CAP_POWER` outside `CAP_ALL`; console shell gets `CAP_POWER` by kernel policy only | **pass** |
-| Console size | graphics programs compiled out of the console image | **pass** |
+| Console size | graphics, demo, block-server and SFS-server programs compiled out | **pass** |
+| Network | optional: `console` boots without it, `console-net` adds it | **pass** |
 | Power | `poweroff`/`reboot` commands; SMC on Qualcomm, HVC on QEMU | **implemented; fog path verified earlier, QEMU PSCI caveat below** |
 | SMP | QEMU `-smp 4` selftest | **15 PASS / 0 FAIL** |
 | Fog QEMU | relocation, at-link, fail-closed park, timer | **PASS** |
@@ -66,10 +71,9 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 3. **GENI UART root cause.** TX now fails fast after the first timeout, so boot
    no longer stalls, but the real clock/pin state is still unknown. This is the
    blocker for a console OS on the phone.
-4. **Network without a NIC.** The console profile still starts the network
-   driver/server; a machine without a virtio-net device reports a probe failure
-   and continues. A `console-net` split is the next cleanup if the product
-   should not even embed the stack.
+4. **Resolved: network is a separate profile.** `console` embeds no network
+   driver/server and boots deterministically without a NIC; `console-net` adds
+   the stack. Verified both reach the shell on a machine without a NIC.
 5. **Resolved: graphics programs are not embedded in the console image.**
    `GPU_DRIVER`, `INPUT_DRIVER` and `HOME` are compiled out of `user_program`
    under `console`; the console image is about 82 KiB smaller. Combining
@@ -96,8 +100,6 @@ no tablet device is attached; it is not a product failure.
 
 1. Root-cause the QEMU PSCI shutdown or document a hard requirement.
 2. Compile graphics programs out of the console build.
-3. Add a `console-net` split and make the default console boot deterministic
-   without a NIC.
 4. Debug the fog TLB proof with the `fog-hw-selftests` image.
 5. Make the GENI UART console usable on the phone (clock/pins), then run the
    product boot on `rain` over UART.

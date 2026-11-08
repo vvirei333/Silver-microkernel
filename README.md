@@ -495,8 +495,8 @@ self-relocation copy), `fog-ui` (framebuffer status panel; implies
 `fog-paint`) and `fog-display` (experimental: start the compositor and
 SilverHome on the bootloader's `cont_splash` panel; real-device only).
 `console` is the product profile: a headless OS with the kernel SFS, the
-nameserver, the network stack, Howl and the UART driver, and no graphics
-tasks. See [`docs/REFERENCE.md`](docs/REFERENCE.md). Normal
+nameserver, Howl and the UART driver, and no graphics tasks. `console-net` adds
+the optional network stack. See [`docs/REFERENCE.md`](docs/REFERENCE.md). Normal
 bare-metal boot starts only
 silverd. In the console profile silverd starts Scout, the network driver, the
 network server, Howl and Howler. The graphical profiles additionally start the

@@ -14,8 +14,11 @@ reference checklist is [`docs/REFERENCE.md`](docs/REFERENCE.md).
 - **Builds:** `no_std`, `no_std,console` (product), `no_std,smp-selftest`,
   `no_std,tablet`, `no_std,fog`, `no_std,fog,fog-reloc`,
   `no_std,fog,fog-ui`, `no_std,fog,fog-reloc,fog-display,fog-auto-reset`.
-- **Console OS (QEMU serial):** boots to `howl ready` with no graphics tasks;
-  `help`, `uname`, `ls /`, `health` all answer. `health` reports no DMA leaks.
+- **Console OS (QEMU serial):** boots to `howl ready` with no graphics tasks
+  and no network by default; `help`, `uname`, `ls /`, `health` all answer.
+  `health` reports no DMA leaks. `console-net` adds the network stack as an
+  opt-in profile. The console image is ~837 KiB versus ~1.09 MiB for the
+  full graphics build.
 - **SMP:** `-smp 4` selftest 15 PASS / 0 FAIL.
 - **Fog QEMU:** relocation, at-link, fail-closed park and timer cases PASS.
 - **Init fix:** Silverd now resolves the child **task id** before every
