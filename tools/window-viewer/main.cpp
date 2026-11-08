@@ -12,12 +12,18 @@
 #include <QFile>
 #include <QImage>
 #include <QKeyEvent>
+#include <QMouseEvent>
+#include <QNetworkAccessManager>
+#include <QNetworkReply>
+#include <QNetworkRequest>
 #include <QPainter>
 #include <QThread>
 #include <QTimer>
+#include <QUrl>
 #include <QWheelEvent>
 #include <QWidget>
 
+#include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -38,12 +44,30 @@ constexpr uint64_t kFieldFrameSeq = 0x18;
 constexpr uint64_t kFieldInputHead = 0x20;
 constexpr uint64_t kFieldInputTail = 0x24;
 constexpr uint64_t kFieldWindowRequest = 0x2C;
+constexpr uint64_t kFieldWebRequestSeq = 0x30;
+constexpr uint64_t kFieldWebRequestLen = 0x34;
+constexpr uint64_t kFieldWebDoneSeq = 0x38;
+constexpr uint64_t kFieldWebStatus = 0x3C;
+constexpr uint64_t kFieldWebBodyLen = 0x40;
+constexpr uint64_t kFieldWebError = 0x44;
+constexpr uint64_t kFieldWebFinalLen = 0x48;
+constexpr uint64_t kFieldWebCapable = 0x4C;
 constexpr uint64_t kPixels = 0x1000;
-constexpr uint64_t kInputRing = 0x0040;
+constexpr uint64_t kWebRequest = 0x240000;
+constexpr int kWebRequestMax = 1024;
+constexpr uint64_t kWebFinalUrl = 0x240800;
+constexpr int kWebFinalUrlMax = 1024;
+constexpr uint64_t kWebBody = 0x241000;
+constexpr int kWebBodyMax = 0x400000 - static_cast<int>(kWebBody);
+constexpr uint64_t kInputRing = 0x0100;
 constexpr uint32_t kInputSlots = 64;
 constexpr uint64_t kInputEntry = 8;
 
 enum InputKind : uint8_t { kInputKey = 1, kInputScroll = 2, kInputClick = 3 };
+
+constexpr uint32_t kWebErrorNone = 0;
+constexpr uint32_t kWebErrorNetwork = 1;
+constexpr uint32_t kWebErrorUnsupported = 3;
 
 uint32_t readU32(const uint8_t *base, uint64_t offset) {
     uint32_t value;
@@ -121,6 +145,116 @@ struct Shared {
     }
 };
 
+class WebProxy : public QObject {
+public:
+    explicit WebProxy(Shared &shared, QObject *parent = nullptr)
+        : QObject(parent), m_shared(shared) {
+        // Tell the guest that HTTPS (and redirects with any scheme) can be
+        // fetched through this viewer; an old viewer leaves the flag at 0.
+        writeU32(m_shared.data, kFieldWebCapable, 1);
+        m_lastRequest = m_shared.u32(kFieldWebRequestSeq);
+        auto *timer = new QTimer(this);
+        connect(timer, &QTimer::timeout, this, [this] { tick(); });
+        timer->start(40);
+    }
+
+private:
+    void tick() {
+        const uint32_t seq = m_shared.u32(kFieldWebRequestSeq);
+        if (seq == 0 || seq == m_lastRequest) {
+            return;
+        }
+        m_lastRequest = seq;
+        std::fprintf(stderr, "proxy: request %u\n", seq);
+        start(seq);
+    }
+
+    void start(uint32_t seq) {
+        if (m_reply != nullptr) {
+            m_reply->abort();
+            m_reply->deleteLater();
+            m_reply = nullptr;
+        }
+        uint32_t length = m_shared.u32(kFieldWebRequestLen);
+        if (length > static_cast<uint32_t>(kWebRequestMax)) {
+            length = kWebRequestMax;
+        }
+        const QString text = QString::fromUtf8(
+            reinterpret_cast<const char *>(m_shared.data + kWebRequest),
+            static_cast<int>(length));
+        const QUrl url(text);
+        if (!url.isValid() ||
+            (url.scheme() != QLatin1String("https") && url.scheme() != QLatin1String("http"))) {
+            publish(seq, 0, QByteArray(), kWebErrorUnsupported, text);
+            return;
+        }
+        QNetworkRequest request(url);
+        // The guest resolves redirects itself so it can choose the HTTP path
+        // for http:// and the host path for https://.
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                             QNetworkRequest::ManualRedirectPolicy);
+        request.setRawHeader("Accept-Encoding", "identity");
+        request.setHeader(QNetworkRequest::UserAgentHeader,
+                          "Mozilla/5.0 (WerewolfOS) Wolfser/0.2");
+        std::fprintf(stderr, "proxy: fetching %s\n", url.toString().toUtf8().constData());
+        m_reply = m_manager.get(request);
+        connect(m_reply, &QNetworkReply::finished, this, [this, seq] { finished(seq); });
+    }
+
+    void finished(uint32_t seq) {
+        QNetworkReply *reply = m_reply;
+        if (reply == nullptr) {
+            return;
+        }
+        m_reply = nullptr;
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        const QUrl redirect =
+            reply->attribute(QNetworkRequest::RedirectionTargetAttribute).toUrl();
+        uint32_t error = kWebErrorNone;
+        QByteArray body;
+        if (status >= 300 && status < 400 && redirect.isValid()) {
+            body = reply->url().resolved(redirect).toEncoded();
+        } else {
+            body = reply->readAll();
+            if (status == 0 && reply->error() != QNetworkReply::NoError) {
+                error = kWebErrorNetwork;
+            }
+        }
+        const QString finalUrl = reply->url().toString();
+        std::fprintf(stderr, "proxy: status=%d bytes=%lld error=%d url=%s\n", status,
+                     static_cast<long long>(body.size()), static_cast<int>(reply->error()),
+                     finalUrl.toUtf8().constData());
+        reply->deleteLater();
+        publish(seq, static_cast<uint32_t>(status), body, error, finalUrl);
+    }
+
+    void publish(uint32_t seq, uint32_t status, const QByteArray &body, uint32_t error,
+                 const QString &finalUrl) {
+        QByteArray final = finalUrl.toUtf8();
+        if (final.size() > kWebFinalUrlMax) {
+            final.truncate(kWebFinalUrlMax);
+        }
+        const QByteArray payload = body.left(kWebBodyMax);
+        std::memcpy(m_shared.data + kWebBody, payload.constData(),
+                    static_cast<size_t>(payload.size()));
+        std::memcpy(m_shared.data + kWebFinalUrl, final.constData(),
+                    static_cast<size_t>(final.size()));
+        writeU32(m_shared.data, kFieldWebStatus, status);
+        writeU32(m_shared.data, kFieldWebBodyLen, static_cast<uint32_t>(payload.size()));
+        writeU32(m_shared.data, kFieldWebError, error);
+        writeU32(m_shared.data, kFieldWebFinalLen, static_cast<uint32_t>(final.size()));
+        // The done sequence is published last: the guest must see the body
+        // and the status before it sees the completion marker.
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        writeU32(m_shared.data, kFieldWebDoneSeq, seq);
+    }
+
+    Shared &m_shared;
+    QNetworkAccessManager m_manager;
+    QNetworkReply *m_reply = nullptr;
+    uint32_t m_lastRequest = 0;
+};
+
 class Viewer : public QWidget {
 public:
     Viewer(Shared &shared, QWidget *parent = nullptr) : QWidget(parent), m_shared(shared) {
@@ -171,6 +305,9 @@ protected:
                              "type  wolfser  in the guest console");
             return;
         }
+        // The guest publishes frame_seq after the pixels; pair it with an
+        // acquire fence so the QImage below sees the completed frame.
+        std::atomic_thread_fence(std::memory_order_acquire);
         const uint32_t width = m_shared.u32(kFieldWidth);
         const uint32_t height = m_shared.u32(kFieldHeight);
         const uint32_t stride = m_shared.u32(kFieldStride);
@@ -196,9 +333,26 @@ protected:
         case Qt::Key_Enter: key = 10; break;
         case Qt::Key_Backspace: key = 11; break;
         case Qt::Key_Escape: key = 12; break;
+        case Qt::Key_Left:
+            if (event->modifiers() & Qt::AltModifier) {
+                key = 14; // back
+                break;
+            }
+            return;
+        case Qt::Key_Right:
+            if (event->modifiers() & Qt::AltModifier) {
+                key = 15; // forward
+                break;
+            }
+            return;
+        case Qt::Key_F5:
+            key = 16; // reload
+            break;
         case Qt::Key_L:
+        case Qt::Key_Q:
+        case Qt::Key_R:
             if (event->modifiers() & Qt::ControlModifier) {
-                key = 13; // focus the address bar
+                key = event->key() == Qt::Key_L ? 13 : (event->key() == Qt::Key_Q ? 17 : 16);
                 break;
             }
             if (event->text().size() == 1 && event->text().at(0).isPrint()) {
@@ -215,6 +369,16 @@ protected:
             }
         }
         pushInput(m_shared.data, kInputKey, 0, key, 0, 0);
+    }
+
+    void mousePressEvent(QMouseEvent *event) override {
+        if (event->button() != Qt::LeftButton) {
+            return;
+        }
+        const QPoint point = event->position().toPoint();
+        pushInput(m_shared.data, kInputClick, 1, 0,
+                  static_cast<uint16_t>(qBound(0, point.x(), 65535)),
+                  static_cast<uint16_t>(qBound(0, point.y(), 65535)));
     }
 
     void wheelEvent(QWheelEvent *event) override {
@@ -246,6 +410,7 @@ int snapshot(Shared &shared, const QString &path, int timeoutSeconds) {
                 std::fprintf(stderr, "viewer: invalid geometry\n");
                 return 2;
             }
+            std::atomic_thread_fence(std::memory_order_acquire);
             QImage frame(shared.data + kPixels, static_cast<int>(width), static_cast<int>(height),
                          static_cast<int>(stride), QImage::Format_RGBA8888);
             if (!frame.save(path)) {
@@ -340,6 +505,8 @@ int main(int argc, char **argv) {
     if (watchMode) {
         // Start hidden with QEMU and show the window only when the guest asks
         // for it (the user typed `wolfser`). Nothing appears before that.
+        auto *proxy = new WebProxy(shared, &app);
+        Q_UNUSED(proxy);
         auto *viewer = new Viewer(shared);
         auto *timer = new QTimer(&app);
         QObject::connect(timer, &QTimer::timeout, [&app, &shared, viewer, timer] {
@@ -358,6 +525,8 @@ int main(int argc, char **argv) {
 
     // No wait for the WIN1 header here: the window stays open and shows a
     // waiting screen until the guest starts Wolfser.
+    auto *proxy = new WebProxy(shared, &app);
+    Q_UNUSED(proxy);
 
     Viewer viewer(shared);
     if (scalePercent != 100) {

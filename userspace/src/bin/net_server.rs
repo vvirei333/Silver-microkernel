@@ -65,10 +65,10 @@ const DNS_QUERY_SLOTS: usize = 2;
 /// Standalone `dns` lookups are bounded so a lost query cannot hang a client.
 const DNS_TIMEOUT_MILLIS: i64 = 8000;
 
-/// Largest host name and request path we accept.
-const HOST_MAX: usize = 96;
-const PATH_MAX: usize = 192;
-const REQUEST_MAX: usize = 512;
+/// Largest host name, request path and request line we accept.
+const HOST_MAX: usize = 128;
+const PATH_MAX: usize = 384;
+const REQUEST_MAX: usize = 1024;
 /// A whole fetch (DNS + connect + transfer) is bounded from the request time.
 const HTTP_TIMEOUT_MILLIS: i64 = 20000;
 
@@ -609,6 +609,7 @@ enum FetchStage {
 struct Fetch {
     stage: FetchStage,
     requester: u64,
+    request_id: u32,
     query: Option<dns::QueryHandle>,
     host: [u8; HOST_MAX],
     host_len: usize,
@@ -630,6 +631,7 @@ impl Fetch {
         Self {
             stage: FetchStage::Idle,
             requester: 0,
+            request_id: 0,
             query: None,
             host: [0; HOST_MAX],
             host_len: 0,
@@ -658,38 +660,46 @@ fn start_http(
     now_millis: i64,
     outbox: &mut Outbox,
 ) {
+    let request_id = net_ipc::http_request_fields(message);
     if fetch.stage != FetchStage::Idle {
-        outbox.push(
-            message.sender,
-            net_ipc::http_reply(net_ipc::NET_ERR_BUSY, 0, 0),
-        );
-        return;
+        if fetch.requester != message.sender {
+            outbox.push(
+                message.sender,
+                net_ipc::http_reply_id(request_id, net_ipc::NET_ERR_BUSY, 0, 0),
+            );
+            return;
+        }
+        // The same client abandoned its previous request (a browser
+        // navigation replaces the old page). Drop the old transaction; the
+        // Connecting stage aborts the stale TCP socket.
+        fetch.stage = FetchStage::Idle;
+        fetch.query = None;
     }
     let Some(url) = read_request(client_base) else {
         outbox.push(
             message.sender,
-            net_ipc::http_reply(net_ipc::NET_ERR_URL, 0, 0),
+            net_ipc::http_reply_id(request_id, net_ipc::NET_ERR_URL, 0, 0),
         );
         return;
     };
     let Some(parsed) = parse_url(url) else {
         outbox.push(
             message.sender,
-            net_ipc::http_reply(net_ipc::NET_ERR_URL, 0, 0),
+            net_ipc::http_reply_id(request_id, net_ipc::NET_ERR_URL, 0, 0),
         );
         return;
     };
     if parsed.tls {
         outbox.push(
             message.sender,
-            net_ipc::http_reply(net_ipc::NET_ERR_TLS, 0, 0),
+            net_ipc::http_reply_id(request_id, net_ipc::NET_ERR_TLS, 0, 0),
         );
         return;
     }
     if parsed.host.len() > HOST_MAX - 1 || parsed.path.len() > PATH_MAX - 1 {
         outbox.push(
             message.sender,
-            net_ipc::http_reply(net_ipc::NET_ERR_URL, 0, 0),
+            net_ipc::http_reply_id(request_id, net_ipc::NET_ERR_URL, 0, 0),
         );
         return;
     }
@@ -700,6 +710,7 @@ fn start_http(
     fetch.path_len = parsed.path.len();
     fetch.port = parsed.port;
     fetch.requester = message.sender;
+    fetch.request_id = request_id;
     fetch.sent = 0;
     fetch.received = 0;
     fetch.started_millis = now_millis;
@@ -727,7 +738,7 @@ fn start_http(
                 fetch.stage = FetchStage::Idle;
                 outbox.push(
                     message.sender,
-                    net_ipc::http_reply(net_ipc::NET_ERR_BUSY, 0, 0),
+                    net_ipc::http_reply_id(request_id, net_ipc::NET_ERR_BUSY, 0, 0),
                 );
             }
         }
@@ -872,9 +883,14 @@ fn drive_fetch(
 
 fn fail_fetch(fetch: &mut Fetch, code: u8, stage: u16, outbox: &mut Outbox) {
     let requester = fetch.requester;
+    let request_id = fetch.request_id;
     fetch.stage = FetchStage::Idle;
     fetch.query = None;
-    outbox.push(requester, net_ipc::http_reply(code, stage, 0));
+    outbox.push(requester, net_ipc::http_reply_id(request_id, code, stage, 0));
+}
+
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
 fn finish_fetch(fetch: &mut Fetch, client_base: u64, outbox: &mut Outbox) {
@@ -885,6 +901,37 @@ fn finish_fetch(fetch: &mut Fetch, client_base: u64, outbox: &mut Outbox) {
         )
     };
     let (code, status, body_len) = parse_response(buffer, fetch.received);
+    let requester = fetch.requester;
+    let request_id = fetch.request_id;
+    // Redirects are the client's decision: hand it the Location header and
+    // let the browser resolve it (a target may need the host's HTTPS path).
+    if code == net_ipc::NET_OK && is_redirect(status) {
+        if let Some(header_end) = find_header_end(&buffer[..fetch.received]) {
+            if let Some(location) = find_header(&buffer[..header_end], b"location") {
+                let offset = (location.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize);
+                let length = location.len().min(net_ipc::CLIENT_BODY_MAX);
+                unsafe {
+                    core::ptr::copy(
+                        buffer.as_ptr().add(offset),
+                        buffer.as_mut_ptr(),
+                        length,
+                    );
+                }
+                fetch.stage = FetchStage::Idle;
+                fetch.query = None;
+                outbox.push(
+                    requester,
+                    net_ipc::http_reply_id(
+                        request_id,
+                        net_ipc::NET_REDIRECT,
+                        status,
+                        length as u32,
+                    ),
+                );
+                return;
+            }
+        }
+    }
     // Move the body to the start of the body window: clients read it from
     // `CLIENT_BODY`, not from after the header.
     if code == net_ipc::NET_OK {
@@ -896,9 +943,11 @@ fn finish_fetch(fetch: &mut Fetch, client_base: u64, outbox: &mut Outbox) {
             }
         }
     }
-    let requester = fetch.requester;
     fetch.stage = FetchStage::Idle;
-    outbox.push(requester, net_ipc::http_reply(code, status, body_len as u32));
+    outbox.push(
+        requester,
+        net_ipc::http_reply_id(request_id, code, status, body_len as u32),
+    );
 }
 
 // ---------------------------------------------------------------------------

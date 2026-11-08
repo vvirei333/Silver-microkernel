@@ -101,7 +101,7 @@ userspace.
 - [x] DNS: `dns <name>` resolves through the DHCP-provided resolver
 - [x] HTTP: `wget <url> [file]` fetches an `http://` document through a real TCP connection into SFS; `ip` shows the lease
 - [x] Vendored `smoltcp` 0.14 with a two-line neighbour fix for broadcast DHCP traffic (`third_party/smoltcp/PATCH.md`)
-- [x] **Wolfser**: `wolfser [query|url]` opens a search/address bar; the guest fetches HTTP and renders the page into an ivshmem RGBA surface (title bar, address bar, wrapped text, error page)
+- [x] **Wolfser**: `wolfser [query|url]` opens a search/address bar; pages render into an ivshmem RGBA surface with clickable links, back/forward history, word wrap, headings and a reader mode. `http://` uses the guest smoltcp stack, `https://` uses the host viewer's Qt TLS proxy
 - [x] Qt window viewer (`tools/window-viewer`) that maps the same surface, repaints on `frame_seq`, and sends keys/wheel through an input ring; `--snapshot` mode for headless checks
 - [x] `SYS_MAP_PHYS_NC`: maps a non-DRAM window (ivshmem) as Normal Non-Cacheable user memory
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
@@ -542,13 +542,21 @@ compressed or chunked-specific browser features beyond the built-in dechunking.
 
 Wolfser is a normal guest program (`wolfser` in Howl). With no argument it
 opens an empty search bar; with an argument it treats the text as an address
-or a query. Enter resolves the input: an explicit `http://` URL is used as-is,
-a bare host gets `http://`, anything else becomes a Bing search over plain
-HTTP (`http://www.bing.com/search?q=...`), which the console stack can fetch
-without TLS. The page is reduced to text (scripts/styles/tags stripped,
-entities decoded, block tags become line breaks) and drawn into one 900x640
-RGBA surface. There is no guest compositor: the surface lives in an ivshmem
-BAR, and a Qt program on the host maps the same file.
+or a query. Enter resolves the input: an explicit URL is used as-is, a bare
+host gets `https://`, anything else becomes a DuckDuckGo HTML search
+(`https://html.duckduckgo.com/html/?q=...`). Plain `http://` is fetched by
+`net_server` over smoltcp; `https://` is handed to the host viewer, which
+fetches it with Qt's TLS stack and writes the response into the shared buffer.
+Redirects (3xx and `<meta http-equiv=refresh>`) are followed by the guest, so a
+page may move between the two paths freely.
+
+The page is reduced to readable content (scripts/styles/tables/navigation
+stripped, entities decoded, word-wrapped paragraphs, headings scaled up) and
+drawn into one 900x640 RGBA surface. A `<main>`, `<article>` or MediaWiki
+content container selects the article region, so Wikipedia opens on the text
+instead of its menus. Links are blue and underlined; clicking one navigates.
+There is no guest compositor: the surface lives in an ivshmem BAR, and a Qt
+program on the host maps the same file.
 
 | Region | Contents |
 | --- | --- |
@@ -556,11 +564,17 @@ BAR, and a Qt program on the host maps the same file.
 | `0x018` | `frame_seq`; the host repaints when it changes |
 | `0x01C` | state: blank / ready / loading / error |
 | `0x020` | input ring head/tail; 64 eight-byte entries |
+| `0x030` | host web-proxy request/done sequence, status, body/URL lengths |
+| `0x100` | input ring entries |
 | `0x1000` | RGBA8888 pixels |
+| `0x240000` | web-proxy request URL (1 KiB), final URL (1 KiB), body (up to 4 MiB) |
 
-Keys from the host (`Ctrl+L` edit the address, `Enter` go, `Backspace`,
-`q` quit, `r` reload, arrows/PageUp/PageDown/Home/End) and wheel events travel
-through the ring; the guest repaints and bumps `frame_seq`. `tools/window-viewer` runs a window with Qt6 and has a
+Keys from the host (`Ctrl+L` edit the address, `Enter` go, `Ctrl+Q` quit,
+`Ctrl+R`/`F5` reload, `Alt+Left`/`Alt+Right` history, arrows and
+PageUp/PageDown/Home/End scroll) and mouse clicks/wheel travel through the
+ring; typing anywhere starts a new search. The guest repaints and bumps
+`frame_seq` only after a memory barrier, so the host never sees a half-drawn
+frame. `tools/window-viewer` is a Qt6 Widgets + Network program and has a
 `--snapshot OUT.png` mode that works with `QT_QPA_PLATFORM=offscreen`, which is
 how the QEMU test checks a frame without a display.
 
@@ -592,9 +606,10 @@ If Wolfser exits with status 21, the VM has no ivshmem device: relaunch QEMU
 with the arguments above (or use `./build_and_qemu.sh`). Starting `wolfser`
 twice reuses the running instance (one window per VM).
 
-The first renderer deliberately has no CSS layout, images or TLS: it is the
-host-window transport plus an HTTP/HTML text path, which the Linux ABI/Phosh
-track will later replace with a real engine.
+The renderer deliberately has no CSS layout or images yet. HTTPS works only
+when the Qt viewer is running (it terminates TLS on the host); a native guest
+TLS stack is the next network milestone. The Linux ABI/Phosh track will
+eventually replace this renderer with a real engine.
 DHCP or DNS. The driver assigns its 64 KiB BAR window at `0x1020_0000`; this
 assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 

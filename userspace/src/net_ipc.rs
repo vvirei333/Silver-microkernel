@@ -89,7 +89,7 @@ pub const OP_IPCONFIG: u8 = 13;
 /// `payload[6]` prefix, `payload[7..11]` gateway, `payload[11..15]` DNS.
 pub const OP_IPCONFIG_REPLY: u8 = 14;
 
-// Result codes carried in the reply payload.
+/// Result codes carried in the reply payload.
 pub const NET_OK: u8 = 0;
 pub const NET_ERR_DNS: u8 = 1;
 pub const NET_ERR_CONNECT: u8 = 2;
@@ -98,6 +98,9 @@ pub const NET_ERR_URL: u8 = 4;
 pub const NET_ERR_TLS: u8 = 5;
 pub const NET_ERR_RESPONSE: u8 = 6;
 pub const NET_ERR_BUSY: u8 = 7;
+/// The server got a 3xx answer; the `Location` header is in the body slot
+/// (length in the reply) and the client decides whether to follow it.
+pub const NET_REDIRECT: u8 = 8;
 
 /// Shell -> server: one echo request to `address`.
 pub fn ping(address: [u8; 4]) -> ipc::Message {
@@ -251,16 +254,31 @@ pub fn dns_fields(message: &ipc::Message) -> Option<(u8, [u8; 4])> {
 
 /// Client -> server: fetch the URL in the request slot.
 pub fn http_request() -> ipc::Message {
-    ipc::Message::new(0, &[OP_HTTP])
+    http_request_id(0)
+}
+
+/// Same as [`http_request`], carrying an id that is echoed in the reply so a
+/// client can discard a late answer to a request it abandoned.
+pub fn http_request_id(id: u32) -> ipc::Message {
+    let mut payload = [0_u8; 5];
+    payload[0] = OP_HTTP;
+    payload[1..5].copy_from_slice(&id.to_le_bytes());
+    ipc::Message::new(0, &payload)
 }
 
 /// Server -> client: fetch outcome, HTTP status and body length.
 pub fn http_reply(code: u8, status: u16, body_len: u32) -> ipc::Message {
-    let mut payload = [0_u8; 8];
+    http_reply_id(0, code, status, body_len)
+}
+
+/// Same as [`http_reply`] with the request id echoed.
+pub fn http_reply_id(id: u32, code: u8, status: u16, body_len: u32) -> ipc::Message {
+    let mut payload = [0_u8; 12];
     payload[0] = OP_HTTP_REPLY;
     payload[1] = code;
     payload[2..4].copy_from_slice(&status.to_le_bytes());
     payload[4..8].copy_from_slice(&body_len.to_le_bytes());
+    payload[8..12].copy_from_slice(&id.to_le_bytes());
     ipc::Message::new(0, &payload)
 }
 
@@ -279,6 +297,26 @@ pub fn http_fields(message: &ipc::Message) -> Option<(u8, u16, u32)> {
             message.payload[7],
         ]),
     ))
+}
+
+/// The request id carried by an `OP_HTTP` request or its reply.
+pub fn http_id(message: &ipc::Message) -> u32 {
+    u32::from_le_bytes([
+        message.payload[8],
+        message.payload[9],
+        message.payload[10],
+        message.payload[11],
+    ])
+}
+
+/// The request id carried by an `OP_HTTP` request (stored after the opcode).
+pub fn http_request_fields(message: &ipc::Message) -> u32 {
+    u32::from_le_bytes([
+        message.payload[1],
+        message.payload[2],
+        message.payload[3],
+        message.payload[4],
+    ])
 }
 
 /// Client -> server: ask for the current IPv4 configuration.

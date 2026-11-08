@@ -52,7 +52,7 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 | Init | Silverd resolves task ids (not cap ids) before grants | **pass** |
 | Capabilities | `CAP_MOUNT`/`CAP_POWER` outside `CAP_ALL`; shell owns `CAP_POWER` by kernel policy | **pass** |
 | Toolbox | multi-call `utils`: grep/wc/head/tail/cp/find/seq/dirname/sleep/true/false | **pass** |
-| Wolfser | `wolfser [query|url]`, search/address bar, ivshmem surface + Qt viewer; `--snapshot` sees a frame with text | **pass** |
+| Wolfser | `wolfser [query|url]`, search/address bar, clickable links, history, redirects; HTTP via smoltcp, HTTPS via the Qt host proxy; `--snapshot` sees a rendered frame | **pass** |
 | Power | `poweroff`/`reboot`; SMC on Qualcomm, HVC on QEMU | **implemented; QEMU PSCI caveat below** |
 | SMP | QEMU `-smp 4` selftest | **15 PASS / 0 FAIL** |
 | Fog QEMU | relocation, at-link, fail-closed park, timer | **PASS** |
@@ -83,12 +83,15 @@ describes a supported build.
    no longer stalls, but the real clock/pin state is still unknown. This is the
    blocker for a console OS on the phone.
 4. **Networking has its first full layer.** DHCP, DNS, TCP and an HTTP client
-   are working (`ip`, `dns`, `wget`); TLS/HTTPS, HTTP/2 and parallel fetches
-   remain. HTTPS is rejected with a clear error until a TLS client is added.
-5. **Wolfser is a text renderer.** The search/address bar, shared surface,
-   Qt viewer, input ring, scrolling, reload and search work; CSS layout,
-   images, HTML forms, TLS and parallel fetches do not. The Linux ABI/Phosh
-   track replaces it with a real engine later.
+   are working (`ip`, `dns`, `wget`); HTTP/2 and parallel fetches remain. The
+   browser reaches HTTPS through the host viewer's Qt TLS proxy (the guest
+   publishes a URL, the host returns the body); a native in-guest TLS stack is
+   still to come.
+5. **Wolfser is a real text browser.** Search/address bar, clickable links,
+   back/forward history, 3xx and meta-refresh redirects, word wrap, headings,
+   reader-mode content selection and a moving loading screen work. CSS layout,
+   images, forms, tabs and bookmarks do not yet; the Linux ABI/Phosh track
+   replaces the renderer with a real engine later.
 6. **Linux ABI/Phosh are not started.** The kernel personality layer, static
    musl binaries, headless Wayland and the Phosh stack are the active
    long-term track; see [`VECTOR.md`](VECTOR.md).
@@ -120,13 +123,17 @@ SMP run: `qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp 4 -m 256M
 
 Console run: boot the product image, then send `help`, `uname`, `ls /`,
 `health` over the serial line. Wolfser: `./build_and_qemu.sh --viewer`, then
-`wolfser` in the guest; the Qt window works under KDE/GNOME on Wayland or X11. A machine without a NIC still boots; the
+`wolfser` in the guest; the Qt window works under KDE/GNOME on Wayland or X11,
+and `https://` pages are fetched by the viewer's Qt Network module. A machine
+without a NIC still boots; the
 network driver reports a probe failure and the shell continues.
 
 ## Next work
 
-1. TLS client (rustls) and `https://` for `wget` and the browser.
-2. Wolfser: richer HTML (headings, links, images), damage rectangles, redirects, more input.
+1. Native TLS client (rustls/embedded-tls) so `wget` and the browser do not
+   depend on the host viewer for `https://`.
+2. Wolfser: images (PNG first), tabs/bookmarks, hover link targets, damage
+   rectangles, and a deterministic HTTP-path test right after boot.
 3. Window transport on real hardware (host-side streaming or a local console).
 4. Linux ABI: static musl binaries, then busybox `sh`.
 5. Phosh: headless Wayland, GTK software render, D-Bus + logind stub, `phosh`.

@@ -554,6 +554,7 @@ fn net_error_text(code: u8) -> &'static str {
         net_ipc::NET_ERR_TLS => "https is not supported yet (http:// only)",
         net_ipc::NET_ERR_RESPONSE => "malformed HTTP response (or no A record)",
         net_ipc::NET_ERR_BUSY => "network server busy",
+        net_ipc::NET_REDIRECT => "redirect (open it in wolfser)",
         _ => "network error",
     }
 }

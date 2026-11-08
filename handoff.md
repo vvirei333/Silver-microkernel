@@ -35,13 +35,25 @@ Redmi port is parked. The reference checklist is
   returns in the neighbour path; without them DHCP boots intermittently hit
   the cache's unicast assertion. See `third_party/smoltcp/PATCH.md`.
 - **Wolfser:** `wolfser` opens with an empty search bar (or `wolfser <query|url>`
-  navigates immediately). It resolves input to an `http://` URL or a Bing
-  search, fetches over HTTP and renders a 900x640 text page into an ivshmem
-  BAR2 surface; `tools/window-viewer` (Qt6) maps the same file, repaints on
-  `frame_seq` and sends editing/scroll keys through the input ring. Verified
-  headlessly: home screen, typed `example.com`, `cats` search, Ctrl+L + new
-  address, scrolling and reload; `--snapshot` produces readable PNGs.
-  `SYS_MAP_PHYS_NC` maps the surface as Normal Non-Cacheable.
+  navigates immediately). Input resolves to an `https://` URL (bare hosts) or a
+  DuckDuckGo HTML search. Plain `http://` goes through `net_server`/smoltcp;
+  `https://` goes through the host viewer's Qt Network proxy in the same
+  ivshmem buffer, so real TLS sites work without a guest TLS stack. Redirects
+  (3xx and meta refresh) are resolved by the guest and may switch backends.
+  The renderer extracts links with their screen runs (blue/underlined, click
+  to navigate), keeps a 24-entry back/forward history, word-wraps, scales
+  headings and uses `<main>`/`<article>`/MediaWiki content containers as a
+  reader mode. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
+  repaints on `frame_seq` and sends keys, wheel and clicks through the ring.
+  Verified headlessly: DDG results with links, clicking the first result through
+  a DDG meta-refresh redirect to the Wikipedia reader view, Alt+Left back to
+  the results, typed `http://github.com/` redirecting to HTTPS, scrolling and
+  reload. `SYS_MAP_PHYS_NC` maps the surface as Normal Non-Cacheable and the
+  guest fences before publishing `frame_seq`.
+- **Known issue:** the plain-HTTP path started within a fraction of a second of
+  `howl ready` timed out once (DHCP race suspected; `wget` works seconds
+  later). Wolfser now waits up to 6 s for a configured lease before an HTTP
+  fetch, but this needs a deterministic QEMU test.
 - **Desktop integration:** `./build_and_qemu.sh` (viewer on by default) adds
   the virtio-net card and the ivshmem device, incrementally builds the Qt
   viewer and starts it **hidden** with `--watch`; it shows a window only when
@@ -64,10 +76,11 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** TLS/`https://` (rustls); Wolfser redirects and richer
-  rendering (images, links, damage); Linux ABI for static musl binaries;
-  headless Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB
-  proof, GENI UART on `rain`, tablet, Redmi storage/power.
+- **Next steps:** native TLS/`https://` (rustls/embedded-tls) for `wget` and a
+  viewer-independent browser; Wolfser images (PNG first), tabs/bookmarks and
+  damage rectangles; Linux ABI for static musl binaries; headless
+  Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB proof, GENI
+  UART on `rain`, tablet, Redmi storage/power.
 
 ## 2026-11-06 — SFS moves toward the kernel
 

@@ -16,8 +16,13 @@ cmake --build build/window-viewer
 The viewer is a normal Qt6 Widgets program, so it is a native window under
 both desktops. Qt selects Wayland when `WAYLAND_DISPLAY` is set and X11
 otherwise; set `QT_QPA_PLATFORM=wayland` or `xcb` to force one. The guest
-draws, the host only blits and forwards input, so no compositor or GPU is
-involved.
+draws, the host blits and forwards input, so no compositor or GPU is involved.
+
+The viewer also links **Qt6 Network** and acts as Wolfser's TLS proxy: when the
+guest publishes an `https://` URL in the shared header, the viewer fetches it
+with Qt's TLS stack and writes the body back (respecting the body cap). A
+viewer without Network support leaves `FIELD_WEB_CAPABLE` at 0, and the guest
+reports that HTTPS needs a rebuilt viewer.
 
 ## Run
 

@@ -57,6 +57,11 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# Remove the stale surface *before* the viewer starts: otherwise a viewer
+# launched against the previous run's inode would watch a file QEMU has
+# already unlinked.
+rm -f "$SHM"
+
 if [ "$VIEWER" -eq 1 ]; then
     # Always run the incremental build: a stale binary would keep an old
     # protocol (the window would wait 20 s and quit before Wolfser starts).
@@ -78,8 +83,6 @@ if [ "$VIEWER" -eq 1 ]; then
         echo "         start it later with tools/wolfser-host.sh" >&2
     fi
 fi
-
-rm -f "$SHM"
 
 qemu-system-aarch64 \
     -machine virt -cpu cortex-a72 -smp 2 -m 256M \
