@@ -60,6 +60,8 @@ pub const SYS_WAIT_EVENT: u64 = 41;
 pub const SYS_CAP_GET_TASK_ID: u64 = 60;
 pub const SYS_CAP_GRANT: u64 = 61;
 pub const SYS_MAP_PHYS: u64 = 62;
+/// Maps a non-DRAM physical range as Normal Non-Cacheable user memory.
+pub const SYS_MAP_PHYS_NC: u64 = 96;
 pub const SYS_BIND_IRQ: u64 = 63;
 pub const SYS_WAIT_IRQ: u64 = 64;
 pub const SYS_TRY_SEND: u64 = 65;
@@ -306,6 +308,11 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
             }
         }
         SYS_MAP_PHYS => sys_map_phys(frame[0], frame[1]),
+        SYS_MAP_PHYS_NC => {
+            scheduler::map_phys_nc_to_current(frame[0] as usize, frame[1] as usize)
+                .map(|address| address as u64)
+                .unwrap_or(SYSCALL_ERROR)
+        }
         SYS_BIND_IRQ => {
             if frame[0] <= u64::from(u32::MAX) && scheduler::bind_irq(frame[0] as u32) {
                 0

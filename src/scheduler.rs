@@ -3268,6 +3268,16 @@ pub fn fs_quota_allows(add_blocks: u32, add_inodes: u32) -> bool {
 }
 
 pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
+    map_phys_to_current_mode(phys_addr, size, false)
+}
+
+/// Maps a device-window range as Normal Non-Cacheable. Used by the browser's
+/// ivshmem surface, which is host RAM rather than a register bank.
+pub fn map_phys_nc_to_current(phys_addr: usize, size: usize) -> Option<usize> {
+    map_phys_to_current_mode(phys_addr, size, true)
+}
+
+fn map_phys_to_current_mode(phys_addr: usize, size: usize, non_cacheable: bool) -> Option<usize> {
     let saved_daif = interrupts::save_and_disable_irq();
     let result = scheduler_manager().and_then(|manager| {
         let shared_dma = manager.tasks.iter().any(|owner| {
@@ -3289,15 +3299,13 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
         {
             return None;
         }
-        // Capacity is checked before the PTE is installed. The operation is
-        // all-or-nothing: a failed bookkeeping step must not leave an MMIO
-        // mapping that no capability authorises (the old order mapped first
-        // and silently skipped the insert when the table was full).
         if !task.cap_table.has_capacity() {
             return None;
         }
         let virtual_address = if shared_dma {
             mmu::map_shared_dma_to_user(task, phys_addr, size)?
+        } else if non_cacheable {
+            mmu::map_phys_nc_to_user(task, phys_addr, size)?
         } else {
             mmu::map_phys_to_user(task, phys_addr, size)?
         };
@@ -4020,6 +4028,9 @@ fn initial_self_rights(program: u64) -> Option<u32> {
         user_program::BIGDIR | user_program::BIGFILE => capability::CAP_FS_WRITE,
         // Multi-call Unix toolbox: `cp` writes, the rest only reads.
         user_program::UTILS => capability::CAP_FS_WRITE,
+        // The browser scans PCI for ivshmem, maps that surface and the
+        // network data window.
+        user_program::BROWSER => capability::CAP_MMIO | capability::CAP_PCI,
         _ => return None,
     };
     Some(rights)

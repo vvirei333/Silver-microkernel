@@ -101,6 +101,9 @@ userspace.
 - [x] DNS: `dns <name>` resolves through the DHCP-provided resolver
 - [x] HTTP: `wget <url> [file]` fetches an `http://` document through a real TCP connection into SFS; `ip` shows the lease
 - [x] Vendored `smoltcp` 0.14 with a two-line neighbour fix for broadcast DHCP traffic (`third_party/smoltcp/PATCH.md`)
+- [x] `browser`: guest-side HTTP browser that renders a page into an ivshmem RGBA surface (title/URL bar, wrapped text, error page)
+- [x] Qt window viewer (`tools/window-viewer`) that maps the same surface, repaints on `frame_seq`, and sends keys/wheel through an input ring; `--snapshot` mode for headless checks
+- [x] `SYS_MAP_PHYS_NC`: maps a non-DRAM window (ivshmem) as Normal Non-Cacheable user memory
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
 - [x] EL0 fault containment: bad user accesses kill the task, not the kernel
 - [x] EL0 fault triage: `ESR_EL1`/`ELR_EL1`/`FAR_EL1` dump and a 16-entry context-switch trace before the guilty task dies
@@ -534,6 +537,40 @@ URL or a page. `wget` copies the body into SFS in 4 KiB chunks (the
 are: IPv4 only, one frame slot per direction, no virtio-net interrupts (RX is
 polled), one HTTP fetch at a time, `http://` only (no TLS yet), and no
 compressed or chunked-specific browser features beyond the built-in dechunking.
+
+## Browser window
+
+The browser is a normal guest program (`browser [url]` in Howl). It fetches
+the page through `net_server`, reduces HTML to text (scripts/styles/tags
+stripped, entities decoded, block tags become line breaks) and draws into one
+900x640 RGBA surface. There is no guest compositor: the surface lives in an
+ivshmem BAR, and a Qt program on the host maps the same file.
+
+| Region | Contents |
+| --- | --- |
+| `0x000` | magic `WIN1`, version, width, height, stride, format |
+| `0x018` | `frame_seq`; the host repaints when it changes |
+| `0x01C` | state: blank / ready / loading / error |
+| `0x020` | input ring head/tail; 64 eight-byte entries |
+| `0x1000` | RGBA8888 pixels |
+
+Keys from the host (`q` quit, `r` reload, arrows/PageUp/PageDown/Home/End) and
+wheel events travel through the ring; the guest repaints and bumps
+`frame_seq`. `tools/window-viewer` runs a window with Qt6 and has a
+`--snapshot OUT.png` mode that works with `QT_QPA_PLATFORM=offscreen`, which is
+how the QEMU test checks a frame without a display.
+
+```bash
+qemu-system-aarch64 ... \
+  -object memory-backend-file,id=ivshmem0,share=on,mem-path=/dev/shm/werewolf-window,size=4M \
+  -device ivshmem-plain,memdev=ivshmem0
+# guest: browser http://example.com/
+# host:  build/window-viewer/werewolf-window --shm /dev/shm/werewolf-window
+```
+
+The first renderer deliberately has no CSS layout, images or TLS: it is the
+host-window transport plus an HTTP/HTML text path, which the Linux ABI/Phosh
+track will later replace with a real engine.
 DHCP or DNS. The driver assigns its 64 KiB BAR window at `0x1020_0000`; this
 assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 

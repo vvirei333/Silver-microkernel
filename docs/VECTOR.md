@@ -24,25 +24,32 @@
 Уже есть: Silver kernel, SFS, Scout, virtio-net + smoltcp (DHCP, ARP/IPv4,
 ICMP, DNS, TCP), Howl, Howler, multi-call `utils` (`grep`, `wc`, `head`,
 `tail`, `cp`, `find`, `seq`, `basename`, `dirname`, `true`, `false`,
-`sleep`), и сетевые команды `ping`, `ip`, `dns`, `wget` (HTTP в SFS).
+`sleep`), сетевые команды `ping`, `ip`, `dns`, `wget` (HTTP в SFS) и
+**браузер**: гость рисует страницу в ivshmem-surface, Qt-viewer на хосте
+показывает кадр и шлёт клавиши/колесо через input ring (прокрутка, reload,
+quit).
 
 Дальше: TLS-клиент/`https://`, `date` (RTC), pager, больше applets.
 
-## 2. Окно браузера на хосте
+## 2. Окно браузера на хосте — работает (первый срез)
 
 ```
-гость (window_server)                    хост (Qt)
+гость (browser)                          хост (Qt)
 +----------------------+   shared mem   +----------------------+
-| RGBA surface         | <------------> | QImageView / blit    |
-| damage[] + frame_seq |                | input ring -> event  |
+| RGBA surface         | <------------> | werewolf-window      |
+| frame_seq + input    |                | blit + key/wheel     |
 +----------------------+                +----------------------+
 ```
 
-- Общий буфер: `ivshmem-plain` на QEMU (файл в `memory-backend-file`).
-- Протокол: заголовок (magic/width/height/stride/format/frame_seq/damage),
-  damage-прямоугольники, input ring (mouse/key/wheel).
-- Гость: `window_server` + браузер. Хост: `tools/window-viewer` на Qt.
-- Никакого DRM/GPU в госте: программный рендер, один surface.
+- Общий буфер: `ivshmem-plain` на QEMU (`memory-backend-file`); BAR2
+  ассайнится гостем и мапится как Normal Non-Cacheable.
+- Протокол: заголовок (magic/width/height/stride/format/frame_seq/state),
+  input ring (64 записи: key/scroll/click), пиксели с `0x1000`.
+- Гость: `browser` — HTTP через `net_server`, HTML → текст, отрисовка
+  5x7-шрифтом, скролл/перезагрузка/выход.
+- Хост: `tools/window-viewer` (Qt6), плюс `--snapshot` для headless-проверки.
+- Никакого DRM/GPU в госте: один surface, программный рендер.
+- Следующее: изображения, ссылки, damage-прямоугольники, TLS.
 
 Браузерная логика — в госте: HTTP-клиент, HTML-токенизатор, простая
 раскладка. HTTPS на первом этапе — host-proxy (хост забирает URL по TLS и
@@ -128,7 +135,7 @@ glibc-поведение, корректность futex/потоков, про�
 ## 6. Ближайший порядок работ
 
 1. Сеть: TLS-клиент и `https://` (rustls), затем HTTP/1.1 keep-alive.
-2. Host-окно: общий surface + viewer + damage/input.
+2. Браузер: изображения/ссылки, damage, больше ввода; затем Linux ABI.
 3. Linux ABI: статические musl-бинарники, затем busybox `sh`.
 4. Phosh: headless Wayland → GTK → D-Bus → `phosh`.
 5. По желанию: свой минимальный браузер в host-окне (или QtWebEngine как

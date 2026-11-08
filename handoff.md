@@ -34,6 +34,12 @@ Redmi port is parked. The reference checklist is
 - **smoltcp patch:** `third_party/smoltcp` vendors 0.14.0 with two guarded
   returns in the neighbour path; without them DHCP boots intermittently hit
   the cache's unicast assertion. See `third_party/smoltcp/PATCH.md`.
+- **Browser window:** `browser [url]` fetches over HTTP and renders a 900x640
+  text page into an ivshmem BAR2 surface; `tools/window-viewer` (Qt6) maps the
+  same file, repaints on `frame_seq` and sends keys/wheel through the input
+  ring. Verified headlessly: example.com and textfiles.com render, scroll and
+  reload change the frame, `--snapshot` produces a readable PNG. `SYS_MAP_PHYS_NC`
+  maps the surface as Normal Non-Cacheable.
 - **SMP:** `-smp 4` selftest 15 PASS / 0 FAIL.
 - **Fog QEMU:** relocation, at-link, fail-closed park and timer cases PASS.
 - **Init fix:** Silverd resolves the child **task id** before every grant
@@ -46,8 +52,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** TLS/`https://` (rustls); host window (shared surface +
-  viewer); guest browser (HTTP + HTML subset); Linux ABI for static musl binaries;
+- **Next steps:** TLS/`https://` (rustls); richer browser rendering (images,
+  links, damage rectangles); Linux ABI for static musl binaries;
   headless Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB
   proof, GENI UART on `rain`, tablet, Redmi storage/power.
 

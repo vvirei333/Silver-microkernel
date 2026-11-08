@@ -797,6 +797,12 @@ fn drive_fetch(
                     port: fetch.port,
                 };
                 let socket = sockets.get_mut::<tcp::Socket>(tcp_handle);
+                // A previous fetch can still sit in TIME-WAIT (the peer's FIN
+                // arrived but the last ACK has not been reaped). `connect`
+                // refuses an open socket, so drop the old connection first.
+                if socket.state() != tcp::State::Closed {
+                    socket.abort();
+                }
                 if socket
                     .connect(interface.context(), remote, fetch.local_port)
                     .is_err()

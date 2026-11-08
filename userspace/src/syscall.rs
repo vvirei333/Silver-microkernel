@@ -48,6 +48,7 @@ const SYS_WAIT_EVENT: u64 = 41;
 const SYS_CAP_GET_TASK_ID: u64 = 60;
 const SYS_CAP_GRANT: u64 = 61;
 const SYS_MAP_PHYS: u64 = 62;
+const SYS_MAP_PHYS_NC: u64 = 96;
 const SYS_BIND_IRQ: u64 = 63;
 const SYS_WAIT_IRQ: u64 = 64;
 const SYS_TRY_SEND: u64 = 65;
@@ -92,6 +93,7 @@ pub const PROGRAM_NET_SERVER: u64 = 13;
 pub const PROGRAM_BIGDIR: u64 = 17;
 pub const PROGRAM_BIGFILE: u64 = 18;
 pub const PROGRAM_UTILS: u64 = 19;
+pub const PROGRAM_BROWSER: u64 = 20;
 /// Sentinel program ID for tasks spawned from a dynamically loaded ELF.
 pub const PROGRAM_DYNAMIC: u64 = u64::MAX - 1;
 pub const CAP_MMIO: u32 = 1 << 4;
@@ -369,6 +371,12 @@ pub fn cap_grant(cap_id: u64, recipient_task_id: u64, rights: u32) -> bool {
 
 pub fn map_phys(phys_addr: u64, size: u64) -> Option<u64> {
     optional_id(unsafe { syscall2(SYS_MAP_PHYS, phys_addr, size) })
+}
+
+/// Maps a device-window range as Normal Non-Cacheable (shared host RAM such
+/// as an ivshmem surface).
+pub fn map_phys_nc(phys_addr: u64, size: u64) -> Option<u64> {
+    optional_id(unsafe { syscall2(SYS_MAP_PHYS_NC, phys_addr, size) })
 }
 
 /// Returns the non-cacheable user virtual address and DMA physical address.

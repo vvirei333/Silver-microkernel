@@ -67,6 +67,8 @@
   обслуживает mailbox и перезапускает упавшие сервисы;
 - `scout` — nameserver;
 - `howl` — интерактивный shell с Unix-подобными командами;
+- `browser` — HTTP-клиент + HTML→текст + отрисовка в ivshmem-surface
+  (окно на хосте: `tools/window-viewer` на Qt6);
 - `howler` — UART-драйвер ввода (Ctrl-Z, доставка байтов shell'у).
 
 ### L4. Утилиты и приложения
@@ -114,8 +116,9 @@
 SFS в ядре, capability-модель, подпись бандлов, сеть ARP/IPv4/ICMP, SMP,
 PSCI power-off/reset, консольные утилиты, `health`/`du`/`fsck`.
 
-Нет: UART-консоль на телефоне, eMMC/UFS, TLS/HTTPS, полный Unix-toolbox,
-окно и браузер.
+Есть: консоль, сеть (DHCP/DNS/TCP/HTTP), браузер в host-окне.
+Нет: TLS/HTTPS, eMMC/UFS, UART-консоль на телефоне, полный Unix-toolbox,
+CSS/изображения/ссылки в браузере.
 
 ## 7. Linux ABI (активная цель)
 

@@ -209,6 +209,8 @@ fn execute(command: &str) {
             syscall::print("  dns <name> Resolve a host name through the network server\r\n");
             syscall::print("  wget <url> [file]\r\n");
             syscall::print("             Fetch http:// into a file (/tmp/index.html)\r\n");
+            syscall::print("  browser [url]\r\n");
+            syscall::print("             Open the page in the host window (ivshmem)\r\n");
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  run <path>  Load and run an ELF file from the filesystem\r\n");
@@ -253,6 +255,7 @@ fn execute(command: &str) {
         Some("ip") | Some("ifconfig") => ip_command(),
         Some("dns") => dns_command(words.next()),
         Some("wget") => wget_command(words.next(), words.next()),
+        Some("browser") => browser_command(words.next()),
         Some("ls") => run_utility(syscall::PROGRAM_LS, words.next().unwrap_or("")),
         Some("bigdir") => run_utility(syscall::PROGRAM_BIGDIR, words.next().unwrap_or("")),
         Some("bigfile") => run_utility(syscall::PROGRAM_BIGFILE, ""),
@@ -633,6 +636,18 @@ fn dns_command(name: Option<&str>) {
 }
 
 /// `wget <url> [file]`: fetch an `http://` document into SFS.
+/// `browser [url]`: starts the guest browser; it keeps running in the
+/// background, so the shell prompt comes back immediately.
+fn browser_command(url: Option<&str>) {
+    let url = url.unwrap_or("http://example.com/");
+    let Some(cap_id) = syscall::spawn_with_args(syscall::PROGRAM_BROWSER, 0, url) else {
+        syscall::print("browser: cannot start the program\r\n");
+        return;
+    };
+    syscall::print("browser: started (window updates in the host viewer)\r\n");
+    let _ = cap_id;
+}
+
 fn wget_command(url: Option<&str>, destination: Option<&str>) {
     let Some(url) = url else {
         syscall::print("usage: wget <http://host/path> [file]\r\n");
@@ -1227,7 +1242,7 @@ fn grant_device_rights(cap_id: u64, task_id: u64, program: u64) {
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
         syscall::print(
-            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|utils|net_driver|net_server> [arg]\r\n",
+            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|utils|browser|net_driver|net_server> [arg]\r\n",
         );
         return;
     };
@@ -1243,6 +1258,7 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
         "say" => syscall::PROGRAM_SAY,
         "sl" => syscall::PROGRAM_SL,
         "utils" => syscall::PROGRAM_UTILS,
+        "browser" => syscall::PROGRAM_BROWSER,
         "net_driver" => syscall::PROGRAM_NET_DRIVER,
         "net_server" => syscall::PROGRAM_NET_SERVER,
         _ => {

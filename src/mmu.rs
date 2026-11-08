@@ -1509,7 +1509,9 @@ pub fn map_phys_to_user(
 
     let (physical_start, physical_offset, page_count) =
         aligned_page_span(phys_addr, size, GRANULE)?;
-    if page_count > ENTRIES {
+    // Device windows share the same multi-group VA window as DMA mappings: a
+    // BAR (or an ivshmem surface) can be larger than one 2 MiB group.
+    if page_count > ENTRIES * USER_MMIO_L2_GROUPS {
         return None;
     }
     map_user_pages(
@@ -1518,6 +1520,38 @@ pub fn map_phys_to_user(
         page_count,
         physical_offset,
         user_device_page,
+    )
+}
+
+/// Maps a device-window range as Normal Non-Cacheable user memory.
+///
+/// The ivshmem BAR is RAM that the guest shares with the host, not a device
+/// register bank: Device attributes would forbid the unaligned accesses and
+/// write combining a framebuffer needs. The range must lie outside DRAM, as
+/// for [`map_phys_to_user`].
+pub fn map_phys_nc_to_user(
+    task: &crate::scheduler::Task,
+    phys_addr: usize,
+    size: usize,
+) -> Option<usize> {
+    if size == 0 {
+        return None;
+    }
+    let physical_end = phys_addr.checked_add(size)?;
+    if physical_end > PHYSICAL_ADDRESS_LIMIT || (phys_addr < DRAM_END && physical_end > DRAM_BASE) {
+        return None;
+    }
+    let (physical_start, physical_offset, page_count) =
+        aligned_page_span(phys_addr, size, GRANULE)?;
+    if page_count > ENTRIES * USER_MMIO_L2_GROUPS {
+        return None;
+    }
+    map_user_pages(
+        task.ttbr0,
+        physical_start,
+        page_count,
+        physical_offset,
+        user_dma_page,
     )
 }
 
