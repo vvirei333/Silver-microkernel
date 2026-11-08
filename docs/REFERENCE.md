@@ -52,7 +52,7 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 | Init | Silverd resolves task ids (not cap ids) before grants | **pass** |
 | Capabilities | `CAP_MOUNT`/`CAP_POWER` outside `CAP_ALL`; shell owns `CAP_POWER` by kernel policy | **pass** |
 | Toolbox | multi-call `utils`: grep/wc/head/tail/cp/find/seq/dirname/sleep/true/false | **pass** |
-| Wolfser | `wolfser [query|url]`, search/address bar, clickable links, per-tab history, four cached tabs, redirects; HTTP via smoltcp, HTTPS via the Qt host proxy; `--snapshot` sees a rendered frame | **pass** |
+| Wolfser | `wolfser [query|url]`, search/address bar, clickable links, per-tab history, four cached tabs, hover status/hand cursor, middle-click new tab, redirects; HTTP via smoltcp, HTTPS via the Qt host proxy; `--snapshot` sees a rendered frame | **pass** |
 | Power | `poweroff`/`reboot`; SMC on Qualcomm, HVC on QEMU | **implemented; QEMU PSCI caveat below** |
 | SMP | QEMU `-smp 4` selftest | **15 PASS / 0 FAIL** |
 | Fog QEMU | relocation, at-link, fail-closed park, timer | **PASS** |

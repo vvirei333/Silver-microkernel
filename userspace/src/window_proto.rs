@@ -40,6 +40,8 @@ pub const FIELD_WEB_FINAL_LEN: u64 = 0x48;
 /// Set to 1 by a viewer that implements the proxy, so the guest can explain
 /// an old viewer instead of waiting for a request that will never finish.
 pub const FIELD_WEB_CAPABLE: u64 = 0x4C;
+/// 1 while the pointer is over a link; the viewer shows a hand cursor.
+pub const FIELD_CURSOR: u64 = 0x50;
 
 pub const FORMAT_RGBA8888: u32 = 1;
 
@@ -47,6 +49,9 @@ pub const STATE_BLANK: u32 = 0;
 pub const STATE_READY: u32 = 1;
 pub const STATE_LOADING: u32 = 2;
 pub const STATE_ERROR: u32 = 3;
+
+// Click `value`: 1 = left, 2 = middle, 3 = Ctrl+left (open in a new tab).
+// Move `value`: 0 = pointer position, 1 = pointer left the window.
 
 // Input ring: 64 eight-byte entries. The host writes at `head`, the guest
 // consumes at `tail`; both advance modulo `INPUT_SLOTS`.
@@ -76,6 +81,7 @@ pub const KEY_NEXT_TAB: u16 = 20; // Ctrl+Tab
 pub const INPUT_KEY: u8 = 1;
 pub const INPUT_SCROLL: u8 = 2;
 pub const INPUT_CLICK: u8 = 3;
+pub const INPUT_MOVE: u8 = 4;
 
 // Web-proxy areas. They live after the pixel surface (which ends at
 // `PIXELS` + 900*640*4); QEMU's ivshmem is 4 MiB.

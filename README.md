@@ -575,7 +575,9 @@ Keys from the host (`Ctrl+L` edit the address, `Enter` go, `Ctrl+T` new tab,
 `Ctrl+W` close tab, `Ctrl+Tab` next tab, `Ctrl+Q` quit, `Ctrl+R`/`F5` reload,
 `Alt+Left`/`Alt+Right` history, arrows and PageUp/PageDown/Home/End scroll) and
 mouse clicks/wheel travel through the ring; clicking a tab switches, `+` opens
-one and the small `x` closes it; typing anywhere starts a new search. The guest repaints and bumps
+one and the small `x` closes it; typing anywhere starts a new search. Hovering
+a link shows its target in the footer and switches to a hand cursor; a middle
+click or Ctrl+click opens the link in a new tab. The guest repaints and bumps
 `frame_seq` only after a memory barrier, so the host never sees a half-drawn
 frame. `tools/window-viewer` is a Qt6 Widgets + Network program and has a
 `--snapshot OUT.png` mode that works with `QT_QPA_PLATFORM=offscreen`, which is

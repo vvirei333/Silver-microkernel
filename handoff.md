@@ -46,8 +46,10 @@ Redmi port is parked. The reference checklist is
   a reader mode. Four tabs keep URL, title, scroll, history and a full cache of
   the extracted page (text, styles, links); switching is instant and does not
   refetch. `Ctrl+T`/`Ctrl+W`/`Ctrl+Tab`, the tab strip, `+` and the close `x`
-  manage them. The first line of every page used to lose its spaces because the
-  wrap buffer had not flushed yet; a `line_len` check fixed it. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
+  manage them. Hovering a link publishes its target in the footer and sets
+  `FIELD_CURSOR` so the viewer shows a hand; middle click/Ctrl+click opens the
+  target in a new tab. The first line of every page used to lose its spaces
+  because the wrap buffer had not flushed yet; a `line_len` check fixed it. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
   repaints on `frame_seq` and sends keys, wheel and clicks through the ring.
   Verified headlessly: DDG results with links, clicking the first result through
   a DDG meta-refresh redirect to the Wikipedia reader view, Alt+Left back to

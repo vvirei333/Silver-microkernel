@@ -52,6 +52,7 @@ constexpr uint64_t kFieldWebBodyLen = 0x40;
 constexpr uint64_t kFieldWebError = 0x44;
 constexpr uint64_t kFieldWebFinalLen = 0x48;
 constexpr uint64_t kFieldWebCapable = 0x4C;
+constexpr uint64_t kFieldCursor = 0x50;
 constexpr uint64_t kPixels = 0x1000;
 constexpr uint64_t kWebRequest = 0x240000;
 constexpr int kWebRequestMax = 1024;
@@ -63,7 +64,7 @@ constexpr uint64_t kInputRing = 0x0100;
 constexpr uint32_t kInputSlots = 64;
 constexpr uint64_t kInputEntry = 8;
 
-enum InputKind : uint8_t { kInputKey = 1, kInputScroll = 2, kInputClick = 3 };
+enum InputKind : uint8_t { kInputKey = 1, kInputScroll = 2, kInputClick = 3, kInputMove = 4 };
 
 constexpr uint32_t kWebErrorNone = 0;
 constexpr uint32_t kWebErrorNetwork = 1;
@@ -260,7 +261,9 @@ public:
     Viewer(Shared &shared, QWidget *parent = nullptr) : QWidget(parent), m_shared(shared) {
         setWindowTitle("Wolfser — WerewolfOS");
         resize(900, 640);
+        setMouseTracking(true);
         m_lastSequence = 0;
+        m_hoverClock.start();
         auto *timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, [this] {
             if (m_shared.u32(kFieldMagic) != kMagic) {
@@ -279,6 +282,11 @@ public:
             if (sequence != m_lastSequence) {
                 m_lastSequence = sequence;
                 update();
+            }
+            const bool overLink = m_shared.u32(kFieldCursor) != 0;
+            if (overLink != m_overLink) {
+                m_overLink = overLink;
+                setCursor(overLink ? Qt::PointingHandCursor : Qt::ArrowCursor);
             }
         });
         timer->start(16);
@@ -386,13 +394,39 @@ protected:
     }
 
     void mousePressEvent(QMouseEvent *event) override {
-        if (event->button() != Qt::LeftButton) {
+        uint8_t value = 0;
+        if (event->button() == Qt::LeftButton) {
+            value = (event->modifiers() & Qt::ControlModifier) ? 3 : 1;
+        } else if (event->button() == Qt::MiddleButton) {
+            value = 2;
+        } else {
             return;
         }
         const QPoint point = event->position().toPoint();
-        pushInput(m_shared.data, kInputClick, 1, 0,
+        pushInput(m_shared.data, kInputClick, value, 0,
                   static_cast<uint16_t>(qBound(0, point.x(), 65535)),
                   static_cast<uint16_t>(qBound(0, point.y(), 65535)));
+    }
+
+    void mouseMoveEvent(QMouseEvent *event) override {
+        const QPoint point = event->position().toPoint();
+        if (point == m_lastHover) {
+            return;
+        }
+        if (m_hoverClock.elapsed() < 35 && m_lastHover.x() >= 0) {
+            return;
+        }
+        m_lastHover = point;
+        m_hoverClock.restart();
+        pushInput(m_shared.data, kInputMove, 0, 0,
+                  static_cast<uint16_t>(qBound(0, point.x(), 65535)),
+                  static_cast<uint16_t>(qBound(0, point.y(), 65535)));
+    }
+
+    void leaveEvent(QEvent *event) override {
+        m_lastHover = QPoint(-1, -1);
+        pushInput(m_shared.data, kInputMove, 1, 0, 0, 0);
+        QWidget::leaveEvent(event);
     }
 
     void wheelEvent(QWheelEvent *event) override {
@@ -408,6 +442,9 @@ private:
     Shared &m_shared;
     uint32_t m_lastSequence = 0;
     bool m_sized = false;
+    bool m_overLink = false;
+    QPoint m_lastHover{-1, -1};
+    QElapsedTimer m_hoverClock;
 };
 
 int snapshot(Shared &shared, const QString &path, int timeoutSeconds) {

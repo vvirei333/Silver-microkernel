@@ -122,6 +122,8 @@ struct App {
     focused: bool,
     active: usize,
     scroll: usize,
+    hover: [u8; URL_CAPACITY],
+    hover_len: usize,
     page: PageState,
     pending: Option<Pending>,
 }
@@ -293,6 +295,8 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         focused: true,
         active: 0,
         scroll: 0,
+        hover: [0; URL_CAPACITY],
+        hover_len: 0,
         page: PageState {
             loaded: false,
             loading: false,
@@ -342,7 +346,22 @@ pub extern "C" fn _start(_argument: u64) -> ! {
                     dirty = true;
                 }
                 window::INPUT_CLICK => {
-                    if handle_click(&mut app, event.x as u32, event.y as u32) {
+                    if handle_click(
+                        &mut app,
+                        event.x as u32,
+                        event.y as u32,
+                        event.value,
+                    ) {
+                        dirty = true;
+                    }
+                }
+                window::INPUT_MOVE => {
+                    if handle_move(
+                        &mut app,
+                        event.x as u32,
+                        event.y as u32,
+                        event.value != 0,
+                    ) {
                         dirty = true;
                     }
                 }
@@ -489,7 +508,7 @@ fn handle_key(app: &mut App, key: u16) -> bool {
     }
 }
 
-fn handle_click(app: &mut App, x: u32, y: u32) -> bool {
+fn handle_click(app: &mut App, x: u32, y: u32, button: u8) -> bool {
     if (TAB_Y..TAB_Y + TAB_BAR_HEIGHT).contains(&y) {
         let count = open_tab_count();
         let mut cursor = TAB_START_X;
@@ -552,12 +571,53 @@ fn handle_click(app: &mut App, x: u32, y: u32) -> bool {
             let text = core::str::from_utf8(&href[..count]).unwrap_or("");
             if let Some(len) = resolve_link(base, text, target) {
                 let url = core::str::from_utf8(&target[..len]).unwrap_or("");
+                if button == 2 || button == 3 {
+                    new_tab(app);
+                }
                 begin_navigation(app, url, false, false);
                 return true;
             }
         }
     }
     false
+}
+
+fn handle_move(app: &mut App, x: u32, y: u32, leave: bool) -> bool {
+    let mut url = [0_u8; URL_CAPACITY];
+    let mut length = 0usize;
+    if !leave {
+        if let Some((offset, count)) = hit_link(app, x, y) {
+            let count = count as usize;
+            let href = unsafe { &mut *core::ptr::addr_of_mut!(CLICK_HREF) };
+            unsafe {
+                let pool = &*core::ptr::addr_of!(LINK_POOL_BYTES);
+                if offset as usize + count <= pool.len() {
+                    href[..count].copy_from_slice(&pool[offset as usize..offset as usize + count]);
+                }
+            }
+            let target = unsafe { &mut *core::ptr::addr_of_mut!(CLICK_TARGET) };
+            let base = {
+                let tab = tab_ref(app.active);
+                core::str::from_utf8(&tab.url[..tab.url_len]).unwrap_or("")
+            };
+            let text = core::str::from_utf8(&href[..count]).unwrap_or("");
+            if let Some(len) = resolve_link(base, text, target) {
+                url[..len].copy_from_slice(&target[..len]);
+                length = len;
+            }
+        }
+    }
+    let changed = length != app.hover_len
+        || (length > 0 && app.hover[..length] != url[..length]);
+    if changed {
+        app.hover_len = length;
+        if length > 0 {
+            app.hover[..length].copy_from_slice(&url[..length]);
+        }
+        let cursor = u32::from(length > 0);
+        window::write_u32(app.window, window::FIELD_CURSOR, cursor);
+    }
+    changed
 }
 
 fn hit_link(app: &App, x: u32, y: u32) -> Option<(u32, u16)> {
@@ -735,6 +795,13 @@ fn reset_active_view(app: &mut App) {
     }
 }
 
+fn clear_hover(app: &mut App) {
+    if app.hover_len > 0 {
+        app.hover_len = 0;
+        window::write_u32(app.window, window::FIELD_CURSOR, 0);
+    }
+}
+
 fn cancel_load(app: &mut App) {
     if app.pending.is_some() {
         app.pending = None;
@@ -748,24 +815,27 @@ fn switch_tab(app: &mut App, slot: usize) {
         return;
     }
     cancel_load(app);
+    clear_hover(app);
     save_active(app);
     restore_active(app, slot);
     app.focused = !tab_ref(slot).loaded;
     paint(app);
 }
 
-fn new_tab(app: &mut App) {
+fn new_tab(app: &mut App) -> bool {
     cancel_load(app);
     save_active(app);
     let tabs = tabs();
     let Some(slot) = (0..TAB_MAX).find(|&index| !tabs[index].open) else {
-        return;
+        return false;
     };
     tabs[slot] = Tab::EMPTY;
     tabs[slot].open = true;
+    clear_hover(app);
     restore_active(app, slot);
     reset_active_view(app);
     paint(app);
+    true
 }
 
 fn close_tab(app: &mut App, slot: usize) {
@@ -775,6 +845,7 @@ fn close_tab(app: &mut App, slot: usize) {
     let was_active = slot == app.active;
     if was_active {
         cancel_load(app);
+        clear_hover(app);
     }
     {
         let tabs = tabs();
@@ -932,6 +1003,8 @@ fn go_history(app: &mut App, delta: i32) {
 }
 
 fn begin_navigation(app: &mut App, url: &str, from_history: bool, keep_address: bool) {
+    app.hover_len = 0;
+    window::write_u32(app.window, window::FIELD_CURSOR, 0);
     app.page.loading = true;
     app.page.error = "";
     app.page.status = 0;
@@ -2738,6 +2811,13 @@ fn draw_footer(base: u64, app: &App, status: &str) {
         }
     }
     draw_text_bytes(base, 12, y, 1, &label[..length], COLOR_MUTED);
+    if app.hover_len > 0 {
+        let max = ((WIDTH - 200) / 6) as usize;
+        let end = core::cmp::min(app.hover_len, max);
+        let url = core::str::from_utf8(&app.hover[..end]).unwrap_or("");
+        draw_text(base, 180, y, 1, url, COLOR_LINK);
+        return;
+    }
     let hint = "CTRL+T NEW  CTRL+W CLOSE  CTRL+TAB NEXT  CTRL+L ADDRESS  ALT+LEFT/RIGHT  CTRL+Q QUIT";
     let width = hint.len() as u32 * 6;
     draw_text(
@@ -2982,6 +3062,7 @@ fn open_window() -> Result<u64, u64> {
     window::write_u32(base, window::FIELD_WEB_REQUEST_SEQ, 0);
     window::write_u32(base, window::FIELD_WEB_DONE_SEQ, 0);
     window::write_u32(base, window::FIELD_WEB_ERROR, window::WEB_ERROR_NONE);
+    window::write_u32(base, window::FIELD_CURSOR, 0);
     // Ask the host to show the window only now, i.e. on the user's command;
     // the viewer may have been waiting invisibly since QEMU started.
     window::write_u32(base, window::FIELD_WINDOW_REQUEST, 1);
