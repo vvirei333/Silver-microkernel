@@ -87,6 +87,7 @@ pub const KEY_QUIT: u16 = 17; // Ctrl+Q
 pub const KEY_NEW_TAB: u16 = 18; // Ctrl+T
 pub const KEY_CLOSE_TAB: u16 = 19; // Ctrl+W
 pub const KEY_NEXT_TAB: u16 = 20; // Ctrl+Tab
+pub const KEY_FIND: u16 = 21; // Ctrl+F
 
 pub const INPUT_KEY: u8 = 1;
 pub const INPUT_SCROLL: u8 = 2;

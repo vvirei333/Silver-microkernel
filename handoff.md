@@ -54,7 +54,10 @@ Redmi port is parked. The reference checklist is
   most 480x360 and writes RGBA into `WEB_BODY`; the guest blends alpha, scrolls
   it with the text and re-fetches it when its tab is restored. The first line
   of every page used to lose its spaces because the wrap buffer had not flushed
-  yet; a `line_len` check fixed it. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
+  yet; a `line_len` check fixed it. `Ctrl+F` searches the rendered text,
+  highlights all hits yellow and the current hit orange, shows `n/total` in the
+  footer and Enter advances (wrapping). Partially scrolled lines are skipped
+  rather than clamped to the body top, which used to overlap the next line. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
   repaints on `frame_seq` and sends keys, wheel and clicks through the ring.
   Verified headlessly: DDG results with links, clicking the first result through
   a DDG meta-refresh redirect to the Wikipedia reader view, Alt+Left back to

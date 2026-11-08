@@ -485,6 +485,7 @@ protected:
                 break;
             }
             return;
+        case Qt::Key_F:
         case Qt::Key_L:
         case Qt::Key_Q:
         case Qt::Key_R:
@@ -492,6 +493,7 @@ protected:
         case Qt::Key_W:
             if (event->modifiers() & Qt::ControlModifier) {
                 switch (event->key()) {
+                case Qt::Key_F: key = 21; break;
                 case Qt::Key_L: key = 13; break;
                 case Qt::Key_Q: key = 17; break;
                 case Qt::Key_R: key = 16; break;

@@ -78,6 +78,9 @@ const COLOR_TAB_ACTIVE: u32 = 0xFF7A_4A28;
 const COLOR_TAB: u32 = 0xFF47_2A15;
 const COLOR_TAB_TEXT_ACTIVE: u32 = 0xFFFF_FFFF;
 const COLOR_TAB_TEXT: u32 = 0xFFD8_C3B2;
+const COLOR_MATCH: u32 = 0xFFFF_E08A;
+const COLOR_MATCH_CURRENT: u32 = 0xFFFF_9A3A;
+const COLOR_FIND: u32 = 0xFFFF_F3C4;
 
 const TAB_MAX: usize = 4;
 const TAB_HISTORY: usize = 12;
@@ -89,6 +92,7 @@ const TAB_Y: u32 = 3;
 const TAB_BAR_HEIGHT: u32 = 22;
 const TAB_TEXT_Y: u32 = 9;
 const TAB_CLOSE_WIDTH: u32 = 18;
+const FIND_CAPACITY: usize = 64;
 
 const DEFAULT_SEARCH: &str = "https://html.duckduckgo.com/html/?q=";
 const IVSHMEM_VENDOR: u16 = 0x1AF4;
@@ -130,6 +134,11 @@ struct App {
     image_ready: bool,
     image_w: u32,
     image_h: u32,
+    find_mode: bool,
+    find_query: [u8; FIND_CAPACITY],
+    find_len: usize,
+    find_total: usize,
+    find_index: usize,
     page: PageState,
     pending: Option<Pending>,
 }
@@ -316,6 +325,11 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         image_ready: false,
         image_w: 0,
         image_h: 0,
+        find_mode: false,
+        find_query: [0; FIND_CAPACITY],
+        find_len: 0,
+        find_total: 0,
+        find_index: 0,
         page: PageState {
             loaded: false,
             loading: false,
@@ -422,6 +436,31 @@ fn clamp_scroll(app: &mut App) {
 
 /// Returns true when the key changed something visible.
 fn handle_key(app: &mut App, key: u16) -> bool {
+    if key == window::KEY_FIND {
+        if app.find_mode {
+            app.find_mode = false;
+        } else {
+            app.find_mode = true;
+            app.find_len = 0;
+            app.find_total = 0;
+            app.find_index = 0;
+            app.focused = false;
+        }
+        return true;
+    }
+    if key == window::KEY_QUIT {
+        syscall::exit();
+    }
+    if key == window::KEY_FOCUS {
+        app.find_mode = false;
+        app.focused = true;
+        app.address_len = 0;
+        app.address[0] = 0;
+        return true;
+    }
+    if app.find_mode {
+        return handle_find_key(app, key);
+    }
     match key {
         window::KEY_ENTER => {
             if app.focused {
@@ -454,12 +493,6 @@ fn handle_key(app: &mut App, key: u16) -> bool {
                 false
             }
         }
-        window::KEY_FOCUS => {
-            app.focused = true;
-            app.address_len = 0;
-            app.address[0] = 0;
-            true
-        }
         window::KEY_BACK => {
             go_history(app, -1);
             true
@@ -472,7 +505,6 @@ fn handle_key(app: &mut App, key: u16) -> bool {
             reload(app);
             true
         }
-        window::KEY_QUIT => syscall::exit(),
         window::KEY_NEW_TAB => {
             new_tab(app);
             true
@@ -530,6 +562,118 @@ fn handle_key(app: &mut App, key: u16) -> bool {
     }
 }
 
+fn handle_find_key(app: &mut App, key: u16) -> bool {
+    match key {
+        window::KEY_ENTER => {
+            if app.find_total > 0 {
+                app.find_index = (app.find_index + 1) % app.find_total;
+                focus_match(app, app.find_index);
+            }
+            true
+        }
+        window::KEY_ESCAPE => {
+            app.find_mode = false;
+            true
+        }
+        window::KEY_BACKSPACE => {
+            if app.find_len > 0 {
+                app.find_len -= 1;
+                refresh_find(app);
+                true
+            } else {
+                false
+            }
+        }
+        key if (0x20..0x7F).contains(&key) => {
+            if app.find_len + 1 < app.find_query.len() {
+                app.find_query[app.find_len] = key as u8;
+                app.find_len += 1;
+                refresh_find(app);
+                true
+            } else {
+                false
+            }
+        }
+        _ => false,
+    }
+}
+
+fn find_needle(app: &App) -> &[u8] {
+    &app.find_query[..app.find_len]
+}
+
+fn count_matches(line: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || needle.len() > line.len() {
+        return 0;
+    }
+    let mut count = 0usize;
+    let mut index = 0usize;
+    while index + needle.len() <= line.len() {
+        if line[index..index + needle.len()].eq_ignore_ascii_case(needle) {
+            count += 1;
+            index += needle.len();
+        } else {
+            index += 1;
+        }
+    }
+    count
+}
+
+fn refresh_find(app: &mut App) {
+    app.find_total = 0;
+    app.find_index = 0;
+    if app.find_len == 0 {
+        return;
+    }
+    let text = unsafe { &*core::ptr::addr_of!(TEXT) };
+    let length = unsafe { *core::ptr::addr_of!(TEXT_LEN) };
+    let needle = &app.find_query[..app.find_len];
+    let mut start = 0usize;
+    while start <= length {
+        let mut end = start;
+        while end < length && text[end] != b'\n' {
+            end += 1;
+        }
+        app.find_total += count_matches(&text[start..end], needle);
+        if end >= length {
+            break;
+        }
+        start = end + 1;
+    }
+    if app.find_total > 0 {
+        focus_match(app, 0);
+    }
+}
+
+fn focus_match(app: &mut App, target: usize) {
+    if app.find_len == 0 {
+        return;
+    }
+    let text = unsafe { &*core::ptr::addr_of!(TEXT) };
+    let length = unsafe { *core::ptr::addr_of!(TEXT_LEN) };
+    let needle = &app.find_query[..app.find_len];
+    let mut seen = 0usize;
+    let mut line = 0usize;
+    let mut start = 0usize;
+    while start <= length {
+        let mut end = start;
+        while end < length && text[end] != b'\n' {
+            end += 1;
+        }
+        let count = count_matches(&text[start..end], needle);
+        if target < seen + count {
+            app.scroll = line.saturating_sub(1);
+            return;
+        }
+        seen += count;
+        line += 1;
+        if end >= length {
+            break;
+        }
+        start = end + 1;
+    }
+}
+
 fn handle_click(app: &mut App, x: u32, y: u32, button: u8) -> bool {
     if (TAB_Y..TAB_Y + TAB_BAR_HEIGHT).contains(&y) {
         let count = open_tab_count();
@@ -572,6 +716,7 @@ fn handle_click(app: &mut App, x: u32, y: u32, button: u8) -> bool {
         && x >= ADDRESS_X
         && x < ADDRESS_X + ADDRESS_WIDTH
     {
+        app.find_mode = false;
         app.focused = true;
         return true;
     }
@@ -912,6 +1057,7 @@ fn switch_tab(app: &mut App, slot: usize) {
     cancel_load(app);
     clear_hover(app);
     clear_image(app);
+    app.find_mode = false;
     save_active(app);
     restore_active(app, slot);
     app.focused = !tab_ref(slot).loaded;
@@ -1128,6 +1274,7 @@ fn go_history(app: &mut App, delta: i32) {
 
 fn begin_navigation(app: &mut App, url: &str, from_history: bool, keep_address: bool) {
     clear_image(app);
+    app.find_mode = false;
     app.hover_len = 0;
     window::write_u32(app.window, window::FIELD_CURSOR, 0);
     app.page.loading = true;
@@ -3050,6 +3197,57 @@ fn draw_footer(base: u64, app: &App, status: &str) {
         COLOR_FOOTER,
     );
     let mut y = HEIGHT - 12;
+    if app.find_mode {
+        fill(
+            base,
+            0,
+            HEIGHT - FOOTER_HEIGHT,
+            WIDTH,
+            FOOTER_HEIGHT,
+            COLOR_FIND,
+        );
+        draw_text(base, 12, y, 1, "FIND:", COLOR_TEXT);
+        if app.find_len > 0 {
+            let query = core::str::from_utf8(&app.find_query[..app.find_len]).unwrap_or("");
+            draw_text(base, 54, y, 1, query, COLOR_TEXT);
+            let mut label = [0_u8; 24];
+            let mut length = 0usize;
+            if app.find_total > 0 {
+                let (current, current_len) = digits((app.find_index + 1) as u16);
+                let (total, total_len) = digits(app.find_total as u16);
+                label[length] = b' ';
+                length += 1;
+                label[length..length + current_len].copy_from_slice(&current[..current_len]);
+                length += current_len;
+                label[length] = b'/';
+                length += 1;
+                label[length..length + total_len].copy_from_slice(&total[..total_len]);
+                length += total_len;
+            } else {
+                label[length..length + 10].copy_from_slice(b" NO MATCH");
+                length += 10;
+            }
+            draw_text_bytes(base, 54 + app.find_len as u32 * 6 + 8, y, 1, &label[..length], COLOR_MUTED);
+        } else {
+            draw_text(
+                base,
+                54,
+                y,
+                1,
+                "TYPE TO SEARCH THE PAGE",
+                COLOR_MUTED,
+            );
+        }
+        draw_text(
+            base,
+            WIDTH - 132,
+            y,
+            1,
+            "ENTER NEXT   ESC CLOSE",
+            COLOR_MUTED,
+        );
+        return;
+    }
     let mut label = [0_u8; 48];
     let mut length = 0usize;
     for &byte in status.as_bytes() {
@@ -3119,6 +3317,7 @@ fn draw_body(base: u64, app: &App) {
     }
     let scroll_pixels = pixels_before(app.scroll);
     let offset = BODY_TOP as i32 - scroll_pixels as i32;
+    let mut match_cursor = 0usize;
     if app.image_ready {
         let x = MARGIN as i32 + ((WIDTH - 2 * MARGIN - app.image_w) / 2) as i32;
         draw_image(base, x, offset, app.image_w, app.image_h);
@@ -3137,8 +3336,33 @@ fn draw_body(base: u64, app: &App) {
         // The lead image occupies space before line 0, so a line with a
         // smaller index than `scroll` can still be visible when the image is
         // scrolling away; decide by position, not by index.
-        if y + height as i32 > BODY_TOP as i32 && y < bottom {
-            draw_styled_line(base, MARGIN, y.max(BODY_TOP as i32) as u32, &text[start..end], &styles[start..end]);
+        // Draw only fully visible lines. Clamping a partially scrolled line
+        // to BODY_TOP would overlap the next line.
+        if y >= BODY_TOP as i32 && y < bottom {
+            let needle = if app.find_mode {
+                &app.find_query[..app.find_len]
+            } else {
+                &[]
+            };
+            let line_matches = count_matches(&text[start..end], needle);
+            let current = if app.find_mode
+                && app.find_index >= match_cursor
+                && app.find_index < match_cursor + line_matches
+            {
+                Some(app.find_index - match_cursor)
+            } else {
+                None
+            };
+            draw_styled_line(
+                base,
+                MARGIN,
+                y as u32,
+                &text[start..end],
+                &styles[start..end],
+                needle,
+                current,
+            );
+            match_cursor += line_matches;
         }
         y += height as i32;
         line += 1;
@@ -3188,7 +3412,45 @@ fn draw_image(base: u64, x: i32, y: i32, width: u32, height: u32) {
     }
 }
 
-fn draw_styled_line(base: u64, x: u32, y: u32, bytes: &[u8], styles: &[u8]) {
+fn draw_styled_line(
+    base: u64,
+    x: u32,
+    y: u32,
+    bytes: &[u8],
+    styles: &[u8],
+    needle: &[u8],
+    current: Option<usize>,
+) {
+    if !needle.is_empty() && needle.len() <= bytes.len() {
+        let scale = match styles.first() {
+            Some(flags) if flags & STYLE_HEADING != 0 => HEADING_SCALE,
+            _ => SCALE,
+        };
+        let cell = (font5x7::GLYPH_WIDTH + 1) * scale;
+        let mut index = 0usize;
+        let mut occurrence = 0usize;
+        while index + needle.len() <= bytes.len() {
+            if bytes[index..index + needle.len()].eq_ignore_ascii_case(needle) {
+                let color = if current == Some(occurrence) {
+                    COLOR_MATCH_CURRENT
+                } else {
+                    COLOR_MATCH
+                };
+                fill(
+                    base,
+                    x + index as u32 * cell,
+                    y.saturating_sub(1),
+                    needle.len() as u32 * cell,
+                    8 * scale,
+                    color,
+                );
+                occurrence += 1;
+                index += needle.len();
+            } else {
+                index += 1;
+            }
+        }
+    }
     let mut cursor = x;
     for (index, &byte) in bytes.iter().enumerate() {
         let flags = styles.get(index).copied().unwrap_or(0);
