@@ -348,11 +348,25 @@ protected:
         case Qt::Key_F5:
             key = 16; // reload
             break;
+        case Qt::Key_Tab:
+            if (event->modifiers() & Qt::ControlModifier) {
+                key = 20; // next tab
+                break;
+            }
+            return;
         case Qt::Key_L:
         case Qt::Key_Q:
         case Qt::Key_R:
+        case Qt::Key_T:
+        case Qt::Key_W:
             if (event->modifiers() & Qt::ControlModifier) {
-                key = event->key() == Qt::Key_L ? 13 : (event->key() == Qt::Key_Q ? 17 : 16);
+                switch (event->key()) {
+                case Qt::Key_L: key = 13; break;
+                case Qt::Key_Q: key = 17; break;
+                case Qt::Key_R: key = 16; break;
+                case Qt::Key_T: key = 18; break;
+                default: key = 19; break; // Ctrl+W
+                }
                 break;
             }
             if (event->text().size() == 1 && event->text().at(0).isPrint()) {

@@ -555,8 +555,10 @@ stripped, entities decoded, word-wrapped paragraphs, headings scaled up) and
 drawn into one 900x640 RGBA surface. A `<main>`, `<article>` or MediaWiki
 content container selects the article region, so Wikipedia opens on the text
 instead of its menus. Links are blue and underlined; clicking one navigates.
-There is no guest compositor: the surface lives in an ivshmem BAR, and a Qt
-program on the host maps the same file.
+Four tabs keep their own URL, history, scroll position and rendered page, so
+switching is instant and does not refetch. There is no guest compositor: the
+surface lives in an ivshmem BAR, and a Qt program on the host maps the same
+file.
 
 | Region | Contents |
 | --- | --- |
@@ -569,10 +571,11 @@ program on the host maps the same file.
 | `0x1000` | RGBA8888 pixels |
 | `0x240000` | web-proxy request URL (1 KiB), final URL (1 KiB), body (up to 4 MiB) |
 
-Keys from the host (`Ctrl+L` edit the address, `Enter` go, `Ctrl+Q` quit,
-`Ctrl+R`/`F5` reload, `Alt+Left`/`Alt+Right` history, arrows and
-PageUp/PageDown/Home/End scroll) and mouse clicks/wheel travel through the
-ring; typing anywhere starts a new search. The guest repaints and bumps
+Keys from the host (`Ctrl+L` edit the address, `Enter` go, `Ctrl+T` new tab,
+`Ctrl+W` close tab, `Ctrl+Tab` next tab, `Ctrl+Q` quit, `Ctrl+R`/`F5` reload,
+`Alt+Left`/`Alt+Right` history, arrows and PageUp/PageDown/Home/End scroll) and
+mouse clicks/wheel travel through the ring; clicking a tab switches, `+` opens
+one and the small `x` closes it; typing anywhere starts a new search. The guest repaints and bumps
 `frame_seq` only after a memory barrier, so the host never sees a half-drawn
 frame. `tools/window-viewer` is a Qt6 Widgets + Network program and has a
 `--snapshot OUT.png` mode that works with `QT_QPA_PLATFORM=offscreen`, which is
@@ -606,9 +609,10 @@ If Wolfser exits with status 21, the VM has no ivshmem device: relaunch QEMU
 with the arguments above (or use `./build_and_qemu.sh`). Starting `wolfser`
 twice reuses the running instance (one window per VM).
 
-The renderer deliberately has no CSS layout or images yet. HTTPS works only
-when the Qt viewer is running (it terminates TLS on the host); a native guest
-TLS stack is the next network milestone. The Linux ABI/Phosh track will
+The renderer deliberately has no CSS layout or images yet, and four tabs are
+the current limit. HTTPS works only when the Qt viewer is running (it
+terminates TLS on the host); a native guest TLS stack is the next network
+milestone. The Linux ABI/Phosh track will
 eventually replace this renderer with a real engine.
 DHCP or DNS. The driver assigns its 64 KiB BAR window at `0x1020_0000`; this
 assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.

@@ -41,9 +41,13 @@ Redmi port is parked. The reference checklist is
   ivshmem buffer, so real TLS sites work without a guest TLS stack. Redirects
   (3xx and meta refresh) are resolved by the guest and may switch backends.
   The renderer extracts links with their screen runs (blue/underlined, click
-  to navigate), keeps a 24-entry back/forward history, word-wraps, scales
-  headings and uses `<main>`/`<article>`/MediaWiki content containers as a
-  reader mode. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
+  to navigate), keeps a per-tab 12-entry back/forward history, word-wraps,
+  scales headings and uses `<main>`/`<article>`/MediaWiki content containers as
+  a reader mode. Four tabs keep URL, title, scroll, history and a full cache of
+  the extracted page (text, styles, links); switching is instant and does not
+  refetch. `Ctrl+T`/`Ctrl+W`/`Ctrl+Tab`, the tab strip, `+` and the close `x`
+  manage them. The first line of every page used to lose its spaces because the
+  wrap buffer had not flushed yet; a `line_len` check fixed it. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
   repaints on `frame_seq` and sends keys, wheel and clicks through the ring.
   Verified headlessly: DDG results with links, clicking the first result through
   a DDG meta-refresh redirect to the Wikipedia reader view, Alt+Left back to
@@ -77,8 +81,8 @@ Redmi port is parked. The reference checklist is
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
 - **Next steps:** native TLS/`https://` (rustls/embedded-tls) for `wget` and a
-  viewer-independent browser; Wolfser images (PNG first), tabs/bookmarks and
-  damage rectangles; Linux ABI for static musl binaries; headless
+  viewer-independent browser; Wolfser images (PNG first), bookmarks/start page
+  and damage rectangles; Linux ABI for static musl binaries; headless
   Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB proof, GENI
   UART on `rain`, tablet, Redmi storage/power.
 

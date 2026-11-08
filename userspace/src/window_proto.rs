@@ -69,6 +69,9 @@ pub const KEY_BACK: u16 = 14; // Alt+Left
 pub const KEY_FORWARD: u16 = 15; // Alt+Right
 pub const KEY_RELOAD: u16 = 16; // F5 / Ctrl+R
 pub const KEY_QUIT: u16 = 17; // Ctrl+Q
+pub const KEY_NEW_TAB: u16 = 18; // Ctrl+T
+pub const KEY_CLOSE_TAB: u16 = 19; // Ctrl+W
+pub const KEY_NEXT_TAB: u16 = 20; // Ctrl+Tab
 
 pub const INPUT_KEY: u8 = 1;
 pub const INPUT_SCROLL: u8 = 2;

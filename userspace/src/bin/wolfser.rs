@@ -35,14 +35,14 @@ use core::panic::PanicInfo;
 const WIDTH: u32 = 900;
 const HEIGHT: u32 = 640;
 const STRIDE: u32 = WIDTH * 4;
-const HEADER_HEIGHT: u32 = 56;
+const HEADER_HEIGHT: u32 = 78;
 const FOOTER_HEIGHT: u32 = 16;
 const MARGIN: u32 = 12;
 const ADDRESS_X: u32 = 100;
-const ADDRESS_Y: u32 = 20;
+const ADDRESS_Y: u32 = 29;
 const ADDRESS_WIDTH: u32 = WIDTH - ADDRESS_X - 8;
 const ADDRESS_HEIGHT: u32 = 24;
-const ADDRESS_TEXT_Y: u32 = 28;
+const ADDRESS_TEXT_Y: u32 = 37;
 const BODY_TOP: u32 = HEADER_HEIGHT + 8;
 const SCALE: u32 = 2;
 const CELL_WIDTH: u32 = 12;
@@ -55,7 +55,7 @@ const HEADING_COLUMNS: u32 = (WIDTH - 2 * MARGIN) / HEADING_CELL;
 
 const BUTTON_WIDTH: u32 = 26;
 const BUTTON_HEIGHT: u32 = 24;
-const BUTTON_Y: u32 = 20;
+const BUTTON_Y: u32 = 29;
 const BUTTON_BACK_X: u32 = 8;
 const BUTTON_FORWARD_X: u32 = 38;
 const BUTTON_RELOAD_X: u32 = 68;
@@ -74,6 +74,21 @@ const COLOR_MUTED: u32 = 0xFF60_6060;
 const COLOR_CODE: u32 = 0xFF33_3333;
 const COLOR_FOOTER: u32 = 0xFFF2_EEE8;
 const COLOR_BUTTON: u32 = 0xFF7A_4A28;
+const COLOR_TAB_ACTIVE: u32 = 0xFF7A_4A28;
+const COLOR_TAB: u32 = 0xFF47_2A15;
+const COLOR_TAB_TEXT_ACTIVE: u32 = 0xFFFF_FFFF;
+const COLOR_TAB_TEXT: u32 = 0xFFD8_C3B2;
+
+const TAB_MAX: usize = 4;
+const TAB_HISTORY: usize = 12;
+const TAB_TITLE: usize = 80;
+const TAB_START_X: u32 = 6;
+const TAB_WIDTH: u32 = 148;
+const TAB_GAP: u32 = 3;
+const TAB_Y: u32 = 3;
+const TAB_BAR_HEIGHT: u32 = 22;
+const TAB_TEXT_Y: u32 = 9;
+const TAB_CLOSE_WIDTH: u32 = 18;
 
 const DEFAULT_SEARCH: &str = "https://html.duckduckgo.com/html/?q=";
 const IVSHMEM_VENDOR: u16 = 0x1AF4;
@@ -88,8 +103,6 @@ const URL_CAPACITY: usize = 512;
 const MAX_LINK_RUNS: usize = 256;
 const LINK_POOL: usize = 24 * 1024;
 const MAX_REDIRECTS: u8 = 8;
-
-const HISTORY_MAX: usize = 24;
 
 const TICKS_PER_SECOND: u64 = 100;
 const FETCH_TIMEOUT_TICKS: u64 = 35 * TICKS_PER_SECOND;
@@ -107,6 +120,7 @@ struct App {
     address: [u8; ADDRESS_CAPACITY],
     address_len: usize,
     focused: bool,
+    active: usize,
     scroll: usize,
     page: PageState,
     pending: Option<Pending>,
@@ -146,6 +160,75 @@ struct LinkRun {
     end: u16,
 }
 
+/// One tab owns its URL, title, scroll position, history and a cache of the
+/// extracted page (text, styles, link runs and link targets). Only the active
+/// tab is mirrored into the global render buffers; switching copies the cache
+/// back, so tabs do not refetch.
+#[derive(Copy, Clone)]
+struct Tab {
+    open: bool,
+    url: [u8; URL_CAPACITY],
+    url_len: usize,
+    address: [u8; ADDRESS_CAPACITY],
+    address_len: usize,
+    title: [u8; TAB_TITLE],
+    title_len: usize,
+    scroll: usize,
+    loaded: bool,
+    status: u16,
+    error: &'static str,
+    history: [[u8; URL_CAPACITY]; TAB_HISTORY],
+    history_lens: [u16; TAB_HISTORY],
+    history_len: usize,
+    history_pos: usize,
+    text: [u8; TEXT_CAPACITY],
+    text_len: usize,
+    style: [u8; TEXT_CAPACITY],
+    link_runs: [LinkRun; MAX_LINK_RUNS],
+    link_count: usize,
+    link_pool: [u8; LINK_POOL],
+    link_pool_len: usize,
+}
+
+impl Tab {
+    const EMPTY: Tab = Tab {
+        open: false,
+        url: [0; URL_CAPACITY],
+        url_len: 0,
+        address: [0; ADDRESS_CAPACITY],
+        address_len: 0,
+        title: [0; TAB_TITLE],
+        title_len: 0,
+        scroll: 0,
+        loaded: false,
+        status: 0,
+        error: "",
+        history: [[0; URL_CAPACITY]; TAB_HISTORY],
+        history_lens: [0; TAB_HISTORY],
+        history_len: 0,
+        history_pos: 0,
+        text: [0; TEXT_CAPACITY],
+        text_len: 0,
+        style: [0; TEXT_CAPACITY],
+        link_runs: [LinkRun {
+            url_off: 0,
+            url_len: 0,
+            line: 0,
+            start: 0,
+            end: 0,
+        }; MAX_LINK_RUNS],
+        link_count: 0,
+        link_pool: [0; LINK_POOL],
+        link_pool_len: 0,
+    };
+
+    fn title_text(&self) -> &str {
+        core::str::from_utf8(&self.title[..self.title_len]).unwrap_or("")
+    }
+}
+
+static mut TABS: [Tab; TAB_MAX] = [Tab::EMPTY; TAB_MAX];
+
 static mut TEXT: [u8; TEXT_CAPACITY] = [0; TEXT_CAPACITY];
 static mut STYLE: [u8; TEXT_CAPACITY] = [0; TEXT_CAPACITY];
 static mut TEXT_LEN: usize = 0;
@@ -161,14 +244,6 @@ static mut LINK_RUNS: [LinkRun; MAX_LINK_RUNS] = [LinkRun {
 static mut LINK_RUN_COUNT: usize = 0;
 static mut LINK_POOL_BYTES: [u8; LINK_POOL] = [0; LINK_POOL];
 static mut LINK_POOL_LEN: usize = 0;
-
-static mut CURRENT_URL: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
-static mut CURRENT_URL_LEN: usize = 0;
-
-static mut HISTORY_URLS: [[u8; URL_CAPACITY]; HISTORY_MAX] = [[0; URL_CAPACITY]; HISTORY_MAX];
-static mut HISTORY_LENS: [u16; HISTORY_MAX] = [0; HISTORY_MAX];
-static mut HISTORY_LEN: usize = 0;
-static mut HISTORY_POS: usize = 0;
 
 static mut REQUEST_ID: u32 = 0;
 static mut PAGE_REDIRECT: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
@@ -216,6 +291,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         address: [0; ADDRESS_CAPACITY],
         address_len: 0,
         focused: true,
+        active: 0,
         scroll: 0,
         page: PageState {
             loaded: false,
@@ -225,6 +301,12 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         },
         pending: None,
     };
+
+    unsafe {
+        let tabs = &mut *core::ptr::addr_of_mut!(TABS);
+        tabs[0] = Tab::EMPTY;
+        tabs[0].open = true;
+    }
 
     if !initial.is_empty() {
         set_address(&mut app, initial);
@@ -350,6 +432,18 @@ fn handle_key(app: &mut App, key: u16) -> bool {
             true
         }
         window::KEY_QUIT => syscall::exit(),
+        window::KEY_NEW_TAB => {
+            new_tab(app);
+            true
+        }
+        window::KEY_CLOSE_TAB => {
+            close_tab(app, app.active);
+            true
+        }
+        window::KEY_NEXT_TAB => {
+            next_tab(app);
+            true
+        }
         window::KEY_UP => {
             app.scroll = app.scroll.saturating_sub(1);
             true
@@ -396,6 +490,29 @@ fn handle_key(app: &mut App, key: u16) -> bool {
 }
 
 fn handle_click(app: &mut App, x: u32, y: u32) -> bool {
+    if (TAB_Y..TAB_Y + TAB_BAR_HEIGHT).contains(&y) {
+        let count = open_tab_count();
+        let mut cursor = TAB_START_X;
+        for screen in 0..count {
+            if x >= cursor && x < cursor + TAB_WIDTH {
+                let Some(slot) = open_slot_at(screen) else {
+                    return false;
+                };
+                if x >= cursor + TAB_WIDTH - TAB_CLOSE_WIDTH {
+                    close_tab(app, slot);
+                } else {
+                    switch_tab(app, slot);
+                }
+                return true;
+            }
+            cursor += TAB_WIDTH + TAB_GAP;
+        }
+        if x >= cursor && x < cursor + TAB_BAR_HEIGHT {
+            new_tab(app);
+            return true;
+        }
+        return false;
+    }
     if (BUTTON_Y..BUTTON_Y + BUTTON_HEIGHT).contains(&y) {
         if (BUTTON_BACK_X..BUTTON_BACK_X + BUTTON_WIDTH).contains(&x) {
             go_history(app, -1);
@@ -428,10 +545,9 @@ fn handle_click(app: &mut App, x: u32, y: u32) -> bool {
                 }
             }
             let target = unsafe { &mut *core::ptr::addr_of_mut!(CLICK_TARGET) };
-            let base = unsafe {
-                let current = &*core::ptr::addr_of!(CURRENT_URL);
-                let current_len = *core::ptr::addr_of!(CURRENT_URL_LEN);
-                core::str::from_utf8(&current[..current_len]).unwrap_or("")
+            let base = {
+                let tab = tab_ref(app.active);
+                core::str::from_utf8(&tab.url[..tab.url_len]).unwrap_or("")
             };
             let text = core::str::from_utf8(&href[..count]).unwrap_or("");
             if let Some(len) = resolve_link(base, text, target) {
@@ -497,9 +613,205 @@ fn set_address(app: &mut App, text: &str) {
     app.address[length] = 0;
 }
 
+
 impl App {
     fn address_text(&self) -> &str {
         core::str::from_utf8(&self.address[..self.address_len]).unwrap_or("")
+    }
+}
+
+fn tabs() -> &'static mut [Tab; TAB_MAX] {
+    unsafe { &mut *core::ptr::addr_of_mut!(TABS) }
+}
+
+fn tab_ref(slot: usize) -> &'static Tab {
+    unsafe { &(*core::ptr::addr_of!(TABS))[slot] }
+}
+
+fn open_tab_count() -> usize {
+    unsafe { (*core::ptr::addr_of!(TABS)).iter().filter(|tab| tab.open).count() }
+}
+
+fn open_slot_at(index: usize) -> Option<usize> {
+    let mut seen = 0usize;
+    unsafe {
+        let tabs = &*core::ptr::addr_of!(TABS);
+        for (slot, tab) in tabs.iter().enumerate() {
+            if tab.open {
+                if seen == index {
+                    return Some(slot);
+                }
+                seen += 1;
+            }
+        }
+    }
+    None
+}
+
+/// Mirrors the live render buffers into the active tab's cache.
+fn save_active(app: &App) {
+    let tab = &mut tabs()[app.active];
+    tab.address_len = app.address_len;
+    tab.address[..app.address_len].copy_from_slice(&app.address[..app.address_len]);
+    tab.scroll = app.scroll;
+    tab.loaded = app.page.loaded;
+    tab.status = app.page.status;
+    tab.error = app.page.error;
+
+    unsafe {
+        let text = &*core::ptr::addr_of!(TEXT);
+        let styles = &*core::ptr::addr_of!(STYLE);
+        let title = &*core::ptr::addr_of!(TITLE);
+        let runs = &*core::ptr::addr_of!(LINK_RUNS);
+        let pool = &*core::ptr::addr_of!(LINK_POOL_BYTES);
+        let text_len = *core::ptr::addr_of!(TEXT_LEN);
+        let title_len = *core::ptr::addr_of!(TITLE_LEN);
+        let run_count = *core::ptr::addr_of!(LINK_RUN_COUNT);
+        let pool_len = *core::ptr::addr_of!(LINK_POOL_LEN);
+        tab.text_len = text_len.min(TEXT_CAPACITY);
+        tab.text[..tab.text_len].copy_from_slice(&text[..tab.text_len]);
+        tab.style[..tab.text_len].copy_from_slice(&styles[..tab.text_len]);
+        tab.title_len = title_len.min(TAB_TITLE);
+        tab.title[..tab.title_len].copy_from_slice(&title[..tab.title_len]);
+        tab.link_count = run_count.min(MAX_LINK_RUNS);
+        tab.link_runs[..tab.link_count].copy_from_slice(&runs[..tab.link_count]);
+        tab.link_pool_len = pool_len.min(LINK_POOL);
+        tab.link_pool[..tab.link_pool_len].copy_from_slice(&pool[..tab.link_pool_len]);
+    }
+}
+
+/// Restores a tab's cached page into the live render buffers.
+fn restore_active(app: &mut App, slot: usize) {
+    app.active = slot;
+    let tab = tab_ref(slot);
+    app.address_len = tab.address_len.min(ADDRESS_CAPACITY - 1);
+    app.address[..app.address_len].copy_from_slice(&tab.address[..app.address_len]);
+    app.address[app.address_len] = 0;
+    app.scroll = tab.scroll;
+    app.page = PageState {
+        loaded: tab.loaded,
+        loading: false,
+        status: tab.status,
+        error: tab.error,
+    };
+    unsafe {
+        let text = &mut *core::ptr::addr_of_mut!(TEXT);
+        let styles = &mut *core::ptr::addr_of_mut!(STYLE);
+        let title = &mut *core::ptr::addr_of_mut!(TITLE);
+        let runs = &mut *core::ptr::addr_of_mut!(LINK_RUNS);
+        let pool = &mut *core::ptr::addr_of_mut!(LINK_POOL_BYTES);
+        let text_len = tab.text_len.min(TEXT_CAPACITY);
+        text[..text_len].copy_from_slice(&tab.text[..text_len]);
+        styles[..text_len].copy_from_slice(&tab.style[..text_len]);
+        *core::ptr::addr_of_mut!(TEXT_LEN) = text_len;
+        let title_len = tab.title_len.min(TITLE_CAPACITY);
+        title[..title_len].copy_from_slice(&tab.title[..title_len]);
+        *core::ptr::addr_of_mut!(TITLE_LEN) = title_len;
+        let run_count = tab.link_count.min(MAX_LINK_RUNS);
+        runs[..run_count].copy_from_slice(&tab.link_runs[..run_count]);
+        *core::ptr::addr_of_mut!(LINK_RUN_COUNT) = run_count;
+        let pool_len = tab.link_pool_len.min(LINK_POOL);
+        pool[..pool_len].copy_from_slice(&tab.link_pool[..pool_len]);
+        *core::ptr::addr_of_mut!(LINK_POOL_LEN) = pool_len;
+    }
+}
+
+fn reset_active_view(app: &mut App) {
+    app.address_len = 0;
+    app.address[0] = 0;
+    app.focused = true;
+    app.scroll = 0;
+    app.page = PageState {
+        loaded: false,
+        loading: false,
+        status: 0,
+        error: "",
+    };
+    unsafe {
+        *core::ptr::addr_of_mut!(TEXT_LEN) = 0;
+        *core::ptr::addr_of_mut!(TITLE_LEN) = 0;
+        *core::ptr::addr_of_mut!(LINK_RUN_COUNT) = 0;
+        *core::ptr::addr_of_mut!(LINK_POOL_LEN) = 0;
+    }
+}
+
+fn cancel_load(app: &mut App) {
+    if app.pending.is_some() {
+        app.pending = None;
+        app.page.loading = false;
+        app.page.error = "";
+    }
+}
+
+fn switch_tab(app: &mut App, slot: usize) {
+    if slot >= TAB_MAX || !tab_ref(slot).open || slot == app.active {
+        return;
+    }
+    cancel_load(app);
+    save_active(app);
+    restore_active(app, slot);
+    app.focused = !tab_ref(slot).loaded;
+    paint(app);
+}
+
+fn new_tab(app: &mut App) {
+    cancel_load(app);
+    save_active(app);
+    let tabs = tabs();
+    let Some(slot) = (0..TAB_MAX).find(|&index| !tabs[index].open) else {
+        return;
+    };
+    tabs[slot] = Tab::EMPTY;
+    tabs[slot].open = true;
+    restore_active(app, slot);
+    reset_active_view(app);
+    paint(app);
+}
+
+fn close_tab(app: &mut App, slot: usize) {
+    if slot >= TAB_MAX || !tab_ref(slot).open {
+        return;
+    }
+    let was_active = slot == app.active;
+    if was_active {
+        cancel_load(app);
+    }
+    {
+        let tabs = tabs();
+        tabs[slot].open = false;
+        tabs[slot] = Tab::EMPTY;
+        if open_tab_count() == 0 {
+            tabs[slot] = Tab::EMPTY;
+            tabs[slot].open = true;
+        }
+    }
+    if was_active {
+        let mut next = None;
+        for step in 1..=TAB_MAX {
+            let candidate = (slot + step) % TAB_MAX;
+            if tab_ref(candidate).open {
+                next = Some(candidate);
+                break;
+            }
+        }
+        if let Some(next) = next {
+            restore_active(app, next);
+            app.focused = !tab_ref(next).loaded;
+        }
+    }
+    paint(app);
+}
+
+fn next_tab(app: &mut App) {
+    if open_tab_count() <= 1 {
+        return;
+    }
+    for step in 1..=TAB_MAX {
+        let candidate = (app.active + step) % TAB_MAX;
+        if tab_ref(candidate).open {
+            switch_tab(app, candidate);
+            return;
+        }
     }
 }
 
@@ -567,21 +879,21 @@ fn submit(app: &mut App) {
 }
 
 fn reload(app: &mut App) {
-    let current_len = unsafe { *core::ptr::addr_of!(CURRENT_URL_LEN) };
     let mut url = [0_u8; URL_CAPACITY];
-    let mut length = current_len;
-    if length > 0 {
-        unsafe {
-            let current = &*core::ptr::addr_of!(CURRENT_URL);
-            url[..length].copy_from_slice(&current[..length]);
+    let mut length = {
+        let tab = tab_ref(app.active);
+        let length = tab.url_len;
+        if length > 0 {
+            url[..length].copy_from_slice(&tab.url[..length]);
         }
-    } else {
+        length
+    };
+    if length == 0 {
         let text = app.address_text();
         let Some(resolved) = resolve_url(text, &mut url) else {
             return;
         };
         length = resolved;
-        set_current_url(core::str::from_utf8(&url[..length]).unwrap_or(""));
     }
     let target = core::str::from_utf8(&url[..length]).unwrap_or("");
     if !target.is_empty() {
@@ -590,33 +902,28 @@ fn reload(app: &mut App) {
 }
 
 fn go_history(app: &mut App, delta: i32) {
-    let length = unsafe { *core::ptr::addr_of!(HISTORY_LEN) };
-    let position = unsafe { *core::ptr::addr_of!(HISTORY_POS) };
-    if length == 0 {
-        return;
-    }
-    let target = if delta < 0 {
-        position.checked_sub((-delta) as usize)
-    } else {
-        let next = position + delta as usize;
-        if next < length {
-            Some(next)
-        } else {
-            None
-        }
-    };
-    let Some(target) = target else {
-        return;
-    };
-    unsafe {
-        *core::ptr::addr_of_mut!(HISTORY_POS) = target;
-    }
     let mut url = [0_u8; URL_CAPACITY];
-    let url_len = unsafe {
-        let urls = &*core::ptr::addr_of!(HISTORY_URLS);
-        let lens = &*core::ptr::addr_of!(HISTORY_LENS);
-        let len = lens[target] as usize;
-        url[..len].copy_from_slice(&urls[target][..len]);
+    let url_len = {
+        let tab = &mut tabs()[app.active];
+        if tab.history_len == 0 {
+            return;
+        }
+        let target = if delta < 0 {
+            tab.history_pos.checked_sub((-delta) as usize)
+        } else {
+            let next = tab.history_pos + delta as usize;
+            if next < tab.history_len {
+                Some(next)
+            } else {
+                None
+            }
+        };
+        let Some(target) = target else {
+            return;
+        };
+        tab.history_pos = target;
+        let len = tab.history_lens[target] as usize;
+        url[..len].copy_from_slice(&tab.history[target][..len]);
         len
     };
     let text = core::str::from_utf8(&url[..url_len]).unwrap_or("");
@@ -1021,7 +1328,23 @@ fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
     app.page.error = "";
     app.scroll = 0;
     set_address(app, url);
-    set_current_url(url);
+
+    let title = unsafe { &*core::ptr::addr_of!(TITLE) };
+    let title_len = unsafe { *core::ptr::addr_of!(TITLE_LEN) };
+    {
+        let tab = &mut tabs()[app.active];
+        let length = url.len().min(URL_CAPACITY - 1);
+        tab.url[..length].copy_from_slice(&url.as_bytes()[..length]);
+        tab.url_len = length;
+        tab.address_len = app.address_len;
+        tab.address[..app.address_len].copy_from_slice(&app.address[..app.address_len]);
+        tab.title_len = title_len.min(TAB_TITLE);
+        tab.title[..tab.title_len].copy_from_slice(&title[..tab.title_len]);
+        tab.loaded = true;
+        tab.status = status;
+        tab.error = "";
+    }
+
     let from_history = app
         .pending
         .as_ref()
@@ -1029,70 +1352,56 @@ fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
         .unwrap_or(false);
     app.pending = None;
     if from_history {
-        history_replace(url);
+        history_replace(app.active, url);
     } else {
-        history_push(url);
+        history_push(app.active, url);
     }
 }
 
-fn set_current_url(url: &str) {
-    let length = url.len().min(URL_CAPACITY - 1);
-    unsafe {
-        let current = &mut *core::ptr::addr_of_mut!(CURRENT_URL);
-        current[..length].copy_from_slice(&url.as_bytes()[..length]);
-        *core::ptr::addr_of_mut!(CURRENT_URL_LEN) = length;
-    }
-}
-
-fn history_push(url: &str) {
+fn history_push(active: usize, url: &str) {
     if url.is_empty() {
         return;
     }
-    unsafe {
-        let length = *core::ptr::addr_of!(HISTORY_LEN);
-        let position = *core::ptr::addr_of!(HISTORY_POS);
-        let urls = &mut *core::ptr::addr_of_mut!(HISTORY_URLS);
-        let lens = &mut *core::ptr::addr_of_mut!(HISTORY_LENS);
-        if length > 0 {
-            let current_len = lens[position] as usize;
-            if current_len == url.len()
-                && urls[position][..current_len] == url.as_bytes()[..]
-            {
-                return;
-            }
-        }
-        let next = if length == 0 { 0 } else { position + 1 };
-        if next >= HISTORY_MAX {
-            // Drop the oldest entry to make room.
-            for index in 1..HISTORY_MAX {
-                urls[index - 1] = urls[index];
-                lens[index - 1] = lens[index];
-            }
-            let slot = HISTORY_MAX - 1;
-            let len = url.len().min(URL_CAPACITY - 1);
-            urls[slot][..len].copy_from_slice(&url.as_bytes()[..len]);
-            lens[slot] = len as u16;
-            *core::ptr::addr_of_mut!(HISTORY_LEN) = HISTORY_MAX;
-            *core::ptr::addr_of_mut!(HISTORY_POS) = slot;
+    let tab = &mut tabs()[active];
+    if tab.history_len > 0 {
+        let position = tab.history_pos;
+        let current_len = tab.history_lens[position] as usize;
+        if current_len == url.len()
+            && tab.history[position][..current_len] == url.as_bytes()[..]
+        {
             return;
         }
-        let len = url.len().min(URL_CAPACITY - 1);
-        urls[next][..len].copy_from_slice(&url.as_bytes()[..len]);
-        lens[next] = len as u16;
-        *core::ptr::addr_of_mut!(HISTORY_LEN) = next + 1;
-        *core::ptr::addr_of_mut!(HISTORY_POS) = next;
     }
+    let next = if tab.history_len == 0 {
+        0
+    } else {
+        tab.history_pos + 1
+    };
+    if next >= TAB_HISTORY {
+        // Drop the oldest entry to make room for the new one.
+        tab.history.copy_within(1.., 0);
+        tab.history_lens.copy_within(1.., 0);
+        let slot = TAB_HISTORY - 1;
+        let len = url.len().min(URL_CAPACITY - 1);
+        tab.history[slot][..len].copy_from_slice(&url.as_bytes()[..len]);
+        tab.history_lens[slot] = len as u16;
+        tab.history_len = TAB_HISTORY;
+        tab.history_pos = slot;
+        return;
+    }
+    let len = url.len().min(URL_CAPACITY - 1);
+    tab.history[next][..len].copy_from_slice(&url.as_bytes()[..len]);
+    tab.history_lens[next] = len as u16;
+    tab.history_len = next + 1;
+    tab.history_pos = next;
 }
 
-fn history_replace(url: &str) {
-    unsafe {
-        let position = *core::ptr::addr_of!(HISTORY_POS);
-        let len = url.len().min(URL_CAPACITY - 1);
-        let urls = &mut *core::ptr::addr_of_mut!(HISTORY_URLS);
-        let lens = &mut *core::ptr::addr_of_mut!(HISTORY_LENS);
-        urls[position][..len].copy_from_slice(&url.as_bytes()[..len]);
-        lens[position] = len as u16;
-    }
+fn history_replace(active: usize, url: &str) {
+    let tab = &mut tabs()[active];
+    let position = tab.history_pos;
+    let len = url.len().min(URL_CAPACITY - 1);
+    tab.history[position][..len].copy_from_slice(&url.as_bytes()[..len]);
+    tab.history_lens[position] = len as u16;
 }
 
 fn is_redirect(status: u16) -> bool {
@@ -1439,7 +1748,10 @@ fn extract(body: &[u8]) {
             continue;
         }
         if byte == b' ' || byte == b'\t' {
-            if writer.len > 0 {
+            // `len` counts only flushed lines: the current line is still in
+            // the wrap buffer, so test `line_len` or the first line loses all
+            // of its spaces.
+            if writer.line_len > 0 {
                 writer.space_pending = true;
             }
             index += 1;
@@ -2175,16 +2487,8 @@ fn paint(app: &App) {
     fill(base, 0, 0, WIDTH, HEIGHT, COLOR_BACKGROUND);
     fill(base, 0, 0, WIDTH, HEADER_HEIGHT, COLOR_HEADER);
 
-    // Chrome: brand, page title, navigation buttons, address bar.
-    draw_text(base, 8, 5, 1, "WOLFSER", COLOR_HEADER_TEXT);
-    let title = unsafe {
-        let bytes = &*core::ptr::addr_of!(TITLE);
-        let len = *core::ptr::addr_of!(TITLE_LEN);
-        core::str::from_utf8(&bytes[..len]).unwrap_or("")
-    };
-    if !title.is_empty() && !app.page.loading {
-        draw_text(base, 62, 5, 1, title, COLOR_HEADER_TITLE);
-    }
+    // Chrome: tab strip, navigation buttons, address bar.
+    draw_tabs(base, app);
     draw_button(base, BUTTON_BACK_X, "<");
     draw_button(base, BUTTON_FORWARD_X, ">");
     draw_button(base, BUTTON_RELOAD_X, "R");
@@ -2267,7 +2571,7 @@ fn paint(app: &App) {
             24,
             BODY_TOP + 96,
             1,
-            "CTRL+L ADDRESS   ALT+LEFT/RIGHT HISTORY   CTRL+R RELOAD   CTRL+Q QUIT",
+            "CTRL+T NEW TAB   CTRL+W CLOSE   CTRL+TAB SWITCH   CTRL+L ADDRESS   CTRL+Q QUIT",
             COLOR_MUTED,
         );
         draw_footer(base, app, "READY");
@@ -2287,6 +2591,79 @@ fn paint(app: &App) {
     };
     draw_footer(base, app, status);
     publish(base, window::STATE_READY);
+}
+
+fn draw_tabs(base: u64, app: &App) {
+    let count = open_tab_count();
+    let mut cursor = TAB_START_X;
+    for screen in 0..count {
+        let Some(slot) = open_slot_at(screen) else {
+            break;
+        };
+        let tab = tab_ref(slot);
+        let active = slot == app.active;
+        fill(
+            base,
+            cursor,
+            TAB_Y,
+            TAB_WIDTH,
+            TAB_BAR_HEIGHT,
+            if active {
+                COLOR_TAB_ACTIVE
+            } else {
+                COLOR_TAB
+            },
+        );
+        let color = if active {
+            COLOR_TAB_TEXT_ACTIVE
+        } else {
+            COLOR_TAB_TEXT
+        };
+        let title = if active && app.page.loading {
+            "LOADING..."
+        } else if tab.title_len > 0 {
+            tab.title_text()
+        } else {
+            "NEW TAB"
+        };
+        let max = ((TAB_WIDTH - TAB_CLOSE_WIDTH - 12) / 6) as usize;
+        let end = core::cmp::min(title.len(), max);
+        draw_text(base, cursor + 6, TAB_TEXT_Y, 1, &title[..end], color);
+        draw_text(
+            base,
+            cursor + TAB_WIDTH - TAB_CLOSE_WIDTH + 4,
+            TAB_TEXT_Y,
+            1,
+            "x",
+            color,
+        );
+        cursor += TAB_WIDTH + TAB_GAP;
+    }
+    // "+" button after the last tab.
+    fill(
+        base,
+        cursor,
+        TAB_Y,
+        TAB_BAR_HEIGHT,
+        TAB_BAR_HEIGHT,
+        COLOR_TAB,
+    );
+    draw_text(
+        base,
+        cursor + 7,
+        TAB_TEXT_Y,
+        1,
+        "+",
+        COLOR_TAB_TEXT,
+    );
+    draw_text(
+        base,
+        WIDTH - 62,
+        TAB_TEXT_Y,
+        1,
+        "WOLFSER",
+        COLOR_HEADER_TITLE,
+    );
 }
 
 fn draw_button(base: u64, x: u32, label: &str) {
@@ -2361,7 +2738,7 @@ fn draw_footer(base: u64, app: &App, status: &str) {
         }
     }
     draw_text_bytes(base, 12, y, 1, &label[..length], COLOR_MUTED);
-    let hint = "CTRL+L ADDRESS   ALT+LEFT/RIGHT HISTORY   CTRL+R RELOAD   CTRL+Q QUIT";
+    let hint = "CTRL+T NEW  CTRL+W CLOSE  CTRL+TAB NEXT  CTRL+L ADDRESS  ALT+LEFT/RIGHT  CTRL+Q QUIT";
     let width = hint.len() as u32 * 6;
     draw_text(
         base,
