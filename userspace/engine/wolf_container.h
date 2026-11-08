@@ -34,16 +34,30 @@ extern "C"
     /// Width of `text` in pixels at the given integer font scale.
     uint32_t wolf_text_width(const char* text, uint32_t len, uint32_t scale);
 
-    /// Draw `text` into a 0xAARRGGBB surface. `clip_*` is in surface pixels.
+    /// Draw `text` into a 0xAABBGGRR surface. `clip_*` is in surface pixels.
     void wolf_draw_text(uint32_t* pixels, int32_t stride, int32_t width, int32_t height,
                         int32_t x, int32_t y, const char* text, uint32_t len, uint32_t scale,
                         uint32_t color, int32_t clip_x, int32_t clip_y, int32_t clip_w,
                         int32_t clip_h);
+
+    /// Fetch `src` (resolved against `base`) through the guest net_server.
+    /// Returns the encoded byte count, or -1. Called from litehtml during
+    /// layout; it blocks the browser task while the net_server replies.
+    int32_t wolf_fetch_image(const uint8_t* src, uint32_t src_len, const uint8_t* base,
+                             uint32_t base_len, uint8_t* out, uint32_t cap);
 }
 
 class WolfContainer : public litehtml::document_container
 {
   public:
+    struct ImageEntry
+    {
+        std::string           key;
+        int                   width = 0;
+        int                   height = 0;
+        std::vector<uint8_t>  pixels;
+    };
+
     WolfContainer(int width, int height);
 
     void set_canvas(WolfCanvas* canvas)
@@ -115,6 +129,11 @@ class WolfContainer : public litehtml::document_container
     WolfCanvas* m_canvas = nullptr;
     std::string m_base_url;
     std::string m_link;
+    std::vector<ImageEntry> m_images;
+    int m_image_fetches = 0;
+
+    std::string image_key(const char* src, const char* baseurl) const;
+    ImageEntry* find_image(const std::string& key);
 };
 
 #endif // WOLF_CONTAINER_H

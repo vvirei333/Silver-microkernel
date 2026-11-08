@@ -63,5 +63,7 @@ The linked browser image is ~6 MiB, so the kernel was widened accordingly:
 - Full pages are rendered as-is, but only external stylesheets up to 64 KiB are
   fetched. Modern 200 KiB CSS (Wikipedia Vector) is skipped and reader mode is
   used instead.
-- Images are not decoded in the engine path yet, and there is no JavaScript or
-  media pipeline.
+- Images are fetched through the guest net_server and decoded in-guest by
+  `stb_image` (PNG/JPEG/GIF). Up to four per page, 512 KiB encoded and 300k
+  pixels each; the RGBA cache is drawn scaled through litehtml's `<img>` box.
+- There is no JavaScript or media pipeline.

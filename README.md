@@ -101,7 +101,7 @@ userspace.
 - [x] DNS: `dns <name>` resolves through the DHCP-provided resolver
 - [x] HTTP: `wget <url> [file]` fetches an `http://` document through a real TCP connection into SFS; `ip` shows the lease
 - [x] Vendored `smoltcp` 0.14 with a two-line neighbour fix for broadcast DHCP traffic (`third_party/smoltcp/PATCH.md`)
-- [x] **Wolfser**: `wolfser [query|url]` opens a search/address bar; pages render into an ivshmem RGBA surface with clickable links, back/forward history, find-in-page, a start page with persistent bookmarks, six tabs and window zoom. The primary renderer is **litehtml** (HTML5 + CSS layout, article reader extraction); the old text/inline-image renderer stays as a fallback. `http://` and `https://` use the guest stack (TLS 1.3); the host viewer's Qt TLS proxy is the fallback
+- [x] **Wolfser**: `wolfser [query|url]` opens a search/address bar; pages render into an ivshmem RGBA surface with clickable links, back/forward history, find-in-page, a start page with persistent bookmarks, six tabs and window zoom. The primary renderer is **litehtml** (HTML5 + CSS layout, article reader extraction, in-guest PNG/JPEG/GIF images); the old text renderer stays as a fallback. `http://` and `https://` use the guest stack (TLS 1.3); the host viewer's Qt TLS proxy is the fallback
 - [x] Qt window viewer (`tools/window-viewer`) that maps the same surface, repaints on `frame_seq`, and sends keys/wheel through an input ring; `--snapshot` mode for headless checks
 - [x] `SYS_MAP_PHYS_NC`: maps a non-DRAM window (ivshmem) as Normal Non-Cacheable user memory
 - [x] Checked copyin/copyout with permission validation, `LDTR/STTR` and PAN enabled
@@ -582,6 +582,10 @@ stylesheet supplies readable typography. Other pages render as-is with their
 inline `<style>` and small external stylesheets (up to 64 KiB). litehtml does
 the hit-testing too, so hovering and clicking links works through the engine.
 
+Images are fetched by the guest's `net_server` and decoded in the guest by
+**stb_image**; up to four per page (512 KiB encoded, 300k pixels each) are
+cached as RGBA and drawn scaled through litehtml's `<img>` boxes.
+
 The reader slice is capped at 48 KiB and the engine heap at 20 MiB; both are
 deliberate current limits, not architectural ones. Six tabs keep their own URL,
 history, scroll position and rendered page, so switching is instant and does
@@ -653,11 +657,11 @@ with the arguments above (or use `./build_and_qemu.sh`). Starting `wolfser`
 twice reuses the running instance (one window per VM).
 
 litehtml gives a genuine CSS layout, but it is not a full browser: there is no
-JavaScript, no DOM API, no audio or video pipeline, and images are not decoded
-in the engine path yet. Reader pages are limited to 48 KiB of sanitized HTML and
-external CSS to 64 KiB; modern 200 KiB stylesheets (Wikipedia Vector) are
-skipped in favour of the reader view. Six tabs and one text field per form are
-the current UI limits. **YouTube still cannot work here**; it needs a
+JavaScript, no DOM API and no audio or video pipeline. Reader pages are limited
+to 48 KiB of sanitized HTML and external CSS to 64 KiB; modern 200 KiB
+stylesheets (Wikipedia Vector) are skipped in favour of the reader view.
+Images are capped at four per page, and six tabs plus one text field per form
+are the current UI limits. **YouTube still cannot work here**; it needs a
 WebKit/Gecko-class engine with a media stack, which is the Linux ABI + Phosh
 track, not another reader-mode increment. TLS runs in the guest and needs no
 host, but the root store is intentionally small and certificate time is a fixed

@@ -52,7 +52,7 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 | Init | Silverd resolves task ids (not cap ids) before grants | **pass** |
 | Capabilities | `CAP_MOUNT`/`CAP_POWER` outside `CAP_ALL`; shell owns `CAP_POWER` by kernel policy | **pass** |
 | Toolbox | multi-call `utils`: grep/wc/head/tail/cp/find/seq/dirname/sleep/true/false | **pass** |
-| Wolfser | `wolfser [query|url]`, search/address bar, clickable links, per-tab history, six cached tabs, **litehtml CSS layout** with MediaWiki/`main`/`article` reader extraction (48 KiB slice), find-in-page, start page with persistent bookmarks, one-field GET/POST forms with a session cookie jar, hover status/hand cursor, middle-click new tab, host zoom, redirects; HTTP and HTTPS TLS 1.3 via smoltcp, Qt proxy as fallback; `--snapshot` sees a rendered frame | **pass** |
+| Wolfser | `wolfser [query|url]`, search/address bar, clickable links, per-tab history, six cached tabs, **litehtml CSS layout** with MediaWiki/`main`/`article` reader extraction (48 KiB slice), in-guest stb_image PNG/JPEG/GIF (4 per page), find-in-page, start page with persistent bookmarks, one-field GET/POST forms with a session cookie jar, hover status/hand cursor, middle-click new tab, host zoom, redirects; HTTP and HTTPS TLS 1.3 via smoltcp, Qt proxy as fallback; `--snapshot` sees a rendered frame | **pass** |
 | Power | `poweroff`/`reboot`; SMC on Qualcomm, HVC on QEMU | **implemented; QEMU PSCI caveat below** |
 | SMP | QEMU `-smp 4` selftest | **15 PASS / 0 FAIL** |
 | Fog QEMU | relocation, at-link, fail-closed park, timer | **PASS** |
@@ -93,9 +93,9 @@ describes a supported build.
    hit-testing. MediaWiki/`main`/`article` pages use a sanitized reader view;
    other pages keep inline CSS and small external stylesheets. Six tabs,
    find-in-page, persistent bookmarks, host zoom and one-field GET/POST forms
-   work. Images, JavaScript, media, larger reader/CSS budgets and full-page
-   layout do not yet; the Linux ABI/Phosh track brings a WebKit/Gecko-class
-   engine for those and for YouTube.
+   work; PNG/JPEG/GIF images are decoded in-guest with stb_image. JavaScript,
+   media, larger reader/CSS budgets and full-page layout do not yet; the Linux
+   ABI/Phosh track brings a WebKit/Gecko-class engine for those and for YouTube.
 6. **Linux ABI/Phosh are not started.** The kernel personality layer, static
    musl binaries, headless Wayland and the Phosh stack are the active
    long-term track; see [`VECTOR.md`](VECTOR.md).
@@ -136,8 +136,8 @@ network driver reports a probe failure and the shell continues.
 
 1. Harden TLS: more roots, RTC-backed certificate time, a real entropy source
    and a TLS 1.2 fallback.
-2. Wolfser: in-guest image decoding, larger reader/CSS budgets, full
-   forms/widgets, keep-alive and damage rectangles.
+2. Wolfser: larger reader/CSS budgets, full forms/widgets, keep-alive and
+   damage rectangles.
 3. Window transport on real hardware (host-side streaming or a local console).
 4. Linux ABI: static musl binaries, then busybox `sh`.
 5. Phosh: headless Wayland, GTK software render, D-Bus + logind stub, `phosh`.

@@ -1,5 +1,7 @@
 #include "wolf_container.h"
 
+#include "stb_image.h"
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -86,6 +88,54 @@ namespace
     {
         fill_rect(canvas, static_cast<int>(box.x), static_cast<int>(box.y),
                   static_cast<int>(box.width), static_cast<int>(box.height), color);
+    }
+
+    void draw_rgba(WolfCanvas* canvas, const std::vector<uint8_t>& pixels, int source_width,
+                   int source_height, int x, int y, int width, int height,
+                   const litehtml::position& clip)
+    {
+        if(canvas == nullptr || source_width <= 0 || source_height <= 0 || width <= 0 || height <= 0)
+        {
+            return;
+        }
+        const int clip_left   = static_cast<int>(clip.x);
+        const int clip_top    = static_cast<int>(clip.y);
+        const int clip_right  = clip_left + static_cast<int>(clip.width);
+        const int clip_bottom = clip_top + static_cast<int>(clip.height);
+        for(int row = 0; row < height; ++row)
+        {
+            const int source_y = row * source_height / height;
+            for(int column = 0; column < width; ++column)
+            {
+                const int pixel_x = x + column;
+                const int pixel_y = y + row;
+                if(pixel_x < clip_left || pixel_y < clip_top || pixel_x >= clip_right ||
+                   pixel_y >= clip_bottom)
+                {
+                    continue;
+                }
+                const int source_x = column * source_width / width;
+                const size_t offset =
+                    (static_cast<size_t>(source_y) * source_width + source_x) * 4;
+                if(offset + 4 > pixels.size())
+                {
+                    continue;
+                }
+                const uint8_t red   = pixels[offset];
+                const uint8_t green = pixels[offset + 1];
+                const uint8_t blue  = pixels[offset + 2];
+                const uint8_t alpha = pixels[offset + 3];
+                if(alpha == 0)
+                {
+                    continue;
+                }
+                const uint32_t color = (static_cast<uint32_t>(alpha) << 24) |
+                                       (static_cast<uint32_t>(blue) << 16) |
+                                       (static_cast<uint32_t>(green) << 8) |
+                                       static_cast<uint32_t>(red);
+                put(canvas, pixel_x, pixel_y, color);
+            }
+        }
     }
 } // namespace
 
@@ -204,20 +254,127 @@ void WolfContainer::draw_list_marker(litehtml::uint_ptr hdc, const litehtml::lis
     }
 }
 
-void WolfContainer::load_image(const char* /*src*/, const char* /*baseurl*/, bool /*redraw_on_ready*/)
+std::string WolfContainer::image_key(const char* src, const char* /*baseurl*/) const
 {
-    // Guest-side image decoding is a later stage. Returning zero sizes below
-    // makes litehtml collapse the <img> box instead of waiting forever.
+    // One container belongs to one document, so the raw src is a sufficient
+    // cache key even when the page base changes between loads.
+    return src != nullptr ? src : "";
 }
 
-void WolfContainer::get_image_size(const char* /*src*/, const char* /*baseurl*/, litehtml::size& sz)
+WolfContainer::ImageEntry* WolfContainer::find_image(const std::string& key)
+{
+    for(auto& image : m_images)
+    {
+        if(image.key == key)
+        {
+            return &image;
+        }
+    }
+    return nullptr;
+}
+
+void WolfContainer::load_image(const char* src, const char* baseurl, bool /*redraw_on_ready*/)
+{
+    if(src == nullptr || *src == '\0' || m_image_fetches >= 4)
+    {
+        return;
+    }
+    const std::string key = image_key(src, baseurl);
+    if(find_image(key) != nullptr)
+    {
+        return;
+    }
+    // Wikipedia thumbnails are tens of KiB; 512 KiB also covers most direct
+    // PNG/JPEG links while keeping the net_server window and heap bounded.
+    constexpr uint32_t kEncodedLimit = 512 * 1024;
+    std::vector<uint8_t> encoded(kEncodedLimit);
+    // litehtml passes nullptr for <img> sources and expects the container to
+    // remember the document base URL from set_base_url().
+    const char* base = (baseurl != nullptr && *baseurl != '\0')
+                           ? baseurl
+                           : m_base_url.c_str();
+    const int32_t length = wolf_fetch_image(
+        reinterpret_cast<const uint8_t*>(src), static_cast<uint32_t>(std::strlen(src)),
+        reinterpret_cast<const uint8_t*>(base), static_cast<uint32_t>(std::strlen(base)),
+        encoded.data(), kEncodedLimit);
+    ++m_image_fetches;
+    if(length <= 0)
+    {
+        return;
+    }
+
+    int width = 0;
+    int height = 0;
+    int channels = 0;
+    if(stbi_info_from_memory(encoded.data(), length, &width, &height, &channels) == 0)
+    {
+        return;
+    }
+    if(width <= 0 || height <= 0 ||
+       static_cast<int64_t>(width) * height > 300 * 1000)
+    {
+        return;
+    }
+    unsigned char* rgba =
+        stbi_load_from_memory(encoded.data(), length, &width, &height, &channels, 4);
+    if(rgba == nullptr)
+    {
+        return;
+    }
+    ImageEntry entry;
+    entry.key    = key;
+    entry.width  = width;
+    entry.height = height;
+    entry.pixels.assign(rgba, rgba + static_cast<size_t>(width) * height * 4);
+    stbi_image_free(rgba);
+    m_images.push_back(std::move(entry));
+}
+
+void WolfContainer::get_image_size(const char* src, const char* baseurl, litehtml::size& sz)
 {
     sz = litehtml::size(0, 0);
+    if(src == nullptr || *src == '\0')
+    {
+        return;
+    }
+    ImageEntry* image = find_image(image_key(src, baseurl));
+    if(image == nullptr)
+    {
+        // litehtml may ask for the intrinsic size before it starts loading;
+        // make the fetch synchronous here so the layout reserves real space.
+        load_image(src, baseurl, false);
+        image = find_image(image_key(src, baseurl));
+    }
+    if(image != nullptr)
+    {
+        sz.width  = image->width;
+        sz.height = image->height;
+    }
 }
 
-void WolfContainer::draw_image(litehtml::uint_ptr /*hdc*/, const litehtml::background_layer& /*layer*/,
-                               const std::string& /*url*/, const std::string& /*base_url*/)
+void WolfContainer::draw_image(litehtml::uint_ptr hdc, const litehtml::background_layer& layer,
+                               const std::string& url, const std::string& base_url)
 {
+    auto* canvas = reinterpret_cast<WolfCanvas*>(hdc);
+    if(canvas == nullptr)
+    {
+        return;
+    }
+    ImageEntry* image = find_image(image_key(url.c_str(), base_url.c_str()));
+    if(image == nullptr)
+    {
+        return;
+    }
+    int width  = static_cast<int>(layer.origin_box.width);
+    int height = static_cast<int>(layer.origin_box.height);
+    if(width <= 0 || height <= 0)
+    {
+        width  = image->width;
+        height = image->height;
+    }
+    draw_rgba(canvas, image->pixels, image->width, image->height,
+              static_cast<int>(layer.origin_box.x), static_cast<int>(layer.origin_box.y),
+              width, height, layer.clip_box);
 }
 
 void WolfContainer::draw_solid_fill(litehtml::uint_ptr hdc, const litehtml::background_layer& layer,

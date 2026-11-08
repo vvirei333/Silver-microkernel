@@ -427,6 +427,8 @@ static mut PAGE_HTML: [[u8; PAGE_CAP]; TAB_MAX] = [[0; PAGE_CAP]; TAB_MAX];
 static mut CSS_BUFFER: [u8; CSS_CAP] = [0; CSS_CAP];
 static mut PAGE_BODY: [u8; PAGE_BODY_CAP] = [0; PAGE_BODY_CAP];
 static mut ENGINE_BASE: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
+static mut IMAGE_SERVER: u64 = 0;
+static mut IMAGE_NET_BASE: u64 = 0;
 
 static mut TEXT: [u8; TEXT_CAPACITY] = [0; TEXT_CAPACITY];
 static mut STYLE: [u8; TEXT_CAPACITY] = [0; TEXT_CAPACITY];
@@ -671,6 +673,10 @@ fn create_engine(app: &mut App, slot: usize, url: &str) {
     base[..count].copy_from_slice(&url.as_bytes()[..count]);
     base[count] = 0;
     let html = unsafe { &(*core::ptr::addr_of!(PAGE_HTML))[slot] };
+    unsafe {
+        *core::ptr::addr_of_mut!(IMAGE_SERVER) = app.server;
+        *core::ptr::addr_of_mut!(IMAGE_NET_BASE) = app.net_base;
+    }
     let handle = unsafe {
         wolf_html_create(
             html.as_ptr(),
@@ -950,7 +956,6 @@ fn dropped_reader_tag(name: &[u8]) -> bool {
         b"textarea".as_slice(),
         b"svg".as_slice(),
         b"math".as_slice(),
-        b"img".as_slice(),
     ] {
         if tag_eq(name, bad) {
             return true;
@@ -1022,12 +1027,20 @@ fn copy_reader(source: &[u8], out: &mut [u8]) -> usize {
             } else {
                 push_bytes(out, &mut length, b"<");
                 push_bytes(out, &mut length, name);
-                for attribute in [b"href".as_slice(), b"src".as_slice(), b"alt".as_slice()] {
+                for attribute in [
+                    b"href".as_slice(),
+                    b"src".as_slice(),
+                    b"alt".as_slice(),
+                    b"width".as_slice(),
+                    b"height".as_slice(),
+                ] {
                     if let Some(value) = tag_attribute(full, attribute) {
+                        let mut decoded = [0u8; URL_CAPACITY];
+                        let decoded_len = decode_attribute(value, &mut decoded);
                         push_bytes(out, &mut length, b" ");
                         push_bytes(out, &mut length, attribute);
                         push_bytes(out, &mut length, b"=\"");
-                        push_bytes(out, &mut length, value);
+                        push_bytes(out, &mut length, &decoded[..decoded_len]);
                         push_bytes(out, &mut length, b"\"");
                     }
                 }
@@ -5664,6 +5677,80 @@ pub extern "C" fn wolf_draw_text(
         }
         cursor += (font5x7::GLYPH_WIDTH as i32 + 1) * scale;
     }
+}
+
+fn fetch_image_blocking(
+    server: u64,
+    net_base: u64,
+    url: &str,
+    out: *mut u8,
+    cap: u32,
+) -> i32 {
+    if server == 0 || net_base == 0 || url.is_empty() || out.is_null() || cap == 0 {
+        return -1;
+    }
+    if !write_request(net_base, url) {
+        return -1;
+    }
+    let request_id = next_request_id();
+    if !syscall::send(server, &net_ipc::http_request_id(request_id)) {
+        return -1;
+    }
+    let deadline = syscall::uptime_ticks().saturating_add(8 * TICKS_PER_SECOND);
+    let mut message = ipc::Message::new(0, &[]);
+    loop {
+        if syscall::receive_timeout(&mut message, RESPONSE_POLL_TICKS).is_ok()
+            && message.sender == server
+            && message.payload[0] == net_ipc::OP_HTTP_REPLY
+            && net_ipc::http_id(&message) == request_id
+        {
+            let Some((code, _status, body_len)) = net_ipc::http_fields(&message) else {
+                return -1;
+            };
+            if code != net_ipc::NET_OK || body_len as usize > cap as usize {
+                return -1;
+            }
+            let body = unsafe {
+                core::slice::from_raw_parts(
+                    (net_base + net_ipc::CLIENT_BODY) as *const u8,
+                    body_len as usize,
+                )
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(body.as_ptr(), out, body.len());
+            }
+            return body.len() as i32;
+        }
+        if syscall::uptime_ticks() >= deadline {
+            return -1;
+        }
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wolf_fetch_image(
+    src: *const u8,
+    src_len: u32,
+    base: *const u8,
+    base_len: u32,
+    out: *mut u8,
+    cap: u32,
+) -> i32 {
+    if src.is_null() || out.is_null() || cap == 0 {
+        return -1;
+    }
+    let src = unsafe { core::slice::from_raw_parts(src, src_len as usize) };
+    let base = unsafe { core::slice::from_raw_parts(base, base_len as usize) };
+    let src = core::str::from_utf8(src).unwrap_or("");
+    let base = core::str::from_utf8(base).unwrap_or("");
+    let mut target = [0u8; URL_CAPACITY];
+    let Some(length) = resolve_link(base, src, &mut target) else {
+        return -1;
+    };
+    let url = core::str::from_utf8(&target[..length]).unwrap_or("");
+    let server = unsafe { *core::ptr::addr_of!(IMAGE_SERVER) };
+    let net_base = unsafe { *core::ptr::addr_of!(IMAGE_NET_BASE) };
+    fetch_image_blocking(server, net_base, url, out, cap)
 }
 
 #[no_mangle]

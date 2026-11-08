@@ -72,9 +72,11 @@ Redmi port is parked. The reference checklist is
   drops Qt auto-repeat and identical events within 20 ms, and the host copies
   each completed frame into a QImage before painting. Loading keeps the old
   document or start page visible with a footer spinner, so searches do not
-  flash a white screen. The fallback text renderer still decodes up to three
-  images through the viewer into 240x180 RGBA slots; the litehtml path
-  currently drops `<img>` and will get in-guest decoding (stb_image) next.
+  flash a white screen. The litehtml path now fetches `<img>` sources through
+  the guest net_server and decodes them in-guest with `stb_image`
+  (PNG/JPEG/GIF): up to four per page, 512 KiB encoded and 300k pixels each,
+  cached as RGBA and drawn scaled. The old text renderer keeps its viewer-side
+  image path as a fallback.
   The first line of every page used to lose its spaces because the wrap buffer
   had not flushed yet; a `line_len` check fixed it. Bookmarks are
   persisted in `/sfs/wolfser.bookmarks` using a path-scoped write window
@@ -133,10 +135,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** litehtml images (`stb_image` + a guest image fetch), larger
-  reader/CSS budgets, full-page layout and keep-alive; TLS hardening (roots,
-  RTC, RNG, TLS 1.2); **YouTube/JS/media still require a WebKit/Gecko-class
-  engine, i.e. the Linux ABI + Phosh track**, not another reader increment;
+- **Next steps:** larger reader/CSS budgets, full-page layout and keep-alive;
+  TLS hardening (roots, RTC, RNG, TLS 1.2); **YouTube/JS/media still require a
+  WebKit/Gecko-class engine, i.e. the Linux ABI + Phosh track**, not another
+  reader increment;
   Linux ABI for static musl binaries; headless Wayland/GTK/D-Bus → Phosh.
   Parked: QEMU PSCI shutdown, fog TLB proof, GENI UART on `rain`, tablet,
   Redmi storage/power.

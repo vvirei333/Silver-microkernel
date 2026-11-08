@@ -40,6 +40,7 @@ CXXFLAGS=(
     -I"$LITEHTML/src"
     -I"$LITEHTML/src/gumbo/src"
     -I"$ROOT/userspace/engine"
+    -I"$ROOT/third_party/stb"
 )
 CFLAGS=(
     -std=c99
@@ -49,6 +50,7 @@ CFLAGS=(
     -fdata-sections
     -funwind-tables
     -I"$LITEHTML/src/gumbo/src"
+    -I"$ROOT/third_party/stb"
 )
 
 mkdir -p "$OUT/obj"
@@ -93,6 +95,7 @@ for source in "$LITEHTML"/src/gumbo/src/*.c; do
 done
 compile_cpp "$ROOT/userspace/engine/wolf_container.cpp"
 compile_cpp "$ROOT/userspace/engine/wolf_html.cpp"
+compile_c "$ROOT/userspace/engine/stb_image.c"
 compile_c "$ROOT/userspace/engine/wolf_syscalls.c"
 
 "$AR" rcs "$OUT/libwolfhtml.a" "$OUT/obj"/*.o
