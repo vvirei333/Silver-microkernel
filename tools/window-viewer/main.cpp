@@ -458,7 +458,13 @@ protected:
         case Qt::Key_Down: key = 2; break;
         case Qt::Key_PageUp: key = 3; break;
         case Qt::Key_PageDown: key = 4; break;
-        case Qt::Key_Home: key = 5; break;
+        case Qt::Key_Home:
+            if (event->modifiers() & Qt::AltModifier) {
+                key = 22; // start page
+                break;
+            }
+            key = 5;
+            break;
         case Qt::Key_End: key = 6; break;
         case Qt::Key_Return:
         case Qt::Key_Enter: key = 10; break;
@@ -485,6 +491,7 @@ protected:
                 break;
             }
             return;
+        case Qt::Key_D:
         case Qt::Key_F:
         case Qt::Key_L:
         case Qt::Key_Q:
@@ -493,6 +500,7 @@ protected:
         case Qt::Key_W:
             if (event->modifiers() & Qt::ControlModifier) {
                 switch (event->key()) {
+                case Qt::Key_D: key = 23; break;
                 case Qt::Key_F: key = 21; break;
                 case Qt::Key_L: key = 13; break;
                 case Qt::Key_Q: key = 17; break;

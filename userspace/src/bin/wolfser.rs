@@ -38,7 +38,7 @@ const STRIDE: u32 = WIDTH * 4;
 const HEADER_HEIGHT: u32 = 78;
 const FOOTER_HEIGHT: u32 = 16;
 const MARGIN: u32 = 12;
-const ADDRESS_X: u32 = 100;
+const ADDRESS_X: u32 = 130;
 const ADDRESS_Y: u32 = 29;
 const ADDRESS_WIDTH: u32 = WIDTH - ADDRESS_X - 8;
 const ADDRESS_HEIGHT: u32 = 24;
@@ -59,6 +59,7 @@ const BUTTON_Y: u32 = 29;
 const BUTTON_BACK_X: u32 = 8;
 const BUTTON_FORWARD_X: u32 = 38;
 const BUTTON_RELOAD_X: u32 = 68;
+const BUTTON_HOME_X: u32 = 98;
 
 const COLOR_BACKGROUND: u32 = 0xFFFF_FFFF;
 const COLOR_HEADER: u32 = 0xFF5F_3A1E;
@@ -81,6 +82,8 @@ const COLOR_TAB_TEXT: u32 = 0xFFD8_C3B2;
 const COLOR_MATCH: u32 = 0xFFFF_E08A;
 const COLOR_MATCH_CURRENT: u32 = 0xFFFF_9A3A;
 const COLOR_FIND: u32 = 0xFFFF_F3C4;
+const COLOR_TILE: u32 = 0xFFF4_EFE9;
+const COLOR_TILE_BORDER: u32 = 0xFFD8_C7B6;
 
 const TAB_MAX: usize = 4;
 const TAB_HISTORY: usize = 12;
@@ -93,6 +96,24 @@ const TAB_BAR_HEIGHT: u32 = 22;
 const TAB_TEXT_Y: u32 = 9;
 const TAB_CLOSE_WIDTH: u32 = 18;
 const FIND_CAPACITY: usize = 64;
+const BOOKMARK_MAX: usize = 8;
+const BOOKMARK_TITLE: usize = 80;
+const TOAST_TICKS: u64 = 2 * TICKS_PER_SECOND;
+
+const TILE_X: u32 = 24;
+const TILE_Y: u32 = BODY_TOP + 64;
+const TILE_WIDTH: u32 = 273;
+const TILE_HEIGHT: u32 = 84;
+const TILE_GAP: u32 = 16;
+const BOOKMARK_Y: u32 = BODY_TOP + 196;
+const BOOKMARK_ROW: u32 = 22;
+
+const QUICK_LINKS: [(&str, &str); 3] = [
+    ("SEARCH THE WEB", ""),
+    ("ENCYCLOPEDIA", "https://en.wikipedia.org/"),
+    ("TEST PAGE", "https://example.com/"),
+];
+const QUICK_HINTS: [&str; 3] = ["DUCKDUCKGO", "WIKIPEDIA.ORG", "EXAMPLE.COM"];
 
 const DEFAULT_SEARCH: &str = "https://html.duckduckgo.com/html/?q=";
 const IVSHMEM_VENDOR: u16 = 0x1AF4;
@@ -139,6 +160,8 @@ struct App {
     find_len: usize,
     find_total: usize,
     find_index: usize,
+    toast_until: u64,
+    toast: &'static str,
     page: PageState,
     pending: Option<Pending>,
 }
@@ -248,6 +271,26 @@ impl Tab {
     }
 }
 
+#[derive(Copy, Clone)]
+struct Bookmark {
+    title: [u8; BOOKMARK_TITLE],
+    title_len: usize,
+    url: [u8; URL_CAPACITY],
+    url_len: usize,
+}
+
+impl Bookmark {
+    const EMPTY: Bookmark = Bookmark {
+        title: [0; BOOKMARK_TITLE],
+        title_len: 0,
+        url: [0; URL_CAPACITY],
+        url_len: 0,
+    };
+}
+
+static mut BOOKMARKS: [Bookmark; BOOKMARK_MAX] = [Bookmark::EMPTY; BOOKMARK_MAX];
+static mut BOOKMARK_COUNT: usize = 0;
+
 static mut TABS: [Tab; TAB_MAX] = [Tab::EMPTY; TAB_MAX];
 
 static mut TEXT: [u8; TEXT_CAPACITY] = [0; TEXT_CAPACITY];
@@ -330,6 +373,8 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         find_len: 0,
         find_total: 0,
         find_index: 0,
+        toast_until: 0,
+        toast: "",
         page: PageState {
             loaded: false,
             loading: false,
@@ -411,6 +456,10 @@ pub extern "C" fn _start(_argument: u64) -> ! {
             dirty = true;
         }
         if app.image_pending && poll_image(&mut app) {
+            dirty = true;
+        }
+        if !app.toast.is_empty() && syscall::uptime_ticks() >= app.toast_until {
+            app.toast = "";
             dirty = true;
         }
 
@@ -515,6 +564,14 @@ fn handle_key(app: &mut App, key: u16) -> bool {
         }
         window::KEY_NEXT_TAB => {
             next_tab(app);
+            true
+        }
+        window::KEY_HOME_PAGE => {
+            show_start(app);
+            true
+        }
+        window::KEY_BOOKMARK => {
+            bookmark_current(app);
             true
         }
         window::KEY_UP => {
@@ -711,6 +768,10 @@ fn handle_click(app: &mut App, x: u32, y: u32, button: u8) -> bool {
             reload(app);
             return true;
         }
+        if (BUTTON_HOME_X..BUTTON_HOME_X + BUTTON_WIDTH).contains(&x) {
+            show_start(app);
+            return true;
+        }
     }
     if (ADDRESS_Y..ADDRESS_Y + ADDRESS_HEIGHT).contains(&y)
         && x >= ADDRESS_X
@@ -721,6 +782,13 @@ fn handle_click(app: &mut App, x: u32, y: u32, button: u8) -> bool {
         return true;
     }
     if y >= BODY_TOP && y < HEIGHT - FOOTER_HEIGHT {
+        if !app.page.loaded {
+            if let Some(action) = start_action_at(x, y) {
+                execute_start_action(app, action);
+                return true;
+            }
+            return false;
+        }
         if let Some((offset, length)) = hit_link(app, x, y) {
             let href = unsafe { &mut *core::ptr::addr_of_mut!(CLICK_HREF) };
             let count = length as usize;
@@ -749,7 +817,44 @@ fn handle_click(app: &mut App, x: u32, y: u32, button: u8) -> bool {
     false
 }
 
+fn apply_hover(app: &mut App, text: &str) -> bool {
+    let length = text.len().min(URL_CAPACITY);
+    let changed = length != app.hover_len
+        || (length > 0 && app.hover[..length] != text.as_bytes()[..length]);
+    if changed {
+        app.hover_len = length;
+        if length > 0 {
+            app.hover[..length].copy_from_slice(&text.as_bytes()[..length]);
+        }
+        let cursor = u32::from(length > 0);
+        window::write_u32(app.window, window::FIELD_CURSOR, cursor);
+    }
+    changed
+}
+
 fn handle_move(app: &mut App, x: u32, y: u32, leave: bool) -> bool {
+    if leave {
+        return apply_hover(app, "");
+    }
+    if !app.page.loaded {
+        let text = match start_action_at(x, y) {
+            Some(StartAction::Search) => Some("SEARCH THE WEB, THEN PRESS ENTER"),
+            Some(StartAction::Url(url)) => Some(url),
+            Some(StartAction::Bookmark(index)) => {
+                let source = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
+                let length = unsafe {
+                    let bookmarks = &*core::ptr::addr_of!(BOOKMARKS);
+                    let length = bookmarks[index].url_len.min(URL_CAPACITY);
+                    source[..length].copy_from_slice(&bookmarks[index].url[..length]);
+                    length
+                };
+                let source = unsafe { &*core::ptr::addr_of!(BASE_URL) };
+                Some(core::str::from_utf8(&source[..length]).unwrap_or(""))
+            }
+            None => None,
+        };
+        return apply_hover(app, text.unwrap_or(""));
+    }
     let mut url = [0_u8; URL_CAPACITY];
     let mut length = 0usize;
     if !leave {
@@ -774,17 +879,7 @@ fn handle_move(app: &mut App, x: u32, y: u32, leave: bool) -> bool {
             }
         }
     }
-    let changed = length != app.hover_len
-        || (length > 0 && app.hover[..length] != url[..length]);
-    if changed {
-        app.hover_len = length;
-        if length > 0 {
-            app.hover[..length].copy_from_slice(&url[..length]);
-        }
-        let cursor = u32::from(length > 0);
-        window::write_u32(app.window, window::FIELD_CURSOR, cursor);
-    }
-    changed
+    apply_hover(app, core::str::from_utf8(&url[..length]).unwrap_or(""))
 }
 
 fn hit_link(app: &App, x: u32, y: u32) -> Option<(u32, u16)> {
@@ -948,6 +1043,7 @@ fn reset_active_view(app: &mut App) {
     app.address[0] = 0;
     app.focused = true;
     app.scroll = 0;
+    app.toast = "";
     app.page = PageState {
         loaded: false,
         loading: false,
@@ -1033,6 +1129,142 @@ fn image_height(app: &App) -> u32 {
     } else {
         0
     }
+}
+
+#[derive(Copy, Clone)]
+enum StartAction {
+    Search,
+    Url(&'static str),
+    Bookmark(usize),
+}
+
+fn start_action_at(x: u32, y: u32) -> Option<StartAction> {
+    if y >= TILE_Y && y < TILE_Y + TILE_HEIGHT {
+        for index in 0..QUICK_LINKS.len() {
+            let left = TILE_X + index as u32 * (TILE_WIDTH + TILE_GAP);
+            if x >= left && x < left + TILE_WIDTH {
+                let (_, url) = QUICK_LINKS[index];
+                return Some(if url.is_empty() {
+                    StartAction::Search
+                } else {
+                    StartAction::Url(url)
+                });
+            }
+        }
+        return None;
+    }
+    let count = unsafe { *core::ptr::addr_of!(BOOKMARK_COUNT) };
+    if count > 0 && y >= BOOKMARK_Y && y < BOOKMARK_Y + count as u32 * BOOKMARK_ROW {
+        let index = ((y - BOOKMARK_Y) / BOOKMARK_ROW) as usize;
+        if index < count && x >= 24 && x < WIDTH - 24 {
+            return Some(StartAction::Bookmark(index));
+        }
+    }
+    None
+}
+
+fn execute_start_action(app: &mut App, action: StartAction) {
+    match action {
+        StartAction::Search => {
+            app.focused = true;
+            app.address_len = 0;
+            app.address[0] = 0;
+            paint(app);
+        }
+        StartAction::Url(url) => begin_navigation(app, url, false, false),
+        StartAction::Bookmark(index) => {
+            let source = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
+            let length = unsafe {
+                let bookmarks = &*core::ptr::addr_of!(BOOKMARKS);
+                let length = bookmarks[index].url_len.min(URL_CAPACITY);
+                source[..length].copy_from_slice(&bookmarks[index].url[..length]);
+                length
+            };
+            let url = unsafe {
+                let source = &*core::ptr::addr_of!(BASE_URL);
+                core::str::from_utf8(&source[..length]).unwrap_or("")
+            };
+            begin_navigation(app, url, false, false);
+        }
+    }
+}
+
+fn show_start(app: &mut App) {
+    cancel_load(app);
+    clear_image(app);
+    clear_hover(app);
+    app.find_mode = false;
+    app.page.loaded = false;
+    app.page.loading = false;
+    app.page.status = 0;
+    app.page.error = "";
+    app.scroll = 0;
+    app.address_len = 0;
+    app.address[0] = 0;
+    app.focused = true;
+    {
+        let tab = &mut tabs()[app.active];
+        tab.loaded = false;
+        tab.status = 0;
+        tab.error = "";
+        tab.scroll = 0;
+        tab.url_len = 0;
+        tab.address_len = 0;
+        tab.title_len = 0;
+        tab.image_len = 0;
+    }
+    unsafe {
+        *core::ptr::addr_of_mut!(TEXT_LEN) = 0;
+        *core::ptr::addr_of_mut!(TITLE_LEN) = 0;
+        *core::ptr::addr_of_mut!(LINK_RUN_COUNT) = 0;
+        *core::ptr::addr_of_mut!(LINK_POOL_LEN) = 0;
+    }
+    paint(app);
+}
+
+fn bookmark_current(app: &mut App) {
+    let tab = tab_ref(app.active);
+    if !app.page.loaded || tab.url_len == 0 {
+        app.toast = "OPEN A PAGE FIRST";
+    } else {
+        let count = unsafe { *core::ptr::addr_of!(BOOKMARK_COUNT) };
+        let mut exists = false;
+        unsafe {
+            let bookmarks = &*core::ptr::addr_of!(BOOKMARKS);
+            for index in 0..count {
+                if bookmarks[index].url_len == tab.url_len
+                    && bookmarks[index].url[..tab.url_len] == tab.url[..tab.url_len]
+                {
+                    exists = true;
+                    break;
+                }
+            }
+        }
+        if exists {
+            app.toast = "ALREADY SAVED";
+        } else if count >= BOOKMARK_MAX {
+            app.toast = "BOOKMARKS FULL";
+        } else {
+            let title = if tab.title_len > 0 {
+                tab.title_text()
+            } else {
+                core::str::from_utf8(&tab.url[..tab.url_len]).unwrap_or("")
+            };
+            unsafe {
+                let bookmarks = &mut *core::ptr::addr_of_mut!(BOOKMARKS);
+                let slot = &mut bookmarks[count];
+                let title_len = title.len().min(BOOKMARK_TITLE);
+                slot.title[..title_len].copy_from_slice(&title.as_bytes()[..title_len]);
+                slot.title_len = title_len;
+                slot.url[..tab.url_len].copy_from_slice(&tab.url[..tab.url_len]);
+                slot.url_len = tab.url_len;
+                *core::ptr::addr_of_mut!(BOOKMARK_COUNT) = count + 1;
+            }
+            app.toast = "SAVED TO THE START PAGE";
+        }
+    }
+    app.toast_until = syscall::uptime_ticks().saturating_add(TOAST_TICKS);
+    paint(app);
 }
 
 fn clear_hover(app: &mut App) {
@@ -2973,6 +3205,7 @@ fn paint(app: &App) {
     draw_button(base, BUTTON_BACK_X, "<");
     draw_button(base, BUTTON_FORWARD_X, ">");
     draw_button(base, BUTTON_RELOAD_X, "R");
+    draw_button(base, BUTTON_HOME_X, "H");
 
     fill(base, ADDRESS_X, ADDRESS_Y, ADDRESS_WIDTH, ADDRESS_HEIGHT, COLOR_ADDRESS);
     fill(base, ADDRESS_X, ADDRESS_Y, ADDRESS_WIDTH, 1, COLOR_ADDRESS_BORDER);
@@ -3030,32 +3263,8 @@ fn paint(app: &App) {
     }
 
     if !app.page.loaded {
-        draw_text(base, 24, BODY_TOP + 28, 2, "WOLFSER", COLOR_TEXT);
-        draw_text(
-            base,
-            24,
-            BODY_TOP + 60,
-            1,
-            "A SMALL BROWSER FOR WEREWOLFOS",
-            COLOR_MUTED,
-        );
-        draw_text(
-            base,
-            24,
-            BODY_TOP + 78,
-            1,
-            "TYPE A SEARCH OR AN ADDRESS ABOVE AND PRESS ENTER",
-            COLOR_MUTED,
-        );
-        draw_text(
-            base,
-            24,
-            BODY_TOP + 96,
-            1,
-            "CTRL+T NEW TAB   CTRL+W CLOSE   CTRL+TAB SWITCH   CTRL+L ADDRESS   CTRL+Q QUIT",
-            COLOR_MUTED,
-        );
-        draw_footer(base, app, "READY");
+        draw_start_page(base, app);
+        draw_footer(base, app, "START");
         publish(base, window::STATE_READY);
         return;
     }
@@ -3072,6 +3281,80 @@ fn paint(app: &App) {
     };
     draw_footer(base, app, status);
     publish(base, window::STATE_READY);
+}
+
+fn draw_start_page(base: u64, app: &App) {
+    draw_text(base, 24, BODY_TOP + 12, 3, "WOLFSER", COLOR_TEXT);
+    draw_text(
+        base,
+        24,
+        BODY_TOP + 48,
+        1,
+        "SEARCH, READ AND KEEP A FEW PAGES",
+        COLOR_MUTED,
+    );
+    for index in 0..QUICK_LINKS.len() {
+        let x = TILE_X + index as u32 * (TILE_WIDTH + TILE_GAP);
+        fill(base, x, TILE_Y, TILE_WIDTH, TILE_HEIGHT, COLOR_TILE);
+        fill(base, x, TILE_Y, TILE_WIDTH, 1, COLOR_TILE_BORDER);
+        fill(base, x, TILE_Y + TILE_HEIGHT - 1, TILE_WIDTH, 1, COLOR_TILE_BORDER);
+        fill(base, x, TILE_Y, 1, TILE_HEIGHT, COLOR_TILE_BORDER);
+        fill(base, x + TILE_WIDTH - 1, TILE_Y, 1, TILE_HEIGHT, COLOR_TILE_BORDER);
+        draw_text(
+            base,
+            x + 14,
+            TILE_Y + 16,
+            2,
+            QUICK_LINKS[index].0,
+            COLOR_TEXT,
+        );
+        draw_text(
+            base,
+            x + 14,
+            TILE_Y + 50,
+            1,
+            QUICK_HINTS[index],
+            COLOR_MUTED,
+        );
+    }
+    draw_text(base, 24, BOOKMARK_Y - 30, 2, "SAVED PAGES", COLOR_TEXT);
+    let count = unsafe { *core::ptr::addr_of!(BOOKMARK_COUNT) };
+    if count == 0 {
+        draw_text(
+            base,
+            24,
+            BOOKMARK_Y,
+            1,
+            "PRESS CTRL+D ON A PAGE TO SAVE IT HERE",
+            COLOR_MUTED,
+        );
+    } else {
+        unsafe {
+            let bookmarks = &*core::ptr::addr_of!(BOOKMARKS);
+            for index in 0..count {
+                let bookmark = &bookmarks[index];
+                let y = BOOKMARK_Y + index as u32 * BOOKMARK_ROW;
+                let title = core::str::from_utf8(&bookmark.title[..bookmark.title_len])
+                    .unwrap_or("");
+                // The URL column starts at x=340; keep the scale-2 title clear
+                // of it (24 characters is 288 px from x=24).
+                let max = 24usize;
+                let end = core::cmp::min(title.len(), max);
+                draw_text(base, 24, y, 2, &title[..end], COLOR_TEXT);
+                let url = core::str::from_utf8(&bookmark.url[..bookmark.url_len]).unwrap_or("");
+                let end = core::cmp::min(url.len(), 88);
+                draw_text(base, 340, y + 2, 1, &url[..end], COLOR_MUTED);
+            }
+        }
+    }
+    draw_text(
+        base,
+        24,
+        HEIGHT - FOOTER_HEIGHT - 20,
+        1,
+        "CTRL+D SAVES THE CURRENT PAGE   ALT+HOME OPENS THIS START PAGE",
+        COLOR_MUTED,
+    );
 }
 
 fn draw_tabs(base: u64, app: &App) {
@@ -3270,6 +3553,10 @@ fn draw_footer(base: u64, app: &App, status: &str) {
         }
     }
     draw_text_bytes(base, 12, y, 1, &label[..length], COLOR_MUTED);
+    if !app.toast.is_empty() {
+        draw_text(base, 180, y, 1, app.toast, COLOR_MUTED);
+        return;
+    }
     if app.hover_len > 0 {
         let max = ((WIDTH - 200) / 6) as usize;
         let end = core::cmp::min(app.hover_len, max);

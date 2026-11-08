@@ -57,7 +57,10 @@ Redmi port is parked. The reference checklist is
   yet; a `line_len` check fixed it. `Ctrl+F` searches the rendered text,
   highlights all hits yellow and the current hit orange, shows `n/total` in the
   footer and Enter advances (wrapping). Partially scrolled lines are skipped
-  rather than clamped to the body top, which used to overlap the next line. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
+  rather than clamped to the body top, which used to overlap the next line.
+  A new tab or `Alt+Home`/the `H` button opens a start page with three quick
+  tiles and the pages saved by `Ctrl+D`; bookmarks live in a static array for
+  the session and need the future profile/SFS layer to persist. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
   repaints on `frame_seq` and sends keys, wheel and clicks through the ring.
   Verified headlessly: DDG results with links, clicking the first result through
   a DDG meta-refresh redirect to the Wikipedia reader view, Alt+Left back to
@@ -91,7 +94,7 @@ Redmi port is parked. The reference checklist is
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
 - **Next steps:** native TLS/`https://` (rustls/embedded-tls) for `wget` and a
-  viewer-independent browser; Wolfser inline images, bookmarks/start page and
+  viewer-independent browser; Wolfser inline images, persistent bookmarks and
   damage rectangles; Linux ABI for static musl binaries; headless
   Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB proof, GENI
   UART on `rain`, tablet, Redmi storage/power.
