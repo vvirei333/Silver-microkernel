@@ -579,9 +579,10 @@ file.
 
 Keys from the host (`Ctrl+L` edit the address, `Enter` go, `Ctrl+T` new tab,
 `Ctrl+W` close tab, `Ctrl+Tab` next tab, `Ctrl+F` find in page, `Ctrl+D`
-bookmark, `Alt+Home` start page, `Ctrl++`/`Ctrl+-`/`Ctrl+0` zoom the host
-window, `Ctrl+Q` quit, `Ctrl+R`/`F5` reload, `Alt+Left`/`Alt+Right` history,
-arrows and PageUp/PageDown/Home/End scroll) and
+bookmark, `Ctrl+G` edit the page's form field, `Alt+Home` start page,
+`Ctrl++`/`Ctrl+-`/`Ctrl+0` zoom the host window, `Ctrl+Q` quit, `Ctrl+R`/`F5`
+reload, `Alt+Left`/`Alt+Right` history, arrows and PageUp/PageDown/Home/End
+scroll) and
 mouse clicks/wheel travel through the ring;
 clicking a tab switches, `+` opens one and the small `x` closes it; typing
 anywhere starts a new search. Hovering a link shows its target in the footer
@@ -589,8 +590,10 @@ and switches to a hand cursor; a middle click or Ctrl+click opens the link in a
 new tab. `Ctrl+F` searches the rendered page, highlights every hit yellow and
 the current one orange, and Enter jumps to the next match. A new tab (or the
 `H` button / `Alt+Home`) opens a start page with quick links and the pages you
-saved with `Ctrl+D` (bookmarks are session-scoped until the profile layer
-lands). The guest repaints and bumps
+saved with `Ctrl+D` (stored in `/sfs/wolfser.bookmarks` and reloaded at
+startup). `Ctrl+G` opens the first text field of the page's form in the footer;
+Enter submits it with the form's GET/POST method, including hidden fields, and
+Esc cancels. The guest repaints and bumps
 `frame_seq` only after a memory barrier, so the host never sees a half-drawn
 frame. `tools/window-viewer` is a Qt6 Widgets + Network program and has a
 `--snapshot OUT.png` mode that works with `QT_QPA_PLATFORM=offscreen`, which is

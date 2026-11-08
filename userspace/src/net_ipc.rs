@@ -65,6 +65,10 @@ pub const CLIENT_SIZE: u64 = 1024 * 1024;
 pub const CLIENT_REQUEST: u64 = 0x0000;
 /// Where the server writes the HTTP body.
 pub const CLIENT_BODY: u64 = 0x4000;
+/// POST body: a `u16` length followed by `application/x-www-form-urlencoded`
+/// bytes. It sits above the URL slot and below the response body.
+pub const CLIENT_POST: u64 = 0x2000;
+pub const CLIENT_POST_MAX: usize = 512;
 /// Maximum request bytes we accept (host + path).
 pub const CLIENT_REQUEST_MAX: usize = CLIENT_BODY as usize - 2;
 /// Maximum body bytes the window can carry.
@@ -80,6 +84,9 @@ pub const OP_DNS: u8 = 9;
 pub const OP_DNS_REPLY: u8 = 10;
 /// Client -> server: fetch the `http://` URL in the window request slot.
 pub const OP_HTTP: u8 = 11;
+/// Client -> server: POST the URL in the request slot with the body at
+/// [`CLIENT_POST`].
+pub const OP_HTTP_POST: u8 = 15;
 /// Server -> client: `payload[1]` result code, `payload[2..4]` HTTP status,
 /// `payload[4..8]` body length; the body is at `CLIENT_BODY`.
 pub const OP_HTTP_REPLY: u8 = 12;
@@ -262,6 +269,14 @@ pub fn http_request() -> ipc::Message {
 pub fn http_request_id(id: u32) -> ipc::Message {
     let mut payload = [0_u8; 5];
     payload[0] = OP_HTTP;
+    payload[1..5].copy_from_slice(&id.to_le_bytes());
+    ipc::Message::new(0, &payload)
+}
+
+/// Client -> server: POST the URL in the request slot.
+pub fn http_post_request_id(id: u32) -> ipc::Message {
+    let mut payload = [0_u8; 5];
+    payload[0] = OP_HTTP_POST;
     payload[1..5].copy_from_slice(&id.to_le_bytes());
     ipc::Message::new(0, &payload)
 }

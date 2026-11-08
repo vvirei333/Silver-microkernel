@@ -79,7 +79,7 @@ const DNS_TIMEOUT_MILLIS: i64 = 8000;
 /// Largest host name, request path and request line we accept.
 const HOST_MAX: usize = 128;
 const PATH_MAX: usize = 384;
-const REQUEST_MAX: usize = 1024;
+const REQUEST_MAX: usize = 1536;
 /// A whole fetch (DNS + connect + transfer) is bounded from the request time.
 const HTTP_TIMEOUT_MILLIS: i64 = 20000;
 
@@ -330,7 +330,7 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
                         &mut outbox,
                     );
                 }
-                net_ipc::OP_HTTP => {
+                net_ipc::OP_HTTP | net_ipc::OP_HTTP_POST => {
                     start_http(
                         &mut message,
                         client_vaddr,
@@ -696,6 +696,9 @@ struct Fetch {
     sent: usize,
     received: usize,
     tls: bool,
+    post: bool,
+    post_body: [u8; net_ipc::CLIENT_POST_MAX],
+    post_len: usize,
     started_millis: i64,
     connect_started: bool,
     local_port: u16,
@@ -719,6 +722,9 @@ impl Fetch {
             sent: 0,
             received: 0,
             tls: false,
+            post: false,
+            post_body: [0; net_ipc::CLIENT_POST_MAX],
+            post_len: 0,
             started_millis: 0,
             connect_started: false,
             local_port: 0,
@@ -737,6 +743,7 @@ fn start_http(
     outbox: &mut Outbox,
 ) {
     let request_id = net_ipc::http_request_fields(message);
+    let post = message.payload[0] == net_ipc::OP_HTTP_POST;
     if fetch.stage != FetchStage::Idle {
         if fetch.requester != message.sender {
             outbox.push(
@@ -779,6 +786,29 @@ fn start_http(
     fetch.path_len = parsed.path.len();
     fetch.port = parsed.port;
     fetch.tls = parsed.tls;
+    fetch.post = post;
+    fetch.post_len = 0;
+    if post {
+        let length = unsafe {
+            core::ptr::read_volatile((client_base + net_ipc::CLIENT_POST) as *const u16) as usize
+        };
+        if length > net_ipc::CLIENT_POST_MAX {
+            outbox.push(
+                message.sender,
+                net_ipc::http_reply_id(request_id, net_ipc::NET_ERR_URL, 0, 0),
+            );
+            return;
+        }
+        fetch.post_len = length;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                (client_base + net_ipc::CLIENT_POST + 2) as *const u8,
+                fetch.post_body.as_mut_ptr(),
+                length,
+            );
+        }
+        net_ipc::fence();
+    }
     fetch.requester = message.sender;
     fetch.request_id = request_id;
     fetch.sent = 0;
@@ -1294,21 +1324,37 @@ fn parse_url(url: &str) -> Option<ParsedUrl<'_>> {
 
 fn build_request(fetch: &mut Fetch) {
     let mut length = 0usize;
-    let pieces: [&[u8]; 8] = [
-        b"GET ",
-        &fetch.path[..fetch.path_len],
-        b" HTTP/1.0\r\nHost: ",
-        &fetch.host[..fetch.host_len],
-        b"\r\nUser-Agent: WerewolfOS/0.1\r\nAccept: text/html,text/plain,*/*\r\n\
-          Accept-Encoding: identity\r\nConnection: close\r\n\r\n",
-        b"",
-        b"",
-        b"",
-    ];
-    for piece in pieces {
-        let count = piece.len().min(fetch.request.len() - length);
-        fetch.request[length..length + count].copy_from_slice(&piece[..count]);
+    let mut push = |bytes: &[u8]| {
+        let count = bytes.len().min(fetch.request.len() - length);
+        fetch.request[length..length + count].copy_from_slice(&bytes[..count]);
         length += count;
+    };
+    push(if fetch.post { b"POST " } else { b"GET " });
+    push(&fetch.path[..fetch.path_len]);
+    push(b" HTTP/1.0\r\nHost: ");
+    push(&fetch.host[..fetch.host_len]);
+    push(b"\r\nUser-Agent: WerewolfOS/0.1\r\nAccept: text/html,text/plain,*/*\r\nAccept-Encoding: identity\r\n");
+    if fetch.post {
+        push(b"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: ");
+        let mut digits = [0_u8; 6];
+        let mut count = 0usize;
+        let mut value = fetch.post_len;
+        loop {
+            digits[count] = b'0' + (value % 10) as u8;
+            value /= 10;
+            count += 1;
+            if value == 0 || count == digits.len() {
+                break;
+            }
+        }
+        for index in (0..count).rev() {
+            push(&digits[index..index + 1]);
+        }
+        push(b"\r\nConnection: close\r\n\r\n");
+        let body = fetch.post_len.min(net_ipc::CLIENT_POST_MAX);
+        push(&fetch.post_body[..body]);
+    } else {
+        push(b"Connection: close\r\n\r\n");
     }
     fetch.request_len = length;
 }

@@ -71,7 +71,10 @@ Redmi port is parked. The reference checklist is
   (no global CAP_FS_WRITE). Six tabs fit the strip, and `Ctrl++`/`Ctrl+-`/
   `Ctrl+0` resize/zoom the host window (input coordinates are scaled back).
   A small DNS cache in net_server keeps repeated navigation from re-resolving
-  every host. `Ctrl+F` searches the rendered text,
+  every host. Pages with a text input expose it through `Ctrl+G`: the footer
+  becomes an editable field, Enter submits the form's action with GET or POST
+  (hidden inputs included), and Esc cancels. POST uses the same guest TLS/HTTP
+  stack; the proxy fallback is disabled for POST. `Ctrl+F` searches the text,
   highlights all hits yellow and the current hit orange, shows `n/total` in the
   footer and Enter advances (wrapping). Partially scrolled lines are skipped
   rather than clamped to the body top, which used to overlap the next line.
@@ -111,8 +114,8 @@ Redmi port is parked. The reference checklist is
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
 - **Next steps:** native TLS/`https://` (rustls/embedded-tls) for `wget` and a
-  TLS hardening (roots, RTC, RNG, TLS 1.2); Wolfser forms/POST, keep-alive and
-  damage rectangles; Linux ABI for static musl binaries; headless
+  TLS hardening (roots, RTC, RNG, TLS 1.2); Wolfser full forms/widgets,
+  keep-alive and damage rectangles; Linux ABI for static musl binaries; headless
   Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB proof, GENI
   UART on `rain`, tablet, Redmi storage/power.
 

@@ -52,7 +52,7 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 | Init | Silverd resolves task ids (not cap ids) before grants | **pass** |
 | Capabilities | `CAP_MOUNT`/`CAP_POWER` outside `CAP_ALL`; shell owns `CAP_POWER` by kernel policy | **pass** |
 | Toolbox | multi-call `utils`: grep/wc/head/tail/cp/find/seq/dirname/sleep/true/false | **pass** |
-| Wolfser | `wolfser [query|url]`, search/address bar, clickable links, per-tab history, six cached tabs, three inline images (Qt decodes PNG/JPEG), find-in-page, start page with persistent bookmarks, hover status/hand cursor, middle-click new tab, host zoom, redirects; HTTP and HTTPS TLS 1.3 via smoltcp, Qt proxy as fallback; `--snapshot` sees a rendered frame | **pass** |
+| Wolfser | `wolfser [query|url]`, search/address bar, clickable links, per-tab history, six cached tabs, three inline images (Qt decodes PNG/JPEG), find-in-page, start page with persistent bookmarks, one-field GET/POST forms, hover status/hand cursor, middle-click new tab, host zoom, redirects; HTTP and HTTPS TLS 1.3 via smoltcp, Qt proxy as fallback; `--snapshot` sees a rendered frame | **pass** |
 | Power | `poweroff`/`reboot`; SMC on Qualcomm, HVC on QEMU | **implemented; QEMU PSCI caveat below** |
 | SMP | QEMU `-smp 4` selftest | **15 PASS / 0 FAIL** |
 | Fog QEMU | relocation, at-link, fail-closed park, timer | **PASS** |
@@ -92,9 +92,9 @@ describes a supported build.
    back/forward history, four tabs with cached pages, 3xx and meta-refresh
    redirects, word wrap, headings, reader-mode content selection, a
    three inline images, find-in-page, a start page with persistent bookmarks,
-   six tabs and host zoom work. CSS layout, HTML forms/POST, keep-alive and
-   more tabs do not yet; the Linux ABI/Phosh track replaces the renderer with a
-   real engine later.
+   six tabs, host zoom and one-field GET/POST forms work. CSS layout, full
+   forms/widgets, keep-alive and more tabs do not yet; the Linux ABI/Phosh
+   track replaces the renderer with a real engine later.
 6. **Linux ABI/Phosh are not started.** The kernel personality layer, static
    musl binaries, headless Wayland and the Phosh stack are the active
    long-term track; see [`VECTOR.md`](VECTOR.md).
@@ -135,8 +135,8 @@ network driver reports a probe failure and the shell continues.
 
 1. Harden TLS: more roots, RTC-backed certificate time, a real entropy source
    and a TLS 1.2 fallback.
-2. Wolfser: HTML forms/POST, keep-alive, damage rectangles and more than six
-   tabs.
+2. Wolfser: full forms/widgets, keep-alive, damage rectangles and more than
+   six tabs.
 3. Window transport on real hardware (host-side streaming or a local console).
 4. Linux ABI: static musl binaries, then busybox `sh`.
 5. Phosh: headless Wayland, GTK software render, D-Bus + logind stub, `phosh`.

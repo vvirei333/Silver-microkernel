@@ -170,6 +170,7 @@ struct App {
     find_index: usize,
     toast_until: u64,
     toast: &'static str,
+    form_editing: bool,
     page: PageState,
     pending: Option<Pending>,
 }
@@ -192,6 +193,9 @@ struct Pending {
     from_history: bool,
     retries: u8,
     fallback_host: bool,
+    post: bool,
+    post_body: [u8; net_ipc::CLIENT_POST_MAX],
+    post_len: usize,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -337,6 +341,34 @@ static mut BOOKMARKS: [Bookmark; BOOKMARK_MAX] = [Bookmark::EMPTY; BOOKMARK_MAX]
 static mut BOOKMARK_COUNT: usize = 0;
 static mut BOOKMARK_FILE: [u8; BOOKMARK_FILE_LIMIT] = [0; BOOKMARK_FILE_LIMIT];
 
+#[derive(Copy, Clone)]
+struct HiddenField {
+    name: [u8; 48],
+    name_len: usize,
+    value: [u8; 96],
+    value_len: usize,
+}
+
+impl HiddenField {
+    const EMPTY: HiddenField = HiddenField {
+        name: [0; 48],
+        name_len: 0,
+        value: [0; 96],
+        value_len: 0,
+    };
+}
+
+static mut FORM_PRESENT: bool = false;
+static mut FORM_POST: bool = false;
+static mut FORM_ACTION: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
+static mut FORM_ACTION_LEN: usize = 0;
+static mut FORM_NAME: [u8; 64] = [0; 64];
+static mut FORM_NAME_LEN: usize = 0;
+static mut FORM_VALUE: [u8; 256] = [0; 256];
+static mut FORM_VALUE_LEN: usize = 0;
+static mut FORM_HIDDEN: [HiddenField; 8] = [HiddenField::EMPTY; 8];
+static mut FORM_HIDDEN_COUNT: usize = 0;
+
 static mut TABS: [Tab; TAB_MAX] = [Tab::EMPTY; TAB_MAX];
 
 static mut TEXT: [u8; TEXT_CAPACITY] = [0; TEXT_CAPACITY];
@@ -424,6 +456,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         find_index: 0,
         toast_until: 0,
         toast: "",
+        form_editing: false,
         page: PageState {
             loaded: false,
             loading: false,
@@ -538,6 +571,7 @@ fn handle_key(app: &mut App, key: u16) -> bool {
         if app.find_mode {
             app.find_mode = false;
         } else {
+            app.form_editing = false;
             app.find_mode = true;
             app.find_len = 0;
             app.find_total = 0;
@@ -551,10 +585,30 @@ fn handle_key(app: &mut App, key: u16) -> bool {
     }
     if key == window::KEY_FOCUS {
         app.find_mode = false;
+        app.form_editing = false;
         app.focused = true;
         app.address_len = 0;
         app.address[0] = 0;
         return true;
+    }
+    if key == window::KEY_FORM {
+        if form_present() {
+            if app.form_editing {
+                app.form_editing = false;
+            } else {
+                app.form_editing = true;
+                app.find_mode = false;
+                app.focused = false;
+                unsafe {
+                    *core::ptr::addr_of_mut!(FORM_VALUE_LEN) = 0;
+                }
+            }
+            return true;
+        }
+        return false;
+    }
+    if app.form_editing {
+        return handle_form_key(app, key);
     }
     if app.find_mode {
         return handle_find_key(app, key);
@@ -778,6 +832,135 @@ fn focus_match(app: &mut App, target: usize) {
         }
         start = end + 1;
     }
+}
+
+fn handle_form_key(app: &mut App, key: u16) -> bool {
+    match key {
+        window::KEY_ENTER => {
+            submit_form(app);
+            true
+        }
+        window::KEY_ESCAPE => {
+            app.form_editing = false;
+            true
+        }
+        window::KEY_BACKSPACE => unsafe {
+            if *core::ptr::addr_of!(FORM_VALUE_LEN) > 0 {
+                *core::ptr::addr_of_mut!(FORM_VALUE_LEN) =
+                    *core::ptr::addr_of!(FORM_VALUE_LEN) - 1;
+                true
+            } else {
+                false
+            }
+        },
+        key if (0x20..0x7F).contains(&key) => unsafe {
+            let length = *core::ptr::addr_of!(FORM_VALUE_LEN);
+            let value = &mut *core::ptr::addr_of_mut!(FORM_VALUE);
+            if length + 1 < value.len() {
+                value[length] = key as u8;
+                *core::ptr::addr_of_mut!(FORM_VALUE_LEN) = length + 1;
+                true
+            } else {
+                false
+            }
+        },
+        _ => false,
+    }
+}
+
+fn form_encode(source: &[u8], output: &mut [u8]) -> usize {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut length = 0usize;
+    for &byte in source {
+        if length + 3 >= output.len() {
+            break;
+        }
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            output[length] = byte;
+            length += 1;
+        } else {
+            output[length] = b'%';
+            output[length + 1] = HEX[(byte >> 4) as usize];
+            output[length + 2] = HEX[(byte & 0xF) as usize];
+            length += 3;
+        }
+    }
+    length
+}
+
+fn build_form_query(output: &mut [u8; net_ipc::CLIENT_POST_MAX]) -> usize {
+    unsafe {
+        let name = &*core::ptr::addr_of!(FORM_NAME);
+        let name_len = *core::ptr::addr_of!(FORM_NAME_LEN);
+        let value = &*core::ptr::addr_of!(FORM_VALUE);
+        let value_len = *core::ptr::addr_of!(FORM_VALUE_LEN);
+        let mut length = form_encode(&name[..name_len], output);
+        if length < output.len() {
+            output[length] = b'=';
+            length += 1;
+        }
+        length += form_encode(&value[..value_len], &mut output[length..]);
+
+        let hidden = &*core::ptr::addr_of!(FORM_HIDDEN);
+        let hidden_count = *core::ptr::addr_of!(FORM_HIDDEN_COUNT);
+        for field in &hidden[..hidden_count] {
+            let field_name = &field.name[..field.name_len];
+            if field_name.eq_ignore_ascii_case(&name[..name_len]) {
+                continue;
+            }
+            if length + 3 >= output.len() {
+                break;
+            }
+            output[length] = b'&';
+            length += 1;
+            length += form_encode(field_name, &mut output[length..]);
+            if length < output.len() {
+                output[length] = b'=';
+                length += 1;
+            }
+            length += form_encode(&field.value[..field.value_len], &mut output[length..]);
+        }
+        length
+    }
+}
+
+fn submit_form(app: &mut App) {
+    let action_len = unsafe { *core::ptr::addr_of!(FORM_ACTION_LEN) };
+    if action_len == 0 {
+        return;
+    }
+    let mut action = [0_u8; URL_CAPACITY];
+    unsafe {
+        let source = &*core::ptr::addr_of!(FORM_ACTION);
+        action[..action_len].copy_from_slice(&source[..action_len]);
+    }
+    let mut query = [0_u8; net_ipc::CLIENT_POST_MAX];
+    let query_len = build_form_query(&mut query);
+    let post = unsafe { *core::ptr::addr_of!(FORM_POST) };
+    if post {
+        let text = core::str::from_utf8(&action[..action_len]).unwrap_or("");
+        begin_navigation_post(app, text, &query[..query_len]);
+    } else {
+        let mut url = [0_u8; URL_CAPACITY];
+        let mut length = action_len;
+        url[..length].copy_from_slice(&action[..length]);
+        if length > 0 && url[length - 1] != b'?' && url[length - 1] != b'&' {
+            if length + 1 < url.len() {
+                url[length] = if action[..action_len].contains(&b'?') {
+                    b'&'
+                } else {
+                    b'?'
+                };
+                length += 1;
+            }
+        }
+        let count = query_len.min(url.len() - length);
+        url[length..length + count].copy_from_slice(&query[..count]);
+        length += count;
+        let text = core::str::from_utf8(&url[..length]).unwrap_or("");
+        begin_navigation(app, text, false, false);
+    }
+    app.form_editing = false;
 }
 
 fn handle_click(app: &mut App, x: u32, y: u32, button: u8) -> bool {
@@ -1124,6 +1307,17 @@ fn clear_image_view(app: &mut App) {
     }
 }
 
+fn clear_form(app: &mut App) {
+    app.form_editing = false;
+    unsafe {
+        *core::ptr::addr_of_mut!(FORM_PRESENT) = false;
+        *core::ptr::addr_of_mut!(FORM_ACTION_LEN) = 0;
+        *core::ptr::addr_of_mut!(FORM_NAME_LEN) = 0;
+        *core::ptr::addr_of_mut!(FORM_VALUE_LEN) = 0;
+        *core::ptr::addr_of_mut!(FORM_HIDDEN_COUNT) = 0;
+    }
+}
+
 fn clear_images(app: &mut App) {
     clear_image_view(app);
     unsafe {
@@ -1426,6 +1620,7 @@ fn save_bookmarks() -> u8 {
 fn show_start(app: &mut App) {
     cancel_load(app);
     clear_images(app);
+    clear_form(app);
     clear_hover(app);
     app.find_mode = false;
     app.page.loaded = false;
@@ -1554,6 +1749,7 @@ fn switch_tab(app: &mut App, slot: usize) {
     cancel_load(app);
     clear_hover(app);
     clear_images(app);
+    clear_form(app);
     app.find_mode = false;
     save_active(app);
     restore_active(app, slot);
@@ -1573,6 +1769,7 @@ fn new_tab(app: &mut App) -> bool {
     tabs[slot].open = true;
     clear_hover(app);
     clear_images(app);
+    clear_form(app);
     restore_active(app, slot);
     reset_active_view(app);
     paint(app);
@@ -1588,6 +1785,7 @@ fn close_tab(app: &mut App, slot: usize) {
         cancel_load(app);
         clear_hover(app);
         clear_images(app);
+        clear_form(app);
     }
     {
         let tabs = tabs();
@@ -1747,6 +1945,7 @@ fn go_history(app: &mut App, delta: i32) {
 
 fn begin_navigation(app: &mut App, url: &str, from_history: bool, keep_address: bool) {
     clear_images(app);
+    clear_form(app);
     app.find_mode = false;
     app.hover_len = 0;
     window::write_u32(app.window, window::FIELD_CURSOR, 0);
@@ -1761,7 +1960,24 @@ fn begin_navigation(app: &mut App, url: &str, from_history: bool, keep_address: 
     app.focused = false;
     // Show the loading frame before a possible DHCP wait or a host round trip.
     paint(app);
-    start_fetch(app, url, 0, from_history, 0);
+    start_fetch_inner(app, url, 0, from_history, 0, None);
+}
+
+fn begin_navigation_post(app: &mut App, url: &str, body: &[u8]) {
+    clear_images(app);
+    clear_form(app);
+    app.find_mode = false;
+    app.hover_len = 0;
+    window::write_u32(app.window, window::FIELD_CURSOR, 0);
+    app.page.loading = true;
+    app.page.error = "";
+    app.page.status = 0;
+    app.scroll = 0;
+    app.pending = None;
+    set_address(app, url);
+    app.focused = false;
+    paint(app);
+    start_fetch_inner(app, url, 0, false, 0, Some(body));
 }
 
 fn start_fetch(
@@ -1770,6 +1986,17 @@ fn start_fetch(
     hops: u8,
     from_history: bool,
     retries: u8,
+) {
+    start_fetch_inner(app, url, hops, from_history, retries, None);
+}
+
+fn start_fetch_inner(
+    app: &mut App,
+    url: &str,
+    hops: u8,
+    from_history: bool,
+    retries: u8,
+    post: Option<&[u8]>,
 ) {
     if url.len() >= URL_CAPACITY {
         fail_page(app, "URL IS TOO LONG");
@@ -1781,7 +2008,9 @@ fn start_fetch(
         // root store does not know.
         if app.server != 0 && app.net_base != 0 {
             let fallback = window::read_u32(app.window, window::FIELD_WEB_CAPABLE) != 0;
-            start_guest_fetch(app, url, hops, from_history, retries, fallback);
+            start_guest_fetch(app, url, hops, from_history, retries, fallback, post);
+        } else if post.is_some() {
+            fail_page(app, "POST NEEDS THE GUEST NETWORK SERVER");
         } else if window::read_u32(app.window, window::FIELD_WEB_CAPABLE) != 0 {
             start_host_fetch(app, url, hops, from_history, retries);
         } else {
@@ -1796,7 +2025,7 @@ fn start_fetch(
         fail_page(app, "ONLY http:// AND https:// URLS ARE SUPPORTED");
         return;
     }
-    start_guest_fetch(app, url, hops, from_history, retries, false);
+    start_guest_fetch(app, url, hops, from_history, retries, false, post);
 }
 
 fn start_guest_fetch(
@@ -1806,6 +2035,7 @@ fn start_guest_fetch(
     from_history: bool,
     retries: u8,
     fallback_host: bool,
+    post: Option<&[u8]>,
 ) {
     if app.server == 0 || app.net_base == 0 {
         fail_page(app, "NETWORK SERVER IS NOT RUNNING");
@@ -1816,12 +2046,34 @@ fn start_guest_fetch(
         fail_page(app, "URL IS TOO LONG FOR THE NETWORK SERVER");
         return;
     }
+    let post_len = post.map_or(0, |body| body.len().min(net_ipc::CLIENT_POST_MAX));
+    if post.is_some() {
+        unsafe {
+            core::ptr::write_volatile(
+                (app.net_base + net_ipc::CLIENT_POST) as *mut u16,
+                post_len as u16,
+            );
+            if post_len > 0 {
+                core::ptr::copy_nonoverlapping(
+                    post.unwrap().as_ptr(),
+                    (app.net_base + net_ipc::CLIENT_POST + 2) as *mut u8,
+                    post_len,
+                );
+            }
+        }
+        net_ipc::fence();
+    }
     let request_id = unsafe {
         let next = (*core::ptr::addr_of!(REQUEST_ID)).wrapping_add(1);
         *core::ptr::addr_of_mut!(REQUEST_ID) = next;
         next
     };
-    if !syscall::send(app.server, &net_ipc::http_request_id(request_id)) {
+    let message = if post.is_some() {
+        net_ipc::http_post_request_id(request_id)
+    } else {
+        net_ipc::http_request_id(request_id)
+    };
+    if !syscall::send(app.server, &message) {
         fail_page(app, "NETWORK SERVER IS NOT RESPONDING");
         return;
     }
@@ -1836,10 +2088,16 @@ fn start_guest_fetch(
         from_history,
         retries,
         fallback_host,
+        post: post.is_some(),
+        post_body: [0; net_ipc::CLIENT_POST_MAX],
+        post_len,
     });
     if let Some(pending) = app.pending.as_mut() {
         pending.url[..url.len()].copy_from_slice(url.as_bytes());
         pending.url_len = url.len();
+        if post_len > 0 {
+            pending.post_body[..post_len].copy_from_slice(&post.unwrap()[..post_len]);
+        }
     }
 }
 
@@ -1878,6 +2136,9 @@ fn start_host_fetch(
         from_history,
         retries,
         fallback_host: false,
+        post: false,
+        post_body: [0; net_ipc::CLIENT_POST_MAX],
+        post_len: 0,
     });
     if let Some(pending) = app.pending.as_mut() {
         pending.url[..url.len()].copy_from_slice(url.as_bytes());
@@ -1938,6 +2199,10 @@ fn retry_guest(app: &mut App) -> bool {
     let hops = pending.hops;
     let from_history = pending.from_history;
     let length = pending.url_len;
+    let post = pending.post;
+    let post_len = pending.post_len;
+    let mut post_body = [0_u8; net_ipc::CLIENT_POST_MAX];
+    post_body[..post_len].copy_from_slice(&pending.post_body[..post_len]);
     let url = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
     url[..length].copy_from_slice(&pending.url[..length]);
     app.pending = None;
@@ -1949,7 +2214,14 @@ fn retry_guest(app: &mut App) -> bool {
     app.page.loading = true;
     app.page.error = "";
     paint(app);
-    start_fetch(app, text, hops, from_history, retries + 1);
+    start_fetch_inner(
+        app,
+        text,
+        hops,
+        from_history,
+        retries + 1,
+        if post { Some(&post_body[..post_len]) } else { None },
+    );
     true
 }
 
@@ -1957,7 +2229,7 @@ fn retry_host(app: &mut App) -> bool {
     let Some(pending) = app.pending.as_ref() else {
         return false;
     };
-    if pending.retries >= 1 {
+    if pending.retries >= 1 || pending.post {
         return false;
     }
     let retries = pending.retries;
@@ -1981,7 +2253,7 @@ fn fallback_to_host(app: &mut App) -> bool {
     let Some(pending) = app.pending.as_ref() else {
         return false;
     };
-    if !pending.fallback_host || pending.url_len == 0 {
+    if !pending.fallback_host || pending.post || pending.url_len == 0 {
         return false;
     }
     let hops = pending.hops;
@@ -2489,6 +2761,11 @@ fn extract(body: &[u8], page_url: &str) {
         *core::ptr::addr_of_mut!(LINK_POOL_LEN) = 0;
         *core::ptr::addr_of_mut!(PAGE_REDIRECT_LEN) = 0;
         *core::ptr::addr_of_mut!(PAGE_IMAGE_COUNT) = 0;
+        *core::ptr::addr_of_mut!(FORM_PRESENT) = false;
+        *core::ptr::addr_of_mut!(FORM_ACTION_LEN) = 0;
+        *core::ptr::addr_of_mut!(FORM_NAME_LEN) = 0;
+        *core::ptr::addr_of_mut!(FORM_VALUE_LEN) = 0;
+        *core::ptr::addr_of_mut!(FORM_HIDDEN_COUNT) = 0;
     }
 
     let mut writer = Writer {
@@ -2519,6 +2796,8 @@ fn extract(body: &[u8], page_url: &str) {
         writer.push_title(value);
     }
 
+    let mut in_form = false;
+    let mut form_has_field = false;
     let mut index = 0usize;
     while index < body.len() && writer.len + 4 < TEXT_CAPACITY {
         let byte = body[index];
@@ -2570,6 +2849,27 @@ fn extract(body: &[u8], page_url: &str) {
                         if let Some(content) = tag_attribute(tag, b"content") {
                             store_meta_redirect(content);
                         }
+                    }
+                }
+                continue;
+            }
+            if tag_eq(name, b"form") {
+                if closing {
+                    in_form = false;
+                } else if !in_form && !form_present() {
+                    in_form = true;
+                    form_has_field = false;
+                    store_form_action(tag, page_url);
+                }
+                continue;
+            }
+            if tag_eq(name, b"input") && !closing && in_form {
+                let kind = tag_attribute(tag, b"type").unwrap_or(b"text");
+                if kind.eq_ignore_ascii_case(b"hidden") {
+                    store_form_hidden(tag);
+                } else if !form_has_field && !form_present() {
+                    if store_form_field(tag) {
+                        form_has_field = true;
                     }
                 }
                 continue;
@@ -2954,6 +3254,118 @@ fn scan_images(body: &[u8], start: usize, end: usize, page_url: &str, line: u16)
             index += 1;
         }
     }
+}
+
+fn form_present() -> bool {
+    unsafe { *core::ptr::addr_of!(FORM_PRESENT) }
+}
+
+fn decode_attribute(value: &[u8], output: &mut [u8]) -> usize {
+    let mut length = 0usize;
+    let mut index = 0usize;
+    while index < value.len() && length + 1 < output.len() {
+        let byte = value[index];
+        if byte == b'&' {
+            if let Some((character, after)) = decode_entity(value, index) {
+                output[length] = character;
+                length += 1;
+                index = after;
+                continue;
+            }
+        }
+        output[length] = byte;
+        length += 1;
+        index += 1;
+    }
+    length
+}
+
+fn store_form_action(tag: &[u8], page_url: &str) {
+    let action = tag_attribute(tag, b"action").unwrap_or(b"");
+    let mut raw = [0_u8; URL_CAPACITY];
+    let length = decode_attribute(action, &mut raw);
+    let text = core::str::from_utf8(&raw[..length]).unwrap_or("");
+    let destination = unsafe { &mut *core::ptr::addr_of_mut!(FORM_ACTION) };
+    let resolved = if length == 0 {
+        let count = page_url.len().min(URL_CAPACITY - 1);
+        destination[..count].copy_from_slice(&page_url.as_bytes()[..count]);
+        Some(count)
+    } else {
+        resolve_link(page_url, text, destination)
+    };
+    unsafe {
+        *core::ptr::addr_of_mut!(FORM_ACTION_LEN) = resolved.unwrap_or(0);
+        let method = tag_attribute(tag, b"method").unwrap_or(b"get");
+        *core::ptr::addr_of_mut!(FORM_POST) = method.eq_ignore_ascii_case(b"post");
+    }
+}
+
+fn store_form_hidden(tag: &[u8]) {
+    let count = unsafe { *core::ptr::addr_of!(FORM_HIDDEN_COUNT) };
+    if count >= 8 {
+        return;
+    }
+    let Some(name) = tag_attribute(tag, b"name") else {
+        return;
+    };
+    if name.is_empty() {
+        return;
+    }
+    unsafe {
+        let hidden = &mut *core::ptr::addr_of_mut!(FORM_HIDDEN);
+        let slot = &mut hidden[count];
+        let length = name.len().min(slot.name.len());
+        slot.name[..length].copy_from_slice(&name[..length]);
+        slot.name_len = length;
+        let value = tag_attribute(tag, b"value").unwrap_or(b"");
+        let length = decode_attribute(value, &mut slot.value);
+        slot.value_len = length;
+        *core::ptr::addr_of_mut!(FORM_HIDDEN_COUNT) = count + 1;
+    }
+}
+
+fn store_form_field(tag: &[u8]) -> bool {
+    if let Some(kind) = tag_attribute(tag, b"type") {
+        if !kind.is_empty()
+            && !kind.eq_ignore_ascii_case(b"text")
+            && !kind.eq_ignore_ascii_case(b"search")
+        {
+            return false;
+        }
+    }
+    let Some(name) = tag_attribute(tag, b"name") else {
+        return false;
+    };
+    if name.is_empty() {
+        return false;
+    }
+    // Skip JS state/CSRF-ish fields so the visible search box wins (DuckDuckGo
+    // puts `state_hidden` before its real `q` input).
+    for bad in [
+        &b"hidden"[..],
+        &b"csrf"[..],
+        &b"token"[..],
+        &b"captcha"[..],
+        &b"state"[..],
+        &b"nonce"[..],
+    ] {
+        if contains_ignore_case(name, bad) {
+            return false;
+        }
+    }
+    unsafe {
+        let field = &mut *core::ptr::addr_of_mut!(FORM_NAME);
+        let length = name.len().min(field.len() - 1);
+        field[..length].copy_from_slice(&name[..length]);
+        *core::ptr::addr_of_mut!(FORM_NAME_LEN) = length;
+
+        let value = tag_attribute(tag, b"value").unwrap_or(b"");
+        let slot = &mut *core::ptr::addr_of_mut!(FORM_VALUE);
+        let length = decode_attribute(value, slot);
+        *core::ptr::addr_of_mut!(FORM_VALUE_LEN) = length;
+        *core::ptr::addr_of_mut!(FORM_PRESENT) = true;
+    }
+    true
 }
 
 fn store_image(tag: &[u8], page_url: &str, line: u16) {
@@ -3801,6 +4213,42 @@ fn draw_footer(base: u64, app: &App, status: &str) {
         COLOR_FOOTER,
     );
     let mut y = HEIGHT - 12;
+    if app.form_editing {
+        fill(
+            base,
+            0,
+            HEIGHT - FOOTER_HEIGHT,
+            WIDTH,
+            FOOTER_HEIGHT,
+            COLOR_FIND,
+        );
+        draw_text(base, 12, y, 1, "FORM:", COLOR_TEXT);
+        unsafe {
+            let name = &*core::ptr::addr_of!(FORM_NAME);
+            let name_len = *core::ptr::addr_of!(FORM_NAME_LEN);
+            let value = &*core::ptr::addr_of!(FORM_VALUE);
+            let value_len = *core::ptr::addr_of!(FORM_VALUE_LEN);
+            let name = core::str::from_utf8(&name[..name_len]).unwrap_or("");
+            draw_text(base, 54, y, 1, name, COLOR_TEXT);
+            let equals_x = 54 + name.len() as u32 * 6;
+            draw_text(base, equals_x, y, 1, "=[", COLOR_MUTED);
+            let value_x = equals_x + 12;
+            let max = ((WIDTH - 180 - value_x) / 6) as usize;
+            let end = core::cmp::min(value_len, max);
+            let value = core::str::from_utf8(&value[..end]).unwrap_or("");
+            draw_text(base, value_x, y, 1, value, COLOR_TEXT);
+            fill(base, value_x + end as u32 * 6, y - 1, 1, 10, COLOR_TEXT);
+        }
+        draw_text(
+            base,
+            WIDTH - 150,
+            y,
+            1,
+            "ENTER SUBMIT  ESC CANCEL",
+            COLOR_MUTED,
+        );
+        return;
+    }
     if app.find_mode {
         fill(
             base,
@@ -3885,7 +4333,11 @@ fn draw_footer(base: u64, app: &App, status: &str) {
         draw_text(base, 180, y, 1, url, COLOR_LINK);
         return;
     }
-    let hint = "CTRL+T NEW  CTRL+W CLOSE  CTRL+TAB NEXT  CTRL+L ADDRESS  ALT+LEFT/RIGHT  CTRL+Q QUIT";
+    let hint = if form_present() {
+        "CTRL+G FORM  CTRL+T NEW  CTRL+W CLOSE  CTRL+TAB NEXT  CTRL+L ADDRESS  CTRL+Q QUIT"
+    } else {
+        "CTRL+T NEW  CTRL+W CLOSE  CTRL+TAB NEXT  CTRL+L ADDRESS  ALT+LEFT/RIGHT  CTRL+Q QUIT"
+    };
     let width = hint.len() as u32 * 6;
     draw_text(
         base,

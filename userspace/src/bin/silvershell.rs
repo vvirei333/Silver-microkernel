@@ -551,7 +551,7 @@ fn net_error_text(code: u8) -> &'static str {
         net_ipc::NET_ERR_CONNECT => "connection failed",
         net_ipc::NET_ERR_TIMEOUT => "timed out",
         net_ipc::NET_ERR_URL => "invalid URL",
-        net_ipc::NET_ERR_TLS => "https is not supported yet (http:// only)",
+        net_ipc::NET_ERR_TLS => "TLS handshake or certificate verification failed",
         net_ipc::NET_ERR_RESPONSE => "malformed HTTP response (or no A record)",
         net_ipc::NET_ERR_BUSY => "network server busy",
         net_ipc::NET_REDIRECT => "redirect (open it in wolfser)",
@@ -655,7 +655,7 @@ fn wolfser_command(url: Option<&str>) {
 
 fn wget_command(url: Option<&str>, destination: Option<&str>) {
     let Some(url) = url else {
-        syscall::print("usage: wget <http://host/path> [file]\r\n");
+        syscall::print("usage: wget <http(s)://host/path> [file]\r\n");
         return;
     };
     let destination = destination.unwrap_or("/tmp/index.html");
@@ -706,10 +706,15 @@ fn wget_command(url: Option<&str>, destination: Option<&str>) {
         return;
     };
     // FS write is capped at 4 KiB per syscall, so stream the body in chunks.
+    // SFS caps a file at 512 KiB; a larger page is deliberately truncated
+    // instead of making every write fail silently.
+    const WGET_LIMIT: usize = 512 * 1024;
+    let available = body_len as usize;
+    let keep = available.min(WGET_LIMIT);
     let body = unsafe {
         core::slice::from_raw_parts(
             (base + net_ipc::CLIENT_BODY) as *const u8,
-            body_len as usize,
+            keep,
         )
     };
     let mut written = 0usize;
@@ -728,9 +733,14 @@ fn wget_command(url: Option<&str>, destination: Option<&str>) {
     syscall::print("wget: HTTP ");
     syscall::print_dec_u64(u64::from(status));
     syscall::print(", ");
-    syscall::print_dec_u64(u64::from(body_len));
+    syscall::print_dec_u64(keep as u64);
     syscall::print(" bytes -> ");
     syscall::print(destination);
+    if available > keep {
+        syscall::print(" (truncated from ");
+        syscall::print_dec_u64(available as u64);
+        syscall::print(")");
+    }
     syscall::print("\r\n");
 }
 
