@@ -7,28 +7,35 @@ The architecture is inspired by XNU, Redox and other proven systems, but the
 interfaces, capability model, SFS format and userspace are original.
 
 Active target: QEMU `virt` (ARM Virt Board), Cortex-A72, developed from a
-Linux desktop. The product is a **console OS**; the browser is a separate
-window rendered on the host. **Linux ABI + Phosh is the active long-term
-goal** (owner decision: months, not years). The Legion Y700 tablet target is
-forgotten; the Redmi 10C hardware port is parked until the OS layer is ready
-(see [redmi10c_poc/README.md](redmi10c_poc/README.md)).
+Linux desktop. The product is a **console OS that provides the base OS**
+(kernel, drivers, network, files); applications — including the browser — come
+from Linux through the compatibility layer. **Linux ABI + Phosh is the active
+long-term goal** (owner decision: months, not years). The Legion Y700 tablet
+target is forgotten; the Redmi 10C hardware port is parked until the OS layer
+is ready (see [redmi10c_poc/README.md](redmi10c_poc/README.md)).
 
-## Project direction (2026-11-08)
+## Project direction (2026-11-09)
 
-The project is a **console-first OS**. The compositor, home screen, input
-driver, kernel surfaces and every framebuffer profile were removed on purpose:
-they pulled the project toward a full graphical OS outside the chosen vector.
+The project is a **console-first OS that provides the base OS**: kernel,
+drivers, networking, files and basic operations stay native. Applications —
+including the browser — come **from Linux through a compatibility layer**
+instead of being rewritten in the native userspace. **Linux ABI + Phosh is the
+active goal**; Wolfser is a temporary browser (a stopgap) and is not the
+product path.
 
 Active vector:
 
-1. **Console OS**: Silver kernel + SFS + network + Howl + Unix toolbox.
-2. **Browser in a separate window**: the guest draws into one shared RGBA
-   surface; a Qt window on the host displays it and forwards input. No guest
-   compositor.
-3. **Linux ABI + Phosh**: a kernel personality layer for Linux syscalls,
-   then a software-rendered headless Wayland stack exported into the same host
-   window. This is the active goal; see
-   [`docs/VECTOR.md`](docs/VECTOR.md).
+1. **Console OS / base**: Silver kernel + SFS + network + Howl + Unix toolbox.
+   `net_server`/smoltcp (DHCP, DNS, TCP, HTTP, TLS) is deliberately ours.
+2. **Linux ABI module**: an optional (`linux-abi`) layer that loads foreign
+   AArch64 ELFs, implements the Linux syscall personality and maps it onto our
+   VFS and drivers. With the feature off, none of it is linked in.
+3. **Phosh**: a software-rendered headless Wayland stack on top of the Linux
+   layer, exported into a host window.
+
+Wolfser (the guest litehtml browser in the host-Qt window) remains available
+so pages can be viewed before the Linux stack is ready, but it is frozen
+except for bug fixes. See [`docs/VECTOR.md`](docs/VECTOR.md).
 
 The tablet is out. Hardware phones are parked behind the QEMU/desktop
 milestone.

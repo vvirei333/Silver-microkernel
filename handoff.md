@@ -3,13 +3,15 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## CURRENT STATUS (2026-11-08)
+## CURRENT STATUS (2026-11-09)
 
 Active vector (see [`docs/VECTOR.md`](docs/VECTOR.md)):
 
-1. console OS on QEMU/desktop (kernel + SFS + network + Howl + toolbox);
-2. browser in a separate window rendered by a Qt host over one shared RGBA
-   surface (no guest compositor);
+1. console OS on QEMU/desktop is the **base OS** (kernel + SFS + network +
+   Howl + toolbox). Drivers, networking and basic operations stay native.
+2. applications (browser included) come **from Linux** through the optional
+   `linux-abi` compatibility layer, not from new native userspace;
+   Wolfser is a temporary browser (stopgap) and is frozen except for bug fixes.
 3. **Linux ABI + Phosh** as the active long-term goal (owner decision:
    months, not years), via a kernel personality layer and software-rendered
    headless Wayland exported to the host window.
@@ -233,12 +235,11 @@ Redmi port is parked. The reference checklist is
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
 - **Next steps:** Linux ABI slice 6 (`pipe2`/`ppoll`/`eventfd`/`memfd`, a
   per-task read scope, `rt_sigaction`/`futex`), then ET_DYN/PIE and `ld.so` so
-  distro binaries and a real shell run; larger reader/CSS budgets, full-page
-  layout and keep-alive;
-  TLS hardening (roots, RTC, RNG, TLS 1.2); **YouTube/JS/media still require a
-  WebKit/Gecko-class engine, i.e. the Linux ABI + Phosh track**, not another
-  reader increment;
-  Linux ABI for static musl binaries; headless Wayland/GTK/D-Bus → Phosh.
+  distro binaries and a real shell run; then headless Wayland/GTK/D-Bus →
+  Phosh. Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+  Wolfser is frozen except for bug fixes: applications, including the browser,
+  come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
+  the Linux ABI + Phosh track**, not another reader increment.
   Parked: QEMU PSCI shutdown, fog TLB proof, GENI UART on `rain`, tablet,
   Redmi storage/power.
 
