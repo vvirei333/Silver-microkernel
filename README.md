@@ -493,11 +493,14 @@ quiescence rounds, a cross-CPU visibility check and a per-CPU timer check),
 (SM6225 RAM-only bring-up), `fog-reloc` (explicit opt-in for the fog
 self-relocation copy), `fog-ui` (framebuffer status panel; implies
 `fog-paint`) and `fog-display` (experimental: start the compositor and
-SilverHome on the bootloader's `cont_splash` panel; real-device only). Normal
+SilverHome on the bootloader's `cont_splash` panel; real-device only).
+`console` is the product profile: a headless OS with the kernel SFS, the
+nameserver, the network stack, Howl and the UART driver, and no graphics
+tasks. See [`docs/REFERENCE.md`](docs/REFERENCE.md). Normal
 bare-metal boot starts only
-silverd, which then starts Scout, the block driver, the network driver, the SFS
-server, the network server, the graphics and input drivers, Howl and Howler in
-that order. No component depends
+silverd. In the console profile silverd starts Scout, the network driver, the
+network server, Howl and Howler. The graphical profiles additionally start the
+graphics and input drivers and SilverHome. No component depends
 on the resulting numbers: the console sink, Howler, the block driver and both
 network tasks are looked up by program ID at runtime, and the block and network
 drivers also answer the sender of each request. To run
@@ -788,6 +791,7 @@ driver's contract.
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
 | [docs/FINAL_AUDIT.md](docs/FINAL_AUDIT.md) | Final audit: DMA window, surface objects/zero-copy, Ed25519 signing, evidence and known limitations |
 | [docs/PORTING_FOG.md](docs/PORTING_FOG.md) | Redmi 10C port plan: platform framebuffer seam, staged touch/storage/power/DSI work, hardware unknowns and regression matrix |
+| [docs/REFERENCE.md](docs/REFERENCE.md) | Reference console product: definition, acceptance checklist, current status, known gaps and next work |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
 
 Current verification snapshot (2026-11-07): **218 host tests** pass; the fog

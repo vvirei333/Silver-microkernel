@@ -3,40 +3,48 @@
 Continuation document: current state, architectural invariants, known tech
 debt and recommended next steps. Update after every significant kernel change.
 
-## CURRENT STATUS (2026-11-07)
+## CURRENT STATUS (2026-11-08)
 
-Four roadmap holes are closed: the fog DMA window, kernel surface objects with
-zero-copy present, Ed25519 bundle signatures, and the final audit.
+The product target changed: WerewolfOS is now a **headless console OS**
+(kernel + kernel SFS + nameserver + network + Howl + Howler), not a full
+graphical OS. The graphics profiles stay in the tree as experiments. The
+reference checklist is [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 - **Host tests:** 218/218 (`cargo test --lib`).
-- **Builds:** `no_std`, `no_std,smp-selftest`, `no_std,tablet`,
-  `no_std,fog,fog-reloc`, `no_std,fog,fog-ui`,
-  `no_std,fog,fog-reloc,fog-display`.
-- **QEMU:** 640x1136 SilverHome frame, pointer click into Calc, back to home;
-  `MMU TLB/ASID/HEAP`, `DMA ZERO`, `DMA WINDOW`, `SURFACE READY`,
-  `howl ready`, no panic; `scopeprobe` status 0 with no leaks; `sfs_fsck`
-  clean. SMP `-smp 4` selftest: 15 PASS / 0 FAIL.
-- **Phone groundwork:** `fog-display` registers the live-FDT `cont_splash`
-  carve-out (`SYS_DISPLAY_INFO/MAP`) and starts compositor + SilverHome on it.
-  With a 1 GiB synthetic khaje tree, the full 720x1650 UI is drawn; default
-  `fog` is unchanged. On the real `rain` unit the compositor maps and clears
-  the panel, but HOME's draw is still pending (see the hardware findings in
-  [`docs/PORTING_FOG.md`](docs/PORTING_FOG.md)). Hardware forced three fixes:
-  the virtio-blk PCI probe is QEMU-only, GENI UART TX fails fast instead of
+- **Builds:** `no_std`, `no_std,console` (product), `no_std,smp-selftest`,
+  `no_std,tablet`, `no_std,fog`, `no_std,fog,fog-reloc`,
+  `no_std,fog,fog-ui`, `no_std,fog,fog-reloc,fog-display,fog-auto-reset`.
+- **Console OS (QEMU serial):** boots to `howl ready` with no graphics tasks;
+  `help`, `uname`, `ls /`, `health` all answer. `health` reports no DMA leaks.
+- **SMP:** `-smp 4` selftest 15 PASS / 0 FAIL.
+- **Fog QEMU:** relocation, at-link, fail-closed park and timer cases PASS.
+- **Init fix:** Silverd now resolves the child **task id** before every
+  capability grant (Scout, Howl, Howler); the old code passed spawn cap ids.
+- **Power:** `poweroff`/`reboot` shell commands. The kernel selects the PSCI
+  conduit per platform (SMC on Qualcomm, HVC on QEMU with
+  `virtualization=on`); the console shell gets `CAP_POWER` from kernel policy,
+  never through a spawn handle. QEMU's emulated PSCI does not exit the VM in
+  our test, so that remains a documented caveat.
+- **Phone status:** the platform display path maps and clears `cont_splash`;
+  HOME's draw on `rain` is still pending. Hardware forced three fixes: the
+  virtio-blk PCI probe is QEMU-only, GENI UART TX fails fast instead of
   stalling per byte, and the newer MMU boot proofs are skipped on fog by
-  default (`fog-hw-selftests` opts in).
-- **Signing:** unsigned bundle under a provisioned key is refused; a valid
-  `sig=` runs (status 0); a tampered signature is refused.
-- **Latest commits:** `d0ac546` DMA window, `9bf3b8b` Ed25519 signatures,
-  `8b5158a` surface objects + zero-copy, `f6ee824` audit fixes.
-- Full audit report: [`docs/FINAL_AUDIT.md`](docs/FINAL_AUDIT.md).
+  default (`fog-hw-selftests` opts in). Console over UART on the phone is not
+  verified (UART clock/pins unknown).
+- **Latest commits:** `3b9e1b5` console profile, `9f17bf5` fog hardware
+  fixes + panel-sized UI.
+- Keyboard/console history: see the sections below.
 
-Immediate next steps are a kernel fence object (guaranteed present
-completion), `SYS_SURFACE_DESTROY`/surface reuse, app-side zero-copy, and
-hardware (rain/fog) execution of the now-enabled cache/DMA self-tests. For the
-Redmi port, the next seam after the platform framebuffer is touch input, then
-storage; the full staged plan is in `docs/PORTING_FOG.md`. Existing signed-key
-provisioning is manual; there is no rotation yet.
+Immediate next steps, in order:
+
+1. Root-cause or explicitly document QEMU PSCI shutdown (HVC returns without
+   terminating the VM).
+2. Compile the graphics programs out of the `console` image (`user_program`).
+3. Add a `console-net` split so a machine without a NIC boots deterministically
+   without the network stack.
+4. Debug the fog TTBR0 TLB proof with `fog-hw-selftests`.
+5. Make the GENI UART console usable on `rain` (clock/pins), then run the
+   product console OS on the phone.
 
 ## 2026-11-06 — SFS moves toward the kernel
 

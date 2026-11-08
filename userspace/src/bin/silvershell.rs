@@ -240,6 +240,8 @@ fn execute(command: &str) {
             syscall::print("  Ctrl-Z     Stop the foreground task and return to shell\r\n");
             syscall::print("  kill <cap> Kill a task\r\n");
             syscall::print("  wait <cap> Wait for a task and print its exit status\r\n");
+            syscall::print("  poweroff   Power the machine down through PSCI\r\n");
+            syscall::print("  reboot     Reset the machine through PSCI\r\n");
         }
         Some("fastfetch") => fastfetch(),
         Some("diskread") => {
@@ -294,6 +296,8 @@ fn execute(command: &str) {
         Some("fg") => foreground_task(words.next()),
         Some("kill") => kill_task(words.next()),
         Some("wait") => wait_task(words.next()),
+        Some("poweroff") => syscall::power_off(),
+        Some("reboot") => syscall::power_reset(),
         Some(_) => syscall::print("Unknown command. Type 'help'.\r\n"),
     }
 }

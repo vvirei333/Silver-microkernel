@@ -64,6 +64,7 @@ const SYS_PCI_READ: u64 = 68;
 const SYS_PCI_WRITE: u64 = 69;
 const SYS_SPAWN_PATH: u64 = 70;
 const SYS_POWER_OFF: u64 = 71;
+const SYS_POWER_RESET: u64 = 97;
 const SYS_MMAP: u64 = 72;
 const SYS_MUNMAP: u64 = 73;
 const SYS_MOUNT: u64 = 80;
@@ -518,8 +519,7 @@ pub fn stop_console() {
     unsafe { syscall0(SYS_STOP_CONSOLE) };
 }
 
-/// Powers the machine down via PSCI `SYSTEM_OFF`. Does not return on QEMU
-/// `virt`; the kernel issues `smc #0` and QEMU exits ("Power down").
+/// Powers the machine down via PSCI `SYSTEM_OFF`. Does not return on success.
 pub fn power_off() {
     let _ = power_off_raw();
 }
@@ -528,6 +528,17 @@ pub fn power_off() {
 /// a successful call does not return. Test-only helper.
 pub fn power_off_raw() -> u64 {
     unsafe { syscall0(SYS_POWER_OFF) }
+}
+
+/// Resets the machine via PSCI `SYSTEM_RESET`. Does not return on success.
+pub fn power_reset() {
+    let _ = power_reset_raw();
+}
+
+/// Raw `SYS_POWER_RESET` result. Requires `CAP_POWER`; a successful call does
+/// not return.
+pub fn power_reset_raw() -> u64 {
+    unsafe { syscall0(SYS_POWER_RESET) }
 }
 
 /// Maps `length` bytes of anonymous memory. When `addr` is 0 the kernel chooses

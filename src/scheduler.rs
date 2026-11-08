@@ -4360,7 +4360,20 @@ fn initial_self_rights(program: u64) -> Option<u32> {
         // The shell hands device rights to the tasks it spawns by hand
         // (`spawn block_driver`), and `CapTable::grant` only allows a task to
         // pass on a right it already holds.
-        user_program::HOWL => capability::CAP_MMIO | capability::CAP_FS_WRITE,
+        // The shell needs MMIO only for the commands that map a device window.
+        // In the console product build it is also the trusted control plane,
+        // so the kernel grants it the power privilege directly; a spawn handle
+        // can never delegate CAP_POWER (it is outside CAP_ALL).
+        user_program::HOWL => {
+            #[cfg(feature = "console")]
+            {
+                capability::CAP_MMIO | capability::CAP_FS_WRITE | capability::CAP_POWER
+            }
+            #[cfg(not(feature = "console"))]
+            {
+                capability::CAP_MMIO | capability::CAP_FS_WRITE
+            }
+        }
         // Trusted filesystem stress helper (not an installed app bundle).
         user_program::BIGDIR | user_program::BIGFILE => capability::CAP_FS_WRITE,
         // The graphics driver owns the on-screen Power button; only this

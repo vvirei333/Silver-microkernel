@@ -69,6 +69,8 @@ pub const SYS_PCI_READ: u64 = 68;
 pub const SYS_PCI_WRITE: u64 = 69;
 pub const SYS_SPAWN_PATH: u64 = 70;
 pub const SYS_POWER_OFF: u64 = 71;
+/// Reset through PSCI `SYSTEM_RESET`; requires `CAP_POWER`, same as power-off.
+pub const SYS_POWER_RESET: u64 = 97;
 pub const SYS_MMAP: u64 = 72;
 pub const SYS_MUNMAP: u64 = 73;
 pub const SYS_MOUNT: u64 = 80;
@@ -399,6 +401,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_PCI_WRITE => sys_pci_write(frame[0], frame[1]),
         SYS_SPAWN_PATH => sys_spawn_path(frame[0]),
         SYS_POWER_OFF => sys_power_off(),
+        SYS_POWER_RESET => sys_power_reset(),
         SYS_MMAP => scheduler::mmap_anonymous(frame[1] as usize, frame[2])
             .map(|address| address as u64)
             .unwrap_or(SYSCALL_ERROR),
@@ -602,46 +605,27 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
     })
 }
 
-/// Powers the machine down through PSCI `SYSTEM_OFF` (0.2+ `FN_SYSTEM_OFF` =
-/// `0x8400_0008`). The conduit follows the PSCI node of each platform's device
-/// tree: QEMU `virt` boots the guest at EL2 and exposes PSCI through **HVC**
-/// (an `smc` there traps as an EL1 exception — no EL3), while the tablet's ABL
-/// specifies `method = "smc"`. Arguments follow SMC Calling Convention /
-/// PSCI 1.0: function id in x0, unused x1-x3 zeroed. QEMU prints "Power down"
-/// and exits; the call never returns. The write is a raw console poke (visible
-/// regardless of console ownership) so the shutdown is observable first.
+/// Powers the machine down through PSCI `SYSTEM_OFF`. The conduit is selected
+/// by the platform in [`crate::power`]: QEMU `virt` needs `virtualization=on`
+/// for the HVC conduit, Qualcomm uses the secure monitor. A missing conduit
+/// traps and the exception vector reports a panic instead of pretending the
+/// machine is off.
 fn sys_power_off() -> u64 {
     if !scheduler::current_task_has_rights(capability::CAP_POWER) {
         return SYSCALL_ERROR;
     }
     console::write_str("POWER OFF: PSCI SYSTEM_OFF\r\n");
-    #[cfg(feature = "tablet")]
-    unsafe {
-        core::arch::asm!(
-            "smc #0",
-            in("x0") 0x8400_0008_u64, // FN_SYSTEM_OFF
-            in("x1") 0_u64,
-            in("x2") 0_u64,
-            in("x3") 0_u64,
-            options(nomem, nostack),
-        );
+    crate::power::system_off()
+}
+
+/// Resets the machine through PSCI `SYSTEM_RESET`; same capability and conduit
+/// rules as [`sys_power_off`].
+fn sys_power_reset() -> u64 {
+    if !scheduler::current_task_has_rights(capability::CAP_POWER) {
+        return SYSCALL_ERROR;
     }
-    #[cfg(not(feature = "tablet"))]
-    unsafe {
-        core::arch::asm!(
-            "hvc #0",
-            in("x0") 0x8400_0008_u64, // FN_SYSTEM_OFF
-            in("x1") 0_u64,
-            in("x2") 0_u64,
-            in("x3") 0_u64,
-            options(nomem, nostack),
-        );
-    }
-    // SYSTEM_OFF does not return; a missing PSCI/EL2 traps here as an EL1
-    // exception and halts (see silver_handle_exception). This line is defensive
-    // only, in case some platform's firmware returns without powering down.
-    console::write_str("POWER OFF: PSCI returned (unexpected)\r\n");
-    0
+    console::write_str("POWER OFF: PSCI SYSTEM_RESET\r\n");
+    crate::power::system_reset()
 }
 
 fn sys_arguments(buffer_ptr: u64, capacity: u64) -> u64 {

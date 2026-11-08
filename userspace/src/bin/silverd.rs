@@ -25,9 +25,11 @@ pub extern "C" fn _start(argument: u64) -> ! {
     });
 
     // 1. Scout
-    let scout_id = syscall::spawn(syscall::PROGRAM_SCOUT, syscall::task_id())
+    let scout_cap = syscall::spawn(syscall::PROGRAM_SCOUT, syscall::task_id())
         .unwrap_or_else(|| fail("SILVERD: SCOUT SPAWN FAILED\r\n"));
-    if !syscall::cap_grant(scout_id, scout_id, syscall::CAP_MMIO) {
+    let scout_id = syscall::cap_get_task_id(scout_cap)
+        .unwrap_or_else(|| fail("SILVERD: SCOUT CAP LOOKUP FAILED\r\n"));
+    if !syscall::cap_grant(scout_cap, scout_id, syscall::CAP_MMIO) {
         fail("SILVERD: SCOUT CAP GRANT FAILED\r\n");
     }
     if !await_scout_ready(scout_id) {
@@ -115,19 +117,26 @@ pub extern "C" fn _start(argument: u64) -> ! {
     }
 
     // 8. Howl (shell)
-    let howl_id = syscall::spawn(syscall::PROGRAM_HOWL, syscall::task_id())
+    let howl_cap = syscall::spawn(syscall::PROGRAM_HOWL, syscall::task_id())
         .unwrap_or_else(|| fail("SILVERD: HOWL SPAWN FAILED\r\n"));
-    if !syscall::cap_grant(howl_id, howl_id, syscall::CAP_MMIO) {
+    let howl_id = syscall::cap_get_task_id(howl_cap)
+        .unwrap_or_else(|| fail("SILVERD: HOWL CAP LOOKUP FAILED\r\n"));
+    if !syscall::cap_grant(howl_cap, howl_id, syscall::CAP_MMIO) {
         fail("SILVERD: HOWL CAP GRANT FAILED\r\n");
     }
-    if !syscall::console_set(howl_id) {
+    // CAP_POWER is granted by the kernel's console policy (it cannot be
+    // delegated through a spawn handle, which only carries CAP_ALL).
+    if !syscall::console_set(howl_cap) {
         fail("SILVERD: CONSOLE HANDOFF FAILED\r\n");
     }
 
-    // 9. Howler (UART)
-    let howler_id = syscall::spawn(syscall::PROGRAM_HOWLER, howl_id)
+    // 9. Howler (UART). The boot argument is the shell's task id: that is
+    // where input bytes are delivered.
+    let howler_cap = syscall::spawn(syscall::PROGRAM_HOWLER, howl_id)
         .unwrap_or_else(|| fail("SILVERD: HOWLER SPAWN FAILED\r\n"));
-    if !syscall::cap_grant(howler_id, howler_id, syscall::CAP_MMIO | syscall::CAP_IRQ) {
+    let howler_id = syscall::cap_get_task_id(howler_cap)
+        .unwrap_or_else(|| fail("SILVERD: HOWLER CAP LOOKUP FAILED\r\n"));
+    if !syscall::cap_grant(howler_cap, howler_id, syscall::CAP_MMIO | syscall::CAP_IRQ) {
         fail("SILVERD: HOWLER CAP GRANT FAILED\r\n");
     }
 
