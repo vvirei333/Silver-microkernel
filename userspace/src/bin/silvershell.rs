@@ -639,6 +639,10 @@ fn dns_command(name: Option<&str>) {
 /// `wolfser [query|url]`: starts Wolfser in the background. Without an
 /// argument it opens with an empty search bar, which is the normal way in.
 fn wolfser_command(url: Option<&str>) {
+    if find_task_id(syscall::PROGRAM_WOLFSER).is_some() {
+        syscall::print("wolfser: already running in the host window\r\n");
+        return;
+    }
     let url = url.unwrap_or("");
     let Some(cap_id) = syscall::spawn_with_args(syscall::PROGRAM_WOLFSER, 0, url) else {
         syscall::print("wolfser: cannot start the program\r\n");

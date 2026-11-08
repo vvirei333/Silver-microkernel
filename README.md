@@ -567,15 +567,17 @@ how the QEMU test checks a frame without a display.
 The easiest way under KDE, GNOME, Wayland or X11:
 
 ```bash
-./build_and_qemu.sh --viewer
+./build_and_qemu.sh
 # in the guest console:
 howl> wolfser
 ```
 
-`--viewer` builds (if needed) and starts the Qt host window; it waits for the
-VM to create the shared file. The same window can be started separately with
-`tools/wolfser-host.sh` (Qt6 picks Wayland or X11 itself). Manual QEMU needs
-the two ivshmem arguments:
+The Qt window is started by default (`--no-viewer` keeps it console-only). It
+opens **immediately** with a "Waiting for Wolfser" screen and stays up until
+the guest publishes its first frame, so it does not matter how long the boot
+or typing takes. The viewer is rebuilt incrementally on every launch. Start
+it separately with `tools/wolfser-host.sh` (Qt6 picks Wayland or X11 itself).
+Manual QEMU needs the two ivshmem arguments:
 
 ```bash
 qemu-system-aarch64 ... \
@@ -586,7 +588,8 @@ qemu-system-aarch64 ... \
 ```
 
 If Wolfser exits with status 21, the VM has no ivshmem device: relaunch QEMU
-with the arguments above (or use `./build_and_qemu.sh --viewer`).
+with the arguments above (or use `./build_and_qemu.sh`). Starting `wolfser`
+twice reuses the running instance (one window per VM).
 
 The first renderer deliberately has no CSS layout, images or TLS: it is the
 host-window transport plus an HTTP/HTML text path, which the Linux ABI/Phosh

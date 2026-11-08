@@ -14,10 +14,13 @@ cd "$(dirname "$0")/.."
 SHM="${WOLFSER_SHM:-/dev/shm/werewolf-window}"
 BIN="build/window-viewer/werewolf-window"
 
-if [ ! -x "$BIN" ]; then
-    echo "building the host viewer (needs cmake and Qt6 Widgets)..."
+if command -v cmake >/dev/null 2>&1; then
+    # Incremental: picks up a changed viewer without a stale binary.
     cmake -S tools/window-viewer -B build/window-viewer >/dev/null
     cmake --build build/window-viewer -j"$(nproc 2>/dev/null || echo 2)" >/dev/null
+elif [ ! -x "$BIN" ]; then
+    echo "error: $BIN is missing and cmake is not installed" >&2
+    exit 1
 fi
 
 exec "$BIN" --shm "$SHM" "$@"

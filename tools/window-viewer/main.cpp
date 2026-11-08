@@ -124,11 +124,22 @@ class Viewer : public QWidget {
 public:
     Viewer(Shared &shared, QWidget *parent = nullptr) : QWidget(parent), m_shared(shared) {
         setWindowTitle("Wolfser — WerewolfOS");
-        resize(static_cast<int>(m_shared.u32(kFieldWidth)),
-               static_cast<int>(m_shared.u32(kFieldHeight)));
-        m_lastSequence = m_shared.u32(kFieldFrameSeq);
+        resize(900, 640);
+        m_lastSequence = 0;
         auto *timer = new QTimer(this);
         connect(timer, &QTimer::timeout, this, [this] {
+            if (m_shared.u32(kFieldMagic) != kMagic) {
+                if (!m_sized) {
+                    update(); // keep the waiting screen alive
+                }
+                return;
+            }
+            const uint32_t width = m_shared.u32(kFieldWidth);
+            const uint32_t height = m_shared.u32(kFieldHeight);
+            if (!m_sized && width != 0 && height != 0) {
+                resize(static_cast<int>(width), static_cast<int>(height));
+                m_sized = true;
+            }
             const uint32_t sequence = m_shared.u32(kFieldFrameSeq);
             if (sequence != m_lastSequence) {
                 m_lastSequence = sequence;
@@ -140,6 +151,25 @@ public:
 
 protected:
     void paintEvent(QPaintEvent *) override {
+        if (m_shared.u32(kFieldMagic) != kMagic) {
+            // The window is opened with QEMU, long before the guest starts
+            // Wolfser. Show something useful instead of exiting.
+            QPainter painter(this);
+            painter.fillRect(rect(), QColor(30, 58, 95));
+            QFont font = painter.font();
+            font.setPointSize(16);
+            font.setBold(true);
+            painter.setFont(font);
+            painter.setPen(Qt::white);
+            painter.drawText(rect().adjusted(24, 0, -24, -24), Qt::AlignCenter,
+                             "Waiting for Wolfser");
+            font.setPointSize(10);
+            font.setBold(false);
+            painter.setFont(font);
+            painter.drawText(rect().adjusted(24, 36, -24, 0), Qt::AlignHCenter | Qt::AlignBottom,
+                             "type  wolfser  in the guest console");
+            return;
+        }
         const uint32_t width = m_shared.u32(kFieldWidth);
         const uint32_t height = m_shared.u32(kFieldHeight);
         const uint32_t stride = m_shared.u32(kFieldStride);
@@ -198,6 +228,7 @@ protected:
 private:
     Shared &m_shared;
     uint32_t m_lastSequence = 0;
+    bool m_sized = false;
 };
 
 int snapshot(Shared &shared, const QString &path, int timeoutSeconds) {
@@ -284,12 +315,8 @@ int main(int argc, char **argv) {
         return snapshot(shared, snapshotPath, timeout);
     }
 
-    if (!shared.waitReady(20000)) {
-        std::fprintf(stderr,
-                     "viewer: %s exists but has no Wolfser header (is ivshmem attached?)\n",
-                     shmPath.toUtf8().constData());
-        return 2;
-    }
+    // No wait for the WIN1 header here: the window stays open and shows a
+    // waiting screen until the guest starts Wolfser.
 
     Viewer viewer(shared);
     if (scalePercent != 100) {
@@ -298,5 +325,7 @@ int main(int argc, char **argv) {
         viewer.resize(width, height);
     }
     viewer.show();
+    viewer.raise();
+    viewer.activateWindow();
     return app.exec();
 }

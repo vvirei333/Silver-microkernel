@@ -47,8 +47,10 @@ tools/wolfser-host.sh           # builds if needed, then opens the window
 # or: build/window-viewer/werewolf-window --shm /dev/shm/werewolf-window
 ```
 
-The viewer waits up to 20 s for QEMU to create the file and publish the WIN1
-header, so it may be started before the VM.
+The viewer opens at once with a "Waiting for Wolfser" screen. It waits for
+QEMU to create the file and for the guest to publish the WIN1 header; it does
+not time out in window mode, so it may be started before the VM and left open
+while the user boots and types `wolfser`.
 
 Keys: printable text goes to the search bar, `Enter` navigates, `Backspace`
 edits, `Ctrl+L` starts a new address, `r` reloads, `q` quits, and

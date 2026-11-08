@@ -7,8 +7,9 @@
 # Usage: ./build_and_qemu.sh [debug|release] [--no-run] [--viewer]
 #   profile defaults to release.
 #   --no-run  stop after the build.
-#   --viewer  build (if needed) and start the Qt host viewer next to QEMU;
-#             works on KDE, GNOME, Wayland and X11 (Qt picks the platform).
+#   --viewer  start the Qt host viewer (the default); it opens immediately and
+#             waits for Wolfser, so it works on KDE, GNOME, Wayland and X11.
+#   --no-viewer  keep QEMU console-only.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -26,13 +27,14 @@ fi
 
 PROFILE=release
 RUN=1
-VIEWER=0
+VIEWER=1
 for argument in "$@"; do
     case "$argument" in
         debug | release) PROFILE="$argument" ;;
         --no-run) RUN=0 ;;
         --viewer) VIEWER=1 ;;
-        *) echo "usage: $0 [debug|release] [--no-run] [--viewer]" >&2; exit 1 ;;
+        --no-viewer) VIEWER=0 ;;
+        *) echo "usage: $0 [debug|release] [--no-run] [--viewer|--no-viewer]" >&2; exit 1 ;;
     esac
 done
 
@@ -56,17 +58,19 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 if [ "$VIEWER" -eq 1 ]; then
-    if [ ! -x "$VIEWER_BIN" ]; then
-        if command -v cmake >/dev/null 2>&1; then
-            echo "building the host viewer..."
-            cmake -S tools/window-viewer -B build/window-viewer >/dev/null
-            cmake --build build/window-viewer -j"$(nproc 2>/dev/null || echo 2)" >/dev/null
-        fi
+    # Always run the incremental build: a stale binary would keep an old
+    # protocol (the window would wait 20 s and quit before Wolfser starts).
+    if command -v cmake >/dev/null 2>&1; then
+        cmake -S tools/window-viewer -B build/window-viewer >/dev/null
+        cmake --build build/window-viewer -j"$(nproc 2>/dev/null || echo 2)" >/dev/null
     fi
     if [ -x "$VIEWER_BIN" ]; then
-        # The viewer waits for QEMU to create the file and publish WIN1.
-        "$VIEWER_BIN" --shm "$SHM" &
+        mkdir -p build
+        # The window opens at once with a waiting screen; the guest publishes
+        # its first frame when the user types `wolfser`.
+        "$VIEWER_BIN" --shm "$SHM" >build/wolfser-viewer.log 2>&1 &
         VIEWER_PID=$!
+        echo "Wolfser window: $SHM (viewer log: build/wolfser-viewer.log)"
     else
         echo "warning: $VIEWER_BIN was not built (install Qt6 + cmake);" >&2
         echo "         start it later with tools/wolfser-host.sh" >&2
