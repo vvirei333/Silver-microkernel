@@ -15,8 +15,14 @@ const SFS_POLL_TICKS: u64 = 50;
 
 #[no_mangle]
 #[link_section = ".text._start"]
-pub extern "C" fn _start(_argument: u64) -> ! {
-    syscall::print("SILVERD: BOOTING\r\n");
+pub extern "C" fn _start(argument: u64) -> ! {
+    // 1 = headless console OS (no compositor, input driver or home screen).
+    let console_only = argument == 1;
+    syscall::print(if console_only {
+        "SILVERD: BOOTING (CONSOLE)\r\n"
+    } else {
+        "SILVERD: BOOTING\r\n"
+    });
 
     // 1. Scout
     let scout_id = syscall::spawn(syscall::PROGRAM_SCOUT, syscall::task_id())
@@ -65,43 +71,47 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("SILVERD: NET SERVER CAP GRANT FAILED\r\n");
     }
 
-    // 6. Graphics driver (ramfb). It paints the engineer menu and then idles
-    // forever so the frame buffer stays mapped. Lend the console for one second
-    // so its init status is visible before Howl takes over.
-    let gpu_cap = syscall::spawn(syscall::PROGRAM_GPU_DRIVER, syscall::task_id())
-        .unwrap_or_else(|| fail("SILVERD: GPU DRIVER SPAWN FAILED\r\n"));
-    let gpu_id = syscall::cap_get_task_id(gpu_cap)
-        .unwrap_or_else(|| fail("SILVERD: GPU DRIVER CAP LOOKUP FAILED\r\n"));
-    if !syscall::cap_grant(gpu_cap, gpu_id, syscall::CAP_MMIO) {
-        fail("SILVERD: GPU DRIVER CAP GRANT FAILED\r\n");
-    }
-    if syscall::console_set(gpu_cap) {
-        syscall::sleep(1000);
-        if !syscall::console_set(syscall::task_id()) {
-            fail("SILVERD: CONSOLE RECLAIM FAILED\r\n");
+    // 6-7. Graphics stack: compositor + input. Skipped in the console OS.
+    if !console_only {
+        // 6. Graphics driver (ramfb). It paints the engineer menu and then
+        // idles forever so the frame buffer stays mapped. Lend the console for
+        // one second so its init status is visible before Howl takes over.
+        let gpu_cap = syscall::spawn(syscall::PROGRAM_GPU_DRIVER, syscall::task_id())
+            .unwrap_or_else(|| fail("SILVERD: GPU DRIVER SPAWN FAILED\r\n"));
+        let gpu_id = syscall::cap_get_task_id(gpu_cap)
+            .unwrap_or_else(|| fail("SILVERD: GPU DRIVER CAP LOOKUP FAILED\r\n"));
+        if !syscall::cap_grant(gpu_cap, gpu_id, syscall::CAP_MMIO) {
+            fail("SILVERD: GPU DRIVER CAP GRANT FAILED\r\n");
         }
-    } else {
-        syscall::print("SILVERD: GPU DRIVER CONSOLE LEND FAILED\r\n");
-    }
+        if syscall::console_set(gpu_cap) {
+            syscall::sleep(1000);
+            if !syscall::console_set(syscall::task_id()) {
+                fail("SILVERD: CONSOLE RECLAIM FAILED\r\n");
+            }
+        } else {
+            syscall::print("SILVERD: GPU DRIVER CONSOLE LEND FAILED\r\n");
+        }
 
-    // 7. Input driver (virtio-tablet). Spawned after gpu_driver so "gpu_driver"
-    // is already registered in the nameserver by the time the first pointer
-    // sample is forwarded. It needs CAP_PCI to probe the device and CAP_MMIO to
-    // map its BAR and allocate the event-ring DMA window.
-    let input_cap = syscall::spawn(syscall::PROGRAM_INPUT_DRIVER, syscall::task_id())
-        .unwrap_or_else(|| fail("SILVERD: INPUT DRIVER SPAWN FAILED\r\n"));
-    let input_id = syscall::cap_get_task_id(input_cap)
-        .unwrap_or_else(|| fail("SILVERD: INPUT DRIVER CAP LOOKUP FAILED\r\n"));
-    if !syscall::cap_grant(input_cap, input_id, syscall::CAP_PCI | syscall::CAP_MMIO) {
-        fail("SILVERD: INPUT DRIVER CAP GRANT FAILED\r\n");
-    }
-    if syscall::console_set(input_cap) {
-        syscall::sleep(1000);
-        if !syscall::console_set(syscall::task_id()) {
-            fail("SILVERD: CONSOLE RECLAIM FAILED\r\n");
+        // 7. Input driver (virtio-tablet). Spawned after gpu_driver so
+        // "gpu_driver" is already registered in the nameserver by the time the
+        // first pointer sample is forwarded. It needs CAP_PCI to probe the
+        // device and CAP_MMIO to map its BAR and allocate the event-ring DMA
+        // window.
+        let input_cap = syscall::spawn(syscall::PROGRAM_INPUT_DRIVER, syscall::task_id())
+            .unwrap_or_else(|| fail("SILVERD: INPUT DRIVER SPAWN FAILED\r\n"));
+        let input_id = syscall::cap_get_task_id(input_cap)
+            .unwrap_or_else(|| fail("SILVERD: INPUT DRIVER CAP LOOKUP FAILED\r\n"));
+        if !syscall::cap_grant(input_cap, input_id, syscall::CAP_PCI | syscall::CAP_MMIO) {
+            fail("SILVERD: INPUT DRIVER CAP GRANT FAILED\r\n");
         }
-    } else {
-        syscall::print("SILVERD: INPUT DRIVER CONSOLE LEND FAILED\r\n");
+        if syscall::console_set(input_cap) {
+            syscall::sleep(1000);
+            if !syscall::console_set(syscall::task_id()) {
+                fail("SILVERD: CONSOLE RECLAIM FAILED\r\n");
+            }
+        } else {
+            syscall::print("SILVERD: INPUT DRIVER CONSOLE LEND FAILED\r\n");
+        }
     }
 
     // 8. Howl (shell)
@@ -121,9 +131,12 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         fail("SILVERD: HOWLER CAP GRANT FAILED\r\n");
     }
 
-    // 10. SilverHome (home-screen client of the compositor).
-    let _home_cap = syscall::spawn(syscall::PROGRAM_HOME, syscall::task_id())
-        .unwrap_or_else(|| fail("SILVERD: HOME SPAWN FAILED\r\n"));
+    // 10. SilverHome (home-screen client of the compositor). Console OS has
+    // no compositor, so there is nothing to attach to.
+    if !console_only {
+        let _home_cap = syscall::spawn(syscall::PROGRAM_HOME, syscall::task_id())
+            .unwrap_or_else(|| fail("SILVERD: HOME SPAWN FAILED\r\n"));
+    }
 
     loop {
         // Mailbox reading loop to check for SFS errors

@@ -1002,8 +1002,13 @@ pub fn init() {
 
     #[cfg(not(feature = "demo-tasks"))]
     {
-        let silverd_id =
-            spawn_user(user_program::SILVERD, 0).expect("silverd must be created at boot");
+        // 1 = headless console OS: Silverd skips the graphics stack.
+        #[cfg(feature = "console")]
+        const SILVERD_ARGUMENT: u64 = 1;
+        #[cfg(not(feature = "console"))]
+        const SILVERD_ARGUMENT: u64 = 0;
+        let silverd_id = spawn_user(user_program::SILVERD, SILVERD_ARGUMENT)
+            .expect("silverd must be created at boot");
         let _ = set_console_owner(silverd_id);
         crate::boot_metrics::log_milestone("SILVERD spawn");
     }

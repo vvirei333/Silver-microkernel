@@ -59,6 +59,11 @@ fog-auto-reset = ["fog"]
 # QEMU-proven but can wedge a real unit before userspace starts, so the default
 # fog image skips them (and logs that it did). QEMU builds always run them.
 fog-hw-selftests = ["fog"]
+# Headless console OS: Silverd starts the nameserver, the kernel SFS mount,
+# the network stack, Howl and the UART driver, but not the compositor, the
+# input driver or SilverHome. This is the supported product profile now; the
+# graphics path stays available for experiments behind its own flags.
+console = []
 # Opt-in bisect test: unmask IRQs and wait for 30 timer ticks before the
 # scheduler is initialised. Useful on QEMU; on the first hardware boot it can
 # deliver a timer IRQ into a not-yet-initialised scheduler, so fog defaults off.
