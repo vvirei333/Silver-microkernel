@@ -572,11 +572,12 @@ The easiest way under KDE, GNOME, Wayland or X11:
 howl> wolfser
 ```
 
-The Qt window is started by default (`--no-viewer` keeps it console-only). It
-opens **immediately** with a "Waiting for Wolfser" screen and stays up until
-the guest publishes its first frame, so it does not matter how long the boot
-or typing takes. The viewer is rebuilt incrementally on every launch. Start
-it separately with `tools/wolfser-host.sh` (Qt6 picks Wayland or X11 itself).
+The script starts the Qt viewer **hidden** together with QEMU (`--no-viewer`
+keeps it console-only). No window appears while the kernel boots: the viewer
+waits for a request from the guest and shows the window only after you type
+`wolfser`. A reload or a second `wolfser` reuses the same window. The viewer
+is rebuilt incrementally on every launch. Start it separately with
+`tools/wolfser-host.sh` (Qt6 picks Wayland or X11 itself).
 Manual QEMU needs the two ivshmem arguments:
 
 ```bash

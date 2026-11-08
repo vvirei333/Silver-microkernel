@@ -22,6 +22,8 @@ pub const FIELD_STATE: u64 = 0x1C;
 pub const FIELD_INPUT_HEAD: u64 = 0x20;
 pub const FIELD_INPUT_TAIL: u64 = 0x24;
 pub const FIELD_SCROLL: u64 = 0x28;
+/// The guest sets this when it wants the host window shown (on `wolfser`).
+pub const FIELD_WINDOW_REQUEST: u64 = 0x2C;
 
 pub const FORMAT_RGBA8888: u32 = 1;
 

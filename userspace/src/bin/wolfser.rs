@@ -84,6 +84,7 @@ struct App {
 
 struct PageState {
     loaded: bool,
+    loading: bool,
     status: u16,
     body_len: usize,
     error: &'static str,
@@ -122,6 +123,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         scroll: 0,
         page: PageState {
             loaded: false,
+            loading: false,
             status: 0,
             body_len: 0,
             error: "",
@@ -129,6 +131,7 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     };
     if !initial.is_empty() {
         set_address(&mut app, initial);
+        paint(&app);
         submit(&mut app);
     }
     paint(&app);
@@ -320,13 +323,21 @@ fn submit(app: &mut App) {
         return;
     };
     let target = core::str::from_utf8(&url[..length]).unwrap_or("");
-    load(app, target);
-    app.focused = false;
+    // Show the loading screen before the (possibly slow) network wait; the
+    // host window must never sit on an all-zero surface.
+    app.page.loaded = false;
+    app.page.loading = true;
+    app.page.error = "";
     app.scroll = 0;
+    paint(app);
+    load(app, target);
+    app.page.loading = false;
+    app.focused = false;
 }
 
 fn load(app: &mut App, url: &str) {
     app.page.loaded = true;
+    app.page.loading = false;
     app.page.status = 0;
     app.page.body_len = 0;
     app.page.error = "";
@@ -655,6 +666,20 @@ fn paint(app: &App) {
         fill(base, caret, ADDRESS_TEXT_Y - 1, 1, 10, COLOR_TEXT);
     }
 
+    if app.page.loading {
+        draw_text(base, 24, BODY_TOP + 24, 2, "LOADING...", COLOR_TEXT);
+        draw_text(
+            base,
+            24,
+            BODY_TOP + 56,
+            1,
+            "WAITING FOR THE NETWORK SERVER",
+            COLOR_MUTED,
+        );
+        publish(base, window::STATE_LOADING);
+        return;
+    }
+
     if !app.page.loaded {
         draw_text(base, 24, BODY_TOP + 28, 2, "WOLFSER", COLOR_TEXT);
         draw_text(
@@ -880,6 +905,9 @@ fn open_window() -> Result<u64, u64> {
     window::write_u32(base, window::FIELD_INPUT_HEAD, 0);
     window::write_u32(base, window::FIELD_INPUT_TAIL, 0);
     window::write_u32(base, window::FIELD_SCROLL, 0);
+    // Ask the host to show the window only now, i.e. on the user's command;
+    // the viewer may have been waiting invisibly since QEMU started.
+    window::write_u32(base, window::FIELD_WINDOW_REQUEST, 1);
     Ok(base)
 }
 

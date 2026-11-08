@@ -68,9 +68,11 @@ if [ "$VIEWER" -eq 1 ]; then
         mkdir -p build
         # The window opens at once with a waiting screen; the guest publishes
         # its first frame when the user types `wolfser`.
-        "$VIEWER_BIN" --shm "$SHM" >build/wolfser-viewer.log 2>&1 &
+        # </dev/null: the viewer must never take the terminal input that belongs to
+        # QEMU's serial console.
+        "$VIEWER_BIN" --watch --shm "$SHM" </dev/null >build/wolfser-viewer.log 2>&1 &
         VIEWER_PID=$!
-        echo "Wolfser window: $SHM (viewer log: build/wolfser-viewer.log)"
+        echo "Wolfser: the window opens when you type \`wolfser\` (log: build/wolfser-viewer.log)"
     else
         echo "warning: $VIEWER_BIN was not built (install Qt6 + cmake);" >&2
         echo "         start it later with tools/wolfser-host.sh" >&2

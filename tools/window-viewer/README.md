@@ -45,12 +45,13 @@ Then, on the host:
 ```bash
 tools/wolfser-host.sh           # builds if needed, then opens the window
 # or: build/window-viewer/werewolf-window --shm /dev/shm/werewolf-window
+# hidden until the guest asks:  ... --watch --shm /dev/shm/werewolf-window
 ```
 
-The viewer opens at once with a "Waiting for Wolfser" screen. It waits for
-QEMU to create the file and for the guest to publish the WIN1 header; it does
-not time out in window mode, so it may be started before the VM and left open
-while the user boots and types `wolfser`.
+With `--watch` the viewer starts hidden, waits for the guest's window request
+(the `wolfser` command) and only then shows the window; nothing appears while
+the kernel boots. Without `--watch` it opens at once with a "Waiting for
+Wolfser" screen. Neither mode times out while waiting.
 
 Keys: printable text goes to the search bar, `Enter` navigates, `Backspace`
 edits, `Ctrl+L` starts a new address, `r` reloads, `q` quits, and

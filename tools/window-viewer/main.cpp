@@ -37,6 +37,7 @@ constexpr uint64_t kFieldFormat = 0x14;
 constexpr uint64_t kFieldFrameSeq = 0x18;
 constexpr uint64_t kFieldInputHead = 0x20;
 constexpr uint64_t kFieldInputTail = 0x24;
+constexpr uint64_t kFieldWindowRequest = 0x2C;
 constexpr uint64_t kPixels = 0x1000;
 constexpr uint64_t kInputRing = 0x0040;
 constexpr uint32_t kInputSlots = 64;
@@ -166,7 +167,7 @@ protected:
             font.setPointSize(10);
             font.setBold(false);
             painter.setFont(font);
-            painter.drawText(rect().adjusted(24, 36, -24, 0), Qt::AlignHCenter | Qt::AlignBottom,
+            painter.drawText(rect().adjusted(24, 96, -24, 0), Qt::AlignHCenter | Qt::AlignTop,
                              "type  wolfser  in the guest console");
             return;
         }
@@ -277,9 +278,11 @@ int snapshot(Shared &shared, const QString &path, int timeoutSeconds) {
 int main(int argc, char **argv) {
     QString shmPath = "/dev/shm/werewolf-window";
     QString snapshotPath;
+    QString waitingSnapshotPath;
     int timeout = 20;
     int scalePercent = 100;
     bool headless = false;
+    bool watchMode = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string arg = argv[i];
@@ -292,9 +295,14 @@ int main(int argc, char **argv) {
             timeout = std::atoi(argv[++i]);
         } else if (arg == "--scale" && i + 1 < argc) {
             scalePercent = std::atoi(argv[++i]);
+        } else if (arg == "--watch") {
+            watchMode = true;
+        } else if (arg == "--snapshot-waiting" && i + 1 < argc) {
+            waitingSnapshotPath = QString::fromLocal8Bit(argv[++i]);
         } else {
             std::fprintf(stderr,
-                         "usage: %s [--shm PATH] [--snapshot OUT.png] [--timeout SECS] [--scale %%]\n",
+                         "usage: %s [--shm PATH] [--snapshot OUT.png] [--timeout SECS] "
+                         "[--scale %%] [--watch] [--snapshot-waiting OUT.png]\n",
                          argv[0]);
             return 1;
         }
@@ -313,6 +321,39 @@ int main(int argc, char **argv) {
 
     if (headless) {
         return snapshot(shared, snapshotPath, timeout);
+    }
+
+    if (!waitingSnapshotPath.isEmpty()) {
+        Viewer viewer(shared);
+        viewer.show();
+        QCoreApplication::processEvents();
+        if (!viewer.grab().save(waitingSnapshotPath)) {
+            std::fprintf(stderr, "viewer: cannot write %s\n",
+                         waitingSnapshotPath.toUtf8().constData());
+            return 2;
+        }
+        std::printf("snapshot-waiting: 900x640 -> %s\n",
+                    waitingSnapshotPath.toUtf8().constData());
+        return 0;
+    }
+
+    if (watchMode) {
+        // Start hidden with QEMU and show the window only when the guest asks
+        // for it (the user typed `wolfser`). Nothing appears before that.
+        auto *viewer = new Viewer(shared);
+        auto *timer = new QTimer(&app);
+        QObject::connect(timer, &QTimer::timeout, [&app, &shared, viewer, timer] {
+            if (shared.u32(kFieldMagic) == kMagic &&
+                shared.u32(kFieldWindowRequest) != 0) {
+                std::fprintf(stderr, "viewer: Wolfser requested, showing window\n");
+                viewer->show();
+                viewer->raise();
+                viewer->activateWindow();
+                timer->stop();
+            }
+        });
+        timer->start(100);
+        return app.exec();
     }
 
     // No wait for the WIN1 header here: the window stays open and shows a

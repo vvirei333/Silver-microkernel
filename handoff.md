@@ -44,10 +44,12 @@ Redmi port is parked. The reference checklist is
   `SYS_MAP_PHYS_NC` maps the surface as Normal Non-Cacheable.
 - **Desktop integration:** `./build_and_qemu.sh` (viewer on by default) adds
   the virtio-net card and the ivshmem device, incrementally builds the Qt
-  viewer and starts it next to QEMU; `tools/wolfser-host.sh` does the same
-  separately. The window opens immediately with a "Waiting for Wolfser"
-  screen and does not time out, so the boot/typing order does not matter. Qt
-  chooses Wayland or X11, so the window is native on KDE and GNOME. Guest
+  viewer and starts it **hidden** with `--watch`; it shows a window only when
+  the guest sets the window request, i.e. after `wolfser`. Nothing appears
+  while the kernel boots, and the hidden viewer's stdin is `/dev/null` so it
+  cannot take QEMU's serial input. While a page is fetched Wolfser paints a
+  "LOADING..." screen, so the surface is never an unexplained black window.
+  Qt chooses Wayland or X11, so the window is native on KDE and GNOME. Guest
   exit 21 means the VM was started without ivshmem; a second `wolfser` reuses
   the running instance.
 - **SMP:** `-smp 4` selftest 15 PASS / 0 FAIL.
