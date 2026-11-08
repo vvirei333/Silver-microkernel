@@ -72,7 +72,8 @@ Redmi port is parked. The reference checklist is
   every host. Pages with a text input expose it through `Ctrl+G`: the footer
   becomes an editable field, Enter submits the form's action with GET or POST
   (hidden inputs included), and Esc cancels. POST uses the same guest TLS/HTTP
-  stack; the proxy fallback is disabled for POST. `Ctrl+F` searches the text,
+  stack; the proxy fallback is disabled for POST. `tools/form-test-server.py`
+  serves a local GET/POST form for a deterministic QEMU check. `Ctrl+F` searches the text,
   highlights all hits yellow and the current hit orange, shows `n/total` in the
   footer and Enter advances (wrapping). Partially scrolled lines are skipped
   rather than clamped to the body top, which used to overlap the next line.
