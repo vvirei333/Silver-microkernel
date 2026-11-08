@@ -97,6 +97,10 @@ const FS_BLOCK_SIZE: usize = 512;
 /// cloned into kernel memory before `elf::load_elf` rejects its segments. This
 /// matches the VFS file cap: the heap is only 2 MiB.
 const EXEC_FILE_LIMIT: usize = vfs::MAX_FILE_BYTES;
+/// A foreign (Linux) binary is larger than the general VFS cap: a static
+/// libc `hello` is ~800 KiB. The read is transient and exactly file-sized;
+/// `vfs::read_file_limit` still refuses anything past this bound.
+const LINUX_EXEC_LIMIT: usize = 1024 * 1024;
 /// Upper bound on a versioned spawn-arguments block copied from userspace.
 const SPAWN_ARGS_LIMIT: usize = 4096;
 
@@ -567,13 +571,13 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         match vfs::file_len(&cwd, path) {
-            Ok(length) if length <= EXEC_FILE_LIMIT => {}
+            Ok(length) if length <= LINUX_EXEC_LIMIT => {}
             _ => return SYSCALL_ERROR,
         }
-        let Ok(bytes) = vfs::read_file(&cwd, path) else {
+        let Ok(bytes) = vfs::read_file_limit(&cwd, path, LINUX_EXEC_LIMIT) else {
             return SYSCALL_ERROR;
         };
-        if bytes.len() > EXEC_FILE_LIMIT {
+        if bytes.len() > LINUX_EXEC_LIMIT {
             return SYSCALL_ERROR;
         }
         let Ok(image) = crate::linux_elf::load_linux_elf(&bytes) else {

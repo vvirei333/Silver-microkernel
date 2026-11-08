@@ -17,8 +17,14 @@
 use crate::{scheduler, syscall, timer, user_memory};
 
 // Linux AArch64 syscall numbers (asm-generic/unistd.h).
+const SYS_IOCTL: u64 = 29;
+const SYS_CLOSE: u64 = 57;
+const SYS_LSEEK: u64 = 62;
 const SYS_READ: u64 = 63;
 const SYS_WRITE: u64 = 64;
+const SYS_WRITEV: u64 = 66;
+const SYS_READLINKAT: u64 = 78;
+const SYS_FSTAT: u64 = 80;
 const SYS_EXIT: u64 = 93;
 const SYS_EXIT_GROUP: u64 = 94;
 const SYS_SET_TID_ADDRESS: u64 = 96;
@@ -29,6 +35,7 @@ const SYS_UNAME: u64 = 160;
 const SYS_GETPID: u64 = 172;
 const SYS_GETPPID: u64 = 173;
 const SYS_GETTID: u64 = 178;
+const SYS_SCHED_YIELD: u64 = 124;
 const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MMAP: u64 = 222;
@@ -43,6 +50,8 @@ const EBADF: u64 = 9;
 const ENOMEM: u64 = 12;
 const EFAULT: u64 = 14;
 const EINVAL: u64 = 22;
+const ENOTTY: u64 = 25;
+const ESPIPE: u64 = 29;
 const ENOSYS: u64 = 38;
 
 /// Linux returns `-errno`; sign-extend so `(long)x0 < 0` works in libc.
@@ -60,7 +69,17 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
     let args = [frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]];
     match number {
         SYS_WRITE => linux_write(args[0], args[1], args[2]),
+        SYS_WRITEV => linux_writev(args[0], args[1], args[2]),
         SYS_READ => linux_read(args[0], args[1], args[2]),
+        SYS_CLOSE => linux_close(args[0]),
+        SYS_LSEEK => errno(ESPIPE),
+        SYS_IOCTL => linux_ioctl(args[0], args[1], args[2]),
+        SYS_FSTAT => linux_fstat(args[0], args[1]),
+        SYS_READLINKAT => errno(ENOENT),
+        SYS_SCHED_YIELD => {
+            scheduler::yield_current();
+            0
+        }
         SYS_EXIT | SYS_EXIT_GROUP => scheduler::exit_current_with_status(args[0]),
         SYS_SET_TID_ADDRESS => scheduler::current_task_id(),
         SYS_SET_ROBUST_LIST => 0, // single-threaded: nothing to register
@@ -79,7 +98,27 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_GETRANDOM => linux_getrandom(args[0], args[1], args[2]),
         // glibc probes rseq and falls back when it is unsupported.
         SYS_RSEQ => errno(ENOSYS),
-        _ => errno(ENOSYS),
+        _ => {
+            #[cfg(feature = "linux-abi-trace")]
+            trace_unsupported(number);
+            errno(ENOSYS)
+        }
+    }
+}
+
+/// One console line per unsupported Linux syscall, so the next implementation
+/// slice is driven by what a real libc actually asks for. Capped so a retry
+/// loop cannot flood the console. Opt-in: `--features linux-abi-trace`.
+#[cfg(feature = "linux-abi-trace")]
+fn trace_unsupported(number: u64) {
+    static mut COUNT: u32 = 0;
+    unsafe {
+        if COUNT < 48 {
+            COUNT += 1;
+            crate::console::write_str("LINUX ENOSYS ");
+            crate::console::write_dec_u64(number);
+            crate::console::write_str("\r\n");
+        }
     }
 }
 
@@ -104,6 +143,82 @@ fn linux_read(fd: u64, _buffer: u64, _count: u64) -> u64 {
         0 => 0,
         _ => errno(EBADF),
     }
+}
+
+fn linux_close(fd: u64) -> u64 {
+    // The console descriptors are process-lifetime objects; "closing" them is
+    // accepted but changes nothing yet. Any other descriptor does not exist.
+    if fd <= 2 {
+        0
+    } else {
+        errno(EBADF)
+    }
+}
+
+/// `writev(2)`: scatter output over up to 16 `struct iovec`s.
+fn linux_writev(fd: u64, iovec: u64, count: u64) -> u64 {
+    const MAX_IOVECS: u64 = 16;
+    const IOVEC_BYTES: u64 = 16;
+    if count > MAX_IOVECS {
+        return errno(EINVAL);
+    }
+    if fd != 1 && fd != 2 {
+        return errno(EBADF);
+    }
+    let mut total = 0u64;
+    for index in 0..count {
+        let mut entry = [0_u8; 16];
+        let address = iovec.wrapping_add(index * IOVEC_BYTES);
+        if user_memory::copy_from_user(address, &mut entry).is_err() {
+            return errno(EFAULT);
+        }
+        let base = u64::from_le_bytes(entry[..8].try_into().unwrap());
+        let length = u64::from_le_bytes(entry[8..].try_into().unwrap());
+        let result = linux_write(fd, base, length);
+        if result == errno(EFAULT) {
+            return result;
+        }
+        total += length;
+    }
+    total
+}
+
+/// `ioctl(2)`: only the terminal size query is meaningful while stdout is the
+/// console. Everything else reports "not a tty".
+fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
+    const TIOCGWINSZ: u64 = 0x5413;
+    if fd > 2 {
+        return errno(EBADF);
+    }
+    if request != TIOCGWINSZ {
+        return errno(ENOTTY);
+    }
+    // struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel }
+    let mut size = [0_u8; 8];
+    size[0..2].copy_from_slice(&24_u16.to_le_bytes());
+    size[2..4].copy_from_slice(&80_u16.to_le_bytes());
+    if user_memory::copy_to_user(&size, argument).is_err() {
+        return errno(EFAULT);
+    }
+    0
+}
+
+/// `fstat(2)` for the three console descriptors. The layout is the aarch64
+/// `struct stat` (128 bytes); glibc uses `st_mode` to decide whether stdout is
+/// a terminal and `st_blksize` to size its stdio buffer.
+fn linux_fstat(fd: u64, buffer: u64) -> u64 {
+    const S_IFCHR: u32 = 0o020000;
+    if fd > 2 {
+        return errno(EBADF);
+    }
+    let mut stat = [0_u8; 128];
+    stat[16..20].copy_from_slice(&(S_IFCHR | 0o620).to_le_bytes()); // st_mode
+    stat[20..24].copy_from_slice(&1_u32.to_le_bytes()); // st_nlink
+    stat[56..60].copy_from_slice(&1024_u32.to_le_bytes()); // st_blksize
+    if user_memory::copy_to_user(&stat, buffer).is_err() {
+        return errno(EFAULT);
+    }
+    0
 }
 
 fn linux_clock_gettime(_clock: u64, timespec: u64) -> u64 {

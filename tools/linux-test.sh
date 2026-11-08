@@ -33,5 +33,15 @@ build rw
 
 python3 scripts/sfs_inject.py "$IMAGE" build/hello.elf linux-hello
 python3 scripts/sfs_inject.py "$IMAGE" build/rw.elf linux-rw
+
+# A real static libc binary (the SFS image is 1 MiB; all three together fit).
+if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then
+    python3 scripts/sfs_inject.py "$IMAGE" build/libc.elf linux-libc
+    LIBC=" linuxrun /sfs/linux-libc"
+else
+    LIBC=""
+    echo "note: no static libc for $CC; skipped the libc test" >&2
+fi
+
 python3 scripts/sfs_fsck.py "$IMAGE"
-echo "installed: linuxrun /sfs/linux-hello  linuxrun /sfs/linux-rw"
+echo "installed: linuxrun /sfs/linux-hello  linuxrun /sfs/linux-rw$LIBC"

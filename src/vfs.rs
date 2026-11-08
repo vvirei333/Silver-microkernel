@@ -1111,6 +1111,23 @@ pub fn read_file(cwd: &str, path: &str) -> Result<Vec<u8>, ()> {
     with_vfs(|vfs| vfs.read_file(cwd, path))
 }
 
+/// Returns a file's contents, allowing a caller-specific bound larger than the
+/// general [`MAX_FILE_BYTES`] policy. The read is still bounded by `limit` and
+/// by the file's real length, so the allocation is exactly the file size. Used
+/// by the Linux ABI loader, where a static libc binary is larger than the
+/// in-memory VFS cap but only read once and immediately freed.
+pub fn read_file_limit(cwd: &str, path: &str, limit: usize) -> Result<Vec<u8>, ()> {
+    with_vfs(|vfs| {
+        let resolved = resolve_path(cwd, path)?;
+        let (mount, relative) = vfs.resolve(&resolved);
+        let length = vfs.mounts[mount].fs.len(&relative)?;
+        if length > limit {
+            return Err(());
+        }
+        vfs.mounts[mount].fs.read_at(&relative, 0, length)
+    })
+}
+
 /// Returns a file's length without reading it. Used to reject an oversized
 /// `SYS_SPAWN_PATH` target before kernel memory is allocated.
 pub fn file_len(cwd: &str, path: &str) -> Result<usize, ()> {

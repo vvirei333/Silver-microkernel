@@ -28,6 +28,9 @@ smp-selftest = ["smp"]
 smp-churn = ["smp-selftest"]
 demo-tasks = []
 tablet = []
+# Opt-in diagnostic: print one console line per unsupported Linux ABI syscall
+# (capped), used while bringing up a libc.
+linux-abi-trace = []
 fog = []
 # Explicit opt-in for the fog image's self-relocation to `__kernel_link_pa`.
 # Standard fog builds stay at the address ABL chose and park when it differs

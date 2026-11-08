@@ -159,6 +159,19 @@ Redmi port is parked. The reference checklist is
   Remaining gap for a real libc: the VFS cap is 512 KiB and a static glibc
   `hello` is ~800 KiB; `read_file` also allocates the full cap, and the kernel
   heap is 2 MiB, so file loading and these first libc syscalls are next.
+  **Slice 3 (real libc):** `vfs::read_file_limit(cwd, path, limit)` reads a
+  file with a caller-specific bound (the general `MAX_FILE_BYTES` policy is
+  unchanged) and allocates exactly the file length; `sys_spawn_linux_path`
+  uses a 1 MiB bound, so the ~800 KiB static glibc binary loads. Added
+  `fstat` (a 128-byte aarch64 `struct stat`, `S_IFCHR|0620` for fds 0-2),
+  `ioctl(TIOCGWINSZ)`, `writev`, `close`, `lseek` (`-ESPIPE`),
+  `readlinkat` (`-ENOENT`) and `sched_yield`. An opt-in
+  `linux-abi-trace` feature logs each still-unsupported number once (capped).
+  Verified in QEMU on a clean boot: `linux-hello` (42), `linux-rw` (7) and a
+  real **static glibc** `linux-libc` (`hello from libc`, 11); with the trace
+  build the glibc run produces zero ENOSYS lines. Still missing: an fd table
+  with `openat/read/close` of real files, signal delivery, thread creation,
+  and ET_DYN relocation (link with `-no-pie`).
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -185,11 +198,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 3 (raise the file/heap budget for an ~800 KiB
-  static libc binary, fix `vfs::read_file` to allocate by length, add a
-  file-descriptor table with `openat/read/close`, then `rt_sigaction` and
-  `futex` for real libc startup); larger reader/CSS budgets, full-page layout
-  and keep-alive;
+- **Next steps:** Linux ABI slice 4 (a file-descriptor table with
+  `openat/read/close` and a read-only `/` mapping, `rt_sigaction`/`futex`,
+  then ET_DYN/PIE relocation and dynamic linker support); larger reader/CSS
+  budgets, full-page layout and keep-alive;
   TLS hardening (roots, RTC, RNG, TLS 1.2); **YouTube/JS/media still require a
   WebKit/Gecko-class engine, i.e. the Linux ABI + Phosh track**, not another
   reader increment;

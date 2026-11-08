@@ -291,9 +291,10 @@ Linux** syscall personality: `x8` carries a Linux syscall number and
 `AT_RANDOM`). Implemented so far: `write` (stdout/stderr), `read` (fd 0 as
 EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 `clock_gettime`, `rt_sigprocmask`, `uname`, `getpid`/`getppid`/`gettid`,
-`brk`, `mmap`, `munmap`, `mprotect`, `prlimit64` and `getrandom`; anything
-else returns `-ENOSYS`. There is no file-descriptor table or signal delivery
-yet.
+`brk`, `mmap`, `munmap`, `mprotect`, `prlimit64`, `getrandom`, `fstat`
+(console descriptors), `ioctl(TIOCGWINSZ)`, `writev`, `close`, `lseek`,
+`readlinkat` and `sched_yield`; anything else returns `-ENOSYS`. There is no
+file-descriptor table or signal delivery yet.
 
 The personality is fixed at spawn, so a foreign binary can never reach the
 Silver syscall table by choosing a colliding number. `linuxrun` is a
@@ -308,9 +309,8 @@ allowed, text is mapped RX, data RW and BSS is zero-filled. The per-2 MiB L3
 tables (and a per-1 GiB L2 table for the low window) are allocated on demand
 and registered with the space root, so the normal teardown frees them.
 
-`tests/linux/` and `tools/linux-test.sh` build two freestanding raw-syscall
-programs, install them with `scripts/sfs_inject.py`, and verify the path in
-QEMU:
+`tests/linux/` and `tools/linux-test.sh` build three programs, install them
+with `scripts/sfs_inject.py`, and verify the path in QEMU:
 
 ```text
 howl> linuxrun /sfs/linux-hello
@@ -320,11 +320,23 @@ Program exited with status 42
 howl> linuxrun /sfs/linux-rw
 RW data+bss ok
 Program exited with status 7
+
+howl> linuxrun /sfs/linux-libc
+hello from libc
+Program exited with status 11
 ```
 
-Remaining gap before a real libc: the VFS file cap is 512 KiB and a static
-glibc `hello` is ~800 KiB; the kernel also needs these first calls to work.
-`ET_DYN` (PIE) images are not relocated yet — link with `-no-pie`.
+The last one is a **real static glibc binary** (libc initialisation, stdio,
+`exit`), which is the point of the track. The loader reads up to 1 MiB through
+`vfs::read_file_limit`; the general VFS cap stays 512 KiB, and the transient
+read is exactly file-sized. `fstat`, `ioctl(TIOCGWINSZ)`, `writev`, `close`,
+`lseek`, `readlinkat` and `sched_yield` are implemented, and
+`--features linux-abi-trace` logs any still-unsupported number (capped) so the
+next slice is driven by what a libc actually calls.
+
+There is no file-descriptor table yet (`openat`/`read` of real files), no
+signal delivery and no thread creation, and `ET_DYN` (PIE) is not relocated —
+link with `-no-pie`.
 
 ## Bundle manifests and signing — complete
 
