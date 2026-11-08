@@ -594,6 +594,20 @@ struct OpenFile {
     directory: bool,
 }
 
+impl Clone for OpenFile {
+    fn clone(&self) -> Self {
+        Self {
+            owner: self.owner,
+            fd: self.fd,
+            path: self.path.clone(),
+            offset: self.offset,
+            writable: self.writable,
+            append: self.append,
+            directory: self.directory,
+        }
+    }
+}
+
 struct Vfs {
     /// Index 0 is the root mount (`/`) and is never removed.
     mounts: Vec<Mount>,
@@ -859,6 +873,32 @@ impl Vfs {
 
     fn open_total(&self) -> usize {
         self.open_files.len()
+    }
+
+    /// Duplicates every descriptor of `parent` for `child` (`fork`). The fd
+    /// numbers and offsets are preserved, so the Linux fd table can map the
+    /// child's entries one-to-one. All-or-nothing: capacity is checked before
+    /// any clone is inserted.
+    #[cfg(feature = "linux-abi")]
+    fn dup_owner(&mut self, parent: u64, child: u64) -> bool {
+        let clones: Vec<OpenFile> = self
+            .open_files
+            .iter()
+            .filter(|file| file.owner == parent)
+            .map(|file| {
+                let mut clone = file.clone();
+                clone.owner = child;
+                clone
+            })
+            .collect();
+        if clones.is_empty() {
+            return true;
+        }
+        if self.open_files.len() + clones.len() > MAX_OPEN_FILES {
+            return false;
+        }
+        self.open_files.extend(clones);
+        true
     }
 
     /// Reads at the descriptor's current offset and commits the new offset
@@ -1222,6 +1262,12 @@ pub fn open_count(owner: u64) -> usize {
 
 pub fn open_total() -> usize {
     with_vfs(|vfs| vfs.open_total())
+}
+
+/// Duplicates the open descriptors of one task for another (`fork`).
+#[cfg(feature = "linux-abi")]
+pub fn dup_owner(parent: u64, child: u64) -> bool {
+    with_vfs(|vfs| vfs.dup_owner(parent, child))
 }
 
 /// Transactional read: `consume` (the copyout) runs under the VFS lock and the

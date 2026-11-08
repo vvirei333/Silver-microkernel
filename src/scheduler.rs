@@ -185,11 +185,14 @@ pub struct TaskInfo {
 
 /// One anonymous mapping installed by `SYS_MMAP`. Kept sorted by
 /// `virtual_address` so the first-fit allocator can scan in a single pass.
+#[derive(Clone)]
 struct MmapRegion {
     virtual_address: usize,
     page_count: usize,
     physical_start: usize,
     generation: u32,
+    /// `PROT_*` the mapping was created with; `fork` must reuse it.
+    prot: u64,
 }
 
 /// Syscall ABI a task is running on.
@@ -954,6 +957,36 @@ silver_user_bootstrap:
     msr spsr_el1, x9
     eret
     .size silver_user_bootstrap, . - silver_user_bootstrap
+
+    .global silver_fork_bootstrap
+    .type silver_fork_bootstrap, %function
+silver_fork_bootstrap:
+    // A forked child resumes as if its `clone` syscall had just returned.
+    // `sp` points at a 272-byte copy of the parent's SVC frame (x0-x30, ELR,
+    // SPSR); the copy's x0 is zero and SP_EL0 was set by the context switch.
+    bl {bkl_release}
+    ldr x9, [sp, #248]
+    msr elr_el1, x9
+    ldr x9, [sp, #256]
+    msr spsr_el1, x9
+    ldp x0, x1, [sp, #0]
+    ldp x2, x3, [sp, #16]
+    ldp x4, x5, [sp, #32]
+    ldp x6, x7, [sp, #48]
+    ldp x8, x9, [sp, #64]
+    ldp x10, x11, [sp, #80]
+    ldp x12, x13, [sp, #96]
+    ldp x14, x15, [sp, #112]
+    ldp x16, x17, [sp, #128]
+    ldp x18, x19, [sp, #144]
+    ldp x20, x21, [sp, #160]
+    ldp x22, x23, [sp, #176]
+    ldp x24, x25, [sp, #192]
+    ldp x26, x27, [sp, #208]
+    ldp x28, x29, [sp, #224]
+    ldr x30, [sp, #240]
+    eret
+    .size silver_fork_bootstrap, . - silver_fork_bootstrap
 "#,
     bkl_release = sym crate::smp::bkl_release_asm
 );
@@ -961,6 +994,8 @@ silver_user_bootstrap:
 extern "C" {
     fn silver_context_switch(current: *mut TaskContext, next: *const TaskContext);
     fn silver_user_bootstrap();
+    #[cfg(feature = "linux-abi")]
+    fn silver_fork_bootstrap();
 }
 
 pub fn init() {
@@ -3299,6 +3334,350 @@ pub fn exec_linux_current(
     })
 }
 
+/// Cleanup guard for a partially built fork. On success every field is taken
+/// into the child task, so `Drop` sees empty state and frees nothing.
+#[cfg(feature = "linux-abi")]
+struct ForkParts {
+    image: Option<LinuxImage>,
+    /// `(space token, asid)` once the address space exists.
+    space: Option<(TableToken, u32)>,
+    /// The private page; owned by the space once `space` is `Some`.
+    private: Option<(usize, u32)>,
+    stack: Option<(usize, u32)>,
+    heap: Vec<(usize, u32)>,
+    mmap: Vec<MmapRegion>,
+}
+
+#[cfg(feature = "linux-abi")]
+impl Drop for ForkParts {
+    fn drop(&mut self) {
+        if let Some((token, asid)) = self.space.take() {
+            let (private, generation) = self.private.take().unwrap_or((0, 0));
+            let _ = mmu::destroy_task_space(token, private, generation, asid as u16);
+        } else if let Some((private, generation)) = self.private.take() {
+            let _ = frame_allocator::free_page_tagged(private, generation);
+        }
+        if let Some((start, generation)) = self.stack.take() {
+            let _ = frame_allocator::free_contiguous_pages_tagged(
+                start,
+                TASK_USER_STACK_PAGES,
+                generation,
+            );
+        }
+        for &(page, generation) in &self.heap {
+            let _ = frame_allocator::free_page_tagged(page, generation);
+        }
+        for region in &self.mmap {
+            let _ = frame_allocator::free_contiguous_pages_tagged(
+                region.physical_start,
+                region.page_count,
+                region.generation,
+            );
+        }
+        if let Some(image) = &self.image {
+            image.release();
+        }
+    }
+}
+
+/// Forks the current Linux task (`clone` with `SIGCHLD`, no shared VM).
+///
+/// The child is a deep copy of the address space: image, heap, anonymous
+/// mappings, private page and user stack get fresh frames; the kernel stack is
+/// new and starts with a copy of the parent's SVC frame whose `x0` is zero, so
+/// the child returns from `clone` as a new process. File descriptors and the
+/// Linux fd table are duplicated, and the child's parent is the caller.
+///
+/// Eager copying keeps this simple and correct; copy-on-write is a later
+/// optimisation.
+#[cfg(feature = "linux-abi")]
+pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u64> {
+    let manager = scheduler_manager()?;
+    if !has_task_capacity(manager) {
+        return None;
+    }
+    let parent_id = current_task_id();
+    let parent_index = smp::current_index();
+
+    // Snapshot everything needed from the parent before mutating the table.
+    let (
+        parent_image,
+        parent_stack,
+        parent_private,
+        parent_heap,
+        parent_mmap,
+        parent_cwd,
+        parent_argv,
+        parent_envp,
+        parent_arguments,
+        parent_break,
+        parent_mmap_bytes,
+        parent_prefix,
+        parent_quota,
+        parent_priority,
+    ) = {
+        let parent = manager.tasks.get(parent_index)?;
+        if parent.personality != Personality::Linux || parent.user_image.is_some() {
+            return None;
+        }
+        (
+            parent.linux_image.as_ref()?.duplicate()?,
+            parent.user_stack,
+            parent.private_page,
+            parent.heap_pages.clone(),
+            parent.mmap_regions.clone(),
+            parent.cwd.clone(),
+            parent.argv.clone(),
+            parent.envp.clone(),
+            parent.arguments.clone(),
+            parent.program_break,
+            parent.mmap_bytes,
+            parent.fs_write_prefix.clone(),
+            parent.fs_quota,
+            parent.priority,
+        )
+    };
+    if parent_stack.is_empty() {
+        return None;
+    }
+
+    let mut parts = ForkParts {
+        image: Some(parent_image),
+        space: None,
+        private: None,
+        stack: None,
+        heap: Vec::new(),
+        mmap: Vec::new(),
+    };
+
+    let Some((stack_start, stack_generation)) =
+        frame_allocator::alloc_user_contiguous_pages_tagged(TASK_USER_STACK_PAGES)
+    else {
+        return None;
+    };
+    parts.stack = Some((stack_start, stack_generation));
+    let Some((private_page, private_generation)) = frame_allocator::alloc_user_page_tagged() else {
+        return None;
+    };
+    parts.private = Some((private_page, private_generation));
+
+    let mut heap = Vec::with_capacity(parent_heap.len());
+    for &(_, _) in &parent_heap {
+        let Some(page) = frame_allocator::alloc_user_page_tagged() else {
+            return None;
+        };
+        heap.push(page);
+    }
+    parts.heap = heap;
+    for region in &parent_mmap {
+        let Some((physical_start, generation)) =
+            frame_allocator::alloc_user_contiguous_pages_tagged(region.page_count)
+        else {
+            return None;
+        };
+        parts.mmap.push(MmapRegion {
+            virtual_address: region.virtual_address,
+            page_count: region.page_count,
+            physical_start,
+            generation,
+            prot: region.prot,
+        });
+    }
+
+    let heap_frames = parts.heap.len();
+    let mmap_frames: usize = parts.mmap.iter().map(|region| region.page_count).sum();
+    let ledger_frames = TASK_STACK_PAGES
+        + mmu::SPACE_TABLE_FRAMES
+        + 1
+        + TASK_USER_STACK_PAGES
+        + parts.image.as_ref()?.page_count()
+        + heap_frames
+        + mmap_frames;
+    if !mem_policy::task_charge_ok(0, ledger_frames, task_frame_limit()) {
+        return None;
+    }
+
+    let Some(kernel_stack_start) = kernel_stack::alloc() else {
+        return None;
+    };
+    // The child resumes through `silver_fork_bootstrap`, so its kernel stack
+    // starts with a copy of the parent's SVC frame and a zero `x0`.
+    let frame_address =
+        phys_to_virt(kernel_stack_start + TASK_STACK_SIZE) - 272;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            frame.as_ptr() as *const u8,
+            frame_address as *mut u8,
+            264,
+        );
+        core::ptr::write_bytes((frame_address + 264) as *mut u8, 0, 8);
+        (frame_address as *mut u64).write(0);
+    }
+    let mut user_stack_pointer: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, sp_el0", out(reg) user_stack_pointer);
+    }
+
+    let Some((ttbr0, token)) = mmu::create_task_space(private_page, stack_start, None) else {
+        kernel_stack::free(kernel_stack_start);
+        return None;
+    };
+    parts.space = Some((token, mmu::asid_of(ttbr0) as u32));
+
+    if !mmu::install_linux_image(ttbr0, parts.image.as_ref()?) {
+        kernel_stack::free(kernel_stack_start);
+        return None;
+    }
+    let heap_physical: Vec<usize> = parts.heap.iter().map(|&(page, _)| page).collect();
+    if !heap_physical.is_empty() && !mmu::map_user_heap_pages(ttbr0, 0, &heap_physical) {
+        kernel_stack::free(kernel_stack_start);
+        return None;
+    }
+    for region in &parts.mmap {
+        if !mmu::map_user_pages_at(
+            ttbr0,
+            region.virtual_address,
+            region.physical_start,
+            region.page_count,
+            region.prot,
+        ) {
+            kernel_stack::free(kernel_stack_start);
+            return None;
+        }
+    }
+
+    // The mappings above zeroed the fresh frames; copy the parent's contents
+    // into them now.
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            phys_to_virt(parent_stack.start) as *const u8,
+            phys_to_virt(stack_start) as *mut u8,
+            TASK_USER_STACK_SIZE,
+        );
+        core::ptr::copy_nonoverlapping(
+            phys_to_virt(parent_private) as *const u8,
+            phys_to_virt(private_page) as *mut u8,
+            PAGE_SIZE,
+        );
+        for (index, &(old_page, _)) in parent_heap.iter().enumerate() {
+            core::ptr::copy_nonoverlapping(
+                phys_to_virt(old_page) as *const u8,
+                phys_to_virt(parts.heap[index].0) as *mut u8,
+                PAGE_SIZE,
+            );
+        }
+        for (index, region) in parent_mmap.iter().enumerate() {
+            core::ptr::copy_nonoverlapping(
+                phys_to_virt(region.physical_start) as *const u8,
+                phys_to_virt(parts.mmap[index].physical_start) as *mut u8,
+                region.page_count * PAGE_SIZE,
+            );
+        }
+    }
+
+    let child_id = manager.next_id;
+    // Duplicate descriptors last: no fallible step may follow this.
+    if !vfs::dup_owner(parent_id, child_id) {
+        kernel_stack::free(kernel_stack_start);
+        return None;
+    }
+    crate::linux_fd::fork_table(parent_id, child_id);
+
+    let mut context = TaskContext::zero();
+    context.stack_pointer = frame_address as u64;
+    context.user_stack_pointer = user_stack_pointer;
+    context.elr = silver_fork_bootstrap as *const () as usize as u64;
+
+    let (space_token, space_asid) = parts.space.take().unwrap();
+    let _ = space_asid;
+    let (private_page, private_generation) = parts.private.take().unwrap();
+    let (stack_start, stack_generation) = parts.stack.take().unwrap();
+
+    let task = Task {
+        fs_write_prefix: parent_prefix,
+        fs_quota: parent_quota,
+        id: child_id,
+        state: TaskState::Ready,
+        resume_state: None,
+        program: user_program::PROGRAM_DYNAMIC,
+        argument: 0,
+        personality: Personality::Linux,
+        cap_table: capability::CapTable::new(),
+        bound_irq: None,
+        irq_pending: false,
+        arguments: parent_arguments,
+        ppid: Some(parent_id),
+        exit_status: None,
+        resources_released: false,
+        argv: parent_argv,
+        envp: parent_envp,
+        cwd: parent_cwd,
+        owns_console: false,
+        priority: parent_priority,
+        context,
+        stack: MemoryRegion::new(kernel_stack_start, kernel_stack_start + TASK_STACK_SIZE),
+        user_stack: MemoryRegion::new(stack_start, stack_start + TASK_USER_STACK_SIZE),
+        user_stack_generation: stack_generation,
+        private_page,
+        private_page_generation: private_generation,
+        space_token,
+        ttbr0,
+        user_image: None,
+        linux_image: parts.image.take(),
+        heap_pages: core::mem::take(&mut parts.heap),
+        dma_pages: Vec::new(),
+        mmap_regions: core::mem::take(&mut parts.mmap),
+        mmap_bytes: parent_mmap_bytes,
+        mem_frames: ledger_frames,
+        program_break: parent_break,
+        waiting_on: None,
+        owned_mutexes: Vec::new(),
+        running_on: None,
+        is_idle: false,
+    };
+
+    manager.tasks.push(task);
+    manager.next_id += 1;
+    let index = manager.tasks.len() - 1;
+    enqueue_ready(manager, smp::this_cpu_id(), index);
+    Some(child_id)
+}
+
+/// Result of `wait4`.
+#[cfg(feature = "linux-abi")]
+pub enum WaitChild {
+    Exited(u64, u64),
+    StillRunning,
+    NoChild,
+}
+
+/// Waits for one child of the calling task (`wait4`). `pid <= 0` matches any
+/// child; a positive value matches exactly that pid.
+#[cfg(feature = "linux-abi")]
+pub fn wait_child(pid: i64, nohang: bool) -> WaitChild {
+    let parent = current_task_id();
+    let Some(manager) = scheduler_manager() else {
+        return WaitChild::NoChild;
+    };
+    let candidate = manager.tasks.iter().find(|task| {
+        task.ppid == Some(parent) && (pid <= 0 || task.id == pid as u64)
+    });
+    let Some(task) = candidate else {
+        return WaitChild::NoChild;
+    };
+    let id = task.id;
+    let zombie = task.state == TaskState::Zombie;
+    if !zombie {
+        if nohang {
+            return WaitChild::StillRunning;
+        }
+    }
+    match wait_inner(id, false, true) {
+        Some(WaitEvent::Exited(status)) => WaitChild::Exited(id, status),
+        _ => WaitChild::NoChild,
+    }
+}
+
 fn spawn_elf_task(
     user_image: Option<LoadedImage>,
     linux_image: Option<LinuxImage>,
@@ -4776,6 +5155,7 @@ impl Task {
             page_count,
             physical_start,
             generation,
+            prot,
         };
         let position = self
             .mmap_regions
@@ -4866,6 +5246,7 @@ impl Task {
                     physical_start: removed_physical + span,
                     page_count: right,
                     generation,
+                    prot: self.mmap_regions[removal.index].prot,
                 };
                 self.mmap_regions[removal.index].page_count = left;
                 self.mmap_regions.insert(removal.index + 1, tail);

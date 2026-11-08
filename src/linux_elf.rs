@@ -82,6 +82,49 @@ impl LinuxImage {
         self.runs.iter().map(|run| run.page_count).sum()
     }
 
+    /// Deep copy for `fork`: fresh runs with the same content, addresses and
+    /// permission classes.
+    pub fn duplicate(&self) -> Option<LinuxImage> {
+        let mut runs: Vec<LinuxRun> = Vec::with_capacity(self.runs.len());
+        for run in &self.runs {
+            let Some((physical_start, generation)) =
+                frame_allocator::alloc_user_contiguous_pages_tagged(run.page_count)
+            else {
+                for prior in &runs {
+                    frame_allocator::free_contiguous_pages_tagged(
+                        prior.physical_start,
+                        prior.page_count,
+                        prior.generation,
+                    );
+                }
+                return None;
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(run.physical_start) as *const u8,
+                    phys_to_virt(physical_start) as *mut u8,
+                    run.page_count * PAGE_SIZE,
+                );
+            }
+            runs.push(LinuxRun {
+                virtual_address: run.virtual_address,
+                physical_start,
+                page_count: run.page_count,
+                generation,
+                kinds: run.kinds.clone(),
+            });
+        }
+        Some(LinuxImage {
+            entry: self.entry,
+            phdr_address: self.phdr_address,
+            phentsize: self.phentsize,
+            phnum: self.phnum,
+            upper_bound: self.upper_bound,
+            runs,
+            released: AtomicBool::new(false),
+        })
+    }
+
     /// Returns every run to the allocator. Idempotent, like
     /// [`crate::elf::LoadedImage::release`].
     pub fn release(&self) {

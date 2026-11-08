@@ -219,6 +219,26 @@ Redmi port is parked. The reference checklist is
   task 7, prints `hello from linux abi` and exits 42. Three consecutive execs
   followed by the glibc test and `health` show no frame/DMA leak (used 2171 of
   31615 frames, leaked 0).
+  **Slice 7 (`fork` + `wait4`):** `clone(SIGCHLD)` with `stack == 0` forks the
+  current Linux task. The address space is deep-copied eagerly: image runs,
+  heap pages, mmap regions (now carrying their `prot`), private page and user
+  stack get fresh frames; the fd table and cwd are duplicated
+  (`vfs::dup_owner` clones the same fd numbers, `linux_fd::fork_table` copies
+  the targets). The child's kernel stack starts with a copy of the parent's
+  SVC frame whose `x0` is zero, and `silver_fork_bootstrap` restores the full
+  register bank, so the child returns 0 from `clone` on its own stack while the
+  parent gets the pid. Failed builds are unwound by `ForkParts`' `Drop`
+  (space, private page, stack, heap, mmap, image). `wait4` matches children by
+  ppid (positive pid or any), blocks through the existing process wait queue,
+  reaps the zombie and writes `(status & 0xff) << 8`; `WNOHANG` returns 0.
+  `tests/linux/fork.c` forks, the child execs `/sfs/linux-hello`, the parent
+  waits and checks `WEXITSTATUS == 42`; QEMU prints the greeting, `parent saw
+  child 42`, and the parent exits 0. Three consecutive forks plus the glibc
+  test and `health` stay at 2171/31613 frames with no zombies or DMA leaks.
+  Console writes from forked Linux children are allowed through
+  `write_user_output_shared` (the Silver console owner is a single task; a
+  process tree shares the terminal). Threads (`CLONE_VM`) are still `-ENOSYS`
+  and COW is a later optimisation.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -245,11 +265,11 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 7 (`clone`/`fork` with an eager address-space
-  copy, `wait4`, `kill`/signals; then `pipe2`/`ppoll`/`eventfd`/`memfd` and a
-  per-task read scope), then ET_DYN/PIE and `ld.so` so distro binaries and a
-  real shell run; then headless Wayland/GTK/D-Bus → Phosh. Network base
-  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 8 (COW fork, `SIGCHLD`/`rt_sigaction` delivery,
+  `pipe2`/`ppoll`/`eventfd`/`memfd` and a per-task read scope), then
+  ET_DYN/PIE and `ld.so` so distro binaries and a real shell run; then headless
+  Wayland/GTK/D-Bus → Phosh. Network base maintenance (keep-alive, TLS
+  roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

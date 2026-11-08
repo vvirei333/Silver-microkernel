@@ -35,6 +35,8 @@ const SYS_FSTAT: u64 = 80;
 const SYS_NEWFSTATAT: u64 = 79;
 const SYS_GETDENTS64: u64 = 61;
 const SYS_EXIT: u64 = 93;
+const SYS_CLONE: u64 = 220;
+const SYS_WAIT4: u64 = 260;
 const SYS_EXECVE: u64 = 221;
 const SYS_EXIT_GROUP: u64 = 94;
 const SYS_SET_TID_ADDRESS: u64 = 96;
@@ -69,6 +71,8 @@ const EPERM: u64 = 1;
 const ENOENT: u64 = 2;
 const ENOEXEC: u64 = 8;
 const EBADF: u64 = 9;
+const ECHILD: u64 = 10;
+const EAGAIN: u64 = 11;
 const ENOMEM: u64 = 12;
 const EACCES: u64 = 13;
 const EFAULT: u64 = 14;
@@ -143,6 +147,8 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         }
         SYS_EXIT | SYS_EXIT_GROUP => scheduler::exit_current_with_status(args[0]),
         SYS_EXECVE => linux_execve(frame, args[0], args[1], args[2]),
+        SYS_CLONE => linux_clone(frame, args[0], args[1], args[2], args[3], args[4]),
+        SYS_WAIT4 => finish(linux_wait4(args[0] as i64, args[1], args[2])),
         SYS_SET_TID_ADDRESS => scheduler::current_task_id(),
         SYS_SET_ROBUST_LIST => 0, // single-threaded: nothing to register
         SYS_CLOCK_GETTIME => linux_clock_gettime(args[0], args[1]),
@@ -231,6 +237,50 @@ fn linux_execve(
         core::arch::asm!("msr sp_el0, {}", in(reg) result.stack_pointer);
     }
     0
+}
+
+/// `clone(2)` with fork semantics (`SIGCHLD`, no shared VM). Thread creation
+/// is not supported yet and is reported as `-ENOSYS`.
+fn linux_clone(
+    frame: &mut [u64; crate::syscall::FRAME_QUADWORDS],
+    flags: u64,
+    stack: u64,
+    _parent_tid: u64,
+    tls: u64,
+    _child_tid: u64,
+) -> u64 {
+    const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_SIGHAND: u64 = 0x0000_0800;
+    const CLONE_THREAD: u64 = 0x0001_0000;
+    if stack != 0 || tls != 0 {
+        return errno(EINVAL);
+    }
+    if flags & (CLONE_VM | CLONE_SIGHAND | CLONE_THREAD) != 0 {
+        return errno(ENOSYS);
+    }
+    match scheduler::fork_current(frame) {
+        Some(pid) => pid,
+        None => errno(EAGAIN),
+    }
+}
+
+/// `wait4(2)`. The exit status is encoded the Linux way: normal exit is
+/// `(code & 0xff) << 8`, which makes `WIFEXITED` true and `WEXITSTATUS` return
+/// the low byte.
+fn linux_wait4(pid: i64, status_pointer: u64, options: u64) -> Result<u64, u64> {
+    const WNOHANG: u64 = 1;
+    match scheduler::wait_child(pid, options & WNOHANG != 0) {
+        scheduler::WaitChild::Exited(child, status) => {
+            if status_pointer != 0 {
+                let word = ((status & 0xff) << 8) as u32;
+                user_memory::copy_to_user(&word.to_le_bytes(), status_pointer)
+                    .map_err(|_| EFAULT)?;
+            }
+            Ok(child)
+        }
+        scheduler::WaitChild::StillRunning => Ok(0),
+        scheduler::WaitChild::NoChild => Err(ECHILD),
+    }
 }
 
 fn linux_write(fd: u64, buffer: u64, count: u64) -> u64 {

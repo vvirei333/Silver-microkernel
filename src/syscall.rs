@@ -1097,10 +1097,11 @@ fn sys_print(ptr: u64, len: u64) -> u64 {
 /// Writes `len` bytes from a user buffer to the console. Unlike `SYS_PRINT`
 /// this has no 4 KiB cap; the buffer is copied in bounded chunks. Used by the
 /// Linux ABI's `write(1|2, ...)`.
-pub(crate) fn write_user_output(ptr: u64, len: u64) -> u64 {
-    if !scheduler::current_task_owns_console() {
-        return 0;
-    }
+/// Console write without the single-owner check. The Linux layer uses it for
+/// fd 1/2: a forked child inherits the terminal even though only one task
+/// (the foreground `linuxrun`) holds console ownership in the Silver model.
+#[cfg(feature = "linux-abi")]
+pub(crate) fn write_user_output_shared(ptr: u64, len: u64) -> u64 {
     let mut remaining = len as usize;
     let mut address = ptr;
     while remaining != 0 {

@@ -243,7 +243,9 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
     let target = lookup(task, fd).ok_or(EBADF)?;
     match target {
         Target::Console => {
-            if crate::syscall::write_user_output(buffer, count) == crate::syscall::SYSCALL_ERROR {
+            if crate::syscall::write_user_output_shared(buffer, count)
+                == crate::syscall::SYSCALL_ERROR
+            {
                 Err(EFAULT)
             } else {
                 Ok(count)
@@ -345,6 +347,19 @@ pub fn close_task(task: u64) {
     if let Some(index) = tables.iter().position(|table| table.task == task) {
         tables.remove(index);
     }
+}
+
+/// Copies the parent's descriptor table to a forked child. VFS handle numbers
+/// were duplicated with the same numbers by `vfs::dup_owner`, so the targets
+/// stay valid.
+pub fn fork_table(parent: u64, child: u64) {
+    let mut tables = TABLES.lock();
+    let Some(source) = tables.iter().find(|table| table.task == parent) else {
+        return;
+    };
+    let slots = source.slots.clone();
+    tables.retain(|table| table.task != child);
+    tables.push(Table { task: child, slots });
 }
 
 pub(crate) fn write_stat(buffer: u64, mode: u32, size: u64, ino: u64) -> Result<(), u64> {
