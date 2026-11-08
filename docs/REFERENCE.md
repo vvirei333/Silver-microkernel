@@ -52,7 +52,7 @@ qemu-system-aarch64 -machine virt,virtualization=on -cpu cortex-a72 -smp 1 \
 | Init | Silverd resolves task ids (not cap ids) before grants | **pass** |
 | Capabilities | `CAP_MOUNT`/`CAP_POWER` outside `CAP_ALL`; shell owns `CAP_POWER` by kernel policy | **pass** |
 | Toolbox | multi-call `utils`: grep/wc/head/tail/cp/find/seq/dirname/sleep/true/false | **pass** |
-| Wolfser | `wolfser [query|url]`, search/address bar, clickable links, per-tab history, four cached tabs, hover status/hand cursor, middle-click new tab, redirects; HTTP via smoltcp, HTTPS via the Qt host proxy; `--snapshot` sees a rendered frame | **pass** |
+| Wolfser | `wolfser [query|url]`, search/address bar, clickable links, per-tab history, four cached tabs, lead image (Qt decodes PNG/JPEG), hover status/hand cursor, middle-click new tab, redirects; HTTP via smoltcp, HTTPS via the Qt host proxy; `--snapshot` sees a rendered frame | **pass** |
 | Power | `poweroff`/`reboot`; SMC on Qualcomm, HVC on QEMU | **implemented; QEMU PSCI caveat below** |
 | SMP | QEMU `-smp 4` selftest | **15 PASS / 0 FAIL** |
 | Fog QEMU | relocation, at-link, fail-closed park, timer | **PASS** |
@@ -89,10 +89,10 @@ describes a supported build.
    still to come.
 5. **Wolfser is a real text browser.** Search/address bar, clickable links,
    back/forward history, four tabs with cached pages, 3xx and meta-refresh
-   redirects, word wrap, headings, reader-mode content selection and a moving
-   loading screen work. CSS layout, images, forms, bookmarks and more tabs do
-   not yet; the Linux ABI/Phosh track replaces the renderer with a real engine
-   later.
+   redirects, word wrap, headings, reader-mode content selection, a
+   lead image and a moving loading screen work. CSS layout, inline images,
+   forms, bookmarks and more tabs do not yet; the Linux ABI/Phosh track
+   replaces the renderer with a real engine later.
 6. **Linux ABI/Phosh are not started.** The kernel personality layer, static
    musl binaries, headless Wayland and the Phosh stack are the active
    long-term track; see [`VECTOR.md`](VECTOR.md).
@@ -133,8 +133,8 @@ network driver reports a probe failure and the shell continues.
 
 1. Native TLS client (rustls/embedded-tls) so `wget` and the browser do not
    depend on the host viewer for `https://`.
-2. Wolfser: images (PNG first), bookmarks/start page, hover link targets,
-   damage rectangles, and more than four tabs.
+2. Wolfser: inline images, bookmarks/start page, damage rectangles and more
+   than four tabs.
 3. Window transport on real hardware (host-side streaming or a local console).
 4. Linux ABI: static musl binaries, then busybox `sh`.
 5. Phosh: headless Wayland, GTK software render, D-Bus + logind stub, `phosh`.

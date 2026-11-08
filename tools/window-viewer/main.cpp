@@ -53,6 +53,13 @@ constexpr uint64_t kFieldWebError = 0x44;
 constexpr uint64_t kFieldWebFinalLen = 0x48;
 constexpr uint64_t kFieldWebCapable = 0x4C;
 constexpr uint64_t kFieldCursor = 0x50;
+constexpr uint64_t kFieldImgRequestSeq = 0x54;
+constexpr uint64_t kFieldImgDoneSeq = 0x58;
+constexpr uint64_t kFieldImgWidth = 0x5C;
+constexpr uint64_t kFieldImgHeight = 0x60;
+constexpr uint64_t kFieldImgLen = 0x64;
+constexpr uint64_t kFieldImgError = 0x68;
+constexpr uint64_t kFieldImgRequestLen = 0x6C;
 constexpr uint64_t kPixels = 0x1000;
 constexpr uint64_t kWebRequest = 0x240000;
 constexpr int kWebRequestMax = 1024;
@@ -60,6 +67,10 @@ constexpr uint64_t kWebFinalUrl = 0x240800;
 constexpr int kWebFinalUrlMax = 1024;
 constexpr uint64_t kWebBody = 0x241000;
 constexpr int kWebBodyMax = 0x400000 - static_cast<int>(kWebBody);
+constexpr uint64_t kImgUrl = 0x240C00;
+constexpr int kImgUrlMax = 1024;
+constexpr int kImageMaxWidth = 480;
+constexpr int kImageMaxHeight = 360;
 constexpr uint64_t kInputRing = 0x0100;
 constexpr uint32_t kInputSlots = 64;
 constexpr uint64_t kInputEntry = 8;
@@ -154,8 +165,12 @@ public:
         // fetched through this viewer; an old viewer leaves the flag at 0.
         writeU32(m_shared.data, kFieldWebCapable, 1);
         m_lastRequest = m_shared.u32(kFieldWebRequestSeq);
+        m_lastImage = m_shared.u32(kFieldImgRequestSeq);
         auto *timer = new QTimer(this);
-        connect(timer, &QTimer::timeout, this, [this] { tick(); });
+        connect(timer, &QTimer::timeout, this, [this] {
+            tick();
+            tickImages();
+        });
         timer->start(40);
     }
 
@@ -170,7 +185,24 @@ private:
         start(seq);
     }
 
+    void tickImages() {
+        const uint32_t seq = m_shared.u32(kFieldImgRequestSeq);
+        if (seq == 0 || seq == m_lastImage) {
+            return;
+        }
+        m_lastImage = seq;
+        startImage(seq);
+    }
+
     void start(uint32_t seq) {
+        // A page navigation owns the body buffer; cancel any image that
+        // could otherwise finish later and overwrite it.
+        if (m_imageReply != nullptr) {
+            m_imageSeq = 0;
+            m_imageReply->abort();
+            m_imageReply->deleteLater();
+            m_imageReply = nullptr;
+        }
         if (m_reply != nullptr) {
             m_reply->abort();
             m_reply->deleteLater();
@@ -229,6 +261,94 @@ private:
         publish(seq, static_cast<uint32_t>(status), body, error, finalUrl);
     }
 
+    void startImage(uint32_t seq) {
+        if (m_imageReply != nullptr) {
+            m_imageSeq = 0;
+            m_imageReply->abort();
+            m_imageReply->deleteLater();
+            m_imageReply = nullptr;
+        }
+        if (m_reply != nullptr) {
+            // A page fetch owns the body buffer; skip this image.
+            publishImage(seq, 0, 0, 0, kWebErrorUnsupported);
+            return;
+        }
+        uint32_t length = m_shared.u32(kFieldImgRequestLen);
+        if (length > static_cast<uint32_t>(kImgUrlMax)) {
+            length = kImgUrlMax;
+        }
+        const QString text = QString::fromUtf8(
+            reinterpret_cast<const char *>(m_shared.data + kImgUrl),
+            static_cast<int>(length));
+        const QUrl url(text);
+        if (!url.isValid() || (url.scheme() != QLatin1String("http") &&
+                               url.scheme() != QLatin1String("https"))) {
+            publishImage(seq, 0, 0, 0, kWebErrorUnsupported);
+            return;
+        }
+        QNetworkRequest request(url);
+        request.setAttribute(QNetworkRequest::RedirectPolicyAttribute,
+                             QNetworkRequest::NoLessSafeRedirectPolicy);
+        request.setRawHeader("Accept-Encoding", "identity");
+        request.setHeader(QNetworkRequest::UserAgentHeader,
+                          "Mozilla/5.0 (WerewolfOS) Wolfser/0.2");
+        std::fprintf(stderr, "proxy: image %s\n", url.toString().toUtf8().constData());
+        m_imageSeq = seq;
+        m_imageReply = m_manager.get(request);
+        connect(m_imageReply, &QNetworkReply::finished, this, [this, seq] { finishedImage(seq); });
+    }
+
+    void finishedImage(uint32_t seq) {
+        QNetworkReply *reply = m_imageReply;
+        if (reply == nullptr || seq != m_imageSeq) {
+            return;
+        }
+        m_imageReply = nullptr;
+        const int status = reply->attribute(QNetworkRequest::HttpStatusCodeAttribute).toInt();
+        QByteArray data = reply->readAll();
+        const bool failed = (reply->error() != QNetworkReply::NoError && status == 0) ||
+                            status >= 400;
+        reply->deleteLater();
+        if (failed) {
+            publishImage(seq, 0, 0, 0, kWebErrorNetwork);
+            return;
+        }
+        QImage image;
+        if (!image.loadFromData(data) || image.isNull()) {
+            publishImage(seq, 0, 0, 0, 2); // decode error
+            return;
+        }
+        if (image.width() > kImageMaxWidth || image.height() > kImageMaxHeight) {
+            image = image.scaled(kImageMaxWidth, kImageMaxHeight, Qt::KeepAspectRatio,
+                                 Qt::SmoothTransformation);
+        }
+        image = image.convertToFormat(QImage::Format_RGBA8888);
+        const uint32_t width = static_cast<uint32_t>(image.width());
+        const uint32_t height = static_cast<uint32_t>(image.height());
+        const uint32_t stride = width * 4;
+        const uint32_t total = stride * height;
+        if (width == 0 || height == 0 || total > static_cast<uint32_t>(kWebBodyMax)) {
+            publishImage(seq, 0, 0, 0, 2);
+            return;
+        }
+        for (uint32_t y = 0; y < height; ++y) {
+            std::memcpy(m_shared.data + kWebBody + static_cast<size_t>(y) * stride,
+                        image.constScanLine(static_cast<int>(y)), stride);
+        }
+        std::fprintf(stderr, "proxy: image %ux%u bytes=%u\n", width, height, total);
+        publishImage(seq, width, height, total, kWebErrorNone);
+    }
+
+    void publishImage(uint32_t seq, uint32_t width, uint32_t height, uint32_t length,
+                      uint32_t error) {
+        writeU32(m_shared.data, kFieldImgWidth, width);
+        writeU32(m_shared.data, kFieldImgHeight, height);
+        writeU32(m_shared.data, kFieldImgLen, length);
+        writeU32(m_shared.data, kFieldImgError, error);
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        writeU32(m_shared.data, kFieldImgDoneSeq, seq);
+    }
+
     void publish(uint32_t seq, uint32_t status, const QByteArray &body, uint32_t error,
                  const QString &finalUrl) {
         QByteArray final = finalUrl.toUtf8();
@@ -253,7 +373,10 @@ private:
     Shared &m_shared;
     QNetworkAccessManager m_manager;
     QNetworkReply *m_reply = nullptr;
+    QNetworkReply *m_imageReply = nullptr;
     uint32_t m_lastRequest = 0;
+    uint32_t m_lastImage = 0;
+    uint32_t m_imageSeq = 0;
 };
 
 class Viewer : public QWidget {

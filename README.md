@@ -555,8 +555,11 @@ stripped, entities decoded, word-wrapped paragraphs, headings scaled up) and
 drawn into one 900x640 RGBA surface. A `<main>`, `<article>` or MediaWiki
 content container selects the article region, so Wikipedia opens on the text
 instead of its menus. Links are blue and underlined; clicking one navigates.
-Four tabs keep their own URL, history, scroll position and rendered page, so
-switching is instant and does not refetch. There is no guest compositor: the
+A lead image (usually the article's infobox picture) is fetched and decoded by
+the host viewer's Qt image stack, then shown centred above the text; the image
+scrolls with the page and is re-fetched when its tab comes back. Four tabs keep
+their own URL, history, scroll position and rendered page, so switching is
+instant and does not refetch. There is no guest compositor: the
 surface lives in an ivshmem BAR, and a Qt program on the host maps the same
 file.
 
@@ -569,7 +572,7 @@ file.
 | `0x030` | host web-proxy request/done sequence, status, body/URL lengths |
 | `0x100` | input ring entries |
 | `0x1000` | RGBA8888 pixels |
-| `0x240000` | web-proxy request URL (1 KiB), final URL (1 KiB), body (up to 4 MiB) |
+| `0x240000` | web-proxy request URL (1 KiB), final URL, image URL, body (HTML or RGBA) |
 
 Keys from the host (`Ctrl+L` edit the address, `Enter` go, `Ctrl+T` new tab,
 `Ctrl+W` close tab, `Ctrl+Tab` next tab, `Ctrl+Q` quit, `Ctrl+R`/`F5` reload,
@@ -611,8 +614,8 @@ If Wolfser exits with status 21, the VM has no ivshmem device: relaunch QEMU
 with the arguments above (or use `./build_and_qemu.sh`). Starting `wolfser`
 twice reuses the running instance (one window per VM).
 
-The renderer deliberately has no CSS layout or images yet, and four tabs are
-the current limit. HTTPS works only when the Qt viewer is running (it
+The renderer deliberately has no CSS layout and shows one lead image per page;
+four tabs are the current limit. HTTPS works only when the Qt viewer is running (it
 terminates TLS on the host); a native guest TLS stack is the next network
 milestone. The Linux ABI/Phosh track will
 eventually replace this renderer with a real engine.

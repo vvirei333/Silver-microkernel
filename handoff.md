@@ -48,8 +48,13 @@ Redmi port is parked. The reference checklist is
   refetch. `Ctrl+T`/`Ctrl+W`/`Ctrl+Tab`, the tab strip, `+` and the close `x`
   manage them. Hovering a link publishes its target in the footer and sets
   `FIELD_CURSOR` so the viewer shows a hand; middle click/Ctrl+click opens the
-  target in a new tab. The first line of every page used to lose its spaces
-  because the wrap buffer had not flushed yet; a `line_len` check fixed it. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
+  target in a new tab. The first image found in the article (including images
+  inside an infobox table, which is skipped as text) becomes a centred lead
+  image: the viewer fetches it with Qt, decodes PNG/JPEG/WebP, scales it to at
+  most 480x360 and writes RGBA into `WEB_BODY`; the guest blends alpha, scrolls
+  it with the text and re-fetches it when its tab is restored. The first line
+  of every page used to lose its spaces because the wrap buffer had not flushed
+  yet; a `line_len` check fixed it. `tools/window-viewer` (Qt6 Widgets + Network) maps the file,
   repaints on `frame_seq` and sends keys, wheel and clicks through the ring.
   Verified headlessly: DDG results with links, clicking the first result through
   a DDG meta-refresh redirect to the Wikipedia reader view, Alt+Left back to
@@ -83,8 +88,8 @@ Redmi port is parked. The reference checklist is
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
 - **Next steps:** native TLS/`https://` (rustls/embedded-tls) for `wget` and a
-  viewer-independent browser; Wolfser images (PNG first), bookmarks/start page
-  and damage rectangles; Linux ABI for static musl binaries; headless
+  viewer-independent browser; Wolfser inline images, bookmarks/start page and
+  damage rectangles; Linux ABI for static musl binaries; headless
   Wayland/GTK/D-Bus → Phosh. Parked: QEMU PSCI shutdown, fog TLB proof, GENI
   UART on `rain`, tablet, Redmi storage/power.
 

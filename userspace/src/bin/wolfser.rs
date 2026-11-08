@@ -124,6 +124,12 @@ struct App {
     scroll: usize,
     hover: [u8; URL_CAPACITY],
     hover_len: usize,
+    image_pending: bool,
+    image_seq: u32,
+    image_started: u64,
+    image_ready: bool,
+    image_w: u32,
+    image_h: u32,
     page: PageState,
     pending: Option<Pending>,
 }
@@ -190,6 +196,8 @@ struct Tab {
     link_count: usize,
     link_pool: [u8; LINK_POOL],
     link_pool_len: usize,
+    image_url: [u8; URL_CAPACITY],
+    image_len: usize,
 }
 
 impl Tab {
@@ -222,6 +230,8 @@ impl Tab {
         link_count: 0,
         link_pool: [0; LINK_POOL],
         link_pool_len: 0,
+        image_url: [0; URL_CAPACITY],
+        image_len: 0,
     };
 
     fn title_text(&self) -> &str {
@@ -262,6 +272,9 @@ static mut HOST_FINAL: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
 static mut BASE_URL: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
 static mut CLICK_HREF: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
 static mut CLICK_TARGET: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
+static mut IMAGE_URL: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
+static mut IMAGE_URL_LEN: usize = 0;
+static mut IMAGE_HREF: [u8; URL_CAPACITY] = [0; URL_CAPACITY];
 
 #[no_mangle]
 #[link_section = ".text._start"]
@@ -297,6 +310,12 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         scroll: 0,
         hover: [0; URL_CAPACITY],
         hover_len: 0,
+        image_pending: false,
+        image_seq: 0,
+        image_started: 0,
+        image_ready: false,
+        image_w: 0,
+        image_h: 0,
         page: PageState {
             loaded: false,
             loading: false,
@@ -375,6 +394,9 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         if app.pending.is_some() {
             poll_pending(&mut app);
             // The spinner keeps moving, so repaint even without input.
+            dirty = true;
+        }
+        if app.image_pending && poll_image(&mut app) {
             dirty = true;
         }
 
@@ -627,7 +649,7 @@ fn hit_link(app: &App, x: u32, y: u32) -> Option<(u32, u16)> {
     let runs = unsafe { &*core::ptr::addr_of!(LINK_RUNS) };
     let run_count = unsafe { *core::ptr::addr_of!(LINK_RUN_COUNT) };
     let scroll_pixels = pixels_before(app.scroll);
-    let mut top = BODY_TOP as i32 - scroll_pixels as i32;
+    let mut top = BODY_TOP as i32 + image_height(app) as i32 - scroll_pixels as i32;
     let mut line = 0u32;
     let mut start = 0usize;
     while start <= length {
@@ -637,7 +659,7 @@ fn hit_link(app: &App, x: u32, y: u32) -> Option<(u32, u16)> {
         }
         let flags = if start < end { styles[start] } else { 0 };
         let height = line_height(flags);
-        if line >= app.scroll as u32 && y as i32 >= top && (y as i32) < top + height as i32 {
+        if y as i32 >= top && (y as i32) < top + height as i32 {
             let cell = if flags & STYLE_HEADING != 0 {
                 HEADING_CELL
             } else {
@@ -795,6 +817,79 @@ fn reset_active_view(app: &mut App) {
     }
 }
 
+fn clear_image(app: &mut App) {
+    app.image_pending = false;
+    app.image_ready = false;
+    app.image_w = 0;
+    app.image_h = 0;
+}
+
+fn start_image_from_global(app: &mut App) {
+    let url = unsafe {
+        let image = &*core::ptr::addr_of!(IMAGE_URL);
+        let len = *core::ptr::addr_of!(IMAGE_URL_LEN);
+        core::str::from_utf8(&image[..len]).unwrap_or("")
+    };
+    start_image(app, url);
+}
+
+fn start_image(app: &mut App, url: &str) {
+    clear_image(app);
+    if url.is_empty() || window::read_u32(app.window, window::FIELD_WEB_CAPABLE) == 0 {
+        return;
+    }
+    let length = url.len().min(window::IMG_URL_MAX);
+    unsafe {
+        let base = app.window + window::IMG_URL;
+        core::ptr::copy_nonoverlapping(url.as_ptr(), base as *mut u8, length);
+    }
+    window::write_u32(app.window, window::FIELD_IMG_REQUEST_LEN, length as u32);
+    net_ipc::fence();
+    let seq = window::read_u32(app.window, window::FIELD_IMG_REQUEST_SEQ).wrapping_add(1);
+    window::write_u32(app.window, window::FIELD_IMG_REQUEST_SEQ, seq);
+    app.image_seq = seq;
+    app.image_started = syscall::uptime_ticks();
+    app.image_pending = true;
+}
+
+fn poll_image(app: &mut App) -> bool {
+    if !app.image_pending {
+        return false;
+    }
+    if syscall::uptime_ticks().saturating_sub(app.image_started) > 15 * TICKS_PER_SECOND {
+        app.image_pending = false;
+        return true;
+    }
+    if window::read_u32(app.window, window::FIELD_IMG_DONE_SEQ) != app.image_seq {
+        return false;
+    }
+    let width = window::read_u32(app.window, window::FIELD_IMG_WIDTH);
+    let height = window::read_u32(app.window, window::FIELD_IMG_HEIGHT);
+    let length = window::read_u32(app.window, window::FIELD_IMG_LEN);
+    let error = window::read_u32(app.window, window::FIELD_IMG_ERROR);
+    app.image_pending = false;
+    if error == 0
+        && width >= 160
+        && height >= 100
+        && width <= 480
+        && height <= 360
+        && length == width.saturating_mul(height).saturating_mul(4)
+    {
+        app.image_ready = true;
+        app.image_w = width;
+        app.image_h = height;
+    }
+    true
+}
+
+fn image_height(app: &App) -> u32 {
+    if app.image_ready {
+        app.image_h + 10
+    } else {
+        0
+    }
+}
+
 fn clear_hover(app: &mut App) {
     if app.hover_len > 0 {
         app.hover_len = 0;
@@ -816,10 +911,24 @@ fn switch_tab(app: &mut App, slot: usize) {
     }
     cancel_load(app);
     clear_hover(app);
+    clear_image(app);
     save_active(app);
     restore_active(app, slot);
     app.focused = !tab_ref(slot).loaded;
     paint(app);
+    let image_len = tab_ref(slot).image_len;
+    if image_len > 0 {
+        let source = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
+        unsafe {
+            let tab = tab_ref(slot);
+            source[..image_len].copy_from_slice(&tab.image_url[..image_len]);
+        }
+        let text = unsafe {
+            let source = &*core::ptr::addr_of!(BASE_URL);
+            core::str::from_utf8(&source[..image_len]).unwrap_or("")
+        };
+        start_image(app, text);
+    }
 }
 
 fn new_tab(app: &mut App) -> bool {
@@ -832,6 +941,7 @@ fn new_tab(app: &mut App) -> bool {
     tabs[slot] = Tab::EMPTY;
     tabs[slot].open = true;
     clear_hover(app);
+    clear_image(app);
     restore_active(app, slot);
     reset_active_view(app);
     paint(app);
@@ -846,6 +956,7 @@ fn close_tab(app: &mut App, slot: usize) {
     if was_active {
         cancel_load(app);
         clear_hover(app);
+        clear_image(app);
     }
     {
         let tabs = tabs();
@@ -868,6 +979,19 @@ fn close_tab(app: &mut App, slot: usize) {
         if let Some(next) = next {
             restore_active(app, next);
             app.focused = !tab_ref(next).loaded;
+            let image_len = tab_ref(next).image_len;
+            if image_len > 0 {
+                let source = unsafe { &mut *core::ptr::addr_of_mut!(BASE_URL) };
+                unsafe {
+                    let tab = tab_ref(next);
+                    source[..image_len].copy_from_slice(&tab.image_url[..image_len]);
+                }
+                let text = unsafe {
+                    let source = &*core::ptr::addr_of!(BASE_URL);
+                    core::str::from_utf8(&source[..image_len]).unwrap_or("")
+                };
+                start_image(app, text);
+            }
         }
     }
     paint(app);
@@ -1003,6 +1127,7 @@ fn go_history(app: &mut App, delta: i32) {
 }
 
 fn begin_navigation(app: &mut App, url: &str, from_history: bool, keep_address: bool) {
+    clear_image(app);
     app.hover_len = 0;
     window::write_u32(app.window, window::FIELD_CURSOR, 0);
     app.page.loading = true;
@@ -1386,7 +1511,7 @@ fn handle_redirect(app: &mut App, base: &str, location: &[u8]) {
 }
 
 fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
-    extract(body);
+    extract(body, url);
     let meta_len = unsafe { *core::ptr::addr_of!(PAGE_REDIRECT_LEN) };
     if meta_len > 0 {
         // `<meta http-equiv="refresh">` and the no-script fallback many
@@ -1416,6 +1541,10 @@ fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
         tab.loaded = true;
         tab.status = status;
         tab.error = "";
+        let image = unsafe { &*core::ptr::addr_of!(IMAGE_URL) };
+        let image_len = unsafe { *core::ptr::addr_of!(IMAGE_URL_LEN) };
+        tab.image_len = image_len.min(URL_CAPACITY);
+        tab.image_url[..tab.image_len].copy_from_slice(&image[..tab.image_len]);
     }
 
     let from_history = app
@@ -1429,6 +1558,7 @@ fn finish_page(app: &mut App, url: &str, status: u16, body: &[u8]) {
     } else {
         history_push(app.active, url);
     }
+    start_image_from_global(app);
 }
 
 fn history_push(active: usize, url: &str) {
@@ -1660,7 +1790,7 @@ fn normalize_url(url: &[u8], out: &mut [u8; URL_CAPACITY]) -> Option<usize> {
 // ---------------------------------------------------------------------------
 // HTML extraction
 
-fn extract(body: &[u8]) {
+fn extract(body: &[u8], page_url: &str) {
     // Reader mode: when a page marks its content with <main> (or <article>),
     // show only that region. Real sites put the site header, menus and footer
     // before/after it, and the linear text renderer would otherwise start
@@ -1680,6 +1810,7 @@ fn extract(body: &[u8]) {
         *core::ptr::addr_of_mut!(LINK_RUN_COUNT) = 0;
         *core::ptr::addr_of_mut!(LINK_POOL_LEN) = 0;
         *core::ptr::addr_of_mut!(PAGE_REDIRECT_LEN) = 0;
+        *core::ptr::addr_of_mut!(IMAGE_URL_LEN) = 0;
     }
 
     let mut writer = Writer {
@@ -1733,7 +1864,14 @@ fn extract(body: &[u8]) {
                 || tag_eq(name, b"sup")
             {
                 if !closing {
-                    index = skip_element(body, index, name);
+                    let end = skip_element(body, index, name);
+                    // Infoboxes and other layout tables are skipped as text,
+                    // but their lead image is often the best picture on the
+                    // page, so look inside before dropping the block.
+                    if tag_eq(name, b"table") {
+                        scan_images(body, index, end, page_url);
+                    }
+                    index = end;
                 }
                 writer.pending_breaks = writer.pending_breaks.max(1);
                 continue;
@@ -1756,6 +1894,10 @@ fn extract(body: &[u8]) {
                         }
                     }
                 }
+                continue;
+            }
+            if tag_eq(name, b"img") && !closing {
+                store_image(tag, page_url);
                 continue;
             }
             if tag_eq(name, b"a") {
@@ -2113,6 +2255,125 @@ fn content_region(body: &[u8]) -> (usize, usize) {
         return (after, skip_element_nested(body, after, b"main"));
     }
     (0, body.len())
+}
+
+fn scan_images(body: &[u8], start: usize, end: usize, page_url: &str) {
+    let mut index = start;
+    while index < end && index < body.len() {
+        if body[index] == b'<' {
+            let (name, tag, after) = read_tag(body, index);
+            if tag_eq(name, b"img") {
+                store_image(tag, page_url);
+            }
+            index = after;
+        } else {
+            index += 1;
+        }
+    }
+}
+
+fn store_image(tag: &[u8], page_url: &str) {
+    let already = unsafe { *core::ptr::addr_of!(IMAGE_URL_LEN) };
+    if already > 0 {
+        return;
+    }
+    let Some(src) = tag_attribute(tag, b"src")
+        .or_else(|| tag_attribute(tag, b"data-src"))
+    else {
+        return;
+    };
+    if src.is_empty() {
+        return;
+    }
+    if let Some(width) = tag_attribute(tag, b"width").and_then(attribute_number) {
+        if width < 120 {
+            return;
+        }
+    }
+    if let Some(height) = tag_attribute(tag, b"height").and_then(attribute_number) {
+        if height < 80 {
+            return;
+        }
+    }
+    let href = unsafe { &mut *core::ptr::addr_of_mut!(IMAGE_HREF) };
+    let mut length = 0usize;
+    let mut index = 0usize;
+    while index < src.len() && length + 1 < href.len() {
+        let byte = src[index];
+        if byte == b'&' {
+            if let Some((character, after)) = decode_entity(src, index) {
+                href[length] = character;
+                length += 1;
+                index = after;
+                continue;
+            }
+        }
+        href[length] = byte;
+        length += 1;
+        index += 1;
+    }
+    let text = core::str::from_utf8(&href[..length]).unwrap_or("");
+    if !looks_like_image_url(text) {
+        return;
+    }
+    let output = unsafe { &mut *core::ptr::addr_of_mut!(IMAGE_URL) };
+    if let Some(resolved) = resolve_link(page_url, text, output) {
+        unsafe {
+            *core::ptr::addr_of_mut!(IMAGE_URL_LEN) = resolved;
+        }
+    }
+}
+
+fn attribute_number(value: &[u8]) -> Option<u32> {
+    let mut number = 0u32;
+    let mut digits = 0usize;
+    for &byte in value {
+        if byte.is_ascii_digit() {
+            number = number.saturating_mul(10).saturating_add(u32::from(byte - b'0'));
+            digits += 1;
+        } else {
+            break;
+        }
+    }
+    if digits > 0 {
+        Some(number)
+    } else {
+        None
+    }
+}
+
+fn contains_ignore_case(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle))
+}
+
+fn looks_like_image_url(url: &str) -> bool {
+    let bytes = url.as_bytes();
+    if url.starts_with("data:") {
+        return false;
+    }
+    if bytes.len() > 4 && bytes[bytes.len() - 4..].eq_ignore_ascii_case(b".svg") {
+        return false;
+    }
+    for bad in [
+        &b"logo"[..],
+        &b"icon"[..],
+        &b"sprite"[..],
+        &b"favicon"[..],
+        &b"avatar"[..],
+        &b"pixel"[..],
+        &b"spacer"[..],
+        &b"1x1"[..],
+    ] {
+        if contains_ignore_case(bytes, bad) {
+            return false;
+        }
+    }
+    true
 }
 
 fn find_title(body: &[u8]) -> Option<&[u8]> {
@@ -2857,7 +3118,12 @@ fn draw_body(base: u64, app: &App) {
         return;
     }
     let scroll_pixels = pixels_before(app.scroll);
-    let mut y = BODY_TOP as i32 - scroll_pixels as i32;
+    let offset = BODY_TOP as i32 - scroll_pixels as i32;
+    if app.image_ready {
+        let x = MARGIN as i32 + ((WIDTH - 2 * MARGIN - app.image_w) / 2) as i32;
+        draw_image(base, x, offset, app.image_w, app.image_h);
+    }
+    let mut y = offset + image_height(app) as i32;
     let bottom = (HEIGHT - FOOTER_HEIGHT) as i32;
     let mut line = 0u32;
     let mut start = 0usize;
@@ -2868,7 +3134,10 @@ fn draw_body(base: u64, app: &App) {
         }
         let flags = if start < end { styles[start] } else { 0 };
         let height = line_height(flags);
-        if line >= app.scroll as u32 && y < bottom {
+        // The lead image occupies space before line 0, so a line with a
+        // smaller index than `scroll` can still be visible when the image is
+        // scrolling away; decide by position, not by index.
+        if y + height as i32 > BODY_TOP as i32 && y < bottom {
             draw_styled_line(base, MARGIN, y.max(BODY_TOP as i32) as u32, &text[start..end], &styles[start..end]);
         }
         y += height as i32;
@@ -2877,6 +3146,45 @@ fn draw_body(base: u64, app: &App) {
             break;
         }
         start = end + 1;
+    }
+}
+
+fn draw_image(base: u64, x: i32, y: i32, width: u32, height: u32) {
+    let top = BODY_TOP as i32;
+    let bottom = (HEIGHT - FOOTER_HEIGHT) as i32;
+    let mut row = 0u32;
+    while row < height {
+        let destination_y = y + row as i32;
+        if destination_y >= top && destination_y < bottom {
+            let mut column = 0u32;
+            while column < width {
+                let destination_x = x + column as i32;
+                if destination_x >= 0 && destination_x < WIDTH as i32 {
+                    let source = (base
+                        + window::WEB_BODY
+                        + u64::from((row * width + column) * 4))
+                        as *const u32;
+                    let pixel = unsafe { core::ptr::read_volatile(source) };
+                    let alpha = (pixel >> 24) & 0xFF;
+                    if alpha == 0xFF {
+                        put_pixel(base, destination_x as u32, destination_y as u32, pixel);
+                    } else if alpha != 0 {
+                        // Blend transparent pixels against the white page.
+                        let inverse = 255 - alpha;
+                        let red = (pixel & 0xFF) * alpha + 255 * inverse;
+                        let green = ((pixel >> 8) & 0xFF) * alpha + 255 * inverse;
+                        let blue = ((pixel >> 16) & 0xFF) * alpha + 255 * inverse;
+                        let blended = (red / 255)
+                            | ((green / 255) << 8)
+                            | ((blue / 255) << 16)
+                            | 0xFF00_0000;
+                        put_pixel(base, destination_x as u32, destination_y as u32, blended);
+                    }
+                }
+                column += 1;
+            }
+        }
+        row += 1;
     }
 }
 

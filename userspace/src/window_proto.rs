@@ -43,6 +43,16 @@ pub const FIELD_WEB_CAPABLE: u64 = 0x4C;
 /// 1 while the pointer is over a link; the viewer shows a hand cursor.
 pub const FIELD_CURSOR: u64 = 0x50;
 
+// Lead-image proxy: the guest asks the host to fetch and decode one image
+// (Qt handles PNG/JPEG/WebP) and writes RGBA pixels into `WEB_BODY`.
+pub const FIELD_IMG_REQUEST_SEQ: u64 = 0x54;
+pub const FIELD_IMG_DONE_SEQ: u64 = 0x58;
+pub const FIELD_IMG_WIDTH: u64 = 0x5C;
+pub const FIELD_IMG_HEIGHT: u64 = 0x60;
+pub const FIELD_IMG_LEN: u64 = 0x64;
+pub const FIELD_IMG_ERROR: u64 = 0x68;
+pub const FIELD_IMG_REQUEST_LEN: u64 = 0x6C;
+
 pub const FORMAT_RGBA8888: u32 = 1;
 
 pub const STATE_BLANK: u32 = 0;
@@ -91,6 +101,9 @@ pub const WEB_FINAL_URL: u64 = 0x24_0800;
 pub const WEB_FINAL_URL_MAX: usize = 1024;
 pub const WEB_BODY: u64 = 0x24_1000;
 pub const WEB_BODY_MAX: usize = 0x40_0000 - WEB_BODY as usize;
+/// Image URL, in the gap between the page's final URL and the body.
+pub const IMG_URL: u64 = 0x24_0C00;
+pub const IMG_URL_MAX: usize = 1024;
 
 /// Host proxy error classes carried in `FIELD_WEB_ERROR`.
 pub const WEB_ERROR_NONE: u32 = 0;
