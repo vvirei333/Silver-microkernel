@@ -141,6 +141,9 @@ const TEXT_CAPACITY: usize = 40 * 1024;
 const CSS_CAP: usize = 256 * 1024;
 const CSS_MAX_FILE: usize = 64 * 1024;
 const READER_CSS: &[u8] = b"body{margin:8px;color:#202122;background:#fff;font-size:16px;line-height:1.4;}h1,h2,h3,h4{color:#000;margin:0.7em 0 0.3em;}p{margin:0.5em 0;}a{color:#3366cc;text-decoration:underline;}li{margin-left:1.4em;}table{border-collapse:collapse;}td,th{border:1px solid #a2a9b1;padding:3px;}";
+// A 96 KiB slice aborts with wolf_heap_failed: the per-task frame limit is
+// total_frames / 4 (32 MiB here) and the ELF image, stacks and net window
+// already charge part of it, so the engine heap cannot grow past 20 MiB.
 const PAGE_BODY_CAP: usize = 48 * 1024;
 const PAGE_CAP: usize = CSS_CAP + PAGE_BODY_CAP;
 const CONTENT_HEIGHT: i32 = (HEIGHT - BODY_TOP - FOOTER_HEIGHT) as i32;
