@@ -4,12 +4,16 @@
 # disk.img attached as a virtio-blk-pci device (the kernel SFS), a virtio-net
 # card (Wolfser's network) and an ivshmem surface (Wolfser's window).
 #
-# Usage: ./build_and_qemu.sh [debug|release] [--no-run] [--viewer]
+# Usage: ./build_and_qemu.sh [debug|release] [--no-run] [--viewer|--no-viewer]
+#                            [--no-linux]
 #   profile defaults to release.
 #   --no-run  stop after the build.
 #   --viewer  start the Qt host viewer (the default); it opens immediately and
 #             waits for Wolfser, so it works on KDE, GNOME, Wayland and X11.
 #   --no-viewer  keep QEMU console-only.
+#   --no-linux   build without the optional Linux ABI module (foreign ELF
+#                loader, Linux syscalls, `linuxrun`). The product then has no
+#                Linux code linked in; this is the removal switch.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -28,18 +32,26 @@ fi
 PROFILE=release
 RUN=1
 VIEWER=1
+LINUX=1
 for argument in "$@"; do
     case "$argument" in
         debug | release) PROFILE="$argument" ;;
         --no-run) RUN=0 ;;
         --viewer) VIEWER=1 ;;
         --no-viewer) VIEWER=0 ;;
-        *) echo "usage: $0 [debug|release] [--no-run] [--viewer|--no-viewer]" >&2; exit 1 ;;
+        --linux) LINUX=1 ;;
+        --no-linux) LINUX=0 ;;
+        *) echo "usage: $0 [debug|release] [--no-run] [--viewer|--no-viewer] [--no-linux]" >&2; exit 1 ;;
     esac
 done
 
+FEATURES=no_std
+if [ "$LINUX" -eq 1 ]; then
+    FEATURES="$FEATURES,linux-abi"
+fi
+
 cargo build "--$PROFILE" --target aarch64-unknown-none \
-    --no-default-features --features no_std
+    --no-default-features --features "$FEATURES"
 
 if [ "$RUN" -ne 1 ]; then
     echo "built: target/aarch64-unknown-none/$PROFILE/silver_microkernel"

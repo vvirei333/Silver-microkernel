@@ -100,6 +100,7 @@ const EXEC_FILE_LIMIT: usize = vfs::MAX_FILE_BYTES;
 /// A foreign (Linux) binary is larger than the general VFS cap: a static
 /// libc `hello` is ~800 KiB. The read is transient and exactly file-sized;
 /// `vfs::read_file_limit` still refuses anything past this bound.
+#[cfg(feature = "linux-abi")]
 const LINUX_EXEC_LIMIT: usize = 1024 * 1024;
 /// Upper bound on a versioned spawn-arguments block copied from userspace.
 const SPAWN_ARGS_LIMIT: usize = 4096;
@@ -199,12 +200,20 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
     let number = frame[8]; // x8 carries the call number
     crate::smp::probe(22);
 
-    // The task's personality is fixed at spawn, so a Linux binary can never
-    // reach the Silver table by picking a colliding number.
-    let result = if scheduler::current_personality() == scheduler::Personality::Linux {
-        crate::linux_abi::dispatch(frame)
-    } else {
-        match number {
+    let result = dispatch_for_personality(frame, number);
+
+    frame[0] = result;
+}
+
+/// Routes the call by the task's spawn-time personality. The binary is built
+/// without any Linux code when the `linux-abi` feature is off: the branch and
+/// the module simply do not exist.
+fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> u64 {
+    #[cfg(feature = "linux-abi")]
+    if scheduler::current_personality() == scheduler::Personality::Linux {
+        return crate::linux_abi::dispatch(frame);
+    }
+    match number {
         SYS_SLEEP => {
             scheduler::sleep(frame[0]);
             0
@@ -359,6 +368,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_PCI_READ => sys_pci_read(frame[0]),
         SYS_PCI_WRITE => sys_pci_write(frame[0], frame[1]),
         SYS_SPAWN_PATH => sys_spawn_path(frame[0]),
+        #[cfg(feature = "linux-abi")]
         SYS_SPAWN_LINUX_PATH => sys_spawn_linux_path(frame[0]),
         SYS_POWER_OFF => sys_power_off(),
         SYS_POWER_RESET => sys_power_reset(),
@@ -378,10 +388,7 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_WAITPID => sys_waitpid(frame[0], frame[1]),
         SYS_SPAWN_ARGSV => sys_spawn_with_argsv(frame[0], frame[1], frame[2], frame[3]),
         _ => SYSCALL_ERROR,
-        }
-    };
-
-    frame[0] = result;
+    }
 }
 
 fn sys_map_phys(phys_addr: u64, size: u64) -> u64 {
@@ -567,6 +574,7 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
 }
 
 /// Loads and runs a foreign (Linux ABI) ELF from the filesystem.
+#[cfg(feature = "linux-abi")]
 fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {

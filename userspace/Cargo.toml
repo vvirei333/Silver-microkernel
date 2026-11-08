@@ -6,6 +6,10 @@ license = "MIT"
 
 [features]
 tablet = []
+# Linux ABI userspace support (the `linuxrun` command). Enabled by the kernel
+# build only when its `linux-abi` feature is on, so a kernel without the
+# module ships a shell without the command.
+linux-abi = []
 
 [dependencies]
 # Bare-metal TCP/IP stack. `std`/`alloc` stay off: the server uses fixed

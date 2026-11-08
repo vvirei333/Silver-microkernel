@@ -21,7 +21,8 @@ Redmi port is parked. The reference checklist is
 [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
 - **Host tests:** 217/217 (`cargo test --lib`).
-- **Builds:** `no_std` (product), `no_std,fog`, `no_std,fog,fog-reloc`,
+- **Builds:** `no_std` (product), `no_std,linux-abi` (Linux module on),
+  `no_std,linux-abi-trace`, `no_std,fog`, `no_std,fog,fog-reloc`,
   `no_std,fog,fog-auto-reset`, `no_std,fog,fog-hw-selftests`,
   `no_std,tablet` (parked), `no_std,smp-selftest`, `no_std,demo-tasks`.
 - **Console OS (QEMU serial):** boots to `howl ready` with no graphics tasks;
@@ -124,7 +125,14 @@ Redmi port is parked. The reference checklist is
   `USER_IMAGE_VA + 8 MiB`, anonymous mmap at `+10 MiB`, and the user stack is
   64 pages (256 KiB). The per-task mmap quota is 24 MiB; litehtml's newlib heap
   is one 20 MiB mapping, separate from the Rust `SYS_BRK` arena.
-- **Linux ABI personality, slice 1 (2026-11-09).** `linuxrun <path>`
+- **Linux ABI personality, slice 1 (2026-11-09).** The whole track is the
+  optional `linux-abi` Cargo feature. With it off, the kernel and the console
+  userspace link **no** Linux loader, syscall translation or `linuxrun`
+  command (verified with `strings`/`nm` on the `no_std` binary); the rest of
+  the OS has no dependency on it. `build_and_qemu.sh` enables it by default
+  and `--no-linux` is the removal switch; `build.rs` forwards the kernel
+  feature to the userspace crate so the shell is built without the command.
+  `linuxrun <path>`
   (`SYS_SPAWN_LINUX_PATH = 98`) spawns a dynamically loaded ELF with the
   AArch64 Linux syscall ABI: `x8` is a Linux number and `src/linux_abi.rs`
   translates it onto kernel services. The personality is fixed at spawn

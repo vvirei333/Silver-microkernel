@@ -282,12 +282,20 @@ program table, so `run bin/hello` is the only way to execute it — proving the
 loader path end-to-end. The embedded `spawn` path is unchanged and shares the
 same `elf::load_elf` (via the thin `elf_loader` shim).
 
-### Linux ABI personality (first slice)
+### Linux ABI module (optional)
 
-`linuxrun <path>` loads the same way but spawns the task with the **AArch64
-Linux** syscall personality: `x8` carries a Linux syscall number and
-`src/linux_abi.rs` translates it. The initial stack is the Linux layout
-(`argc/argv/envp/auxv`, including `AT_PAGESZ`, `AT_ENTRY`, `AT_PHDR`,
+The whole Linux track is one Cargo feature, `linux-abi`. Without it the kernel
+and the console userspace contain **no** Linux ELF loader, no Linux syscall
+translation and no `linuxrun`: the loader module, the `mmu` install paths and
+the shell command do not exist in the binary. Nothing else in the OS depends
+on them. The removal switch is `./build_and_qemu.sh --no-linux` (or just
+`--features no_std`), and the module can be deleted from the tree without
+touching the rest of the system.
+
+With the feature on, `linuxrun <path>` loads the same way but spawns the task
+with the **AArch64 Linux** syscall personality: `x8` carries a Linux syscall
+number and `src/linux_abi.rs` translates it. The initial stack is the Linux
+layout (`argc/argv/envp/auxv`, including `AT_PAGESZ`, `AT_ENTRY`, `AT_PHDR`,
 `AT_RANDOM`). Implemented so far: `write` (stdout/stderr), `read` (fd 0 as
 EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 `clock_gettime`, `rt_sigprocmask`, `uname`, `getpid`/`getppid`/`gettid`,

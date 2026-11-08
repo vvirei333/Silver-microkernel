@@ -1328,6 +1328,7 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
 /// Runs under the kernel lock, for a space that is not executing. On failure
 /// the pages installed by this call are unmapped again; tables allocated by it
 /// stay registered with the space and are reclaimed if the space is destroyed.
+#[cfg(feature = "linux-abi")]
 pub fn install_linux_run(
     ttbr0: usize,
     virtual_address: usize,
@@ -1419,6 +1420,7 @@ pub fn install_linux_run(
 }
 
 /// Maps every run of a foreign image. See [`install_linux_run`].
+#[cfg(feature = "linux-abi")]
 pub fn install_linux_image(ttbr0: usize, image: &crate::linux_elf::LinuxImage) -> bool {
     for run in &image.runs {
         if !install_linux_run(
@@ -1434,6 +1436,7 @@ pub fn install_linux_image(ttbr0: usize, image: &crate::linux_elf::LinuxImage) -
     true
 }
 
+#[cfg(feature = "linux-abi")]
 fn alloc_registered_table(root: usize) -> Option<usize> {
     let (page, generation) = frame_allocator::alloc_page_tagged()?;
     unsafe {
@@ -1446,6 +1449,7 @@ fn alloc_registered_table(root: usize) -> Option<usize> {
     Some(page)
 }
 
+#[cfg(feature = "linux-abi")]
 fn rollback_linux_run(ttbr0: usize, virtual_address: usize, installed: usize) {
     unsafe {
         let root = root_of(ttbr0);

@@ -124,6 +124,7 @@ pub fn build_argv_envp(
 /// seed), and the entry for `AT_RANDOM` is appended automatically — callers
 /// must not pass it. The bytes are a deterministic pseudo-random stream, not
 /// entropy; they only need to differ per task.
+#[cfg(any(test, feature = "linux-abi"))]
 pub fn build_linux_stack(
     argv: &[Vec<u8>],
     envp: &[Vec<u8>],

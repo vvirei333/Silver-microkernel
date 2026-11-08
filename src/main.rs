@@ -22,7 +22,17 @@ mod condvar;
 mod console;
 #[cfg(not(feature = "std"))]
 mod elf;
+#[cfg(feature = "linux-abi")]
 mod linux_elf;
+/// Without the `linux-abi` feature the Linux image type still exists as an
+/// uninhabited placeholder so the task plumbing can carry `Option<LinuxImage>`
+/// (always `None`) — but no Linux loader, syscall or ELF code is compiled.
+#[cfg(not(feature = "linux-abi"))]
+mod linux_elf {
+    #[allow(dead_code)]
+    #[derive(Copy, Clone)]
+    pub struct LinuxImage;
+}
 #[cfg(not(feature = "std"))]
 mod elf_loader;
 #[cfg(not(feature = "std"))]
@@ -73,6 +83,7 @@ mod semaphore;
 mod smp;
 #[cfg(not(feature = "std"))]
 mod syscall;
+#[cfg(feature = "linux-abi")]
 mod linux_abi;
 #[cfg(not(feature = "std"))]
 mod timer;

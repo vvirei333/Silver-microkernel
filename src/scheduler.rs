@@ -201,6 +201,7 @@ struct MmapRegion {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum Personality {
     Native,
+    #[cfg(feature = "linux-abi")]
     Linux,
 }
 
@@ -3122,6 +3123,7 @@ pub fn spawn_elf_with_policy_and_args(
 /// Spawns a foreign (Linux ABI) image. Same capability model as
 /// [`spawn_elf_with_policy_and_args`]: the child starts with no rights and the
 /// parent gets a handle it can delegate.
+#[cfg(feature = "linux-abi")]
 pub fn spawn_linux_elf_with_args(
     image: LinuxImage,
     fs_write_prefix: Option<String>,
@@ -4168,6 +4170,7 @@ fn initial_self_rights(program: u64) -> Option<u32> {
 /// `build_linux_stack`, so they are not listed here. `AT_PHDR` is zero when
 /// the program headers are not covered by a `PT_LOAD`; static binaries that do
 /// not consult it (musl's `_start`) are unaffected.
+#[cfg(feature = "linux-abi")]
 fn linux_auxv(image: AuxvImage) -> Vec<(u64, u64)> {
     const AT_PHDR: u64 = 3;
     const AT_PHENT: u64 = 4;
@@ -4199,6 +4202,7 @@ fn linux_auxv(image: AuxvImage) -> Vec<(u64, u64)> {
 
 /// The subset of a loaded image that `auxv` needs, so the native and Linux
 /// loaders share one builder.
+#[cfg(feature = "linux-abi")]
 #[derive(Copy, Clone)]
 struct AuxvImage {
     entry: usize,
@@ -4207,6 +4211,7 @@ struct AuxvImage {
     phnum: u64,
 }
 
+#[cfg(feature = "linux-abi")]
 impl AuxvImage {
     fn native(image: &LoadedImage) -> Self {
         Self {
@@ -4253,7 +4258,9 @@ impl Task {
             // Linux wants the same argc/argv/envp prefix plus auxv. The values
             // are derivable from the loaded image, so a foreign ELF starts with
             // a stack its libc understands.
+            #[cfg(feature = "linux-abi")]
             let linux_auxv: Vec<(u64, u64)> = match personality {
+                #[cfg(feature = "linux-abi")]
                 Personality::Linux => linux_image
                     .as_ref()
                     .map(|image| linux_auxv(AuxvImage::linux(image)))
@@ -4268,6 +4275,7 @@ impl Task {
                     mmu::USER_STACK_VA + mmu::USER_STACK_SIZE,
                     mmu::USER_STACK_SIZE - 1024,
                 )?,
+                #[cfg(feature = "linux-abi")]
                 Personality::Linux => silver_microkernel::build_linux_stack(
                     &argv,
                     &envp,
@@ -4281,8 +4289,11 @@ impl Task {
         // pages already exist (RAII releases them if this returns None), and
         // every other frame is allocated below. Page tables beyond the fixed
         // space are not charged separately (at most one L3 per 2 MiB).
+        #[cfg(feature = "linux-abi")]
         let image_frames = image.as_ref().map_or(0, |image| image.page_count)
             + linux_image.as_ref().map_or(0, |image| image.page_count());
+        #[cfg(not(feature = "linux-abi"))]
+        let image_frames = image.as_ref().map_or(0, |image| image.page_count);
         let ledger_frames = TASK_STACK_PAGES
             + mmu::SPACE_TABLE_FRAMES
             + 1 // private page
@@ -4335,6 +4346,7 @@ impl Task {
             if let Some(image) = &user_image {
                 image.release();
             }
+            #[cfg(feature = "linux-abi")]
             if let Some(image) = &linux_image {
                 image.release();
             }
@@ -4353,6 +4365,7 @@ impl Task {
         // A Linux image is mapped at its own p_vaddr after the base space
         // exists; the loader cannot do it earlier because the space root is
         // created here. `destroy_task_space` also frees the private page.
+        #[cfg(feature = "linux-abi")]
         if let Some(image) = &linux_image {
             if !mmu::install_linux_image(ttbr0, image) {
                 mmu::destroy_task_space(
@@ -4399,10 +4412,14 @@ impl Task {
 
         let stack = MemoryRegion::new(stack_start, stack_start + TASK_STACK_SIZE);
         let mut context = TaskContext::zero();
+        #[cfg(feature = "linux-abi")]
+        let linux_entry_va = linux_image.as_ref().map(|image| image.entry as u64);
+        #[cfg(not(feature = "linux-abi"))]
+        let linux_entry_va: Option<u64> = None;
         context.registers[0] = if let Some(image) = &user_image {
             image.entry as u64
-        } else if let Some(image) = &linux_image {
-            image.entry as u64
+        } else if let Some(linux_entry) = linux_entry_va {
+            linux_entry
         } else {
             entry.expect("kernel task entry is required") as usize as u64
         };
@@ -4835,6 +4852,7 @@ impl Task {
         if let Some(image) = &self.user_image {
             image.release();
         }
+        #[cfg(feature = "linux-abi")]
         if let Some(image) = &self.linux_image {
             image.release();
         }

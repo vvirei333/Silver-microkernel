@@ -28,9 +28,14 @@ smp-selftest = ["smp"]
 smp-churn = ["smp-selftest"]
 demo-tasks = []
 tablet = []
+# Optional Linux ABI module: foreign ELF loading, the Linux syscall
+# personality and the `linuxrun` shell command. With this off the kernel and
+# the console userspace contain no Linux code at all; it can be removed from
+# the product by dropping one feature.
+linux-abi = []
 # Opt-in diagnostic: print one console line per unsupported Linux ABI syscall
 # (capped), used while bringing up a libc.
-linux-abi-trace = []
+linux-abi-trace = ["linux-abi"]
 fog = []
 # Explicit opt-in for the fog image's self-relocation to `__kernel_link_pa`.
 # Standard fog builds stay at the address ABL chose and park when it differs

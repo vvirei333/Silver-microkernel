@@ -214,6 +214,7 @@ fn execute(command: &str) {
             syscall::print("  ls [path]  List a directory (cwd by default)\r\n");
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  run <path>  Load and run an ELF file from the filesystem\r\n");
+            #[cfg(feature = "linux-abi")]
             syscall::print("  linuxrun <path>  Run a Linux ABI ELF (x8 = Linux syscall)\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
             syscall::print("             Print, truncate/write, or append to a file\r\n");
@@ -263,6 +264,7 @@ fn execute(command: &str) {
         Some("cat") => run_utility(syscall::PROGRAM_CAT, words.next().unwrap_or("")),
         Some("touch") => touch_command(words.next()),
         Some("run") => run_elf(words.next().unwrap_or("")),
+        #[cfg(feature = "linux-abi")]
         Some("linuxrun") => run_linux_elf(words.next().unwrap_or("")),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
         Some("mkdir") => make_directory(words.next()),
@@ -793,6 +795,7 @@ fn run_elf(path: &str) {
 /// Loads a foreign ELF (`linuxrun <path>`) and runs it with the Linux syscall
 /// personality. The kernel assigns the console inside the spawn, before the
 /// child can run on any CPU, so no `console_set` round trip is needed.
+#[cfg(feature = "linux-abi")]
 fn run_linux_elf(path: &str) {
     run_elf_with(path, syscall::spawn_linux_path, false);
 }

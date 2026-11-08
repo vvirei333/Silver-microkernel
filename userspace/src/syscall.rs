@@ -476,6 +476,7 @@ pub fn spawn_path(path: &str) -> Option<u64> {
 
 /// Spawns a foreign ELF with the Linux ABI personality; the child's `svc #0`
 /// uses Linux syscall numbers instead of the Silver table.
+#[cfg(feature = "linux-abi")]
 pub fn spawn_linux_path(path: &str) -> Option<u64> {
     let cap_id = with_path(path, |ptr| unsafe { syscall1(SYS_SPAWN_LINUX_PATH, ptr) });
     optional_id(cap_id)

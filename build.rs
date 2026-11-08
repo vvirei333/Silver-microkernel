@@ -65,6 +65,11 @@ fn main() {
     if env::var_os("CARGO_FEATURE_TABLET").is_some() {
         command.arg("--features").arg("tablet");
     }
+    // The Linux ABI is an optional module: when the kernel feature is off, the
+    // shell must not expose `linuxrun` or its syscall wrapper.
+    if env::var_os("CARGO_FEATURE_LINUX_ABI").is_some() {
+        command.arg("--features").arg("linux-abi");
+    }
     let status = command
         .status()
         .expect("failed to invoke userspace cargo build");
