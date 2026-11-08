@@ -34,22 +34,6 @@ fog = []
 # from the link address; enabling this requires an independently proven free
 # destination and the live FDT check tracked in the bring-up notes.
 fog-reloc = ["fog"]
-# Debug-only visual evidence on the cont_splash framebuffer. Not part of the
-# normal fog build: it assumes the Rain/Fog splash buffer at 0x5C00_0000.
-fog-paint = ["fog", "no_std"]
-# Read-only framebuffer register dump for the GICv3 / Generic Timer
-# bring-up. It reads architectural state and paints it on the cont_splash
-# buffer; it never writes a GIC, timer or security register.
-fog-diag = ["fog", "fog-paint"]
-# Live framebuffer status panel: proves GICv3, the Generic Timer, the
-# scheduler and the Howl task are running on a UART-less unit. Presentation
-# only; it reads state and never touches a device register.
-fog-ui = ["fog", "fog-paint"]
-# Experimental phone UI path: register the bootloader's `cont_splash` buffer as
-# a platform framebuffer and start the compositor + SilverHome on it. Only for
-# real-device images: QEMU's fog DTB can advertise a splash address that its
-# `-m` RAM does not actually back.
-fog-display = ["fog"]
 # Real-device bring-up convenience: after the scheduler and the timer are up,
 # reset the machine through PSCI `SYSTEM_RESET` so a RAM-only diagnostic boot
 # returns to Android without holding the power key. Never part of a release
@@ -59,14 +43,6 @@ fog-auto-reset = ["fog"]
 # QEMU-proven but can wedge a real unit before userspace starts, so the default
 # fog image skips them (and logs that it did). QEMU builds always run them.
 fog-hw-selftests = ["fog"]
-# Headless console OS: Silverd starts the nameserver, the kernel SFS mount,
-# the network stack, Howl and the UART driver, but not the compositor, the
-# input driver or SilverHome. This is the supported product profile now; the
-# graphics path stays available for experiments behind its own flags.
-console = []
-# Console OS with the network stack. Without it the product image contains no
-# network driver/server and boots deterministically on a machine without a NIC.
-console-net = ["console"]
 # Opt-in bisect test: unmask IRQs and wait for 30 timer ticks before the
 # scheduler is initialised. Useful on QEMU; on the first hardware boot it can
 # deliver a timer IRQ into a not-yet-initialised scheduler, so fog defaults off.

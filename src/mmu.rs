@@ -1570,43 +1570,6 @@ pub fn map_dma_to_user_space(ttbr0: usize, phys_addr: usize, size: usize) -> Opt
     map_user_pages(ttbr0, phys_addr, page_count, 0, user_dma_page)
 }
 
-/// Maps a platform display buffer (the bootloader's scanout memory) into a
-/// task as Normal Non-Cacheable. Unlike [`map_dma_to_user_space`] this does not
-/// zero or clean the range: the pixels are not a recycled allocator frame, and
-/// a zero would blank the panel before the compositor redraws it.
-///
-/// The caller must have validated the range against the registered display
-/// region; this function only checks the architectural bounds.
-pub fn map_display_to_user(
-    task: &crate::scheduler::Task,
-    phys_addr: usize,
-    size: usize,
-) -> Option<usize> {
-    if phys_addr % GRANULE != 0 || size == 0 {
-        return None;
-    }
-    checked_range_end(phys_addr, size, DRAM_BASE, DRAM_END)?;
-    let (physical_start, physical_offset, page_count) =
-        aligned_page_span(phys_addr, size, GRANULE)?;
-    if page_count > ENTRIES * USER_MMIO_L2_GROUPS {
-        return None;
-    }
-    // Drop any dirty bootloader cache lines in this range before EL0 starts
-    // writing through the NC alias; otherwise a later writeback could
-    // overwrite fresh pixels with stale splash data.
-    invalidate_range(
-        phys_to_virt(phys_addr),
-        phys_to_virt(phys_addr.saturating_add(size)),
-    );
-    map_user_pages(
-        task.ttbr0,
-        physical_start,
-        page_count,
-        physical_offset,
-        user_dma_page,
-    )
-}
-
 /// Maps a registered DMA allocation shared by another task. The scheduler
 /// validates that the physical range lies inside some task's `dma_pages` run
 /// before calling this function.
@@ -1643,29 +1606,6 @@ pub fn map_shared_dma_to_user(
         page_count,
         physical_offset,
         user_dma_page,
-    )
-}
-
-/// Read-only variant of [`map_shared_dma_to_user`] for surfaces. The grantee
-/// can read the pixels (and a display controller can scan them out) but an
-/// EL0 store faults instead of silently corrupting the owner's buffer.
-pub fn map_shared_dma_ro_to_user(
-    task: &crate::scheduler::Task,
-    phys_addr: usize,
-    size: usize,
-) -> Option<usize> {
-    checked_range_end(phys_addr, size, DRAM_BASE, DRAM_END)?;
-    let (physical_start, physical_offset, page_count) =
-        aligned_page_span(phys_addr, size, GRANULE)?;
-    if page_count > ENTRIES * USER_MMIO_L2_GROUPS {
-        return None;
-    }
-    map_user_pages(
-        task.ttbr0,
-        physical_start,
-        page_count,
-        physical_offset,
-        user_dma_ro_page,
     )
 }
 
@@ -2051,22 +1991,16 @@ pub fn run_tlb_self_test() -> bool {
     };
     let va = USER_MMAP_VA;
 
-    #[cfg(feature = "fog-paint")]
-    crate::fog::stage_mark(13); // scratch address space created
 
     // The test switches the running PE's own TTBR0. IRQs must stay masked:
     // an IRQ handler that touched user memory would see this scratch space.
     let saved_daif = crate::interrupts::save_and_disable_irq();
     let previous = current_ttbr0();
     switch_address_space(root);
-    #[cfg(feature = "fog-paint")]
-    crate::fog::stage_mark(14); // TTBR0 switched to the scratch space
 
     // Published frames are zeroed by `map_user_pages_at`, so seed the first
     // page through the *user* mapping and read it back.
     let mapped_first = map_user_pages_at(root, va, first, 1, PROT_WRITE);
-    #[cfg(feature = "fog-paint")]
-    crate::fog::stage_mark(15); // first page mapped and TLB invalidated
     let first_read = if mapped_first {
         unsafe {
             (va as *mut u64).write_volatile(FIRST_VALUE);
@@ -2075,8 +2009,6 @@ pub fn run_tlb_self_test() -> bool {
     } else {
         0
     };
-    #[cfg(feature = "fog-paint")]
-    crate::fog::stage_mark(16); // first page written and read
 
     // Repoint the same VA at `second`, using the user map (which zeroes it) and
     // then seeding it through the kernel alias. A stale TLB entry for `first`
@@ -2084,8 +2016,6 @@ pub fn run_tlb_self_test() -> bool {
     // test must catch.
     let remapped =
         unmap_user_pages_at(root, va, 1) && map_user_pages_at(root, va, second, 1, PROT_WRITE);
-    #[cfg(feature = "fog-paint")]
-    crate::fog::stage_mark(17); // second page mapped over the same VA
     if remapped {
         unsafe {
             (phys_to_virt(second) as *mut u64).write_volatile(SECOND_VALUE);
@@ -2097,13 +2027,9 @@ pub fn run_tlb_self_test() -> bool {
     } else {
         0
     };
-    #[cfg(feature = "fog-paint")]
-    crate::fog::stage_mark(18); // second page written and read
 
     switch_address_space(previous);
     crate::interrupts::restore_irq(saved_daif);
-    #[cfg(feature = "fog-paint")]
-    crate::fog::stage_mark(19); // restored the previous TTBR0
 
     // Tear the scratch space down exactly once. If a PTE survived, the frames
     // must be leaked rather than handed to the allocator under a live mapping.
@@ -2114,8 +2040,6 @@ pub fn run_tlb_self_test() -> bool {
         safe_to_free &= frame_allocator::free_page_tagged(second, second_generation);
     }
     let released = destroy_task_space(space, private, private_generation, asid_of(root));
-    #[cfg(feature = "fog-paint")]
-    crate::fog::stage_mark(20); // scratch space torn down
 
     first_read == FIRST_VALUE && second_read == SECOND_VALUE && safe_to_free && released
 }
@@ -2550,16 +2474,6 @@ fn user_dma_page(output_address: usize) -> u64 {
 /// Read-only DMA alias for a surface shared with another task (for example a
 /// compositor scanning a client-owned buffer). EL0 may read the pixels but
 /// cannot modify them; the owner keeps its writable alias.
-fn user_dma_ro_page(output_address: usize) -> u64 {
-    descriptor_address(output_address as u64)
-        | DESC_PAGE
-        | (ATTR_NORMAL_NC << 2)
-        | AP_BOTH_RO
-        | SH_INNER
-        | AF
-        | UXN
-        | PXN
-}
 
 unsafe fn zero_page(physical: usize) {
     unsafe { core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, GRANULE) };

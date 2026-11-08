@@ -191,46 +191,6 @@ struct MmapRegion {
     generation: u32,
 }
 
-pub const SURFACE_RIGHT_READ: u32 = 1;
-/// The grantee may ask the kernel to declare this surface as display
-/// scanout, and `SYS_SURFACE_MAP` returns the physical address to it.
-pub const SURFACE_RIGHT_SCANOUT: u32 = 2;
-pub const SURFACE_RIGHTS_ALL: u32 = SURFACE_RIGHT_READ | SURFACE_RIGHT_SCANOUT;
-
-/// One task-to-surface grant. The owner keeps the writable alias; a grantee
-/// can only map the surface read-only.
-#[derive(Copy, Clone)]
-pub struct SurfaceGrant {
-    pub task: u64,
-    pub rights: u32,
-}
-
-/// A kernel-owned display surface. Its frames are also recorded in
-/// `dma_pages`, so ordinary task teardown revokes every CPU alias; the
-/// additional fields add owner/grant checks and scanout lifetime safety.
-pub struct SurfaceRecord {
-    pub id: u64,
-    physical: usize,
-    page_count: usize,
-    width: u32,
-    height: u32,
-    owner_va: usize,
-    grants: Vec<SurfaceGrant>,
-    /// Task that declared this surface as display scanout, if any.
-    scanout_holder: Option<u64>,
-    /// The frames must never return to the allocator (a device may still be
-    /// scanning them). Set when a scanout holder dies or a grant is revoked.
-    leaked: bool,
-}
-
-/// A read-only mapping of a foreign surface in this task's address space.
-struct SurfaceMapping {
-    surface: u64,
-    virtual_address: usize,
-}
-
-static NEXT_SURFACE_ID: AtomicU64 = AtomicU64::new(1);
-
 pub struct Task {
     pub id: u64,
     pub state: TaskState,
@@ -284,10 +244,6 @@ pub struct Task {
     /// address space. A stale token is refused by the page-table registry.
     space_token: TableToken,
     dma_pages: Vec<(usize, usize, u32)>,
-    /// Surfaces this task owns (created through `SYS_SURFACE_CREATE`).
-    surfaces: Vec<SurfaceRecord>,
-    /// Read-only foreign-surface mappings installed in this address space.
-    surface_maps: Vec<SurfaceMapping>,
     mmap_regions: Vec<MmapRegion>,
     /// Sum of `mmap_regions` spans, bounded by [`MAX_MMAP_BYTES_PER_TASK`].
     /// Kept separately so the quota check is O(1), not a walk per request.
@@ -1002,15 +958,7 @@ pub fn init() {
 
     #[cfg(not(feature = "demo-tasks"))]
     {
-        // 1 = headless console OS: Silverd skips the graphics stack.
-        // 2 = console OS plus the network stack.
-        #[cfg(feature = "console-net")]
-        const SILVERD_ARGUMENT: u64 = 2;
-        #[cfg(all(feature = "console", not(feature = "console-net")))]
-        const SILVERD_ARGUMENT: u64 = 1;
-        #[cfg(not(feature = "console"))]
-        const SILVERD_ARGUMENT: u64 = 0;
-        let silverd_id = spawn_user(user_program::SILVERD, SILVERD_ARGUMENT)
+        let silverd_id = spawn_user(user_program::SILVERD, 0)
             .expect("silverd must be created at boot");
         let _ = set_console_owner(silverd_id);
         crate::boot_metrics::log_milestone("SILVERD spawn");
@@ -1117,14 +1065,6 @@ pub fn init_fog() {
     // Experimental phone UI: the compositor takes the bootloader's registered
     // panel buffer and SilverHome draws through the command stream. Input is
     // not spawned until a real touch driver exists.
-    #[cfg(feature = "fog-display")]
-    {
-        let _gpu_id = spawn_user(user_program::GPU_DRIVER, 0)
-            .expect("gpu_driver must start on fog-display");
-        let _home_id =
-            spawn_user(user_program::HOME, howl_id).expect("home must start on fog-display");
-    }
-
     finish_init(0);
 }
 
@@ -1279,7 +1219,7 @@ pub fn run_task_ledger_selftest() -> bool {
 pub fn run_console_cap_selftest() -> bool {
     let allowed = initial_self_rights(user_program::HOWLER)
         .is_some_and(|rights| rights & capability::CAP_CONSOLE_GRANT != 0);
-    let denied = initial_self_rights(user_program::BLOCK_DRIVER)
+    let denied = initial_self_rights(user_program::NET_DRIVER)
         .is_some_and(|rights| rights & capability::CAP_CONSOLE_GRANT == 0);
     allowed && denied
 }
@@ -2723,8 +2663,6 @@ pub fn munmap(address: usize, length: usize) -> bool {
 }
 
 pub fn start() -> ! {
-    #[cfg(feature = "fog-paint")]
-    crate::fog::paint(0xFFFF_0000); // red: scheduler::start entered
     let saved_daif = interrupts::save_and_disable_irq();
     let manager = scheduler_manager().unwrap();
     let current_index = smp::current_index();
@@ -2738,8 +2676,6 @@ pub fn start() -> ! {
     // drops it again right before `eret`-ing into the first user task, so
     // the acquire/release pair stays balanced.
     smp::bkl_acquire();
-    #[cfg(feature = "fog-paint")]
-    crate::fog::paint(0xFFFF_8000); // orange: BKL acquired
     first_task.state = TaskState::Running;
     first_task.running_on = Some(0);
     #[cfg(all(feature = "smp", feature = "smp-selftest"))]
@@ -2756,10 +2692,6 @@ pub fn start() -> ! {
     let boot_context = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CONTEXT) };
 
     mmu::switch_address_space(first_task.ttbr0);
-    #[cfg(feature = "fog-paint")]
-    crate::fog::paint(0xFFFF_FF00); // yellow: TTBR0 switched
-    #[cfg(feature = "fog-paint")]
-    crate::fog::paint(0xFF00_FFFF); // cyan: about to context-switch
 
     unsafe {
         silver_context_switch(boot_context, first_context);
@@ -3378,13 +3310,13 @@ pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
 }
 
 pub fn alloc_dma_for_current(size: usize) -> Option<(usize, usize, u32)> {
-    alloc_dma_run(size, capability::CAP_MMIO)
+    alloc_dma_run(size)
 }
 
-/// Shared implementation for explicit DMA allocation (`CAP_MMIO`) and display
-/// surfaces (`CAP_SURFACE`). The capability is checked before any frame is
-/// charged, so a refused request has no side effects.
-fn alloc_dma_run(size: usize, right: u32) -> Option<(usize, usize, u32)> {
+/// Shared implementation for explicit DMA allocation. The capability is
+/// checked before any frame is charged, so a refused request has no side
+/// effects.
+fn alloc_dma_run(size: usize) -> Option<(usize, usize, u32)> {
     if size == 0 || size > mmu::USER_DMA_MAX_SIZE {
         return None;
     }
@@ -3396,9 +3328,9 @@ fn alloc_dma_run(size: usize, right: u32) -> Option<(usize, usize, u32)> {
         let task_id = task.id;
         if !task
             .cap_table
-            .has_self_rights(task_id, right)
+            .has_self_rights(task_id, capability::CAP_MMIO)
         {
-            console::write_str("DMA: FAIL - missing MMIO/surface right\r\n");
+            console::write_str("DMA: FAIL - missing MMIO right\r\n");
             return None;
         }
         if !task.charge_frames(page_count) {
@@ -3426,264 +3358,6 @@ fn alloc_dma_run(size: usize, right: u32) -> Option<(usize, usize, u32)> {
         };
         task.dma_pages.push((physical, page_count, generation));
         Some((virtual_address, physical, generation))
-    });
-    interrupts::restore_irq(saved_daif);
-    result
-}
-
-fn surface_owner_index(manager: &TaskManager, id: u64) -> Option<usize> {
-    manager
-        .tasks
-        .iter()
-        .position(|task| task.surfaces.iter().any(|surface| surface.id == id))
-}
-
-/// Allocates a display surface owned by the caller and maps it writable into
-/// the caller's DMA window. Returns `(surface id, virtual address)`.
-pub fn create_surface(width: u32, height: u32) -> Option<(u64, usize)> {
-    if width == 0 || height == 0 {
-        return None;
-    }
-    let size = (width as usize)
-        .checked_mul(height as usize)?
-        .checked_mul(4)?;
-    if size == 0 || size > mmu::USER_DMA_MAX_SIZE {
-        return None;
-    }
-    let id = NEXT_SURFACE_ID.fetch_add(1, Ordering::Relaxed);
-    // `alloc_dma_for_current` validates CAP_MMIO, charges the ledger, zeroes
-    // and publishes the NC mapping, and records the run for teardown.
-    let (virtual_address, physical, _generation) =
-        alloc_dma_run(size, capability::CAP_SURFACE)?;
-    let manager = scheduler_manager()?;
-    let task = manager.tasks.get_mut(smp::current_index())?;
-    task.surfaces.push(SurfaceRecord {
-        id,
-        physical,
-        page_count: size.div_ceil(PAGE_SIZE),
-        width,
-        height,
-        owner_va: virtual_address,
-        grants: Vec::new(),
-        scanout_holder: None,
-        leaked: false,
-    });
-    Some((id, virtual_address))
-}
-
-/// Grants `target` read (and optionally scanout) access to a surface the
-/// caller owns. Granting requires the target to hold `CAP_MMIO`, because that
-/// is the right a later `SYS_SURFACE_MAP` needs anyway.
-pub fn grant_surface(id: u64, target: u64, rights: u32) -> bool {
-    if rights == 0 || rights & !SURFACE_RIGHTS_ALL != 0 {
-        return false;
-    }
-    let saved_daif = interrupts::save_and_disable_irq();
-    let result = scheduler_manager().map_or(false, |manager| {
-        let Some(caller) = manager.tasks.get(smp::current_index()).map(|task| task.id) else {
-            return false;
-        };
-        let Some(owner_index) = surface_owner_index(manager, id) else {
-            return false;
-        };
-        if manager.tasks[owner_index].id != caller || target == caller {
-            return false;
-        }
-        let Some(target_task) = manager.tasks.iter().find(|task| task.id == target) else {
-            return false;
-        };
-        if !target_task
-            .cap_table
-            .has_self_rights(target, capability::CAP_SURFACE)
-        {
-            return false;
-        }
-        let Some(surface) = manager.tasks[owner_index]
-            .surfaces
-            .iter_mut()
-            .find(|surface| surface.id == id)
-        else {
-            return false;
-        };
-        surface.grants.retain(|grant| grant.task != target);
-        surface.grants.push(SurfaceGrant { task: target, rights });
-        true
-    });
-    interrupts::restore_irq(saved_daif);
-    result
-}
-
-/// Maps a surface owned by the caller or granted to it. Returns
-/// `(va, pa, owner task id, packed dimensions)`; `pa` is zero unless the
-/// caller has the scanout right (the owner always does).
-pub fn map_surface(id: u64) -> Option<(usize, usize, u64, u64)> {
-    let saved_daif = interrupts::save_and_disable_irq();
-    let result = scheduler_manager().and_then(|manager| {
-        let current_index = smp::current_index();
-        let caller = manager.tasks.get(current_index)?.id;
-        let owner_index = surface_owner_index(manager, id)?;
-        let (physical, page_count, width, height, owner_va, owner, rights) = {
-            let owner_task = &manager.tasks[owner_index];
-            let surface = owner_task
-                .surfaces
-                .iter()
-                .find(|surface| surface.id == id)?;
-            let rights = if owner_task.id == caller {
-                SURFACE_RIGHTS_ALL
-            } else {
-                surface
-                    .grants
-                    .iter()
-                    .find(|grant| grant.task == caller)?
-                    .rights
-            };
-            (
-                surface.physical,
-                surface.page_count,
-                surface.width,
-                surface.height,
-                surface.owner_va,
-                owner_task.id,
-                rights,
-            )
-        };
-        let packed = (u64::from(width) << 32) | u64::from(height);
-        let physical_address = if rights & SURFACE_RIGHT_SCANOUT != 0 {
-            physical
-        } else {
-            0
-        };
-        if owner == caller {
-            return Some((owner_va, physical_address, owner, packed));
-        }
-        let task = &manager.tasks[current_index];
-        if !task
-            .cap_table
-            .has_self_rights(caller, capability::CAP_SURFACE)
-        {
-            return None;
-        }
-        if let Some(mapping) = task.surface_maps.iter().find(|map| map.surface == id) {
-            return Some((mapping.virtual_address, physical_address, owner, packed));
-        }
-        let span = page_count.checked_mul(PAGE_SIZE)?;
-        let virtual_address = mmu::map_shared_dma_ro_to_user(task, physical, span)?;
-        let task = manager.tasks.get_mut(current_index)?;
-        task.surface_maps.push(SurfaceMapping {
-            surface: id,
-            virtual_address,
-        });
-        Some((virtual_address, physical_address, owner, packed))
-    });
-    interrupts::restore_irq(saved_daif);
-    result
-}
-
-/// Revokes `target`'s grant and removes its mapping. Frames are not freed;
-/// they stay owned by the surface (and are never reused if a device may still
-/// be scanning). Returns true when a grant existed.
-pub fn revoke_surface(id: u64, target: u64) -> bool {
-    let saved_daif = interrupts::save_and_disable_irq();
-    let result = scheduler_manager().map_or(false, |manager| {
-        let Some(caller) = manager.tasks.get(smp::current_index()).map(|task| task.id) else {
-            return false;
-        };
-        let Some(owner_index) = surface_owner_index(manager, id) else {
-            return false;
-        };
-        if manager.tasks[owner_index].id != caller {
-            return false;
-        }
-        let (physical, page_count) = {
-            let surface = manager.tasks[owner_index]
-                .surfaces
-                .iter_mut()
-                .find(|surface| surface.id == id)
-                .expect("surface index was found above");
-            if !surface.grants.iter().any(|grant| grant.task == target) {
-                return false;
-            }
-            surface.grants.retain(|grant| grant.task != target);
-            if surface.scanout_holder == Some(target) {
-                // The display may still be reading this range; never recycle.
-                surface.scanout_holder = None;
-                surface.leaked = true;
-            }
-            (surface.physical, surface.page_count)
-        };
-        let Some(target_task) = manager.tasks.iter_mut().find(|task| task.id == target) else {
-            return true;
-        };
-        let Some(span) = page_count.checked_mul(PAGE_SIZE) else {
-            return true;
-        };
-        // Physical-range revoke covers every alias of these frames in the
-        // target's MMIO window, not just the recorded VA.
-        let _ = mmu::revoke_phys_range(target_task.ttbr0, physical, physical + span);
-        target_task
-            .surface_maps
-            .retain(|mapping| mapping.surface != id);
-        true
-    });
-    interrupts::restore_irq(saved_daif);
-    result
-}
-
-/// Declares (or releases) a surface as the display scanout buffer. Only the
-/// owner or a grantee with [`SURFACE_RIGHT_SCANOUT`] may do this.
-pub fn set_surface_scanout(id: u64, enable: bool) -> bool {
-    let saved_daif = interrupts::save_and_disable_irq();
-    let result = scheduler_manager().map_or(false, |manager| {
-        let Some(caller) = manager.tasks.get(smp::current_index()).map(|task| task.id) else {
-            return false;
-        };
-        let Some(owner_index) = surface_owner_index(manager, id) else {
-            return false;
-        };
-        let owner = manager.tasks[owner_index].id;
-        let Some(surface) = manager.tasks[owner_index]
-            .surfaces
-            .iter_mut()
-            .find(|surface| surface.id == id)
-        else {
-            return false;
-        };
-        if owner != caller {
-            let allowed = surface
-                .grants
-                .iter()
-                .any(|grant| grant.task == caller && grant.rights & SURFACE_RIGHT_SCANOUT != 0);
-            if !allowed {
-                return false;
-            }
-        }
-        if enable {
-            surface.scanout_holder = Some(caller);
-        } else if surface.scanout_holder == Some(caller) {
-            surface.scanout_holder = None;
-        }
-        true
-    });
-    interrupts::restore_irq(saved_daif);
-    result
-}
-
-/// Maps the registered platform display buffer into the caller. The frames do
-/// not belong to the frame allocator (they are the bootloader's scanout
-/// carve-out), so no DMA ledger entry is created; task teardown only drops the
-/// page-table aliases.
-pub fn map_display_for_current() -> Option<usize> {
-    let info = crate::display::info()?;
-    let saved_daif = interrupts::save_and_disable_irq();
-    let result = scheduler_manager().and_then(|manager| {
-        let task = manager.tasks.get_mut(smp::current_index())?;
-        if !task
-            .cap_table
-            .has_self_rights(task.id, capability::CAP_SURFACE)
-        {
-            return None;
-        }
-        mmu::map_display_to_user(task, info.base, info.byte_len())
     });
     interrupts::restore_irq(saved_daif);
     result
@@ -4127,31 +3801,6 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     let needs_quiesce = manager.tasks.iter().any(|task| {
         task.state == TaskState::Dead && task.running_on.is_none() && !task.dma_pages.is_empty()
     });
-    // Surface bookkeeping for dying tasks: drop their grants everywhere, and
-    // if a dying task was the scanout holder, pin the frames (the display may
-    // still read them) instead of letting teardown recycle them.
-    let dead_ids: Vec<u64> = manager
-        .tasks
-        .iter()
-        .filter(|task| task.state == TaskState::Dead)
-        .map(|task| task.id)
-        .collect();
-    if !dead_ids.is_empty() {
-        for owner in manager.tasks.iter_mut() {
-            for surface in owner.surfaces.iter_mut() {
-                if let Some(holder) = surface.scanout_holder {
-                    if dead_ids.contains(&holder) {
-                        surface.scanout_holder = None;
-                        surface.leaked = true;
-                        console::write_str("SURFACE: scanout holder died, pinning surface ");
-                        console::write_dec_u64(surface.id);
-                        console::write_str("\r\n");
-                    }
-                }
-                surface.grants.retain(|grant| !dead_ids.contains(&grant.task));
-            }
-        }
-    }
     let quiesced = needs_quiesce && smp::quiesce_begin();
     let mut dma_revokes: Vec<(usize, usize, mmu::RevokeResult)> = Vec::new();
     for dead in manager
@@ -4353,41 +4002,22 @@ fn initial_self_rights(program: u64) -> Option<u32> {
         user_program::HOWLER => {
             capability::CAP_MMIO | capability::CAP_IRQ | capability::CAP_CONSOLE_GRANT
         }
-        user_program::BLOCK_DRIVER | user_program::NET_DRIVER => {
-            capability::CAP_MMIO | capability::CAP_PCI
-        }
-        // The filesystem server only needs MMIO to map the shared DMA window
-        // the block driver hands back; without this a server spawned by hand
-        // from the shell could never mount.
-        user_program::SFS_SERVER | user_program::NET_SERVER => capability::CAP_MMIO,
+        user_program::NET_DRIVER => capability::CAP_MMIO | capability::CAP_PCI,
+        user_program::NET_SERVER => capability::CAP_MMIO,
         // The shell hands device rights to the tasks it spawns by hand
-        // (`spawn block_driver`), and `CapTable::grant` only allows a task to
+        // (`spawn net_driver`), and `CapTable::grant` only allows a task to
         // pass on a right it already holds.
         // The shell needs MMIO only for the commands that map a device window.
         // In the console product build it is also the trusted control plane,
         // so the kernel grants it the power privilege directly; a spawn handle
         // can never delegate CAP_POWER (it is outside CAP_ALL).
+        // The shell is the trusted control plane of the console OS; it owns
+        // the power privilege directly (a spawn handle can never delegate it).
         user_program::HOWL => {
-            #[cfg(feature = "console")]
-            {
-                capability::CAP_MMIO | capability::CAP_FS_WRITE | capability::CAP_POWER
-            }
-            #[cfg(not(feature = "console"))]
-            {
-                capability::CAP_MMIO | capability::CAP_FS_WRITE
-            }
+            capability::CAP_MMIO | capability::CAP_FS_WRITE | capability::CAP_POWER
         }
         // Trusted filesystem stress helper (not an installed app bundle).
         user_program::BIGDIR | user_program::BIGFILE => capability::CAP_FS_WRITE,
-        // The graphics driver owns the on-screen Power button; only this
-        // trusted component receives the power privilege. It also owns the
-        // display: it needs CAP_SURFACE to map and scan out client buffers.
-        user_program::GPU_DRIVER => {
-            capability::CAP_MMIO | capability::CAP_POWER | capability::CAP_SURFACE
-        }
-        // The home screen renders directly into a kernel surface and shares it
-        // with the compositor, but it never touches device registers.
-        user_program::HOME => capability::CAP_SURFACE,
         _ => return None,
     };
     Some(rights)
@@ -4566,8 +4196,6 @@ impl Task {
             user_image,
             heap_pages: Vec::new(),
             dma_pages: Vec::new(),
-            surfaces: Vec::new(),
-            surface_maps: Vec::new(),
             mmap_regions: Vec::new(),
             mmap_bytes: 0,
             mem_frames: ledger_frames,
@@ -4911,21 +4539,6 @@ impl Task {
             console::write_str("MMU: address space teardown was refused\r\n");
         }
         for &(physical, page_count, generation) in &self.dma_pages {
-            // A surface pinned as scanout (or already marked leaked) must keep
-            // its frames forever: a display controller may still read them
-            // even though every CPU mapping is gone.
-            let scanout_pinned = self.surfaces.iter().any(|surface| {
-                surface.physical == physical
-                    && surface.page_count == page_count
-                    && (surface.leaked || surface.scanout_holder.is_some())
-            });
-            if scanout_pinned {
-                DMA_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
-                console::write_str("SURFACE LEAK: scanout range 0x");
-                console::write_hex_u64(physical as u64);
-                console::write_str(" kept out of the allocator\r\n");
-                continue;
-            }
             // Exact (physical, page_count) match: allocator ranges never
             // overlap, so a dead task's own range cannot be confused with
             // another dead task's range in the same reap pass.
@@ -4977,8 +4590,6 @@ impl Task {
         self.user_image = None;
         self.heap_pages.clear();
         self.dma_pages.clear();
-        self.surfaces.clear();
-        self.surface_maps.clear();
         self.mmap_regions.clear();
         self.mmap_bytes = 0;
         // The ledger is only meaningful while the task can allocate; a zombie
@@ -5004,27 +4615,6 @@ fn scheduler_manager() -> Option<&'static mut TaskManager> {
 }
 
 extern "C" fn idle_task() -> ! {
-    #[cfg(feature = "fog-paint")]
-    unsafe {
-        // No stack, no Rust call: paint brown as the very first idle
-        // instruction. If SP from the context is bad, this still tells us
-        // that the context switch reached the idle entry point.
-        core::arch::asm!(
-            // MMU is on here: use the high-half alias, not the physical
-            // address. `phys_to_virt(0x5C00_0000)` is 0xFFFF_0000_5C00_0000.
-            "mov x9, #0x5C000000",
-            "movk x9, #0xFFFF, lsl #48",
-            "mov x10, #0x5C800000",
-            "movk x10, #0xFFFF, lsl #48",
-            "mov w11, #0x4000",
-            "movk w11, #0x8040, lsl #16",
-            "1:",
-            "str w11, [x9], #4",
-            "cmp x9, x10",
-            "b.lo 1b",
-            options(nostack),
-        );
-    }
     // First dispatch on a CPU enters here with the kernel lock held by the
     // dispatching `schedule` (user-mode bootstrap drops it in asm; kernel
     // entries do it here). Idle never holds the lock again: it sleeps in
@@ -5032,30 +4622,7 @@ extern "C" fn idle_task() -> ! {
     if smp::bkl_depth() > 0 {
         smp::bkl_release();
     }
-    // The full-screen ladder must not run once userspace owns the panel: IRQs
-    // are enabled between these two paints, so the compositor can draw the UI
-    // before the second paint and the idle colour would erase it. A
-    // `fog-display` build keeps only the small stage marker below.
-    #[cfg(all(feature = "fog-paint", not(feature = "fog-display")))]
-    crate::fog::paint(0xFF00_FF00); // green: idle task entered
     interrupts::enable_irq();
-    #[cfg(all(feature = "fog-paint", not(feature = "fog-display")))]
-    crate::fog::paint(0xFF00_00FF); // blue: idle waiting for an IRQ
-    #[cfg(feature = "fog-ui")]
-    {
-        // Live status panel. IRQs are enabled above, so the 100 Hz tick keeps
-        // preempting this loop and the scheduler keeps running underneath.
-        crate::fog_ui::run()
-    }
-    #[cfg(all(not(feature = "fog-ui"), feature = "fog-diag"))]
-    {
-        // "Immediately before the idle wait": IRQs unmasked, timer armed,
-        // scheduler has not dispatched anything yet. The paged display then
-        // runs instead of `WFI` so the operator can photograph every page.
-        crate::gic_diag::capture(2);
-        crate::gic_diag::run_display()
-    }
-    #[cfg(all(not(feature = "fog-ui"), not(feature = "fog-diag")))]
     loop {
         interrupts::wait_for_irq();
     }

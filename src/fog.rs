@@ -11,81 +11,11 @@ use crate::fdt::{self, Fdt, Region};
 #[cfg(feature = "fog-auto-reset")]
 use core::sync::atomic::{AtomicU64, Ordering};
 
-/// Debug-only colour ladder on the Rain/Fog cont_splash framebuffer.
-/// `fog-paint` is not part of a normal build; it assumes the live Rain
-/// reserved-memory base at 0x5C00_0000 and exists only to make a UART-less
-/// unit observable. The boot stub paints green at entry and blue after the
-/// placement decision; this function paints later kernel milestones.
-#[cfg(feature = "fog-paint")]
-pub fn paint(color: u32) {
-    const BASE: usize = 0x5C00_0000;
-    const SIZE: usize = 0x0080_0000;
-    let pointer = crate::memory::phys_to_virt(BASE) as *mut u32;
-    let words = SIZE / 4;
-    let mut index = 0;
-    while index < words {
-        unsafe { core::ptr::write_volatile(pointer.add(index), color) };
-        index += 1;
-    }
-}
-
-#[cfg(not(feature = "fog-paint"))]
-#[inline(always)]
-pub fn paint(_color: u32) {}
-
-/// Paint only the top band of the splash buffer, leaving the last full-screen
-/// stage colour visible. Used by the exception handler so a fault colour does
-/// not hide the stage that faulted.
-#[cfg(feature = "fog-paint")]
-pub fn paint_band(color: u32) {
-    const BASE: usize = 0x5C00_0000;
-    // A thin 16 KiB strip (about six 720-pixel rows) keeps the exception
-    // colour visible without hiding the register table painted below it.
-    const SIZE: usize = 0x0000_4000;
-    let pointer = crate::memory::phys_to_virt(BASE) as *mut u32;
-    let words = SIZE / 4;
-    let mut index = 0;
-    while index < words {
-        unsafe { core::ptr::write_volatile(pointer.add(index), color) };
-        index += 1;
-    }
-}
-
-#[cfg(not(feature = "fog-paint"))]
-#[inline(always)]
-pub fn paint_band(_color: u32) {}
-
-/// Diagnostic progress bars for `fog-paint` builds: a full-screen stage colour
-/// would erase every earlier marker, so each completed sub-stage draws one
-/// white bar below the previous one. The number of bars is the number of
-/// completed sub-stages; the background stays on the last full-screen colour.
-#[cfg(feature = "fog-paint")]
-pub fn stage_mark(index: u32) {
-    const BASE: usize = 0x5C00_0000;
-    const WIDTH: usize = 720;
-    const BAR_HEIGHT: usize = 12;
-    const BAR_STEP: usize = 24;
-    let pointer = crate::memory::phys_to_virt(BASE) as *mut u32;
-    let y = 8 + index as usize * BAR_STEP;
-    for row in 0..BAR_HEIGHT {
-        for x in 0..WIDTH {
-            unsafe {
-                core::ptr::write_volatile(pointer.add((y + row) * WIDTH + x), 0xFFFF_FFFF);
-            }
-        }
-    }
-}
-
-#[cfg(not(feature = "fog-paint"))]
-#[inline(always)]
-pub fn stage_mark(_index: u32) {}
-
 #[cfg(feature = "fog-auto-reset")]
 static AUTO_RESET_AT: AtomicU64 = AtomicU64::new(0);
 
-/// Arms a one-shot reset `seconds` after this call. Runs from the timer IRQ,
-/// which only exists once the scheduler is alive; a boot that wedges earlier
-/// still needs the power key.
+/// Arms a one-shot reset `seconds` after this call. Diagnostic only: a
+/// RAM-only fog boot uses it to return to Android without a power-key hold.
 #[cfg(feature = "fog-auto-reset")]
 pub fn arm_auto_reset(seconds: u64) {
     let deadline = crate::timer::ticks()
@@ -158,10 +88,6 @@ pub struct FogInfo {
     pub gic_node: bool,
     pub gic_cells_len: usize,
     pub gic_cells: [u32; crate::fdt::RAW_CELLS],
-    /// `cont_splash`/`splash` reserved region when the platform framebuffer
-    /// feature is enabled and the live FDT describes a usable buffer.
-    pub display: Region,
-    pub display_present: bool,
 }
 
 impl FogInfo {
@@ -198,8 +124,6 @@ impl FogInfo {
             gic_node: false,
             gic_cells_len: 0,
             gic_cells: [0; crate::fdt::RAW_CELLS],
-            display: Region { start: 0, end: 0 },
-            display_present: false,
         }
     }
 
@@ -349,37 +273,6 @@ pub fn probe(params: &BootParams) -> FogInfo {
         result.memreserve_first = reserved[reserved_count];
     }
     reserved_count += memreserve_count;
-
-    // Platform display (opt-in `fog-display`). The bootloader leaves the panel
-    // scanning `cont_splash`; the live FDT names the carve-out, so no physical
-    // address is hardcoded. The buffer must be inside a `/memory` region and
-    // large enough for the configured panel mode; otherwise it stays
-    // unavailable and the display syscalls fail closed.
-    #[cfg(feature = "fog-display")]
-    {
-        let named = tree
-            .reserved_region_named("cont_splash")
-            .or_else(|| tree.reserved_region_named("splash"));
-        if let Some(region) = named {
-            let info = crate::display::DisplayInfo {
-                base: region.start as usize,
-                width: crate::display::FOG_PANEL_WIDTH,
-                height: crate::display::FOG_PANEL_HEIGHT,
-                stride: crate::display::FOG_PANEL_STRIDE,
-                bytes_per_pixel: crate::display::BYTES_PER_PIXEL,
-            };
-            let inside_memory = memory[..memory_count]
-                .iter()
-                .any(|memory| region.start >= memory.start && region.end <= memory.end);
-            if inside_memory
-                && region.size() >= info.byte_len() as u64
-                && crate::display::register(info)
-            {
-                result.display = region;
-                result.display_present = true;
-            }
-        }
-    }
 
     // The fixed arrays are deliberately larger than a normal khaje tree. If
     // one is full, the parser may have dropped entries, so the placement
@@ -539,24 +432,6 @@ pub fn log_banner(params: &BootParams, info: &FogInfo) {
         console("+0x");
         crate::console::write_hex_u64(info.dtb_region.size());
         console("\r\n");
-    }
-
-    #[cfg(feature = "fog-display")]
-    {
-        console("SILVER DISPLAY ");
-        if info.display_present {
-            console("OK base=0x");
-            crate::console::write_hex_u64(info.display.start);
-            console(" size=0x");
-            crate::console::write_hex_u64(info.display.size());
-            console(" mode=");
-            crate::console::write_dec_u64(u64::from(crate::display::FOG_PANEL_WIDTH));
-            console("x");
-            crate::console::write_dec_u64(u64::from(crate::display::FOG_PANEL_HEIGHT));
-            console("\r\n");
-        } else {
-            console("UNAVAILABLE\r\n");
-        }
     }
 
     console("SILVER GIC ");

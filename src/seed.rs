@@ -20,9 +20,6 @@ pub const SCOPEPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scop
 /// to `0x0` so the EL0 fault handler has a deterministic way to be exercised.
 pub const CRASH_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/crash.elf"));
 /// Built-in apps, installed into `/sfs` and launched from there by SilverHome.
-pub const CALC_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/calc.elf"));
-pub const GALLERY_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gallery.elf"));
-pub const NOTES_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/notes.elf"));
 
 /// Installs the built-in app bundles into the mounted SFS. Called after
 /// `/sfs` is mounted; a file whose size already matches is left untouched.
@@ -32,9 +29,6 @@ pub fn seed_apps() {
     // shows up as a failed install below.
     let _ = crate::vfs::mkdir("/", "/sfs/apps");
     for (path, image) in [
-        ("/sfs/apps/calc.elf", CALC_ELF),
-        ("/sfs/apps/gallery.elf", GALLERY_ELF),
-        ("/sfs/apps/notes.elf", NOTES_ELF),
         ("/sfs/apps/scopeprobe.elf", SCOPEPROBE_ELF),
     ] {
         match crate::vfs::file_len("/", path) {

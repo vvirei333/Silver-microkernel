@@ -82,13 +82,6 @@ pub const SYS_MEMINFO_V2: u64 = 85;
 pub const SYS_HEALTH: u64 = 86;
 pub const SYS_FS_REPLACE: u64 = 87;
 pub const SYS_FS_USAGE: u64 = 88;
-pub const SYS_SURFACE_CREATE: u64 = 89;
-pub const SYS_SURFACE_GRANT: u64 = 90;
-pub const SYS_SURFACE_MAP: u64 = 91;
-pub const SYS_SURFACE_REVOKE: u64 = 92;
-pub const SYS_SURFACE_SCANOUT: u64 = 93;
-pub const SYS_DISPLAY_INFO: u64 = 94;
-pub const SYS_DISPLAY_MAP: u64 = 95;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -157,18 +150,6 @@ struct FsUsageInfo {
     blocks: u64,
 }
 
-/// Versioned platform display description shared with userspace.
-#[repr(C)]
-struct DisplayInfoOut {
-    version: u64,
-    size: u64,
-    available: u64,
-    base: u64,
-    width: u64,
-    height: u64,
-    stride: u64,
-    bytes_per_pixel: u64,
-}
 
 #[repr(C)]
 struct HealthInfo {
@@ -316,47 +297,6 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
         SYS_FS_RENAME => sys_fs_rename(frame[0], frame[1]),
         SYS_FS_REPLACE => sys_fs_replace(frame[0], frame[1]),
         SYS_FS_USAGE => sys_fs_usage(frame[0], frame[1]),
-        SYS_SURFACE_CREATE => match scheduler::create_surface(frame[0] as u32, frame[1] as u32) {
-            Some((id, virtual_address)) => {
-                frame[1] = id;
-                virtual_address as u64
-            }
-            None => SYSCALL_ERROR,
-        },
-        SYS_SURFACE_GRANT => {
-            if scheduler::grant_surface(frame[0], frame[1], frame[2] as u32) {
-                0
-            } else {
-                SYSCALL_ERROR
-            }
-        }
-        SYS_SURFACE_MAP => match scheduler::map_surface(frame[0]) {
-            Some((virtual_address, physical_address, owner, dimensions)) => {
-                frame[1] = physical_address as u64;
-                frame[2] = owner;
-                frame[3] = dimensions;
-                virtual_address as u64
-            }
-            None => SYSCALL_ERROR,
-        },
-        SYS_SURFACE_REVOKE => {
-            if scheduler::revoke_surface(frame[0], frame[1]) {
-                0
-            } else {
-                SYSCALL_ERROR
-            }
-        }
-        SYS_SURFACE_SCANOUT => {
-            if scheduler::set_surface_scanout(frame[0], frame[1] != 0) {
-                0
-            } else {
-                SYSCALL_ERROR
-            }
-        }
-        SYS_DISPLAY_INFO => sys_display_info(frame[0]),
-        SYS_DISPLAY_MAP => scheduler::map_display_for_current()
-            .map(|address| address as u64)
-            .unwrap_or(SYSCALL_ERROR),
         SYS_CAP_GET_TASK_ID => scheduler::capability_task_id(frame[0]).unwrap_or(SYSCALL_ERROR),
         SYS_CAP_GRANT => {
             if scheduler::grant_capability(frame[0], frame[1], frame[2] as u32) {
@@ -775,43 +715,6 @@ fn sys_fs_usage(path_ptr: u64, out_ptr: u64) -> u64 {
             0
         }
     })
-}
-
-fn sys_display_info(out_ptr: u64) -> u64 {
-    let display = crate::display::info();
-    let info = match display {
-        Some(display) => DisplayInfoOut {
-            version: 1,
-            size: core::mem::size_of::<DisplayInfoOut>() as u64,
-            available: 1,
-            base: display.base as u64,
-            width: u64::from(display.width),
-            height: u64::from(display.height),
-            stride: u64::from(display.stride),
-            bytes_per_pixel: u64::from(display.bytes_per_pixel),
-        },
-        None => DisplayInfoOut {
-            version: 1,
-            size: core::mem::size_of::<DisplayInfoOut>() as u64,
-            available: 0,
-            base: 0,
-            width: 0,
-            height: 0,
-            stride: 0,
-            bytes_per_pixel: 0,
-        },
-    };
-    let bytes = unsafe {
-        core::slice::from_raw_parts(
-            (&info as *const DisplayInfoOut).cast::<u8>(),
-            core::mem::size_of::<DisplayInfoOut>(),
-        )
-    };
-    if user_memory::copy_to_user(bytes, out_ptr).is_err() {
-        SYSCALL_ERROR
-    } else {
-        0
-    }
 }
 
 fn sys_fs_replace(source_ptr: u64, destination_ptr: u64) -> u64 {

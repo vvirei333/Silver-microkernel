@@ -64,8 +64,6 @@ pub fn init() {
     }
     rearm();
     set_control(1);
-    #[cfg(feature = "fog-paint")]
-    crate::fog::paint(0xFF00_FFFF); // cyan: timer armed
 }
 
 /// Whether timer interrupts can actually be delivered on this platform.

@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Builds the kernel together with the embedded userspace ELFs (build.rs
 # re-invokes cargo inside userspace/) and boots the result in QEMU with
-# disk.img attached as a virtio-blk-pci device, which sfs_server needs, plus a
-# ramfb framebuffer on a GTK window for the graphics driver. The UART shell
+# disk.img attached as a virtio-blk-pci device, which the kernel SFS needs.
+# This is the console product: no framebuffer and no input device; the shell
 # stays multiplexed with the QEMU monitor on stdio.
 #
 # Usage: ./build_and_qemu.sh [debug|release] [--no-run]
@@ -46,7 +46,5 @@ exec qemu-system-aarch64 \
     -kernel "target/aarch64-unknown-none/$PROFILE/silver_microkernel" \
     -drive file=disk.img,format=raw,if=none,id=hd \
     -device virtio-blk-pci,drive=hd \
-    -device ramfb \
-    -device virtio-tablet-pci,disable-legacy=on,id=tablet0 \
-    -display gtk,show-cursor=on \
+    -display none \
     -serial mon:stdio

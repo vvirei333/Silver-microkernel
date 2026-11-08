@@ -20,8 +20,6 @@ mod channel;
 mod condvar;
 #[cfg(not(feature = "std"))]
 mod console;
-#[cfg_attr(not(feature = "fog-display"), allow(dead_code))]
-mod display;
 #[cfg(not(feature = "std"))]
 mod elf;
 #[cfg(not(feature = "std"))]
@@ -32,10 +30,7 @@ mod exceptions;
 mod fdt;
 #[cfg(not(feature = "std"))]
 mod fog;
-#[cfg(all(not(feature = "std"), feature = "fog-diag"))]
-mod gic_diag;
-#[cfg(all(not(feature = "std"), feature = "fog-ui"))]
-mod fog_ui;
+#[cfg(not(feature = "std"))]
 mod fog_validate;
 #[cfg(not(feature = "std"))]
 mod frame_allocator;
@@ -114,21 +109,6 @@ pub unsafe extern "C" fn fog_validate_relocation(
 #[cfg(all(feature = "std", feature = "no_std"))]
 compile_error!("Features 'std' and 'no_std' are mutually exclusive");
 
-#[cfg(all(feature = "fog-display", any(feature = "fog-ui", feature = "fog-diag")))]
-compile_error!(
-    "'fog-display' starts the userspace compositor on cont_splash; \
-     'fog-ui'/'fog-diag' paint a kernel status panel on the same buffer"
-);
-
-#[cfg(all(
-    feature = "console",
-    any(feature = "fog-display", feature = "fog-ui", feature = "fog-diag")
-))]
-compile_error!(
-    "'console' is the headless product profile; it cannot be combined with a \
-     framebuffer/compositor profile"
-);
-
 #[cfg(all(not(feature = "std"), not(target_arch = "aarch64")))]
 compile_error!("The bare-metal kernel currently supports only AArch64");
 
@@ -153,12 +133,8 @@ core::arch::global_asm!(".set FOG_BUILD, 0");
 core::arch::global_asm!(".set FOG_RELOC, 1");
 #[cfg(not(feature = "fog-reloc"))]
 core::arch::global_asm!(".set FOG_RELOC, 0");
-// Debug-only visual evidence on the Rain/Fog cont_splash framebuffer. The
-// address comes from the live Rain reserved-memory tree, not from a generic
-// fog fact; only enable it for a controlled diagnostic boot.
-#[cfg(feature = "fog-paint")]
-core::arch::global_asm!(".set FOG_PAINT, 1");
-#[cfg(not(feature = "fog-paint"))]
+// The boot-stub paint ladder is gone with the graphics subsystem; the flag
+// stays so the historical `.if FOG_PAINT` blocks assemble to nothing.
 core::arch::global_asm!(".set FOG_PAINT, 0");
 
 core::arch::global_asm!(
@@ -1310,9 +1286,6 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::log("KERNEL ENTRY");
 
     mmu::init();
-    #[cfg(feature = "fog-paint")]
-    fog::paint(0xFF00_FFFF); // cyan: MMU is on
-    ram_log::fb_progress(); // entry bar — after mmu::init so the fb is mapped
 
     // Console first: a bad memory map must be *reported* before the
     // allocator asserts on an empty window.
@@ -1331,8 +1304,6 @@ pub extern "C" fn kernel_main() -> ! {
         }
         console::write_str("\r\n");
     }
-    #[cfg(feature = "fog-paint")]
-    fog::paint(0xFF80_8000); // olive: console is up (distinct from scheduler yellow)
     #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     {
         console::write_str("PLATFORM=QEMU\r\n");
@@ -1375,7 +1346,6 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
     ram_log::log("MMU OK");
-    ram_log::fb_progress();
 
     let memory_map = memory::current();
     if !memory_map.is_valid() || memory_map.available.is_empty() {
@@ -1383,15 +1353,11 @@ pub extern "C" fn kernel_main() -> ! {
         console::write_str("SILVER FOG HALT: invalid memory map\r\n");
         exceptions::silver_handle_exception(6, 0, 0, 0);
     }
-    #[cfg(feature = "fog-paint")]
-    fog::paint(0xFF00_8080); // teal: memory map accepted
     let available_pages = frame_allocator::init(memory_map.available);
 
     if !memory_map.is_valid() || available_pages == 0 || !frame_allocator::run_self_test() {
         exceptions::silver_handle_exception(6, 0, 0, 0);
     }
-    #[cfg(feature = "fog-paint")]
-    fog::paint(0xFF80_0080); // purple: frame allocator self-test passed
     // Snapshot the on-disk SFS before the EL0 block driver claims the device,
     // then serve it read-only from the kernel VFS. Additive: a missing device
     // leaves the boot path unchanged.
@@ -1399,10 +1365,7 @@ pub extern "C" fn kernel_main() -> ! {
         sfs::report();
         ram_log::log("KSFS loaded");
     }
-    #[cfg(feature = "fog-paint")]
-    fog::stage_mark(1);
-    ram_log::log("FRAME ALLOC OK");
-    ram_log::fb_progress();
+        ram_log::log("FRAME ALLOC OK");
 
     // User-visible memory (mmap, brk, DMA, ELF images, task stacks) may not
     // eat the frames the kernel and its devices still need. The gate is a
@@ -1411,19 +1374,14 @@ pub extern "C" fn kernel_main() -> ! {
     if !frame_allocator::run_user_reserve_selftest() {
         exceptions::silver_handle_exception(6, 0, 0, 0);
     }
-    #[cfg(feature = "fog-paint")]
-    fog::stage_mark(2);
-    ram_log::log("MEM RESERVE OK");
-    ram_log::fb_progress();
+        ram_log::log("MEM RESERVE OK");
 
     let Some(heap_base) = allocator::init() else {
         exceptions::silver_handle_exception(7, 0, 0, 0);
     };
 
     let value = alloc::boxed::Box::new(42_u64);
-    #[cfg(feature = "fog-paint")]
-    fog::stage_mark(3);
-    #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
+        #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     {
         let value_address = (&*value as *const u64) as usize;
         console::write_str("HEAP=OK BASE=");
@@ -1436,7 +1394,6 @@ pub extern "C" fn kernel_main() -> ! {
         boot_metrics::log_milestone("Heap init");
     }
     ram_log::log("HEAP OK");
-    ram_log::fb_progress();
 
     // One 2 MiB-aligned arena, split into 4 KiB pages with one unmapped
     // guard page below every task stack. A failure here would make task
@@ -1444,10 +1401,7 @@ pub extern "C" fn kernel_main() -> ! {
     if !kernel_stack::init() || !kernel_stack::run_self_test() {
         exceptions::silver_handle_exception(6, 0, 0, 0);
     }
-    #[cfg(feature = "fog-paint")]
-    fog::stage_mark(4);
-    ram_log::log("KERNEL STACK OK");
-    ram_log::fb_progress();
+        ram_log::log("KERNEL STACK OK");
 
     // Address-space reclamation invariants: partial unmap is refused without
     // touching the mapped page, teardown retires the root token once, and a
@@ -1455,10 +1409,7 @@ pub extern "C" fn kernel_main() -> ! {
     if !mmu::run_self_test() {
         exceptions::silver_handle_exception(9, 0, 0, 0);
     }
-    #[cfg(feature = "fog-paint")]
-    fog::stage_mark(5);
-    ram_log::log("MMU RECLAIM OK");
-    ram_log::fb_progress();
+        ram_log::log("MMU RECLAIM OK");
 
     // Enlarged DMA window: a first-fit run must cross a 2 MiB group boundary
     // and an oversized request must be refused. The display path depends on
@@ -1466,11 +1417,8 @@ pub extern "C" fn kernel_main() -> ! {
     if !mmu::run_dma_window_self_test() {
         exceptions::silver_handle_exception(9, 0, 0, 0);
     }
-    #[cfg(feature = "fog-paint")]
-    fog::stage_mark(6);
-    console::write_str("DMA WINDOW OK\r\n");
+        console::write_str("DMA WINDOW OK\r\n");
     ram_log::log("DMA WINDOW OK");
-    ram_log::fb_progress();
 
     // The newer MMU/ASID/DMA boot proofs are QEMU-proven but have not yet
     // completed on the phone: the TLB proof wedges a `rain` unit before
@@ -1485,21 +1433,15 @@ pub extern "C" fn kernel_main() -> ! {
         if !mmu::run_tlb_self_test() {
             exceptions::silver_handle_exception(9, 0, 0, 0);
         }
-        #[cfg(feature = "fog-paint")]
-        fog::stage_mark(7);
-        ram_log::log("MMU TLB OK");
-        ram_log::fb_progress();
+                ram_log::log("MMU TLB OK");
 
         // ASID isolation: two spaces map the same VA to different frames; two
         // switches without any flush must still return each space's own value.
         if !mmu::run_asid_self_test() {
             exceptions::silver_handle_exception(9, 0, 0, 0);
         }
-        #[cfg(feature = "fog-paint")]
-        fog::stage_mark(8);
-        console::write_str("MMU ASID OK\r\n");
+                console::write_str("MMU ASID OK\r\n");
         ram_log::log("MMU ASID OK");
-        ram_log::fb_progress();
 
         // Heap-L3 persistence: emptying the heap through the generic unmap must
         // not free the table, and the next heap map must land in the same slot
@@ -1507,22 +1449,16 @@ pub extern "C" fn kernel_main() -> ! {
         if !mmu::run_heap_table_self_test() {
             exceptions::silver_handle_exception(9, 0, 0, 0);
         }
-        #[cfg(feature = "fog-paint")]
-        fog::stage_mark(9);
-        console::write_str("MMU HEAP OK\r\n");
+                console::write_str("MMU HEAP OK\r\n");
         ram_log::log("MMU HEAP OK");
-        ram_log::fb_progress();
 
         // Recycled DMA frames must be zero before EL0 can read them.
         if !mmu::run_dma_zero_self_test() {
             exceptions::silver_handle_exception(9, 0, 0, 0);
         }
-        #[cfg(feature = "fog-paint")]
-        fog::stage_mark(10);
-        console::write_str("DMA ZERO OK\r\n");
+                console::write_str("DMA ZERO OK\r\n");
         ram_log::log("DMA ZERO OK");
-        ram_log::fb_progress();
-    }
+        }
 
     // RX ring arithmetic under head/tail wraparound (the cross-CPU exclusion
     // is the lock around push/pop; this proves the indices themselves).
@@ -1533,7 +1469,6 @@ pub extern "C" fn kernel_main() -> ! {
         }
         console::write_str("UART RING OK\r\n");
         ram_log::log("UART RING OK");
-        ram_log::fb_progress();
 
         // SYS_STOP_CONSOLE requires CAP_CONSOLE_GRANT: the owner has it, a
         // plain driver does not.
@@ -1542,8 +1477,7 @@ pub extern "C" fn kernel_main() -> ! {
         }
         console::write_str("CONSOLE CAP OK\r\n");
         ram_log::log("CONSOLE CAP OK");
-        ram_log::fb_progress();
-    }
+        }
 
     if DEEP_BOOT_SELFTESTS {
         // DMA quarantine window: a released run must survive the grace passes
@@ -1551,22 +1485,16 @@ pub extern "C" fn kernel_main() -> ! {
         if !scheduler::run_dma_quarantine_self_test() {
             exceptions::silver_handle_exception(9, 0, 0, 0);
         }
-        #[cfg(feature = "fog-paint")]
-        fog::stage_mark(11);
-        ram_log::log("DMA QUARANTINE OK");
-        ram_log::fb_progress();
+                ram_log::log("DMA QUARANTINE OK");
 
         // In-flight DMA lease gate: an armed device range must block reuse until
         // the driver drops the lease.
         if !scheduler::run_dma_lease_self_test() {
             exceptions::silver_handle_exception(9, 0, 0, 0);
         }
-        #[cfg(feature = "fog-paint")]
-        fog::stage_mark(12);
-        console::write_str("DMA LEASE OK\r\n");
+                console::write_str("DMA LEASE OK\r\n");
         ram_log::log("DMA LEASE OK");
-        ram_log::fb_progress();
-    }
+        }
 
     drop(value);
     #[cfg(feature = "fog")]
@@ -1575,27 +1503,19 @@ pub extern "C" fn kernel_main() -> ! {
         console::write_hex_u64(heap_base as u64);
         console::write_str("\r\n");
     }
-    #[cfg(feature = "fog-paint")]
-    fog::paint(0xFFFF_00FF); // magenta: frame allocator + heap are alive
 
     // The tablet/fog path shares the QEMU boot sequence from here on: gic::init
     // dispatches to gicv3, and the timer PPI is selected per platform (INTID
     // 30 on SM8650, 18 on SM6225/khaje).
     gic::init();
-    #[cfg(feature = "fog-diag")]
-    crate::gic_diag::capture(0); // before the timer is armed
     timer::init();
     #[cfg(feature = "fog-auto-reset")]
     fog::arm_auto_reset(30);
-    #[cfg(feature = "fog-diag")]
-    crate::gic_diag::capture(1); // after the timer is armed
     // BISECT: isolated timer test — unmask IRQs in kernel context, wait for
     // ticks only when a redistributor was confirmed. Without one, spinning
     // for an interrupt that cannot be delivered would just hide the failure.
     #[cfg(any(not(feature = "fog"), feature = "fog-timer-test"))]
     {
-        #[cfg(feature = "fog-paint")]
-        fog::paint(0xFFFF_FF80); // pale yellow: entering the timer test
         if timer::available() {
             let saved = interrupts::save_and_disable_irq();
             interrupts::enable_irq();
@@ -1621,10 +1541,7 @@ pub extern "C" fn kernel_main() -> ! {
         // tick, and the scheduler state is not ready yet.
         console::write_str("TIMER TEST: SKIP (fog hardware default)\r\n");
     }
-    #[cfg(feature = "fog-paint")]
-    fog::paint(0xFF00_FF80); // spring green: timer test finished/skipped
     ram_log::log("GICv3+TIMER OK");
-    ram_log::fb_progress();
     vfs::init();
     seed::seed();
     // The kernel SFS snapshot is mounted read-write: the kernel owns the
@@ -1640,7 +1557,6 @@ pub extern "C" fn kernel_main() -> ! {
     #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     vfs::run_self_test();
     ram_log::log("VFS+SEED OK");
-    ram_log::fb_progress();
     if silver_microkernel::bundle_sig::signatures_enabled() {
         console::write_str("BUNDLE SIGNATURES: ENFORCED\r\n");
     } else {
@@ -1652,8 +1568,6 @@ pub extern "C" fn kernel_main() -> ! {
         console::write_str("SILVER PLATFORM READY\r\n");
         scheduler::init_fog();
         console::write_str("SILVER SCHEDULER START\r\n");
-        #[cfg(feature = "fog-paint")]
-        fog::paint(0xFFFF_FFFF); // white: scheduler is about to start
         scheduler::start();
     }
     #[cfg(not(feature = "fog"))]
@@ -1670,7 +1584,6 @@ pub extern "C" fn kernel_main() -> ! {
             console::write_str("SCHEDULER START\r\n");
         }
         ram_log::log("SCHEDULER START - BOOT COMPLETE");
-        ram_log::fb_fill(0, 120, 0); // full green = fully booted
         scheduler::start();
     }
 }

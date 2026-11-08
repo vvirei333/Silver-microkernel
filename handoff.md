@@ -5,49 +5,35 @@ debt and recommended next steps. Update after every significant kernel change.
 
 ## CURRENT STATUS (2026-11-08)
 
-The product target changed: WerewolfOS is now a **headless console OS**
-(kernel + kernel SFS + nameserver + network + Howl + Howler), not a full
-graphical OS. The graphics profiles stay in the tree as experiments. The
-reference checklist is [`docs/REFERENCE.md`](docs/REFERENCE.md).
+The product is a **console OS** (kernel + kernel SFS + nameserver + network +
+Howl + Howler). The graphics subsystem was **removed** after reconsidering the
+project's development vector: compositor, framebuffer backends, kernel surface
+objects, input driver and home screen are gone, along with the
+`fog-paint`/`fog-ui`/`fog-diag`/`fog-display` features. A single window is a
+future, separate deliverable for a basic browser. The reference checklist is
+[`docs/REFERENCE.md`](docs/REFERENCE.md).
 
-- **Host tests:** 218/218 (`cargo test --lib`).
-- **Builds:** `no_std`, `no_std,console` (product), `no_std,smp-selftest`,
-  `no_std,tablet`, `no_std,fog`, `no_std,fog,fog-reloc`,
-  `no_std,fog,fog-ui`, `no_std,fog,fog-reloc,fog-display,fog-auto-reset`.
-- **Console OS (QEMU serial):** boots to `howl ready` with no graphics tasks
-  and no network by default; `help`, `uname`, `ls /`, `health` all answer.
-  `health` reports no DMA leaks. `console-net` adds the network stack as an
-  opt-in profile. The console image is ~837 KiB versus ~1.09 MiB for the
-  full graphics build.
+- **Host tests:** 217/217 (`cargo test --lib`).
+- **Builds:** `no_std` (product), `no_std,fog`, `no_std,fog,fog-reloc`,
+  `no_std,fog,fog-auto-reset`, `no_std,fog,fog-hw-selftests`,
+  `no_std,tablet`, `no_std,smp-selftest`, `no_std,demo-tasks`.
+- **Console OS (QEMU serial):** boots to `howl ready` with no graphics tasks;
+  `help`, `uname`, `ls /`, `health` all answer. `health` reports no DMA leaks.
 - **SMP:** `-smp 4` selftest 15 PASS / 0 FAIL.
 - **Fog QEMU:** relocation, at-link, fail-closed park and timer cases PASS.
-- **Init fix:** Silverd now resolves the child **task id** before every
-  capability grant (Scout, Howl, Howler); the old code passed spawn cap ids.
-- **Power:** `poweroff`/`reboot` shell commands. The kernel selects the PSCI
-  conduit per platform (SMC on Qualcomm, HVC on QEMU with
-  `virtualization=on`); the console shell gets `CAP_POWER` from kernel policy,
-  never through a spawn handle. QEMU's emulated PSCI does not exit the VM in
-  our test, so that remains a documented caveat.
-- **Phone status:** the platform display path maps and clears `cont_splash`;
-  HOME's draw on `rain` is still pending. Hardware forced three fixes: the
-  virtio-blk PCI probe is QEMU-only, GENI UART TX fails fast instead of
-  stalling per byte, and the newer MMU boot proofs are skipped on fog by
-  default (`fog-hw-selftests` opts in). Console over UART on the phone is not
-  verified (UART clock/pins unknown).
-- **Latest commits:** `3b9e1b5` console profile, `9f17bf5` fog hardware
-  fixes + panel-sized UI.
-- Keyboard/console history: see the sections below.
-
-Immediate next steps, in order:
-
-1. Root-cause or explicitly document QEMU PSCI shutdown (HVC returns without
-   terminating the VM).
-2. Compile the graphics programs out of the `console` image (`user_program`).
-3. Add a `console-net` split so a machine without a NIC boots deterministically
-   without the network stack.
-4. Debug the fog TTBR0 TLB proof with `fog-hw-selftests`.
-5. Make the GENI UART console usable on `rain` (clock/pins), then run the
-   product console OS on the phone.
+- **Init fix:** Silverd resolves the child **task id** before every grant
+  (Scout, Howl, Howler); the old code passed spawn cap ids.
+- **Power:** `poweroff`/`reboot`; kernel policy gives the shell `CAP_POWER`
+  (spawn handles cannot delegate it). SMC on Qualcomm, HVC on QEMU with
+  `virtualization=on`; QEMU's emulated PSCI still does not exit the VM.
+- **Phone status:** console over UART on `rain` is not verified (UART
+  clock/pins unknown). Earlier hardware forced three fixes: the virtio-blk PCI
+  probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
+  the newer MMU boot proofs are skipped on fog by default
+  (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
+- **Next steps:** root-cause QEMU PSCI shutdown; busybox-style Unix toolbox;
+  DHCP/DNS/TCP + `wget`; debug the fog TTBR0 TLB proof; make the GENI UART
+  usable on `rain`; then storage/power and, later, the browser window.
 
 ## 2026-11-06 — SFS moves toward the kernel
 
@@ -2258,28 +2244,18 @@ Required build profiles (all must stay green):
 cargo build --release --target aarch64-unknown-none --no-default-features --features no_std
 cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,smp-selftest
 cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,tablet
+cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog
 cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog,fog-reloc
-cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog,fog-ui
-cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog,fog-reloc,fog-display
+cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog,fog-auto-reset
+cargo build --release --target aarch64-unknown-none --no-default-features --features no_std,fog,fog-hw-selftests
 ```
 
-QEMU smoke: boot to `howl ready`, require `MMU TLB OK`, `MMU ASID OK`,
-`MMU HEAP OK`, `DMA ZERO OK`, `DMA WINDOW OK`, `SURFACE READY` and a 640x1136
-`P2/P6` screenshot with non-black samples. Click an app through QMP
-`input-send-event`, confirm the app frame, click its back button and confirm the
-home frame returns. Run `run /sfs/apps/scopeprobe.elf` (status 0), `health`
-(DMA leaked 0) and `du /sfs/apps`; finish with `scripts/sfs_fsck.py`.
-
-Platform display (QEMU, requires a synthetic 1 GiB khaje DTB with a
-`cont_splash` node; the stock fog test DTB is 128 MiB and must not enable this):
-
-```bash
-# build no_std,fog,fog-reloc,fog-display, objcopy to a raw Image and patch
-# text_offset=0x80000, then boot with -m 1G -dtb <tree with cont_splash>
-# require: SILVER DISPLAY OK base=0x5C000000 mode=720x1650
-#          non-zero pixels at 0x5C000000 (monitor: xp /16xw 0x5C000000)
-#          howl ready
-```
+QEMU smoke (console product): boot with `-display none -serial stdio`, require
+`howl ready`, then send `help`, `uname`, `ls /`, `health` over the serial line;
+`health` must report `dma leaked 0`. Run `run /sfs/apps/scopeprobe.elf`
+(status 0) and finish with `scripts/sfs_fsck.py`. There is no framebuffer,
+surface, compositor or input device to test: those were removed on 2026-11-08.
+The SMP run (`-smp 4`) expects 15 PASS / 0 FAIL.
 
 Bundle signing check (needs a throwaway key):
 

@@ -1,5 +1,11 @@
 # WerewolfOS / Silver Kernel — Redmi 10C bring-up
 
+> **2026-11-08:** the graphics subsystem (compositor, framebuffer, surfaces,
+> input driver, home screen) was removed after reconsidering the project's
+> development vector. The `fog-ui`/`fog-display` panel evidence below is
+> historical; the port target is now the console OS over UART. See
+> [`../docs/PORTING_FOG.md`](../docs/PORTING_FOG.md).
+
 Minimal RAM-only path for booting Silver on a Xiaomi Redmi 10C and reaching the
 Howl shell prompt:
 
@@ -12,8 +18,6 @@ Wi-Fi, GPU, display, audio, the full driver set and the rest of the normal
 desktop boot are out of scope for the first hardware milestone.
 
 ## Verified on hardware
-
-![Silver fog-ui status panel on the Redmi 10C](fog-ui.png)
 
 The panel above is painted by the kernel itself on the physical Redmi 10C
 (`rain`, SM6225 / khaje) during a RAM-only `fastboot boot`: GICv3 and the
@@ -33,13 +37,11 @@ exact `fog-ui` layout; the on-device photograph is kept with the task notes.
 
 ## Status
 
-- **New: `fog-display` groundwork (experimental).** The kernel can find the
-  bootloader's `cont_splash` carve-out in the live FDT, register it as the
-  platform framebuffer (`SYS_DISPLAY_INFO`/`SYS_DISPLAY_MAP`), and start the
-  real compositor + SilverHome on it. QEMU-verified with a 1 GiB synthetic
-  khaje tree (720x1650 panel pixels at `0x5C000000`); real-device execution is
-  still pending. Default `fog` remains unchanged and does not spawn
-  userspace graphics. See [`../docs/PORTING_FOG.md`](../docs/PORTING_FOG.md).
+- **Graphics removed (2026-11-08).** The `fog-display` platform framebuffer,
+  `fog-ui` panel and `fog-paint` ladder were deleted with the rest of the
+  graphics subsystem after the development-vector review. The port target is
+  now the console OS over UART. See
+  [`../docs/PORTING_FOG.md`](../docs/PORTING_FOG.md).
 - The `fog` build compiles and links against `linker_fog.ld`.
 - The boot stub captures the hand-over state and records the address ABL
   actually used. A standard `fog` build does **not** relocate: if the entry
@@ -367,32 +369,11 @@ reported and the timer is left disabled instead of using frame 0.
 
 It is a simulation and does not prove anything about the phone's hardware.
 
-### Visual debug ladder (`fog-paint`)
+### Visual debug ladder — removed
 
-A UART-less unit has no console. For a controlled diagnostic boot only, build
-with the opt-in `fog-paint` feature:
-
-```sh
-cargo build --release --target aarch64-unknown-none \
-    --no-default-features --features no_std,fog,fog-reloc,fog-paint
-```
-
-It fills the Rain/Fog `cont_splash` framebuffer at `0x5C00_0000` with a colour
-at each milestone:
-
-| Colour | Milestone |
-| --- | --- |
-| green | payload executed at least to the boot claim |
-| blue | placement policy passed (at-link or checked copy) |
-| cyan | MMU is on |
-| yellow | console/probe path is alive |
-| magenta | frame allocator + kernel heap are alive |
-| orange | GIC/timer path completed |
-| white | scheduler is about to start |
-
-This is a diagnostic aid, not a normal build: it assumes the `rain`
-reserved-memory base and is outside the QEMU test's 128 MB RAM. The normal fog
-image does not touch the framebuffer.
+The `fog-paint` colour ladder was deleted with the graphics subsystem. The
+boot/timer evidence it produced is historical; the console port relies on the
+UART, and the GENI UART clock/pins are still unverified.
 
 ## Hardware bring-up plan
 

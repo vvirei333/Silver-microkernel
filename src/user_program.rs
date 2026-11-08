@@ -10,13 +10,8 @@ pub const CAT: u64 = 6;
 pub const ECHO: u64 = 7;
 pub const SAY: u64 = 8;
 pub const SL: u64 = 9;
-pub const BLOCK_DRIVER: u64 = 10;
-pub const SFS_SERVER: u64 = 11; // <--- ДОБАВЛЕНО
 pub const NET_DRIVER: u64 = 12;
 pub const NET_SERVER: u64 = 13;
-pub const GPU_DRIVER: u64 = 14;
-pub const INPUT_DRIVER: u64 = 15;
-pub const HOME: u64 = 16;
 pub const BIGDIR: u64 = 17;
 pub const BIGFILE: u64 = 18;
 
@@ -24,7 +19,7 @@ pub const BIGFILE: u64 = 18;
 /// `run <path>` path). Distinct from `u64::MAX`, which marks kernel tasks.
 pub const PROGRAM_DYNAMIC: u64 = u64::MAX - 1;
 
-#[cfg(any(not(feature = "console"), feature = "demo-tasks"))]
+#[cfg(feature = "demo-tasks")]
 static DEMO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silver_userspace.elf"));
 static SILVERD_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/silverd.elf"));
 static SCOUT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scout.elf"));
@@ -35,27 +30,15 @@ static CAT_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cat.elf"));
 static ECHO_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/echo.elf"));
 static SAY_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/say.elf"));
 static SL_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sl.elf"));
-#[cfg(not(feature = "console"))]
-static BLOCK_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/block_driver.elf"));
-#[cfg(not(feature = "console"))]
-static SFS_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/sfs_server.elf")); // <--- ДОБАВЛЕНО
-#[cfg(any(not(feature = "console"), feature = "console-net"))]
 static NET_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_driver.elf"));
-#[cfg(any(not(feature = "console"), feature = "console-net"))]
 static NET_SERVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/net_server.elf"));
-#[cfg(not(feature = "console"))]
-static GPU_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/gpu_driver.elf"));
-#[cfg(not(feature = "console"))]
-static INPUT_DRIVER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/input_driver.elf"));
-#[cfg(not(feature = "console"))]
-static HOME_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/home.elf"));
 static BIGDIR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigdir.elf"));
 static BIGFILE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigfile.elf"));
 
 /// Selects an executable for spawn. Unknown program IDs are rejected.
 pub fn image(program: u64) -> Option<&'static [u8]> {
     match program {
-        #[cfg(any(not(feature = "console"), feature = "demo-tasks"))]
+        #[cfg(feature = "demo-tasks")]
         DEMO => Some(DEMO_ELF),
         SILVERD => Some(SILVERD_ELF),
         SCOUT => Some(SCOUT_ELF),
@@ -66,20 +49,8 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         ECHO => Some(ECHO_ELF),
         SAY => Some(SAY_ELF),
         SL => Some(SL_ELF),
-        #[cfg(not(feature = "console"))]
-        BLOCK_DRIVER => Some(BLOCK_DRIVER_ELF),
-        #[cfg(not(feature = "console"))]
-        SFS_SERVER => Some(SFS_SERVER_ELF), // <--- ДОБАВЛЕНО
-        #[cfg(any(not(feature = "console"), feature = "console-net"))]
         NET_DRIVER => Some(NET_DRIVER_ELF),
-        #[cfg(any(not(feature = "console"), feature = "console-net"))]
         NET_SERVER => Some(NET_SERVER_ELF),
-        #[cfg(not(feature = "console"))]
-        GPU_DRIVER => Some(GPU_DRIVER_ELF),
-        #[cfg(not(feature = "console"))]
-        INPUT_DRIVER => Some(INPUT_DRIVER_ELF),
-        #[cfg(not(feature = "console"))]
-        HOME => Some(HOME_ELF),
         BIGDIR => Some(BIGDIR_ELF),
         BIGFILE => Some(BIGFILE_ELF),
         _ => None,

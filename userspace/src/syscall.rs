@@ -42,13 +42,6 @@ const SYS_FS_RMDIR: u64 = 37;
 const SYS_FS_RENAME: u64 = 38;
 const SYS_FS_REPLACE: u64 = 87;
 const SYS_FS_USAGE: u64 = 88;
-const SYS_SURFACE_CREATE: u64 = 89;
-const SYS_SURFACE_GRANT: u64 = 90;
-const SYS_SURFACE_MAP: u64 = 91;
-const SYS_SURFACE_REVOKE: u64 = 92;
-const SYS_SURFACE_SCANOUT: u64 = 93;
-const SYS_DISPLAY_INFO: u64 = 94;
-const SYS_DISPLAY_MAP: u64 = 95;
 const SYS_CONSOLE_SET: u64 = 39;
 const SYS_TASK_RESUME: u64 = 40;
 const SYS_WAIT_EVENT: u64 = 41;
@@ -94,13 +87,8 @@ pub const PROGRAM_CAT: u64 = 6;
 pub const PROGRAM_ECHO: u64 = 7;
 pub const PROGRAM_SAY: u64 = 8;
 pub const PROGRAM_SL: u64 = 9;
-pub const PROGRAM_BLOCK_DRIVER: u64 = 10;
-pub const PROGRAM_SFS_SERVER: u64 = 11;
 pub const PROGRAM_NET_DRIVER: u64 = 12;
 pub const PROGRAM_NET_SERVER: u64 = 13;
-pub const PROGRAM_GPU_DRIVER: u64 = 14;
-pub const PROGRAM_INPUT_DRIVER: u64 = 15;
-pub const PROGRAM_HOME: u64 = 16;
 pub const PROGRAM_BIGDIR: u64 = 17;
 pub const PROGRAM_BIGFILE: u64 = 18;
 /// Sentinel program ID for tasks spawned from a dynamically loaded ELF.
@@ -390,110 +378,6 @@ pub fn alloc_dma(size: u64) -> Option<(u64, u64)> {
     } else {
         Some((virtual_address, physical_address))
     }
-}
-
-/// A surface mapped into this task. `virtual_address` is read-only for a
-/// grantee; `physical_address` is zero unless the task has the scanout right.
-#[derive(Copy, Clone)]
-pub struct SurfaceMap {
-    pub virtual_address: u64,
-    pub physical_address: u64,
-    pub owner: u64,
-    pub width: u32,
-    pub height: u32,
-}
-
-/// Creates a writable display surface owned by the caller.
-pub fn surface_create(width: u32, height: u32) -> Option<(u64, u64)> {
-    let (virtual_address, id) =
-        unsafe { syscall2_pair(SYS_SURFACE_CREATE, u64::from(width), u64::from(height)) };
-    if virtual_address == SYSCALL_ERROR {
-        None
-    } else {
-        Some((id, virtual_address))
-    }
-}
-
-/// Grants `target` rights (`1` read, `2` scanout) on a surface we own.
-pub fn surface_grant(id: u64, target: u64, rights: u64) -> bool {
-    unsafe { syscall3(SYS_SURFACE_GRANT, id, target, rights) == 0 }
-}
-
-/// Maps a surface owned by, or granted to, the caller.
-pub fn surface_map(id: u64) -> Option<SurfaceMap> {
-    let (virtual_address, physical_address, owner, dimensions) =
-        unsafe { syscall1_quad(SYS_SURFACE_MAP, id) };
-    if virtual_address == SYSCALL_ERROR {
-        return None;
-    }
-    Some(SurfaceMap {
-        virtual_address,
-        physical_address,
-        owner,
-        width: (dimensions >> 32) as u32,
-        height: dimensions as u32,
-    })
-}
-
-pub fn surface_revoke(id: u64, target: u64) -> bool {
-    unsafe { syscall2(SYS_SURFACE_REVOKE, id, target) == 0 }
-}
-
-/// Declares or releases a surface as the display scanout buffer.
-pub fn surface_scanout(id: u64, enable: bool) -> bool {
-    unsafe { syscall2(SYS_SURFACE_SCANOUT, id, u64::from(enable)) == 0 }
-}
-
-/// A platform framebuffer supplied by the bootloader (phone panel). On QEMU
-/// `available` is 0 and the compositor uses `ramfb` instead.
-#[derive(Copy, Clone)]
-#[repr(C)]
-pub struct DisplayInfo {
-    pub version: u64,
-    pub size: u64,
-    pub available: u64,
-    pub base: u64,
-    pub width: u64,
-    pub height: u64,
-    pub stride: u64,
-    pub bytes_per_pixel: u64,
-}
-
-impl DisplayInfo {
-    pub fn present(&self) -> bool {
-        self.available != 0 && self.width != 0 && self.height != 0 && self.stride != 0
-    }
-}
-
-pub fn display_info() -> Option<DisplayInfo> {
-    let mut info = DisplayInfo {
-        version: 0,
-        size: 0,
-        available: 0,
-        base: 0,
-        width: 0,
-        height: 0,
-        stride: 0,
-        bytes_per_pixel: 0,
-    };
-    let result = unsafe {
-        syscall1(
-            SYS_DISPLAY_INFO,
-            &mut info as *mut DisplayInfo as u64,
-        )
-    };
-    if result == 0 {
-        Some(info)
-    } else {
-        None
-    }
-}
-
-/// Maps the platform framebuffer into this task and returns its NC virtual
-/// address. Requires `CAP_SURFACE`; only the registered display carve-out is
-/// accepted by the kernel.
-pub fn display_map() -> Option<u64> {
-    optional_id(unsafe { syscall0(SYS_DISPLAY_MAP) })
 }
 
 pub fn pci_read32(offset: u64) -> Option<u32> {

@@ -1,4 +1,9 @@
 # Final audit — zero-copy surfaces, bundle signing, DMA window
+> **Исторический документ.** Графическая подсистема (композитор,
+> surface objects, framebuffer, input/home) удалена 2026-11-08 после
+> пересмотра вектора развития проекта. Описанные ниже графические части в
+> дереве отсутствуют; документ сохранён как запись аудита.
+
 
 Date: 2026-11-07. Scope: the four remaining roadmap holes (fog DMA window,
 kernel surface objects/zero-copy, bundle signatures, full audit).

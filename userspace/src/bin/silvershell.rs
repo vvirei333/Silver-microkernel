@@ -202,10 +202,6 @@ fn execute(command: &str) {
             syscall::print("howl commands:\r\n");
             syscall::print("  help       Show this command list\r\n");
             syscall::print("  fastfetch  Show OS, uptime and memory information\r\n");
-            syscall::print("  diskread [sector]\r\n");
-            syscall::print("             Read a sector (0 by default), show first 16 bytes\r\n");
-            syscall::print("  hexdump [sector]\r\n");
-            syscall::print("             Dump 512 bytes of a sector (0 by default)\r\n");
             syscall::print("  sfsinfo    Show the mounted SFS superblock\r\n");
             syscall::print("  memtest    mmap 1 MiB, write/read it back\r\n");
             syscall::print("  ping <ip>  Send one ICMP echo request\r\n");
@@ -244,32 +240,6 @@ fn execute(command: &str) {
             syscall::print("  reboot     Reset the machine through PSCI\r\n");
         }
         Some("fastfetch") => fastfetch(),
-        Some("diskread") => {
-            let sector = match words.next() {
-                Some(value) => match parse_number(value) {
-                    Some(sector) => sector,
-                    None => {
-                        syscall::print("diskread: sector must be a non-negative integer\r\n");
-                        return;
-                    }
-                },
-                None => 0,
-            };
-            disk_read(sector);
-        }
-        Some("hexdump") => {
-            let sector = match words.next() {
-                Some(value) => match parse_number(value) {
-                    Some(sector) => sector,
-                    None => {
-                        syscall::print("hexdump: sector must be a non-negative integer\r\n");
-                        return;
-                    }
-                },
-                None => 0,
-            };
-            hexdump(sector);
-        }
         Some("sfsinfo") => sfs_info(),
         Some("memtest") => memtest(),
         Some("ping") => ping_command(words.next()),
@@ -330,194 +300,6 @@ fn find_task_id_preferring(program: u64, preferred: u64) -> Option<u64> {
         .find(|task| task.id == preferred && live(task))
         .or_else(|| tasks.iter().rev().find(|task| live(task)))
         .map(|task| task.id)
-}
-
-/// Locates the block driver for one request, printing `message` when it is not
-/// running. Every call re-resolves the ID, so a driver that crashed and was
-/// respawned under a new ID is used again without restarting the shell.
-fn block_driver(message: &str) -> Option<u64> {
-    let driver = find_task_id(syscall::PROGRAM_BLOCK_DRIVER);
-    if driver.is_none() {
-        syscall::print(message);
-    }
-    driver
-}
-
-fn disk_read(sector: u64) {
-    static mut SHARED_MAPPING: Option<(u64, u64)> = None;
-
-    let Some(driver) = block_driver("DISK DRIVER NOT RUNNING\r\n") else {
-        return;
-    };
-
-    let mut request_payload = [0_u8; 9];
-    request_payload[0] = 1; // OP_READ_SECTOR
-    request_payload[1..9].copy_from_slice(&sector.to_le_bytes());
-    let request = ipc::Message::new(0, &request_payload);
-    if !syscall::send(driver, &request) {
-        syscall::print("DISK READ FAILED\r\n");
-        return;
-    }
-
-    let mut response = ipc::Message::new(0, &[]);
-    if !receive_from(driver, &mut response) {
-        syscall::print("DISK READ FAILED\r\n");
-        return;
-    }
-    match response.payload[0] {
-        0 => {
-            syscall::print("DISK READ FAILED\r\n");
-            return;
-        }
-        2 => {
-            syscall::print("DISK DRIVER NOT INITIALIZED (NO DISK?)\r\n");
-            return;
-        }
-        1 => {}
-        _ => {
-            syscall::print("DISK READ FAILED\r\n");
-            return;
-        }
-    }
-
-    let mut physical_bytes = [0_u8; 8];
-    let mut length_bytes = [0_u8; 2];
-    physical_bytes.copy_from_slice(&response.payload[1..9]);
-    length_bytes.copy_from_slice(&response.payload[9..11]);
-    let physical_address = u64::from_le_bytes(physical_bytes);
-    let length = usize::from(u16::from_le_bytes(length_bytes));
-    if length != 512 {
-        syscall::print("DISK READ FAILED\r\n");
-        acknowledge_disk_buffer(driver);
-        return;
-    }
-
-    let mapped = unsafe {
-        match SHARED_MAPPING {
-            Some((cached_physical, virtual_address)) if cached_physical == physical_address => {
-                Some(virtual_address)
-            }
-            _ => {
-                let mapped = syscall::map_phys(physical_address, length as u64);
-                if let Some(virtual_address) = mapped {
-                    SHARED_MAPPING = Some((physical_address, virtual_address));
-                }
-                mapped
-            }
-        }
-    };
-    let Some(virtual_address) = mapped else {
-        syscall::print("DISK SHARED MEMORY MAP FAILED\r\n");
-        acknowledge_disk_buffer(driver);
-        return;
-    };
-
-    let mut data = [0_u8; 512];
-    for (index, byte) in data.iter_mut().enumerate() {
-        *byte = unsafe { core::ptr::read_volatile((virtual_address as *const u8).add(index)) };
-    }
-    acknowledge_disk_buffer(driver);
-
-    let mut first = [0_u8; 8];
-    let mut second = [0_u8; 8];
-    first.copy_from_slice(&data[..8]);
-    second.copy_from_slice(&data[8..16]);
-    syscall::print("DISK SECTOR ");
-    syscall::print_dec_u64(sector);
-    syscall::print(": 0x");
-    syscall::print_hex_u64(u64::from_be_bytes(first));
-    syscall::print_hex_u64(u64::from_be_bytes(second));
-    syscall::print("\r\n");
-}
-
-fn hexdump(sector: u64) {
-    static mut SHARED_MAPPING: Option<(u64, u64)> = None;
-
-    let Some(driver) = block_driver("HEXDUMP FAILED: DISK DRIVER NOT RUNNING\r\n") else {
-        return;
-    };
-
-    let mut request_payload = [0_u8; 9];
-    request_payload[0] = 1; // OP_READ_SECTOR
-    request_payload[1..9].copy_from_slice(&sector.to_le_bytes());
-    let request = ipc::Message::new(0, &request_payload);
-    if !syscall::send(driver, &request) {
-        syscall::print("HEXDUMP FAILED\r\n");
-        return;
-    }
-
-    let mut response = ipc::Message::new(0, &[]);
-    if !receive_from(driver, &mut response) || response.payload[0] != 1 {
-        syscall::print("HEXDUMP FAILED\r\n");
-        return;
-    }
-
-    let mut physical_bytes = [0_u8; 8];
-    let mut length_bytes = [0_u8; 2];
-    physical_bytes.copy_from_slice(&response.payload[1..9]);
-    length_bytes.copy_from_slice(&response.payload[9..11]);
-    let physical_address = u64::from_le_bytes(physical_bytes);
-    let length = usize::from(u16::from_le_bytes(length_bytes));
-
-    if length != 512 {
-        syscall::print("HEXDUMP FAILED: BAD LENGTH\r\n");
-        acknowledge_disk_buffer(driver);
-        return;
-    }
-
-    let mapped = unsafe {
-        match SHARED_MAPPING {
-            Some((cached_physical, virtual_address)) if cached_physical == physical_address => {
-                Some(virtual_address)
-            }
-            _ => {
-                let mapped = syscall::map_phys(physical_address, length as u64);
-                if let Some(virtual_address) = mapped {
-                    SHARED_MAPPING = Some((physical_address, virtual_address));
-                }
-                mapped
-            }
-        }
-    };
-
-    let Some(virtual_address) = mapped else {
-        syscall::print("HEXDUMP FAILED: MAP FAILED\r\n");
-        acknowledge_disk_buffer(driver);
-        return;
-    };
-
-    let mut data = [0_u8; 512];
-    for (index, byte) in data.iter_mut().enumerate() {
-        *byte = unsafe { core::ptr::read_volatile((virtual_address as *const u8).add(index)) };
-    }
-    acknowledge_disk_buffer(driver);
-
-    syscall::print("HEXDUMP SECTOR ");
-    syscall::print_dec_u64(sector);
-    syscall::print("\r\n");
-
-    for line in 0..32 {
-        let offset = line * 16;
-        print_offset(offset);
-        syscall::print("  ");
-        for i in 0..16 {
-            print_hex_byte(data[offset + i]);
-            syscall::print(" ");
-            if i == 7 {
-                syscall::print(" ");
-            }
-        }
-        syscall::print(" |");
-        for i in 0..16 {
-            let b = data[offset + i];
-            let c = if (32..=126).contains(&b) { b } else { b'.' };
-            let buf = [c];
-            if let Ok(s) = core::str::from_utf8(&buf) {
-                syscall::print(s);
-            }
-        }
-        syscall::print("|\r\n");
-    }
 }
 
 fn print_offset(offset: usize) {
@@ -1118,8 +900,6 @@ fn program_name(program: u64) -> &'static str {
         syscall::PROGRAM_ECHO => "echo        ",
         syscall::PROGRAM_SAY => "say         ",
         syscall::PROGRAM_SL => "sl          ",
-        syscall::PROGRAM_BLOCK_DRIVER => "block_driver",
-        syscall::PROGRAM_SFS_SERVER => "sfs_server  ",
         syscall::PROGRAM_NET_DRIVER => "net_driver  ",
         syscall::PROGRAM_NET_SERVER => "net_server  ",
         syscall::PROGRAM_DYNAMIC => "elf         ",
@@ -1151,9 +931,7 @@ fn state_name(state: u64) -> &'static str {
 /// device access, which is a diagnosable state rather than a silent one.
 fn grant_device_rights(cap_id: u64, task_id: u64, program: u64) {
     let rights = match program {
-        syscall::PROGRAM_BLOCK_DRIVER
-        | syscall::PROGRAM_SFS_SERVER
-        | syscall::PROGRAM_NET_DRIVER
+        syscall::PROGRAM_NET_DRIVER
         | syscall::PROGRAM_NET_SERVER => syscall::CAP_MMIO,
         _ => return,
     };
@@ -1167,7 +945,7 @@ fn grant_device_rights(cap_id: u64, task_id: u64, program: u64) {
 fn spawn_program(program: Option<&str>, argument: Option<&str>) {
     let Some(program) = program else {
         syscall::print(
-            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server|net_driver|net_server> [arg]\r\n",
+            "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|net_driver|net_server> [arg]\r\n",
         );
         return;
     };
@@ -1182,8 +960,6 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
         "echo" => syscall::PROGRAM_ECHO,
         "say" => syscall::PROGRAM_SAY,
         "sl" => syscall::PROGRAM_SL,
-        "block_driver" => syscall::PROGRAM_BLOCK_DRIVER, // <--- ДОБАВЛЕНО
-        "sfs_server" => syscall::PROGRAM_SFS_SERVER,     // <--- ДОБАВЛЕНО
         "net_driver" => syscall::PROGRAM_NET_DRIVER,
         "net_server" => syscall::PROGRAM_NET_SERVER,
         _ => {

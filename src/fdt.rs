@@ -320,31 +320,6 @@ impl<'a> Fdt<'a> {
         Some(visitor.count)
     }
 
-    /// Returns the first `/reserved-memory` direct-child region whose node name
-    /// starts with `prefix` (unit address included), or `None`.
-    ///
-    /// Used to discover the bootloader's `cont_splash_region` without trusting
-    /// a hardcoded physical address. The same fail-closed rules as
-    /// [`reserved_regions`](Self::reserved_regions) apply: a malformed `reg`,
-    /// overflow or ambiguous multi-region child is refused.
-    pub fn reserved_region_named(&self, prefix: &str) -> Option<Region> {
-        let mut visitor = NamedReserved {
-            prefix,
-            address_cells: 2,
-            size_cells: 2,
-            in_reserved: false,
-            depth: 0,
-            matching: false,
-            region: None,
-            malformed: false,
-        };
-        self.walk(&mut visitor)?;
-        if visitor.malformed {
-            return None;
-        }
-        visitor.region
-    }
-
     /// Copies the DTB header memory-reservation map into `out`. This is where
     /// the bootloader normally records the DTB itself and the ramdisk.
     ///
@@ -753,93 +728,6 @@ impl<'a, 'o> Visitor<'a> for ReservedRegions<'o> {
         if path == "/reserved-memory" {
             self.in_reserved = false;
         } else if self.in_reserved && path.starts_with("/reserved-memory/") {
-            self.depth = self.depth.saturating_sub(1);
-        }
-    }
-}
-
-/// Finds one named direct child of `/reserved-memory` and returns its first
-/// `reg` range. Only the first region is used: a display carve-out with a
-/// multi-range `reg` is ambiguous and refused.
-struct NamedReserved<'a> {
-    prefix: &'a str,
-    address_cells: u32,
-    size_cells: u32,
-    in_reserved: bool,
-    depth: usize,
-    matching: bool,
-    region: Option<Region>,
-    malformed: bool,
-}
-
-impl<'a> Visitor<'a> for NamedReserved<'_> {
-    fn begin(&mut self, path: &str, name: &str) {
-        if path == "/reserved-memory" {
-            self.in_reserved = true;
-            self.depth = 0;
-            self.matching = false;
-        } else if self.in_reserved && path.starts_with("/reserved-memory/") {
-            self.depth += 1;
-            // Direct child only; a nested node with the same prefix is not a
-            // top-level carve-out. A nested begin must not clear the match of
-            // its parent, because `reg` may follow child nodes.
-            if self.depth == 1 {
-                self.matching = name.starts_with(self.prefix);
-            }
-        }
-    }
-
-    fn property(&mut self, path: &str, name: &str, value: &'a [u8]) {
-        if !self.in_reserved {
-            return;
-        }
-        if path == "/reserved-memory" {
-            match name {
-                "#address-cells" => {
-                    if let Some(cells) = read_be32(value, 0) {
-                        if cells <= MAX_CELLS {
-                            self.address_cells = cells;
-                        }
-                    }
-                }
-                "#size-cells" => {
-                    if let Some(cells) = read_be32(value, 0) {
-                        if cells <= MAX_CELLS {
-                            self.size_cells = cells;
-                        }
-                    }
-                }
-                _ => {}
-            }
-            return;
-        }
-        if self.matching && name == "reg" {
-            let mut regions = [Region::new(0, 0); 1];
-            let mut count = 0usize;
-            if !parse_regions(
-                value,
-                self.address_cells,
-                self.size_cells,
-                &mut regions,
-                &mut count,
-            ) || count != 1
-            {
-                self.malformed = true;
-                return;
-            }
-            self.region = Some(regions[0]);
-        }
-    }
-
-    fn end(&mut self, path: &str) {
-        if path == "/reserved-memory" {
-            self.in_reserved = false;
-            self.matching = false;
-            self.depth = 0;
-        } else if self.in_reserved && path.starts_with("/reserved-memory/") {
-            if self.depth == 1 {
-                self.matching = false;
-            }
             self.depth = self.depth.saturating_sub(1);
         }
     }
@@ -1758,42 +1646,6 @@ mod tests {
         let fdt = Fdt::new(&blob).unwrap();
         let mut regions = [Region::default(); 1];
         assert_eq!(fdt.reserved_regions(&mut regions), None);
-    }
-
-    #[test]
-    fn named_reserved_region_is_found_and_must_be_unique() {
-        let blob = sample_dtb().build();
-        let fdt = Fdt::new(&blob).unwrap();
-        assert_eq!(
-            fdt.reserved_region_named("splash"),
-            Some(Region::new(0x5C00_0000, 0x5CF0_0000))
-        );
-        assert_eq!(
-            fdt.reserved_region_named("cont_splash"),
-            None,
-            "prefix must match the live node name"
-        );
-
-        // A multi-range carve-out is ambiguous and refused.
-        let mut dtb = Dtb::new();
-        dtb.begin("");
-        dtb.prop_str("compatible", "test,board");
-        dtb.begin("reserved-memory");
-        dtb.prop_u32("#address-cells", 1);
-        dtb.prop_u32("#size-cells", 1);
-        dtb.begin("splash@5c000000");
-        dtb.prop(
-            "reg",
-            &[
-                0x5c, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x00, 0x5d, 0x00, 0x00, 0x00, 0x00,
-                0x10, 0x00, 0x00,
-            ],
-        );
-        dtb.end();
-        dtb.end();
-        let blob = dtb.build();
-        let fdt = Fdt::new(&blob).unwrap();
-        assert_eq!(fdt.reserved_region_named("splash"), None);
     }
 
     #[test]
