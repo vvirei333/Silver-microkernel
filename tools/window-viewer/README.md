@@ -11,9 +11,18 @@ cmake -S tools/window-viewer -B build/window-viewer
 cmake --build build/window-viewer
 ```
 
+## KDE / GNOME, Wayland / X11
+
+The viewer is a normal Qt6 Widgets program, so it is a native window under
+both desktops. Qt selects Wayland when `WAYLAND_DISPLAY` is set and X11
+otherwise; set `QT_QPA_PLATFORM=wayland` or `xcb` to force one. The guest
+draws, the host only blits and forwards input, so no compositor or GPU is
+involved.
+
 ## Run
 
-Start QEMU with a shared memory file and the ivshmem device:
+Start QEMU with a shared memory file and the ivshmem device (or just run
+`./build_and_qemu.sh --viewer`, which does this and launches the viewer):
 
 ```bash
 qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp 1 -m 256M \
@@ -34,8 +43,12 @@ howl> wolfser build a bear
 Then, on the host:
 
 ```bash
-build/window-viewer/werewolf-window --shm /dev/shm/werewolf-window
+tools/wolfser-host.sh           # builds if needed, then opens the window
+# or: build/window-viewer/werewolf-window --shm /dev/shm/werewolf-window
 ```
+
+The viewer waits up to 20 s for QEMU to create the file and publish the WIN1
+header, so it may be started before the VM.
 
 Keys: printable text goes to the search bar, `Enter` navigates, `Backspace`
 edits, `Ctrl+L` starts a new address, `r` reloads, `q` quits, and

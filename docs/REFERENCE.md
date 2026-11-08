@@ -119,7 +119,8 @@ SMP run: `qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp 4 -m 256M
 `SMP SELFTEST ... FAIL`.
 
 Console run: boot the product image, then send `help`, `uname`, `ls /`,
-`health` over the serial line. A machine without a NIC still boots; the
+`health` over the serial line. Wolfser: `./build_and_qemu.sh --viewer`, then
+`wolfser` in the guest; the Qt window works under KDE/GNOME on Wayland or X11. A machine without a NIC still boots; the
 network driver reports a probe failure and the shell continues.
 
 ## Next work

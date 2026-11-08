@@ -13,6 +13,7 @@
 #include <QImage>
 #include <QKeyEvent>
 #include <QPainter>
+#include <QThread>
 #include <QTimer>
 #include <QWheelEvent>
 #include <QWidget>
@@ -78,14 +79,40 @@ struct Shared {
     uchar *data = nullptr;
     qsizetype size = 0;
 
-    bool open(const QString &path) {
-        file.setFileName(path);
-        if (!file.open(QIODevice::ReadWrite)) {
-            return false;
-        }
-        size = file.size();
-        data = file.map(0, size);
-        return data != nullptr && size > static_cast<qsizetype>(kPixels);
+    /// Opens the shared file, waiting for QEMU to create it. Starting the
+    /// viewer before the VM is normal: the window appears once the file and
+    /// the WIN1 header exist.
+    bool open(const QString &path, int waitMilliseconds = 20000) {
+        QElapsedTimer timer;
+        timer.start();
+        do {
+            file.setFileName(path);
+            if (file.open(QIODevice::ReadWrite)) {
+                size = file.size();
+                if (size > static_cast<qsizetype>(kPixels)) {
+                    data = file.map(0, size);
+                    if (data != nullptr) {
+                        return true;
+                    }
+                }
+                file.close();
+            }
+            data = nullptr;
+            QThread::msleep(100);
+        } while (timer.elapsed() < waitMilliseconds);
+        return false;
+    }
+
+    bool waitReady(int waitMilliseconds = 20000) {
+        QElapsedTimer timer;
+        timer.start();
+        do {
+            if (u32(kFieldMagic) == kMagic) {
+                return true;
+            }
+            QThread::msleep(100);
+        } while (timer.elapsed() < waitMilliseconds);
+        return false;
     }
 
     uint32_t u32(uint64_t offset) const {
@@ -248,13 +275,20 @@ int main(int argc, char **argv) {
     QApplication app(argc, argv);
 
     Shared shared;
-    if (!shared.open(shmPath)) {
+    if (!shared.open(shmPath, headless ? timeout * 1000 : 20000)) {
         std::fprintf(stderr, "viewer: cannot map %s\n", shmPath.toUtf8().constData());
         return 2;
     }
 
     if (headless) {
         return snapshot(shared, snapshotPath, timeout);
+    }
+
+    if (!shared.waitReady(20000)) {
+        std::fprintf(stderr,
+                     "viewer: %s exists but has no Wolfser header (is ivshmem attached?)\n",
+                     shmPath.toUtf8().constData());
+        return 2;
     }
 
     Viewer viewer(shared);

@@ -564,13 +564,29 @@ through the ring; the guest repaints and bumps `frame_seq`. `tools/window-viewer
 `--snapshot OUT.png` mode that works with `QT_QPA_PLATFORM=offscreen`, which is
 how the QEMU test checks a frame without a display.
 
+The easiest way under KDE, GNOME, Wayland or X11:
+
+```bash
+./build_and_qemu.sh --viewer
+# in the guest console:
+howl> wolfser
+```
+
+`--viewer` builds (if needed) and starts the Qt host window; it waits for the
+VM to create the shared file. The same window can be started separately with
+`tools/wolfser-host.sh` (Qt6 picks Wayland or X11 itself). Manual QEMU needs
+the two ivshmem arguments:
+
 ```bash
 qemu-system-aarch64 ... \
   -object memory-backend-file,id=ivshmem0,share=on,mem-path=/dev/shm/werewolf-window,size=4M \
   -device ivshmem-plain,memdev=ivshmem0
 # guest: wolfser
-# host:  build/window-viewer/werewolf-window --shm /dev/shm/werewolf-window
+# host:  tools/wolfser-host.sh
 ```
+
+If Wolfser exits with status 21, the VM has no ivshmem device: relaunch QEMU
+with the arguments above (or use `./build_and_qemu.sh --viewer`).
 
 The first renderer deliberately has no CSS layout, images or TLS: it is the
 host-window transport plus an HTTP/HTML text path, which the Linux ABI/Phosh

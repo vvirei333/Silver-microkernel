@@ -42,6 +42,11 @@ Redmi port is parked. The reference checklist is
   headlessly: home screen, typed `example.com`, `cats` search, Ctrl+L + new
   address, scrolling and reload; `--snapshot` produces readable PNGs.
   `SYS_MAP_PHYS_NC` maps the surface as Normal Non-Cacheable.
+- **Desktop integration:** `./build_and_qemu.sh --viewer` adds the virtio-net
+  card and the ivshmem device, builds the Qt viewer when needed and starts it
+  next to QEMU; `tools/wolfser-host.sh` does the same separately. Qt chooses
+  Wayland or X11, so the window is native on KDE and GNOME. Guest exit 21
+  means the VM was started without ivshmem.
 - **SMP:** `-smp 4` selftest 15 PASS / 0 FAIL.
 - **Fog QEMU:** relocation, at-link, fail-closed park and timer cases PASS.
 - **Init fix:** Silverd resolves the child **task id** before every grant
