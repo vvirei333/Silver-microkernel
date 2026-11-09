@@ -187,6 +187,28 @@ pub struct TaskInfo {
 }
 
 /// One anonymous mapping installed by `SYS_MMAP`. Kept sorted by
+/// Ownership handle for a true `MAP_SHARED` memory-file window. The frames
+/// belong to the memfd, so unmapping this region must not free them; holding
+/// the handle keeps the memfd (and its frames) alive while a mapping exists.
+#[derive(Clone, Default)]
+struct SharedMapping {
+    #[cfg(feature = "linux-abi")]
+    owner: Option<crate::linux_fd::MappedFile>,
+}
+
+impl SharedMapping {
+    fn is_some(&self) -> bool {
+        #[cfg(feature = "linux-abi")]
+        {
+            self.owner.is_some()
+        }
+        #[cfg(not(feature = "linux-abi"))]
+        {
+            false
+        }
+    }
+}
+
 /// `virtual_address` so the first-fit allocator can scan in a single pass.
 #[derive(Clone)]
 struct MmapRegion {
@@ -196,6 +218,8 @@ struct MmapRegion {
     generation: u32,
     /// `PROT_*` the mapping was created with; `fork` must reuse it.
     prot: u64,
+    /// Set for a `MAP_SHARED` memfd window: the frames are memfd-owned.
+    shared: SharedMapping,
 }
 
 /// Syscall ABI a task is running on.
@@ -2929,7 +2953,7 @@ pub fn mmap_anonymous(length: usize, prot: u64) -> Option<usize> {
 /// Anonymous `MAP_FIXED`: place the mapping at an exact virtual address,
 /// replacing any existing mapping in the range.
 pub fn mmap_anonymous_at(length: usize, prot: u64, address: usize) -> Option<usize> {
-    with_group_owner(|task| task.mmap_region(length, prot, Some(address), None))?
+    with_group_owner(|task| task.mmap_region(length, prot, Some(address), None, None))?
 }
 
 /// Maps a file-backed region for the current task. `fixed` implements Linux
@@ -2942,6 +2966,19 @@ pub fn mmap_file(
     contents: &[u8],
 ) -> Option<usize> {
     with_group_owner(|task| task.mmap_file(length, prot, fixed, contents))?
+}
+
+/// Maps a memfd `MAP_SHARED` window. The frames stay owned by the memfd, so
+/// every process that maps the same file sees the same bytes.
+#[cfg(feature = "linux-abi")]
+pub fn mmap_shared_file(
+    length: usize,
+    prot: u64,
+    fixed: Option<usize>,
+    physical_start: usize,
+    owner: crate::linux_fd::MappedFile,
+) -> Option<usize> {
+    with_group_owner(|task| task.mmap_shared_file(length, prot, fixed, physical_start, owner))?
 }
 
 /// Changes protections on an existing mapping of the current task.
@@ -3753,6 +3790,12 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
     }
     parts.heap = heap;
     for region in &parent_mmap {
+        if region.shared.is_some() {
+            // A MAP_SHARED window is not copied: the child maps the same
+            // memfd frames writable, so both sides see each other's writes.
+            parts.mmap.push(region.clone());
+            continue;
+        }
         if !frame_allocator::share_contiguous_pages_tagged(
             region.physical_start,
             region.page_count,
@@ -3766,6 +3809,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             physical_start: region.physical_start,
             generation: region.generation,
             prot: region.prot,
+            shared: SharedMapping::default(),
         });
     }
 
@@ -3825,13 +3869,24 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         return None;
     }
     for region in &parts.mmap {
-        if !mmu::map_shared_user_pages_at(
-            ttbr0,
-            region.virtual_address,
-            region.physical_start,
-            region.page_count,
-            region.prot,
-        ) {
+        let mapped = if region.shared.is_some() {
+            mmu::map_shared_writable_pages_at(
+                ttbr0,
+                region.virtual_address,
+                region.physical_start,
+                region.page_count,
+                region.prot,
+            )
+        } else {
+            mmu::map_shared_user_pages_at(
+                ttbr0,
+                region.virtual_address,
+                region.physical_start,
+                region.page_count,
+                region.prot,
+            )
+        };
+        if !mapped {
             kernel_stack::free(kernel_stack_start);
             return None;
         }
@@ -3860,6 +3915,10 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             return None;
         }
         for region in &parent_mmap {
+            if region.shared.is_some() {
+                // Shared windows stay writable on both sides.
+                continue;
+            }
             if region.prot & mmu::PROT_WRITE != 0
                 && !mmu::protect_user_pages_at(
                     parent.ttbr0,
@@ -5613,6 +5672,7 @@ impl Task {
         prot: u64,
         fixed: Option<usize>,
         contents: Option<&[u8]>,
+        shared: Option<(usize, SharedMapping)>,
     ) -> Option<usize> {
         // W^X: a single mapping must never be writable and executable at the
         // same time. Validate before placement, frame allocation, PTE
@@ -5674,36 +5734,62 @@ impl Task {
         if !self.charge_frames(page_count) {
             return None;
         }
-        let (physical_start, generation) =
-            match frame_allocator::alloc_user_contiguous_pages_tagged(page_count) {
-                Some(pair) => pair,
-                None => {
-                    self.release_frames(page_count);
-                    return None;
-                }
-            };
-        if !mmu::map_user_pages_at(
-            self.ttbr0,
-            virtual_address,
-            physical_start,
-            page_count,
-            prot,
-        ) {
-            frame_allocator::free_contiguous_pages_tagged(physical_start, page_count, generation);
+        let (physical_start, generation, owner) = match shared {
+            // Frames already owned by a memfd: map them where they are and
+            // keep the lifetime handle. They must never be freed here.
+            Some((physical_start, owner)) => (physical_start, 0u32, owner),
+            None => {
+                let (physical_start, generation) =
+                    match frame_allocator::alloc_user_contiguous_pages_tagged(page_count) {
+                        Some(pair) => pair,
+                        None => {
+                            self.release_frames(page_count);
+                            return None;
+                        }
+                    };
+                (physical_start, generation, SharedMapping::default())
+            }
+        };
+        let mapped = if owner.is_some() {
+            mmu::map_shared_writable_pages_at(
+                self.ttbr0,
+                virtual_address,
+                physical_start,
+                page_count,
+                prot,
+            )
+        } else {
+            mmu::map_user_pages_at(
+                self.ttbr0,
+                virtual_address,
+                physical_start,
+                page_count,
+                prot,
+            )
+        };
+        if !mapped {
+            if !owner.is_some() {
+                frame_allocator::free_contiguous_pages_tagged(
+                    physical_start,
+                    page_count,
+                    generation,
+                );
+            }
             self.release_frames(page_count);
             return None;
         }
         // The mapping is zeroed by `map_user_pages_at`; copy only the file
-        // bytes that exist. The tail stays zero, which is friendlier than a
-        // SIGBUS for the last partial page and matches our loader's BSS rule.
+        // bytes that exist. A shared window already holds the memfd's bytes.
         if let Some(bytes) = contents {
-            let count = bytes.len().min(span);
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    phys_to_virt(physical_start) as *mut u8,
-                    count,
-                );
+            if !owner.is_some() {
+                let count = bytes.len().min(span);
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        bytes.as_ptr(),
+                        phys_to_virt(physical_start) as *mut u8,
+                        count,
+                    );
+                }
             }
         }
 
@@ -5713,6 +5799,7 @@ impl Task {
             physical_start,
             generation,
             prot,
+            shared: owner,
         };
         let position = self
             .mmap_regions
@@ -5725,7 +5812,7 @@ impl Task {
     }
 
     fn mmap_anonymous(&mut self, length: usize, prot: u64) -> Option<usize> {
-        self.mmap_region(length, prot, None, None)
+        self.mmap_region(length, prot, None, None, None)
     }
 
     fn mmap_file(
@@ -5735,7 +5822,31 @@ impl Task {
         fixed: Option<usize>,
         contents: &[u8],
     ) -> Option<usize> {
-        self.mmap_region(length, prot, fixed, Some(contents))
+        self.mmap_region(length, prot, fixed, Some(contents), None)
+    }
+
+    /// Maps a memfd `MAP_SHARED` window over frames owned by the memfd.
+    #[cfg(feature = "linux-abi")]
+    fn mmap_shared_file(
+        &mut self,
+        length: usize,
+        prot: u64,
+        fixed: Option<usize>,
+        physical_start: usize,
+        owner: crate::linux_fd::MappedFile,
+    ) -> Option<usize> {
+        self.mmap_region(
+            length,
+            prot,
+            fixed,
+            None,
+            Some((
+                physical_start,
+                SharedMapping {
+                    owner: Some(owner),
+                },
+            )),
+        )
     }
 
     /// Returns an RX page containing `mov x8, #139; svc #0`, the user trampoline
@@ -5751,7 +5862,7 @@ impl Task {
         const CODE: [u8; 12] = [
             0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
         ];
-        let address = self.mmap_region(PAGE_SIZE, mmu::PROT_EXEC, None, Some(&CODE))?;
+        let address = self.mmap_region(PAGE_SIZE, mmu::PROT_EXEC, None, Some(&CODE), None)?;
         self.signal_trampoline = Some(address);
         Some(address)
     }
@@ -5911,7 +6022,10 @@ impl Task {
                 && page < region.virtual_address + region.page_count * PAGE_SIZE
         }) {
             let region = &self.mmap_regions[index];
-            if region.prot & mmu::PROT_WRITE == 0 {
+            // A MAP_SHARED window owns no frames: a write fault means the
+            // window was made read-only, and Linux kills the task instead of
+            // silently breaking the sharing contract.
+            if region.shared.is_some() || region.prot & mmu::PROT_WRITE == 0 {
                 return false;
             }
             let old_physical = region.physical_start;
@@ -5989,6 +6103,7 @@ impl Task {
             let generation = self.mmap_regions[index].generation;
             let prot = self.mmap_regions[index].prot;
             let region_pages = self.mmap_regions[index].page_count;
+            let shared = self.mmap_regions[index].shared.is_some();
             let left = start_page;
             let right = region_pages - start_page - count;
             // A middle range needs one extra bookkeeping slot. Refuse before
@@ -6011,12 +6126,15 @@ impl Task {
                 return false;
             }
             // Free only the removed slice of the original contiguous run;
-            // every page in it shares the run's generation.
-            if !frame_allocator::free_contiguous_pages_tagged(
-                removed_physical,
-                count,
-                generation,
-            ) {
+            // every page in it shares the run's generation. A shared memfd
+            // window leaves its frames to the memfd object.
+            if !shared
+                && !frame_allocator::free_contiguous_pages_tagged(
+                    removed_physical,
+                    count,
+                    generation,
+                )
+            {
                 console::write_str("MMAP: allocator refused run 0x");
                 console::write_hex_u64(removed_physical as u64);
                 console::write_str(" - leaked\r\n");
@@ -6043,6 +6161,7 @@ impl Task {
                         page_count: right,
                         generation,
                         prot,
+                        shared: self.mmap_regions[index].shared.clone(),
                     };
                     self.mmap_regions[index].page_count = left;
                     self.mmap_regions.insert(index + 1, tail);
@@ -6194,6 +6313,7 @@ impl Task {
             page_count: region.page_count - offset_pages,
             generation: region.generation,
             prot: region.prot,
+            shared: region.shared.clone(),
         };
         self.mmap_regions[index].page_count = offset_pages;
         self.mmap_regions.insert(index + 1, tail);
@@ -6326,6 +6446,11 @@ fn release_space_resources(
 ) {
     for region in &resources.mmap_regions {
         if mmu::unmap_user_pages_at(resources.ttbr0, region.virtual_address, region.page_count) {
+            if region.shared.is_some() {
+                // The memfd owns these frames; dropping `region.shared` above
+                // drops this mapping's reference to the file.
+                continue;
+            }
             frame_allocator::free_contiguous_pages_tagged(
                 region.physical_start,
                 region.page_count,

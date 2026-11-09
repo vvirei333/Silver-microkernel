@@ -88,6 +88,10 @@ const SYS_MADVISE: u64 = 233;
 const SYS_PRLIMIT64: u64 = 261;
 const SYS_GETRANDOM: u64 = 278;
 const SYS_RSEQ: u64 = 293;
+const SYS_PREAD64: u64 = 67;
+const SYS_PWRITE64: u64 = 68;
+const SYS_FTRUNCATE: u64 = 46;
+const SYS_FALLOCATE: u64 = 47;
 const SYS_SOCKET: u64 = 198;
 const SYS_SOCKETPAIR: u64 = 199;
 const SYS_BIND: u64 = 200;
@@ -166,10 +170,35 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
             args[1] & 0x800 != 0,
         )),
         SYS_MEMFD_CREATE => finish(linux_fd::memfd(scheduler::current_task_id())),
+        SYS_FTRUNCATE => finish(
+            linux_fd::memfd_truncate(
+                scheduler::current_task_id(),
+                args[0],
+                args[1] as usize,
+            )
+            .map(|_| 0),
+        ),
+        SYS_FALLOCATE => {
+            if args[1] != 0 {
+                errno(ENOSYS)
+            } else {
+                finish(
+                    linux_fd::memfd_fallocate(
+                        scheduler::current_task_id(),
+                        args[0],
+                        args[2] as usize,
+                        args[3] as usize,
+                    )
+                    .map(|_| 0),
+                )
+            }
+        }
         SYS_FUTEX => linux_futex(args[0], args[1], args[2], args[3]),
         SYS_PIPE2 => linux_pipe2(args[0], args[1]),
         SYS_PPOLL => finish(linux_ppoll(args[0], args[1], args[2])),
         SYS_CLOSE => finish(linux_fd::close(scheduler::current_task_id(), args[0]).map(|_| 0)),
+        SYS_PREAD64 => linux_pread(args[0], args[1], args[2], args[3]),
+        SYS_PWRITE64 => linux_pwrite(args[0], args[1], args[2], args[3]),
         SYS_LSEEK => finish(linux_fd::lseek(
             scheduler::current_task_id(),
             args[0],
@@ -1540,17 +1569,35 @@ fn linux_mmap(
         return placed.map(|placed| placed as u64).unwrap_or(errno(ENOMEM));
     }
 
-    // File-backed mapping. Linux requires a page-aligned file offset. The
-    // whole file range is copied into fresh private frames: matches the
-    // MAP_PRIVATE contract for the dynamic loader, and keeps us independent
-    // of a page cache we do not have yet. A writable MAP_SHARED request would
-    // silently lose its write-back, so fail it instead of lying.
+    // File-backed mapping. Linux requires a page-aligned file offset.
     if offset % PAGE_SIZE != 0 {
         return errno(EINVAL);
     }
-    if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 {
-        return errno(EINVAL);
+    // A `MAP_SHARED` memfd is a true shared window: every process that maps
+    // the same file (passed over SCM_RIGHTS) sees the same frames. This is
+    // what Wayland's `wl_shm` buffers use. Other files still copy into
+    // private frames, and a writable shared mapping of a read-only SFS file
+    // is refused rather than silently losing its write-back.
+    if flags & MAP_SHARED != 0 {
+        let task = scheduler::current_task_id();
+        if let Ok((physical, owner)) =
+            linux_fd::memfd_shared(task, fd, offset as usize, length as usize)
+        {
+            return scheduler::mmap_shared_file(
+                length as usize,
+                prot,
+                fixed,
+                physical,
+                owner,
+            )
+            .map(|placed| placed as u64)
+            .unwrap_or(errno(ENOMEM));
+        }
+        if prot & PROT_WRITE != 0 {
+            return errno(EINVAL);
+        }
     }
+    // MAP_PRIVATE: copy the file range into fresh frames.
     if length as usize > crate::vfs::MAX_FILE_BYTES {
         return errno(ENOMEM);
     }
@@ -1595,6 +1642,33 @@ fn linux_munmap(address: u64, length: u64) -> u64 {
         0
     } else {
         errno(EINVAL)
+    }
+}
+
+fn linux_pread(fd: u64, buffer: u64, count: u64, offset: u64) -> u64 {
+    let count = (count as usize).min(1 << 20);
+    let mut bytes = alloc::vec![0_u8; count];
+    let task = scheduler::current_task_id();
+    match linux_fd::pread(task, fd, offset, &mut bytes) {
+        Ok(read) => {
+            if user_memory::copy_to_user(&bytes[..read], buffer).is_err() {
+                return errno(EFAULT);
+            }
+            read as u64
+        }
+        Err(code) => errno(code),
+    }
+}
+
+fn linux_pwrite(fd: u64, buffer: u64, count: u64, offset: u64) -> u64 {
+    let count = (count as usize).min(1 << 20);
+    let mut bytes = alloc::vec![0_u8; count];
+    if user_memory::copy_from_user(buffer, &mut bytes).is_err() {
+        return errno(EFAULT);
+    }
+    match linux_fd::pwrite(scheduler::current_task_id(), fd, offset, &bytes) {
+        Ok(written) => written as u64,
+        Err(code) => errno(code),
     }
 }
 

@@ -552,6 +552,22 @@ fixed mappings), and `mprotect` rewrites PTE permissions on both the anonymous
 window and the main image. The rootfs is not a limit: it is 16 MiB, the kernel
 heap is 16 MiB, and the per-file cap is 8 MiB.
 
+A writable `MAP_SHARED` mapping of a `memfd` is a true shared window: the
+memfd owns one contiguous physical run, every process that maps the file (its
+descriptor can travel over `SCM_RIGHTS`) maps the same frames, and `read`/
+`write`/`pread`/`pwrite` go through those frames too. `ftruncate` and
+`fallocate` size the file. Unmapping one window leaves the frames for the
+others; the run is freed with the last descriptor and mapping. This is the
+buffer path `wl_shm` uses:
+
+```text
+howl> linuxrun /sfs/linux-memfd
+shared memfd ok
+```
+
+The mapping survives `fork` as a shared window (not a COW copy), and
+remapping after `munmap` still sees the child's writes.
+
 `ET_DYN`/PIE images load with a bias (`0x1000_0000` for the program,
 `0x2000_0000` for its interpreter), and `PT_INTERP` is resolved from the VFS
 and attached to the same image; the kernel starts at the interpreter entry and

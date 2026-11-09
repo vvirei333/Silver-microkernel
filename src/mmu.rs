@@ -1149,6 +1149,20 @@ pub fn map_shared_user_pages_at(
     map_user_pages_at_inner(ttbr0, virtual_address, physical_start, page_count, prot, false, true)
 }
 
+/// Maps frames that already contain live data and are owned by another
+/// object (a memfd's shared run). No zeroing, and writable `prot` stays
+/// writable: this is a true `MAP_SHARED` mapping whose writes must be visible
+/// to every other mapping of the same run.
+pub fn map_shared_writable_pages_at(
+    ttbr0: usize,
+    virtual_address: usize,
+    physical_start: usize,
+    page_count: usize,
+    prot: u64,
+) -> bool {
+    map_user_pages_at_inner(ttbr0, virtual_address, physical_start, page_count, prot, false, false)
+}
+
 /// Shared implementation of the two entry points above.
 fn map_user_pages_at_inner(
     ttbr0: usize,

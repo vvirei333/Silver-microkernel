@@ -34,11 +34,133 @@ pub struct PipeState {
     write_ends: usize,
 }
 
+/// A contiguous physical run backing a `MAP_SHARED` memfd. The run is owned
+/// by the memfd, not by any address space: unmapping a task's window must not
+/// free it, and a second mapping (another process) must see the same bytes.
+struct MemFdFrames {
+    physical_start: usize,
+    page_count: usize,
+    generation: u32,
+}
+
 /// Shared state of one `memfd_create` file. The offset lives in the shared
 /// object, so `dup` shares it exactly like a real file description.
 pub struct MemFdState {
     data: Vec<u8>,
     offset: usize,
+    /// Populated by the first writable `MAP_SHARED` mapping. While present,
+    /// file I/O goes through these frames so mappings and `read`/`write` see
+    /// one copy.
+    frames: Option<MemFdFrames>,
+    /// Number of live mappings. Reallocating the run is only safe at zero.
+    maps: usize,
+}
+
+impl MemFdState {
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+
+    /// Ensures a physical run covers `needed` bytes. Grows only when no
+    /// mapping exists, because a resize would move frames out from under an
+    /// existing PTE.
+    fn ensure_frames(&mut self, needed: usize) -> Result<(), u64> {
+        let needed = needed.max(self.data.len());
+        let page_count = needed.div_ceil(crate::memory::PAGE_SIZE).max(1);
+        let capacity = self
+            .frames
+            .as_ref()
+            .map(|frames| frames.page_count * crate::memory::PAGE_SIZE)
+            .unwrap_or(0);
+        if self.frames.is_some() && capacity >= needed {
+            if self.data.len() < needed {
+                self.data.resize(needed, 0);
+            }
+            return Ok(());
+        }
+        if self.frames.is_some() && self.maps != 0 {
+            return Err(ENOMEM);
+        }
+        let Some((physical_start, generation)) =
+            crate::frame_allocator::alloc_user_contiguous_pages_tagged(page_count)
+        else {
+            return Err(ENOMEM);
+        };
+        let base = crate::memory::phys_to_virt(physical_start);
+        unsafe {
+            core::ptr::write_bytes(base as *mut u8, 0, page_count * crate::memory::PAGE_SIZE);
+            let copy = self.data.len().min(page_count * crate::memory::PAGE_SIZE);
+            core::ptr::copy_nonoverlapping(self.data.as_ptr(), base as *mut u8, copy);
+        }
+        if let Some(old) = self.frames.take() {
+            crate::frame_allocator::free_contiguous_pages_tagged(
+                old.physical_start,
+                old.page_count,
+                old.generation,
+            );
+        }
+        self.frames = Some(MemFdFrames {
+            physical_start,
+            page_count,
+            generation,
+        });
+        if self.data.len() < needed {
+            self.data.resize(needed, 0);
+        }
+        Ok(())
+    }
+}
+
+impl Drop for MemFdState {
+    fn drop(&mut self) {
+        if let Some(frames) = self.frames.take() {
+            crate::frame_allocator::free_contiguous_pages_tagged(
+                frames.physical_start,
+                frames.page_count,
+                frames.generation,
+            );
+        }
+    }
+}
+
+/// A live `MAP_SHARED` window on a memfd. Holding this keeps the memfd state
+/// (and therefore its frames) alive even after every descriptor is closed, as
+/// Linux does for a mapping.
+pub struct MappedFile {
+    state: Arc<Mutex<MemFdState>>,
+}
+
+impl Clone for MappedFile {
+    fn clone(&self) -> Self {
+        self.state.lock().maps += 1;
+        Self {
+            state: self.state.clone(),
+        }
+    }
+}
+
+impl MappedFile {
+    /// Splits the shared run into the physical base and page count a mapping
+    /// needs. `length` and `offset` are page-aligned by the caller.
+    pub fn window(&self, offset: usize, length: usize) -> Result<(usize, usize), u64> {
+        let mut state = self.state.lock();
+        state.ensure_frames(offset.saturating_add(length))?;
+        let frames = state.frames.as_ref().ok_or(ENOMEM)?;
+        if offset.saturating_add(length) > frames.page_count * crate::memory::PAGE_SIZE {
+            return Err(ENOMEM);
+        }
+        Ok((
+            frames.physical_start + offset,
+            length.div_ceil(crate::memory::PAGE_SIZE),
+        ))
+    }
+}
+
+impl Drop for MappedFile {
+    fn drop(&mut self) {
+        let mut state = self.state.lock();
+        state.maps = state.maps.saturating_sub(1);
+    }
 }
 
 /// One queued datagram/message on a Unix socket, with the descriptors that
@@ -419,9 +541,15 @@ pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize
         }
         Target::MemFd(state) => {
             let file = state.lock();
-            let start = (offset as usize).min(file.data.len());
-            let count = (file.data.len() - start).min(buffer.len());
-            buffer[..count].copy_from_slice(&file.data[start..start + count]);
+            let start = (offset as usize).min(file.len());
+            let count = (file.len() - start).min(buffer.len());
+            if let Some(frames) = &file.frames {
+                let source = crate::memory::phys_to_virt(frames.physical_start + start);
+                let bytes = unsafe { core::slice::from_raw_parts(source as *const u8, count) };
+                buffer[..count].copy_from_slice(bytes);
+            } else {
+                buffer[..count].copy_from_slice(&file.data[start..start + count]);
+            }
             Ok(count)
         }
         Target::Zero => {
@@ -493,6 +621,48 @@ pub fn lseek(task: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, u64> {
         }
         _ => Err(ESPIPE),
     }
+}
+
+/// Positional write used by `pwrite64`. Grows a memfd like `write` does and
+/// does not move the descriptor offset.
+pub fn pwrite(task: u64, fd: u64, offset: u64, bytes: &[u8]) -> Result<usize, u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::MemFd(state) = target else {
+        return Err(EINVAL);
+    };
+    let mut file = state.lock();
+    let start = offset as usize;
+    let end = start.checked_add(bytes.len()).ok_or(EINVAL)?;
+    if file.frames.is_some() {
+        let capacity = file
+            .frames
+            .as_ref()
+            .map(|frames| frames.page_count * crate::memory::PAGE_SIZE)
+            .unwrap_or(0);
+        if end > capacity {
+            if file.maps != 0 {
+                return Err(EFBIG);
+            }
+            file.ensure_frames(end)?;
+        }
+        let physical = file.frames.as_ref().ok_or(ENOMEM)?.physical_start;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                crate::memory::phys_to_virt(physical + start) as *mut u8,
+                bytes.len(),
+            );
+        }
+    } else {
+        if end > file.data.len() {
+            file.data.resize(end, 0);
+        }
+        file.data[start..end].copy_from_slice(bytes);
+    }
+    if end > file.data.len() {
+        file.data.resize(end, 0);
+    }
+    Ok(bytes.len())
 }
 
 /// Fills the aarch64 `struct stat` for a descriptor.
@@ -623,6 +793,8 @@ pub fn memfd(task: u64) -> Result<u64, u64> {
         Target::MemFd(Arc::new(Mutex::new(MemFdState {
             data: Vec::new(),
             offset: 0,
+            frames: None,
+            maps: 0,
         }))),
     )
     .ok_or(EMFILE)
@@ -673,12 +845,17 @@ fn memfd_read(
     count: u64,
 ) -> Result<u64, u64> {
     let mut file = state.lock();
-    let available = file.data.len().saturating_sub(file.offset);
+    let available = file.len().saturating_sub(file.offset);
     let take = (count as usize).min(available);
     if take == 0 {
         return Ok(0);
     }
-    let chunk = file.data[file.offset..file.offset + take].to_vec();
+    let chunk = if let Some(frames) = &file.frames {
+        let source = crate::memory::phys_to_virt(frames.physical_start + file.offset);
+        unsafe { core::slice::from_raw_parts(source as *const u8, take) }.to_vec()
+    } else {
+        file.data[file.offset..file.offset + take].to_vec()
+    };
     file.offset += take;
     drop(file);
     user_memory::copy_to_user(&chunk, buffer).map_err(|_| EFAULT)?;
@@ -696,12 +873,101 @@ fn memfd_write(
     let mut file = state.lock();
     let start = file.offset;
     let end = start.checked_add(total).ok_or(EINVAL)?;
-    if end > file.data.len() {
-        file.data.resize(end, 0);
+    if file.frames.is_some() {
+        // A live mapping fixes the run in place; growing it would move the
+        // frames. Fail instead of silently writing into unmapped memory.
+        let capacity = file
+            .frames
+            .as_ref()
+            .map(|frames| frames.page_count * crate::memory::PAGE_SIZE)
+            .unwrap_or(0);
+        if end > capacity {
+            if file.maps != 0 {
+                return Err(EFBIG);
+            }
+            file.ensure_frames(end)?;
+        }
+        let physical = file.frames.as_ref().ok_or(ENOMEM)?.physical_start;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                crate::memory::phys_to_virt(physical + start) as *mut u8,
+                total,
+            );
+        }
+        if end > file.data.len() {
+            file.data.resize(end, 0);
+        }
+    } else {
+        if end > file.data.len() {
+            file.data.resize(end, 0);
+        }
+        file.data[start..end].copy_from_slice(&bytes);
     }
-    file.data[start..end].copy_from_slice(&bytes);
     file.offset = end;
     Ok(total as u64)
+}
+
+/// `ftruncate(2)` / `fallocate(2)` on a memfd. The file is backed lazily; a
+/// resize is refused while a shared mapping pins the current run.
+pub fn memfd_truncate(task: u64, fd: u64, length: usize) -> Result<(), u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::MemFd(state) = target else {
+        return Err(EINVAL);
+    };
+    let mut file = state.lock();
+    if length > file.data.len() {
+        if file.frames.is_some() {
+            let capacity = file
+                .frames
+                .as_ref()
+                .map(|frames| frames.page_count * crate::memory::PAGE_SIZE)
+                .unwrap_or(0);
+            if length > capacity {
+                if file.maps != 0 {
+                    return Err(ENOMEM);
+                }
+                file.ensure_frames(length)?;
+            }
+        }
+    }
+    file.data.resize(length, 0);
+    Ok(())
+}
+
+/// `fallocate(2)` with mode 0: grow the file if `offset + length` exceeds it.
+pub fn memfd_fallocate(task: u64, fd: u64, offset: usize, length: usize) -> Result<(), u64> {
+    let needed = offset.checked_add(length).ok_or(EINVAL)?;
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::MemFd(state) = target else {
+        return Err(EINVAL);
+    };
+    let current = state.lock().data.len();
+    if needed > current {
+        memfd_truncate(task, fd, needed)?;
+    }
+    Ok(())
+}
+
+/// Maps a memfd `MAP_SHARED` window. Returns the physical base of the window
+/// and a handle that keeps the memfd alive for the lifetime of the mapping.
+pub fn memfd_shared(
+    task: u64,
+    fd: u64,
+    offset: usize,
+    length: usize,
+) -> Result<(usize, MappedFile), u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::MemFd(state) = target else {
+        return Err(EINVAL);
+    };
+    state.lock().ensure_frames(offset.saturating_add(length))?;
+    state.lock().maps += 1;
+    let owner = MappedFile {
+        state: state.clone(),
+    };
+    let (physical, _) = owner.window(offset, length)?;
+    Ok((physical, owner))
 }
 
 /// Blocking `read` on a pipe. EOF only when every write end is closed.
@@ -1121,6 +1387,8 @@ const ESPIPE: u64 = 29;
 const EROFS: u64 = 30;
 const EPIPE: u64 = 32;
 const ENOTSOCK: u64 = 88;
+const ENOMEM: u64 = 12;
+const EFBIG: u64 = 27;
 const EMFILE: u64 = 24;
 const S_IFSOCK: u32 = 0o140000;
 
