@@ -237,7 +237,9 @@ static unsigned shell_id;
 static unsigned xdg_surface_id;
 static unsigned toplevel_id;
 static unsigned output_id;
+static unsigned output_version;
 static unsigned seat_id;
+static unsigned seat_version;
 static unsigned keyboard_id;
 static unsigned pointer_id;
 static unsigned configure_serial = 1;
@@ -248,14 +250,19 @@ static unsigned frame_id;
 static int pool_fd = -1;
 static int verified;
 
-static void send_global(long client, unsigned registry, unsigned name,
-                        const char *interface) {
+static void send_global_version(long client, unsigned registry, unsigned name,
+                                const char *interface, unsigned version) {
     begin(registry, 0 /* wl_registry.global */);
     put_u32(name);
     put_string(interface);
-    put_u32(1);
+    put_u32(version);
     finish();
     send_message(client, -1);
+}
+
+static void send_global(long client, unsigned registry, unsigned name,
+                        const char *interface) {
+    send_global_version(client, registry, name, interface, 1);
 }
 
 static void send_done(long client, unsigned callback, unsigned data) {
@@ -291,16 +298,16 @@ static int serve(long client) {
                 send_done(client, callback, 0);
             } else if (object == 1 && opcode == 1) { /* wl_display.get_registry */
                 registry_id = take_u32();
-                send_global(client, registry_id, 1, "wl_compositor");
+                send_global_version(client, registry_id, 1, "wl_compositor", 4);
                 send_global(client, registry_id, 2, "wl_shm");
                 send_global(client, registry_id, 3, "xdg_wm_base");
-                send_global(client, registry_id, 4, "wl_output");
-                send_global(client, registry_id, 5, "wl_seat");
+                send_global_version(client, registry_id, 4, "wl_output", 4);
+                send_global_version(client, registry_id, 5, "wl_seat", 5);
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
                 take_string(interface, sizeof(interface));
-                (void)take_u32();
+                unsigned version = take_u32();
                 unsigned new_id = take_u32();
                 if (text_equal(interface, "wl_compositor")) {
                     compositor_id = new_id;
@@ -310,10 +317,15 @@ static int serve(long client) {
                     put_u32(0); /* ARGB8888 */
                     finish();
                     send_message(client, -1);
+                    begin(shm_id, 0 /* wl_shm.format */);
+                    put_u32(1); /* XRGB8888 */
+                    finish();
+                    send_message(client, -1);
                 } else if (text_equal(interface, "xdg_wm_base")) {
                     shell_id = new_id;
                 } else if (text_equal(interface, "wl_output")) {
                     output_id = new_id;
+                    output_version = version;
                     begin(output_id, 0 /* geometry */);
                     put_i32(0); put_i32(0);
                     put_i32(300); put_i32(200);
@@ -324,10 +336,31 @@ static int serve(long client) {
                     begin(output_id, 1 /* mode */);
                     put_u32(3); put_i32(1024); put_i32(768); put_i32(60000);
                     finish(); send_message(client, -1);
-                    begin(output_id, 2 /* done */);
-                    finish(); send_message(client, -1);
+                    if (output_version >= 2) {
+                        begin(output_id, 3 /* scale */);
+                        put_i32(2);
+                        finish(); send_message(client, -1);
+                    }
+                    if (output_version >= 4) {
+                        begin(output_id, 4 /* name */);
+                        put_string("Werewolf panel");
+                        finish(); send_message(client, -1);
+                        begin(output_id, 5 /* description */);
+                        put_string("WerewolfOS 1024x768 panel");
+                        finish(); send_message(client, -1);
+                    }
+                    if (output_version >= 2) {
+                        begin(output_id, 2 /* done */);
+                        finish(); send_message(client, -1);
+                    }
                 } else if (text_equal(interface, "wl_seat")) {
                     seat_id = new_id;
+                    seat_version = version;
+                    if (seat_version >= 2) {
+                        begin(seat_id, 1 /* name */);
+                        put_string("Werewolf seat");
+                        finish(); send_message(client, -1);
+                    }
                     begin(seat_id, 0 /* capabilities */);
                     put_u32(3); /* pointer | keyboard */
                     finish(); send_message(client, -1);
@@ -372,22 +405,10 @@ static int serve(long client) {
                 if (keymap >= 0) {
                     sys3(57, keymap, 0, 0);
                 }
-                begin(keyboard_id, 1 /* enter */);
-                put_u32(configure_serial);
-                put_u32(surface_id);
-                put_u32(0); /* keys array, empty */
-                finish();
-                send_message(client, -1);
+                /* wayland-info never creates a surface, so there is no valid
+                 * surface to deliver keyboard enter for. */
             } else if (object == seat_id && opcode == 0) {
-                /* wl_seat.get_pointer(new_id): enter + motion. */
                 pointer_id = take_u32();
-                begin(pointer_id, 0 /* enter */);
-                put_u32(configure_serial);
-                put_u32(surface_id);
-                put_i32(100 << 8);
-                put_i32(50 << 8);
-                finish();
-                send_message(client, -1);
                 begin(pointer_id, 2 /* motion */);
                 put_u32(1);
                 put_i32(100 << 8);

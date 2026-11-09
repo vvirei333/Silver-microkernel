@@ -27,6 +27,10 @@ static int configured;
 static int output_done;
 static int output_scale;
 static int surface_entered;
+static int output_name_ok;
+static int output_description_ok;
+static int seat_name_ok;
+static int keyboard_repeat_ok;
 static uint32_t seat_caps;
 static int keymap_ok;
 static int pointer_ok;
@@ -45,15 +49,22 @@ static void output_mode(void *data, struct wl_output *out, uint32_t flags,
                         int32_t width, int32_t height, int32_t refresh);
 static void output_done_event(void *data, struct wl_output *out);
 static void output_scale_event(void *data, struct wl_output *out, int32_t factor);
+static void output_name_event(void *data, struct wl_output *out, const char *name);
+static void output_description_event(void *data, struct wl_output *out,
+                                     const char *description);
 static const struct wl_output_listener output_listener = {
     .geometry = output_geometry,
     .mode = output_mode,
     .done = output_done_event,
     .scale = output_scale_event,
+    .name = output_name_event,
+    .description = output_description_event,
 };
 static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps);
+static void seat_name_event(void *data, struct wl_seat *s, const char *name);
 static const struct wl_seat_listener seat_listener = {
     .capabilities = seat_capabilities,
+    .name = seat_name_event,
 };
 
 static void registry_global(void *data, struct wl_registry *registry,
@@ -71,10 +82,12 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 1 ? version : 1;
         shell = wl_registry_bind(registry, name, &xdg_wm_base_interface, use);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
-        output = wl_registry_bind(registry, name, &wl_output_interface, 2);
+        uint32_t use = version < 4 ? version : 4;
+        output = wl_registry_bind(registry, name, &wl_output_interface, use);
         wl_output_add_listener(output, &output_listener, NULL);
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
-        seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
+        uint32_t use = version < 5 ? version : 5;
+        seat = wl_registry_bind(registry, name, &wl_seat_interface, use);
         wl_seat_add_listener(seat, &seat_listener, NULL);
     }
 }
@@ -127,6 +140,20 @@ static void output_scale_event(void *data, struct wl_output *out,
     output_scale = factor;
 }
 
+static void output_name_event(void *data, struct wl_output *out,
+                              const char *name) {
+    (void)data; (void)out;
+    output_name_ok = name != NULL && strcmp(name, "Werewolf panel") == 0;
+}
+
+static void output_description_event(void *data, struct wl_output *out,
+                                     const char *description) {
+    (void)data; (void)out;
+    output_description_ok = description != NULL &&
+                            strcmp(description,
+                                   "WerewolfOS 1024x768 panel") == 0;
+}
+
 static void keyboard_keymap(void *data, struct wl_keyboard *kb,
                             uint32_t format, int32_t fd, uint32_t size) {
     (void)data; (void)kb; (void)format;
@@ -167,12 +194,16 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *kb,
     (void)locked; (void)group;
 }
 
+static void keyboard_repeat_info(void *data, struct wl_keyboard *kb,
+                                 int32_t rate, int32_t delay);
+
 static const struct wl_keyboard_listener keyboard_listener = {
     .keymap = keyboard_keymap,
     .enter = keyboard_enter,
     .leave = keyboard_leave,
     .key = keyboard_key,
     .modifiers = keyboard_modifiers,
+    .repeat_info = keyboard_repeat_info,
 };
 
 static void pointer_enter(void *data, struct wl_pointer *ptr, uint32_t serial,
@@ -237,6 +268,17 @@ static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps) {
     (void)data;
     (void)s;
     seat_caps = caps;
+}
+
+static void seat_name_event(void *data, struct wl_seat *s, const char *name) {
+    (void)data; (void)s;
+    seat_name_ok = name != NULL && strcmp(name, "Werewolf seat") == 0;
+}
+
+static void keyboard_repeat_info(void *data, struct wl_keyboard *kb,
+                                 int32_t rate, int32_t delay) {
+    (void)data; (void)kb;
+    keyboard_repeat_ok = rate == 25 && delay == 600;
 }
 
 static void shell_ping(void *data, struct xdg_wm_base *base, uint32_t serial) {
@@ -412,12 +454,15 @@ int main(void) {
         fprintf(stderr, "wlclient: buffer releases missing\n");
         return 11;
     }
-    if (!surface_entered || !output_done || output_scale != 2 || !keymap_ok ||
-        !pointer_ok || !key_enter) {
+    if (!surface_entered || !output_done || output_scale != 2 ||
+        !output_name_ok || !output_description_ok || !seat_name_ok ||
+        !keyboard_repeat_ok || !keymap_ok || !pointer_ok || !key_enter) {
         fprintf(stderr,
-                "wlclient: events missing surface=%d out=%d scale=%d map=%d ptr=%d enter=%d\n",
-                surface_entered, output_done, output_scale, keymap_ok,
-                pointer_ok, key_enter);
+                "wlclient: events missing surface=%d out=%d scale=%d "
+                "oname=%d odesc=%d sname=%d krepeat=%d map=%d ptr=%d enter=%d\n",
+                surface_entered, output_done, output_scale, output_name_ok,
+                output_description_ok, seat_name_ok, keyboard_repeat_ok,
+                keymap_ok, pointer_ok, key_enter);
         return 11;
     }
 

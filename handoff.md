@@ -682,6 +682,14 @@ Redmi port is parked. The reference checklist is
   a second because free bits are grouped per bitmap block (bitmap writes no
   longer scale with file size); fsck is clean before and after. Whole-file
   reads and `exec` remain capped at 8 MiB by `MAX_FILE_BYTES`.
+  **Slice 42 (Wayland v4/v5 globals):** the mini compositor now advertises
+  `wl_compositor` v4, `wl_output` v4 and `wl_seat` v5, and `wl_shm` lists both
+  ARGB8888 and XRGB8888. `wl_output` sends scale, name and description before
+  done; `wl_seat` sends its name; `wl_keyboard.repeat_info` is emitted for
+  version-4 keyboards. The real libwayland client binds the higher versions
+  and verifies name/description/repeat plus the existing scale/enter/input
+  events; the stock `wayland-info` harness advertises the same versions and
+  prints them. Both clients and `wayland-info` pass.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -708,9 +716,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 42 (raise the whole-file/exec cap or stream
-  ELF segments, then a larger toolkit). Network base maintenance (keep-alive,
-  TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 43 (stream ELF segments or raise the
+  whole-file/exec cap, then a larger toolkit; Wayland: data-device/clipboard
+  and xdg-decoration for GTK). Network base maintenance (keep-alive, TLS
+  roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

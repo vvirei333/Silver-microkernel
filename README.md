@@ -584,14 +584,15 @@ compositor sends `xdg_toplevel.configure` and `xdg_surface.configure`, and
 still verifies the shared pixels. The vendored `xdg-shell-client-protocol.h`/
 `.c` come from `wayland-protocols` 1.50.
 
-Input and output are advertised as well: `wl_output` v2 sends
-geometry/mode/scale/done, `wl_surface.enter` names the output, and `wl_seat`
-reports pointer+keyboard capabilities. Once
+Input and output are advertised as well: `wl_output` v4 sends
+geometry/mode/scale/name/description/done, `wl_surface.enter` names the
+output, and `wl_seat` v5 reports its name and pointer+keyboard capabilities.
+`wl_keyboard.repeat_info` carries the key repeat rate. Once
 the surface exists the client calls `get_keyboard`/`get_pointer`; the
 compositor answers `wl_keyboard.keymap` with a memfd carried over
 `SCM_RIGHTS`, then `wl_keyboard.enter`, and `wl_pointer.enter`/`motion` with
-24.8 fixed coordinates. The client verifies the keymap text, the pointer position, output
-scale 2 and the surface-enter event. (The passed descriptor shares the writer's open file description,
+24.8 fixed coordinates. The client verifies the keymap text, pointer position, output scale 2,
+output name/description, seat name/repeat info and the surface-enter event. (The passed descriptor shares the writer's open file description,
 so the client rewinds before reading the keymap.)
 
 The client animates: it creates two `wl_buffer`s from one pool, commits three
@@ -605,14 +606,18 @@ enumerates everything the mini compositor advertises:
 
 ```text
 howl> linuxrun /sfs/linux-wlinfo
-interface: 'wl_compositor',  version: 1, name: 1
+interface: 'wl_compositor',  version: 4, name: 1
 interface: 'wl_shm',         version: 1, name: 2
+         1 = 'XR24'
          0 = 'AR24'
 interface: 'xdg_wm_base',    version: 1, name: 3
-interface: 'wl_output',      version: 1, name: 4
-       make: 'Werewolf', model: 'Panel',
+interface: 'wl_output',      version: 4, name: 4
+       name: Werewolf panel
+       description: WerewolfOS 1024x768 panel
+       make: 'Werewolf', model: 'Panel', scale: 2,
        width: 1024 px, height: 768 px, refresh: 60.000 Hz
-interface: 'wl_seat',        version: 1, name: 5
+interface: 'wl_seat',        version: 5, name: 5
+       name: Werewolf seat
        capabilities: pointer keyboard
 wayland-info ok
 ```
