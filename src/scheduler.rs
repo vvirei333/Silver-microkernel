@@ -2104,6 +2104,8 @@ pub fn kill_task(id: u64) -> bool {
     crate::linux_fd::close_task(id);
     #[cfg(feature = "linux-abi")]
     crate::linux_signal::close_task(id);
+    #[cfg(feature = "linux-abi")]
+    crate::linux_abi::futex_cleanup(id);
     vfs::close_task(id);
     manager.tasks[index].state = TaskState::Dead;
     manager.tasks[index].bound_irq = None;
@@ -2630,6 +2632,42 @@ pub fn group_leader(task: u64) -> u64 {
         .and_then(|manager| manager.tasks.iter().find(|entry| entry.id == task))
         .map(|entry| if entry.is_thread { entry.tgid } else { entry.id })
         .unwrap_or(task)
+}
+
+/// True when the current task is a `CLONE_VM` sibling rather than a process
+/// leader. Its address space belongs to the leader and must not be replaced
+/// (or released) by `execve`.
+#[cfg(feature = "linux-abi")]
+pub fn current_is_thread() -> bool {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
+        .map(|task| task.is_thread)
+        .unwrap_or(false)
+}
+
+/// Parent task id of `task`, or `None` for a root task.
+pub fn task_parent(task: u64) -> Option<u64> {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.iter().find(|entry| entry.id == task))
+        .and_then(|entry| entry.ppid)
+}
+
+/// Personality of a live task, used to bound signals to the Linux layer.
+#[cfg(feature = "linux-abi")]
+pub fn task_personality(task: u64) -> Option<Personality> {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.iter().find(|entry| entry.id == task))
+        .map(|entry| entry.personality)
+}
+
+/// True when `task` holds a delegated capability for `target` carrying
+/// `rights`. Mirrors `SYS_WAITPID`'s authorization: a spawn handle is
+/// authority over that specific target, not a global privilege.
+pub fn task_has_target_rights(task: u64, target: u64, rights: u32) -> bool {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.iter().find(|entry| entry.id == task))
+        .map(|entry| entry.cap_table.has_target_rights(target, rights))
+        .unwrap_or(false)
 }
 
 /// Live user TLS register. `TaskContext::tls` is only refreshed when the task
@@ -5113,6 +5151,19 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         // before their free, so a Dead task's pointer here is either None or
         // a `'static` queue (e.g. PROCESS_WAIT_QUEUE).
         detach_from_wait_queue(task);
+        // `exit_group` and other cross-CPU kills mark a sibling Dead without
+        // running its own exit path, so the per-task tables (mailboxes, Linux
+        // descriptors, signal dispositions, futex waiters, VFS handles) would
+        // stay allocated for the life of the machine. These helpers are
+        // idempotent: a task that exited normally already cleared them here.
+        #[cfg(feature = "linux-abi")]
+        crate::linux_fd::close_task(task.id);
+        #[cfg(feature = "linux-abi")]
+        crate::linux_signal::close_task(task.id);
+        #[cfg(feature = "linux-abi")]
+        crate::linux_abi::futex_cleanup(task.id);
+        crate::ipc::remove_task(task.id);
+        vfs::close_task(task.id);
         wake.extend(task.release_mutexes());
         task.cap_table.remove_all();
         task.bound_irq = None;

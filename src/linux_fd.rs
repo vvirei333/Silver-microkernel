@@ -684,6 +684,14 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         Target::Vfs(vfs_fd) => {
             let mut bytes = alloc::vec![0_u8; (count as usize).min(1 << 20)];
             user_memory::copy_from_user(buffer, &mut bytes).map_err(|_| EFAULT)?;
+            // The native `SYS_FS_WRITE` path checks the manifest quota before
+            // touching the VFS. The Linux path must enforce the same budget,
+            // or a task with a small quota could fill the shared RamFs up to
+            // the global limit.
+            let blocks = (bytes.len().div_ceil(512) + 2) as u32;
+            if !crate::scheduler::fs_quota_allows(blocks, 0) {
+                return Err(ENOSPC);
+            }
             vfs::write(task, vfs_fd, &bytes)
                 .map(|written| written as u64)
                 .map_err(|_| EBADF)

@@ -246,6 +246,18 @@ impl Reader {
         block >= self.superblock.data_block_start && block < self.superblock.total_blocks
     }
 
+    /// Reads one on-disk allocation bit. Streaming mount verification must not
+    /// trust the bitmap as a whole, so every referenced block is checked here.
+    fn bitmap_used(&self, block: u32) -> Option<bool> {
+        let byte = block as usize / 8;
+        let bitmap_block = self.superblock.bitmap_block + (byte / BLOCK_SIZE) as u32;
+        let mut bytes = [0_u8; BLOCK_SIZE];
+        if !read_block(bitmap_block, &mut bytes) {
+            return None;
+        }
+        Some(bytes[byte % BLOCK_SIZE] & (1 << (block % 8)) != 0)
+    }
+
     /// Physical block backing logical `slot`, or `None` for a hole/EOF.
     fn block_at(&self, inode: &Inode, slot: usize) -> Option<u32> {
         let block = if slot < DIRECT_BLOCKS {
@@ -1232,6 +1244,151 @@ pub fn loaded() -> bool {
     STATE.lock().superblock.is_some()
 }
 
+/// Records one reachable block: it must be a data block, must be marked used
+/// in the bitmap, and must not already be owned by another inode. A duplicate
+/// is the corruption `truncate`/`free_many` would turn into a double free
+/// across two live files.
+fn mark_referenced(reader: &Reader, referenced: &mut [bool], block: u32) -> bool {
+    let Some(index) = block
+        .checked_sub(reader.superblock.data_block_start)
+        .map(|index| index as usize)
+    else {
+        return false;
+    };
+    let Some(slot) = referenced.get_mut(index) else {
+        return false;
+    };
+    if *slot {
+        return false;
+    }
+    if reader.bitmap_used(block) != Some(true) {
+        return false;
+    }
+    *slot = true;
+    true
+}
+
+/// Verifies the on-disk image through the streaming cache before the first
+/// write. The old whole-image `sfs_format::fsck` disappeared with the switch
+/// to streaming reads; without this pass a cross-linked or stale-bitmap image
+/// mounts and the first truncate frees a block that another live file still
+/// owns. Leaked blocks are tolerated (they are unreachable but harmless), like
+/// the offline fsck.
+fn verify_image(reader: &Reader) -> bool {
+    let superblock = reader.superblock;
+    let data_blocks = superblock
+        .total_blocks
+        .saturating_sub(superblock.data_block_start) as usize;
+    if data_blocks == 0 {
+        return false;
+    }
+    let mut referenced = alloc::vec![false; data_blocks];
+
+    for index in 0..superblock.inode_count {
+        let Some(inode) = reader.inode(index) else {
+            return false;
+        };
+        match inode.kind {
+            INODE_KIND_FREE => continue,
+            INODE_KIND_FILE | INODE_KIND_DIR => {}
+            _ => return false,
+        }
+        let limit = if inode.is_dir() {
+            MAX_FILE_BLOCKS
+        } else {
+            let needed = (inode.size as usize).div_ceil(BLOCK_SIZE);
+            if needed > MAX_FILE_BLOCKS {
+                return false;
+            }
+            needed
+        };
+        for slot in 0..limit {
+            match reader.block_at(&inode, slot) {
+                Some(block) => {
+                    if !mark_referenced(reader, &mut referenced, block) {
+                        return false;
+                    }
+                }
+                None if inode.is_dir() => break,
+                // A file that claims more blocks than its tree holds has
+                // truncated metadata: fail instead of reading garbage.
+                None => return false,
+            }
+        }
+        if inode.is_dir() {
+            for slot in 0..MAX_FILE_BLOCKS {
+                let Some(block) = reader.block_at(&inode, slot) else {
+                    break;
+                };
+                let mut bytes = [0_u8; BLOCK_SIZE];
+                if !read_block(block, &mut bytes) {
+                    return false;
+                }
+                for entry in 0..DIR_ENTRIES_PER_BLOCK {
+                    let offset = entry * DIR_ENTRY_SIZE;
+                    let child = u32_at(&bytes, offset);
+                    if child == 0 {
+                        continue;
+                    }
+                    if child >= superblock.inode_count || child == index {
+                        return false;
+                    }
+                    if reader.inode(child).map(|child| child.kind) == Some(INODE_KIND_FREE) {
+                        return false;
+                    }
+                }
+            }
+        }
+        if inode.indirect != 0 && !mark_referenced(reader, &mut referenced, inode.indirect) {
+            return false;
+        }
+        if inode.double != 0 && !mark_referenced(reader, &mut referenced, inode.double) {
+            return false;
+        }
+        if inode.double != 0 {
+            let mut node = [0_u8; BLOCK_SIZE];
+            if !read_block(inode.double, &mut node) {
+                return false;
+            }
+            for table in 0..INDIRECT_POINTERS {
+                let block = u32_at(&node, table * 4);
+                if block != 0 && !mark_referenced(reader, &mut referenced, block) {
+                    return false;
+                }
+            }
+        }
+        if inode.triple != 0 && !mark_referenced(reader, &mut referenced, inode.triple) {
+            return false;
+        }
+        if inode.triple != 0 {
+            let mut root = [0_u8; BLOCK_SIZE];
+            if !read_block(inode.triple, &mut root) {
+                return false;
+            }
+            for outer in 0..INDIRECT_POINTERS {
+                let double_block = u32_at(&root, outer * 4);
+                if double_block == 0 {
+                    continue;
+                }
+                if !mark_referenced(reader, &mut referenced, double_block) {
+                    return false;
+                }
+                let mut node = [0_u8; BLOCK_SIZE];
+                if !read_block(double_block, &mut node) {
+                    return false;
+                }
+                for middle in 0..INDIRECT_POINTERS {
+                    let table = u32_at(&node, middle * 4);
+                    if table != 0 && !mark_referenced(reader, &mut referenced, table) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+    true
+}
+
 /// Mounts the on-disk SFS in streaming mode. Only block 0 and the root inode
 /// are touched up front; everything else is read on demand.
 pub fn load() -> bool {
@@ -1267,6 +1424,12 @@ pub fn load() -> bool {
     };
     if !root.is_dir() {
         console::write_str("KSFS: root is not a directory\r\n");
+        STATE.lock().superblock = None;
+        return false;
+    }
+    let consistent = reader().map(|reader| verify_image(&reader)).unwrap_or(false);
+    if !consistent {
+        console::write_str("KSFS: inconsistent image, refusing to mount\r\n");
         STATE.lock().superblock = None;
         return false;
     }

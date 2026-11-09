@@ -354,6 +354,13 @@ fn linux_execve(
     envp_pointer: u64,
 ) -> u64 {
     const EXEC_LIMIT: usize = 32 * 1024 * 1024;
+    // `execve` from a `CLONE_VM` sibling would build a new address space and
+    // then release the leader's, pulling the tables out from under every
+    // running thread. Until a thread takes over the whole group, refuse
+    // instead of corrupting the process.
+    if scheduler::current_is_thread() {
+        return errno(EINVAL);
+    }
     let Some(path) = user_string(path_pointer) else {
         return errno(EFAULT);
     };
@@ -816,11 +823,20 @@ fn parse_rights(control: u64, controllen: u64) -> Result<Vec<u64>, u64> {
         let length = u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap());
         let level = i32::from_le_bytes(raw[offset + 8..offset + 12].try_into().unwrap());
         let kind = i32::from_le_bytes(raw[offset + 12..offset + 16].try_into().unwrap());
-        if length < 16 || offset as u64 + length > controllen {
+        if length < 16 {
             break;
         }
+        // `length` is attacker-controlled: a plain `offset + length` wraps in
+        // release builds. A wrapped sum used to pass the bound check and then
+        // made `offset` wrap backwards, so the loop never advanced and the
+        // kernel spun forever holding the kernel lock. Every step is checked
+        // and must make strict forward progress.
+        let end = match (offset as u64).checked_add(length) {
+            Some(end) if end <= controllen => end as usize,
+            _ => break,
+        };
         if level == SOL_SOCKET as i32 && kind == SCM_RIGHTS as i32 {
-            let count = (length as usize - 16) / 4;
+            let count = (end - offset - 16) / 4;
             if count > 64 {
                 return Err(EINVAL);
             }
@@ -832,7 +848,14 @@ fn parse_rights(control: u64, controllen: u64) -> Result<Vec<u64>, u64> {
                 }
             }
         }
-        offset += (length as usize + 7) & !7;
+        let advance = match (length as usize).checked_add(7) {
+            Some(value) => value & !7,
+            None => break,
+        };
+        offset = match offset.checked_add(advance) {
+            Some(next) if next > offset => next,
+            _ => break,
+        };
     }
     Ok(fds)
 }
@@ -1310,8 +1333,19 @@ fn linux_kill(pid: i64, signal: u64) -> u64 {
     }
     let task = scheduler::current_task_id();
     let target = if pid > 0 { pid as u64 } else { task };
-    if target != task && !scheduler::task_alive(target) {
-        return errno(ESRCH);
+    if target != task {
+        if !scheduler::task_alive(target) {
+            return errno(ESRCH);
+        }
+        // Linux checks the sender's credentials here. Every task runs as uid
+        // 0 in this system, so a uid comparison would authorize everything;
+        // the real boundary is the kernel object graph: self, own threads,
+        // parent/child, an explicit CAP_KILL handle, or another Linux task.
+        // Native daemons (net_server, wolfser, drivers) are unreachable from
+        // a stray pid guess.
+        if !may_signal(task, target) {
+            return errno(EPERM);
+        }
     }
     if signal == 0 {
         return 0;
@@ -1343,6 +1377,31 @@ fn linux_kill(pid: i64, signal: u64) -> u64 {
         scheduler::wake_for_signal(target);
     }
     0
+}
+
+/// Authorization for `kill(2)`: self, same thread group, parent or child, a
+/// delegated `CAP_KILL` handle, or another Linux task. Native daemons stay out
+/// of reach unless a handle explicitly grants `CAP_KILL`.
+#[cfg(feature = "linux-abi")]
+fn may_signal(sender: u64, target: u64) -> bool {
+    if sender == target || scheduler::group_leader(sender) == scheduler::group_leader(target) {
+        return true;
+    }
+    if scheduler::task_parent(target) == Some(sender)
+        || scheduler::task_parent(sender) == Some(target)
+    {
+        return true;
+    }
+    if scheduler::task_has_target_rights(sender, target, crate::capability::CAP_KILL) {
+        return true;
+    }
+    matches!(
+        (
+            scheduler::task_personality(sender),
+            scheduler::task_personality(target),
+        ),
+        (Some(scheduler::Personality::Linux), Some(scheduler::Personality::Linux))
+    )
 }
 
 fn linux_write(fd: u64, buffer: u64, count: u64) -> u64 {
