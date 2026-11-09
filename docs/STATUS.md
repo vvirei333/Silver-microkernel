@@ -61,8 +61,9 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   - `zxdg_decoration_manager_v1` (client-side configure, set/unset mode),
     `wp_viewporter` (source/destination scaling), `wl_subcompositor`
     (subsurface position/place/sync), `zxdg_output_manager_v1` v3
-    (logical position/size/name/description) and `xdg_activation_v1`
-    (token/activate);
+    (logical position/size/name/description), `xdg_activation_v1`
+    (token/activate) and `wp_fractional_scale_manager_v1` (preferred 2.0
+    scale);
   - `wl_output` v4 (geometry/mode/scale/name/description/done) and `wl_seat`
     v5 (name, pointer+keyboard), plus `wl_surface.enter` for the output;
   - `wl_keyboard.keymap` memfd over `SCM_RIGHTS`, `repeat_info`,

@@ -591,8 +591,9 @@ negotiates client-side decorations (`set_mode`/`unset_mode`, configure),
 `wp_viewporter` accepts source/destination crop-scale state, and
 `wl_subcompositor` accepts child surfaces with position, place and
 sync/desync requests, `zxdg_output_manager_v1` reports the logical output
-region, name and description, and `xdg_activation_v1` issues an activation
-token and accepts `activate`. The vendored `xdg-shell-client-protocol.h`/
+region, name and description, `xdg_activation_v1` issues an activation token
+and accepts `activate`, and `wp_fractional_scale_manager_v1` reports a
+preferred scale of 240/120 (2.0) for the surface. The vendored `xdg-shell-client-protocol.h`/
 `.c` come from `wayland-protocols` 1.50.
 
 Input and output are advertised as well: `wl_output` v4 sends

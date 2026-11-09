@@ -18,6 +18,7 @@
 #include "viewporter-client-protocol.h"
 #include "xdg-output-client-protocol.h"
 #include "xdg-activation-client-protocol.h"
+#include "fractional-scale-client-protocol.h"
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shared_memory;
@@ -37,6 +38,9 @@ static int xdg_output_ok;
 static struct xdg_activation_v1 *activation;
 static struct xdg_activation_token_v1 *activation_token;
 static int activation_token_ok;
+static struct wp_fractional_scale_manager_v1 *fractional_manager;
+static struct wp_fractional_scale_v1 *fractional_scale;
+static int fractional_ok;
 static struct wl_data_device *data_device;
 static struct wl_data_source *data_source;
 static struct wl_data_offer *clipboard_offer;
@@ -258,6 +262,19 @@ static const struct xdg_activation_token_v1_listener activation_listener = {
     .done = activation_token_done,
 };
 
+static void fractional_preferred_scale(void *data,
+                                       struct wp_fractional_scale_v1 *scale,
+                                       uint32_t preferred) {
+    (void)data; (void)scale;
+    if (preferred == 240) {
+        fractional_ok = 1;
+    }
+}
+
+static const struct wp_fractional_scale_v1_listener fractional_listener = {
+    .preferred_scale = fractional_preferred_scale,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version) {
@@ -306,6 +323,11 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 1 ? version : 1;
         activation = wl_registry_bind(registry, name,
                                       &xdg_activation_v1_interface, use);
+    } else if (strcmp(interface,
+                      wp_fractional_scale_manager_v1_interface.name) == 0) {
+        uint32_t use = version < 1 ? version : 1;
+        fractional_manager = wl_registry_bind(
+            registry, name, &wp_fractional_scale_manager_v1_interface, use);
     }
 }
 
@@ -723,6 +745,29 @@ int main(int argc, char **argv) {
         fprintf(stderr, "wlclient: activation token missing\n");
         return 8;
     }
+    if (fractional_manager == NULL) {
+        fprintf(stderr, "wlclient: fractional scale missing\n");
+        return 8;
+    }
+    fractional_scale = wp_fractional_scale_manager_v1_get_fractional_scale(
+        fractional_manager, surface);
+    if (fractional_scale == NULL) {
+        return 8;
+    }
+    wp_fractional_scale_v1_add_listener(fractional_scale,
+                                        &fractional_listener, NULL);
+    for (int attempt = 0; attempt < 4 && !fractional_ok; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (!fractional_ok) {
+        fprintf(stderr, "wlclient: fractional scale missing\n");
+        return 8;
+    }
+    wp_fractional_scale_v1_destroy(fractional_scale);
+    wp_fractional_scale_manager_v1_destroy(fractional_manager);
+
     xdg_activation_v1_activate(activation, "werewolf-token", surface);
     xdg_activation_token_v1_destroy(activation_token);
     xdg_activation_v1_destroy(activation);

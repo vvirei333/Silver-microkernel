@@ -250,6 +250,8 @@ static unsigned xdg_output_manager_id;
 static unsigned xdg_output_id;
 static unsigned activation_id;
 static unsigned activation_token_id;
+static unsigned fractional_manager_id;
+static unsigned fractional_id;
 static unsigned subsurface_surface_id;
 static int subsurface_ok;
 static unsigned data_source_id;
@@ -301,6 +303,8 @@ typedef struct {
     unsigned xdg_output_id;
     unsigned activation_id;
     unsigned activation_token_id;
+    unsigned fractional_manager_id;
+    unsigned fractional_id;
     unsigned subsurface_surface_id;
     int subsurface_ok;
     unsigned data_source_id;
@@ -342,6 +346,7 @@ typedef struct {
     X(subcompositor_id) X(subsurface_id) X(subsurface_surface_id) X(subsurface_ok) \
     X(xdg_output_manager_id) X(xdg_output_id) \
     X(activation_id) X(activation_token_id) \
+    X(fractional_manager_id) X(fractional_id) \
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
     X(configure_serial) X(surface_id) X(popup_surface_id) \
     X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
@@ -499,6 +504,8 @@ static int serve(long client) {
                 send_global_version(client, registry_id, 10,
                                     "zxdg_output_manager_v1", 3);
                 send_global(client, registry_id, 11, "xdg_activation_v1");
+                send_global(client, registry_id, 12,
+                            "wp_fractional_scale_manager_v1");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -572,7 +579,18 @@ static int serve(long client) {
                     xdg_output_manager_id = new_id;
                 } else if (text_equal(interface, "xdg_activation_v1")) {
                     activation_id = new_id;
+                } else if (text_equal(interface,
+                                      "wp_fractional_scale_manager_v1")) {
+                    fractional_manager_id = new_id;
                 }
+            } else if (object == fractional_manager_id && opcode == 1) {
+                fractional_id = take_u32(); /* get_fractional_scale */
+                (void)take_u32(); /* surface */
+                begin(fractional_id, 0 /* preferred_scale */);
+                put_u32(240); /* 2.0 */
+                finish(); send_message(client, -1);
+            } else if (object == fractional_id && opcode == 0) {
+                fractional_id = 0;
             } else if (object == activation_id && opcode == 1) {
                 activation_token_id = take_u32(); /* get_activation_token */
             } else if (object == activation_token_id && opcode == 3) {
@@ -1076,6 +1094,8 @@ static void reset_client(void) {
     xdg_output_id = 0;
     activation_id = 0;
     activation_token_id = 0;
+    fractional_manager_id = 0;
+    fractional_id = 0;
     subsurface_surface_id = 0;
     subsurface_ok = 0;
     data_source_id = 0;
