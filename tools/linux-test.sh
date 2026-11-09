@@ -32,6 +32,7 @@
 #   linuxrun /sfs/linux-sockets # glibc AF_UNIX + SCM_RIGHTS, prints 'glibc socket ok'
 #   linuxrun /sfs/linux-memfd  # memfd + MAP_SHARED across fork, prints 'shared memfd ok'
 #   linuxrun /sfs/linux-namedsock # bind/listen/accept/connect, prints 'named socket ok'
+#   linuxrun /sfs/linux-scratch # writable /tmp + mkdir/unlink/rename, prints 'scratch ok'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -158,6 +159,9 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     "$CC" -O2 -o build/memfd-shared tests/linux/memfd_shared.c
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/memfd-shared
+    "$CC" -O2 -o build/scratch tests/linux/scratch.c
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/scratch
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-hello linux-dyn
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-signal linux-dynsig
     python3 scripts/sfs_inject.py "$IMAGE" build/pthread-test linux-pthread
@@ -166,7 +170,8 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     python3 scripts/sfs_inject.py "$IMAGE" build/exitgroup-thread linux-exitgroup
     python3 scripts/sfs_inject.py "$IMAGE" build/sockets linux-sockets
     python3 scripts/sfs_inject.py "$IMAGE" build/memfd-shared linux-memfd
-    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit linuxrun /sfs/linux-groupsig linuxrun /sfs/linux-exitgroup linuxrun /sfs/linux-sockets linuxrun /sfs/linux-memfd"
+    python3 scripts/sfs_inject.py "$IMAGE" build/scratch linux-scratch
+    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit linuxrun /sfs/linux-groupsig linuxrun /sfs/linux-exitgroup linuxrun /sfs/linux-sockets linuxrun /sfs/linux-memfd linuxrun /sfs/linux-scratch"
 else
     DYN=""
     echo "note: patchelf or the dynamic AArch64 libc is missing; skipped the dynamic test" >&2

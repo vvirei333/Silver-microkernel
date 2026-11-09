@@ -406,6 +406,7 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     const O_WRONLY: u64 = 0o1;
     const O_RDWR: u64 = 0o2;
     const O_CREAT: u64 = 0o100;
+    const O_EXCL: u64 = 0o200;
     const O_TRUNC: u64 = 0o1000;
     const O_APPEND: u64 = 0o2000;
     const O_DIRECTORY: u64 = 0o200000;
@@ -424,8 +425,34 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     if !crate::scheduler::read_path_allowed(task, &resolved) {
         return Err(EACCES);
     }
-    if flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND) != 0 {
-        return Err(EROFS);
+    let wants_write =
+        flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND) != 0;
+    if wants_write {
+        // SFS is read-only; only the RamFs scratch tree accepts writes.
+        if !silver_microkernel::path_is_under(&resolved, crate::scheduler::LINUX_SCRATCH_PREFIX)
+        {
+            return Err(EROFS);
+        }
+        let exists = vfs::file_len(cwd, path).is_ok();
+        if flags & O_CREAT != 0 && flags & O_EXCL != 0 && exists {
+            return Err(EEXIST);
+        }
+        if flags & O_TRUNC != 0 {
+            vfs::create(cwd, path).map_err(|_| EACCES)?;
+        } else if !exists {
+            if flags & O_CREAT == 0 {
+                return Err(ENOENT);
+            }
+            vfs::create(cwd, path).map_err(|_| EACCES)?;
+        }
+        let vfs_flags = crate::vfs::OPEN_WRITE
+            | if flags & O_APPEND != 0 {
+                crate::vfs::OPEN_APPEND
+            } else {
+                0
+            };
+        let fd = vfs::open(task, cwd, path, vfs_flags).map_err(|_| EACCES)?;
+        return insert(task, Target::Vfs(fd)).ok_or(EMFILE);
     }
     if flags & O_DIRECTORY != 0 {
         let fd = vfs::open_dir(task, cwd, path).map_err(|_| ENOENT)?;
@@ -1637,6 +1664,7 @@ const EPIPE: u64 = 32;
 const ENOTSOCK: u64 = 88;
 const ENOTCONN: u64 = 107;
 const EADDRINUSE: u64 = 98;
+const EEXIST: u64 = 17;
 const ECONNREFUSED: u64 = 111;
 const ENOMEM: u64 = 12;
 const EFBIG: u64 = 27;

@@ -501,6 +501,19 @@ Redmi port is parked. The reference checklist is
   with the fix, 14 consecutive `linux-memfd` runs (glibc `fork` + TLS) and the
   full series are clean. Full series plus repeats and `health`:
   9596/31578 frames, zero zombies/open files/DMA leaks; fsck clean.
+  **Slice 24 (writable scratch tree):** the root RamFs already had `/tmp`;
+  Linux tasks may now read and write it while SFS stays read-only. `openat`
+  with `O_CREAT`/`O_EXCL`/`O_TRUNC`/`O_APPEND` creates, truncates and appends
+  through the VFS, and `mkdirat`, `unlinkat` (including `AT_REMOVEDIR`) and
+  `renameat`/`renameat2` work there. `RamFs` gained a replacing `rename`, and
+  the VFS scope check allows the scratch prefix. Linux spawn supplies
+  `TMPDIR=/tmp` and `XDG_RUNTIME_DIR=/tmp`, the locations Wayland/D-Bus
+  toolkits use for sockets and lock files. Test: `linux-scratch` checks
+  `getenv`, creates a lock file with `O_EXCL`, verifies `EEXIST`, appends,
+  `stat`s the size, renames over the destination, writes inside a runtime
+  directory, removes everything, and confirms `/sfs` still returns `EROFS`;
+  prints `scratch ok`. Full series plus repeats and `health`:
+  9596/31577 frames, zero zombies/open files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -527,9 +540,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 24 (writable runtime directory/tmpfs), then
-  headless Wayland/GTK/D-Bus → Phosh. Network base maintenance (keep-alive,
-  TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 25 (start the Wayland/GTK/D-Bus stack on
+  top of socketpair/named sockets, shared memfd and the writable runtime
+  directory). Network base maintenance (keep-alive, TLS roots/RTC/RNG,
+  TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

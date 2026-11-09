@@ -509,6 +509,18 @@ howl> linuxrun /sfs/linux-scope
 scope ok
 ```
 
+`/tmp` is the writable scratch tree: it lives on the root RamFs, so `openat`
+with `O_CREAT`/`O_TRUNC`/`O_APPEND`, `mkdirat`, `unlinkat` and
+`renameat`/`renameat2` work there, while SFS stays read-only. Linux tasks see
+`TMPDIR=/tmp` and `XDG_RUNTIME_DIR=/tmp`, which is where Wayland and D-Bus put
+sockets and lock files. The test round-trips a lock file, `O_EXCL`, `stat`,
+rename-over-destination, a file inside a runtime directory, and cleanup:
+
+```text
+howl> linuxrun /sfs/linux-scratch
+scratch ok
+```
+
 Threads use `clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_SETTLS)`: they
 share the leader's address space and memory, get a separate user/kernel stack
 and per-thread `TPIDR_EL0` TLS, and exit through a futex-based join

@@ -2909,10 +2909,29 @@ pub fn read_path_allowed(task: u64, path: &str) -> bool {
         return false;
     };
     match &task.read_prefix {
-        Some(prefix) => silver_microkernel::path_is_under(path, prefix),
+        Some(prefix) => {
+            if silver_microkernel::path_is_under(path, prefix) {
+                return true;
+            }
+            // The writable scratch tree is also readable: toolkits keep
+            // their runtime sockets and lock files there.
+            #[cfg(feature = "linux-abi")]
+            {
+                task.personality == Personality::Linux
+                    && silver_microkernel::path_is_under(path, LINUX_SCRATCH_PREFIX)
+            }
+            #[cfg(not(feature = "linux-abi"))]
+            {
+                false
+            }
+        }
         None => true,
     }
 }
+
+/// Writable tree for Linux tasks. `/tmp` lives on the root RamFs, so it is a
+/// real, in-memory writable filesystem; SFS stays read-only.
+pub const LINUX_SCRATCH_PREFIX: &str = "/tmp";
 
 pub fn current_read_path_allowed(path: &str) -> bool {
     read_path_allowed(current_task_id(), path)

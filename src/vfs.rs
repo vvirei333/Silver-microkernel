@@ -398,6 +398,25 @@ impl FileSystem for RamFs {
         Ok(())
     }
 
+    fn replace(&mut self, source: &str, destination: &str) -> Result<(), ()> {
+        if source == destination {
+            return Ok(());
+        }
+        let destination_components = rel_components(destination)?;
+        let destination_node = find_node(&self.root, &destination_components);
+        let destination_is_file = destination_node
+            .map(|node| matches!(node.kind, NodeKind::File(_)))
+            .unwrap_or(false);
+        if destination_node.is_some() && !destination_is_file {
+            // Renaming a file over a directory is refused.
+            return Err(());
+        }
+        if destination_is_file {
+            self.remove_file(destination)?;
+        }
+        self.rename(source, destination)
+    }
+
     fn is_directory(&self, path: &str) -> Result<bool, ()> {
         let components = rel_components(path)?;
         match &find_node(&self.root, &components).ok_or(())?.kind {

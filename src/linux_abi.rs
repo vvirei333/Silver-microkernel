@@ -16,6 +16,7 @@
 
 use crate::mutex::Mutex;
 use crate::{linux_fd, scheduler, timer, user_memory};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 struct FutexWaiter {
@@ -90,6 +91,10 @@ const SYS_GETRANDOM: u64 = 278;
 const SYS_RSEQ: u64 = 293;
 const SYS_PREAD64: u64 = 67;
 const SYS_PWRITE64: u64 = 68;
+const SYS_MKDIRAT: u64 = 34;
+const SYS_UNLINKAT: u64 = 35;
+const SYS_RENAMEAT: u64 = 38;
+const SYS_RENAMEAT2: u64 = 276;
 const SYS_FTRUNCATE: u64 = 46;
 const SYS_FALLOCATE: u64 = 47;
 const SYS_SOCKET: u64 = 198;
@@ -122,7 +127,9 @@ const ENOTDIR: u64 = 20;
 const EISDIR: u64 = 21;
 const EINVAL: u64 = 22;
 const EMFILE: u64 = 24;
-const ENOTTY: u64 = 25;const ESPIPE: u64 = 29;
+const EEXIST: u64 = 17;
+const ENOTTY: u64 = 25;
+const ESPIPE: u64 = 29;
 const EROFS: u64 = 30;
 const ERANGE: u64 = 34;
 const ENOSYS: u64 = 38;
@@ -214,6 +221,10 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_FCNTL => linux_fcntl(args[0], args[1], args[2]),
         SYS_GETCWD => linux_getcwd(args[0], args[1]),
         SYS_CHDIR => linux_chdir(args[0]),
+        SYS_MKDIRAT => linux_mkdirat(args[0], args[1], args[2]),
+        SYS_UNLINKAT => linux_unlinkat(args[0], args[1], args[2]),
+        SYS_RENAMEAT => linux_renameat(args[0], args[1], args[2], args[3], 0),
+        SYS_RENAMEAT2 => linux_renameat(args[0], args[1], args[2], args[3], args[4]),
         SYS_IOCTL => linux_ioctl(args[0], args[1], args[2]),
         SYS_FSTAT => finish(linux_fd::fstat(scheduler::current_task_id(), args[0], args[1]).map(|_| 0)),
         SYS_NEWFSTATAT => linux_newfstatat(args[0], args[1], args[2], args[3]),
@@ -1318,6 +1329,91 @@ fn linux_getcwd(buffer: u64, capacity: u64) -> u64 {
         return errno(EFAULT);
     }
     (bytes.len() + 1) as u64
+}
+
+const AT_REMOVEDIR: u64 = 0x200;
+const RENAME_NOREPLACE: u64 = 1;
+
+fn scratch_resolved(dirfd: u64, path_pointer: u64) -> Result<(String, String), u64> {
+    let Some(path) = user_string(path_pointer) else {
+        return Err(EFAULT);
+    };
+    if path.is_empty() {
+        return Err(ENOENT);
+    }
+    let cwd = dirfd_cwd(dirfd)?;
+    let resolved = crate::vfs::resolve(&cwd, &path).map_err(|_| ENOENT)?;
+    if !silver_microkernel::path_is_under(&resolved, crate::scheduler::LINUX_SCRATCH_PREFIX) {
+        return Err(EROFS);
+    }
+    Ok((cwd, path))
+}
+
+fn linux_mkdirat(dirfd: u64, path_pointer: u64, _mode: u64) -> u64 {
+    let (cwd, path) = match scratch_resolved(dirfd, path_pointer) {
+        Ok(pair) => pair,
+        Err(code) => return errno(code),
+    };
+    match crate::vfs::mkdir(&cwd, &path) {
+        Ok(()) => 0,
+        Err(()) => {
+            if crate::vfs::resolve_directory(&cwd, &path).is_ok() {
+                errno(EEXIST)
+            } else {
+                errno(EACCES)
+            }
+        }
+    }
+}
+
+fn linux_unlinkat(dirfd: u64, path_pointer: u64, flags: u64) -> u64 {
+    if flags & !AT_REMOVEDIR != 0 {
+        return errno(EINVAL);
+    }
+    let (cwd, path) = match scratch_resolved(dirfd, path_pointer) {
+        Ok(pair) => pair,
+        Err(code) => return errno(code),
+    };
+    let result = if flags & AT_REMOVEDIR != 0 {
+        crate::vfs::rmdir(&cwd, &path, scheduler::cwd_in_use)
+    } else {
+        crate::vfs::unlink(&cwd, &path)
+    };
+    if result.is_ok() {
+        0
+    } else {
+        errno(EACCES)
+    }
+}
+
+fn linux_renameat(
+    old_dirfd: u64,
+    old_pointer: u64,
+    new_dirfd: u64,
+    new_pointer: u64,
+    flags: u64,
+) -> u64 {
+    if flags & !(RENAME_NOREPLACE | 2) != 0 || flags & 2 != 0 {
+        return errno(ENOSYS);
+    }
+    let (_, old_path) = match scratch_resolved(old_dirfd, old_pointer) {
+        Ok(pair) => pair,
+        Err(code) => return errno(code),
+    };
+    let (_, new_path) = match scratch_resolved(new_dirfd, new_pointer) {
+        Ok(pair) => pair,
+        Err(code) => return errno(code),
+    };
+    let result = if flags & RENAME_NOREPLACE != 0 {
+        crate::vfs::rename("/", &old_path, &new_path, scheduler::cwd_in_use)
+    } else {
+        crate::vfs::replace("/", &old_path, &new_path)
+    };
+    if result.is_ok() {
+        0
+    } else {
+        errno(EACCES)
+    }
 }
 
 fn linux_chdir(path_ptr: u64) -> u64 {
