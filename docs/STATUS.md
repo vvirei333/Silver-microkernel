@@ -31,7 +31,10 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 - virtio-blk-pci + virtio-net, GENI UART, PSCI power off/reset.
 - SFS rootfs read on demand through a 256 KiB block cache (streaming); the
   image no longer occupies RAM. Create/truncate/write, mkdir/remove and
-  rename/replace all work on the same cache. Writable RamFs at `/tmp`.
+  rename/replace all work on the same cache. The block tree reaches a third
+  indirect level (format maximum about 1 GiB; the 64 MiB image is the real
+  bound), and freeing a large file clears its bitmap in batched writes.
+  Writable RamFs at `/tmp`.
 - Console shell (`howl`) with file, process, mount, network and health commands.
 - Fastfetch-style boot banner, kernel/userspace version **0.1.1**.
 
@@ -74,7 +77,8 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 |---|---|
 | SFS image | 64 MiB, 2048 inodes, read on demand (256 KiB block cache) |
 | Kernel heap | 16 MiB |
-| Single SFS file | 8 MiB (block-tree maximum; streaming backend) |
+| Single SFS file | ~1 GiB tree / image-bound (triple indirect) |
+| Whole-file read / exec | 8 MiB (`MAX_FILE_BYTES`; streamed file I/O has no such cap) |
 | Anonymous mmap per task | 24 MiB |
 | Tasks | 64 (zombies capped separately) |
 | Linux fds per process | 256 |
@@ -83,8 +87,9 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 SFS writes allocate blocks through the streaming cache (bitmap, inode table
 and directory blocks are read-modify-written in place). Same-parent and
 cross-directory rename (files and directories), rollback on a failed move,
-and replace-over-destination are implemented. The per-file cap is still
-8 MiB until the block tree grows a third indirect level.
+and replace-over-destination are implemented. The block tree now has direct,
+single, double and triple indirect levels; whole-file reads and `exec` are
+still capped separately at 8 MiB so they cannot allocate an unbounded buffer.
 
 ## Test matrix
 

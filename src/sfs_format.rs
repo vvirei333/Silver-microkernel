@@ -24,9 +24,10 @@ pub const NAME_MAX: usize = 27;
 pub const DIRECT_BLOCKS: usize = 4;
 /// Pointers in one table block (512 / 4).
 pub const INDIRECT_POINTERS: usize = BLOCK_SIZE / 4;
-/// A file can use 4 direct blocks, the indirect table and the double
-/// indirect tree. The VFS caps a file at 512 KiB, so only the first few
-/// sub-tables are ever used.
+/// The in-memory host-test reference models 4 direct blocks, the indirect
+/// table and the double-indirect tree. The kernel streaming backend and
+/// `scripts/sfs_*.py` additionally use the word at offset 32 as a triple
+/// indirect pointer; this host path keeps the smaller tree.
 pub const MAX_FILE_BLOCKS: usize =
     DIRECT_BLOCKS + INDIRECT_POINTERS + INDIRECT_POINTERS * INDIRECT_POINTERS;
 pub const DOUBLE_FIRST_SLOT: usize = DIRECT_BLOCKS + INDIRECT_POINTERS;

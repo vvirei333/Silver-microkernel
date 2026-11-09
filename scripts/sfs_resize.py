@@ -7,8 +7,9 @@ a bigger inode table). Rather than moving raw blocks around and rewriting every
 inode reference, this tool builds a new image and copies the filesystem tree:
 
   * inode numbers and directory entries stay identical (so paths never change);
-  * every data block and indirect table is reallocated sequentially in the new
-    image and written back into the inode that owned it.
+  * every data block and indirect table (single, double or triple) is
+    reallocated sequentially in the new image and written back into the inode
+    that owned it.
 
 Usage:
   sfs_resize.py [image] [megabytes] [inode_count]
@@ -77,8 +78,8 @@ class Image:
         offset = self.inode_offset(index)
         kind, size = struct.unpack_from("<II", self.data, offset)
         blocks = list(struct.unpack_from("<4I", self.data, offset + 8))
-        indirect, double = struct.unpack_from("<II", self.data, offset + 24)
-        return kind, size, blocks, indirect, double
+        indirect, double, triple = struct.unpack_from("<III", self.data, offset + 24)
+        return kind, size, blocks, indirect, double, triple
 
     def block_bytes(self, block: int) -> bytes:
         start = block * BLOCK
@@ -117,7 +118,7 @@ class Builder:
         self.data[start : start + BLOCK] = self.old.block_bytes(source)
         return block
 
-    def copy_tree(self, blocks, indirect: int, double: int):
+    def copy_tree(self, blocks, indirect: int, double: int, triple: int):
         """Reallocates one inode's block tree and returns the new pointers."""
         new_blocks = [0, 0, 0, 0]
         for slot, block in enumerate(blocks[:4]):
@@ -152,20 +153,48 @@ class Builder:
                             self.copy_block(block),
                         )
 
-        return new_blocks, new_indirect, new_double
+        new_triple = 0
+        if triple:
+            new_triple = self.alloc()
+            for outer, double_block in enumerate(self.old.pointers(triple)):
+                if not double_block:
+                    continue
+                new_double = self.alloc()
+                struct.pack_into(
+                    "<I", self.data, new_triple * BLOCK + outer * 4, new_double
+                )
+                for middle, table in enumerate(self.old.pointers(double_block)):
+                    if not table:
+                        continue
+                    new_table = self.alloc()
+                    struct.pack_into(
+                        "<I", self.data, new_double * BLOCK + middle * 4, new_table
+                    )
+                    for entry, block in enumerate(self.old.pointers(table)):
+                        if block:
+                            struct.pack_into(
+                                "<I", self.data,
+                                new_table * BLOCK + entry * 4,
+                                self.copy_block(block),
+                            )
+
+        return new_blocks, new_indirect, new_double, new_triple
 
     def copy_inodes(self) -> None:
         for index in range(self.old.inodes):
-            kind, size, blocks, indirect, double = self.old.inode(index)
+            kind, size, blocks, indirect, double, triple = self.old.inode(index)
             if kind == INODE_KIND_FREE:
                 continue
-            new_blocks, new_indirect, new_double = self.copy_tree(
-                blocks, indirect, double
+            new_blocks, new_indirect, new_double, new_triple = self.copy_tree(
+                blocks, indirect, double, triple
             )
             destination = self.itable * BLOCK + index * INODE_SIZE
             struct.pack_into("<II", self.data, destination, kind, size)
             struct.pack_into("<4I", self.data, destination + 8, *new_blocks)
-            struct.pack_into("<II", self.data, destination + 24, new_indirect, new_double)
+            struct.pack_into(
+                "<III", self.data, destination + 24,
+                new_indirect, new_double, new_triple,
+            )
 
     def finish(self, root: int) -> bytes:
         struct.pack_into("<I", self.data, 0, MAGIC)

@@ -14,6 +14,11 @@ import sys
 BLOCK = 512
 INODE_SIZE = 64
 DIRECT = 4
+INDIRECT_POINTERS = BLOCK // 4
+INDIRECT_SQUARED = INDIRECT_POINTERS * INDIRECT_POINTERS
+DOUBLE_FIRST = DIRECT + INDIRECT_POINTERS
+TRIPLE_FIRST = DOUBLE_FIRST + INDIRECT_SQUARED
+MAX_FILE_BLOCKS = TRIPLE_FIRST + INDIRECT_SQUARED * INDIRECT_POINTERS
 KIND_NAMES = {0: "free", 1: "file", 2: "dir"}
 
 
@@ -58,14 +63,18 @@ def main(path: str) -> int:
         blocks = struct.unpack_from("<4I", image, off + 8)
         indirect = struct.unpack_from("<I", image, off + 24)[0]
         double = struct.unpack_from("<I", image, off + 28)[0]
+        triple = struct.unpack_from("<I", image, off + 32)[0]
         if kind == 0:
-            if any(blocks) or indirect != 0:
-                problems.append(f"inode {index}: free but has blocks {blocks} indirect {indirect}")
+            if any(blocks) or indirect != 0 or double != 0 or triple != 0:
+                problems.append(
+                    f"inode {index}: free but has blocks {blocks} "
+                    f"indirect {indirect} double {double} triple {triple}"
+                )
             continue
         if kind == 1:
             files += 1
-            if size > (DIRECT + 128 + 128 * 128) * BLOCK:
-                problems.append(f"inode {index}: size {size} exceeds indirect capacity")
+            if size > MAX_FILE_BLOCKS * BLOCK:
+                problems.append(f"inode {index}: size {size} exceeds block-tree capacity")
         elif kind == 2:
             dirs += 1
         else:
@@ -139,6 +148,85 @@ def main(path: str) -> int:
                         problems.append(f"inode {index}: block {block} not marked used in bitmap")
                     if kind == 1 and slot * BLOCK >= size:
                         problems.append(f"inode {index}: double block {block} beyond size {size}")
+
+        if triple != 0:
+            if not (data_start <= triple < total):
+                problems.append(f"inode {index}: triple-indirect block {triple} outside data area")
+                continue
+            if triple in owners:
+                problems.append(
+                    f"CROSS-LINK: triple-indirect {triple} also owned by {owners[triple]}"
+                )
+            else:
+                owners[triple] = f"{index} (triple)"
+            if not used(triple):
+                problems.append(f"inode {index}: triple-indirect {triple} not marked used")
+            root = struct.unpack_from("<128I", image, triple * BLOCK)
+            for outer, double_block in enumerate(root):
+                if double_block == 0:
+                    continue
+                if not (data_start <= double_block < total):
+                    problems.append(
+                        f"inode {index} triple[{outer}]: double block {double_block} "
+                        f"outside data area"
+                    )
+                    continue
+                if double_block in owners:
+                    problems.append(
+                        f"CROSS-LINK: double block {double_block} owned by "
+                        f"{owners[double_block]} and inode {index}"
+                    )
+                else:
+                    owners[double_block] = f"{index} triple[{outer}]"
+                if not used(double_block):
+                    problems.append(
+                        f"inode {index}: triple double block {double_block} not marked used"
+                    )
+                node = struct.unpack_from("<128I", image, double_block * BLOCK)
+                for middle, table in enumerate(node):
+                    if table == 0:
+                        continue
+                    if not (data_start <= table < total):
+                        problems.append(
+                            f"inode {index} triple[{outer}][{middle}]: table {table} "
+                            f"outside data area"
+                        )
+                        continue
+                    if table in owners:
+                        problems.append(
+                            f"CROSS-LINK: table {table} owned by {owners[table]} "
+                            f"and inode {index}"
+                        )
+                    else:
+                        owners[table] = f"{index} triple[{outer}][{middle}]"
+                    if not used(table):
+                        problems.append(f"inode {index}: table {table} not marked used")
+                    entries = struct.unpack_from("<128I", image, table * BLOCK)
+                    for pointer, block in enumerate(entries):
+                        if block == 0:
+                            continue
+                        slot = TRIPLE_FIRST + outer * INDIRECT_SQUARED + middle * 128 + pointer
+                        if not (data_start <= block < total):
+                            problems.append(
+                                f"inode {index} triple[{outer}][{middle}][{pointer}]: "
+                                f"block {block} outside data area"
+                            )
+                            continue
+                        if block in owners:
+                            problems.append(
+                                f"CROSS-LINK: block {block} owned by {owners[block]} "
+                                f"and inode {index}"
+                            )
+                        else:
+                            owners[block] = f"{index} triple[{outer}][{middle}][{pointer}]"
+                        if not used(block):
+                            problems.append(
+                                f"inode {index}: block {block} not marked used in bitmap"
+                            )
+                        if kind == 1 and slot * BLOCK >= size:
+                            problems.append(
+                                f"inode {index}: triple block {block} beyond size {size}"
+                            )
 
         if indirect == 0:
             continue

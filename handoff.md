@@ -669,6 +669,19 @@ Redmi port is parked. The reference checklist is
   rejected subtree move, and replace-over-destination; fsck stays clean.
   Wayland adds `wl_surface.enter` and the real client verifies it alongside
   `wl_output` scale 2.
+  **Slice 41 (triple-indirect files):** the inode's reserved word at offset 32
+  is now a third indirect pointer. `src/sfs.rs` reads, allocates, truncates and
+  frees the triple tree (outer 128×128 double tables), `MAX_FILE_BLOCKS`
+  grows to about 1 GiB, and append allocation starts at the current EOF block
+  instead of rescanning from slot zero. `scripts/sfs_inject.py`,
+  `sfs_fsck.py` and `sfs_resize.py` understand the same tree. Tests: a 9 MiB
+  payload injected offline is read byte-for-byte by a Linux test (`triple
+  ok`) and by `wc`; appending two bytes to a file ending exactly at the first
+  triple slot allocates the triple root, double table and leaf table, and
+  grows the file to 8,456,194 bytes. Deleting that 9 MiB file now takes under
+  a second because free bits are grouped per bitmap block (bitmap writes no
+  longer scale with file size); fsck is clean before and after. Whole-file
+  reads and `exec` remain capped at 8 MiB by `MAX_FILE_BYTES`.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -695,9 +708,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 41 (third indirect level for >8 MiB files
-  across kernel and image tools, then a larger toolkit). Network base
-  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 42 (raise the whole-file/exec cap or stream
+  ELF segments, then a larger toolkit). Network base maintenance (keep-alive,
+  TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

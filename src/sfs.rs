@@ -1,16 +1,15 @@
-//! Kernel SFS: a streaming, read-only VFS backend.
+//! Kernel SFS: a streaming, read-write VFS backend.
 //!
 //! The kernel owns the virtio-blk device and reads 512-byte blocks on demand
-//! through a small write-through cache; the whole image is no longer loaded
-//! into RAM. Metadata (superblock, inodes, directories, indirect tables) and
-//! file data all come from the same block cache, so the RAM footprint is
-//! bounded by [`CACHE_BLOCKS`] instead of the image size.
+//! through a small write-through cache; the whole image is never loaded into
+//! RAM. Metadata (superblock, inodes, directories, indirect tables) and file
+//! data all come from the same block cache, so the RAM footprint is bounded by
+//! [`CACHE_BLOCKS`] instead of the image size.
 //!
-//! SFS mutations (create/unlink/rename/write) are not available in streaming
-//! mode: writes would need to allocate blocks and update the bitmap/inode
-//! tables, which is the next format slice. `/tmp` remains writable on RamFs.
-//! The offline tools (`scripts/sfs_*.py`) and `sfs_format` host tests still
-//! own the write format.
+//! Mutations allocate/free blocks in the on-disk bitmap and update inodes and
+//! directory blocks in place. The block tree is direct + single + double +
+//! triple indirect: the maximum file is about 1 GiB by format, bounded by the
+//! image size in practice. `/tmp` remains a separate writable RamFs.
 
 use alloc::vec::Vec;
 
@@ -27,8 +26,12 @@ const INODE_KIND_DIR: u32 = 2;
 const DIR_ENTRY_SIZE: usize = 32;
 const DIR_ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DIR_ENTRY_SIZE;
 const NAME_LIMIT: usize = 27;
+const DOUBLE_FIRST_SLOT: usize = DIRECT_BLOCKS + INDIRECT_POINTERS;
+const TRIPLE_FIRST_SLOT: usize =
+    DOUBLE_FIRST_SLOT + INDIRECT_POINTERS * INDIRECT_POINTERS;
+const INDIRECT_SQUARED: usize = INDIRECT_POINTERS * INDIRECT_POINTERS;
 const MAX_FILE_BLOCKS: usize =
-    DIRECT_BLOCKS + INDIRECT_POINTERS + INDIRECT_POINTERS * INDIRECT_POINTERS;
+    TRIPLE_FIRST_SLOT + INDIRECT_SQUARED * INDIRECT_POINTERS;
 
 /// 512 cached blocks = 256 KiB. Enough for the inode table scan and a few
 /// directory/file blocks without rereading them on every step.
@@ -53,6 +56,7 @@ struct Inode {
     blocks: [u32; DIRECT_BLOCKS],
     indirect: u32,
     double: u32,
+    triple: u32,
 }
 
 impl Inode {
@@ -194,15 +198,6 @@ fn split_path(path: &str) -> Option<(Vec<&str>, &str)> {
     Some((parts, name))
 }
 
-fn read_status_bits(block: u32, used: bool) -> Option<[u8; BLOCK_SIZE]> {
-    let mut bytes = [0_u8; BLOCK_SIZE];
-    if !read_block(block, &mut bytes) {
-        return None;
-    }
-    let _ = used;
-    Some(bytes)
-}
-
 fn reader() -> Option<Reader> {
     let state = STATE.lock();
     Some(Reader {
@@ -243,6 +238,7 @@ impl Reader {
             ],
             indirect: u32_at(&bytes, within + 24),
             double: u32_at(&bytes, within + 28),
+            triple: u32_at(&bytes, within + 32),
         })
     }
 
@@ -263,9 +259,9 @@ impl Reader {
                 return None;
             }
             u32_at(&table, (slot - DIRECT_BLOCKS) * 4)
-        } else {
-            let position = slot - DIRECT_BLOCKS - INDIRECT_POINTERS;
-            if position >= INDIRECT_POINTERS * INDIRECT_POINTERS || inode.double == 0 {
+        } else if slot < TRIPLE_FIRST_SLOT {
+            let position = slot - DOUBLE_FIRST_SLOT;
+            if position >= INDIRECT_SQUARED || inode.double == 0 {
                 return None;
             }
             let table_index = position / INDIRECT_POINTERS;
@@ -275,6 +271,35 @@ impl Reader {
                 return None;
             }
             let table_block = u32_at(&node, table_index * 4);
+            if table_block == 0 {
+                return None;
+            }
+            let mut table = [0_u8; BLOCK_SIZE];
+            if !read_block(table_block, &mut table) {
+                return None;
+            }
+            u32_at(&table, pointer * 4)
+        } else {
+            let position = slot - TRIPLE_FIRST_SLOT;
+            if position >= INDIRECT_SQUARED * INDIRECT_POINTERS || inode.triple == 0 {
+                return None;
+            }
+            let outer = position / INDIRECT_SQUARED;
+            let middle = (position % INDIRECT_SQUARED) / INDIRECT_POINTERS;
+            let pointer = position % INDIRECT_POINTERS;
+            let mut root = [0_u8; BLOCK_SIZE];
+            if !read_block(inode.triple, &mut root) {
+                return None;
+            }
+            let double_block = u32_at(&root, outer * 4);
+            if double_block == 0 {
+                return None;
+            }
+            let mut node = [0_u8; BLOCK_SIZE];
+            if !read_block(double_block, &mut node) {
+                return None;
+            }
+            let table_block = u32_at(&node, middle * 4);
             if table_block == 0 {
                 return None;
             }
@@ -486,6 +511,7 @@ impl Reader {
         }
         put_u32_at(&mut bytes, within + 24, inode.indirect);
         put_u32_at(&mut bytes, within + 28, inode.double);
+        put_u32_at(&mut bytes, within + 32, inode.triple);
         write_block(block, &bytes)
     }
 
@@ -522,18 +548,48 @@ impl Reader {
     }
 
     fn free_block(&self, block: u32) -> bool {
-        if block < self.superblock.data_block_start || block >= self.superblock.total_blocks {
-            return false;
+        self.free_many(&[block])
+    }
+
+    /// Clears many allocation bits with one write per touched bitmap block.
+    /// Freeing a large file one `free_block` call at a time turned a delete
+    /// into thousands of bitmap round-trips; grouping keeps it proportional to
+    /// the bitmap size instead of the file size.
+    fn free_many(&self, blocks: &[u32]) -> bool {
+        let mut sorted: Vec<u32> = blocks
+            .iter()
+            .copied()
+            .filter(|block| {
+                *block >= self.superblock.data_block_start
+                    && *block < self.superblock.total_blocks
+            })
+            .collect();
+        if sorted.is_empty() {
+            return true;
         }
-        let offset = (block as usize) / 8;
-        let bitmap_block = self.superblock.bitmap_block + (offset / BLOCK_SIZE) as u32;
-        let byte = offset % BLOCK_SIZE;
-        let mut bytes = [0_u8; BLOCK_SIZE];
-        if !read_block(bitmap_block, &mut bytes) {
-            return false;
+        sorted.sort_unstable();
+        sorted.dedup();
+        const BITS_PER_BITMAP_BLOCK: usize = BLOCK_SIZE * 8;
+        let mut index = 0usize;
+        while index < sorted.len() {
+            let bitmap_index = sorted[index] as usize / BITS_PER_BITMAP_BLOCK;
+            let bitmap_block = self.superblock.bitmap_block + bitmap_index as u32;
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(bitmap_block, &mut bytes) {
+                return false;
+            }
+            while index < sorted.len()
+                && sorted[index] as usize / BITS_PER_BITMAP_BLOCK == bitmap_index
+            {
+                let block = sorted[index] as usize % BITS_PER_BITMAP_BLOCK;
+                bytes[block / 8] &= !(1 << (block % 8));
+                index += 1;
+            }
+            if !write_block(bitmap_block, &bytes) {
+                return false;
+            }
         }
-        bytes[byte] &= !(1 << (block % 8));
-        write_block(bitmap_block, &bytes)
+        true
     }
 
     fn allocate_inode(&self, kind: u32) -> Option<u32> {
@@ -558,6 +614,7 @@ impl Reader {
                         blocks: [0; DIRECT_BLOCKS],
                         indirect: 0,
                         double: 0,
+                        triple: 0,
                     };
                     if !self.write_inode(candidate as u32, inode) {
                         return None;
@@ -577,7 +634,7 @@ impl Reader {
             inode.blocks[slot] = block;
             return true;
         }
-        if slot < DIRECT_BLOCKS + INDIRECT_POINTERS {
+        if slot < DOUBLE_FIRST_SLOT {
             if inode.indirect == 0 {
                 let Some(table) = self.allocate_block() else {
                     return false;
@@ -595,13 +652,57 @@ impl Reader {
             put_u32_at(&mut bytes, (slot - DIRECT_BLOCKS) * 4, block);
             return write_block(inode.indirect, &bytes);
         }
-        let position = slot - DIRECT_BLOCKS - INDIRECT_POINTERS;
-        if position >= INDIRECT_POINTERS * INDIRECT_POINTERS {
+        if slot < TRIPLE_FIRST_SLOT {
+            let position = slot - DOUBLE_FIRST_SLOT;
+            if position >= INDIRECT_SQUARED {
+                return false;
+            }
+            let table_index = position / INDIRECT_POINTERS;
+            let pointer = position % INDIRECT_POINTERS;
+            if inode.double == 0 {
+                let Some(table) = self.allocate_block() else {
+                    return false;
+                };
+                if !zero_block(table) {
+                    let _ = self.free_block(table);
+                    return false;
+                }
+                inode.double = table;
+            }
+            let mut node = [0_u8; BLOCK_SIZE];
+            if !read_block(inode.double, &mut node) {
+                return false;
+            }
+            let mut table = u32_at(&node, table_index * 4);
+            if table == 0 {
+                let Some(allocated) = self.allocate_block() else {
+                    return false;
+                };
+                if !zero_block(allocated) {
+                    let _ = self.free_block(allocated);
+                    return false;
+                }
+                put_u32_at(&mut node, table_index * 4, allocated);
+                if !write_block(inode.double, &node) {
+                    return false;
+                }
+                table = allocated;
+            }
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(table, &mut bytes) {
+                return false;
+            }
+            put_u32_at(&mut bytes, pointer * 4, block);
+            return write_block(table, &bytes);
+        }
+        let position = slot - TRIPLE_FIRST_SLOT;
+        if position >= INDIRECT_SQUARED * INDIRECT_POINTERS {
             return false;
         }
-        let table_index = position / INDIRECT_POINTERS;
+        let outer = position / INDIRECT_SQUARED;
+        let middle = (position % INDIRECT_SQUARED) / INDIRECT_POINTERS;
         let pointer = position % INDIRECT_POINTERS;
-        if inode.double == 0 {
+        if inode.triple == 0 {
             let Some(table) = self.allocate_block() else {
                 return false;
             };
@@ -609,13 +710,32 @@ impl Reader {
                 let _ = self.free_block(table);
                 return false;
             }
-            inode.double = table;
+            inode.triple = table;
         }
-        let mut node = [0_u8; BLOCK_SIZE];
-        if !read_block(inode.double, &mut node) {
+        let mut root = [0_u8; BLOCK_SIZE];
+        if !read_block(inode.triple, &mut root) {
             return false;
         }
-        let mut table = u32_at(&node, table_index * 4);
+        let mut double_block = u32_at(&root, outer * 4);
+        if double_block == 0 {
+            let Some(allocated) = self.allocate_block() else {
+                return false;
+            };
+            if !zero_block(allocated) {
+                let _ = self.free_block(allocated);
+                return false;
+            }
+            put_u32_at(&mut root, outer * 4, allocated);
+            if !write_block(inode.triple, &root) {
+                return false;
+            }
+            double_block = allocated;
+        }
+        let mut node = [0_u8; BLOCK_SIZE];
+        if !read_block(double_block, &mut node) {
+            return false;
+        }
+        let mut table = u32_at(&node, middle * 4);
         if table == 0 {
             let Some(allocated) = self.allocate_block() else {
                 return false;
@@ -624,8 +744,8 @@ impl Reader {
                 let _ = self.free_block(allocated);
                 return false;
             }
-            put_u32_at(&mut node, table_index * 4, allocated);
-            if !write_block(inode.double, &node) {
+            put_u32_at(&mut node, middle * 4, allocated);
+            if !write_block(double_block, &node) {
                 return false;
             }
             table = allocated;
@@ -639,16 +759,17 @@ impl Reader {
     }
 
     fn truncate_inode(&self, index: u32, mut inode: Inode) -> bool {
+        let mut freed: Vec<u32> = Vec::new();
         let mut slot = 0;
         while let Some(block) = self.block_at(&inode, slot) {
-            let _ = self.free_block(block);
+            freed.push(block);
             slot += 1;
             if slot >= MAX_FILE_BLOCKS {
                 break;
             }
         }
         if inode.indirect != 0 {
-            let _ = self.free_block(inode.indirect);
+            freed.push(inode.indirect);
         }
         if inode.double != 0 {
             let mut node = [0_u8; BLOCK_SIZE];
@@ -656,17 +777,47 @@ impl Reader {
                 for table_index in 0..INDIRECT_POINTERS {
                     let table = u32_at(&node, table_index * 4);
                     if table != 0 {
-                        let _ = self.free_block(table);
+                        freed.push(table);
                     }
                 }
             }
-            let _ = self.free_block(inode.double);
+            freed.push(inode.double);
         }
+        if inode.triple != 0 {
+            let mut root = [0_u8; BLOCK_SIZE];
+            if read_block(inode.triple, &mut root) {
+                for outer in 0..INDIRECT_POINTERS {
+                    let double_block = u32_at(&root, outer * 4);
+                    if double_block == 0 {
+                        continue;
+                    }
+                    let mut node = [0_u8; BLOCK_SIZE];
+                    if read_block(double_block, &mut node) {
+                        for middle in 0..INDIRECT_POINTERS {
+                            let table = u32_at(&node, middle * 4);
+                            if table != 0 {
+                                freed.push(table);
+                            }
+                        }
+                    }
+                    freed.push(double_block);
+                }
+            }
+            freed.push(inode.triple);
+        }
+        // Publish the empty inode first. If clearing bits then fails, the
+        // blocks leak (fsck-visible) instead of remaining reachable through a
+        // half-freed inode.
         inode.size = 0;
         inode.blocks = [0; DIRECT_BLOCKS];
         inode.indirect = 0;
         inode.double = 0;
-        self.write_inode(index, inode)
+        inode.triple = 0;
+        if !self.write_inode(index, inode) {
+            return false;
+        }
+        let _ = self.free_many(&freed);
+        true
     }
 
     fn dir_add(&self, parent: u32, name: &str, child: u32) -> bool {
@@ -931,6 +1082,7 @@ impl Reader {
                 blocks: [0; DIRECT_BLOCKS],
                 indirect: 0,
                 double: 0,
+                triple: 0,
             };
             let _ = self.write_inode(destination_index, freed);
         }
@@ -957,6 +1109,7 @@ impl Reader {
             blocks: [0; DIRECT_BLOCKS],
             indirect: 0,
             double: 0,
+            triple: 0,
         };
         if !self.write_inode(index, inode) || !self.dir_add(parent, name, index) {
             return None;
@@ -977,11 +1130,16 @@ impl Reader {
         }
         let start = if append { inode.size as usize } else { offset };
         let end = start.checked_add(bytes.len())?;
-        if end > MAX_FILE_BLOCKS * BLOCK_SIZE {
+        if end > MAX_FILE_BLOCKS * BLOCK_SIZE || end > u32::MAX as usize {
             return None;
         }
-        let needed = end.div_ceil(BLOCK_SIZE);
-        for slot in 0..needed {
+        // Every slot below the current EOF is already allocated. Allocate only
+        // from the block containing the write position (or EOF for a gap), so
+        // appending a large file is linear instead of rescanning the tree from
+        // slot zero on every write call.
+        let first_slot = start.min(inode.size as usize) / BLOCK_SIZE;
+        let last_slot = end.div_ceil(BLOCK_SIZE);
+        for slot in first_slot..last_slot {
             if self.block_at(&inode, slot).is_none() {
                 let block = self.allocate_block()?;
                 if !zero_block(block) {
@@ -1064,6 +1222,7 @@ impl Reader {
             blocks: [0; DIRECT_BLOCKS],
             indirect: 0,
             double: 0,
+            triple: 0,
         };
         self.write_inode(child, freed)
     }

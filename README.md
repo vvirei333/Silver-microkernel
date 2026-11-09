@@ -129,7 +129,7 @@ open files, SFS usage and DMA state. The interactive `howl` shell and the
 - [x] *(parked)* Real Redmi 10C boot: RAM-only `fastboot boot` reaches the scheduler and the Howl task, with live GICv3 timer interrupts (verified on a `rain` unit)
 - [x] Boot-time MMU TLB proof: read through TTBR0, remap the same VA, read again (fails the boot if the `tlbi` broadcast is missing)
 - [x] Per-task anonymous-mapping quota (16 MiB), DMA quarantine and per-task memory ledger
-- [x] Kernel-owned persistent SFS: read/write, positioned writes, directories, single/double-indirect files and fsck
+- [x] Kernel-owned persistent SFS: read/write, positioned writes, directories, single/double/triple-indirect files and fsck
 - [x] SFS manifest write scopes, per-task open-file quota (32), global VFS budget and lifecycle cleanup
 - [x] Atomic file replacement (`replace`, `SYS_FS_REPLACE`) for bundle updates without exposing a half-written file
 - [x] SHA-256 bundle integrity: manifest `sha256=` is checked before an ELF becomes a task
@@ -355,8 +355,10 @@ Program exited with status 0
 The last one is a **real static glibc binary** (libc initialisation, stdio,
 `open`/`read`/`close`, `opendir`/`readdir`, `exit`), which is the point of the
 track. The loader reads up to 8 MiB through `vfs::read_file_limit`; the
-general VFS cap is the same 8 MiB (the SFS double-indirect limit is about
-8.26 MiB), and the transient read is exactly file-sized.
+general whole-file VFS cap is the same 8 MiB. The SFS block tree itself now
+reaches about 1 GiB through a third indirect level, so streamed file I/O is
+not limited by that transient whole-file buffer, and the read is exactly
+file-sized.
 `fstat`, `ioctl(TIOCGWINSZ)`, `writev`, `close`, `lseek`, `readlinkat` and
 `sched_yield` are implemented, and `--features linux-abi-trace` logs any
 still-unsupported number (capped) so the next slice is driven by what a libc
@@ -691,10 +693,13 @@ fixed mappings), and `mprotect` rewrites PTE permissions on both the anonymous
 window and the main image. SFS is streamed: the kernel reads 512-byte blocks
 from virtio-blk on demand through a 256 KiB cache, so the 64 MiB / 2048-inode
 image no longer occupies RAM (the kernel heap is 16 MiB). The per-file cap is
-still 8 MiB (the SFS block tree's maximum). Streaming SFS supports
-create/truncate/write, mkdir/remove and rename/replace through the cache, with
-same-parent renames written in place and cross-directory moves rolled back if
-the source entry cannot be detached. `/tmp` is the scratch filesystem.
+still 8 MiB for whole-file reads and `exec` (`MAX_FILE_BYTES`), but the SFS
+block tree now has a third indirect level, so files are limited by the image
+size instead. Streaming SFS supports create/truncate/write, mkdir/remove and
+rename/replace through the cache, with same-parent renames written in place
+and cross-directory moves rolled back if the source entry cannot be detached;
+large deletes batch bitmap updates instead of writing the bitmap per block.
+`/tmp` is the scratch filesystem.
 
 A writable `MAP_SHARED` mapping of a `memfd` is a true shared window: the
 memfd owns one contiguous physical run, every process that maps the file (its
