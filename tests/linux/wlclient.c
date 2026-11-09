@@ -13,9 +13,13 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <wayland-client.h>
+#include "xdg-shell-client-protocol.h"
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shared_memory;
+static struct xdg_wm_base *shell;
+static uint32_t configure_serial;
+static int configured;
 
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
@@ -28,6 +32,9 @@ static void registry_global(void *data, struct wl_registry *registry,
     } else if (strcmp(interface, wl_shm_interface.name) == 0) {
         uint32_t use = version < 1 ? version : 1;
         shared_memory = wl_registry_bind(registry, name, &wl_shm_interface, use);
+    } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
+        uint32_t use = version < 1 ? version : 1;
+        shell = wl_registry_bind(registry, name, &xdg_wm_base_interface, use);
     }
 }
 
@@ -53,6 +60,47 @@ static const struct wl_shm_listener shm_listener = {
     .format = shm_format,
 };
 
+static void shell_ping(void *data, struct xdg_wm_base *base, uint32_t serial) {
+    (void)data;
+    xdg_wm_base_pong(base, serial);
+}
+
+static const struct xdg_wm_base_listener shell_listener = {
+    .ping = shell_ping,
+};
+
+static void surface_configure(void *data, struct xdg_surface *surface,
+                              uint32_t serial) {
+    (void)data;
+    (void)surface;
+    configure_serial = serial;
+    configured = 1;
+}
+
+static const struct xdg_surface_listener surface_listener = {
+    .configure = surface_configure,
+};
+
+static void toplevel_configure(void *data, struct xdg_toplevel *toplevel,
+                               int32_t width, int32_t height,
+                               struct wl_array *states) {
+    (void)data;
+    (void)toplevel;
+    (void)width;
+    (void)height;
+    (void)states;
+}
+
+static void toplevel_close(void *data, struct xdg_toplevel *toplevel) {
+    (void)data;
+    (void)toplevel;
+}
+
+static const struct xdg_toplevel_listener toplevel_listener = {
+    .configure = toplevel_configure,
+    .close = toplevel_close,
+};
+
 int main(void) {
     struct wl_display *display = wl_display_connect("/tmp/wayland-test");
     if (display == NULL) {
@@ -67,10 +115,11 @@ int main(void) {
     if (wl_display_roundtrip(display) < 0) {
         return 4;
     }
-    if (compositor == NULL || shared_memory == NULL) {
+    if (compositor == NULL || shared_memory == NULL || shell == NULL) {
         fprintf(stderr, "wlclient: missing globals\n");
         return 5;
     }
+    xdg_wm_base_add_listener(shell, &shell_listener, NULL);
     wl_shm_add_listener(shared_memory, &shm_listener, NULL);
     if (wl_display_roundtrip(display) < 0) {
         return 6;
@@ -80,6 +129,27 @@ int main(void) {
     if (surface == NULL) {
         return 7;
     }
+    struct xdg_surface *xdg_surface =
+        xdg_wm_base_get_xdg_surface(shell, surface);
+    if (xdg_surface == NULL) {
+        return 7;
+    }
+    xdg_surface_add_listener(xdg_surface, &surface_listener, NULL);
+    struct xdg_toplevel *toplevel = xdg_surface_get_toplevel(xdg_surface);
+    if (toplevel == NULL) {
+        return 7;
+    }
+    xdg_toplevel_add_listener(toplevel, &toplevel_listener, NULL);
+    xdg_toplevel_set_title(toplevel, "werewolf-client");
+    xdg_toplevel_set_app_id(toplevel, "org.werewolf.test");
+    /* A bufferless commit asks the compositor for an initial configure. */
+    wl_surface_commit(surface);
+    while (!configured) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 7;
+        }
+    }
+    xdg_surface_ack_configure(xdg_surface, configure_serial);
 
     const int width = 8;
     const int height = 8;

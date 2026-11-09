@@ -570,6 +570,14 @@ path. The Wayland header order was also corrected to
 `object id, opcode, size` (the earlier self-consistent test used
 `object id, size, opcode`).
 
+The same client also speaks **xdg-shell**: `xdg_wm_base` is advertised by the
+compositor, the client binds it, creates `xdg_surface`/`xdg_toplevel`, commits
+a bufferless surface to request an initial configure, acknowledges the
+`xdg_surface.configure` serial and only then attaches its buffer. The
+compositor sends `xdg_toplevel.configure` and `xdg_surface.configure`, and
+still verifies the shared pixels. The vendored `xdg-shell-client-protocol.h`/
+`.c` come from `wayland-protocols` 1.50.
+
 D-Bus runs on the same socket layer. `getsockopt(SO_PEERCRED)` reports the
 Linux personality's root credentials (`struct ucred`), which is what EXTERNAL
 authentication checks. The test is again a minimal daemon plus client: the

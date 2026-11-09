@@ -569,6 +569,15 @@ Redmi port is parked. The reference checklist is
   headers live in `third_party/wayland-aarch64` (MIT). Full series plus
   repeats and `health`: 9596/31575 frames, zero zombies/open files/DMA leaks;
   fsck clean.
+  **Slice 30 (xdg-shell):** the mini compositor advertises `xdg_wm_base` and
+  handles `get_xdg_surface`/`get_toplevel`/`ack_configure`, sending
+  `xdg_toplevel.configure` (8x8, empty states) and `xdg_surface.configure`.
+  The real libwayland client binds the shell, creates the xdg surface and
+  toplevel, does a bufferless commit, waits for configure, acknowledges the
+  serial and only then attaches its memfd buffer. `wayland-protocols` 1.50
+  xdg-shell headers/generated code and its license are vendored. Full series
+  plus repeats and `health`: 9596/31575 frames, zero zombies/open files/DMA
+  leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -595,9 +604,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 30 (xdg-shell in the mini compositor and a
-  real toolkit client, filling the syscalls it probes). Network base
-  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 31 (wl_seat/wl_output and a real toolkit
+  client, filling the syscalls it probes). Network base maintenance
+  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

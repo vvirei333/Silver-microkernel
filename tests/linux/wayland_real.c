@@ -233,6 +233,10 @@ static long connect_path(long socket) {
 static unsigned registry_id;
 static unsigned compositor_id;
 static unsigned shm_id;
+static unsigned shell_id;
+static unsigned xdg_surface_id;
+static unsigned toplevel_id;
+static unsigned configure_serial = 1;
 static unsigned surface_id;
 static unsigned pool_id;
 static unsigned buffer_id;
@@ -285,6 +289,7 @@ static int serve(long client) {
                 registry_id = take_u32();
                 send_global(client, registry_id, 1, "wl_compositor");
                 send_global(client, registry_id, 2, "wl_shm");
+                send_global(client, registry_id, 3, "xdg_wm_base");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -299,9 +304,31 @@ static int serve(long client) {
                     put_u32(0); /* ARGB8888 */
                     finish();
                     send_message(client, -1);
+                } else if (text_equal(interface, "xdg_wm_base")) {
+                    shell_id = new_id;
                 }
             } else if (object == compositor_id && opcode == 0) {
                 surface_id = take_u32(); /* create_surface */
+            } else if (object == shell_id && opcode == 2) {
+                /* xdg_wm_base.get_xdg_surface(new_id, surface) */
+                xdg_surface_id = take_u32();
+                (void)take_u32();
+            } else if (object == xdg_surface_id && opcode == 1) {
+                /* xdg_surface.get_toplevel(new_id): send configure. */
+                toplevel_id = take_u32();
+                begin(toplevel_id, 0 /* xdg_toplevel.configure */);
+                put_i32(8); /* width */
+                put_i32(8); /* height */
+                put_u32(0); /* states array: empty */
+                finish();
+                send_message(client, -1);
+                begin(xdg_surface_id, 0 /* xdg_surface.configure */);
+                put_u32(configure_serial);
+                configure_serial += 1;
+                finish();
+                send_message(client, -1);
+            } else if (object == xdg_surface_id && opcode == 4) {
+                (void)take_u32(); /* ack_configure(serial) */
             } else if (object == shm_id && opcode == 0) {
                 pool_id = take_u32(); /* create_pool */
                 (void)take_i32();
