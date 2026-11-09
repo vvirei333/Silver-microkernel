@@ -2740,6 +2740,31 @@ pub fn mmap_anonymous(length: usize, prot: u64) -> Option<usize> {
     current_task_mut()?.mmap_anonymous(length, prot)
 }
 
+/// Anonymous `MAP_FIXED`: place the mapping at an exact virtual address,
+/// replacing any existing mapping in the range.
+pub fn mmap_anonymous_at(length: usize, prot: u64, address: usize) -> Option<usize> {
+    current_task_mut()?.mmap_region(length, prot, Some(address), None)
+}
+
+/// Maps a file-backed region for the current task. `fixed` implements Linux
+/// `MAP_FIXED`: any existing mapping in the range is replaced. `contents` is
+/// copied into the fresh frames (zero-filled after its end).
+pub fn mmap_file(
+    length: usize,
+    prot: u64,
+    fixed: Option<usize>,
+    contents: &[u8],
+) -> Option<usize> {
+    current_task_mut()?.mmap_file(length, prot, fixed, contents)
+}
+
+/// Changes protections on an existing mapping of the current task.
+pub fn mprotect(address: usize, length: usize, prot: u64) -> bool {
+    current_task_mut()
+        .map(|task| task.mprotect_range(address, length, prot))
+        .unwrap_or(false)
+}
+
 /// Unmaps an anonymous region previously returned by `mmap_anonymous`.
 pub fn munmap(address: usize, length: usize) -> bool {
     current_task_mut()
@@ -3191,12 +3216,14 @@ pub fn spawn_linux_elf_with_args(
     envp: Vec<Vec<u8>>,
 ) -> Option<capability::CapId> {
     if scheduler_manager().map_or(true, |manager| !has_task_capacity(manager)) {
+        crate::console::write_str("LINUX: no task capacity\r\n");
         return None;
     }
     if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
+        crate::console::write_str("LINUX: no capability capacity\r\n");
         return None;
     }
-    let task_id = spawn_elf_task(
+    let task_id = match spawn_elf_task(
         None,
         Some(image),
         0,
@@ -3206,7 +3233,13 @@ pub fn spawn_linux_elf_with_args(
         argv,
         envp,
         true,
-    )?;
+    ) {
+        Some(task_id) => task_id,
+        None => {
+            crate::console::write_str("LINUX: spawn_elf_task failed\r\n");
+            return None;
+        }
+    };
     let parent = current_task_mut()?;
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
 }
@@ -3719,7 +3752,7 @@ fn spawn_elf_task(
         .get(smp::current_index())
         .map(|task| task.cwd.clone())
         .unwrap_or_else(|| String::from("/"));
-    let mut task = Task::new(
+    let mut task = match Task::new(
         id,
         None,
         Some((user_program::PROGRAM_DYNAMIC, argument)),
@@ -3732,7 +3765,13 @@ fn spawn_elf_task(
         fs_write_prefix,
         fs_quota,
         personality,
-    )?;
+    ) {
+        Some(task) => task,
+        None => {
+            crate::console::write_str("TASK: new failed\r\n");
+            return None;
+        }
+    };
     task.cwd = cwd;
     manager.tasks.push(task);
     manager.next_id += 1;
@@ -4730,6 +4769,7 @@ fn linux_auxv(image: AuxvImage) -> Vec<(u64, u64)> {
     const AT_GID: u64 = 13;
     const AT_EGID: u64 = 14;
     const AT_SECURE: u64 = 23;
+    const AT_EXECFN: u64 = 31;
     let mut entries = Vec::new();
     entries.push((AT_PHDR, image.phdr_address as u64));
     entries.push((AT_PHENT, image.phentsize));
@@ -4743,6 +4783,8 @@ fn linux_auxv(image: AuxvImage) -> Vec<(u64, u64)> {
     entries.push((AT_GID, 0));
     entries.push((AT_EGID, 0));
     entries.push((AT_SECURE, 0));
+    // The stack builder replaces the zero with a pointer to argv[0].
+    entries.push((AT_EXECFN, 0));
     entries
 }
 
@@ -4837,6 +4879,10 @@ impl Task {
                 )?,
             })
         };
+        if argv_block.is_none() && !(argv.is_empty() && envp.is_empty()) {
+            crate::console::write_str("TASK: argv/envp stack failed\r\n");
+            return None;
+        }
         // Charge the fixed footprint before allocating anything: the image
         // pages already exist (RAII releases them if this returns None), and
         // every other frame is allocated below. Page tables beyond the fixed
@@ -4855,10 +4901,12 @@ impl Task {
                 0
             };
         if !mem_policy::task_charge_ok(0, ledger_frames, task_frame_limit()) {
+            crate::console::write_str("TASK: frame ledger refused\r\n");
             return None;
         }
 
         let Some(stack_start) = kernel_stack::alloc() else {
+            crate::console::write_str("TASK: kernel stack alloc failed\r\n");
             return None;
         };
 
@@ -4920,6 +4968,7 @@ impl Task {
         #[cfg(feature = "linux-abi")]
         if let Some(image) = &linux_image {
             if !mmu::install_linux_image(ttbr0, image) {
+                crate::console::write_str("TASK: install_linux_image failed\r\n");
                 mmu::destroy_task_space(
                     space_token,
                     private_page,
@@ -5115,36 +5164,66 @@ impl Task {
         self.release_frames(before.saturating_sub(self.heap_pages.len()));
     }
 
-    /// Allocates and maps `length` bytes of anonymous memory into a free virtual
-    /// range in the task's TTBR0, returning the chosen address.
-    fn mmap_anonymous(&mut self, length: usize, prot: u64) -> Option<usize> {
-        // W^X: a single anonymous mapping must never be writable and
-        // executable at the same time. Validate before placement, frame
-        // allocation, PTE publication or `mmap_regions` bookkeeping, so a
-        // rejected request leaves no state behind.
+    /// Allocates and maps `length` bytes into the task's TTBR0. Anonymous
+    /// mappings pass `fixed = None`; file-backed mappings may request an exact
+    /// address (Linux `MAP_FIXED`) and pass the file bytes to copy into the
+    /// freshly allocated frames.
+    fn mmap_region(
+        &mut self,
+        length: usize,
+        prot: u64,
+        fixed: Option<usize>,
+        contents: Option<&[u8]>,
+    ) -> Option<usize> {
+        // W^X: a single mapping must never be writable and executable at the
+        // same time. Validate before placement, frame allocation, PTE
+        // publication or `mmap_regions` bookkeeping, so a rejected request
+        // leaves no state behind.
         if prot & mmu::PROT_WRITE != 0 && prot & mmu::PROT_EXEC != 0 {
             return None;
         }
+
+        let (virtual_address, page_count) = match fixed {
+            Some(address) => {
+                let page_count = length.div_ceil(PAGE_SIZE);
+                if page_count == 0 || page_count > mmu::USER_MMAP_MAX_PAGES {
+                    return None;
+                }
+                if address % PAGE_SIZE != 0 || address < mmu::USER_MMAP_VA {
+                    return None;
+                }
+                let span = page_count.checked_mul(PAGE_SIZE)?;
+                let end = address.checked_add(span)?;
+                if end > mmu::USER_MMAP_MAX_VA {
+                    return None;
+                }
+                // Linux `MAP_FIXED` replaces whatever was mapped in the range.
+                // The dynamic loader relies on this after reserving a whole
+                // library span with `PROT_NONE` and mapping each segment over
+                // it. Unmapping first also keeps the region list sorted.
+                if !self.munmap_range(address, span) {
+                    return None;
+                }
+                (address, page_count)
+            }
+            None => silver_microkernel::mmap_place(
+                length,
+                mmu::USER_MMAP_VA,
+                mmu::USER_MMAP_MAX_VA,
+                PAGE_SIZE,
+                self.mmap_regions
+                    .iter()
+                    .map(|region| (region.virtual_address, region.page_count)),
+            )?,
+        };
+
         if self.mmap_regions.len() >= MAX_MMAP_REGIONS {
             return None;
         }
-        // `length` is user-controlled: the pure placement helper bounds the
-        // page count against the window and uses checked arithmetic, so an
-        // absurd request (e.g. `usize::MAX`) returns None instead of
-        // overflowing `page_count * PAGE_SIZE` and panicking the kernel.
-        let (virtual_address, page_count) = silver_microkernel::mmap_place(
-            length,
-            mmu::USER_MMAP_VA,
-            mmu::USER_MMAP_MAX_VA,
-            PAGE_SIZE,
-            self.mmap_regions
-                .iter()
-                .map(|region| (region.virtual_address, region.page_count)),
-        )?;
+        let span = page_count.checked_mul(PAGE_SIZE)?;
 
         // Per-task memory quota: reject before any frame or PTE is touched, so
         // a refused request leaves no state behind.
-        let span = page_count.checked_mul(PAGE_SIZE)?;
         if !silver_microkernel::mmap_quota_ok(self.mmap_bytes, span, MAX_MMAP_BYTES_PER_TASK) {
             return None;
         }
@@ -5175,6 +5254,19 @@ impl Task {
             self.release_frames(page_count);
             return None;
         }
+        // The mapping is zeroed by `map_user_pages_at`; copy only the file
+        // bytes that exist. The tail stays zero, which is friendlier than a
+        // SIGBUS for the last partial page and matches our loader's BSS rule.
+        if let Some(bytes) = contents {
+            let count = bytes.len().min(span);
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    phys_to_virt(physical_start) as *mut u8,
+                    count,
+                );
+            }
+        }
 
         let region = MmapRegion {
             virtual_address,
@@ -5193,93 +5285,265 @@ impl Task {
         Some(virtual_address)
     }
 
-    /// Unmaps a page-aligned sub-range of one anonymous mapping. A range in
-    /// the middle of a mapping splits the bookkeeping into two regions; the
-    /// pages on both sides keep the original physical run and generation.
-    fn munmap(&mut self, address: usize, length: usize) -> bool {
+    fn mmap_anonymous(&mut self, length: usize, prot: u64) -> Option<usize> {
+        self.mmap_region(length, prot, None, None)
+    }
+
+    fn mmap_file(
+        &mut self,
+        length: usize,
+        prot: u64,
+        fixed: Option<usize>,
+        contents: &[u8],
+    ) -> Option<usize> {
+        self.mmap_region(length, prot, fixed, Some(contents))
+    }
+
+    /// Unmaps any page-aligned range, even when it spans several mappings or
+    /// holes. Used by `munmap(2)` and by `MAP_FIXED` replacement.
+    fn munmap_range(&mut self, address: usize, length: usize) -> bool {
         let page_count = length.div_ceil(PAGE_SIZE);
-        // Same user-controlled bound as `mmap_anonymous`: an absurd length
-        // must be rejected up front, before the unmap loop walks pages.
-        if page_count == 0 || page_count > mmu::USER_MMAP_MAX_PAGES {
+        // Same user-controlled bound as `mmap_region`: an absurd length must
+        // be rejected up front, before the unmap loop walks pages.
+        if page_count == 0 || page_count > mmu::USER_MMAP_MAX_PAGES || address % PAGE_SIZE != 0 {
             return false;
         }
-        let Some(removal) = silver_microkernel::mmap_remove(
-            self.mmap_regions
-                .iter()
-                .map(|region| (region.virtual_address, region.page_count)),
-            address,
-            page_count,
-            PAGE_SIZE,
-        ) else {
+        let Some(span) = page_count.checked_mul(PAGE_SIZE) else {
             return false;
         };
-        // A middle range needs one extra bookkeeping slot. Refuse before any
-        // PTE or frame is touched, so a full table leaves the mapping intact.
-        if removal.left_pages > 0
-            && removal.right_pages > 0
-            && self.mmap_regions.len() >= MAX_MMAP_REGIONS
+        let Some(end) = address.checked_add(span) else {
+            return false;
+        };
+        if address < mmu::USER_MMAP_VA || end > mmu::USER_MMAP_MAX_VA {
+            return false;
+        }
+
+        // Walk backwards: removing or inserting a region only shifts entries
+        // above the current index, and those were already processed.
+        let mut index = self.mmap_regions.len();
+        while index > 0 {
+            index -= 1;
+            let region_start = self.mmap_regions[index].virtual_address;
+            let region_end = region_start + self.mmap_regions[index].page_count * PAGE_SIZE;
+            let inter_start = address.max(region_start);
+            let inter_end = end.min(region_end);
+            if inter_start >= inter_end {
+                continue;
+            }
+            let start_page = (inter_start - region_start) / PAGE_SIZE;
+            let count = (inter_end - inter_start) / PAGE_SIZE;
+            let physical_start = self.mmap_regions[index].physical_start;
+            let generation = self.mmap_regions[index].generation;
+            let prot = self.mmap_regions[index].prot;
+            let region_pages = self.mmap_regions[index].page_count;
+            let left = start_page;
+            let right = region_pages - start_page - count;
+            // A middle range needs one extra bookkeeping slot. Refuse before
+            // any PTE or frame is touched, so a full table leaves the mapping
+            // intact.
+            if left > 0 && right > 0 && self.mmap_regions.len() >= MAX_MMAP_REGIONS {
+                return false;
+            }
+            let removed_physical = physical_start + start_page * PAGE_SIZE;
+
+            // Fail closed: `unmap_user_pages_at` is all-or-nothing, so on
+            // failure nothing was unmapped and the region stays tracked.
+            if !mmu::unmap_user_pages_at(self.ttbr0, inter_start, count) {
+                MMAP_LEAKED_FRAMES.fetch_add(count, Ordering::Relaxed);
+                console::write_str("MMAP LEAK: range 0x");
+                console::write_hex_u64(removed_physical as u64);
+                console::write_str(" left mapped after refused unmap (");
+                console::write_dec_u64(count as u64);
+                console::write_str(" pages)\r\n");
+                return false;
+            }
+            // Free only the removed slice of the original contiguous run;
+            // every page in it shares the run's generation.
+            if !frame_allocator::free_contiguous_pages_tagged(
+                removed_physical,
+                count,
+                generation,
+            ) {
+                console::write_str("MMAP: allocator refused run 0x");
+                console::write_hex_u64(removed_physical as u64);
+                console::write_str(" - leaked\r\n");
+            }
+
+            match (left > 0, right > 0) {
+                (false, false) => {
+                    self.mmap_regions.remove(index);
+                }
+                (true, false) => {
+                    self.mmap_regions[index].page_count = left;
+                }
+                (false, true) => {
+                    let region = &mut self.mmap_regions[index];
+                    region.virtual_address = inter_end;
+                    region.physical_start = removed_physical + count * PAGE_SIZE;
+                    region.page_count = right;
+                    region.prot = prot;
+                }
+                (true, true) => {
+                    let tail = MmapRegion {
+                        virtual_address: inter_end,
+                        physical_start: removed_physical + count * PAGE_SIZE,
+                        page_count: right,
+                        generation,
+                        prot,
+                    };
+                    self.mmap_regions[index].page_count = left;
+                    self.mmap_regions.insert(index + 1, tail);
+                }
+            }
+            self.mmap_bytes = self.mmap_bytes.saturating_sub(count * PAGE_SIZE);
+            self.release_frames(count);
+        }
+        true
+    }
+
+    fn munmap(&mut self, address: usize, length: usize) -> bool {
+        self.munmap_range(address, length)
+    }
+
+    /// Changes protections on an already-mapped range. `mprotect(2)` may cover
+    /// several adjacent regions, so the range is split at its boundaries and
+    /// every fully covered region records the new `prot` for `fork`.
+    fn mprotect_range(&mut self, address: usize, length: usize, prot: u64) -> bool {
+        if prot & mmu::PROT_WRITE != 0 && prot & mmu::PROT_EXEC != 0 {
+            return false;
+        }
+        let page_count = length.div_ceil(PAGE_SIZE);
+        if page_count == 0 || page_count > mmu::USER_MMAP_MAX_PAGES || address % PAGE_SIZE != 0 {
+            return false;
+        }
+        let Some(span) = page_count.checked_mul(PAGE_SIZE) else {
+            return false;
+        };
+        let Some(end) = address.checked_add(span) else {
+            return false;
+        };
+
+        // Anonymous/file-backed mappings use the region list so `fork` and
+        // `munmap` see the updated protection.
+        if address >= mmu::USER_MMAP_VA && end <= mmu::USER_MMAP_MAX_VA {
+            // Every page in the requested range must already belong to a
+            // mapping; unlike Linux we do not create PROT_NONE holes
+            // implicitly.
+            let mut cursor = address;
+            while cursor < end {
+                let mut next = 0;
+                for region in &self.mmap_regions {
+                    let region_end =
+                        region.virtual_address + region.page_count * PAGE_SIZE;
+                    if cursor >= region.virtual_address && cursor < region_end {
+                        next = region_end;
+                        break;
+                    }
+                }
+                if next == 0 {
+                    return false;
+                }
+                cursor = next.min(end);
+            }
+            // At most two splits (start and end), and each split adds one.
+            if self.mmap_regions.len() + 2 > MAX_MMAP_REGIONS {
+                return false;
+            }
+            if !mmu::protect_user_pages_at(self.ttbr0, address, page_count, prot) {
+                return false;
+            }
+            if !self.split_region_at(address) || !self.split_region_at(end) {
+                return false;
+            }
+            for region in &mut self.mmap_regions {
+                let region_end = region.virtual_address + region.page_count * PAGE_SIZE;
+                if region.virtual_address >= address && region_end <= end {
+                    region.prot = prot;
+                }
+            }
+            return true;
+        }
+
+        // The main executable and its interpreter live below the mmap window
+        // (MAIN_BIAS/INTERP_BIAS). glibc calls mprotect on the main binary's
+        // RELRO immediately after relocation, so that range must work too.
+        #[cfg(feature = "linux-abi")]
         {
+            let ttbr0 = self.ttbr0;
+            let Some(image) = self.linux_image.as_mut() else {
+                return false;
+            };
+            let mut cursor = address;
+            while cursor < end {
+                let mut next = 0;
+                for run in &image.runs {
+                    let run_end = run.virtual_address + run.page_count * PAGE_SIZE;
+                    if cursor >= run.virtual_address && cursor < run_end {
+                        next = run_end;
+                        break;
+                    }
+                }
+                if next == 0 {
+                    return false;
+                }
+                cursor = next.min(end);
+            }
+            if !mmu::protect_user_pages_at(ttbr0, address, page_count, prot) {
+                return false;
+            }
+            // Keep `kinds` in sync so `fork` restores the final protections.
+            let kind = if prot & mmu::PROT_EXEC != 0 {
+                crate::elf::PageKind::Text
+            } else if prot & mmu::PROT_WRITE != 0 {
+                crate::elf::PageKind::Data
+            } else {
+                crate::elf::PageKind::ReadOnly
+            };
+            for run in &mut image.runs {
+                let run_start = run.virtual_address;
+                let run_end = run_start + run.page_count * PAGE_SIZE;
+                let inter_start = address.max(run_start);
+                let inter_end = end.min(run_end);
+                if inter_start >= inter_end {
+                    continue;
+                }
+                let first = (inter_start - run_start) / PAGE_SIZE;
+                let last = (inter_end - run_start) / PAGE_SIZE;
+                for slot in &mut run.kinds[first..last] {
+                    *slot = kind;
+                }
+            }
+            true
+        }
+        #[cfg(not(feature = "linux-abi"))]
+        {
+            let _ = (address, end, page_count);
+            false
+        }
+    }
+
+    fn split_region_at(&mut self, address: usize) -> bool {
+        let Some(index) = self.mmap_regions.iter().position(|region| {
+            let end = region.virtual_address + region.page_count * PAGE_SIZE;
+            region.virtual_address < address && address < end
+        }) else {
+            return true;
+        };
+        if self.mmap_regions.len() >= MAX_MMAP_REGIONS {
             return false;
         }
-
-        let region = &self.mmap_regions[removal.index];
-        let (virtual_address, physical_start, generation) = (
-            region.virtual_address,
-            region.physical_start,
-            region.generation,
-        );
-        let span = page_count * PAGE_SIZE;
-        let removed_physical = physical_start + (address - virtual_address);
-
-        // Fail closed: `unmap_user_pages_at` is all-or-nothing, so on failure
-        // nothing was unmapped and the region stays tracked. Freeing the run
-        // here would leave live PTEs pointing at reclaimed frames.
-        if !mmu::unmap_user_pages_at(self.ttbr0, address, page_count) {
-            MMAP_LEAKED_FRAMES.fetch_add(page_count, Ordering::Relaxed);
-            console::write_str("MMAP LEAK: range 0x");
-            console::write_hex_u64(removed_physical as u64);
-            console::write_str(" left mapped after refused unmap (");
-            console::write_dec_u64(page_count as u64);
-            console::write_str(" pages)\r\n");
-            return false;
-        }
-        // Free only the removed slice of the original contiguous run; every
-        // page in it shares the run's generation.
-        if !frame_allocator::free_contiguous_pages_tagged(removed_physical, page_count, generation) {
-            console::write_str("MMAP: allocator refused run 0x");
-            console::write_hex_u64(removed_physical as u64);
-            console::write_str(" - leaked\r\n");
-        }
-
-        let left = removal.left_pages;
-        let right = removal.right_pages;
-        match (left > 0, right > 0) {
-            (false, false) => {
-                self.mmap_regions.remove(removal.index);
-            }
-            (true, false) => {
-                self.mmap_regions[removal.index].page_count = left;
-            }
-            (false, true) => {
-                let region = &mut self.mmap_regions[removal.index];
-                region.virtual_address = address + span;
-                region.physical_start = removed_physical + span;
-                region.page_count = right;
-            }
-            (true, true) => {
-                let tail = MmapRegion {
-                    virtual_address: address + span,
-                    physical_start: removed_physical + span,
-                    page_count: right,
-                    generation,
-                    prot: self.mmap_regions[removal.index].prot,
-                };
-                self.mmap_regions[removal.index].page_count = left;
-                self.mmap_regions.insert(removal.index + 1, tail);
-            }
-        }
-        self.mmap_bytes = self.mmap_bytes.saturating_sub(span);
-        self.release_frames(page_count);
+        let offset_pages =
+            (address - self.mmap_regions[index].virtual_address) / PAGE_SIZE;
+        let region = &self.mmap_regions[index];
+        let tail = MmapRegion {
+            virtual_address: address,
+            physical_start: region.physical_start + offset_pages * PAGE_SIZE,
+            page_count: region.page_count - offset_pages,
+            generation: region.generation,
+            prot: region.prot,
+        };
+        self.mmap_regions[index].page_count = offset_pages;
+        self.mmap_regions.insert(index + 1, tail);
         true
     }
 

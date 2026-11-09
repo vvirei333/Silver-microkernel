@@ -22,7 +22,7 @@ backends, kernel surface objects, input driver, home screen, `fog-paint`/
 Redmi port is parked. The reference checklist is
 [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
-- **Host tests:** 220/220 (`cargo test --lib`).
+- **Host tests:** 221/221 (`cargo test --lib`).
 - **Builds:** `no_std` (product), `no_std,linux-abi` (Linux module on),
   `no_std,linux-abi-trace`, `no_std,fog`, `no_std,fog,fog-reloc`,
   `no_std,fog,fog-auto-reset`, `no_std,fog,fog-hw-selftests`,
@@ -33,6 +33,8 @@ Redmi port is parked. The reference checklist is
   two-column summary — OS/kernel, codename, arch, platform, shell, FS, uptime,
   memory with a percentage, processes, open files, SFS usage and DMA state —
   followed by the 16-colour bar, and `uname` reports `Silver Kernel v0.1.1`.
+  A real dynamic glibc binary (`ld.so` + `libc.so.6`) loads and prints
+  `dynamic hello` through the Linux ABI.
 - **Network:** `net_server` runs DHCP (with the static fallback), DNS, TCP and
   HTTP. `ip` prints the lease, `ping 10.0.2.2` is OK, `dns example.com`
   resolves, `wget http://example.com/ /tmp/e.html` stores a 577-byte page, and
@@ -147,7 +149,8 @@ Redmi port is parked. The reference checklist is
   `write` (1/2), `read` (fd 0 reports EOF), `exit`/`exit_group`,
   `set_tid_address`, `set_robust_list`, `clock_gettime`, `rt_sigprocmask`,
   `uname`, `getpid`/`getppid`/`gettid`, `brk`, `mmap` (hint ignored, `MAP_FIXED`
-  refused), `munmap`, `mprotect` (no-op), `prlimit64`, `getrandom`; `rseq` and
+  refused), `munmap`, `mprotect` (a no-op at the time; real in slice 13),
+  `prlimit64`, `getrandom`; `rseq` and
   unknown numbers return `-ENOSYS`. Errors use `-errno`, never the Silver
   sentinels. The initial stack is the real Linux layout
   (`argc/argv/envp/auxv`) built by `build_linux_stack`, with `AT_PAGESZ`,
@@ -316,6 +319,37 @@ Redmi port is parked. The reference checklist is
   a normal 64 KiB `read(2)` works. Frame use after the full Linux test series
   plus `health`: 9595/31609, zero zombies/open files/DMA leaks. The remaining
   gate for a real `ld.so`/libc is file-backed `mmap` and a real `mprotect`.
+  **Slice 13 (file-backed `mmap`, `mprotect`, real `ld.so`):**
+  `linux_mmap` now takes the full six arguments. `MAP_PRIVATE` file mappings
+  read the requested range through a new `linux_fd::pread`
+  (`vfs::pread_with`, no fd-offset change) and copy it into fresh private
+  frames; the tail past EOF stays zero. `MAP_FIXED` replaces any existing
+  mapping in the range, which is what glibc does after reserving a library
+  span with `PROT_NONE`. `mprotect` rewrites PTEs in place, splits mapping
+  bookkeeping at both range edges, and also handles the main executable and
+  interpreter images below the mmap window (their `PageKind`s are updated so
+  `fork` keeps the final protections). `mmap`/`munmap` now accept gaps and
+  multi-region ranges.
+  Auxv gained `AT_EXECFN` (a stack pointer to argv[0], filled by
+  `build_linux_stack`) so `$ORIGIN` works without `/proc/self/exe`; the spawn
+  environment also sets `LD_LIBRARY_PATH=/sfs`.
+  Two `mmu` bugs surfaced: `protect_user_pages_at` indexed the image range
+  with the mmap-window `(va - DRAM_BASE)` formula, which underflowed at
+  `0x1000_0000` and panicked the kernel; it now walks L1/L2/L3 generically
+  like `install_linux_run`. `scripts/sfs_inject.py` also had an off-by-one
+  when growing a directory (`len(dir_blocks) + 1`), leaving a hole that the
+  packed kernel walker stops at; the root had more than 16 entries for the
+  first time, which exposed it.
+  Test: `tools/linux-test.sh` injects the toolchain's `ld-linux-aarch64.so.1`
+  and `libc.so.6`, patches `tests/linux/dynhello.c` to
+  `/sfs/ld-linux-aarch64.so.1` with RUNPATH `$ORIGIN`, and installs
+  `linux-dyn`. QEMU prints `dynamic hello` and exits 0: file-backed libc
+  mapping, relocations, image RELRO `mprotect` and libc startup all work.
+  `linux-mmapfile` covers file contents, a writable page, and a `MAP_FIXED`
+  replacement over a `PROT_NONE` reservation. Full series plus `health`:
+  9596/31606 frames, zero zombies/open files/DMA leaks; offline fsck clean.
+  Remaining Linux gaps: signal frames/`rt_sigreturn`, COW fork, threads, a
+  per-task read scope, and writable/shared file mappings.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -342,10 +376,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 13 (file-backed `mmap` + real `mprotect`, so
-  a real `ld.so`/libc loads; signal-frame delivery and `rt_sigreturn`; COW
-  fork), then headless Wayland/GTK/D-Bus → Phosh. Network base maintenance
-  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 14 (signal-frame delivery and
+  `rt_sigreturn`, COW fork; then threads and a per-task read scope), then
+  headless Wayland/GTK/D-Bus → Phosh. Network base maintenance (keep-alive,
+  TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

@@ -447,15 +447,19 @@ signal ok
 
 Still missing: a per-task read scope (a Linux task can read any VFS path, which
 is acceptable on the single-user console but must be closed before untrusted
-apps), user-installed signal handlers (dispositions are recorded, see below),
-and file-backed `mmap`/`mprotect` (the last gate before a real `ld.so` loads
-libraries). The rootfs is no longer a limit: it is 16 MiB, the kernel heap is
-16 MiB, and the per-file cap is 8 MiB.
+apps) and user-installed signal handlers (dispositions are recorded, see
+below). File-backed `mmap` and a real `mprotect` are implemented:
+`MAP_PRIVATE` copies the file range into private frames, `MAP_FIXED` replaces
+an existing range (the loader's `PROT_NONE` reservation followed by per-segment
+fixed mappings), and `mprotect` rewrites PTE permissions on both the anonymous
+window and the main image. The rootfs is not a limit: it is 16 MiB, the kernel
+heap is 16 MiB, and the per-file cap is 8 MiB.
 
 `ET_DYN`/PIE images load with a bias (`0x1000_0000` for the program,
 `0x2000_0000` for its interpreter), and `PT_INTERP` is resolved from the VFS
 and attached to the same image; the kernel starts at the interpreter entry and
-passes `AT_PHDR`/`AT_ENTRY` (main program) and `AT_BASE` (interpreter bias).
+passes `AT_PHDR`/`AT_ENTRY` (main program), `AT_BASE` (interpreter bias) and
+`AT_EXECFN` (argv[0], so `$ORIGIN` works without `/proc`).
 A self-contained test pairs a PIE main with a tiny ET_EXEC interpreter that
 reads `AT_ENTRY` from the auxiliary vector and jumps to it:
 
@@ -464,9 +468,18 @@ howl> linuxrun /sfs/linux-pie
 pie main
 ```
 
-A real glibc `ld.so` additionally needs file-backed `mmap`/`mprotect`; the
-16 MiB rootfs already has room for `ld.so` (about 235 KiB) plus `libc.so.6`
-(about 2.2 MiB). A 3 MiB payload exercises the enlarged image end to end:
+A real glibc `ld.so` now runs end to end. When the cross toolchain provides
+`ld-linux-aarch64.so.1` and `libc.so.6`, `tools/linux-test.sh` injects both,
+patches the test binary's interpreter and RUNPATH, and installs it:
+
+```text
+howl> linuxrun /sfs/linux-dyn
+dynamic hello
+```
+
+The loader maps `libc.so.6` file-backed, applies relocations, `mprotect`s the
+main image's RELRO and enters libc. `LD_LIBRARY_PATH=/sfs` covers the current
+single-root layout. A 3 MiB payload exercises the enlarged image end to end:
 
 ```text
 howl> linuxrun /sfs/linux-bigfile

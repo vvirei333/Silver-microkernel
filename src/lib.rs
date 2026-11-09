@@ -188,8 +188,12 @@ fn build_stack(
     let auxv_offset = envp_ptrs.checked_add((envp.len() + 1).checked_mul(8)?)?;
     let strings = auxv_offset.checked_add(auxv_entries.checked_mul(16)?)?;
     let mut cursor = strings;
+    let mut execfn = 0usize;
     for (index, text) in argv.iter().enumerate() {
         let virtual_address = block_start.checked_add(cursor)?;
+        if index == 0 {
+            execfn = virtual_address;
+        }
         let slot = argv_ptrs.checked_add(index.checked_mul(8)?)?;
         block[slot..slot + 8].copy_from_slice(&(virtual_address as u64).to_le_bytes());
         block[cursor..cursor + text.len()].copy_from_slice(text);
@@ -203,8 +207,16 @@ fn build_stack(
         cursor = cursor.checked_add(text.len().checked_add(1)?)?;
     }
     if !auxv.is_empty() {
-        for (index, (kind, value)) in auxv.iter().enumerate() {
+        const AT_EXECFN: u64 = 31;
+        for (index, &(kind, value)) in auxv.iter().enumerate() {
             let slot = auxv_offset + index * 16;
+            // `AT_EXECFN` is a pointer to argv[0] on this stack, so the
+            // dynamic loader can resolve `$ORIGIN` without `/proc/self/exe`.
+            let value = if kind == AT_EXECFN && value == 0 {
+                execfn as u64
+            } else {
+                value
+            };
             block[slot..slot + 8].copy_from_slice(&kind.to_le_bytes());
             block[slot + 8..slot + 16].copy_from_slice(&value.to_le_bytes());
         }
@@ -823,6 +835,31 @@ mod tests {
         assert_eq!(&layout.block[88..104], &[0u8; 16]);
         // The AT_RANDOM seed is not all zero.
         assert!(layout.block[..16].iter().any(|&byte| byte != 0));
+    }
+
+    #[test]
+    fn linux_stack_fills_at_execfn_from_argv0() {
+        let argv = vec![b"/sfs/prog".to_vec()];
+        let envp = vec![b"K=V".to_vec()];
+        let auxv = [(31u64, 0u64)];
+        let top = 0x7FE0_1000usize;
+        let layout = build_linux_stack(&argv, &envp, &auxv, top, 8192).expect("fits");
+        let block_start = layout.sp - 16;
+        let argv0 = u64::from_le_bytes(layout.block[24..32].try_into().unwrap()) as usize;
+        // auxv starts at offset 56: (AT_EXECFN, argv0), then AT_RANDOM.
+        assert_eq!(
+            u64::from_le_bytes(layout.block[56..64].try_into().unwrap()),
+            31
+        );
+        assert_eq!(
+            u64::from_le_bytes(layout.block[64..72].try_into().unwrap()) as usize,
+            argv0
+        );
+        assert_eq!(
+            u64::from_le_bytes(layout.block[72..80].try_into().unwrap()),
+            25
+        );
+        assert_eq!(&layout.block[argv0 - block_start..argv0 - block_start + 10], b"/sfs/prog\0");
     }
 
     #[test]

@@ -185,10 +185,10 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_PRCTL => 0,
         SYS_BRK => linux_brk(args[0]),
         SYS_MUNMAP => linux_munmap(args[0], args[1]),
-        SYS_MMAP => linux_mmap(args[0], args[1], args[2], args[3]),
+        SYS_MMAP => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         // Our mappings are created with their final permissions; there is no
         // page-level protection state to change yet.
-        SYS_MPROTECT => 0,
+        SYS_MPROTECT => linux_mprotect(args[0], args[1], args[2]),
         SYS_PRLIMIT64 => 0, // no rlimits; report "unchanged"
         SYS_GETRANDOM => linux_getrandom(args[0], args[1], args[2]),
         // glibc probes rseq and falls back when it is unsupported.
@@ -882,26 +882,97 @@ fn linux_futex(address: u64, operation: u64, value: u64, timeout: u64) -> u64 {
     }
 }
 
-fn linux_mmap(address: u64, length: u64, prot: u64, flags: u64) -> u64 {
+fn linux_mmap(
+    address: u64,
+    length: u64,
+    prot: u64,
+    flags: u64,
+    fd: u64,
+    offset: u64,
+) -> u64 {
+    const MAP_SHARED: u64 = 0x01;
+    const MAP_PRIVATE: u64 = 0x02;
+    const MAP_FIXED: u64 = 0x10;
     const MAP_ANONYMOUS: u64 = 0x20;
-    const ENODEV: u64 = 19;
+    const MAP_FIXED_NOREPLACE: u64 = 0x10_0000;
+    const PROT_WRITE: u64 = 0x2;
+    const PAGE_SIZE: u64 = crate::memory::PAGE_SIZE as u64;
+
     if length == 0 {
         return errno(EINVAL);
     }
-    if flags & MAP_ANONYMOUS == 0 {
-        // File-backed mappings need page-cache/`mprotect` support; fail
-        // honestly instead of handing back zeroed anonymous memory.
-        return errno(ENODEV);
-    }
-    // An address hint is ignored; MAP_FIXED is refused rather than silently
-    // placing the mapping elsewhere (a caller that asked for a fixed address
-    // must not get a different one).
-    if flags & MAP_FIXED != 0 && address != 0 {
+    // Read permission is implied by every mapping we create; reject unknown
+    // protection bits rather than silently ignoring them.
+    if prot & !0x7 != 0 {
         return errno(EINVAL);
     }
-    scheduler::mmap_anonymous(length as usize, prot)
+    if flags & (MAP_PRIVATE | MAP_SHARED) == 0 {
+        return errno(EINVAL);
+    }
+    let fixed_bits = MAP_FIXED | MAP_FIXED_NOREPLACE;
+    let fixed = if flags & fixed_bits != 0 {
+        if address == 0 || address % PAGE_SIZE != 0 {
+            return errno(EINVAL);
+        }
+        Some(address as usize)
+    } else {
+        // A hint without MAP_FIXED is advisory; first-fit ignores it.
+        None
+    };
+
+    if flags & MAP_ANONYMOUS != 0 {
+        let placed = match fixed {
+            Some(address) => scheduler::mmap_anonymous_at(length as usize, prot, address),
+            None => scheduler::mmap_anonymous(length as usize, prot),
+        };
+        return placed.map(|placed| placed as u64).unwrap_or(errno(ENOMEM));
+    }
+
+    // File-backed mapping. Linux requires a page-aligned file offset. The
+    // whole file range is copied into fresh private frames: matches the
+    // MAP_PRIVATE contract for the dynamic loader, and keeps us independent
+    // of a page cache we do not have yet. A writable MAP_SHARED request would
+    // silently lose its write-back, so fail it instead of lying.
+    if offset % PAGE_SIZE != 0 {
+        return errno(EINVAL);
+    }
+    if flags & MAP_SHARED != 0 && prot & PROT_WRITE != 0 {
+        return errno(EINVAL);
+    }
+    if length as usize > crate::vfs::MAX_FILE_BYTES {
+        return errno(ENOMEM);
+    }
+    let task = scheduler::current_task_id();
+    let mut bytes = alloc::vec![0_u8; length as usize];
+    let read = match linux_fd::pread(task, fd, offset, &mut bytes) {
+        Ok(read) => read,
+        Err(error) => return errno(error),
+    };
+    scheduler::mmap_file(length as usize, prot, fixed, &bytes[..read])
         .map(|placed| placed as u64)
         .unwrap_or(errno(ENOMEM))
+}
+
+fn linux_mprotect(address: u64, length: u64, prot: u64) -> u64 {
+    const PAGE_SIZE: u64 = crate::memory::PAGE_SIZE as u64;
+    if address % PAGE_SIZE != 0 || prot & !0x7 != 0 {
+        return errno(EINVAL);
+    }
+    if length == 0 {
+        return 0;
+    }
+    if scheduler::mprotect(address as usize, length as usize, prot) {
+        0
+    } else {
+        crate::console::write_str("LINUX: mprotect failed addr=0x");
+        crate::console::write_hex_u64(address);
+        crate::console::write_str(" len=0x");
+        crate::console::write_hex_u64(length);
+        crate::console::write_str(" prot=0x");
+        crate::console::write_hex_u64(prot);
+        crate::console::write_str("\r\n");
+        errno(ENOMEM)
+    }
 }
 
 fn linux_munmap(address: u64, length: u64) -> u64 {

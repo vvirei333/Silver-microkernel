@@ -588,8 +588,16 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
         if bytes.len() > LINUX_EXEC_LIMIT {
             return SYSCALL_ERROR;
         }
-        let Ok(image) = crate::linux_elf::load_linux_program(&cwd, &bytes, LINUX_EXEC_LIMIT) else {
-            return SYSCALL_ERROR;
+        let image = match crate::linux_elf::load_linux_program(&cwd, &bytes, LINUX_EXEC_LIMIT) {
+            Ok(image) => image,
+            Err(error) => {
+                crate::console::write_str("LINUX: cannot load ");
+                crate::console::write_str(path);
+                crate::console::write_str(": ");
+                crate::console::write_str(crate::linux_elf::error_name(error));
+                crate::console::write_str("\r\n");
+                return SYSCALL_ERROR;
+            }
         };
         // The same bundle policy applies: an unkeyed plain ELF has no digest
         // and passes, while a signed manifest still has to verify.
@@ -608,6 +616,9 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
             b"PATH=/bin:/sbin:/usr/bin:/usr/sbin".to_vec(),
             b"HOME=/".to_vec(),
             b"TERM=vt100".to_vec(),
+            // The SFS root is mounted at /sfs, so that is where shared
+            // libraries live. A real distro would use /lib and /usr/lib.
+            b"LD_LIBRARY_PATH=/sfs".to_vec(),
         ];
         scheduler::spawn_linux_elf_with_args(image, policy.write_prefix, policy.quota, argv, envp)
             .unwrap_or(SYSCALL_ERROR)

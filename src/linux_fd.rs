@@ -312,6 +312,47 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
     }
 }
 
+/// Positional read used by file-backed `mmap`. Does not move the fd offset.
+pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize, u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    match target {
+        Target::Vfs(vfs_fd) => {
+            if vfs::fd_kind(task, vfs_fd) == Some(vfs::FD_KIND_DIR) {
+                return Err(EISDIR);
+            }
+            let mut read = 0usize;
+            vfs::pread_with(
+                task,
+                vfs_fd,
+                offset as usize,
+                buffer.len(),
+                |bytes| {
+                    let count = bytes.len().min(buffer.len());
+                    buffer[..count].copy_from_slice(&bytes[..count]);
+                    read = count;
+                    Ok(())
+                },
+            )
+            .map_err(|_| EBADF)?;
+            Ok(read)
+        }
+        Target::MemFd(state) => {
+            let file = state.lock();
+            let start = (offset as usize).min(file.data.len());
+            let count = (file.data.len() - start).min(buffer.len());
+            buffer[..count].copy_from_slice(&file.data[start..start + count]);
+            Ok(count)
+        }
+        Target::Zero => {
+            let count = buffer.len();
+            buffer.fill(0);
+            Ok(count)
+        }
+        Target::Null => Ok(0),
+        _ => Err(ENODEV),
+    }
+}
+
 pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
     let target = lookup(task, fd).ok_or(EBADF)?;
     match target {
@@ -710,6 +751,7 @@ const ENOENT: u64 = 2;
 const EBADF: u64 = 9;
 const EAGAIN: u64 = 11;
 const EFAULT: u64 = 14;
+const ENODEV: u64 = 19;
 const ENOTDIR: u64 = 20;
 const EISDIR: u64 = 21;
 const EINVAL: u64 = 22;

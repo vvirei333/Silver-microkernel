@@ -158,7 +158,7 @@ class Image:
         for byte in range(BLOCK):
             self.data[block * BLOCK + byte] = 0
         blocks, indirect, double = self.append_block(
-            blocks, indirect, double, block, len(self.dir_blocks(dir_index)) + 1
+            blocks, indirect, double, block, len(self.dir_blocks(dir_index))
         )
         self.set_inode(dir_index, INODE_KIND_DIR, 0, blocks, indirect, double)
         self.write_entry(block * BLOCK, inode, encoded)

@@ -1236,6 +1236,81 @@ pub fn replace_user_page(
     true
 }
 
+/// Changes the permission bits of an already-mapped range inside the
+/// anonymous window, leaving every physical page in place. Used by
+/// `mprotect(2)`, in particular for RELRO pages that move from RW to RO after
+/// the dynamic loader has applied relocations.
+///
+/// All-or-nothing: the whole range is checked for a live 4 KiB mapping before
+/// the first descriptor changes, so a hole does not leave a half-applied
+/// protection. W^X is enforced here as well as in [`map_user_pages_at`].
+pub fn protect_user_pages_at(
+    ttbr0: usize,
+    virtual_address: usize,
+    page_count: usize,
+    prot: u64,
+) -> bool {
+    if page_count == 0 || virtual_address % GRANULE != 0 {
+        return false;
+    }
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return false;
+    }
+    let Some(span) = page_count.checked_mul(GRANULE) else {
+        return false;
+    };
+    let Some(end) = virtual_address.checked_add(span) else {
+        return false;
+    };
+    // The image lives below the anonymous window (MAIN_BIAS/INTERP_BIAS);
+    // `mprotect` must work there too, not only on `mmap` regions.
+    if virtual_address < GRANULE || end > USER_STACK_GUARD_VA {
+        return false;
+    }
+
+    let root = root_of(ttbr0);
+    unsafe {
+        let l1_user = follow_table(root, 0);
+        // Walk L1/L2/L3 generically: the image at 0x1000_0000/0x2000_0000 is
+        // below `DRAM_BASE`, so the old `(va - DRAM_BASE) / BLOCK_2M` indexing
+        // used by the mmap window cannot be reused here.
+        // Validate every target slot first: a refusal must not leave the
+        // range half-protected.
+        for index in 0..page_count {
+            let va = virtual_address + index * GRANULE;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_index = (va >> 21) & (ENTRIES - 1);
+            let l3_index = (va >> 12) & 0x1FF;
+            let l2_entry = read_entry(l1_user, l1_index);
+            if l2_entry & DESC_TABLE != DESC_TABLE {
+                return false;
+            }
+            let l2 = descriptor_address(l2_entry) as usize;
+            let l3_entry = read_entry(l2, l2_index);
+            if l3_entry & DESC_TABLE != DESC_TABLE {
+                return false;
+            }
+            let l3 = descriptor_address(l3_entry) as usize;
+            if read_entry(l3, l3_index) & DESC_PAGE != DESC_PAGE {
+                return false;
+            }
+        }
+        for index in 0..page_count {
+            let va = virtual_address + index * GRANULE;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_index = (va >> 21) & (ENTRIES - 1);
+            let l3_index = (va >> 12) & 0x1FF;
+            let l2 = descriptor_address(read_entry(l1_user, l1_index)) as usize;
+            let l3 = descriptor_address(read_entry(l2, l2_index)) as usize;
+            let physical = descriptor_address(read_entry(l3, l3_index)) as usize;
+            write_entry(l3, l3_index, user_anonymous_page(physical, prot));
+            clean_entry_line(l3, l3_index);
+        }
+    }
+    finish_table_changes_for(ttbr0);
+    true
+}
+
 /// Removes `page_count` pages starting at `virtual_address`, freeing an L3 table
 /// once its last entry is gone. The physical frames are returned to the caller
 /// by address (tracked separately by the scheduler), so this only edits tables.

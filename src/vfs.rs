@@ -937,6 +937,35 @@ impl Vfs {
         Ok(data.len())
     }
 
+    /// Reads at an explicit offset without moving the file description's
+    /// position. `mmap` uses this to fill a file-backed region while leaving
+    /// the fd's own read cursor alone.
+    fn pread_with<F>(
+        &mut self,
+        owner: u64,
+        fd: u64,
+        offset: usize,
+        limit: usize,
+        consume: F,
+    ) -> Result<usize, ()>
+    where
+        F: FnOnce(&[u8]) -> Result<(), ()>,
+    {
+        let index = self
+            .open_files
+            .iter()
+            .position(|file| file.owner == owner && file.fd == fd)
+            .ok_or(())?;
+        if self.open_files[index].directory {
+            return Err(());
+        }
+        let path = self.open_files[index].path.clone();
+        let (mount, relative) = self.resolve(&path);
+        let data = self.mounts[mount].fs.read_at(&relative, offset, limit)?;
+        consume(&data)?;
+        Ok(data.len())
+    }
+
     fn write(&mut self, owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
         let index = self
             .open_files
@@ -1281,6 +1310,21 @@ where
     F: FnOnce(&[u8]) -> Result<(), ()>,
 {
     with_vfs(|vfs| vfs.read_with(owner, fd, limit, consume))
+}
+
+/// Positional read: does not advance the fd offset. Used by file-backed
+/// `mmap`, which may map several segments of one file.
+pub fn pread_with<F>(
+    owner: u64,
+    fd: u64,
+    offset: usize,
+    limit: usize,
+    consume: F,
+) -> Result<usize, ()>
+where
+    F: FnOnce(&[u8]) -> Result<(), ()>,
+{
+    with_vfs(|vfs| vfs.pread_with(owner, fd, offset, limit, consume))
 }
 
 pub fn write(owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {

@@ -16,6 +16,8 @@
 #   linuxrun /sfs/linux-signal  # sigaction/sigprocmask/kill/SIGCHLD
 #   linuxrun /sfs/linux-pie     # ET_DYN + PT_INTERP, prints 'pie main', exit 7
 #   linuxrun /sfs/linux-bigfile # 16 MiB rootfs + 3 MiB file, prints 'rootfs ok'
+#   linuxrun /sfs/linux-mmapfile # file mmap + mprotect + MAP_FIXED, prints 'mmap ok'
+#   linuxrun /sfs/linux-dyn     # real ld.so + dynamic libc, prints 'dynamic hello'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -54,6 +56,7 @@ build pipe
 build ipc
 build signal
 build bigfile
+build mmapfile
 
 # ET_DYN main + custom interpreter (no libc needed).
 "$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
@@ -82,8 +85,9 @@ Path("build/big.bin").write_bytes((block * 3)[:3 * 1024 * 1024])
 PY
 python3 scripts/sfs_inject.py "$IMAGE" build/big.bin big.bin
 python3 scripts/sfs_inject.py "$IMAGE" build/bigfile.elf linux-bigfile
+python3 scripts/sfs_inject.py "$IMAGE" build/mmapfile.elf linux-mmapfile
 
-# A real static libc binary (the SFS image is 1 MiB; all three together fit).
+# A real static libc binary (the SFS image is 16 MiB; all of these fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then
     printf 'readme!!' > build/readme.txt
     python3 scripts/sfs_inject.py "$IMAGE" build/readme.txt readme.txt
@@ -94,5 +98,23 @@ else
     echo "note: no static libc for $CC; skipped the libc test" >&2
 fi
 
+# A dynamically linked binary exercises the real ld.so path: file-backed
+# mmap, MAP_FIXED over a PROT_NONE reservation, and mprotect on the main
+# image's RELRO. The interpreter is patched to the path in our VFS.
+LD_SO="$("$CC" -print-file-name=ld-linux-aarch64.so.1)"
+LIBC_SO="$("$CC" -print-file-name=libc.so.6)"
+if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
+    && "$CC" -O2 -o build/dyn-hello tests/linux/dynhello.c 2>/dev/null; then
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/dyn-hello
+    python3 scripts/sfs_inject.py "$IMAGE" "$LD_SO" ld-linux-aarch64.so.1
+    python3 scripts/sfs_inject.py "$IMAGE" "$LIBC_SO" libc.so.6
+    python3 scripts/sfs_inject.py "$IMAGE" build/dyn-hello linux-dyn
+    DYN=" linuxrun /sfs/linux-dyn"
+else
+    DYN=""
+    echo "note: patchelf or the dynamic AArch64 libc is missing; skipped the dynamic test" >&2
+fi
+
 python3 scripts/sfs_fsck.py "$IMAGE"
-echo "installed: linuxrun /sfs/linux-hello  linuxrun /sfs/linux-rw$LIBC"
+echo "installed: linuxrun /sfs/linux-hello  linuxrun /sfs/linux-rw$LIBC$DYN"
