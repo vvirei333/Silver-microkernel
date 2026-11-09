@@ -455,9 +455,22 @@ howl> linuxrun /sfs/linux-sockets
 glibc socket ok
 ```
 
-Named `AF_UNIX` sockets (`socket`/`bind`/`listen`/`accept`/`connect`) still
-need a writable runtime directory and return `-ENOSYS`; `socketpair(2)` is the
-first transport slice.
+Named `AF_UNIX` sockets work through a path registry:
+`socket(AF_UNIX, SOCK_STREAM)` returns an unbound endpoint, `bind` reserves a
+filesystem or abstract name (`EADDRINUSE` on a duplicate), `listen` arms the
+backlog, `connect` joins a listener and turns the caller's descriptor into the
+client end, and `accept`/`accept4` hand out the server end. `getsockname`
+returns the bound name with the Linux NUL-terminated length. The name does not
+need a file on disk yet, which is how Wayland and D-Bus address each other:
+
+```text
+howl> linuxrun /sfs/linux-namedsock
+named socket ok
+```
+
+Accepted descriptors support everything a pair does, including `SCM_RIGHTS`.
+A writable runtime directory (for socket lock files and `XDG_RUNTIME_DIR`) is
+still the next step.
 
 Signals keep per-task dispositions, blocked masks and pending bits.
 `rt_sigaction`/`rt_sigprocmask` round-trip, `kill`/`tgkill` apply the default

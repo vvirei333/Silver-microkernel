@@ -31,6 +31,7 @@
 #   linuxrun /sfs/linux-exitgroup # exit_group from a worker kills the process
 #   linuxrun /sfs/linux-sockets # glibc AF_UNIX + SCM_RIGHTS, prints 'glibc socket ok'
 #   linuxrun /sfs/linux-memfd  # memfd + MAP_SHARED across fork, prints 'shared memfd ok'
+#   linuxrun /sfs/linux-namedsock # bind/listen/accept/connect, prints 'named socket ok'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -76,6 +77,7 @@ build cowfork
 build scope
 build threads
 build unixsock
+build namedsock
 
 # ET_DYN main + custom interpreter (no libc needed).
 "$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
@@ -111,6 +113,7 @@ python3 scripts/sfs_inject.py "$IMAGE" build/cowfork.elf linux-cowfork
 python3 scripts/sfs_inject.py "$IMAGE" build/scope.elf linux-scope
 python3 scripts/sfs_inject.py "$IMAGE" build/threads.elf linux-threads
 python3 scripts/sfs_inject.py "$IMAGE" build/unixsock.elf linux-unixsock
+python3 scripts/sfs_inject.py "$IMAGE" build/namedsock.elf linux-namedsock
 
 # A real static libc binary (the SFS image is 16 MiB; all of these fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then

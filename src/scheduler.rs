@@ -2632,6 +2632,17 @@ pub fn group_leader(task: u64) -> u64 {
         .unwrap_or(task)
 }
 
+/// Live user TLS register. `TaskContext::tls` is only refreshed when the task
+/// is switched out, so a task that is currently running (and is therefore the
+/// caller of `fork`) must read the register itself.
+fn current_user_tls() -> u64 {
+    let value: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, tpidr_el0", out(reg) value, options(nostack, preserves_flags));
+    }
+    value
+}
+
 /// Task id that owns the descriptor table. Threads share the leader's table.
 pub fn fd_table_owner(task: u64) -> u64 {
     group_leader(task)
@@ -3748,7 +3759,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             parent.signal_trampoline,
             parent.fs_write_prefix.clone(),
             parent.read_prefix.clone(),
-            parent.context.tls,
+            current_user_tls(),
             parent.fs_quota,
             parent.priority,
         )

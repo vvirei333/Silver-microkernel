@@ -190,6 +190,19 @@ struct SocketState {
     stream: bool,
 }
 
+/// State of a bound `AF_UNIX` listening socket. The registry holds one Arc
+/// per bound path; the fd table holds another. Pending entries own the server
+/// end of each accepted-not-yet-accepted connection.
+struct ListenerState {
+    path: Vec<u8>,
+    refs: usize,
+    listening: bool,
+    backlog: usize,
+    pending: VecDeque<Arc<Mutex<SocketState>>>,
+}
+
+static LISTENERS: Mutex<Vec<Arc<Mutex<ListenerState>>>> = Mutex::new(Vec::new());
+
 /// Linux fd targets. `Clone` (not `Copy`) because a pipe/eventfd/memfd target
 /// shares an `Arc`; cloning is what `dup`/`fork` do deliberately.
 #[derive(Clone)]
@@ -212,6 +225,15 @@ enum Target {
     Socket {
         state: Arc<Mutex<SocketState>>,
         end: u8,
+        nonblock: bool,
+    },
+    /// A socket created by `socket(2)` but not connected or bound yet.
+    Unbound {
+        nonblock: bool,
+    },
+    /// A bound `AF_UNIX` socket; `listen(2)` flips it to accepting.
+    Listener {
+        state: Arc<Mutex<ListenerState>>,
         nonblock: bool,
     },
 }
@@ -248,6 +270,30 @@ fn lookup(task: u64, fd: u64) -> Option<Target> {
     })
 }
 
+/// Drops one reference to one end of a connected pair. The last reference
+/// closes that side and wakes the peer with EOF.
+fn release_socket_end(state: &Arc<Mutex<SocketState>>, end: u8) {
+    let dropped = {
+        let mut socket = state.lock();
+        let end = end as usize;
+        if socket.refs[end] == 0 {
+            return;
+        }
+        socket.refs[end] -= 1;
+        if socket.refs[end] != 0 {
+            return;
+        }
+        socket.ends[end].write_closed = true;
+        socket.ends[end].read_closed = true;
+        socket.ends[end].incoming.drain(..).collect::<Vec<_>>()
+    };
+    for message in dropped {
+        for target in message.fds {
+            target.release_endpoint();
+        }
+    }
+}
+
 impl Target {
     /// A new descriptor referring to the same pipe end.
     fn retain_endpoint(&self) {
@@ -262,6 +308,9 @@ impl Target {
             }
             Target::Socket { state, end, .. } => {
                 state.lock().refs[*end as usize] += 1;
+            }
+            Target::Listener { state, .. } => {
+                state.lock().refs += 1;
             }
             _ => {}
         }
@@ -279,26 +328,28 @@ impl Target {
                 }
             }
             Target::Socket { state, end, .. } => {
-                let dropped = {
-                    let mut socket = state.lock();
-                    let end = *end as usize;
-                    if socket.refs[end] == 0 {
-                        return;
-                    }
-                    socket.refs[end] -= 1;
-                    if socket.refs[end] != 0 {
-                        return;
-                    }
-                    // Last descriptor of this end: the peer must see EOF and
-                    // no future write may succeed.
-                    socket.ends[end].write_closed = true;
-                    socket.ends[end].read_closed = true;
-                    socket.ends[end].incoming.drain(..).collect::<Vec<_>>()
-                };
-                for message in dropped {
-                    for target in message.fds {
-                        target.release_endpoint();
-                    }
+                release_socket_end(state, *end);
+            }
+            Target::Listener { state, .. } => {
+                // Lock the registry before the listener, matching `bind`, so
+                // the two lock orders cannot deadlock.
+                let mut registry = LISTENERS.lock();
+                let mut listener = state.lock();
+                if listener.refs == 0 {
+                    return;
+                }
+                listener.refs -= 1;
+                if listener.refs != 0 {
+                    return;
+                }
+                let pending: Vec<Arc<Mutex<SocketState>>> =
+                    listener.pending.drain(..).collect();
+                let path = listener.path.clone();
+                drop(listener);
+                registry.retain(|entry| entry.lock().path != path);
+                drop(registry);
+                for connection in pending {
+                    release_socket_end(&connection, 1);
                 }
             }
             _ => {}
@@ -511,6 +562,7 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             user_memory::copy_to_user(&chunk[..read], buffer).map_err(|_| EFAULT)?;
             Ok(read as u64)
         }
+        Target::Unbound { .. } | Target::Listener { .. } => Err(ENOTCONN),
     }
 }
 
@@ -597,6 +649,7 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             user_memory::copy_from_user(buffer, &mut bytes).map_err(|_| EFAULT)?;
             socket_send_locked(&state, end, &bytes, Vec::new())
         }
+        Target::Unbound { .. } | Target::Listener { .. } => Err(ENOTCONN),
     }
 }
 
@@ -690,7 +743,9 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
             let size = state.lock().data.len() as u64;
             write_stat(buffer, S_IFREG | 0o600, size, fd.max(1))
         }
-        Target::Socket { .. } => write_stat(buffer, S_IFSOCK | 0o600, 0, fd.max(1)),
+        Target::Socket { .. } | Target::Unbound { .. } | Target::Listener { .. } => {
+            write_stat(buffer, S_IFSOCK | 0o600, 0, fd.max(1))
+        }
     }
 }
 
@@ -1072,6 +1127,186 @@ pub fn socketpair(task: u64, nonblock: bool) -> Result<(u64, u64), u64> {
     }
 }
 
+/// `socket(2)` for `AF_UNIX`: an unbound endpoint, ready for `bind` or
+/// `connect`.
+pub fn socket(task: u64, nonblock: bool) -> Result<u64, u64> {
+    insert(task, Target::Unbound { nonblock }).ok_or(EMFILE)
+}
+
+/// Replaces exactly one descriptor slot, optionally requiring it to still be
+/// an unbound socket. Used by `bind` and `connect`, which turn the calling
+/// descriptor into a different kind of endpoint.
+fn replace_unbound(task: u64, fd: u64, replacement: Target) -> Result<(), u64> {
+    with_table(task, |table| {
+        let Some(slot) = table.slots.get_mut(fd as usize) else {
+            return false;
+        };
+        if !matches!(slot, Some(Target::Unbound { .. })) {
+            return false;
+        }
+        *slot = Some(replacement);
+        true
+    })
+    .then_some(())
+    .ok_or(EBADF)
+}
+
+/// `bind(2)` for a filesystem or abstract `AF_UNIX` path.
+pub fn bind(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
+    if path.is_empty() {
+        return Err(EINVAL);
+    }
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::Unbound { nonblock } = target else {
+        return Err(EINVAL);
+    };
+    let state = Arc::new(Mutex::new(ListenerState {
+        path: path.clone(),
+        refs: 1,
+        listening: false,
+        backlog: 1,
+        pending: VecDeque::new(),
+    }));
+    {
+        let mut registry = LISTENERS.lock();
+        if registry
+            .iter()
+            .any(|entry| entry.lock().path == path)
+        {
+            return Err(EADDRINUSE);
+        }
+        registry.push(state.clone());
+    }
+    if replace_unbound(
+        task,
+        fd,
+        Target::Listener {
+            state: state.clone(),
+            nonblock,
+        },
+    )
+    .is_err()
+    {
+        LISTENERS.lock().retain(|entry| !Arc::ptr_eq(entry, &state));
+        return Err(EBADF);
+    }
+    Ok(())
+}
+
+/// `listen(2)`: marks a bound socket as accepting connections.
+pub fn listen(task: u64, fd: u64, backlog: u64) -> Result<(), u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::Listener { state, .. } = target else {
+        return Err(EINVAL);
+    };
+    let mut listener = state.lock();
+    listener.listening = true;
+    listener.backlog = (backlog as usize).clamp(1, 128);
+    Ok(())
+}
+
+/// `connect(2)`: joins a bound listener and turns the calling descriptor into
+/// the client end of a connected pair.
+pub fn connect(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
+    if path.is_empty() {
+        return Err(EINVAL);
+    }
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::Unbound { nonblock } = target else {
+        return Err(EINVAL);
+    };
+    let listener = {
+        let registry = LISTENERS.lock();
+        registry
+            .iter()
+            .find(|entry| entry.lock().path == path)
+            .cloned()
+    };
+    let Some(listener) = listener else {
+        return Err(ECONNREFUSED);
+    };
+    let pair = Arc::new(Mutex::new(SocketState {
+        ends: [SocketEnd::default(), SocketEnd::default()],
+        refs: [1, 1],
+        stream: true,
+    }));
+    {
+        let mut state = listener.lock();
+        if !state.listening || state.pending.len() >= state.backlog.max(1) {
+            return Err(ECONNREFUSED);
+        }
+        // The queue takes ownership of the server end's reference.
+        state.pending.push_back(pair.clone());
+    }
+    if replace_unbound(
+        task,
+        fd,
+        Target::Socket {
+            state: pair.clone(),
+            end: 0,
+            nonblock,
+        },
+    )
+    .is_err()
+    {
+        {
+            let mut state = listener.lock();
+            state
+                .pending
+                .retain(|connection| !Arc::ptr_eq(connection, &pair));
+        }
+        release_socket_end(&pair, 0);
+        release_socket_end(&pair, 1);
+        return Err(EBADF);
+    }
+    Ok(())
+}
+
+/// `accept(2)`/`accept4(2)`: pops one pending connection. Returns the new
+/// descriptor; the caller writes the (unnamed) peer address.
+pub fn accept(task: u64, fd: u64, nonblock_flag: bool) -> Result<u64, u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::Listener { state, nonblock } = target else {
+        return Err(EINVAL);
+    };
+    let nonblock = nonblock || nonblock_flag;
+    loop {
+        let pending = {
+            let mut listener = state.lock();
+            listener.pending.pop_front()
+        };
+        if let Some(pair) = pending {
+            // The queue's reference to the server end moves into the table.
+            match insert(
+                task,
+                Target::Socket {
+                    state: pair.clone(),
+                    end: 1,
+                    nonblock,
+                },
+            ) {
+                Some(new_fd) => return Ok(new_fd),
+                None => {
+                    release_socket_end(&pair, 1);
+                    return Err(EMFILE);
+                }
+            }
+        }
+        if nonblock {
+            return Err(EAGAIN);
+        }
+        scheduler::sleep(1);
+    }
+}
+
+/// Local address bytes for `getsockname`; `None` means an unnamed pair.
+pub fn socket_local_name(task: u64, fd: u64) -> Option<Vec<u8>> {
+    match lookup(task, fd)? {
+        Target::Listener { state, .. } => Some(state.lock().path.clone()),
+        _ => None,
+    }
+}
+
 /// Queues `bytes` (and any passed descriptors) on the peer end.
 fn socket_send_locked(
     state: &Arc<Mutex<SocketState>>,
@@ -1237,7 +1472,10 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
     let (access, nonblock) = match target {
         Target::Vfs(_) => (0, false),
         Target::Pipe { read, .. } => (if read { 0 } else { O_WRONLY }, false),
-        Target::Socket { nonblock, .. } | Target::EventFd { nonblock, .. } => (O_RDWR, nonblock),
+        Target::Socket { nonblock, .. }
+        | Target::Unbound { nonblock }
+        | Target::Listener { nonblock, .. }
+        | Target::EventFd { nonblock, .. } => (O_RDWR, nonblock),
         Target::Console
         | Target::Null
         | Target::Zero
@@ -1257,6 +1495,8 @@ pub fn set_nonblock(task: u64, fd: u64, nonblock: bool) -> Result<(), u64> {
             .and_then(|slot| slot.as_mut())
         {
             Some(Target::Socket { nonblock: flag, .. })
+            | Some(Target::Unbound { nonblock: flag })
+            | Some(Target::Listener { nonblock: flag, .. })
             | Some(Target::EventFd { nonblock: flag, .. }) => {
                 *flag = nonblock;
                 true
@@ -1331,6 +1571,14 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
             }
             ready
         }
+        Target::Unbound { .. } => POLLOUT,
+        Target::Listener { state, .. } => {
+            if state.lock().pending.is_empty() {
+                0
+            } else {
+                POLLIN
+            }
+        }
     })
 }
 
@@ -1387,6 +1635,9 @@ const ESPIPE: u64 = 29;
 const EROFS: u64 = 30;
 const EPIPE: u64 = 32;
 const ENOTSOCK: u64 = 88;
+const ENOTCONN: u64 = 107;
+const EADDRINUSE: u64 = 98;
+const ECONNREFUSED: u64 = 111;
 const ENOMEM: u64 = 12;
 const EFBIG: u64 = 27;
 const EMFILE: u64 = 24;

@@ -279,14 +279,19 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_SHUTDOWN => finish(
             linux_fd::socket_shutdown(scheduler::current_task_id(), args[0], args[1]).map(|_| 0),
         ),
-        SYS_GETSOCKNAME | SYS_GETPEERNAME => linux_sockname(args[1], args[2]),
+        SYS_GETSOCKNAME | SYS_GETPEERNAME => {
+            linux_sockname(scheduler::current_task_id(), args[0], args[1], args[2])
+        }
         SYS_SETSOCKOPT => linux_setsockopt(args[0], args[1]),
         SYS_GETSOCKOPT => linux_getsockopt(args[0], args[1], args[2], args[3], args[4]),
-        // Named `AF_UNIX` sockets need a writable runtime directory; the
-        // transport that Wayland/D-Bus use over a pair is socketpair(2).
-        SYS_SOCKET | SYS_BIND | SYS_LISTEN | SYS_CONNECT | SYS_ACCEPT | SYS_ACCEPT4 => {
-            errno(ENOSYS)
-        }
+        SYS_SOCKET => linux_socket(args[0], args[1], args[2]),
+        SYS_BIND => linux_bind(args[0], args[1], args[2]),
+        SYS_LISTEN => finish(
+            linux_fd::listen(scheduler::current_task_id(), args[0], args[1]).map(|_| 0),
+        ),
+        SYS_CONNECT => linux_connect(args[0], args[1], args[2]),
+        SYS_ACCEPT => linux_accept(args[0], args[1], args[2], 0),
+        SYS_ACCEPT4 => linux_accept(args[0], args[1], args[2], args[3]),
         // glibc probes rseq and falls back when it is unsupported.
         SYS_RSEQ => errno(ENOSYS),
         _ => {
@@ -802,33 +807,127 @@ fn linux_recvfrom(
     if user_memory::copy_to_user(&bytes[..read], buffer).is_err() {
         return errno(EFAULT);
     }
-    linux_sockname(address, address_length);
+    let _ = write_sockaddr(address, address_length, &[]);
     read as u64
 }
 
-/// Writes an unnamed `sockaddr_un` (family only) and its length.
-fn linux_sockname(address: u64, length_pointer: u64) -> u64 {
+/// Reads an `AF_UNIX` `sockaddr_un`. Filesystem names are NUL-terminated;
+/// abstract names keep the leading NUL and their full byte length.
+fn read_sockaddr(address: u64, length: u64) -> Result<Vec<u8>, u64> {
+    if address == 0 || length < 3 {
+        return Err(EINVAL);
+    }
+    let length = (length as usize).min(110);
+    let mut raw = alloc::vec![0_u8; length];
+    user_memory::copy_from_user(address, &mut raw).map_err(|_| EFAULT)?;
+    let family = u16::from_le_bytes(raw[0..2].try_into().unwrap());
+    if family != AF_UNIX as u16 {
+        return Err(EAFNOSUPPORT);
+    }
+    let body = &raw[2..];
+    let path = if body[0] == 0 {
+        if body.len() < 2 {
+            return Err(EINVAL);
+        }
+        body.to_vec()
+    } else {
+        let end = body.iter().position(|byte| *byte == 0).unwrap_or(body.len());
+        if end == 0 {
+            return Err(EINVAL);
+        }
+        body[..end].to_vec()
+    };
+    Ok(path)
+}
+
+/// Writes `family + path` into a caller `sockaddr_un` and stores the used
+/// length. `path` is empty for an unnamed socket.
+fn write_sockaddr(address: u64, length_pointer: u64, path: &[u8]) -> Result<(), u64> {
     let mut capacity = 0u32;
     if length_pointer != 0 {
         let mut raw = [0_u8; 4];
-        if user_memory::copy_from_user(length_pointer, &mut raw).is_err() {
-            return errno(EFAULT);
-        }
+        user_memory::copy_from_user(length_pointer, &mut raw).map_err(|_| EFAULT)?;
         capacity = u32::from_le_bytes(raw);
     }
+    // Filesystem names are returned NUL-terminated and the length includes
+    // the terminator, matching Linux. Abstract names carry their own leading
+    // NUL and no extra terminator.
+    let filesystem = path.first().map(|byte| *byte != 0).unwrap_or(false);
+    let terminator = usize::from(filesystem);
+    let total = 2 + path.len() + terminator;
     if address != 0 && capacity >= 2 {
         let family = (AF_UNIX as u16).to_le_bytes();
-        if user_memory::copy_to_user(&family, address).is_err() {
-            return errno(EFAULT);
+        user_memory::copy_to_user(&family, address).map_err(|_| EFAULT)?;
+        if capacity as usize >= total && !path.is_empty() {
+            user_memory::copy_to_user(path, address + 2).map_err(|_| EFAULT)?;
+            if terminator != 0 {
+                let nul = [0_u8; 1];
+                user_memory::copy_to_user(&nul, address + 2 + path.len() as u64)
+                    .map_err(|_| EFAULT)?;
+            }
         }
     }
     if length_pointer != 0 {
-        let length = if address == 0 { 0u32 } else { 2u32 };
-        if user_memory::copy_to_user(&length.to_le_bytes(), length_pointer).is_err() {
-            return errno(EFAULT);
-        }
+        let used = if address == 0 {
+            0
+        } else {
+            total.min(capacity as usize) as u32
+        };
+        user_memory::copy_to_user(&used.to_le_bytes(), length_pointer).map_err(|_| EFAULT)?;
     }
-    0
+    Ok(())
+}
+
+fn linux_sockname(task: u64, fd: u64, address: u64, length_pointer: u64) -> u64 {
+    let path = linux_fd::socket_local_name(task, fd).unwrap_or_default();
+    match write_sockaddr(address, length_pointer, &path) {
+        Ok(()) => 0,
+        Err(code) => errno(code),
+    }
+}
+
+fn linux_socket(domain: u64, kind: u64, protocol: u64) -> u64 {
+    if domain != AF_UNIX {
+        return errno(EAFNOSUPPORT);
+    }
+    let base = kind & 0xf;
+    if (base != 1 && base != 2) || protocol != 0 {
+        return errno(EPROTONOSUPPORT);
+    }
+    finish(linux_fd::socket(
+        scheduler::current_task_id(),
+        kind & SOCK_NONBLOCK != 0,
+    ))
+}
+
+fn linux_bind(fd: u64, address: u64, length: u64) -> u64 {
+    let path = match read_sockaddr(address, length) {
+        Ok(path) => path,
+        Err(code) => return errno(code),
+    };
+    finish(linux_fd::bind(scheduler::current_task_id(), fd, path).map(|_| 0))
+}
+
+fn linux_connect(fd: u64, address: u64, length: u64) -> u64 {
+    let path = match read_sockaddr(address, length) {
+        Ok(path) => path,
+        Err(code) => return errno(code),
+    };
+    finish(linux_fd::connect(scheduler::current_task_id(), fd, path).map(|_| 0))
+}
+
+fn linux_accept(fd: u64, address: u64, length_pointer: u64, flags: u64) -> u64 {
+    let task = scheduler::current_task_id();
+    let new_fd = match linux_fd::accept(task, fd, flags & SOCK_NONBLOCK != 0) {
+        Ok(new_fd) => new_fd,
+        Err(code) => return errno(code),
+    };
+    // The accepted peer is unnamed in this model (clients do not bind).
+    if let Err(code) = write_sockaddr(address, length_pointer, &[]) {
+        let _ = linux_fd::close(task, new_fd);
+        return errno(code);
+    }
+    new_fd
 }
 
 fn linux_setsockopt(_fd: u64, level: u64) -> u64 {
