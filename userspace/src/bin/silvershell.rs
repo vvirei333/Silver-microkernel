@@ -195,6 +195,11 @@ fn execute(command: &str) {
         return;
     }
 
+    if let Some(name) = command.strip_prefix("linuxrun-") {
+        run_linux_alias(name);
+        return;
+    }
+
     let mut words = command.split_whitespace();
     match words.next() {
         None => {}
@@ -216,6 +221,7 @@ fn execute(command: &str) {
             syscall::print("  run <path>  Load and run an ELF file from the filesystem\r\n");
             #[cfg(feature = "linux-abi")]
             syscall::print("  linuxrun <path>  Run a Linux ABI ELF (x8 = Linux syscall)\r\n");
+            syscall::print("  linuxrun-<app>   Run /sfs/apps/<app> or /sfs/<app>\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
             syscall::print("             Print, truncate/write, or append to a file\r\n");
             syscall::print("  touch <file>\r\n");
@@ -798,6 +804,33 @@ fn run_elf(path: &str) {
 #[cfg(feature = "linux-abi")]
 fn run_linux_elf(path: &str) {
     run_elf_with(path, syscall::spawn_linux_path, false);
+}
+
+/// `linuxrun-<app>`: resolves `/sfs/apps/<app>` then `/sfs/<app>`, so a
+/// installed bundle and a plain test binary share one short command.
+fn run_linux_alias(name: &str) {
+    run_elf_with(name, spawn_linux_alias, false);
+}
+
+fn spawn_linux_alias(name: &str) -> Option<u64> {
+    if name.is_empty() {
+        return None;
+    }
+    let mut path = [0_u8; 160];
+    for prefix in [b"/sfs/apps/".as_slice(), b"/sfs/".as_slice()] {
+        let total = prefix.len() + name.len();
+        if total >= path.len() {
+            continue;
+        }
+        path[..prefix.len()].copy_from_slice(prefix);
+        path[prefix.len()..total].copy_from_slice(name.as_bytes());
+        if let Ok(text) = core::str::from_utf8(&path[..total]) {
+            if let Some(id) = syscall::spawn_linux_path(text) {
+                return Some(id);
+            }
+        }
+    }
+    None
 }
 
 fn run_elf_with(path: &str, spawn: fn(&str) -> Option<u64>, assign_console: bool) {

@@ -86,7 +86,7 @@ open files, SFS usage and DMA state. The interactive `howl` shell and the
 - [x] MMU: 4-level tables, 4 KB granules, high-half kernel via TTBR1
 - [x] Userspace ELFs (apps, drivers, shell and probes) with checked `PT_LOAD` loading and BSS zeroing
 - [x] Init architecture: `silverd` starts Scout, the block, network, graphics and input drivers, the SFS and network servers, Howl and Howler, all resolved by program ID
-- [x] howl: `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`, `sl`, `run`, `mkdir`, `rm`, `rmdir`, `mv`, `replace`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`, `health`, `du`
+- [x] howl: `help`, `fastfetch`, `ls`, `cat`, `echo`, `say`, `sl`, `run`, `linuxrun-<app>`, `mkdir`, `rm`, `rmdir`, `mv`, `replace`, `cd`, `pwd`, `clear`, `uname`, `ps`, `spawn`, `bg`, `fg`, `kill`, `wait`, `health`, `du`
 - [x] Shell output redirection: `>` truncates, `>>` appends, quoted operators stay literal
 - [x] ANSI clear/home and a bold cyan `howl>` prompt
 - [x] RAM-VFS: `/bin`, `/etc`, `/tmp`, files/directories and per-task descriptors
@@ -355,7 +355,12 @@ Program exited with status 0
 
 The last one is a **real static glibc binary** (libc initialisation, stdio,
 `open`/`read`/`close`, `opendir`/`readdir`, `exit`), which is the point of the
-track. A Linux main executable is streamed from the VFS: only the ELF header,
+track. `linuxrun-<app>` is the short launcher: it tries `/sfs/apps/<app>` and
+then `/sfs/<app>`, so `linuxrun-glibtest` and `linuxrun-linux-hello` work
+without spelling out the full path. Linux children inherit
+`WAYLAND_DISPLAY=wayland-test`, `XDG_RUNTIME_DIR=/tmp`,
+`XDG_DATA_DIRS=/sfs/share`, `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` under `/tmp`.
+A Linux main executable is streamed from the VFS: only the ELF header,
 program headers and interpreter are buffered, while `PT_LOAD` bytes are copied
 chunk by chunk into their final frames. The main image may therefore reach
 32 MiB, while whole-file reads and the interpreter path stay capped at 8 MiB

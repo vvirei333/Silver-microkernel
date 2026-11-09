@@ -35,6 +35,11 @@ static gboolean quit_loop(gpointer data) {
 int main(void) {
     g_print("glib %d.%d.%d\n", GLIB_MAJOR_VERSION, GLIB_MINOR_VERSION,
             GLIB_MICRO_VERSION);
+    g_print("env wayland=%s runtime=%s\n",
+            g_getenv("WAYLAND_DISPLAY") != NULL ? g_getenv("WAYLAND_DISPLAY")
+                                                : "(none)",
+            g_getenv("XDG_RUNTIME_DIR") != NULL ? g_getenv("XDG_RUNTIME_DIR")
+                                                : "(none)");
     Wolf *wolf = g_object_new(wolf_get_type(), NULL);
     if (wolf == NULL || !G_IS_OBJECT(wolf)) {
         g_print("gobject failed\n");

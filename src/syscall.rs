@@ -655,6 +655,10 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
             // Writable scratch tree for runtime sockets and lock files.
             b"TMPDIR=/tmp".to_vec(),
             b"XDG_RUNTIME_DIR=/tmp".to_vec(),
+            b"WAYLAND_DISPLAY=wayland-test".to_vec(),
+            b"XDG_DATA_DIRS=/sfs/share".to_vec(),
+            b"XDG_CONFIG_HOME=/tmp/.config".to_vec(),
+            b"XDG_CACHE_HOME=/tmp/.cache".to_vec(),
             // The SFS root is mounted at /sfs, so that is where shared
             // libraries live. A real distro would use /lib and /usr/lib.
             b"LD_LIBRARY_PATH=/sfs".to_vec(),

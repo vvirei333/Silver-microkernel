@@ -35,7 +35,9 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   indirect level (format maximum about 1 GiB; the 64 MiB image is the real
   bound), and freeing a large file clears its bitmap in batched writes.
   Writable RamFs at `/tmp`.
-- Console shell (`howl`) with file, process, mount, network and health commands.
+- Console shell (`howl`) with file, process, mount, network and health
+  commands; `linuxrun-<app>` resolves `/sfs/apps/<app>` then `/sfs/<app>` and
+  supplies the Wayland/XDG environment.
 - Fastfetch-style boot banner, kernel/userspace version **0.1.1**.
 
 ### Linux ABI

@@ -795,6 +795,13 @@ Redmi port is parked. The reference checklist is
   `linuxrun /sfs/glibtest` and prints `glib 2.90.1`, `gobject wolf-42`,
   `glib mainloop ok`; the existing libc/dynamic tests still run. This is the
   first real GLib app under the ABI, not a hand-written syscall test.
+  **Slice 57 (uniform app launcher):** `linuxrun-<app>` now tries
+  `/sfs/apps/<app>` and then `/sfs/<app>` before reporting failure, so
+  `linuxrun-glibtest` and `linuxrun-linux-hello` work without a full path.
+  Linux children get `WAYLAND_DISPLAY=wayland-test`, `XDG_RUNTIME_DIR=/tmp`,
+  `XDG_DATA_DIRS=/sfs/share` and `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` under
+  `/tmp`; `glibtest` prints the inherited Wayland/runtime values. This is the
+  launch shape `linuxrun-phosh` will use.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -821,7 +828,7 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 57 (GTK3/GTK4 toolkit on top of GLib and
+- **Next steps:** Linux ABI slice 58 (GTK3/GTK4 toolkit on top of GLib and
   the Wayland compositor; Wayland: compositor-side state). Network base
   maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
