@@ -525,6 +525,18 @@ Redmi port is parked. The reference checklist is
   pipe readiness, a 50 ms timer, an eventfd, `EPOLL_CTL_DEL`, disarm and
   `gettime`) prints `event loop ok`. Full series plus repeats and `health`:
   9596/31575 frames, zero zombies/open files/DMA leaks; fsck clean.
+  **Slice 26 (Wayland wire protocol):** a freestanding compositor/client pair
+  speaks the Wayland wire format over a named `AF_UNIX` socket. The server
+  implements `wl_display.get_registry`/`sync`, sends `wl_registry.global` for
+  `wl_compositor`/`wl_shm`, tracks `bind`, handles
+  `wl_compositor.create_surface`, `wl_shm.create_pool` (receiving the memfd
+  with `SCM_RIGHTS`), `wl_shm_pool.create_buffer`, `wl_surface.attach`/
+  `damage`/`commit`, maps the pool `MAP_SHARED` and verifies the client's
+  ARGB8888 pixels before acknowledging the final sync. The client parses
+  globals, binds, draws into a memfd, commits and waits for the second
+  `wl_callback.done`; the parent only prints `wayland ok` after the
+  compositor read the shared buffer. Full series plus repeats and `health`:
+  9596/31575 frames, zero zombies/open files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -551,9 +563,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 26 (Wayland wire protocol over the named
-  socket + SCM_RIGHTS memfd path, then D-Bus). Network base maintenance
-  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 27 (D-Bus auth + message exchange on the
+  same socket pair, then a real toolkit against the Wayland transport).
+  Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

@@ -532,6 +532,24 @@ howl> linuxrun /sfs/linux-eventloop
 event loop ok
 ```
 
+The Wayland wire protocol runs end to end over those primitives. The test is a
+pair of freestanding programs: the parent is a tiny compositor that listens on
+a named `AF_UNIX` socket, answers `wl_display.get_registry` and `sync`, tracks
+the client's `bind` of `wl_compositor`/`wl_shm`, receives the `wl_shm` pool
+descriptor with `SCM_RIGHTS`, maps it `MAP_SHARED` and verifies the pixels the
+client drew. The child is the client: it parses the registry globals, binds,
+creates a surface, builds an ARGB8888 memfd buffer, attaches/damages/commits
+it, and waits for the final `wl_callback.done`:
+
+```text
+howl> linuxrun /sfs/linux-wayland
+wayland ok
+```
+
+The client acks only after the compositor has read the shared buffer, so this
+covers the whole transport: named sockets, `SCM_RIGHTS`, shared memfd and
+protocol framing.
+
 Threads use `clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_SETTLS)`: they
 share the leader's address space and memory, get a separate user/kernel stack
 and per-thread `TPIDR_EL0` TLS, and exit through a futex-based join
