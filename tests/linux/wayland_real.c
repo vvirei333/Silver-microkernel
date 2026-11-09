@@ -1250,6 +1250,54 @@ static void reset_client(void) {
     wants_offer = 0;
 }
 
+#ifdef SERVE_ONLY
+void _start(void) {
+    long server = sys3(198, 1, 1, 0);
+    if (server < 0 || bind_path(server) < 0) {
+        fail("gtk-serve: bind failed\n", 21);
+    }
+    if (sys3(201 /* listen */, server, 4, 0) < 0) {
+        fail("gtk-serve: listen failed\n", 23);
+    }
+    long child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
+    if (child < 0) {
+        fail("gtk-serve: fork failed\n", 21);
+    }
+    if (child == 0) {
+        static const char *argv[] = {"/sfs/gtkdemo", 0};
+        static const char *envp[] = {
+            "XDG_RUNTIME_DIR=/tmp",
+            "WAYLAND_DISPLAY=wayland-test",
+            "GDK_BACKEND=wayland",
+            "LD_LIBRARY_PATH=/sfs",
+            "XDG_DATA_DIRS=/sfs/share",
+            "GSETTINGS_SCHEMA_DIR=/sfs",
+            "FONTCONFIG_FILE=/sfs/fonts.conf",
+            0,
+        };
+        sys6(221 /* execve */, (long)argv[0], (long)argv, (long)envp, 0, 0, 0);
+        fail("gtk-serve: exec failed\n", 20);
+    }
+    long client = sys3(202 /* accept */, server, 0, 0);
+    if (client < 0) {
+        fail("gtk-serve: accept failed\n", 23);
+    }
+    reset_client();
+    while (serve(client) == 0) {
+    }
+    sys3(57, client, 0, 0);
+    sys3(57, server, 0, 0);
+    int status = 0;
+    sys6(260 /* wait4 */, child, (long)&status, 0, 0, 0, 0);
+    if ((status & 0x7f) != 0 || ((status >> 8) & 0xff) != 0) {
+        fail("gtk-serve: client failed\n", 23);
+    }
+    sys3(64, 1, (long)"gtk client ok\n", 14);
+    sys3(93, 0, 0, 0);
+    for (;;) {
+    }
+}
+#else
 void _start(void) {
     long server = sys3(198, 1, 1, 0);
     if (server < 0 || bind_path(server) < 0) {
@@ -1393,3 +1441,5 @@ void _start(void) {
     for (;;) {
     }
 }
+#endif
+

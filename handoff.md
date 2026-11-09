@@ -808,6 +808,16 @@ Redmi port is parked. The reference checklist is
   `g_file_get_contents`, creates a `GFile`, and runs a `GMainLoop`; the guest
   prints `gio file ok`, `gio path /tmp/gio-test.txt`, `gio mainloop ok`.
   Both GLib and GIO tests run on the same 64 MiB image; 221 host tests pass.
+  **Slice 59 (GTK3 probe):** a GTK3 3.24.52 demo (`gtk window shown`,
+  `gtk mainloop ok`) runs under host `qemu-aarch64-static` with the Arch ARM
+  GTK stack. In the guest, the 64 MiB image cannot hold the stack (~72
+  libraries, ~75 MiB), so a temporary 256 MiB image was used. The dynamic
+  loader gets through most libraries but then fails to map a 1.3 MiB segment:
+  the per-task mapping policy still assumes a small number of large contiguous
+  runs. This is a real mmap/VM slice, not a missing syscall. `scripts/
+  sfs_inject.py` gained a free-block cursor so a 75 MiB bulk install takes
+  ~1.7 s instead of tens of minutes. `wayland_real.c` also gained a
+  `SERVE_ONLY` build that accepts one external client (the GTK harness).
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP

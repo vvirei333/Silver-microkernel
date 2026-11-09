@@ -58,6 +58,7 @@ class Image:
             raise SystemExit("not an SFS image (bad magic)")
         if self.block_size != BLOCK:
             raise SystemExit(f"unsupported block size {self.block_size}")
+        self.next_block = self.data_start
 
     # --- geometry helpers -------------------------------------------------
     def block_offset(self, block: int) -> int:
@@ -75,9 +76,18 @@ class Image:
             self.data[offset] |= mask
         else:
             self.data[offset] &= ~mask & 0xFF
+            if block < self.next_block:
+                self.next_block = block
 
     def alloc_block(self) -> int:
-        for block in range(self.data_start, self.total):
+        # A cursor keeps bulk installs linear: rescanning the whole bitmap for
+        # every 512-byte block made a 75 MiB library set take tens of minutes.
+        for block in range(self.next_block, self.total):
+            if not self.used(block):
+                self.set_used(block)
+                self.next_block = block + 1
+                return block
+        for block in range(self.data_start, self.next_block):
             if not self.used(block):
                 self.set_used(block)
                 return block
