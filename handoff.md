@@ -614,6 +614,13 @@ Redmi port is parked. The reference checklist is
   tree's maximum), covering the enlarged bitmap/inode metadata end to end.
   Full series plus repeats and `health`: 21884/31575 frames (heap included),
   zero zombies/open files/DMA leaks; fsck clean.
+  **Slice 35 (two clients) and status refresh:** `linux-wlreal` now forks two
+  real `libwayland` clients; the harness accepts both, resets the per-client
+  surface namespace, serves each (three animated frames each) and reports
+  `libwayland 2 clients ok`. Added `docs/STATUS.md`, a fresh project snapshot
+  (architecture, capabilities, limits table, test matrix, build commands and
+  roadmap) linked from the README. Full series plus repeats and `health`:
+  21884/31575 frames, zero zombies/open files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -640,10 +647,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 35 (several concurrent clients and
-  per-surface focus; a full GTK stack still needs more than 32 MiB or a
-  streaming SFS). Network base maintenance (keep-alive, TLS roots/RTC/RNG,
-  TLS 1.2).
+- **Next steps:** Linux ABI slice 36 (per-surface focus: keyboard/pointer
+  enter/leave driven by surface commits; a full GTK stack still needs more
+  than 32 MiB or a streaming SFS). Network base maintenance (keep-alive, TLS
+  roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

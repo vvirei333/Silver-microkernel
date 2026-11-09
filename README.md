@@ -6,6 +6,9 @@ focused; drivers, services, Howl and applications run in isolated EL0 tasks.
 The architecture is inspired by XNU, Redox and other proven systems, but the
 interfaces, capability model, SFS format and userspace are original.
 
+**Fresh status snapshot:** [docs/STATUS.md](docs/STATUS.md) — current
+capabilities, limits, the full Linux ABI test matrix and the next steps.
+
 Active target: QEMU `virt` (ARM Virt Board), Cortex-A72, developed from a
 Linux desktop. The product is a **console OS that provides the base OS**
 (kernel, drivers, network, files); applications — including the browser — come

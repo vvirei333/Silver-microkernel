@@ -586,6 +586,32 @@ static int run_client(void) {
     }
 }
 
+/// Each accepted connection is a separate client namespace; reset the
+/// per-surface state before serving the next one.
+static void reset_client(void) {
+    if (pool_fd >= 0) {
+        sys3(57, pool_fd, 0, 0);
+        pool_fd = -1;
+    }
+    registry_id = 0;
+    compositor_id = 0;
+    shm_id = 0;
+    shell_id = 0;
+    xdg_surface_id = 0;
+    toplevel_id = 0;
+    output_id = 0;
+    seat_id = 0;
+    keyboard_id = 0;
+    pointer_id = 0;
+    surface_id = 0;
+    pool_id = 0;
+    buffer_id = 0;
+    frame_id = 0;
+    configure_serial = 1;
+    verified = 0;
+    commits = 0;
+}
+
 void _start(void) {
     long server = sys3(198, 1, 1, 0);
     if (server < 0 || bind_path(server) < 0) {
@@ -595,42 +621,55 @@ void _start(void) {
         fail("wayland: listen failed\n", 23);
     }
 
-    long child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
-    if (child < 0) {
-        fail("wayland: fork failed\n", 21);
-    }
-    if (child == 0) {
-        static const char *argv[] = {"/sfs/wlclient", 0};
-        static const char *envp[] = {
-            "XDG_RUNTIME_DIR=/tmp",
-            "WAYLAND_DISPLAY=wayland-test",
-            "LD_LIBRARY_PATH=/sfs",
-            0,
-        };
-        sys6(221 /* execve */, (long)argv[0], (long)argv, (long)envp, 0, 0, 0);
-        fail("wlreal: exec failed\n", 20);
+    long children[2];
+    for (int index = 0; index < 2; index++) {
+        long child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
+        if (child < 0) {
+            fail("wayland: fork failed\n", 21);
+        }
+        if (child == 0) {
+            static const char *argv[] = {"/sfs/wlclient", 0};
+            static const char *envp[] = {
+                "XDG_RUNTIME_DIR=/tmp",
+                "WAYLAND_DISPLAY=wayland-test",
+                "LD_LIBRARY_PATH=/sfs",
+                0,
+            };
+            sys6(221 /* execve */, (long)argv[0], (long)argv, (long)envp, 0, 0, 0);
+            fail("wlreal: exec failed\n", 20);
+        }
+        children[index] = child;
     }
 
-    long client = sys3(202 /* accept */, server, 0, 0);
-    if (client < 0) {
-        fail("wayland: accept failed\n", 23);
+    int okay = 1;
+    for (int index = 0; index < 2; index++) {
+        long client = sys3(202 /* accept */, server, 0, 0);
+        if (client < 0) {
+            fail("wayland: accept failed\n", 23);
+        }
+        reset_client();
+        if (!serve(client)) {
+            okay = 0;
+        }
+        sys3(57, client, 0, 0);
     }
-    int okay = serve(client);
-    sys3(57, client, 0, 0);
     sys3(57, server, 0, 0);
 
-    int status = 0;
-    if (sys6(260 /* wait4 */, child, (long)&status, 0, 0, 0, 0) != child) {
-        fail("wayland: wait failed\n", 21);
+    for (int index = 0; index < 2; index++) {
+        int status = 0;
+        if (sys6(260 /* wait4 */, children[index], (long)&status, 0, 0, 0, 0) !=
+            children[index]) {
+            fail("wayland: wait failed\n", 21);
+        }
+        if ((status & 0x7f) != 0 || ((status >> 8) & 0xff) != 0) {
+            fail("wayland: client failed\n", 23);
+        }
     }
     if (!okay) {
         fail("wayland: pixels not verified\n", 30);
     }
-    if ((status & 0x7f) != 0 || ((status >> 8) & 0xff) != 0) {
-        fail("wayland: client failed\n", 23);
-    }
 
-    sys3(64, 1, (long)"libwayland ok\n", 14);
+    sys3(64, 1, (long)"libwayland 2 clients ok\n", 24);
     sys3(93, 0, 0, 0);
     for (;;) {
     }
