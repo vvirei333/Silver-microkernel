@@ -286,6 +286,32 @@ Redmi port is parked. The reference checklist is
   interpreter still needs file-backed `mmap`/`mprotect` and a bigger rootfs.
   Running pie, signal, pipe, glibc and `health` together stays at 2171/31608
   frames with no zombies/open files/DMA leaks.
+  **Slice 12 (16 MiB rootfs):** the SFS image is 16 MiB with 512 inodes;
+  `scripts/make_sfs.py` defaults to that geometry and the new
+  `scripts/sfs_resize.py` grows an existing image while preserving every file
+  (inode numbers and directory entries are stable, block trees are copied).
+  `tools/linux-test.sh` grows `disk.img` on first use and installs
+  `tests/linux/bigfile.c`, which reads a 3 MiB payload (`big.bin`) in 64 KiB
+  chunks and prints `rootfs ok`.
+  Three real bugs surfaced and were fixed with it:
+  * `sfs::load` copied only the first 2048 sectors (1 MiB) into RAM no matter
+    how big the device was; it now reads every sector up to
+    `MAX_IMAGE_SECTORS = 32768` (16 MiB).
+  * `sfs_format::fsck` used a fixed `MAX_FILE_BLOCKS` array and rejected any
+    filesystem with more data blocks than one file may own (so every image
+    above ~8.25 MiB failed to mount); it now tracks one bit per data block in
+    a heap `Vec`.
+  * `flush_bitmap` wrote only the first bitmap sector. Above 4096 blocks the
+    remaining allocation bits never reached the disk, so a later writer
+    reallocated live blocks (the first 16 MiB boot produced a
+    `scopeprobe.elf`/`linux-bigfile` cross-link). It now writes every bitmap
+    sector, verified by a host test and an offline `sfs_fsck.py` after boot.
+  The kernel heap grew to 16 MiB (a real `libc.so.6` is about 2.2 MiB), the
+  VFS/Linux exec cap to 8 MiB, and `copy_from_user`/`copy_to_user` now chunk
+  into 4 KiB validation windows instead of rejecting any multi-page buffer, so
+  a normal 64 KiB `read(2)` works. Frame use after the full Linux test series
+  plus `health`: 9595/31609, zero zombies/open files/DMA leaks. The remaining
+  gate for a real `ld.so`/libc is file-backed `mmap` and a real `mprotect`.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -312,10 +338,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 12 (file-backed `mmap` + real `mprotect`, a
-  rootfs larger than 1 MiB, then a real `ld.so`/libc; signal-frame delivery
-  and `rt_sigreturn`; COW fork), then headless Wayland/GTK/D-Bus → Phosh.
-  Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 13 (file-backed `mmap` + real `mprotect`, so
+  a real `ld.so`/libc loads; signal-frame delivery and `rt_sigreturn`; COW
+  fork), then headless Wayland/GTK/D-Bus → Phosh. Network base maintenance
+  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

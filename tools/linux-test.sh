@@ -15,17 +15,27 @@
 #   linuxrun /sfs/linux-ipc     # eventfd2+memfd+futex, prints 'ipc ok'
 #   linuxrun /sfs/linux-signal  # sigaction/sigprocmask/kill/SIGCHLD
 #   linuxrun /sfs/linux-pie     # ET_DYN + PT_INTERP, prints 'pie main', exit 7
+#   linuxrun /sfs/linux-bigfile # 16 MiB rootfs + 3 MiB file, prints 'rootfs ok'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
-# The image is modified in place; `git checkout -- disk.img` restores the
-# tracked copy after the test.
+# The image is modified in place. It is git-tracked; on first use the script
+# grows the committed base to 16 MiB (scripts/sfs_resize.py preserves the
+# existing tree), then installs the test programs. `git checkout -- disk.img`
+# restores the clean base afterwards.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
 CC="${LINUX_CC:-aarch64-linux-gnu-gcc}"
 IMAGE="${1:-disk.img}"
+
+# The kernel keeps the whole SFS in RAM. A 1 MiB image cannot hold ld.so plus a
+# real libc, so grow the rootfs (preserving files) before installing tests.
+if [ ! -f "$IMAGE" ]; then
+    python3 scripts/make_sfs.py "$IMAGE" 16 512
+fi
+python3 scripts/sfs_resize.py "$IMAGE" 16 512
 
 mkdir -p build
 build() {
@@ -43,6 +53,7 @@ build fork
 build pipe
 build ipc
 build signal
+build bigfile
 
 # ET_DYN main + custom interpreter (no libc needed).
 "$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
@@ -61,6 +72,16 @@ python3 scripts/sfs_inject.py "$IMAGE" build/ipc.elf linux-ipc
 python3 scripts/sfs_inject.py "$IMAGE" build/signal.elf linux-signal
 python3 scripts/sfs_inject.py "$IMAGE" build/pie-main.elf linux-pie
 python3 scripts/sfs_inject.py "$IMAGE" build/ld-test.elf ld-test
+
+# A 3 MiB payload proves the enlarged rootfs end to end (mount, VFS limits,
+# 64 KiB reads). Byte i is `i & 0xff`; tests/linux/bigfile.c verifies all of it.
+python3 - <<'PY'
+from pathlib import Path
+block = bytes(range(256)) * 4096
+Path("build/big.bin").write_bytes((block * 3)[:3 * 1024 * 1024])
+PY
+python3 scripts/sfs_inject.py "$IMAGE" build/big.bin big.bin
+python3 scripts/sfs_inject.py "$IMAGE" build/bigfile.elf linux-bigfile
 
 # A real static libc binary (the SFS image is 1 MiB; all three together fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then

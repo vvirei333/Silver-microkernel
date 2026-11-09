@@ -4,7 +4,7 @@ block 1, an inode table starting at block 2, data blocks after it. The layout
 matches the kernel's `sfs_format` module (and the historical format_sfs.py).
 
 Usage: make_sfs.py [image] [megabytes] [inode_count]
-Defaults: disk.img, 8 MiB, 512 inodes.
+Defaults: disk.img, 16 MiB, 512 inodes.
 """
 import struct, sys
 
@@ -14,7 +14,7 @@ MAGIC = 0x53465321
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else "disk.img"
-    mib = int(sys.argv[2]) if len(sys.argv) > 2 else 8
+    mib = int(sys.argv[2]) if len(sys.argv) > 2 else 16
     inode_count = int(sys.argv[3]) if len(sys.argv) > 3 else 512
 
     total_blocks = mib * 1024 * 1024 // BLOCK

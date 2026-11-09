@@ -425,9 +425,10 @@ fn undo_new_entry(
 }
 
 /// Upper bound on the loaded image: the format keeps the whole image in
-/// kernel RAM, so the cap is the frame budget, not the disk. 8 MiB covers
-/// the app bundles with wide headroom; bigger disks need sparse reads first.
-const MAX_IMAGE_SECTORS: usize = 16384;
+/// kernel RAM, so the cap is the frame budget, not the disk. 16 MiB gives the
+/// Linux ABI room for `ld.so` plus a real libc (and the app bundles); the
+/// loader reads the whole device, not just the legacy 1 MiB prefix.
+const MAX_IMAGE_SECTORS: usize = 32768;
 
 /// Reads the whole image into kernel memory and keeps ownership of the disk.
 /// The read size adapts to the device capacity (clamped to
@@ -444,18 +445,8 @@ pub fn load() -> bool {
     } else {
         capacity
     };
-    let mut sectors = device_sectors.min(MAX_IMAGE_SECTORS);
-    let mut physical_tag: Option<(usize, u32)> = None;
-    while sectors >= IMAGE_SECTORS {
-        if let Some(allocation) = frame_allocator::alloc_contiguous_pages_tagged(sectors * BLOCK_SIZE / 4096) {
-            physical_tag = Some(allocation);
-            break;
-        }
-        // Not enough contiguous frames for this size: halve and retry, down
-        // to the legacy geometry.
-        sectors /= 2;
-    }
-    let Some((physical, _tag)) = physical_tag else {
+    let sectors = device_sectors.clamp(IMAGE_SECTORS, MAX_IMAGE_SECTORS);
+    let Some((physical, _tag)) = frame_allocator::alloc_contiguous_pages_tagged(sectors * BLOCK_SIZE / 4096) else {
         console::write_str("KSFS: image allocation failed\r\n");
         return false;
     };
@@ -467,7 +458,7 @@ pub fn load() -> bool {
     let bytes = sectors * BLOCK_SIZE;
     let base = phys_to_virt(physical);
     let mut sector = [0_u8; BLOCK_SIZE];
-    for index in 0..IMAGE_SECTORS {
+    for index in 0..sectors {
         if !virtio_blk::read_sector(index as u64, &mut sector) {
             console::write_str("KSFS: image read failed\r\n");
             return false;

@@ -226,7 +226,7 @@ fn linux_execve(
     argv_pointer: u64,
     envp_pointer: u64,
 ) -> u64 {
-    const EXEC_LIMIT: usize = 1024 * 1024;
+    const EXEC_LIMIT: usize = crate::vfs::MAX_FILE_BYTES;
     let Some(path) = user_string(path_pointer) else {
         return errno(EFAULT);
     };

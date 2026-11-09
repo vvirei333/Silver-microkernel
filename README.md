@@ -331,8 +331,8 @@ allowed, text is mapped RX, data RW and BSS is zero-filled. The per-2 MiB L3
 tables (and a per-1 GiB L2 table for the low window) are allocated on demand
 and registered with the space root, so the normal teardown frees them.
 
-`tests/linux/` and `tools/linux-test.sh` build three programs, install them
-with `scripts/sfs_inject.py`, and verify the path in QEMU:
+`tests/linux/` and `tools/linux-test.sh` build the raw-syscall programs,
+install them with `scripts/sfs_inject.py`, and verify the path in QEMU:
 
 ```text
 howl> linuxrun /sfs/linux-hello
@@ -345,13 +345,14 @@ Program exited with status 7
 
 howl> linuxrun /sfs/linux-libc
 hello from libc
-Program exited with status 11
+Program exited with status 0
 ```
 
 The last one is a **real static glibc binary** (libc initialisation, stdio,
 `open`/`read`/`close`, `opendir`/`readdir`, `exit`), which is the point of the
-track. The loader reads up to 1 MiB through `vfs::read_file_limit`; the
-general VFS cap stays 512 KiB, and the transient read is exactly file-sized.
+track. The loader reads up to 8 MiB through `vfs::read_file_limit`; the
+general VFS cap is the same 8 MiB (the SFS double-indirect limit is about
+8.26 MiB), and the transient read is exactly file-sized.
 `fstat`, `ioctl(TIOCGWINSZ)`, `writev`, `close`, `lseek`, `readlinkat` and
 `sched_yield` are implemented, and `--features linux-abi-trace` logs any
 still-unsupported number (capped) so the next slice is driven by what a libc
@@ -446,7 +447,9 @@ signal ok
 Still missing: a per-task read scope (a Linux task can read any VFS path, which
 is acceptable on the single-user console but must be closed before untrusted
 apps), user-installed signal handlers (dispositions are recorded, see below),
-file-backed `mmap`, and a rootfs large enough for a real `ld.so` + libc.
+and file-backed `mmap`/`mprotect` (the last gate before a real `ld.so` loads
+libraries). The rootfs is no longer a limit: it is 16 MiB, the kernel heap is
+16 MiB, and the per-file cap is 8 MiB.
 
 `ET_DYN`/PIE images load with a bias (`0x1000_0000` for the program,
 `0x2000_0000` for its interpreter), and `PT_INTERP` is resolved from the VFS
@@ -460,8 +463,14 @@ howl> linuxrun /sfs/linux-pie
 pie main
 ```
 
-A real glibc `ld.so` additionally needs file-backed `mmap`/`mprotect` and a
-rootfs bigger than the 1 MiB SFS image; that is the next step.
+A real glibc `ld.so` additionally needs file-backed `mmap`/`mprotect`; the
+16 MiB rootfs already has room for `ld.so` (about 235 KiB) plus `libc.so.6`
+(about 2.2 MiB). A 3 MiB payload exercises the enlarged image end to end:
+
+```text
+howl> linuxrun /sfs/linux-bigfile
+rootfs ok
+```
 
 ## Bundle manifests and signing — complete
 
@@ -588,7 +597,9 @@ Linux, one-shot with the SFS disk attached (what `sfs_server` needs):
 ./build_and_qemu.sh --no-run   # build only
 ```
 
-The script attaches `disk.img` (SFS-formatted with `format_sfs.py`) as a
+The script attaches `disk.img` (a 16 MiB SFS image created with
+`scripts/make_sfs.py`; `tools/linux-test.sh` grows an existing image with
+`scripts/sfs_resize.py`) as a
 `virtio-blk-pci` device; without it the block driver reports "not
 initialized" and the filesystem server exits with a stage-coded status.
 Exit code diagnostics: the kernel prints `EXIT: task=… program=… status=…`

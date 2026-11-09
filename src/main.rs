@@ -1375,24 +1375,12 @@ pub extern "C" fn kernel_main() -> ! {
     if !memory_map.is_valid() || available_pages == 0 || !frame_allocator::run_self_test() {
         exceptions::silver_handle_exception(6, 0, 0, 0);
     }
-    // Snapshot the on-disk SFS before the EL0 block driver claims the device,
-    // then serve it read-only from the kernel VFS. Additive: a missing device
-    // leaves the boot path unchanged.
-    if sfs::load() {
-        sfs::report();
-        ram_log::log("KSFS loaded");
-    }
-        ram_log::log("FRAME ALLOC OK");
+    ram_log::log("FRAME ALLOC OK");
 
-    // User-visible memory (mmap, brk, DMA, ELF images, task stacks) may not
-    // eat the frames the kernel and its devices still need. The gate is a
-    // free-count policy; prove here that it refuses one-sidedly and that the
-    // raw kernel allocator is unaffected.
-    if !frame_allocator::run_user_reserve_selftest() {
-        exceptions::silver_handle_exception(6, 0, 0, 0);
-    }
-        ram_log::log("MEM RESERVE OK");
-
+    // The heap comes before the filesystem: mounting validates the image with
+    // `sfs_format::fsck`, which now tracks one bit per data block (a 16 MiB
+    // rootfs has more blocks than a single file's `MAX_FILE_BLOCKS` window and
+    // no longer fits a fixed stack array).
     let Some(heap_base) = allocator::init() else {
         exceptions::silver_handle_exception(7, 0, 0, 0);
     };
@@ -1411,6 +1399,23 @@ pub extern "C" fn kernel_main() -> ! {
         boot_metrics::log_milestone("Heap init");
     }
     ram_log::log("HEAP OK");
+
+    // Snapshot the on-disk SFS before the EL0 block driver claims the device,
+    // then serve it read-only from the kernel VFS. Additive: a missing device
+    // leaves the boot path unchanged.
+    if sfs::load() {
+        sfs::report();
+        ram_log::log("KSFS loaded");
+    }
+
+    // User-visible memory (mmap, brk, DMA, ELF images, task stacks) may not
+    // eat the frames the kernel and its devices still need. The gate is a
+    // free-count policy; prove here that it refuses one-sidedly and that the
+    // raw kernel allocator is unaffected.
+    if !frame_allocator::run_user_reserve_selftest() {
+        exceptions::silver_handle_exception(6, 0, 0, 0);
+    }
+        ram_log::log("MEM RESERVE OK");
 
     // One 2 MiB-aligned arena, split into 4 KiB pages with one unmapped
     // guard page below every task stack. A failure here would make task

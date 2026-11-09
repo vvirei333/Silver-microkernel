@@ -101,7 +101,7 @@ const EXEC_FILE_LIMIT: usize = vfs::MAX_FILE_BYTES;
 /// libc `hello` is ~800 KiB. The read is transient and exactly file-sized;
 /// `vfs::read_file_limit` still refuses anything past this bound.
 #[cfg(feature = "linux-abi")]
-const LINUX_EXEC_LIMIT: usize = 1024 * 1024;
+const LINUX_EXEC_LIMIT: usize = vfs::MAX_FILE_BYTES;
 /// Upper bound on a versioned spawn-arguments block copied from userspace.
 const SPAWN_ARGS_LIMIT: usize = 4096;
 

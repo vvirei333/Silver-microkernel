@@ -27,11 +27,13 @@ pub const OPEN_APPEND: u64 = 2;
 pub const FD_KIND_FILE: u64 = 1;
 pub const FD_KIND_DIR: u64 = 2;
 
-/// Hard cap for a single file in the in-memory VFS. The kernel heap is only
-/// 2 MiB; a user-controlled file must never be able to consume an unbounded
-/// share of it. 512 KiB leaves room for the read buffer, ELF image setup and
-/// other kernel allocations.
-pub const MAX_FILE_BYTES: usize = 512 * 1024;
+/// Hard cap for a single file in the in-memory VFS. SFS itself tops out at
+/// `MAX_FILE_BLOCKS * 512` bytes (about 8.26 MiB: four direct, one indirect
+/// and one double-indirect tree), so 8 MiB lets a real `libc.so.6` through
+/// while staying inside the format. The Linux loader reads such a file into
+/// one temporary heap buffer; the kernel heap is sized for it (see
+/// `allocator::HEAP_PAGES`).
+pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// System-wide budget for file payload **capacity**, summed over every RamFs
 /// backend. Accounting the logical length was not enough: `Vec` growth keeps
 /// spare capacity, so several backends could hold far more memory than

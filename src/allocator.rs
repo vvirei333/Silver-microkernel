@@ -4,13 +4,13 @@ use linked_list_allocator::LockedHeap;
 
 use crate::{exceptions, frame_allocator, memory, console};
 
-/// Kernel heap size in 4 KiB pages. 512 pages (2 MiB) is required, not a
-/// leftover bisect knob: the demo resource probe grows a VFS file to the
-/// 512 KiB cap, and `RamFs::write_at` materialises that growth in the kernel
-/// heap (`next_power_of_two`). With 256 pages the combined
-/// `demo-tasks,smp-selftest` build dies with `ALLOCATION ERROR SIZE=0x80000`.
-/// Shrinking this needs file storage moved out of the kernel heap first.
-pub const HEAP_PAGES: usize = 512;
+/// Kernel heap size in 4 KiB pages. 4096 pages (16 MiB) is sized for the
+/// larger rootfs: the Linux loader reads a whole `ld.so`/libc image into a
+/// temporary heap buffer before copying it into user frames, and the VFS
+/// per-file cap below is 8 MiB. The old 2 MiB heap could not hold a real
+/// `libc.so.6` (about 2.2 MiB). The demo resource probe still needs at least
+/// 512 pages for its 512 KiB `RamFs` growth; this is strictly more.
+pub const HEAP_PAGES: usize = 4096;
 pub const HEAP_SIZE: usize = HEAP_PAGES * crate::memory::PAGE_SIZE;
 
 struct KernelAllocator {

@@ -355,7 +355,19 @@ pub fn flush_block(
 }
 
 pub fn flush_bitmap(image: &[u8], superblock: &Superblock, disk: &mut dyn SfsDisk) -> bool {
-    flush_block(image, disk, superblock.bitmap_block as usize)
+    // The bitmap is one bit per block: an image above 1 MiB (4096 blocks) needs
+    // more than one 512-byte sector. Writing only `bitmap_block` left every
+    // allocation past block 4095 out of the on-disk bitmap, so a later offline
+    // writer (or the next boot) handed those blocks out again.
+    let blocks = (superblock.total_blocks as usize)
+        .div_ceil(8)
+        .div_ceil(BLOCK_SIZE);
+    for index in 0..blocks {
+        if !flush_block(image, disk, superblock.bitmap_block as usize + index) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Resolves a logical file block to a physical block number, following the
@@ -1239,11 +1251,11 @@ pub struct FsckReport {
 
 pub fn fsck(image: &[u8], superblock: &Superblock) -> Result<FsckReport, ()> {
     let mut report = FsckReport::default();
-    let mut referenced = [false; MAX_FILE_BLOCKS];
     let data_blocks = (superblock.total_blocks - superblock.data_block_start) as usize;
-    if data_blocks > referenced.len() {
-        return Err(());
-    }
+    // One bit per data block, not a fixed MAX_FILE_BLOCKS window: a larger
+    // rootfs has more blocks than any single file can own, and the old fixed
+    // array made every image above ~8 MiB fail the mount with "inconsistent".
+    let mut referenced = alloc::vec![false; data_blocks];
 
     for inode in 0..superblock.inode_count {
         let Some((kind, size, blocks, indirect, double)) = inode_get(image, superblock, inode)
@@ -1331,18 +1343,21 @@ pub fn fsck(image: &[u8], superblock: &Superblock) -> Result<FsckReport, ()> {
 fn mark_referenced(
     image: &[u8],
     superblock: &Superblock,
-    referenced: &mut [bool; MAX_FILE_BLOCKS],
+    referenced: &mut [bool],
     block: u32,
 ) -> Result<(), ()> {
     if block < superblock.data_block_start || block >= superblock.total_blocks {
         return Err(());
     }
     let index = (block - superblock.data_block_start) as usize;
-    if referenced[index] {
+    let Some(entry) = referenced.get_mut(index) else {
+        return Err(());
+    };
+    if *entry {
         // Two inodes own the same block: on-disk cross-link.
         return Err(());
     }
-    referenced[index] = true;
+    *entry = true;
     if !bitmap_used(image, superblock, block) {
         // Referenced but free: the allocator may hand it out.
         return Err(());
@@ -1394,14 +1409,28 @@ mod tests {
 
     /// Builds a formatted image: 128 data blocks, 32 inodes, root at inode 0.
     fn make_image(total_blocks: usize) -> (Vec<u8>, MemDisk, Superblock) {
+        make_image_with_geometry(
+            total_blocks,
+            2,
+            (2 + 32 * INODE_SIZE / BLOCK_SIZE + 1) as u32,
+        )
+    }
+
+    /// Same as [`make_image`], but with explicit metadata geometry so a test
+    /// can build an image whose bitmap spans several blocks.
+    fn make_image_with_geometry(
+        total_blocks: usize,
+        inode_table_block: u32,
+        data_block_start: u32,
+    ) -> (Vec<u8>, MemDisk, Superblock) {
         let mut image = vec![0_u8; total_blocks * BLOCK_SIZE];
         let sb = Superblock {
             total_blocks: total_blocks as u32,
             root_inode: 0,
             inode_count: 32,
-            inode_table_block: 2,
+            inode_table_block,
             bitmap_block: 1,
-            data_block_start: (2 + 32 * INODE_SIZE / BLOCK_SIZE + 1) as u32,
+            data_block_start,
         };
         put_u32(&mut image, 0, MAGIC);
         put_u32(&mut image, 8, BLOCK_SIZE as u32);
@@ -1627,6 +1656,52 @@ mod tests {
         assert_eq!(block_count_used(&image, &sb), 1);
         let (kind, size, _, _, _) = inode_get(&image, &sb, index).unwrap();
         assert_eq!((kind, size), (INODE_KIND_FILE, 0));
+    }
+
+    #[test]
+    fn bitmap_flush_covers_every_sector_of_a_large_image() {
+        // 16 MiB: 4096 bitmap bytes = 8 sectors. The old flush wrote only the
+        // first sector, so allocations past block 4095 were lost on disk.
+        let total = 32768usize;
+        let bitmap_blocks = total.div_ceil(8).div_ceil(BLOCK_SIZE);
+        let inode_table_block = 1 + bitmap_blocks;
+        let data_start = inode_table_block + (32 * INODE_SIZE).div_ceil(BLOCK_SIZE);
+        let (mut image, mut disk, sb) = make_image_with_geometry(
+            total,
+            inode_table_block as u32,
+            data_start as u32,
+        );
+        assert!(superblock(&image).is_ok());
+        let block = 20000u32;
+        bitmap_set(&mut image, &sb, block, true);
+        assert!(flush_bitmap(&image, &sb, &mut disk));
+        for index in 0..bitmap_blocks {
+            let sector = sb.bitmap_block as usize + index;
+            assert_eq!(
+                &disk.device[sector][..],
+                &image[sector * BLOCK_SIZE..(sector + 1) * BLOCK_SIZE]
+            );
+        }
+        assert!(bitmap_used(&image, &sb, block));
+    }
+
+    #[test]
+    fn fsck_accepts_more_data_blocks_than_one_file_can_hold() {
+        // The old fsck used a fixed MAX_FILE_BLOCKS array and refused a 16 MiB
+        // filesystem because it has more data blocks than one file may own.
+        let total = 32768usize;
+        let bitmap_blocks = total.div_ceil(8).div_ceil(BLOCK_SIZE);
+        let inode_table_block = 1 + bitmap_blocks;
+        let data_start = inode_table_block + (32 * INODE_SIZE).div_ceil(BLOCK_SIZE);
+        let (mut image, mut disk, sb) = make_image_with_geometry(
+            total,
+            inode_table_block as u32,
+            data_start as u32,
+        );
+        seed_root(&mut image, &sb, &mut disk);
+        assert!(total - data_start > MAX_FILE_BLOCKS);
+        let report = fsck(&image, &sb).unwrap();
+        assert_eq!((report.files, report.dirs, report.leaks), (0, 1, 0));
     }
 
     fn fsck_reports_counts() {
