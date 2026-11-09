@@ -1699,6 +1699,16 @@ pub fn yield_current() {
     interrupts::restore_irq(saved_daif);
 }
 
+/// Applies a blocking/ready transition unless the task has already been
+/// killed. `exit_group` marks siblings Dead from another CPU; a task that is
+/// in the middle of a syscall would otherwise overwrite Dead with Sleeping or
+/// Blocked and never be reaped.
+fn set_state_unless_dead(task: &mut Task, next: TaskState) {
+    if !matches!(task.state, TaskState::Dead | TaskState::Zombie) {
+        task.state = next;
+    }
+}
+
 pub fn sleep(milliseconds: u64) {
     if milliseconds == 0 {
         yield_current();
@@ -1707,7 +1717,7 @@ pub fn sleep(milliseconds: u64) {
     let saved_daif = interrupts::save_and_disable_irq();
     let wake_at = timer::ticks().saturating_add(timer::milliseconds_to_ticks(milliseconds));
     if let Some(task) = current_task_mut() {
-        task.state = TaskState::Sleeping(wake_at);
+        set_state_unless_dead(task, TaskState::Sleeping(wake_at));
     }
     schedule_step();
     interrupts::restore_irq(saved_daif);
@@ -1735,7 +1745,7 @@ pub fn wait_irq() -> bool {
         if let Some(intid) = task.bound_irq {
             crate::gic::enable_irq(intid);
         }
-        task.state = TaskState::Blocked;
+        set_state_unless_dead(task, TaskState::Blocked);
         schedule_released();
     }
 }
@@ -1813,7 +1823,7 @@ pub fn block_current_on(queue: &WaitQueue, link: WaitLink) {
     queue.enqueue(id);
     if let Some(task) = current_task_mut() {
         task.waiting_on = Some(link);
-        task.state = TaskState::Blocked;
+        set_state_unless_dead(task, TaskState::Blocked);
     }
     schedule_released();
     if let Some(task) = current_task_mut() {
@@ -1828,7 +1838,7 @@ pub fn block_current_on_until(queue: &WaitQueue, link: WaitLink, deadline: u64) 
     queue.enqueue(id);
     if let Some(task) = current_task_mut() {
         task.waiting_on = Some(link);
-        task.state = TaskState::BlockedUntil(deadline);
+        set_state_unless_dead(task, TaskState::BlockedUntil(deadline));
     }
     schedule_released();
     queue.remove(id);
@@ -2241,7 +2251,7 @@ fn wait_inner(id: u64, report_stopped: bool, consume: bool) -> Option<WaitEvent>
         PROCESS_WAIT_QUEUE.enqueue(waiter);
         if let Some(task) = current_task_mut() {
             task.waiting_on = Some(WaitLink::Immortal(&PROCESS_WAIT_QUEUE));
-            task.state = TaskState::Blocked;
+            set_state_unless_dead(task, TaskState::Blocked);
         }
         schedule_released();
         PROCESS_WAIT_QUEUE.remove(waiter);
@@ -2588,12 +2598,19 @@ pub fn current_tgid() -> u64 {
         .unwrap_or(0)
 }
 
-/// Task id that owns the descriptor table. Threads share the leader's table.
-pub fn fd_table_owner(task: u64) -> u64 {
+/// Thread-group leader for `task`: itself for a process, the leader's id for a
+/// thread. Shared process state (descriptors, signal dispositions) is keyed by
+/// this id.
+pub fn group_leader(task: u64) -> u64 {
     scheduler_manager()
         .and_then(|manager| manager.tasks.iter().find(|entry| entry.id == task))
         .map(|entry| if entry.is_thread { entry.tgid } else { entry.id })
         .unwrap_or(task)
+}
+
+/// Task id that owns the descriptor table. Threads share the leader's table.
+pub fn fd_table_owner(task: u64) -> u64 {
+    group_leader(task)
 }
 
 /// Runs `action` on the group leader (the current task for a process, the
@@ -2621,9 +2638,12 @@ pub fn exit_group(status: u64) -> ! {
         .and_then(|manager| manager.tasks.iter().find(|task| task.id == current))
         .map(|task| !task.is_thread)
         .unwrap_or(false);
-    if !is_leader {
-        exit_current_with_status(status);
-    }
+    // Kill every other member of the group. The leader's record carries the
+    // group status (this is what a parent waits for), and the leader owns the
+    // shared address space, so the reaper releases it after the leader dies.
+    // This is also the path a non-leader takes: it must not release the space
+    // itself, but the group must still terminate.
+    let mut wake = Vec::new();
     if let Some(manager) = scheduler_manager() {
         for task in manager.tasks.iter_mut() {
             if task.id != current
@@ -2632,10 +2652,21 @@ pub fn exit_group(status: u64) -> ! {
             {
                 task.state = TaskState::Dead;
                 task.bound_irq = None;
-                task.exit_status = Some(1);
+                task.exit_status = Some(if task.id == tgid { status } else { 1 });
+                wake.push(task.id);
             }
         }
     }
+    for id in wake {
+        wake_for_signal(id);
+    }
+    if !is_leader {
+        // The leader is now Dead; its reaper releases the shared space. This
+        // thread only has to leave its own context.
+        exit_current_with_status(status);
+    }
+    // Wait until every sibling is reaped. They were just woken, so a blocked
+    // futex waiter or sleeper cannot delay this indefinitely.
     loop {
         let done = scheduler_manager()
             .map(|manager| {
@@ -4982,6 +5013,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     // exactly once. `clear_resources` empties the heavy fields, so a zombie
     // carries only PID/PPID/exit status and small metadata until `wait`.
     let mut became_zombie: Vec<u64> = Vec::new();
+    let mut lost_console: Vec<u64> = Vec::new();
     let mut drop_threads: Vec<u64> = Vec::new();
     let mut wake: Vec<u64> = Vec::new();
     for task in &mut manager.tasks {
@@ -5000,6 +5032,9 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         task.release_space(&dma_revokes);
         task.clear_resources();
         task.state = TaskState::Zombie;
+        if task.owns_console {
+            lost_console.push(task.id);
+        }
         became_zombie.push(task.id);
         if task.is_thread {
             drop_threads.push(task.id);
@@ -5011,6 +5046,13 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         // made Ready during teardown is picked up even if its CPU returns to
         // user mode instead of scheduling immediately.
         smp::ipi_reschedule_others();
+    }
+
+    // A task killed from another CPU (exit_group, kill) never runs its own
+    // exit path, so the reaper must return the console it held. Without this
+    // the shell stayed alive but its prompt and output went to a dead owner.
+    for id in lost_console {
+        recover_console(manager, id);
     }
 
     // Orphans must point at a live reaper, never at a dead PID.

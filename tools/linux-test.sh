@@ -26,6 +26,8 @@
 #   linuxrun /sfs/linux-dynsig  # glibc sigaction + raise, prints 'dyn signal 10'
 #   linuxrun /sfs/linux-pthread # glibc pthread_create/join, prints 'pthread 42'
 #   linuxrun /sfs/linux-pthread-exit # exit_group kills a live worker
+#   linuxrun /sfs/linux-groupsig # signal dispositions shared by the group
+#   linuxrun /sfs/linux-exitgroup # exit_group from a worker kills the process
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -136,11 +138,19 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     "$CC" -O2 -pthread -o build/pthread-exit tests/linux/pthread_exit.c
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/pthread-exit
+    "$CC" -O2 -pthread -o build/group-signal tests/linux/group_signal.c
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/group-signal
+    "$CC" -O2 -pthread -o build/exitgroup-thread tests/linux/exitgroup_thread.c
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/exitgroup-thread
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-hello linux-dyn
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-signal linux-dynsig
     python3 scripts/sfs_inject.py "$IMAGE" build/pthread-test linux-pthread
     python3 scripts/sfs_inject.py "$IMAGE" build/pthread-exit linux-pthread-exit
-    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit"
+    python3 scripts/sfs_inject.py "$IMAGE" build/group-signal linux-groupsig
+    python3 scripts/sfs_inject.py "$IMAGE" build/exitgroup-thread linux-exitgroup
+    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit linuxrun /sfs/linux-groupsig linuxrun /sfs/linux-exitgroup"
 else
     DYN=""
     echo "note: patchelf or the dynamic AArch64 libc is missing; skipped the dynamic test" >&2

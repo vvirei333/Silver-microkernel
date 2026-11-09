@@ -444,7 +444,20 @@ Redmi port is parked. The reference checklist is
   worker (`worker x`, `pthread 42`); `linux-pthread-exit` leaves a sleeping
   worker and returns from main (`exit group ok`). Full series plus repeated
   runs and `health`: 9596/31584 frames, zero zombies/open files/DMA leaks.
-  Remaining: non-leader `exit_group` and per-thread-group signal dispositions.
+  Remaining: none for threads beyond the usual single-address-space caveats.
+  **Slice 20 (group exit and signal dispositions):** `exit_group` from a
+  non-leader now kills every group member, gives the leader record the group
+  status and lets the reaper release the shared space. A task killed from
+  another CPU cannot run its own exit path, so the reaper returns a console
+  it owned; without that the shell stayed alive while its output went to the
+  dead owner. Blocking transitions (`sleep`, `wait_irq`, wait-queue blocks)
+  no longer overwrite `Dead`, so a task marked dead mid-syscall is still
+  reaped. Signal dispositions live in the thread-group leader's table, while
+  blocked/pending/alternative-stack state stays per thread. Tests:
+  `linux-exitgroup` (worker `exit(0)` kills a sleeping main, prints
+  `worker exiting`) and `linux-groupsig` (worker installs SIGUSR1, main
+  raises it, prints `group signal ok`). Full series plus repeats and
+  `health`: 9596/31583 frames, zero zombies/open files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -471,9 +484,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 20 (non-leader `exit_group`, shared signal
-  dispositions, then headless Wayland/GTK/D-Bus → Phosh). Network base
-  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 21 (headless Wayland/GTK/D-Bus → Phosh).
+  Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

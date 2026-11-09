@@ -92,6 +92,11 @@ fn with_table<R>(task: u64, action: impl FnOnce(&mut Table) -> R) -> R {
     action(&mut tables[index])
 }
 
+/// Dispositions are a property of the thread group, not of one thread.
+fn owner(task: u64) -> u64 {
+    scheduler::group_leader(task)
+}
+
 fn bit(signal: u32) -> Option<u64> {
     if (1..=64).contains(&signal) {
         Some(1 << (signal - 1))
@@ -102,14 +107,14 @@ fn bit(signal: u32) -> Option<u64> {
 
 pub fn action(task: u64, signal: u32) -> Option<Action> {
     bit(signal)?;
-    with_table(task, |table| table.actions[signal as usize])
+    with_table(owner(task), |table| table.actions[signal as usize])
 }
 
 pub fn set_action(task: u64, signal: u32, action: Action) {
     if bit(signal).is_none() {
         return;
     }
-    with_table(task, |table| {
+    with_table(owner(task), |table| {
         table.actions[signal as usize] = Some(action);
     });
 }
@@ -128,13 +133,15 @@ pub fn raise(task: u64, signal: u32) -> bool {
     let Some(bit) = bit(signal) else {
         return false;
     };
+    // An ignored disposition drops the signal. The disposition lives in the
+    // group table, the pending bit in the target thread's own table.
+    if action(task, signal)
+        .map(|action| action.handler == SIG_IGN)
+        .unwrap_or(false)
+    {
+        return false;
+    }
     with_table(task, |table| {
-        if table.actions[signal as usize]
-            .map(|action| action.handler == SIG_IGN)
-            .unwrap_or(false)
-        {
-            return false;
-        }
         table.pending |= bit;
         true
     })
@@ -181,7 +188,8 @@ pub fn close_task(task: u64) {
 /// True when the task ever set a disposition or mask. Used to avoid creating a
 /// Linux signal table for a native parent that simply forked a Linux child.
 pub fn has_table(task: u64) -> bool {
-    TABLES.lock().iter().any(|table| table.task == task)
+    let owner = owner(task);
+    TABLES.lock().iter().any(|table| table.task == owner)
 }
 
 /// Default action for a signal delivered with `SIG_DFL`. Signals whose default

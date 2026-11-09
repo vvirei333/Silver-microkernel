@@ -508,9 +508,24 @@ howl> linuxrun /sfs/linux-pthread-exit
 exit group ok
 ```
 
-Remaining thread limitation: `exit_group` called from a non-leader still exits
-only that thread, and signal dispositions remain per-task rather than
-per-thread-group.
+`exit_group` from any thread terminates the whole group: the caller marks the
+other members `Dead`, the leader's record carries the group status, and the
+reaper releases the shared space. A worker calling `exit(0)` while `main` is
+still asleep kills the process (main never prints):
+
+```text
+howl> linuxrun /sfs/linux-exitgroup
+worker exiting
+```
+
+Signal dispositions are per thread group, as on Linux: a handler installed by
+a worker is seen by the main thread, while the blocked mask, pending set and
+`sigaltstack` stay per thread:
+
+```text
+howl> linuxrun /sfs/linux-groupsig
+group signal ok
+```
 File-backed `mmap` and a real `mprotect` are implemented:
 `MAP_PRIVATE` copies the file range into private frames, `MAP_FIXED` replaces
 an existing range (the loader's `PROT_NONE` reservation followed by per-segment
