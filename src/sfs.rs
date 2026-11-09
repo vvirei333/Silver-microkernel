@@ -763,6 +763,180 @@ impl Reader {
         None
     }
 
+    /// Finds a directory entry, returning the block/slot that stores it.
+    fn find_entry(&self, parent: u32, name: &str) -> Option<(u32, usize, u32)> {
+        let inode = self.inode(parent)?;
+        if !inode.is_dir() {
+            return None;
+        }
+        for slot in 0..MAX_FILE_BLOCKS {
+            let Some(block) = self.block_at(&inode, slot) else {
+                break;
+            };
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut bytes) {
+                return None;
+            }
+            for entry in 0..DIR_ENTRIES_PER_BLOCK {
+                let offset = entry * DIR_ENTRY_SIZE;
+                let child = u32_at(&bytes, offset);
+                if child == 0 {
+                    continue;
+                }
+                let length = bytes[offset + 4] as usize;
+                if length == 0 || length > NAME_LIMIT {
+                    continue;
+                }
+                if &bytes[offset + 5..offset + 5 + length] == name.as_bytes() {
+                    return Some((block, entry, child));
+                }
+            }
+        }
+        None
+    }
+
+    /// Rewrites one directory entry in place: inode pointer plus name.
+    fn write_entry(&self, block: u32, slot: usize, child: u32, name: &str) -> bool {
+        if name.is_empty() || name.len() > NAME_LIMIT {
+            return false;
+        }
+        let mut bytes = [0_u8; BLOCK_SIZE];
+        if !read_block(block, &mut bytes) {
+            return false;
+        }
+        let offset = slot * DIR_ENTRY_SIZE;
+        put_u32_at(&mut bytes, offset, child);
+        for byte in &mut bytes[offset + 4..offset + DIR_ENTRY_SIZE] {
+            *byte = 0;
+        }
+        bytes[offset + 4] = name.len() as u8;
+        bytes[offset + 5..offset + 5 + name.len()].copy_from_slice(name.as_bytes());
+        write_block(block, &bytes)
+    }
+
+    fn is_under(source: &[&str], destination: &[&str]) -> bool {
+        destination.len() > source.len()
+            && destination[..source.len()] == *source
+    }
+
+    /// Moves an entry without overwriting. Same-parent moves rename in place;
+    /// cross-parent moves add the destination first and roll back on failure.
+    fn rename(&self, source: &str, destination: &str) -> bool {
+        if source == destination {
+            return false;
+        }
+        let Some((source_parents, source_name)) = split_path(source) else {
+            return false;
+        };
+        let Some((destination_parents, destination_name)) = split_path(destination) else {
+            return false;
+        };
+        let Some(source_parent) = self.resolve_parts(&source_parents) else {
+            return false;
+        };
+        let Some(destination_parent) = self.resolve_parts(&destination_parents) else {
+            return false;
+        };
+        let Some((source_block, source_slot, child)) = self.find_entry(source_parent, source_name)
+        else {
+            return false;
+        };
+        if self.find_entry(destination_parent, destination_name).is_some() {
+            return false;
+        }
+        let Some(inode) = self.inode(child) else {
+            return false;
+        };
+        // A directory can never move into its own subtree. Compare full paths,
+        // not just the parents: every "/x" has empty parents, so parent-only
+        // comparison would refuse every root-level directory move.
+        let mut source_parts = source_parents.clone();
+        source_parts.push(source_name);
+        let mut destination_parts = destination_parents.clone();
+        destination_parts.push(destination_name);
+        if inode.is_dir() && Self::is_under(&source_parts, &destination_parts) {
+            return false;
+        }
+        if source_parent == destination_parent {
+            return self.write_entry(source_block, source_slot, child, destination_name);
+        }
+        if !self.dir_add(destination_parent, destination_name, child) {
+            return false;
+        }
+        if !self.dir_remove(source_parent, source_name).is_some() {
+            // Undo the destination entry so a failure leaves one name, not two.
+            let _ = self.dir_remove(destination_parent, destination_name);
+            return false;
+        }
+        true
+    }
+
+    /// Replaces `destination` with `source`. The source entry is detached
+    /// first, then the destination name is re-pointed at the source inode;
+    /// only then is the old destination inode released. A failure before the
+    /// re-point restores the source entry.
+    fn replace(&self, source: &str, destination: &str) -> bool {
+        if source == destination {
+            return false;
+        }
+        let Some((source_parents, source_name)) = split_path(source) else {
+            return false;
+        };
+        let Some((destination_parents, destination_name)) = split_path(destination) else {
+            return false;
+        };
+        let Some(source_parent) = self.resolve_parts(&source_parents) else {
+            return false;
+        };
+        let Some(destination_parent) = self.resolve_parts(&destination_parents) else {
+            return false;
+        };
+        let Some((source_block, source_slot, source_index)) =
+            self.find_entry(source_parent, source_name)
+        else {
+            return false;
+        };
+        let Some(source_inode) = self.inode(source_index) else {
+            return false;
+        };
+        if !source_inode.is_file() {
+            return false;
+        }
+        let Some((destination_block, destination_slot, destination_index)) =
+            self.find_entry(destination_parent, destination_name)
+        else {
+            return self.rename(source, destination);
+        };
+        let Some(destination_inode) = self.inode(destination_index) else {
+            return false;
+        };
+        if !destination_inode.is_file() || destination_index == source_index {
+            return false;
+        }
+        // Detach the source name first: if the device dies after this, the
+        // old destination is still intact and the source inode is a leak.
+        if self.dir_remove(source_parent, source_name).is_none() {
+            return false;
+        }
+        if !self.write_entry(destination_block, destination_slot, source_index, destination_name) {
+            let _ = self.write_entry(source_block, source_slot, source_index, source_name);
+            return false;
+        }
+        // The destination inode is unreachable now; release it. A failure
+        // here leaks blocks (the safe direction) but the replacement holds.
+        if self.truncate_inode(destination_index, destination_inode) {
+            let freed = Inode {
+                kind: INODE_KIND_FREE,
+                size: 0,
+                blocks: [0; DIRECT_BLOCKS],
+                indirect: 0,
+                double: 0,
+            };
+            let _ = self.write_inode(destination_index, freed);
+        }
+        true
+    }
+
     fn create(&self, path: &str, kind: u32) -> Option<u32> {
         let (parents, name) = split_path(path)?;
         let parent = self.resolve_parts(&parents)?;
@@ -982,12 +1156,14 @@ impl FileSystem for Sfs {
         if reader.remove(path, true) { Ok(()) } else { Err(()) }
     }
 
-    fn rename(&mut self, _source: &str, _destination: &str) -> Result<(), ()> {
-        Err(())
+    fn rename(&mut self, source: &str, destination: &str) -> Result<(), ()> {
+        let reader = reader().ok_or(())?;
+        if reader.rename(source, destination) { Ok(()) } else { Err(()) }
     }
 
-    fn replace(&mut self, _source: &str, _destination: &str) -> Result<(), ()> {
-        Err(())
+    fn replace(&mut self, source: &str, destination: &str) -> Result<(), ()> {
+        let reader = reader().ok_or(())?;
+        if reader.replace(source, destination) { Ok(()) } else { Err(()) }
     }
 
     fn is_directory(&self, path: &str) -> Result<bool, ()> {

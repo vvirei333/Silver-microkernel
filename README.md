@@ -514,7 +514,8 @@ scope ok
 
 `/tmp` is the writable scratch tree: it lives on the root RamFs, so `openat`
 with `O_CREAT`/`O_TRUNC`/`O_APPEND`, `mkdirat`, `unlinkat` and
-`renameat`/`renameat2` work there, while SFS stays read-only. Linux tasks see
+`renameat`/`renameat2` work there. SFS has its own streaming
+create/write/rename/replace path; the Linux scratch test stays on `/tmp`. Linux tasks see
 `TMPDIR=/tmp` and `XDG_RUNTIME_DIR=/tmp`, which is where Wayland and D-Bus put
 sockets and lock files. The test round-trips a lock file, `O_EXCL`, `stat`,
 rename-over-destination, a file inside a runtime directory, and cleanup:
@@ -581,13 +582,14 @@ compositor sends `xdg_toplevel.configure` and `xdg_surface.configure`, and
 still verifies the shared pixels. The vendored `xdg-shell-client-protocol.h`/
 `.c` come from `wayland-protocols` 1.50.
 
-Input and output are advertised as well: `wl_output` sends
-geometry/mode/done, and `wl_seat` reports pointer+keyboard capabilities. Once
+Input and output are advertised as well: `wl_output` v2 sends
+geometry/mode/scale/done, `wl_surface.enter` names the output, and `wl_seat`
+reports pointer+keyboard capabilities. Once
 the surface exists the client calls `get_keyboard`/`get_pointer`; the
 compositor answers `wl_keyboard.keymap` with a memfd carried over
 `SCM_RIGHTS`, then `wl_keyboard.enter`, and `wl_pointer.enter`/`motion` with
-24.8 fixed coordinates. The client verifies the keymap text and the pointer
-position. (The passed descriptor shares the writer's open file description,
+24.8 fixed coordinates. The client verifies the keymap text, the pointer position, output
+scale 2 and the surface-enter event. (The passed descriptor shares the writer's open file description,
 so the client rewinds before reading the keymap.)
 
 The client animates: it creates two `wl_buffer`s from one pool, commits three
@@ -690,8 +692,9 @@ window and the main image. SFS is streamed: the kernel reads 512-byte blocks
 from virtio-blk on demand through a 256 KiB cache, so the 64 MiB / 2048-inode
 image no longer occupies RAM (the kernel heap is 16 MiB). The per-file cap is
 still 8 MiB (the SFS block tree's maximum). Streaming SFS supports
-create/truncate/write and mkdir/remove through the cache; `rename`/`replace`
-are the remaining mutation gaps. `/tmp` is the scratch filesystem.
+create/truncate/write, mkdir/remove and rename/replace through the cache, with
+same-parent renames written in place and cross-directory moves rolled back if
+the source entry cannot be detached. `/tmp` is the scratch filesystem.
 
 A writable `MAP_SHARED` mapping of a `memfd` is a true shared window: the
 memfd owns one contiguous physical run, every process that maps the file (its

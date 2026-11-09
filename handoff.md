@@ -658,6 +658,17 @@ Redmi port is parked. The reference checklist is
   `wl_output` v2 and sends `scale(2)`; the real client binds v2 and checks it.
   Full series plus repeats and `health`: 5500/31515 frames, zero zombies/open
   files/DMA leaks; fsck clean.
+  **Slice 40 (SFS rename/replace, wl_surface.enter):** the streaming backend
+  gained `rename` and `replace`. Same-parent renames rewrite the directory
+  entry in place; cross-directory moves add the destination entry and roll it
+  back if the source entry cannot be detached; directories are checked
+  against moving into their own subtree. `replace` detaches the source name,
+  re-points the destination entry at the source inode and releases the old
+  destination (leaking blocks only if the final free fails, never the old
+  file). QEMU tests cover file and directory moves, a rejected overwrite, a
+  rejected subtree move, and replace-over-destination; fsck stays clean.
+  Wayland adds `wl_surface.enter` and the real client verifies it alongside
+  `wl_output` scale 2.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -684,8 +695,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 40 (third indirect level for >8 MiB files
-  across kernel and image tools, plus SFS rename/replace). Network base
+- **Next steps:** Linux ABI slice 41 (third indirect level for >8 MiB files
+  across kernel and image tools, then a larger toolkit). Network base
   maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on

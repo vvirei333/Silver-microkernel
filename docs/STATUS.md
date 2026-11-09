@@ -30,8 +30,8 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   fork, wait/exit, capabilities, IPC mailboxes and mutexes.
 - virtio-blk-pci + virtio-net, GENI UART, PSCI power off/reset.
 - SFS rootfs read on demand through a 256 KiB block cache (streaming); the
-  image no longer occupies RAM. Create/truncate/write/mkdir/remove work on the
-  same cache (rename/replace still pending). Writable RamFs at `/tmp`.
+  image no longer occupies RAM. Create/truncate/write, mkdir/remove and
+  rename/replace all work on the same cache. Writable RamFs at `/tmp`.
 - Console shell (`howl`) with file, process, mount, network and health commands.
 - Fastfetch-style boot banner, kernel/userspace version **0.1.1**.
 
@@ -52,7 +52,8 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 - Hand-written mini compositor plus a **real `libwayland-client`**:
   - core `wl_display`/`wl_registry`/`wl_compositor`/`wl_shm`/`wl_surface`;
   - `xdg_wm_base` / `xdg_surface` / `xdg_toplevel` (configure/ack);
-  - `wl_output` (geometry/mode/done) and `wl_seat` (pointer+keyboard);
+  - `wl_output` v2 (geometry/mode/scale/done) and `wl_seat`
+    (pointer+keyboard), plus `wl_surface.enter` for the output;
   - `wl_keyboard.keymap` memfd over `SCM_RIGHTS`, `wl_pointer` fixed coords;
   - two buffers, three animated frames, `wl_callback.done` +
     `wl_buffer.release` per frame;
@@ -73,16 +74,17 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 |---|---|
 | SFS image | 64 MiB, 2048 inodes, read on demand (256 KiB block cache) |
 | Kernel heap | 16 MiB |
-| Single SFS file | 8 MiB (block-tree maximum; read-only streaming backend) |
+| Single SFS file | 8 MiB (block-tree maximum; streaming backend) |
 | Anonymous mmap per task | 24 MiB |
 | Tasks | 64 (zombies capped separately) |
 | Linux fds per process | 256 |
 | User VA | image `0x4000_0000`, heap `0x4080_0000`, mmap `0x40A0_0000+`, stack `0x7FE0_1000` |
 
 SFS writes allocate blocks through the streaming cache (bitmap, inode table
-and directory blocks are read-modify-written in place); `rename`/`replace`
-are the remaining mutation gaps. The per-file cap is still 8 MiB until the
-block tree grows a third indirect level.
+and directory blocks are read-modify-written in place). Same-parent and
+cross-directory rename (files and directories), rollback on a failed move,
+and replace-over-destination are implemented. The per-file cap is still
+8 MiB until the block tree grows a third indirect level.
 
 ## Test matrix
 

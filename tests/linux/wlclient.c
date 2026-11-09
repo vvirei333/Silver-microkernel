@@ -26,6 +26,7 @@ static uint32_t configure_serial;
 static int configured;
 static int output_done;
 static int output_scale;
+static int surface_entered;
 static uint32_t seat_caps;
 static int keymap_ok;
 static int pointer_ok;
@@ -255,8 +256,24 @@ static void surface_configure(void *data, struct xdg_surface *surface,
     configured = 1;
 }
 
-static const struct xdg_surface_listener surface_listener = {
+static const struct xdg_surface_listener xdg_surface_listener = {
     .configure = surface_configure,
+};
+
+static void surface_enter_event(void *data, struct wl_surface *surface,
+                                struct wl_output *output) {
+    (void)data; (void)surface; (void)output;
+    surface_entered = 1;
+}
+
+static void surface_leave_event(void *data, struct wl_surface *surface,
+                                struct wl_output *output) {
+    (void)data; (void)surface; (void)output;
+}
+
+static const struct wl_surface_listener wl_surface_listener = {
+    .enter = surface_enter_event,
+    .leave = surface_leave_event,
 };
 
 static void toplevel_configure(void *data, struct xdg_toplevel *toplevel,
@@ -312,12 +329,13 @@ int main(void) {
     if (surface == NULL) {
         return 7;
     }
+    wl_surface_add_listener(surface, &wl_surface_listener, NULL);
     struct xdg_surface *xdg_surface =
         xdg_wm_base_get_xdg_surface(shell, surface);
     if (xdg_surface == NULL) {
         return 7;
     }
-    xdg_surface_add_listener(xdg_surface, &surface_listener, NULL);
+    xdg_surface_add_listener(xdg_surface, &xdg_surface_listener, NULL);
     struct xdg_toplevel *toplevel = xdg_surface_get_toplevel(xdg_surface);
     if (toplevel == NULL) {
         return 7;
@@ -394,11 +412,12 @@ int main(void) {
         fprintf(stderr, "wlclient: buffer releases missing\n");
         return 11;
     }
-    if (!output_done || output_scale != 2 || !keymap_ok || !pointer_ok ||
-        !key_enter) {
+    if (!surface_entered || !output_done || output_scale != 2 || !keymap_ok ||
+        !pointer_ok || !key_enter) {
         fprintf(stderr,
-                "wlclient: input events missing out=%d scale=%d map=%d ptr=%d enter=%d\n",
-                output_done, output_scale, keymap_ok, pointer_ok, key_enter);
+                "wlclient: events missing surface=%d out=%d scale=%d map=%d ptr=%d enter=%d\n",
+                surface_entered, output_done, output_scale, keymap_ok,
+                pointer_ok, key_enter);
         return 11;
     }
 

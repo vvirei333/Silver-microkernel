@@ -249,6 +249,7 @@ static int pool_fd = -1;
 static int verified;
 static unsigned commits;
 static int focused;
+static int surface_entered;
 
 static void send_global_version(long client, unsigned registry, unsigned name,
                                 const char *interface, unsigned version) {
@@ -422,7 +423,14 @@ static int serve(long client) {
             } else if (object == surface_id && opcode == 3) {
                 frame_id = take_u32(); /* wl_surface.frame */
             } else if (object == surface_id && opcode == 6) {
-                /* wl_surface.commit: verify the shared pixels. */
+                /* wl_surface.commit: report the output, then verify pixels. */
+                if (!surface_entered && output_id != 0) {
+                    surface_entered = 1;
+                    begin(surface_id, 0 /* wl_surface.enter */);
+                    put_u32(output_id);
+                    finish();
+                    send_message(client, -1);
+                }
                 if (pool_fd >= 0 && buffer_id != 0) {
                     long mapped = sys6(222, 0, 4096, 1, 1, pool_fd, 0);
                     if (mapped > 0) {
@@ -645,6 +653,7 @@ static void reset_client(void) {
     verified = 0;
     commits = 0;
     focused = 0;
+    surface_entered = 0;
 }
 
 void _start(void) {
