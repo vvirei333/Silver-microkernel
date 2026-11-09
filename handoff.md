@@ -350,6 +350,25 @@ Redmi port is parked. The reference checklist is
   9596/31606 frames, zero zombies/open files/DMA leaks; offline fsck clean.
   Remaining Linux gaps: signal frames/`rt_sigreturn`, COW fork, threads, a
   per-task read scope, and writable/shared file mappings.
+  **Slice 14 (signal frames and `rt_sigreturn`):** `src/linux_signal.rs` now
+  builds a real AArch64 `rt_sigframe` on the user stack (`siginfo` 128 B +
+  `ucontext` 4544 B with `sigcontext`), stores the interrupted x0-x30/SP/PC/
+  PSTATE, and enters the handler with `(sig, siginfo, ucontext)`. Delivery runs
+  in the SVC return path, so the target is always the current task; ignored
+  and default signals are resolved while scanning, default-terminating ones
+  exit, and a user handler blocks its own signal (plus `sa_mask`) unless
+  `SA_NODEFER`. `SA_RESETHAND` resets to `SIG_DFL`.
+  `rt_sigreturn` restores the register bank, SP, PC/PSTATE and `uc_sigmask`.
+  AArch64 glibc does not pass `SA_RESTORER`; the kernel therefore supplies a
+  cached RX page containing `mov x8, #139; svc #0`, while an explicit restorer
+  is honored when `SA_RESTORER` is set. `rt_sigaction` now stores and returns
+  `sa_mask` too. `wait4` leaves `SIGCHLD` pending when a user handler is
+  installed, so the handler runs after the reap.
+  Tests: `linux-sighandler` covers `SA_SIGINFO`, siginfo fields, the restorer
+  path and a blocked-then-unblocked signal (`sigframe ok`); `linux-dynsig`
+  uses real glibc `sigaction`/`raise` (`dyn signal 10`). Remaining gaps:
+  asynchronous delivery to a task already running in EL0, `sigaltstack`,
+  COW fork and threads.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -376,10 +395,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 14 (signal-frame delivery and
-  `rt_sigreturn`, COW fork; then threads and a per-task read scope), then
-  headless Wayland/GTK/D-Bus → Phosh. Network base maintenance (keep-alive,
-  TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 15 (asynchronous signal delivery while a task
+  runs in EL0, `sigaltstack`, then COW fork and threads; a per-task read
+  scope), then headless Wayland/GTK/D-Bus → Phosh. Network base maintenance
+  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

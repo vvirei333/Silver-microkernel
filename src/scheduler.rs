@@ -269,6 +269,10 @@ pub struct Task {
     /// Sum of `mmap_regions` spans, bounded by [`MAX_MMAP_BYTES_PER_TASK`].
     /// Kept separately so the quota check is O(1), not a walk per request.
     mmap_bytes: usize,
+    /// Cached RX page with `mov x8, #139; svc #0`, used as the return address
+    /// when a signal disposition has no SA_RESTORER. It lives in
+    /// `mmap_regions`, so ordinary teardown frees it.
+    signal_trampoline: Option<usize>,
     /// Frames this task has charged to its ledger: every frame it can pin,
     /// including the fixed address-space tables, stacks, image, heap, mmap and
     /// DMA. Bounded by `mem_policy::task_frame_limit`; the global user-frame
@@ -2765,6 +2769,13 @@ pub fn mprotect(address: usize, length: usize, prot: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Returns the current task's kernel-provided signal restorer page, creating
+/// it on first use.
+#[cfg(feature = "linux-abi")]
+pub fn signal_trampoline() -> Option<usize> {
+    current_task_mut()?.signal_trampoline()
+}
+
 /// Unmaps an anonymous region previously returned by `mmap_anonymous`.
 pub fn munmap(address: usize, length: usize) -> bool {
     current_task_mut()
@@ -3362,6 +3373,7 @@ pub fn exec_linux_current(
         task.linux_image = Some(image);
         task.user_image = None;
         task.mmap_bytes = 0;
+        task.signal_trampoline = None;
         task.program_break = mmu::USER_HEAP_VA;
         task.mem_frames = ledger_frames;
         task.resources_released = false;
@@ -3465,6 +3477,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         parent_arguments,
         parent_break,
         parent_mmap_bytes,
+        parent_trampoline,
         parent_prefix,
         parent_quota,
         parent_priority,
@@ -3485,6 +3498,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             parent.arguments.clone(),
             parent.program_break,
             parent.mmap_bytes,
+            parent.signal_trampoline,
             parent.fs_write_prefix.clone(),
             parent.fs_quota,
             parent.priority,
@@ -3681,6 +3695,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         dma_pages: Vec::new(),
         mmap_regions: core::mem::take(&mut parts.mmap),
         mmap_bytes: parent_mmap_bytes,
+        signal_trampoline: parent_trampoline,
         mem_frames: ledger_frames,
         program_break: parent_break,
         waiting_on: None,
@@ -5077,6 +5092,7 @@ impl Task {
             dma_pages: Vec::new(),
             mmap_regions: Vec::new(),
             mmap_bytes: 0,
+            signal_trampoline: None,
             mem_frames: ledger_frames,
             program_break: mmu::USER_HEAP_VA,
             waiting_on: None,
@@ -5297,6 +5313,24 @@ impl Task {
         contents: &[u8],
     ) -> Option<usize> {
         self.mmap_region(length, prot, fixed, Some(contents))
+    }
+
+    /// Returns an RX page containing `mov x8, #139; svc #0`, the user trampoline
+    /// used when a `sigaction` has no `SA_RESTORER`. It is created once per
+    /// task and cached in `signal_trampoline`; because it is an ordinary mmap
+    /// region, fork copies it and teardown frees its frame.
+    #[cfg(feature = "linux-abi")]
+    fn signal_trampoline(&mut self) -> Option<usize> {
+        if let Some(address) = self.signal_trampoline {
+            return Some(address);
+        }
+        // mov x8, #139 (rt_sigreturn); svc #0; brk #0.
+        const CODE: [u8; 12] = [
+            0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
+        ];
+        let address = self.mmap_region(PAGE_SIZE, mmu::PROT_EXEC, None, Some(&CODE))?;
+        self.signal_trampoline = Some(address);
+        Some(address)
     }
 
     /// Unmaps any page-aligned range, even when it spans several mappings or
@@ -5613,6 +5647,7 @@ impl Task {
             #[cfg(feature = "linux-abi")]
             linux_image: self.linux_image.take(),
         };
+        self.signal_trampoline = None;
         release_space_resources(&resources, dma_revokes);
     }
 

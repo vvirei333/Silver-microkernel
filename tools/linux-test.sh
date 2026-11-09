@@ -17,7 +17,9 @@
 #   linuxrun /sfs/linux-pie     # ET_DYN + PT_INTERP, prints 'pie main', exit 7
 #   linuxrun /sfs/linux-bigfile # 16 MiB rootfs + 3 MiB file, prints 'rootfs ok'
 #   linuxrun /sfs/linux-mmapfile # file mmap + mprotect + MAP_FIXED, prints 'mmap ok'
+#   linuxrun /sfs/linux-sighandler # user handler + rt_sigframe/rt_sigreturn, prints 'sigframe ok'
 #   linuxrun /sfs/linux-dyn     # real ld.so + dynamic libc, prints 'dynamic hello'
+#   linuxrun /sfs/linux-dynsig  # glibc sigaction + raise, prints 'dyn signal 10'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -57,6 +59,7 @@ build ipc
 build signal
 build bigfile
 build mmapfile
+build sighandler
 
 # ET_DYN main + custom interpreter (no libc needed).
 "$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
@@ -86,6 +89,7 @@ PY
 python3 scripts/sfs_inject.py "$IMAGE" build/big.bin big.bin
 python3 scripts/sfs_inject.py "$IMAGE" build/bigfile.elf linux-bigfile
 python3 scripts/sfs_inject.py "$IMAGE" build/mmapfile.elf linux-mmapfile
+python3 scripts/sfs_inject.py "$IMAGE" build/sighandler.elf linux-sighandler
 
 # A real static libc binary (the SFS image is 16 MiB; all of these fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then
@@ -107,10 +111,14 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     && "$CC" -O2 -o build/dyn-hello tests/linux/dynhello.c 2>/dev/null; then
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/dyn-hello
+    "$CC" -O2 -o build/dyn-signal tests/linux/dynsignal.c
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/dyn-signal
     python3 scripts/sfs_inject.py "$IMAGE" "$LD_SO" ld-linux-aarch64.so.1
     python3 scripts/sfs_inject.py "$IMAGE" "$LIBC_SO" libc.so.6
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-hello linux-dyn
-    DYN=" linuxrun /sfs/linux-dyn"
+    python3 scripts/sfs_inject.py "$IMAGE" build/dyn-signal linux-dynsig
+    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig"
 else
     DYN=""
     echo "note: patchelf or the dynamic AArch64 libc is missing; skipped the dynamic test" >&2

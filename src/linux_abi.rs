@@ -173,7 +173,11 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_CLOCK_GETTIME => linux_clock_gettime(args[0], args[1]),
         SYS_RT_SIGPROCMASK => linux_rt_sigprocmask(args[0], args[1], args[2]),
         SYS_RT_SIGACTION => linux_rt_sigaction(args[0], args[1], args[2]),
-        SYS_RT_SIGRETURN | SYS_SIGALTSTACK => 0,
+        SYS_RT_SIGRETURN => {
+            crate::linux_signal::restore_frame(frame);
+            0
+        }
+        SYS_SIGALTSTACK => 0,
         SYS_KILL => linux_kill(args[0] as i64, args[1]),
         SYS_TGKILL => linux_kill(args[1] as i64, args[2]),
         SYS_UNAME => linux_uname(args[0]),
@@ -186,8 +190,6 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_BRK => linux_brk(args[0]),
         SYS_MUNMAP => linux_munmap(args[0], args[1]),
         SYS_MMAP => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
-        // Our mappings are created with their final permissions; there is no
-        // page-level protection state to change yet.
         SYS_MPROTECT => linux_mprotect(args[0], args[1], args[2]),
         SYS_PRLIMIT64 => 0, // no rlimits; report "unchanged"
         SYS_GETRANDOM => linux_getrandom(args[0], args[1], args[2]),
@@ -294,10 +296,17 @@ fn linux_wait4(pid: i64, status_pointer: u64, options: u64) -> Result<u64, u64> 
     const WNOHANG: u64 = 1;
     match scheduler::wait_child(pid, options & WNOHANG != 0) {
         scheduler::WaitChild::Exited(child, status) => {
-            crate::linux_signal::clear_pending(
-                scheduler::current_task_id(),
-                crate::linux_signal::SIGCHLD,
-            );
+            // A user SIGCHLD handler must still run after the reap; only
+            // default/ignored dispositions consume the pending bit here.
+            let task = scheduler::current_task_id();
+            let handler = crate::linux_signal::action(task, crate::linux_signal::SIGCHLD)
+                .map(|action| action.handler)
+                .unwrap_or(crate::linux_signal::SIG_DFL);
+            if handler == crate::linux_signal::SIG_DFL
+                || handler == crate::linux_signal::SIG_IGN
+            {
+                crate::linux_signal::clear_pending(task, crate::linux_signal::SIGCHLD);
+            }
             if status_pointer != 0 {
                 let word = ((status & 0xff) << 8) as u32;
                 user_memory::copy_to_user(&word.to_le_bytes(), status_pointer)
@@ -439,6 +448,7 @@ fn linux_rt_sigaction(signal: u64, action_pointer: u64, old_pointer: u64) -> u64
         bytes[..8].copy_from_slice(&old.handler.to_le_bytes());
         bytes[8..16].copy_from_slice(&old.flags.to_le_bytes());
         bytes[16..24].copy_from_slice(&old.restorer.to_le_bytes());
+        bytes[24..32].copy_from_slice(&old.mask.to_le_bytes());
         if user_memory::copy_to_user(&bytes, old_pointer).is_err() {
             return errno(EFAULT);
         }
@@ -452,6 +462,7 @@ fn linux_rt_sigaction(signal: u64, action_pointer: u64, old_pointer: u64) -> u64
             handler: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
             flags: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
             restorer: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            mask: u64::from_le_bytes(bytes[24..32].try_into().unwrap()),
         };
         crate::linux_signal::set_action(task, signal as u32, action);
     }
@@ -460,8 +471,9 @@ fn linux_rt_sigaction(signal: u64, action_pointer: u64, old_pointer: u64) -> u64
 
 /// `kill(2)`/`tgkill(2)`. `SIGKILL` and default-terminating signals terminate
 /// the target; a default-ignored signal (including `SIGCHLD`) is a no-op; a
-/// user handler is recorded as pending but not invoked yet. `pid == 0` or a
-/// negative pid targets the caller (no process groups).
+/// user handler is recorded as pending and entered when the target next
+/// returns to EL0. `pid == 0` or a negative pid targets the caller (no process
+/// groups).
 fn linux_kill(pid: i64, signal: u64) -> u64 {
     const ESRCH: u64 = 3;
     if signal > 64 {

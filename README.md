@@ -436,19 +436,27 @@ Signals keep per-task dispositions, blocked masks and pending bits.
 `rt_sigaction`/`rt_sigprocmask` round-trip, `kill`/`tgkill` apply the default
 actions (`SIGKILL` and default-terminating signals end the target, ignored
 signals are no-ops) and a child's exit raises `SIGCHLD` in the parent.
-User-installed handlers are recorded but not invoked yet — building the
-AArch64 `rt_sigframe` and returning through `rt_sigreturn` is the next signal
-step. The test forks, waits, and `SIGKILL`s a sleeping child:
+User-installed handlers now run: the kernel writes an AArch64 `rt_sigframe`
+(`siginfo` + `ucontext`/`sigcontext`) on the user stack, enters the handler
+with `(sig, siginfo, ucontext)`, and `rt_sigreturn` restores the interrupted
+registers and mask. glibc passes no `SA_RESTORER` on AArch64, so the kernel
+supplies a cached RX trampoline (`mov x8, #139; svc #0`), just like the
+sigpage; an explicit restorer is used when `SA_RESTORER` is set.
+`SA_SIGINFO`, `SA_NODEFER` and `SA_RESETHAND` are honored.
 
 ```text
-howl> linuxrun /sfs/linux-signal
-signal ok
+howl> linuxrun /sfs/linux-sighandler
+sigframe ok
+
+howl> linuxrun /sfs/linux-dynsig
+dyn signal 10
 ```
 
 Still missing: a per-task read scope (a Linux task can read any VFS path, which
 is acceptable on the single-user console but must be closed before untrusted
-apps) and user-installed signal handlers (dispositions are recorded, see
-below). File-backed `mmap` and a real `mprotect` are implemented:
+apps), signal delivery while a task is already running in EL0 (signals are
+currently entered at syscall return), `sigaltstack`, and threads.
+File-backed `mmap` and a real `mprotect` are implemented:
 `MAP_PRIVATE` copies the file range into private frames, `MAP_FIXED` replaces
 an existing range (the loader's `PROT_NONE` reservation followed by per-segment
 fixed mappings), and `mprotect` rewrites PTE permissions on both the anonymous

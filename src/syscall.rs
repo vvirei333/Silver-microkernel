@@ -203,6 +203,13 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
     let result = dispatch_for_personality(frame, number);
 
     frame[0] = result;
+    // A signal raised by this syscall (or by another task) is entered on the
+    // way back to EL0. `frame[0]` is set first so delivery can replace x0 with
+    // the signal number.
+    #[cfg(feature = "linux-abi")]
+    if scheduler::current_personality() == scheduler::Personality::Linux {
+        crate::linux_signal::deliver_pending(frame);
+    }
 }
 
 /// Routes the call by the task's spawn-time personality. The binary is built
