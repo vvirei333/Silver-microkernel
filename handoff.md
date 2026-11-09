@@ -715,6 +715,17 @@ Redmi port is parked. The reference checklist is
   9.4 MiB aarch64 ELF (a binary-blob object linked into a tiny program) ran as
   `stream exec ok`, proving the >8 MiB path; the full Linux series, real
   libwayland and `wayland-info` still pass, and fsck/health stay clean.
+  **Slice 46 (clipboard data-device):** the mini compositor advertises
+  `wl_data_device_manager` v1. It tracks a data source and its mime list,
+  answers `set_selection` with `data_offer`/`offer`/`selection`, and forwards
+  `data_offer.receive(mime, fd)` to `wl_data_source.send` over `SCM_RIGHTS`.
+  The real client offers `text/plain;charset=utf-8`, receives the selection,
+  reads the text from the pipe and verifies `clipboard from werewolf`. The
+  server IDs start at `0xFF000000` (the Wayland server range) and the test
+  passes in both concurrent clients. The test compositor is still sequential,
+  so the offer is delivered back to the setting client; true cross-client
+  multiplexing is the next compositor step. `wayland-info` lists the new
+  global.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -741,9 +752,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 46 (a larger GTK/GLib toolkit and a
-  clipboard/data-device path; Wayland: data-device and xdg-decoration).
-  Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 47 (a larger GTK/GLib toolkit; Wayland:
+  multiplexing the test compositor for real cross-client clipboard, then
+  xdg-decoration/viewporter). Network base maintenance (keep-alive, TLS
+  roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

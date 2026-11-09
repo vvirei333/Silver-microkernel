@@ -238,6 +238,12 @@ static unsigned xdg_surface_id;
 static unsigned toplevel_id;
 static unsigned output_id;
 static unsigned output_version;
+static unsigned data_manager_id;
+static unsigned data_device_id;
+static unsigned data_source_id;
+static unsigned data_offer_id;
+static char data_mimes[4][64];
+static unsigned data_mime_count;
 static unsigned seat_id;
 static unsigned seat_version;
 static unsigned keyboard_id;
@@ -331,6 +337,7 @@ static int serve(long client) {
                 send_global(client, registry_id, 3, "xdg_wm_base");
                 send_global_version(client, registry_id, 4, "wl_output", 4);
                 send_global_version(client, registry_id, 5, "wl_seat", 5);
+                send_global(client, registry_id, 6, "wl_data_device_manager");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -392,7 +399,58 @@ static int serve(long client) {
                     begin(seat_id, 0 /* capabilities */);
                     put_u32(3); /* pointer | keyboard */
                     finish(); send_message(client, -1);
+                } else if (text_equal(interface, "wl_data_device_manager")) {
+                    data_manager_id = new_id;
                 }
+            } else if (object == data_manager_id && opcode == 0) {
+                data_source_id = take_u32(); /* create_data_source */
+            } else if (object == data_manager_id && opcode == 1) {
+                data_device_id = take_u32(); /* get_data_device */
+                (void)take_u32(); /* seat */
+            } else if (object == data_source_id && opcode == 0) {
+                /* wl_data_source.offer(mime_type) */
+                if (data_mime_count < 4) {
+                    take_string(data_mimes[data_mime_count],
+                                sizeof(data_mimes[data_mime_count]));
+                    data_mime_count += 1;
+                }
+            } else if (object == data_source_id && opcode == 1) {
+                data_source_id = 0;
+                data_mime_count = 0;
+            } else if (object == data_device_id && opcode == 1) {
+                /* wl_data_device.set_selection(source, serial) */
+                unsigned source = take_u32();
+                (void)take_u32();
+                if (source != 0 && source == data_source_id && data_mime_count != 0) {
+                    data_offer_id = 0xFF000000u;
+                    begin(data_device_id, 0 /* data_offer */);
+                    put_u32(data_offer_id);
+                    finish(); send_message(client, -1);
+                    for (unsigned mime = 0; mime < data_mime_count; mime++) {
+                        begin(data_offer_id, 0 /* wl_data_offer.offer */);
+                        put_string(data_mimes[mime]);
+                        finish(); send_message(client, -1);
+                    }
+                    begin(data_device_id, 5 /* selection */);
+                    put_u32(data_offer_id);
+                    finish(); send_message(client, -1);
+                }
+            } else if (object == data_device_id && opcode == 2) {
+                data_device_id = 0;
+            } else if (object == data_offer_id && opcode == 1) {
+                /* wl_data_offer.receive(mime_type, fd) */
+                char mime[64];
+                take_string(mime, sizeof(mime));
+                if (incoming_fd >= 0 && data_source_id != 0) {
+                    begin(data_source_id, 1 /* wl_data_source.send */);
+                    put_string(mime);
+                    finish();
+                    send_message(client, incoming_fd);
+                    sys3(57, incoming_fd, 0, 0);
+                    incoming_fd = -1;
+                }
+            } else if (object == data_offer_id && opcode == 2) {
+                data_offer_id = 0;
             } else if (object == compositor_id && opcode == 0) {
                 unsigned new_surface = take_u32(); /* create_surface */
                 if (surface_id == 0) {
@@ -763,6 +821,11 @@ static void reset_client(void) {
     toplevel_id = 0;
     output_id = 0;
     output_version = 0;
+    data_manager_id = 0;
+    data_device_id = 0;
+    data_source_id = 0;
+    data_offer_id = 0;
+    data_mime_count = 0;
     seat_id = 0;
     seat_version = 0;
     keyboard_id = 0;

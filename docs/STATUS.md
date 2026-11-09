@@ -62,6 +62,9 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
     v5 (name, pointer+keyboard), plus `wl_surface.enter` for the output;
   - `wl_keyboard.keymap` memfd over `SCM_RIGHTS`, `repeat_info`,
     `wl_pointer` fixed coords;
+  - `wl_data_device_manager` clipboard: source offer, data offer,
+    selection, receive and source send with an `SCM_RIGHTS` fd (single-client
+    round-trip in the test compositor; cross-client multiplexing is future);
   - two buffers, three animated frames, `wl_callback.done` +
     `wl_buffer.release` per frame;
   - **per-surface focus**: keyboard/pointer enter on the first mapped commit,

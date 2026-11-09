@@ -20,6 +20,13 @@ static struct wl_shm *shared_memory;
 static struct xdg_wm_base *shell;
 static struct wl_output *output;
 static struct wl_seat *seat;
+static struct wl_data_device_manager *data_manager;
+static struct wl_data_device *data_device;
+static struct wl_data_source *data_source;
+static struct wl_data_offer *clipboard_offer;
+static int clipboard_selection;
+static int clipboard_source_sent;
+static int clipboard_mime_ok;
 static struct wl_keyboard *keyboard;
 static struct wl_pointer *pointer;
 static uint32_t configure_serial;
@@ -72,6 +79,95 @@ static const struct wl_seat_listener seat_listener = {
     .name = seat_name_event,
 };
 
+static const char clipboard_text[] = "clipboard from werewolf\n";
+
+static void data_source_target(void *data, struct wl_data_source *source,
+                               const char *mime_type) {
+    (void)data; (void)source; (void)mime_type;
+}
+
+static void data_source_send(void *data, struct wl_data_source *source,
+                             const char *mime_type, int32_t fd) {
+    (void)data; (void)source;
+    if (mime_type != NULL &&
+        strcmp(mime_type, "text/plain;charset=utf-8") == 0) {
+        ssize_t written = write(fd, clipboard_text, sizeof(clipboard_text) - 1);
+        if (written == (ssize_t)(sizeof(clipboard_text) - 1)) {
+            clipboard_source_sent = 1;
+        }
+    }
+    close(fd);
+}
+
+static void data_source_cancelled(void *data, struct wl_data_source *source) {
+    (void)data; (void)source;
+}
+
+static const struct wl_data_source_listener data_source_listener = {
+    .target = data_source_target,
+    .send = data_source_send,
+    .cancelled = data_source_cancelled,
+};
+
+static void data_offer_offer(void *data, struct wl_data_offer *offer,
+                             const char *mime_type) {
+    (void)data; (void)offer;
+    if (mime_type != NULL &&
+        strcmp(mime_type, "text/plain;charset=utf-8") == 0) {
+        clipboard_mime_ok = 1;
+    }
+}
+
+static const struct wl_data_offer_listener data_offer_listener = {
+    .offer = data_offer_offer,
+};
+
+static void data_device_data_offer(void *data, struct wl_data_device *device,
+                                   struct wl_data_offer *offer) {
+    (void)data; (void)device;
+    wl_data_offer_add_listener(offer, &data_offer_listener, NULL);
+    clipboard_offer = offer;
+}
+
+static void data_device_selection(void *data, struct wl_data_device *device,
+                                  struct wl_data_offer *offer) {
+    (void)data; (void)device;
+    if (offer != NULL) {
+        clipboard_offer = offer;
+        clipboard_selection = 1;
+    }
+}
+
+static void data_device_enter(void *data, struct wl_data_device *device,
+                              uint32_t serial, struct wl_surface *surface,
+                              wl_fixed_t x, wl_fixed_t y,
+                              struct wl_data_offer *offer) {
+    (void)data; (void)device; (void)serial; (void)surface; (void)x; (void)y;
+    (void)offer;
+}
+
+static void data_device_leave(void *data, struct wl_data_device *device) {
+    (void)data; (void)device;
+}
+
+static void data_device_motion(void *data, struct wl_data_device *device,
+                               uint32_t time, wl_fixed_t x, wl_fixed_t y) {
+    (void)data; (void)device; (void)time; (void)x; (void)y;
+}
+
+static void data_device_drop(void *data, struct wl_data_device *device) {
+    (void)data; (void)device;
+}
+
+static const struct wl_data_device_listener data_device_listener = {
+    .data_offer = data_device_data_offer,
+    .enter = data_device_enter,
+    .leave = data_device_leave,
+    .motion = data_device_motion,
+    .drop = data_device_drop,
+    .selection = data_device_selection,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version) {
@@ -94,6 +190,10 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 5 ? version : 5;
         seat = wl_registry_bind(registry, name, &wl_seat_interface, use);
         wl_seat_add_listener(seat, &seat_listener, NULL);
+    } else if (strcmp(interface, wl_data_device_manager_interface.name) == 0) {
+        uint32_t use = version < 1 ? version : 1;
+        data_manager = wl_registry_bind(registry, name,
+                                        &wl_data_device_manager_interface, use);
     }
 }
 
@@ -412,6 +512,17 @@ int main(void) {
         return 6;
     }
 
+    data_device = wl_data_device_manager_get_data_device(data_manager, seat);
+    data_source = wl_data_device_manager_create_data_source(data_manager);
+    if (data_device == NULL || data_source == NULL) {
+        fprintf(stderr, "wlclient: data device missing\n");
+        return 6;
+    }
+    wl_data_device_add_listener(data_device, &data_device_listener, NULL);
+    wl_data_source_add_listener(data_source, &data_source_listener, NULL);
+    wl_data_source_offer(data_source, "text/plain;charset=utf-8");
+    wl_data_device_set_selection(data_device, data_source, configure_serial);
+
     struct wl_surface *surface = wl_compositor_create_surface(compositor);
     if (surface == NULL) {
         return 7;
@@ -574,6 +685,38 @@ int main(void) {
     xdg_surface_destroy(popup_xdg_surface);
     wl_surface_destroy(popup_surface);
     xdg_positioner_destroy(positioner);
+
+    /* Clipboard: set_selection -> data_offer/selection -> receive -> send. */
+    for (int attempt = 0; attempt < 8 && !clipboard_selection; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 10;
+        }
+    }
+    if (!clipboard_selection || !clipboard_mime_ok || clipboard_offer == NULL) {
+        fprintf(stderr, "wlclient: clipboard offer missing\n");
+        return 10;
+    }
+    int clipboard_fds[2];
+    if (pipe(clipboard_fds) != 0) {
+        return 10;
+    }
+    wl_data_offer_receive(clipboard_offer, "text/plain;charset=utf-8",
+                          clipboard_fds[1]);
+    close(clipboard_fds[1]);
+    for (int attempt = 0; attempt < 8 && !clipboard_source_sent; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 10;
+        }
+    }
+    char clipboard_buffer[64];
+    ssize_t clipboard_length = read(clipboard_fds[0], clipboard_buffer,
+                                    sizeof(clipboard_buffer));
+    close(clipboard_fds[0]);
+    if (!clipboard_source_sent || clipboard_length != (ssize_t)(sizeof(clipboard_text) - 1) ||
+        memcmp(clipboard_buffer, clipboard_text, sizeof(clipboard_text) - 1) != 0) {
+        fprintf(stderr, "wlclient: clipboard round-trip failed\n");
+        return 10;
+    }
 
     /* Three frames alternating buffers, each waiting for frame + release. */
     for (int frame = 0; frame < 3; frame++) {

@@ -303,6 +303,7 @@ static int serve(long client) {
                 send_global(client, registry_id, 3, "xdg_wm_base");
                 send_global_version(client, registry_id, 4, "wl_output", 4);
                 send_global_version(client, registry_id, 5, "wl_seat", 5);
+                send_global(client, registry_id, 6, "wl_data_device_manager");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -353,6 +354,8 @@ static int serve(long client) {
                         begin(output_id, 2 /* done */);
                         finish(); send_message(client, -1);
                     }
+                } else if (text_equal(interface, "wl_data_device_manager")) {
+                    (void)new_id;
                 } else if (text_equal(interface, "wl_seat")) {
                     seat_id = new_id;
                     seat_version = version;
