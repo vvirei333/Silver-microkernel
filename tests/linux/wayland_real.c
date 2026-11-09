@@ -244,6 +244,12 @@ static unsigned keyboard_id;
 static unsigned pointer_id;
 static unsigned configure_serial = 1;
 static unsigned surface_id;
+static unsigned popup_surface_id;
+static unsigned popup_xdg_surface_id;
+static unsigned popup_id;
+static unsigned positioner_id;
+static int popup_grab;
+static int popup_committed;
 static unsigned pool_id;
 static unsigned buffer_id;
 static unsigned frame_id;
@@ -388,11 +394,23 @@ static int serve(long client) {
                     finish(); send_message(client, -1);
                 }
             } else if (object == compositor_id && opcode == 0) {
-                surface_id = take_u32(); /* create_surface */
+                unsigned new_surface = take_u32(); /* create_surface */
+                if (surface_id == 0) {
+                    surface_id = new_surface;
+                } else {
+                    popup_surface_id = new_surface;
+                }
+            } else if (object == shell_id && opcode == 1) {
+                positioner_id = take_u32(); /* create_positioner */
             } else if (object == shell_id && opcode == 2) {
                 /* xdg_wm_base.get_xdg_surface(new_id, surface) */
-                xdg_surface_id = take_u32();
-                (void)take_u32();
+                unsigned new_xdg_surface = take_u32();
+                unsigned surface = take_u32();
+                if (popup_surface_id != 0 && surface == popup_surface_id) {
+                    popup_xdg_surface_id = new_xdg_surface;
+                } else {
+                    xdg_surface_id = new_xdg_surface;
+                }
             } else if (object == xdg_surface_id && opcode == 1) {
                 /* xdg_surface.get_toplevel(new_id): send configure. */
                 toplevel_id = take_u32();
@@ -407,8 +425,35 @@ static int serve(long client) {
                 configure_serial += 1;
                 finish();
                 send_message(client, -1);
+            } else if (object == popup_xdg_surface_id && opcode == 2) {
+                /* xdg_surface.get_popup(new_id, parent, positioner) */
+                popup_id = take_u32();
+                (void)take_u32();
+                (void)take_u32();
+                begin(popup_id, 0 /* xdg_popup.configure */);
+                put_i32(40); put_i32(30); put_i32(200); put_i32(120);
+                finish(); send_message(client, -1);
+                begin(popup_xdg_surface_id, 0 /* xdg_surface.configure */);
+                put_u32(configure_serial);
+                configure_serial += 1;
+                finish(); send_message(client, -1);
             } else if (object == xdg_surface_id && opcode == 4) {
                 (void)take_u32(); /* ack_configure(serial) */
+            } else if (object == popup_xdg_surface_id && opcode == 4) {
+                (void)take_u32(); /* ack_configure(serial) */
+            } else if (object == popup_id && opcode == 1) {
+                (void)take_u32(); /* seat */
+                (void)take_u32(); /* serial */
+                popup_grab = 1;
+                if (popup_committed) {
+                    begin(popup_id, 1 /* xdg_popup.popup_done */);
+                    finish(); send_message(client, -1);
+                    popup_grab = 0;
+                }
+            } else if (object == popup_id && opcode == 0) {
+                popup_id = 0;
+            } else if (object == positioner_id && opcode == 0) {
+                positioner_id = 0;
             } else if (object == seat_id && opcode == 1) {
                 /* wl_seat.get_keyboard(new_id): keymap fd + enter. */
                 keyboard_id = take_u32();
@@ -483,6 +528,18 @@ static int serve(long client) {
                 } else {
                     send_toplevel_state(client, 0);
                 }
+            } else if (object == popup_surface_id && opcode == 6) {
+                /* Popup commit: dismiss a grabbed popup once it is mapped. */
+                popup_committed = 1;
+                if (popup_grab && popup_id != 0) {
+                    begin(popup_id, 1 /* xdg_popup.popup_done */);
+                    finish(); send_message(client, -1);
+                    popup_grab = 0;
+                }
+            } else if (object == popup_surface_id && opcode == 0) {
+                popup_surface_id = 0;
+                popup_xdg_surface_id = 0;
+                popup_id = 0;
             } else if (object == surface_id && opcode == 3) {
                 frame_id = take_u32(); /* wl_surface.frame */
             } else if (object == surface_id && opcode == 6) {
@@ -711,6 +768,12 @@ static void reset_client(void) {
     keyboard_id = 0;
     pointer_id = 0;
     surface_id = 0;
+    popup_surface_id = 0;
+    popup_xdg_surface_id = 0;
+    popup_id = 0;
+    positioner_id = 0;
+    popup_grab = 0;
+    popup_committed = 0;
     pool_id = 0;
     buffer_id = 0;
     frame_id = 0;

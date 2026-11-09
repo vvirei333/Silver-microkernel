@@ -29,6 +29,9 @@ static int toplevel_maximized;
 static int toplevel_fullscreen;
 static int output_scale;
 static int surface_entered;
+static int popup_configured;
+static int popup_configure_ok;
+static int popup_done;
 static int output_name_ok;
 static int output_description_ok;
 static int seat_name_ok;
@@ -320,6 +323,37 @@ static const struct wl_surface_listener wl_surface_listener = {
     .leave = surface_leave_event,
 };
 
+static void popup_surface_configure(void *data, struct xdg_surface *surface,
+                                    uint32_t serial) {
+    (void)data;
+    (void)surface;
+    configure_serial = serial;
+    popup_configured = 1;
+}
+
+static const struct xdg_surface_listener popup_xdg_surface_listener = {
+    .configure = popup_surface_configure,
+};
+
+static void popup_configure_event(void *data, struct xdg_popup *popup,
+                                  int32_t x, int32_t y, int32_t width,
+                                  int32_t height) {
+    (void)data;
+    (void)popup;
+    popup_configure_ok = x == 40 && y == 30 && width == 200 && height == 120;
+}
+
+static void popup_done_event(void *data, struct xdg_popup *popup) {
+    (void)data;
+    (void)popup;
+    popup_done = 1;
+}
+
+static const struct xdg_popup_listener popup_listener = {
+    .configure = popup_configure_event,
+    .popup_done = popup_done_event,
+};
+
 static void toplevel_configure(void *data, struct xdg_toplevel *toplevel,
                                int32_t width, int32_t height,
                                struct wl_array *states) {
@@ -492,6 +526,54 @@ int main(void) {
     uint32_t *second_pixels = (uint32_t *)((char *)pixels + 2048);
     second_pixels[0] = 0xFF778899u;
     second_pixels[1] = 0xFFAABBCCu;
+
+    /* xdg_popup: positioner, popup configure, map, grab and popup_done. */
+    struct xdg_positioner *positioner = xdg_wm_base_create_positioner(shell);
+    if (positioner == NULL) {
+        return 10;
+    }
+    xdg_positioner_set_size(positioner, 200, 120);
+    xdg_positioner_set_anchor_rect(positioner, 0, 0, 1, 1);
+    xdg_positioner_set_anchor(positioner, XDG_POSITIONER_ANCHOR_TOP_LEFT);
+    xdg_positioner_set_gravity(positioner, XDG_POSITIONER_GRAVITY_BOTTOM_RIGHT);
+    struct wl_surface *popup_surface =
+        wl_compositor_create_surface(compositor);
+    struct xdg_surface *popup_xdg_surface =
+        xdg_wm_base_get_xdg_surface(shell, popup_surface);
+    if (popup_surface == NULL || popup_xdg_surface == NULL) {
+        return 10;
+    }
+    xdg_surface_add_listener(popup_xdg_surface, &popup_xdg_surface_listener,
+                             NULL);
+    struct xdg_popup *popup =
+        xdg_surface_get_popup(popup_xdg_surface, xdg_surface, positioner);
+    if (popup == NULL) {
+        return 10;
+    }
+    xdg_popup_add_listener(popup, &popup_listener, NULL);
+    while (!popup_configured) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 10;
+        }
+    }
+    if (!popup_configure_ok) {
+        fprintf(stderr, "wlclient: popup configure wrong\n");
+        return 10;
+    }
+    xdg_surface_ack_configure(popup_xdg_surface, configure_serial);
+    wl_surface_attach(popup_surface, first, 0, 0);
+    wl_surface_damage(popup_surface, 0, 0, 8, 8);
+    wl_surface_commit(popup_surface);
+    xdg_popup_grab(popup, seat, configure_serial);
+    while (!popup_done) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 10;
+        }
+    }
+    xdg_popup_destroy(popup);
+    xdg_surface_destroy(popup_xdg_surface);
+    wl_surface_destroy(popup_surface);
+    xdg_positioner_destroy(positioner);
 
     /* Three frames alternating buffers, each waiting for frame + release. */
     for (int frame = 0; frame < 3; frame++) {

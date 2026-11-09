@@ -57,6 +57,7 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   - `wl_shm` advertises both ARGB8888 and XRGB8888;
   - `xdg_wm_base` / `xdg_surface` / `xdg_toplevel` (configure/ack), with
     maximized and fullscreen configure states;
+  - `xdg_positioner` / `xdg_popup` (configure, grab, popup_done);
   - `wl_output` v4 (geometry/mode/scale/name/description/done) and `wl_seat`
     v5 (name, pointer+keyboard), plus `wl_surface.enter` for the output;
   - `wl_keyboard.keymap` memfd over `SCM_RIGHTS`, `repeat_info`,

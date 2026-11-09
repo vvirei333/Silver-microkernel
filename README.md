@@ -582,7 +582,9 @@ a bufferless surface to request an initial configure, acknowledges the
 `xdg_surface.configure` serial and only then attaches its buffer. The
 compositor sends `xdg_toplevel.configure` and `xdg_surface.configure`, honours
 `set_maximized`/`unset_maximized` and `set_fullscreen`/`unset_fullscreen` with
-the matching state arrays, and still verifies the shared pixels. The vendored `xdg-shell-client-protocol.h`/
+the matching state arrays, and still verifies the shared pixels. `xdg_popup`
+is implemented too: the client creates a positioner, gets a popup configure,
+maps it, grabs it and receives `popup_done`. The vendored `xdg-shell-client-protocol.h`/
 `.c` come from `wayland-protocols` 1.50.
 
 Input and output are advertised as well: `wl_output` v4 sends
