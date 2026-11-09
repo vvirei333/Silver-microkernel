@@ -722,10 +722,18 @@ Redmi port is parked. The reference checklist is
   The real client offers `text/plain;charset=utf-8`, receives the selection,
   reads the text from the pipe and verifies `clipboard from werewolf`. The
   server IDs start at `0xFF000000` (the Wayland server range) and the test
-  passes in both concurrent clients. The test compositor is still sequential,
-  so the offer is delivered back to the setting client; true cross-client
-  multiplexing is the next compositor step. `wayland-info` lists the new
-  global.
+  passes in both concurrent clients. `wayland-info` lists the new global.
+  **Slice 47 (multiplexed compositor, cross-client clipboard):** the test
+  compositor now keeps a `ClientState` per connection (all protocol object
+  ids, surface/popup state, buffers, flags) and loads/saves it around each
+  pollable `serve` call. `ppoll` drives both accepted sockets, so a client can
+  receive events while the other is executing. The clipboard is shared:
+  `set_selection` broadcasts a data offer to every client with a data device,
+  and `data_offer.receive` forwards `wl_data_source.send` to the owner's fd
+  even while the receiver is being served. `wayland_real` spawns a `source`
+  and a `receiver` client; both still run the full surface/popup/frame test,
+  then the source offers text and the receiver reads it. Server object ids are
+  allocated per client from 0xFF000000. Both clients pass; health is clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -752,10 +760,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 47 (a larger GTK/GLib toolkit; Wayland:
-  multiplexing the test compositor for real cross-client clipboard, then
-  xdg-decoration/viewporter). Network base maintenance (keep-alive, TLS
-  roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 48 (a larger GTK/GLib toolkit; Wayland:
+  xdg-decoration/viewporter and more GTK globals). Network base maintenance
+  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

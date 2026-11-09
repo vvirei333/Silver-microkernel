@@ -483,7 +483,9 @@ static const struct xdg_toplevel_listener toplevel_listener = {
     .close = toplevel_close,
 };
 
-int main(void) {
+int main(int argc, char **argv) {
+    int is_source = argc > 1 && strcmp(argv[1], "source") == 0;
+    int is_receiver = argc > 1 && strcmp(argv[1], "receiver") == 0;
     struct wl_display *display = wl_display_connect("/tmp/wayland-test");
     if (display == NULL) {
         fprintf(stderr, "wlclient: connect failed\n");
@@ -513,15 +515,21 @@ int main(void) {
     }
 
     data_device = wl_data_device_manager_get_data_device(data_manager, seat);
-    data_source = wl_data_device_manager_create_data_source(data_manager);
-    if (data_device == NULL || data_source == NULL) {
+    if (data_device == NULL) {
         fprintf(stderr, "wlclient: data device missing\n");
         return 6;
     }
     wl_data_device_add_listener(data_device, &data_device_listener, NULL);
-    wl_data_source_add_listener(data_source, &data_source_listener, NULL);
-    wl_data_source_offer(data_source, "text/plain;charset=utf-8");
-    wl_data_device_set_selection(data_device, data_source, configure_serial);
+    if (!is_receiver) {
+        data_source = wl_data_device_manager_create_data_source(data_manager);
+        if (data_source == NULL) {
+            fprintf(stderr, "wlclient: data source missing\n");
+            return 6;
+        }
+        wl_data_source_add_listener(data_source, &data_source_listener, NULL);
+        wl_data_source_offer(data_source, "text/plain;charset=utf-8");
+        wl_data_device_set_selection(data_device, data_source, configure_serial);
+    }
 
     struct wl_surface *surface = wl_compositor_create_surface(compositor);
     if (surface == NULL) {
@@ -686,36 +694,56 @@ int main(void) {
     wl_surface_destroy(popup_surface);
     xdg_positioner_destroy(positioner);
 
-    /* Clipboard: set_selection -> data_offer/selection -> receive -> send. */
-    for (int attempt = 0; attempt < 8 && !clipboard_selection; attempt++) {
+    /* Clipboard: source offers text, receiver asks for it, source writes
+     * through the passed fd. */
+    if (is_source && !is_receiver) {
+        for (int attempt = 0; attempt < 16 && !clipboard_source_sent; attempt++) {
+            if (wl_display_roundtrip(display) < 0) {
+                return 10;
+            }
+        }
+        if (!clipboard_source_sent) {
+            fprintf(stderr, "wlclient: clipboard source not drained\n");
+            return 10;
+        }
+        printf("clipboard source ok\n");
+    } else {
+        for (int attempt = 0; attempt < 16 && !clipboard_selection; attempt++) {
+            if (wl_display_roundtrip(display) < 0) {
+                return 10;
+            }
+        }
+        if (!clipboard_selection || !clipboard_mime_ok ||
+            clipboard_offer == NULL) {
+            fprintf(stderr, "wlclient: clipboard offer missing\n");
+            return 10;
+        }
+        int clipboard_fds[2];
+        if (pipe(clipboard_fds) != 0) {
+            return 10;
+        }
+        wl_data_offer_receive(clipboard_offer, "text/plain;charset=utf-8",
+                              clipboard_fds[1]);
+        close(clipboard_fds[1]);
+        /* The source is another process in the cross-client test, so just
+         * block on the pipe while it writes; a roundtrip has already made the
+         * server forward our receive request. */
         if (wl_display_roundtrip(display) < 0) {
             return 10;
         }
-    }
-    if (!clipboard_selection || !clipboard_mime_ok || clipboard_offer == NULL) {
-        fprintf(stderr, "wlclient: clipboard offer missing\n");
-        return 10;
-    }
-    int clipboard_fds[2];
-    if (pipe(clipboard_fds) != 0) {
-        return 10;
-    }
-    wl_data_offer_receive(clipboard_offer, "text/plain;charset=utf-8",
-                          clipboard_fds[1]);
-    close(clipboard_fds[1]);
-    for (int attempt = 0; attempt < 8 && !clipboard_source_sent; attempt++) {
-        if (wl_display_roundtrip(display) < 0) {
+        char clipboard_buffer[64];
+        ssize_t clipboard_length = read(clipboard_fds[0], clipboard_buffer,
+                                        sizeof(clipboard_buffer));
+        close(clipboard_fds[0]);
+        if (clipboard_length != (ssize_t)(sizeof(clipboard_text) - 1) ||
+            memcmp(clipboard_buffer, clipboard_text,
+                   sizeof(clipboard_text) - 1) != 0) {
+            fprintf(stderr, "wlclient: clipboard round-trip failed\n");
             return 10;
         }
-    }
-    char clipboard_buffer[64];
-    ssize_t clipboard_length = read(clipboard_fds[0], clipboard_buffer,
-                                    sizeof(clipboard_buffer));
-    close(clipboard_fds[0]);
-    if (!clipboard_source_sent || clipboard_length != (ssize_t)(sizeof(clipboard_text) - 1) ||
-        memcmp(clipboard_buffer, clipboard_text, sizeof(clipboard_text) - 1) != 0) {
-        fprintf(stderr, "wlclient: clipboard round-trip failed\n");
-        return 10;
+        if (is_receiver) {
+            printf("clipboard receiver ok\n");
+        }
     }
 
     /* Three frames alternating buffers, each waiting for frame + release. */

@@ -593,11 +593,11 @@ Input and output are advertised as well: `wl_output` v4 sends
 geometry/mode/scale/name/description/done, `wl_surface.enter` names the
 output, and `wl_seat` v5 reports its name and pointer+keyboard capabilities.
 `wl_keyboard.repeat_info` carries the key repeat rate. Clipboard support
-comes from `wl_data_device_manager`: the client offers `text/plain`, sets the
-selection, receives a data offer, calls `receive` and the source writes the
-text through the passed fd. The test compositor serves one client at a time,
-so this is a single-client round-trip; cross-client multiplexing is future
-work. Once
+comes from `wl_data_device_manager`: a source client offers `text/plain` and
+sets the selection, the other client receives a data offer, calls `receive`
+and the source writes the text through the passed fd. The test compositor now
+multiplexes both clients with `ppoll` and per-client protocol state, so this
+is a real cross-client clipboard transfer. Once
 the surface exists the client calls `get_keyboard`/`get_pointer`; the
 compositor answers `wl_keyboard.keymap` with a memfd carried over
 `SCM_RIGHTS`, then `wl_keyboard.enter`, and `wl_pointer.enter`/`motion` with

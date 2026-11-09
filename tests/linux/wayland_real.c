@@ -264,6 +264,91 @@ static int verified;
 static unsigned commits;
 static int focused;
 static int surface_entered;
+static int selection_changed;
+static int wants_offer;
+static int current_client = -1;
+
+typedef struct {
+    unsigned registry_id;
+    unsigned compositor_id;
+    unsigned shm_id;
+    unsigned shell_id;
+    unsigned xdg_surface_id;
+    unsigned toplevel_id;
+    unsigned output_id;
+    unsigned output_version;
+    unsigned data_manager_id;
+    unsigned data_device_id;
+    unsigned data_source_id;
+    unsigned data_offer_id;
+    unsigned seat_id;
+    unsigned seat_version;
+    unsigned keyboard_id;
+    unsigned pointer_id;
+    unsigned configure_serial;
+    unsigned surface_id;
+    unsigned popup_surface_id;
+    unsigned popup_xdg_surface_id;
+    unsigned popup_id;
+    unsigned positioner_id;
+    int popup_grab;
+    int popup_committed;
+    unsigned pool_id;
+    unsigned buffer_id;
+    unsigned frame_id;
+    int pool_fd;
+    int verified;
+    unsigned commits;
+    int focused;
+    int surface_entered;
+    unsigned data_mime_count;
+    char data_mimes[4][64];
+    long fd;
+    unsigned next_server_id;
+    int connected;
+    int selection_changed;
+    int wants_offer;
+} ClientState;
+
+#define CLIENT_SCALARS(X) \
+    X(registry_id) X(compositor_id) X(shm_id) X(shell_id) \
+    X(xdg_surface_id) X(toplevel_id) X(output_id) X(output_version) \
+    X(data_manager_id) X(data_device_id) X(data_source_id) X(data_offer_id) \
+    X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
+    X(configure_serial) X(surface_id) X(popup_surface_id) \
+    X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
+    X(popup_grab) X(popup_committed) X(pool_id) X(buffer_id) X(frame_id) \
+    X(pool_fd) X(verified) X(commits) X(focused) X(surface_entered) \
+    X(data_mime_count) X(selection_changed) X(wants_offer)
+
+#define MAX_CLIENTS 2
+static ClientState clients[MAX_CLIENTS];
+static int clipboard_owner = -1;
+static unsigned clipboard_source_id;
+static char clipboard_mimes[4][64];
+static unsigned clipboard_mime_count;
+
+static void copy_mimes(char destination[4][64], char source[4][64]) {
+    for (unsigned outer = 0; outer < 4; outer++) {
+        for (unsigned inner = 0; inner < 64; inner++) {
+            destination[outer][inner] = source[outer][inner];
+        }
+    }
+}
+
+static void load_client(ClientState *client) {
+#define LOAD(field) field = client->field;
+    CLIENT_SCALARS(LOAD)
+#undef LOAD
+    copy_mimes(data_mimes, client->data_mimes);
+}
+
+static void save_client(ClientState *client) {
+#define SAVE(field) client->field = field;
+    CLIENT_SCALARS(SAVE)
+#undef SAVE
+    copy_mimes(client->data_mimes, data_mimes);
+}
 
 static void send_global_version(long client, unsigned registry, unsigned name,
                                 const char *interface, unsigned version) {
@@ -287,6 +372,37 @@ static void send_done(long client, unsigned callback, unsigned data) {
     send_message(client, -1);
 }
 
+/// Sends the current shared selection to one client, allocating the next
+/// server-range object id for its data offer.
+static void send_clipboard_offer(ClientState *client) {
+    if (!client->connected || client->data_device_id == 0 ||
+        clipboard_owner < 0 || clipboard_mime_count == 0) {
+        return;
+    }
+    unsigned offer = client->next_server_id++;
+    client->data_offer_id = offer;
+    begin(client->data_device_id, 0 /* wl_data_device.data_offer */);
+    put_u32(offer);
+    finish();
+    send_message(client->fd, -1);
+    for (unsigned mime = 0; mime < clipboard_mime_count; mime++) {
+        begin(offer, 0 /* wl_data_offer.offer */);
+        put_string(clipboard_mimes[mime]);
+        finish();
+        send_message(client->fd, -1);
+    }
+    begin(client->data_device_id, 5 /* wl_data_device.selection */);
+    put_u32(offer);
+    finish();
+    send_message(client->fd, -1);
+}
+
+static void broadcast_clipboard(void) {
+    for (int index = 0; index < MAX_CLIENTS; index++) {
+        send_clipboard_offer(&clients[index]);
+    }
+}
+
 /// Sends a toplevel configure with zero or one state, then the matching
 /// xdg_surface.configure serial.
 static void send_toplevel_state(long client, unsigned state) {
@@ -307,14 +423,14 @@ static void send_toplevel_state(long client, unsigned state) {
 }
 
 static int serve(long client) {
-    for (;;) {
-        long count = receive_message(client);
-        if (count == 0) {
-            return verified && commits >= 3;
-        }
-        if (count < 0) {
-            return 0;
-        }
+    long count = receive_message(client);
+    if (count == 0) {
+        return 1; /* peer closed */
+    }
+    if (count < 0) {
+        return -1; /* protocol/transport error */
+    }
+    {
         /* One flush may contain several protocol messages. */
         message_start = 0;
         while (message_start + 8 <= incoming_length) {
@@ -407,6 +523,7 @@ static int serve(long client) {
             } else if (object == data_manager_id && opcode == 1) {
                 data_device_id = take_u32(); /* get_data_device */
                 (void)take_u32(); /* seat */
+                wants_offer = 1;
             } else if (object == data_source_id && opcode == 0) {
                 /* wl_data_source.offer(mime_type) */
                 if (data_mime_count < 4) {
@@ -417,23 +534,23 @@ static int serve(long client) {
             } else if (object == data_source_id && opcode == 1) {
                 data_source_id = 0;
                 data_mime_count = 0;
+                if (clipboard_owner == current_client) {
+                    clipboard_owner = -1;
+                    clipboard_mime_count = 0;
+                }
             } else if (object == data_device_id && opcode == 1) {
                 /* wl_data_device.set_selection(source, serial) */
                 unsigned source = take_u32();
                 (void)take_u32();
                 if (source != 0 && source == data_source_id && data_mime_count != 0) {
-                    data_offer_id = 0xFF000000u;
-                    begin(data_device_id, 0 /* data_offer */);
-                    put_u32(data_offer_id);
-                    finish(); send_message(client, -1);
-                    for (unsigned mime = 0; mime < data_mime_count; mime++) {
-                        begin(data_offer_id, 0 /* wl_data_offer.offer */);
-                        put_string(data_mimes[mime]);
-                        finish(); send_message(client, -1);
-                    }
-                    begin(data_device_id, 5 /* selection */);
-                    put_u32(data_offer_id);
-                    finish(); send_message(client, -1);
+                    clipboard_owner = current_client;
+                    clipboard_source_id = source;
+                    clipboard_mime_count = data_mime_count;
+                    copy_mimes(clipboard_mimes, data_mimes);
+                    selection_changed = 1;
+                } else if (source == 0) {
+                    clipboard_owner = -1;
+                    clipboard_mime_count = 0;
                 }
             } else if (object == data_device_id && opcode == 2) {
                 data_device_id = 0;
@@ -441,11 +558,12 @@ static int serve(long client) {
                 /* wl_data_offer.receive(mime_type, fd) */
                 char mime[64];
                 take_string(mime, sizeof(mime));
-                if (incoming_fd >= 0 && data_source_id != 0) {
-                    begin(data_source_id, 1 /* wl_data_source.send */);
+                if (incoming_fd >= 0 && clipboard_owner >= 0 &&
+                    clipboard_source_id != 0) {
+                    begin(clipboard_source_id, 1 /* wl_data_source.send */);
                     put_string(mime);
                     finish();
-                    send_message(client, incoming_fd);
+                    send_message(clients[clipboard_owner].fd, incoming_fd);
                     sys3(57, incoming_fd, 0, 0);
                     incoming_fd = -1;
                 }
@@ -662,6 +780,7 @@ static int serve(long client) {
             message_start += size;
         }
     }
+    return 0;
 }
 
 /* ------------------------------------------------------------------ client */
@@ -845,6 +964,8 @@ static void reset_client(void) {
     commits = 0;
     focused = 0;
     surface_entered = 0;
+    selection_changed = 0;
+    wants_offer = 0;
 }
 
 void _start(void) {
@@ -863,7 +984,9 @@ void _start(void) {
             fail("wayland: fork failed\n", 21);
         }
         if (child == 0) {
-            static const char *argv[] = {"/sfs/wlclient", 0};
+            static const char *source_argv[] = {"/sfs/wlclient", "source", 0};
+            static const char *receiver_argv[] = {"/sfs/wlclient", "receiver", 0};
+            const char **argv = index == 0 ? source_argv : receiver_argv;
             static const char *envp[] = {
                 "XDG_RUNTIME_DIR=/tmp",
                 "WAYLAND_DISPLAY=wayland-test",
@@ -877,18 +1000,96 @@ void _start(void) {
     }
 
     int okay = 1;
-    for (int index = 0; index < 2; index++) {
+    for (int index = 0; index < MAX_CLIENTS; index++) {
         long client = sys3(202 /* accept */, server, 0, 0);
         if (client < 0) {
             fail("wayland: accept failed\n", 23);
         }
         reset_client();
-        if (!serve(client)) {
-            okay = 0;
-        }
-        sys3(57, client, 0, 0);
+        clients[index].fd = client;
+        clients[index].connected = 1;
+        clients[index].next_server_id = 0xFF000000u;
+        save_client(&clients[index]);
     }
     sys3(57, server, 0, 0);
+
+    struct pollfd {
+        int fd;
+        short events;
+        short revents;
+    };
+    int remaining = MAX_CLIENTS;
+    while (remaining > 0) {
+        struct pollfd ready[MAX_CLIENTS];
+        int count = 0;
+        for (int index = 0; index < MAX_CLIENTS; index++) {
+            if (!clients[index].connected) {
+                continue;
+            }
+            ready[count].fd = (int)clients[index].fd;
+            ready[count].events = 1; /* POLLIN */
+            ready[count].revents = 0;
+            count += 1;
+        }
+        if (count == 0) {
+            break;
+        }
+        if (sys6(73 /* ppoll */, (long)ready, count, 0, 0, 0, 0) <= 0) {
+            continue;
+        }
+        for (int index = 0; index < MAX_CLIENTS; index++) {
+            if (!clients[index].connected) {
+                continue;
+            }
+            int slot = -1;
+            for (int probe = 0; probe < count; probe++) {
+                if (ready[probe].fd == (int)clients[index].fd) {
+                    slot = probe;
+                    break;
+                }
+            }
+            if (slot < 0 || (ready[slot].revents & 1) == 0) {
+                continue;
+            }
+            current_client = index;
+            load_client(&clients[index]);
+            int result = serve(clients[index].fd);
+            save_client(&clients[index]);
+            if (result != 0) {
+                if (clipboard_owner == index) {
+                    clipboard_owner = -1;
+                    clipboard_mime_count = 0;
+                }
+                sys3(57, clients[index].fd, 0, 0);
+                clients[index].connected = 0;
+                remaining -= 1;
+                if (result < 0) {
+                    okay = 0;
+                }
+                continue;
+            }
+            if (selection_changed) {
+                selection_changed = 0;
+                clients[index].selection_changed = 0;
+                wants_offer = 0;
+                clients[index].wants_offer = 0;
+                broadcast_clipboard();
+            } else if (wants_offer) {
+                wants_offer = 0;
+                clients[index].wants_offer = 0;
+                send_clipboard_offer(&clients[index]);
+            }
+        }
+    }
+    for (int index = 0; index < MAX_CLIENTS; index++) {
+        if (clients[index].connected) {
+            sys3(57, clients[index].fd, 0, 0);
+            clients[index].connected = 0;
+        }
+        if (!clients[index].verified || clients[index].commits < 3) {
+            okay = 0;
+        }
+    }
 
     for (int index = 0; index < 2; index++) {
         int status = 0;
