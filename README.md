@@ -468,9 +468,17 @@ howl> linuxrun /sfs/linux-asyncsig
 async sig ok
 ```
 
-Still missing: a per-task read scope (a Linux task can read any VFS path, which
-is acceptable on the single-user console but must be closed before untrusted
-apps) and threads.
+Linux tasks are confined to the `/sfs` subtree: `openat`, `newfstatat`,
+`chdir` and `execve` resolve the path and reject anything outside the
+per-task read prefix. Native tasks stay unrestricted. The scope test tries
+`/bin/hello` (denied) and `/sfs/readme.txt` (allowed):
+
+```text
+howl> linuxrun /sfs/linux-scope
+scope ok
+```
+
+Still missing: threads (`CLONE_VM`).
 File-backed `mmap` and a real `mprotect` are implemented:
 `MAP_PRIVATE` copies the file range into private frames, `MAP_FIXED` replaces
 an existing range (the loader's `PROT_NONE` reservation followed by per-segment

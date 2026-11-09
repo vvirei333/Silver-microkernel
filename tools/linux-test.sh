@@ -20,6 +20,7 @@
 #   linuxrun /sfs/linux-sighandler # user handler + rt_sigframe/rt_sigreturn, prints 'sigframe ok'
 #   linuxrun /sfs/linux-asyncsig  # IRQ-delivered signal + sigaltstack, prints 'async sig ok'
 #   linuxrun /sfs/linux-cowfork   # COW fork isolation, prints 'cow fork ok'
+#   linuxrun /sfs/linux-scope     # only /sfs is readable, prints 'scope ok'
 #   linuxrun /sfs/linux-dyn     # real ld.so + dynamic libc, prints 'dynamic hello'
 #   linuxrun /sfs/linux-dynsig  # glibc sigaction + raise, prints 'dyn signal 10'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
@@ -64,6 +65,7 @@ build mmapfile
 build sighandler
 build asyncsig
 build cowfork
+build scope
 
 # ET_DYN main + custom interpreter (no libc needed).
 "$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
@@ -96,6 +98,7 @@ python3 scripts/sfs_inject.py "$IMAGE" build/mmapfile.elf linux-mmapfile
 python3 scripts/sfs_inject.py "$IMAGE" build/sighandler.elf linux-sighandler
 python3 scripts/sfs_inject.py "$IMAGE" build/asyncsig.elf linux-asyncsig
 python3 scripts/sfs_inject.py "$IMAGE" build/cowfork.elf linux-cowfork
+python3 scripts/sfs_inject.py "$IMAGE" build/scope.elf linux-scope
 
 # A real static libc binary (the SFS image is 16 MiB; all of these fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then

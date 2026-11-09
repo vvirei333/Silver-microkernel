@@ -242,11 +242,17 @@ fn linux_execve(
         return errno(EFAULT);
     };
     let cwd = scheduler::current_task_cwd();
-    match crate::vfs::file_len(&cwd, &path) {
+    let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
+        return errno(ENOENT);
+    };
+    if !scheduler::current_read_path_allowed(&resolved) {
+        return errno(EACCES);
+    }
+    match crate::vfs::file_len(&cwd, &resolved) {
         Ok(length) if length <= EXEC_LIMIT => {}
         _ => return errno(ENOENT),
     }
-    let Ok(bytes) = crate::vfs::read_file_limit(&cwd, &path, EXEC_LIMIT) else {
+    let Ok(bytes) = crate::vfs::read_file_limit(&cwd, &resolved, EXEC_LIMIT) else {
         return errno(ENOENT);
     };
     let Ok(image) = crate::linux_elf::load_linux_program(&cwd, &bytes, EXEC_LIMIT) else {
@@ -666,6 +672,12 @@ fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
+    let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
+        return errno(ENOENT);
+    };
+    if !scheduler::current_read_path_allowed(&resolved) {
+        return errno(EACCES);
+    }
     if let Ok(size) = crate::vfs::file_len(&cwd, &path) {
         return match linux_fd::write_stat(buffer, S_IFREG | 0o644, size as u64, 0) {
             Ok(()) => 0,
@@ -724,6 +736,9 @@ fn linux_chdir(path_ptr: u64) -> u64 {
     let Ok(resolved) = crate::vfs::resolve_directory(&cwd, &path) else {
         return errno(ENOENT);
     };
+    if !scheduler::current_read_path_allowed(&resolved) {
+        return errno(EACCES);
+    }
     if scheduler::set_current_task_cwd(resolved) {
         0
     } else {

@@ -406,7 +406,14 @@ Redmi port is parked. The reference checklist is
   child, verifies isolation and repeated writes: `cow fork ok`. Three
   consecutive runs plus the full Linux series and `health` stay at
   9596/31586 frames with zero zombies/open files/DMA leaks; offline fsck
-  clean. Remaining gaps: threads (`CLONE_VM`), a per-task read scope.
+  clean. Remaining gaps: threads (`CLONE_VM`).
+  **Slice 17 (per-task read scope):** every Linux task carries a read prefix
+  (default `/sfs`); native tasks carry `None`. `openat`, `newfstatat`,
+  `chdir` and `execve` resolve the path first and return `-EACCES` when it is
+  outside the prefix. `/dev/*` synthetic devices remain reachable before the
+  scope check. The prefix is copied across `fork` and preserved by `execve`.
+  Test `linux-scope` denies `/bin/hello` and `/bin`, allows
+  `/sfs/readme.txt` and `chdir /sfs`, and prints `scope ok`.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -433,9 +440,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 17 (threads/`CLONE_VM` and a per-task read
-  scope), then headless Wayland/GTK/D-Bus → Phosh. Network base maintenance
-  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 18 (threads/`CLONE_VM`, per-thread TLS and
+  futex wait/wake), then headless Wayland/GTK/D-Bus → Phosh. Network base
+  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

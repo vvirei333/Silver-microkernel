@@ -182,6 +182,9 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     if let Some(device) = device {
         return insert(task, device).ok_or(EMFILE);
     }
+    if !crate::scheduler::read_path_allowed(task, &resolved) {
+        return Err(EACCES);
+    }
     if flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND) != 0 {
         return Err(EROFS);
     }
@@ -750,6 +753,7 @@ pub(crate) fn write_stat(buffer: u64, mode: u32, size: u64, ino: u64) -> Result<
 const ENOENT: u64 = 2;
 const EBADF: u64 = 9;
 const EAGAIN: u64 = 11;
+const EACCES: u64 = 13;
 const EFAULT: u64 = 14;
 const ENODEV: u64 = 19;
 const ENOTDIR: u64 = 20;

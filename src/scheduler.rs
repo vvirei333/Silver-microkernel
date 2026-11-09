@@ -220,6 +220,9 @@ pub struct Task {
     /// Path prefix this task may write under, taken from the bundle manifest.
     /// Only meaningful when the task has no global `CAP_FS_WRITE`.
     fs_write_prefix: Option<String>,
+    /// Read-only subtree a Linux task may resolve. `None` means unrestricted
+    /// (native tasks); Linux tasks default to `/sfs`.
+    read_prefix: Option<String>,
     /// Optional `(block limit, inode limit)` for the write prefix. `None`
     /// means no per-bundle quota; trusted tasks are never limited.
     fs_quota: Option<(u32, u32)>,
@@ -2730,6 +2733,25 @@ pub fn set_current_task_cwd(cwd: String) -> bool {
     false
 }
 
+/// Enforces the per-task read subtree. Native tasks have no prefix and stay
+/// unrestricted; Linux tasks default to `/sfs` (the SFS mount).
+pub fn read_path_allowed(task: u64, path: &str) -> bool {
+    let Some(manager) = scheduler_manager() else {
+        return false;
+    };
+    let Some(task) = manager.tasks.iter().find(|entry| entry.id == task) else {
+        return false;
+    };
+    match &task.read_prefix {
+        Some(prefix) => silver_microkernel::path_is_under(path, prefix),
+        None => true,
+    }
+}
+
+pub fn current_read_path_allowed(path: &str) -> bool {
+    read_path_allowed(current_task_id(), path)
+}
+
 pub fn task_infos() -> Vec<TaskInfo> {
     scheduler_manager()
         .map(|manager| {
@@ -3538,6 +3560,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         parent_mmap_bytes,
         parent_trampoline,
         parent_prefix,
+        parent_read_prefix,
         parent_quota,
         parent_priority,
     ) = {
@@ -3561,6 +3584,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             parent.mmap_bytes,
             parent.signal_trampoline,
             parent.fs_write_prefix.clone(),
+            parent.read_prefix.clone(),
             parent.fs_quota,
             parent.priority,
         )
@@ -3748,6 +3772,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
     let task = Task {
         fs_write_prefix: parent_prefix,
         fs_quota: parent_quota,
+        read_prefix: parent_read_prefix,
         id: child_id,
         state: TaskState::Ready,
         resume_state: None,
@@ -5141,9 +5166,20 @@ impl Task {
             cap_table.insert(id, rights);
         }
 
+        #[cfg(feature = "linux-abi")]
+        let read_prefix = match personality {
+            Personality::Linux => Some(String::from("/sfs")),
+            Personality::Native => None,
+        };
+        #[cfg(not(feature = "linux-abi"))]
+        let read_prefix: Option<String> = {
+            let _ = personality;
+            None
+        };
         Some(Self {
             fs_write_prefix,
             fs_quota,
+            read_prefix,
             id,
             state: TaskState::Ready,
             resume_state: None,
