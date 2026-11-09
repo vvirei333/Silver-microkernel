@@ -20,6 +20,8 @@
 #include "xdg-activation-client-protocol.h"
 #include "fractional-scale-client-protocol.h"
 #include "presentation-time-client-protocol.h"
+#include "relative-pointer-client-protocol.h"
+#include "pointer-constraints-client-protocol.h"
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shared_memory;
@@ -46,6 +48,12 @@ static struct wp_presentation *presentation;
 static struct wp_presentation_feedback *presentation_feedback;
 static int presentation_clock_ok;
 static int presentation_ok;
+static struct zwp_relative_pointer_manager_v1 *relative_manager;
+static struct zwp_relative_pointer_v1 *relative_pointer;
+static int relative_ok;
+static struct zwp_pointer_constraints_v1 *constraints;
+static struct zwp_locked_pointer_v1 *locked_pointer;
+static int locked_ok;
 static struct wl_data_device *data_device;
 static struct wl_data_source *data_source;
 static struct wl_data_offer *clipboard_offer;
@@ -322,6 +330,35 @@ static const struct wp_presentation_feedback_listener feedback_listener = {
     .discarded = feedback_discarded,
 };
 
+static void relative_motion(void *data, struct zwp_relative_pointer_v1 *pointer,
+                             uint32_t utime_hi, uint32_t utime_lo,
+                             wl_fixed_t dx, wl_fixed_t dy,
+                             wl_fixed_t dx_unaccel, wl_fixed_t dy_unaccel) {
+    (void)data; (void)pointer; (void)utime_hi; (void)utime_lo;
+    (void)dx_unaccel; (void)dy_unaccel;
+    if (wl_fixed_to_int(dx) == 3 && wl_fixed_to_int(dy) == 4) {
+        relative_ok = 1;
+    }
+}
+
+static const struct zwp_relative_pointer_v1_listener relative_listener = {
+    .relative_motion = relative_motion,
+};
+
+static void pointer_locked(void *data, struct zwp_locked_pointer_v1 *pointer) {
+    (void)data; (void)pointer;
+    locked_ok = 1;
+}
+
+static void pointer_unlocked(void *data, struct zwp_locked_pointer_v1 *pointer) {
+    (void)data; (void)pointer;
+}
+
+static const struct zwp_locked_pointer_v1_listener locked_listener = {
+    .locked = pointer_locked,
+    .unlocked = pointer_unlocked,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version) {
@@ -380,6 +417,16 @@ static void registry_global(void *data, struct wl_registry *registry,
         presentation = wl_registry_bind(registry, name,
                                         &wp_presentation_interface, use);
         wp_presentation_add_listener(presentation, &presentation_listener, NULL);
+    } else if (strcmp(interface,
+                      zwp_relative_pointer_manager_v1_interface.name) == 0) {
+        uint32_t use = version < 1 ? version : 1;
+        relative_manager = wl_registry_bind(
+            registry, name, &zwp_relative_pointer_manager_v1_interface, use);
+    } else if (strcmp(interface,
+                      zwp_pointer_constraints_v1_interface.name) == 0) {
+        uint32_t use = version < 1 ? version : 1;
+        constraints = wl_registry_bind(
+            registry, name, &zwp_pointer_constraints_v1_interface, use);
     }
 }
 
@@ -939,6 +986,52 @@ int main(int argc, char **argv) {
     if (wl_display_roundtrip(display) < 0) {
         return 7;
     }
+
+    if (relative_manager == NULL) {
+        fprintf(stderr, "wlclient: relative pointer missing\n");
+        return 8;
+    }
+    relative_pointer = zwp_relative_pointer_manager_v1_get_relative_pointer(
+        relative_manager, pointer);
+    if (relative_pointer == NULL) {
+        return 8;
+    }
+    zwp_relative_pointer_v1_add_listener(relative_pointer, &relative_listener,
+                                         NULL);
+    for (int attempt = 0; attempt < 4 && !relative_ok; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (!relative_ok) {
+        fprintf(stderr, "wlclient: relative motion missing\n");
+        return 8;
+    }
+    zwp_relative_pointer_v1_destroy(relative_pointer);
+    zwp_relative_pointer_manager_v1_destroy(relative_manager);
+
+    if (constraints == NULL) {
+        fprintf(stderr, "wlclient: pointer constraints missing\n");
+        return 8;
+    }
+    locked_pointer = zwp_pointer_constraints_v1_lock_pointer(
+        constraints, surface, pointer, NULL,
+        ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
+    if (locked_pointer == NULL) {
+        return 8;
+    }
+    zwp_locked_pointer_v1_add_listener(locked_pointer, &locked_listener, NULL);
+    for (int attempt = 0; attempt < 4 && !locked_ok; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (!locked_ok) {
+        fprintf(stderr, "wlclient: pointer lock missing\n");
+        return 8;
+    }
+    zwp_locked_pointer_v1_destroy(locked_pointer);
+    zwp_pointer_constraints_v1_destroy(constraints);
 
     const int width = 8;
     const int height = 8;

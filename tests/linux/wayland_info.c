@@ -317,6 +317,10 @@ static int serve(long client) {
                             "wp_fractional_scale_manager_v1");
                 send_global_version(client, registry_id, 13,
                                     "wp_presentation", 3);
+                send_global(client, registry_id, 14,
+                            "zwp_relative_pointer_manager_v1");
+                send_global(client, registry_id, 15,
+                            "zwp_pointer_constraints_v1");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -386,6 +390,12 @@ static int serve(long client) {
                     begin(new_id, 0 /* clock_id */);
                     put_u32(1);
                     finish(); send_message(client, -1);
+                } else if (text_equal(interface,
+                                      "zwp_relative_pointer_manager_v1")) {
+                    (void)new_id;
+                } else if (text_equal(interface,
+                                      "zwp_pointer_constraints_v1")) {
+                    (void)new_id;
                 } else if (text_equal(interface, "wl_seat")) {
                     seat_id = new_id;
                     seat_version = version;

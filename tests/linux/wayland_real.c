@@ -254,6 +254,10 @@ static unsigned fractional_manager_id;
 static unsigned fractional_id;
 static unsigned presentation_id;
 static unsigned feedback_id;
+static unsigned relative_manager_id;
+static unsigned relative_pointer_id;
+static unsigned constraints_id;
+static unsigned locked_id;
 static unsigned subsurface_surface_id;
 static int subsurface_ok;
 static unsigned data_source_id;
@@ -309,6 +313,10 @@ typedef struct {
     unsigned fractional_id;
     unsigned presentation_id;
     unsigned feedback_id;
+    unsigned relative_manager_id;
+    unsigned relative_pointer_id;
+    unsigned constraints_id;
+    unsigned locked_id;
     unsigned subsurface_surface_id;
     int subsurface_ok;
     unsigned data_source_id;
@@ -352,6 +360,8 @@ typedef struct {
     X(activation_id) X(activation_token_id) \
     X(fractional_manager_id) X(fractional_id) \
     X(presentation_id) X(feedback_id) \
+    X(relative_manager_id) X(relative_pointer_id) \
+    X(constraints_id) X(locked_id) \
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
     X(configure_serial) X(surface_id) X(popup_surface_id) \
     X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
@@ -513,6 +523,10 @@ static int serve(long client) {
                             "wp_fractional_scale_manager_v1");
                 send_global_version(client, registry_id, 13,
                                     "wp_presentation", 3);
+                send_global(client, registry_id, 14,
+                            "zwp_relative_pointer_manager_v1");
+                send_global(client, registry_id, 15,
+                            "zwp_pointer_constraints_v1");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -589,12 +603,38 @@ static int serve(long client) {
                 } else if (text_equal(interface,
                                       "wp_fractional_scale_manager_v1")) {
                     fractional_manager_id = new_id;
+                } else if (text_equal(interface,
+                                      "zwp_relative_pointer_manager_v1")) {
+                    relative_manager_id = new_id;
+                } else if (text_equal(interface,
+                                      "zwp_pointer_constraints_v1")) {
+                    constraints_id = new_id;
                 } else if (text_equal(interface, "wp_presentation")) {
                     presentation_id = new_id;
                     begin(presentation_id, 0 /* clock_id */);
                     put_u32(1); /* CLOCK_MONOTONIC */
                     finish(); send_message(client, -1);
                 }
+            } else if (object == relative_manager_id && opcode == 1) {
+                relative_pointer_id = take_u32();
+                (void)take_u32(); /* pointer */
+                begin(relative_pointer_id, 0 /* relative_motion */);
+                put_u32(0); put_u32(0);
+                put_i32(3 << 8); put_i32(4 << 8);
+                put_i32(3 << 8); put_i32(4 << 8);
+                finish(); send_message(client, -1);
+            } else if (object == relative_pointer_id && opcode == 0) {
+                relative_pointer_id = 0;
+            } else if (object == constraints_id && opcode == 1) {
+                locked_id = take_u32();
+                (void)take_u32(); /* surface */
+                (void)take_u32(); /* pointer */
+                (void)take_u32(); /* region */
+                (void)take_u32(); /* lifetime */
+                begin(locked_id, 0 /* locked */);
+                finish(); send_message(client, -1);
+            } else if (object == locked_id && opcode == 0) {
+                locked_id = 0;
             } else if (object == presentation_id && opcode == 1) {
                 (void)take_u32(); /* surface */
                 feedback_id = take_u32();
@@ -1129,6 +1169,10 @@ static void reset_client(void) {
     fractional_id = 0;
     presentation_id = 0;
     feedback_id = 0;
+    relative_manager_id = 0;
+    relative_pointer_id = 0;
+    constraints_id = 0;
+    locked_id = 0;
     subsurface_surface_id = 0;
     subsurface_ok = 0;
     data_source_id = 0;

@@ -188,6 +188,8 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
             "$WAYLAND/lib/xdg-activation-protocol.c" \
             "$WAYLAND/lib/fractional-scale-protocol.c" \
             "$WAYLAND/lib/presentation-time-protocol.c" \
+            "$WAYLAND/lib/relative-pointer-protocol.c" \
+            "$WAYLAND/lib/pointer-constraints-protocol.c" \
             -L"$WAYLAND/lib" -Wl,-rpath-link,"$WAYLAND/lib" \
             -l:libwayland-client.so -l:libffi.so.8
         patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
