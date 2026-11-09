@@ -428,7 +428,7 @@ fn undo_new_entry(
 /// kernel RAM, so the cap is the frame budget, not the disk. 16 MiB gives the
 /// Linux ABI room for `ld.so` plus a real libc (and the app bundles); the
 /// loader reads the whole device, not just the legacy 1 MiB prefix.
-const MAX_IMAGE_SECTORS: usize = 32768;
+const MAX_IMAGE_SECTORS: usize = 65536;
 
 /// Reads the whole image into kernel memory and keeps ownership of the disk.
 /// The read size adapts to the device capacity (clamped to

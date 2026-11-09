@@ -606,6 +606,14 @@ Redmi port is parked. The reference checklist is
   commit count and only reports success after three frames. Full series plus
   repeats and `health`: 9596/31575 frames, zero zombies/open files/DMA leaks;
   fsck clean.
+  **Slice 34 (larger SFS and metadata):** the rootfs grows to 32 MiB with 1024
+  inodes. The kernel heap grows to 48 MiB (12288 pages) because the whole SFS
+  image is loaded into it, and `MAX_IMAGE_SECTORS` rises to 65536. Scripts,
+  `--linux-tests` and `tools/linux-test.sh` default to 32 MiB / 1024.
+  The big-file test now writes and verifies an 8 MiB payload (the SFS block
+  tree's maximum), covering the enlarged bitmap/inode metadata end to end.
+  Full series plus repeats and `health`: 21884/31575 frames (heap included),
+  zero zombies/open files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -632,9 +640,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 34 (several concurrent clients and
-  per-surface focus; the 16 MiB SFS still rules out a full GTK stack). Network
-  base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 35 (several concurrent clients and
+  per-surface focus; a full GTK stack still needs more than 32 MiB or a
+  streaming SFS). Network base maintenance (keep-alive, TLS roots/RTC/RNG,
+  TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

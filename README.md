@@ -683,8 +683,9 @@ File-backed `mmap` and a real `mprotect` are implemented:
 `MAP_PRIVATE` copies the file range into private frames, `MAP_FIXED` replaces
 an existing range (the loader's `PROT_NONE` reservation followed by per-segment
 fixed mappings), and `mprotect` rewrites PTE permissions on both the anonymous
-window and the main image. The rootfs is not a limit: it is 16 MiB, the kernel
-heap is 16 MiB, and the per-file cap is 8 MiB.
+window and the main image. The rootfs is not a limit: it is 32 MiB with 1024
+inodes, the kernel heap is 48 MiB (the whole image is loaded into it), and the
+per-file cap is 8 MiB (the SFS block tree's maximum).
 
 A writable `MAP_SHARED` mapping of a `memfd` is a true shared window: the
 memfd owns one contiguous physical run, every process that maps the file (its
@@ -864,7 +865,7 @@ The committed `disk.img` is the clean base image, so test binaries such as
 `tools/linux-test.sh` before booting (it needs the AArch64 cross compiler);
 `git checkout -- disk.img` restores the clean image afterwards.
 
-The script attaches `disk.img` (a 16 MiB SFS image created with
+The script attaches `disk.img` (a 32 MiB SFS image created with
 `scripts/make_sfs.py`; `tools/linux-test.sh` grows an existing image with
 `scripts/sfs_resize.py`) as a
 `virtio-blk-pci` device; without it the block driver reports "not

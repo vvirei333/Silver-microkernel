@@ -4,7 +4,7 @@ block 1, an inode table starting at block 2, data blocks after it. The layout
 matches the kernel's `sfs_format` module (and the historical format_sfs.py).
 
 Usage: make_sfs.py [image] [megabytes] [inode_count]
-Defaults: disk.img, 16 MiB, 512 inodes.
+Defaults: disk.img, 32 MiB, 1024 inodes.
 """
 import struct, sys
 
