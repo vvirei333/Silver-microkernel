@@ -432,9 +432,8 @@ pipe: ping
 ```
 
 `eventfd2` (counter shared by dup/fork, `ppoll`-able), `memfd_create`
-(anonymous in-memory file with read/write/lseek/fstat) and a timed `futex`
-(`FUTEX_WAIT` validates the value and returns `-ETIMEDOUT`; there are no
-threads yet) are available:
+(anonymous in-memory file with read/write/lseek/fstat) and `futex`
+(`FUTEX_WAIT` blocks until `FUTEX_WAKE` or timeout) are available:
 
 ```text
 howl> linuxrun /sfs/linux-ipc
@@ -478,7 +477,28 @@ howl> linuxrun /sfs/linux-scope
 scope ok
 ```
 
-Still missing: threads (`CLONE_VM`).
+Threads use `clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_SETTLS)`: they
+share the leader's address space and memory, get a separate user/kernel stack
+and per-thread `TPIDR_EL0` TLS, and exit through a futex-based join
+(`CLONE_CHILD_CLEARTID`). The freestanding test exercises a shared word,
+TLS and futex wait/wake:
+
+```text
+howl> linuxrun /sfs/linux-threads
+threads ok
+```
+
+Real glibc `pthread_create`/`pthread_join` works through the same path (8 MiB
+stack from `getrlimit(RLIMIT_STACK)`, 8 MiB stack mmap, futex join):
+
+```text
+howl> linuxrun /sfs/linux-pthread
+pthread 42
+```
+
+First thread slice limitation: fd table, heap and mmap bookkeeping remain
+leader-owned; a worker that opens files or grows `brk` itself needs the next
+thread group refactor. `exit_group` with live workers is also not complete.
 File-backed `mmap` and a real `mprotect` are implemented:
 `MAP_PRIVATE` copies the file range into private frames, `MAP_FIXED` replaces
 an existing range (the loader's `PROT_NONE` reservation followed by per-segment

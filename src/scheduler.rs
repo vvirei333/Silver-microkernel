@@ -161,6 +161,8 @@ pub struct TaskContext {
     stack_pointer: u64,
     user_stack_pointer: u64,
     elr: u64,
+    /// User TLS (TPIDR_EL0). Kernel per-CPU state lives in TPIDR_EL1.
+    tls: u64,
 }
 
 impl TaskContext {
@@ -170,6 +172,7 @@ impl TaskContext {
             stack_pointer: 0,
             user_stack_pointer: 0,
             elr: 0,
+            tls: 0,
         }
     }
 }
@@ -267,6 +270,14 @@ pub struct Task {
     /// Root token for `ttbr0`: the only proof that teardown still owns this
     /// address space. A stale token is refused by the page-table registry.
     space_token: TableToken,
+    /// False for a `CLONE_VM` thread: the address space belongs to the leader
+    /// and must survive this task's exit.
+    owns_space: bool,
+    /// Thread-group id. `getpid` returns it; `gettid` returns `id`.
+    tgid: u64,
+    is_thread: bool,
+    /// `CLONE_CHILD_CLEARTID`: clear this word and futex-wake it on exit.
+    clear_child_tid: Option<u64>,
     dma_pages: Vec<(usize, usize, u32)>,
     mmap_regions: Vec<MmapRegion>,
     /// Sum of `mmap_regions` spans, bounded by [`MAX_MMAP_BYTES_PER_TASK`].
@@ -934,7 +945,11 @@ silver_context_switch:
     mrs x9, sp_el0
     str x9, [x0, #104]
     str x30, [x0, #112]
+    mrs x9, tpidr_el0
+    str x9, [x0, #120]
 
+    ldr x9, [x1, #120]
+    msr tpidr_el0, x9
     ldr x9, [x1, #104]
     msr sp_el0, x9
     ldr x9, [x1, #96]
@@ -1952,6 +1967,10 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
     let id = current_task_id();
     #[cfg(feature = "linux-abi")]
     let parent = current_task_mut().and_then(|task| task.ppid);
+    #[cfg(feature = "linux-abi")]
+    let (tgid, clear_tid) = current_task_mut()
+        .map(|task| (task.tgid, task.clear_child_tid))
+        .unwrap_or((0, None));
     // Kernel-side trace: syscall::print is discarded for tasks that do not own
     // the console, so a task dying silently leaves no user-visible evidence.
     // console writes here are raw MMIO pokes and stay visible for every task.
@@ -1971,11 +1990,19 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
         console::write_hex_u64(status);
         console::write_str(")\r\n");
     }
+    #[cfg(feature = "linux-abi")]
+    if let Some(pointer) = clear_tid {
+        let zero = 0_u32.to_le_bytes();
+        let _ = crate::user_memory::copy_to_user(&zero, pointer);
+        crate::linux_abi::futex_wake_address(pointer, tgid, 1);
+    }
     crate::ipc::remove_task(id);
     #[cfg(feature = "linux-abi")]
     crate::linux_fd::close_task(id);
     #[cfg(feature = "linux-abi")]
     crate::linux_signal::close_task(id);
+    #[cfg(feature = "linux-abi")]
+    crate::linux_abi::futex_cleanup(id);
     vfs::close_task(id);
     let saved_daif = interrupts::save_and_disable_irq();
     if let Some(task) = current_task_mut() {
@@ -2551,6 +2578,13 @@ pub fn current_task_id() -> u64 {
     scheduler_manager()
         .and_then(|manager| manager.tasks.get(smp::current_index()))
         .map(|task| task.id)
+        .unwrap_or(0)
+}
+
+pub fn current_tgid() -> u64 {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
+        .map(|task| task.tgid)
         .unwrap_or(0)
 }
 
@@ -3561,6 +3595,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         parent_trampoline,
         parent_prefix,
         parent_read_prefix,
+        parent_tls,
         parent_quota,
         parent_priority,
     ) = {
@@ -3585,6 +3620,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             parent.signal_trampoline,
             parent.fs_write_prefix.clone(),
             parent.read_prefix.clone(),
+            parent.context.tls,
             parent.fs_quota,
             parent.priority,
         )
@@ -3764,6 +3800,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
     context.stack_pointer = frame_address as u64;
     context.user_stack_pointer = user_stack_pointer;
     context.elr = silver_fork_bootstrap as *const () as usize as u64;
+    context.tls = parent_tls;
 
     let (space_token, space_asid) = parts.space.take().unwrap();
     let _ = space_asid;
@@ -3773,6 +3810,10 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         fs_write_prefix: parent_prefix,
         fs_quota: parent_quota,
         read_prefix: parent_read_prefix,
+        owns_space: true,
+        tgid: child_id,
+        is_thread: false,
+        clear_child_tid: None,
         id: child_id,
         state: TaskState::Ready,
         resume_state: None,
@@ -3854,6 +3895,148 @@ pub fn wait_child(pid: i64, nohang: bool) -> WaitChild {
         Some(WaitEvent::Exited(status)) => WaitChild::Exited(id, status),
         _ => WaitChild::NoChild,
     }
+}
+
+/// Creates a Linux thread sharing the current task's address space
+/// (`CLONE_VM|CLONE_THREAD`). The new task gets a fresh kernel stack, the
+/// caller-provided user stack/TLS and a copy of the SVC frame with `x0 = 0`.
+/// It does not own the space or the process resources; the leader keeps them.
+#[cfg(feature = "linux-abi")]
+pub fn spawn_thread(
+    frame: &[u64; crate::syscall::FRAME_QUADWORDS],
+    stack: u64,
+    tls: u64,
+    parent_tid: u64,
+    child_tid: u64,
+    parent_settid: bool,
+    child_settid: bool,
+    clear_child_tid: Option<u64>,
+) -> Option<u64> {
+    let manager = scheduler_manager()?;
+    if !has_task_capacity(manager) {
+        return None;
+    }
+    let (
+        ttbr0,
+        tgid,
+        program_break,
+        cwd,
+        argv,
+        envp,
+        prefix,
+        read_prefix,
+        quota,
+        priority,
+    ) = {
+        let parent = manager.tasks.get(smp::current_index())?;
+        if parent.personality != Personality::Linux {
+            return None;
+        }
+        (
+            parent.ttbr0,
+            parent.tgid,
+            parent.program_break,
+            parent.cwd.clone(),
+            parent.argv.clone(),
+            parent.envp.clone(),
+            parent.fs_write_prefix.clone(),
+            parent.read_prefix.clone(),
+            parent.fs_quota,
+            parent.priority,
+        )
+    };
+    if !mem_policy::task_charge_ok(0, TASK_STACK_PAGES, task_frame_limit()) {
+        return None;
+    }
+    let kernel_stack_start = kernel_stack::alloc()?;
+    let frame_address = phys_to_virt(kernel_stack_start + TASK_STACK_SIZE) - 272;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            frame.as_ptr() as *const u8,
+            frame_address as *mut u8,
+            264,
+        );
+        core::ptr::write_bytes((frame_address + 264) as *mut u8, 0, 8);
+        (frame_address as *mut u64).write(0);
+    }
+    let id = manager.next_id;
+    let mut context = TaskContext::zero();
+    context.stack_pointer = frame_address as u64;
+    context.user_stack_pointer = stack;
+    context.elr = silver_fork_bootstrap as *const () as usize as u64;
+    context.tls = tls;
+    let task = Task {
+        fs_write_prefix: prefix,
+        fs_quota: quota,
+        read_prefix,
+        owns_space: false,
+        tgid,
+        is_thread: true,
+        clear_child_tid,
+        id,
+        state: TaskState::Ready,
+        resume_state: None,
+        program: user_program::PROGRAM_DYNAMIC,
+        argument: 0,
+        personality: Personality::Linux,
+        cap_table: capability::CapTable::new(),
+        bound_irq: None,
+        irq_pending: false,
+        arguments: Vec::new(),
+        ppid: None,
+        exit_status: None,
+        resources_released: false,
+        argv,
+        envp,
+        cwd,
+        owns_console: false,
+        priority,
+        context,
+        stack: MemoryRegion::new(
+            kernel_stack_start,
+            kernel_stack_start + TASK_STACK_SIZE,
+        ),
+        user_stack: MemoryRegion::new(0, 0),
+        user_stack_generation: 0,
+        private_page: 0,
+        private_page_generation: 0,
+        space_token: TableToken::empty(),
+        dma_pages: Vec::new(),
+        mmap_regions: Vec::new(),
+        mmap_bytes: 0,
+        signal_trampoline: None,
+        mem_frames: TASK_STACK_PAGES,
+        program_break,
+        waiting_on: None,
+        owned_mutexes: Vec::new(),
+        running_on: None,
+        is_idle: false,
+        ttbr0,
+        user_image: None,
+        linux_image: None,
+        heap_pages: Vec::new(),
+    };
+    // Publish the TID before the child can run and clear it again.
+    let word = (id as u32).to_le_bytes();
+    if parent_settid
+        && parent_tid != 0
+        && crate::user_memory::copy_to_user(&word, parent_tid).is_err()
+    {
+        kernel_stack::free(kernel_stack_start);
+        return None;
+    }
+    if child_settid
+        && child_tid != 0
+        && crate::user_memory::copy_to_user(&word, child_tid).is_err()
+    {
+        kernel_stack::free(kernel_stack_start);
+        return None;
+    }
+    manager.tasks.push(task);
+    manager.next_id += 1;
+    let index = manager.tasks.len() - 1;
+    enqueue_ready(manager, smp::this_cpu_id(), index);
+    Some(id)
 }
 
 fn spawn_elf_task(
@@ -4739,6 +4922,7 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     // exactly once. `clear_resources` empties the heavy fields, so a zombie
     // carries only PID/PPID/exit status and small metadata until `wait`.
     let mut became_zombie: Vec<u64> = Vec::new();
+    let mut drop_threads: Vec<u64> = Vec::new();
     let mut wake: Vec<u64> = Vec::new();
     for task in &mut manager.tasks {
         if task.state != TaskState::Dead || task.running_on.is_some() || task.resources_released {
@@ -4757,6 +4941,9 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         task.clear_resources();
         task.state = TaskState::Zombie;
         became_zombie.push(task.id);
+        if task.is_thread {
+            drop_threads.push(task.id);
+        }
     }
     if quiesced {
         smp::quiesce_end();
@@ -4790,6 +4977,15 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         });
         if let Some(index) = found {
             wake_blocked_index(manager, index, smp::this_cpu_id());
+        }
+    }
+
+    // Threads are not waitable. Their status is only used by the
+    // CLONE_CHILD_CLEARTID futex, so drop the metadata record immediately
+    // instead of letting it count against the zombie cap.
+    for id in drop_threads {
+        if let Some(index) = manager.tasks.iter().position(|task| task.id == id) {
+            let _ = take_zombie(manager, index);
         }
     }
 
@@ -5180,6 +5376,10 @@ impl Task {
             fs_write_prefix,
             fs_quota,
             read_prefix,
+            owns_space: true,
+            tgid: id,
+            is_thread: false,
+            clear_child_tid: None,
             id,
             state: TaskState::Ready,
             resume_state: None,
@@ -5947,7 +6147,7 @@ impl Task {
     /// Guarded by `resources_released`/`ttbr0`: a zombie has already run this
     /// once, and calling it again with `ttbr0 == 0` would dereference zero.
     fn release_space(&mut self, dma_revokes: &[(usize, usize, mmu::RevokeResult)]) {
-        if self.resources_released || self.ttbr0 == 0 {
+        if !self.owns_space || self.resources_released || self.ttbr0 == 0 {
             return;
         }
         // Take ownership so the release logic has exactly one source of truth

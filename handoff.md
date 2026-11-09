@@ -414,6 +414,25 @@ Redmi port is parked. The reference checklist is
   scope check. The prefix is copied across `fork` and preserved by `execve`.
   Test `linux-scope` denies `/bin/hello` and `/bin`, allows
   `/sfs/readme.txt` and `chdir /sfs`, and prints `scope ok`.
+  **Slice 18 (threads):** `clone(CLONE_VM|CLONE_THREAD|...)` creates a task
+  that shares the leader's TTBR0 and memory but owns only a fresh kernel stack
+  and the caller-provided user stack. `TaskContext` gained `tls` and the
+  context switch saves/restores `TPIDR_EL0`; `CLONE_SETTLS` sets it per thread.
+  `getpid` returns the thread-group id, `gettid` the task id.
+  Futex is real: a per-address/tgid waiter table, `FUTEX_WAIT` blocks until
+  `FUTEX_WAKE`, a changed word or a timeout; `FUTEX_WAKE` wakes sleepers.
+  `CLONE_PARENT_SETTID`/`CHILD_SETTID` publish the tid before the child runs,
+  `CLONE_CHILD_CLEARTID` clears it and wakes the join futex on exit, and thread
+  records are removed in the reaper instead of consuming the zombie cap.
+  Supporting fixes found by glibc: `faccessat` (read-only, no `W_OK`),
+  `madvise` as a no-op, and `getrlimit(RLIMIT_STACK)`/`prlimit64` returning
+  8 MiB so pthread does not request a 512 MiB stack.
+  Tests: `linux-threads` (freestanding CLONE_VM + TLS + futex) prints
+  `threads ok`; `linux-pthread` (real glibc pthread_create/join) prints
+  `pthread 42`. Full series plus repeated thread tests and `health` stay at
+  9596/31585 frames, zero zombies/open files/DMA leaks; offline fsck clean.
+  Limitations: fd table, heap and mmap bookkeeping are still leader-owned, and
+  `exit_group` with live workers is not complete.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -440,9 +459,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 18 (threads/`CLONE_VM`, per-thread TLS and
-  futex wait/wake), then headless Wayland/GTK/D-Bus → Phosh. Network base
-  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 19 (shared thread-group fd/heap/mmap
+  ownership and `exit_group`), then headless Wayland/GTK/D-Bus → Phosh.
+  Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

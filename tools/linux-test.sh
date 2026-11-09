@@ -21,8 +21,10 @@
 #   linuxrun /sfs/linux-asyncsig  # IRQ-delivered signal + sigaltstack, prints 'async sig ok'
 #   linuxrun /sfs/linux-cowfork   # COW fork isolation, prints 'cow fork ok'
 #   linuxrun /sfs/linux-scope     # only /sfs is readable, prints 'scope ok'
+#   linuxrun /sfs/linux-threads   # CLONE_VM + TLS + futex, prints 'threads ok'
 #   linuxrun /sfs/linux-dyn     # real ld.so + dynamic libc, prints 'dynamic hello'
 #   linuxrun /sfs/linux-dynsig  # glibc sigaction + raise, prints 'dyn signal 10'
+#   linuxrun /sfs/linux-pthread # glibc pthread_create/join, prints 'pthread 42'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -66,6 +68,7 @@ build sighandler
 build asyncsig
 build cowfork
 build scope
+build threads
 
 # ET_DYN main + custom interpreter (no libc needed).
 "$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
@@ -99,6 +102,7 @@ python3 scripts/sfs_inject.py "$IMAGE" build/sighandler.elf linux-sighandler
 python3 scripts/sfs_inject.py "$IMAGE" build/asyncsig.elf linux-asyncsig
 python3 scripts/sfs_inject.py "$IMAGE" build/cowfork.elf linux-cowfork
 python3 scripts/sfs_inject.py "$IMAGE" build/scope.elf linux-scope
+python3 scripts/sfs_inject.py "$IMAGE" build/threads.elf linux-threads
 
 # A real static libc binary (the SFS image is 16 MiB; all of these fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then
@@ -125,9 +129,13 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
         --set-rpath '$ORIGIN' build/dyn-signal
     python3 scripts/sfs_inject.py "$IMAGE" "$LD_SO" ld-linux-aarch64.so.1
     python3 scripts/sfs_inject.py "$IMAGE" "$LIBC_SO" libc.so.6
+    "$CC" -O2 -pthread -o build/pthread-test tests/linux/pthread.c
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/pthread-test
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-hello linux-dyn
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-signal linux-dynsig
-    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig"
+    python3 scripts/sfs_inject.py "$IMAGE" build/pthread-test linux-pthread
+    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread"
 else
     DYN=""
     echo "note: patchelf or the dynamic AArch64 libc is missing; skipped the dynamic test" >&2

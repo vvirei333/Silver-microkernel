@@ -14,8 +14,18 @@
 //! descriptors, signals and threads are deliberate no-ops or `-ENOSYS`; each
 //! one is called out at its match arm.
 
+use crate::mutex::Mutex;
 use crate::{linux_fd, scheduler, timer, user_memory};
 use alloc::vec::Vec;
+
+struct FutexWaiter {
+    address: u64,
+    tgid: u64,
+    task: u64,
+    woken: bool,
+}
+
+static FUTEX_WAITERS: Mutex<Vec<FutexWaiter>> = Mutex::new(Vec::new());
 
 // Linux AArch64 syscall numbers (asm-generic/unistd.h).
 const SYS_DUP: u64 = 23;
@@ -38,6 +48,7 @@ const SYS_WRITEV: u64 = 66;
 const SYS_READLINKAT: u64 = 78;
 const SYS_FSTAT: u64 = 80;
 const SYS_NEWFSTATAT: u64 = 79;
+const SYS_FACCESSAT: u64 = 48;
 const SYS_GETDENTS64: u64 = 61;
 const SYS_EXIT: u64 = 93;
 const SYS_CLONE: u64 = 220;
@@ -73,6 +84,7 @@ const SYS_BRK: u64 = 214;
 const SYS_MUNMAP: u64 = 215;
 const SYS_MMAP: u64 = 222;
 const SYS_MPROTECT: u64 = 226;
+const SYS_MADVISE: u64 = 233;
 const SYS_PRLIMIT64: u64 = 261;
 const SYS_GETRANDOM: u64 = 278;
 const SYS_RSEQ: u64 = 293;
@@ -149,6 +161,7 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_IOCTL => linux_ioctl(args[0], args[1], args[2]),
         SYS_FSTAT => finish(linux_fd::fstat(scheduler::current_task_id(), args[0], args[1]).map(|_| 0)),
         SYS_NEWFSTATAT => linux_newfstatat(args[0], args[1], args[2], args[3]),
+        SYS_FACCESSAT => linux_faccessat(args[0], args[1], args[2]),
         SYS_GETDENTS64 => finish(linux_fd::getdents64(
             scheduler::current_task_id(),
             args[0],
@@ -181,7 +194,8 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_KILL => linux_kill(args[0] as i64, args[1]),
         SYS_TGKILL => linux_kill(args[1] as i64, args[2]),
         SYS_UNAME => linux_uname(args[0]),
-        SYS_GETPID | SYS_GETTID => scheduler::current_task_id(),
+        SYS_GETPID => scheduler::current_tgid(),
+        SYS_GETTID => scheduler::current_task_id(),
         SYS_GETPPID => scheduler::current_task_ppid().unwrap_or(0),
         SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => 0,
         SYS_GETRLIMIT => linux_getrlimit(args[0], args[1]),
@@ -191,7 +205,14 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_MUNMAP => linux_munmap(args[0], args[1]),
         SYS_MMAP => linux_mmap(args[0], args[1], args[2], args[3], args[4], args[5]),
         SYS_MPROTECT => linux_mprotect(args[0], args[1], args[2]),
-        SYS_PRLIMIT64 => 0, // no rlimits; report "unchanged"
+        SYS_MADVISE => 0,
+        SYS_PRLIMIT64 => {
+            if args[3] != 0 {
+                linux_getrlimit(args[1], args[3])
+            } else {
+                0
+            }
+        }
         SYS_GETRANDOM => linux_getrandom(args[0], args[1], args[2]),
         // glibc probes rseq and falls back when it is unsupported.
         SYS_RSEQ => errno(ENOSYS),
@@ -276,18 +297,48 @@ fn linux_clone(
     frame: &mut [u64; crate::syscall::FRAME_QUADWORDS],
     flags: u64,
     stack: u64,
-    _parent_tid: u64,
+    parent_tid: u64,
     tls: u64,
-    _child_tid: u64,
+    child_tid: u64,
 ) -> u64 {
     const CLONE_VM: u64 = 0x0000_0100;
     const CLONE_SIGHAND: u64 = 0x0000_0800;
     const CLONE_THREAD: u64 = 0x0001_0000;
-    if stack != 0 || tls != 0 {
-        return errno(EINVAL);
+    const CLONE_SETTLS: u64 = 0x0008_0000;
+    const CLONE_PARENT_SETTID: u64 = 0x0010_0000;
+    const CLONE_CHILD_CLEARTID: u64 = 0x0020_0000;
+    const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
+
+    if flags & CLONE_VM != 0 {
+        if flags & CLONE_THREAD == 0 {
+            // Shared VM without a thread group would need a process object.
+            return errno(ENOSYS);
+        }
+        if stack == 0 {
+            return errno(EINVAL);
+        }
+        let clear = if flags & CLONE_CHILD_CLEARTID != 0 {
+            Some(child_tid)
+        } else {
+            None
+        };
+        return match scheduler::spawn_thread(
+            frame,
+            stack,
+            if flags & CLONE_SETTLS != 0 { tls } else { 0 },
+            parent_tid,
+            child_tid,
+            flags & CLONE_PARENT_SETTID != 0,
+            flags & CLONE_CHILD_SETTID != 0,
+            clear,
+        ) {
+            Some(tid) => tid,
+            None => errno(EAGAIN),
+        };
     }
-    if flags & (CLONE_VM | CLONE_SIGHAND | CLONE_THREAD) != 0 {
-        return errno(ENOSYS);
+
+    if stack != 0 || tls != 0 || flags & CLONE_THREAD != 0 || flags & CLONE_SIGHAND != 0 {
+        return errno(EINVAL);
     }
     match scheduler::fork_current(frame) {
         Some(pid) => pid,
@@ -656,6 +707,39 @@ fn linux_openat(dirfd: u64, path_ptr: u64, flags: u64, _mode: u64) -> u64 {
     ))
 }
 
+/// `faccessat(2)`: existence/readability probe. The Linux view is read-only,
+/// so a write-access check fails with `-EROFS`.
+fn linux_faccessat(dirfd: u64, path_ptr: u64, mode: u64) -> u64 {
+    const W_OK: u64 = 2;
+    let Some(path) = user_string(path_ptr) else {
+        return errno(EFAULT);
+    };
+    if path.is_empty() {
+        return errno(ENOENT);
+    }
+    let cwd = match dirfd_cwd(dirfd) {
+        Ok(cwd) => cwd,
+        Err(code) => return code,
+    };
+    let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
+        return errno(ENOENT);
+    };
+    if !scheduler::current_read_path_allowed(&resolved) {
+        return errno(EACCES);
+    }
+    if mode & W_OK != 0 {
+        return errno(EROFS);
+    }
+    if resolved.starts_with("/dev/")
+        || crate::vfs::file_len(&cwd, &resolved).is_ok()
+        || crate::vfs::resolve_directory(&cwd, &resolved).is_ok()
+    {
+        0
+    } else {
+        errno(ENOENT)
+    }
+}
+
 /// `newfstatat(2)`: stat by path, or by descriptor with `AT_EMPTY_PATH`.
 fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
     let Some(path) = user_string(path_ptr) else {
@@ -859,11 +943,12 @@ fn linux_nanosleep(request: u64, remaining: u64) -> u64 {
 }
 
 fn linux_getrlimit(resource: u64, buffer: u64) -> u64 {
+    const RLIMIT_STACK: u64 = 3;
     const RLIMIT_NOFILE: u64 = 7;
-    let limit: u64 = if resource == RLIMIT_NOFILE {
-        256
-    } else {
-        1 << 30
+    let limit: u64 = match resource {
+        RLIMIT_STACK => 8 * 1024 * 1024,
+        RLIMIT_NOFILE => 256,
+        _ => 1 << 30,
     };
     let mut bytes = [0_u8; 16];
     bytes[..8].copy_from_slice(&limit.to_le_bytes());
@@ -925,9 +1010,13 @@ fn linux_brk(requested: u64) -> u64 {
 fn linux_futex(address: u64, operation: u64, value: u64, timeout: u64) -> u64 {
     const FUTEX_WAIT: u64 = 0;
     const FUTEX_WAKE: u64 = 1;
+    const FUTEX_WAIT_BITSET: u64 = 9;
+    const FUTEX_WAKE_BITSET: u64 = 10;
     const ETIMEDOUT: u64 = 110;
+    let task = scheduler::current_task_id();
+    let tgid = scheduler::current_tgid();
     match operation & 0x7f {
-        FUTEX_WAIT => {
+        FUTEX_WAIT | FUTEX_WAIT_BITSET => {
             let mut raw = [0_u8; 4];
             if user_memory::copy_from_user(address, &mut raw).is_err() {
                 return errno(EFAULT);
@@ -935,8 +1024,8 @@ fn linux_futex(address: u64, operation: u64, value: u64, timeout: u64) -> u64 {
             if u32::from_le_bytes(raw) != value as u32 {
                 return errno(EAGAIN);
             }
-            let millis = if timeout == 0 {
-                10
+            let deadline = if timeout == 0 {
+                None
             } else {
                 let mut bytes = [0_u8; 16];
                 if user_memory::copy_from_user(timeout, &mut bytes).is_err() {
@@ -945,19 +1034,84 @@ fn linux_futex(address: u64, operation: u64, value: u64, timeout: u64) -> u64 {
                 let seconds = i64::from_le_bytes(bytes[..8].try_into().unwrap());
                 let nanoseconds = i64::from_le_bytes(bytes[8..].try_into().unwrap());
                 if seconds < 0 {
-                    10
+                    None
                 } else {
-                    ((seconds as u64).saturating_mul(1000)
-                        + nanoseconds.max(0) as u64 / 1_000_000)
-                        .min(1000)
+                    let millis = (seconds as u64).saturating_mul(1000)
+                        + nanoseconds.max(0) as u64 / 1_000_000;
+                    Some(
+                        timer::ticks().saturating_add(timer::milliseconds_to_ticks(millis)),
+                    )
                 }
             };
-            scheduler::sleep(millis.max(1));
-            errno(ETIMEDOUT)
+            FUTEX_WAITERS.lock().push(FutexWaiter {
+                address,
+                tgid,
+                task,
+                woken: false,
+            });
+            loop {
+                {
+                    let mut waiters = FUTEX_WAITERS.lock();
+                    let Some(entry) = waiters
+                        .iter()
+                        .find(|entry| entry.task == task && entry.address == address)
+                    else {
+                        return 0;
+                    };
+                    if entry.woken {
+                        waiters.retain(|entry| entry.task != task || entry.address != address);
+                        return 0;
+                    }
+                }
+                let mut current = [0_u8; 4];
+                if user_memory::copy_from_user(address, &mut current).is_err() {
+                    futex_cleanup(task);
+                    return errno(EFAULT);
+                }
+                if u32::from_le_bytes(current) != value as u32 {
+                    futex_cleanup(task);
+                    return 0;
+                }
+                if let Some(deadline) = deadline {
+                    if timer::ticks() >= deadline {
+                        futex_cleanup(task);
+                        return errno(ETIMEDOUT);
+                    }
+                }
+                scheduler::sleep(1);
+            }
         }
-        FUTEX_WAKE => 0,
+        FUTEX_WAKE | FUTEX_WAKE_BITSET => {
+            futex_wake_address(address, tgid, value as usize) as u64
+        }
         _ => errno(ENOSYS),
     }
+}
+
+/// Wakes up to `count` waiters on `(address, tgid)`. Returns how many were
+/// marked; `wake_for_signal` also interrupts their polling sleep.
+pub fn futex_wake_address(address: u64, tgid: u64, count: usize) -> usize {
+    let mut wake = Vec::new();
+    {
+        let mut waiters = FUTEX_WAITERS.lock();
+        for entry in waiters.iter_mut() {
+            if wake.len() >= count {
+                break;
+            }
+            if entry.address == address && entry.tgid == tgid && !entry.woken {
+                entry.woken = true;
+                wake.push(entry.task);
+            }
+        }
+    }
+    for task in &wake {
+        scheduler::wake_for_signal(*task);
+    }
+    wake.len()
+}
+
+pub fn futex_cleanup(task: u64) {
+    FUTEX_WAITERS.lock().retain(|entry| entry.task != task);
 }
 
 fn linux_mmap(
