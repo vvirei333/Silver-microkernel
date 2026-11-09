@@ -776,7 +776,13 @@ Linux, one-shot with the SFS disk attached (what `sfs_server` needs):
 ./build_and_qemu.sh            # release build + QEMU with disk.img via virtio-blk-pci
 ./build_and_qemu.sh debug      # same, debug build
 ./build_and_qemu.sh --no-run   # build only
+./build_and_qemu.sh --linux-tests   # install the Linux ABI tests, then boot
 ```
+
+The committed `disk.img` is the clean base image, so test binaries such as
+`/sfs/linux-wayland` are not in it. `--linux-tests` runs
+`tools/linux-test.sh` before booting (it needs the AArch64 cross compiler);
+`git checkout -- disk.img` restores the clean image afterwards.
 
 The script attaches `disk.img` (a 16 MiB SFS image created with
 `scripts/make_sfs.py`; `tools/linux-test.sh` grows an existing image with

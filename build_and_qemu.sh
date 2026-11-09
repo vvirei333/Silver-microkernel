@@ -5,7 +5,7 @@
 # card (Wolfser's network) and an ivshmem surface (Wolfser's window).
 #
 # Usage: ./build_and_qemu.sh [debug|release] [--no-run] [--viewer|--no-viewer]
-#                            [--no-linux]
+#                            [--no-linux] [--linux-tests]
 #   profile defaults to release.
 #   --no-run  stop after the build.
 #   --viewer  start the Qt host viewer (the default); it opens immediately and
@@ -14,6 +14,10 @@
 #   --no-linux   build without the optional Linux ABI module (foreign ELF
 #                loader, Linux syscalls, `linuxrun`). The product then has no
 #                Linux code linked in; this is the removal switch.
+#   --linux-tests  install the Linux ABI test programs into disk.img first
+#                (runs tools/linux-test.sh; needs the AArch64 cross compiler).
+#                The base image only has the OS files, so `linuxrun` targets
+#                such as /sfs/linux-wayland exist only after this step.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -33,6 +37,7 @@ PROFILE=release
 RUN=1
 VIEWER=1
 LINUX=1
+TESTS=0
 for argument in "$@"; do
     case "$argument" in
         debug | release) PROFILE="$argument" ;;
@@ -41,17 +46,25 @@ for argument in "$@"; do
         --no-viewer) VIEWER=0 ;;
         --linux) LINUX=1 ;;
         --no-linux) LINUX=0 ;;
-        *) echo "usage: $0 [debug|release] [--no-run] [--viewer|--no-viewer] [--no-linux]" >&2; exit 1 ;;
+        --linux-tests) TESTS=1 ;;
+        *) echo "usage: $0 [debug|release] [--no-run] [--viewer|--no-viewer] [--no-linux] [--linux-tests]" >&2; exit 1 ;;
     esac
 done
 
 FEATURES=no_std
 if [ "$LINUX" -eq 1 ]; then
     FEATURES="$FEATURES,linux-abi"
+elif [ "$TESTS" -eq 1 ]; then
+    echo "--linux-tests needs the Linux ABI (remove --no-linux)" >&2
+    exit 1
 fi
 
 cargo build "--$PROFILE" --target aarch64-unknown-none \
     --no-default-features --features "$FEATURES"
+
+if [ "$TESTS" -eq 1 ]; then
+    ./tools/linux-test.sh
+fi
 
 if [ "$RUN" -ne 1 ]; then
     echo "built: target/aarch64-unknown-none/$PROFILE/silver_microkernel"
