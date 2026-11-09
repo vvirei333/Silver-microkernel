@@ -130,7 +130,7 @@ open files, SFS usage and DMA state. The interactive `howl` shell and the
 - [x] Boot-time MMU TLB proof: read through TTBR0, remap the same VA, read again (fails the boot if the `tlbi` broadcast is missing)
 - [x] Per-task anonymous-mapping quota (16 MiB), DMA quarantine and per-task memory ledger
 - [x] Kernel-owned persistent SFS: read/write, positioned writes, directories, single/double/triple-indirect files and fsck
-- [x] Real GLib 2.90 / GObject dynamic program and `GMainLoop` under the Linux ABI
+- [x] Real GLib 2.90 / GObject / GIO dynamic programs and `GMainLoop` under the Linux ABI
 - [x] SFS manifest write scopes, per-task open-file quota (32), global VFS budget and lifecycle cleanup
 - [x] Atomic file replacement (`replace`, `SYS_FS_REPLACE`) for bundle updates without exposing a half-written file
 - [x] SHA-256 bundle integrity: manifest `sha256=` is checked before an ELF becomes a task

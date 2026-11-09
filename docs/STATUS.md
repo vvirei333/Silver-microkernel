@@ -42,8 +42,9 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 
 ### Linux ABI
 - Static and dynamic glibc programs; real `ld.so`, PIE/`PT_INTERP`, `$ORIGIN`.
-- Real **GLib 2.90 / GObject** dynamic program and `GMainLoop` (vendored
-  aarch64 libs); `linuxrun /sfs/glibtest`.
+- Real **GLib 2.90 / GObject / GIO** dynamic programs and `GMainLoop`
+  (vendored aarch64 libs); `linuxrun /sfs/glibtest` and
+  `linuxrun /sfs/giotest`.
 - ~100 syscalls: files, `brk`, `mmap`/`mprotect`/`munmap`, `pread`/`pwrite`,
   `clone`, `futex`, `rt_sigaction`/`rt_sigreturn`, `epoll`, `timerfd`,
   `eventfd`, `pipe2`, `memfd_create`, `ftruncate`/`fallocate`, `socketpair`,

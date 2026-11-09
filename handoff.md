@@ -802,6 +802,12 @@ Redmi port is parked. The reference checklist is
   `XDG_DATA_DIRS=/sfs/share` and `XDG_CONFIG_HOME`/`XDG_CACHE_HOME` under
   `/tmp`; `glibtest` prints the inherited Wayland/runtime values. This is the
   launch shape `linuxrun-phosh` will use.
+  **Slice 58 (GIO):** vendored `libgio`, `libgmodule`, `libz`, `libmount`,
+  `libblkid`, `libsystemd` and `libgcc_s` alongside GLib. `tests/linux/gio.c`
+  writes and reads `/tmp/gio-test.txt` through `g_file_set_contents`/
+  `g_file_get_contents`, creates a `GFile`, and runs a `GMainLoop`; the guest
+  prints `gio file ok`, `gio path /tmp/gio-test.txt`, `gio mainloop ok`.
+  Both GLib and GIO tests run on the same 64 MiB image; 221 host tests pass.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP

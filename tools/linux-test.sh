@@ -39,6 +39,7 @@
 #   linuxrun /sfs/linux-wlinfo  # stock wayland-info binary against the compositor
 #   linuxrun /sfs/linux-dbus   # EXTERNAL auth + Hello/Reply, prints 'dbus ok'
 #   linuxrun /sfs/glibtest      # real GLib 2.90 + GObject main loop
+#   linuxrun /sfs/giotest       # real GIO file I/O + main loop
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -101,6 +102,15 @@ if [ -f "$GLIB/lib/libglib-2.0.so.0" ] && [ -f "$GLIB/lib/libgobject-2.0.so.0" ]
         -l:libglib-2.0.so.0 -l:libgobject-2.0.so.0 -l:libffi.so.8
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/glibtest
+    "$CC" -O2 -I"$GLIB/include/glib-2.0" -I"$GLIB/lib/glib-2.0/include" \
+        -o build/giotest tests/linux/gio.c \
+        -L"$GLIB/lib" -Lthird_party/wayland-aarch64/lib \
+        -Wl,-rpath-link,"$GLIB/lib" \
+        -Wl,-rpath-link,third_party/wayland-aarch64/lib \
+        -l:libgio-2.0.so.0 -l:libgobject-2.0.so.0 -l:libglib-2.0.so.0 \
+        -l:libgmodule-2.0.so.0 -l:libffi.so.8
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/giotest
 fi
 
 # ET_DYN main + custom interpreter (no libc needed).
@@ -143,11 +153,14 @@ python3 scripts/sfs_inject.py "$IMAGE" build/wayland_real.elf linux-wlreal
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland_info.elf linux-wlinfo
 python3 scripts/sfs_inject.py "$IMAGE" build/dbus.elf linux-dbus
 if [ -f build/glibtest ]; then
-    python3 scripts/sfs_inject.py "$IMAGE" "$GLIB/lib/libglib-2.0.so.0" libglib-2.0.so.0
-    python3 scripts/sfs_inject.py "$IMAGE" "$GLIB/lib/libgobject-2.0.so.0" libgobject-2.0.so.0
-    python3 scripts/sfs_inject.py "$IMAGE" "$GLIB/lib/libpcre2-8.so.0" libpcre2-8.so.0
+    for library in libglib-2.0.so.0 libgobject-2.0.so.0 libpcre2-8.so.0 \
+                   libgio-2.0.so.0 libgmodule-2.0.so.0 libz.so.1 \
+                   libmount.so.1 libblkid.so.1 libsystemd.so.0 libgcc_s.so.1; do
+        python3 scripts/sfs_inject.py "$IMAGE" "$GLIB/lib/$library" "$library"
+    done
     python3 scripts/sfs_inject.py "$IMAGE" build/glibtest glibtest
-    GLIBTEST=" linuxrun /sfs/glibtest"
+    python3 scripts/sfs_inject.py "$IMAGE" build/giotest giotest
+    GLIBTEST=" linuxrun /sfs/glibtest linuxrun /sfs/giotest"
 else
     GLIBTEST=""
 fi
