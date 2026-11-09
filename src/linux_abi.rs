@@ -47,6 +47,11 @@ const SYS_EXIT_GROUP: u64 = 94;
 const SYS_SET_TID_ADDRESS: u64 = 96;
 const SYS_SET_ROBUST_LIST: u64 = 99;
 const SYS_CLOCK_GETTIME: u64 = 113;
+const SYS_KILL: u64 = 129;
+const SYS_TGKILL: u64 = 131;
+const SYS_SIGALTSTACK: u64 = 132;
+const SYS_RT_SIGACTION: u64 = 134;
+const SYS_RT_SIGRETURN: u64 = 139;
 const SYS_CLOCK_GETRES: u64 = 114;
 const SYS_CLOCK_NANOSLEEP: u64 = 115;
 const SYS_NANOSLEEP: u64 = 101;
@@ -166,7 +171,11 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_SET_TID_ADDRESS => scheduler::current_task_id(),
         SYS_SET_ROBUST_LIST => 0, // single-threaded: nothing to register
         SYS_CLOCK_GETTIME => linux_clock_gettime(args[0], args[1]),
-        SYS_RT_SIGPROCMASK => 0, // no signal delivery yet
+        SYS_RT_SIGPROCMASK => linux_rt_sigprocmask(args[0], args[1], args[2]),
+        SYS_RT_SIGACTION => linux_rt_sigaction(args[0], args[1], args[2]),
+        SYS_RT_SIGRETURN | SYS_SIGALTSTACK => 0,
+        SYS_KILL => linux_kill(args[0] as i64, args[1]),
+        SYS_TGKILL => linux_kill(args[1] as i64, args[2]),
         SYS_UNAME => linux_uname(args[0]),
         SYS_GETPID | SYS_GETTID => scheduler::current_task_id(),
         SYS_GETPPID => scheduler::current_task_ppid().unwrap_or(0),
@@ -285,6 +294,10 @@ fn linux_wait4(pid: i64, status_pointer: u64, options: u64) -> Result<u64, u64> 
     const WNOHANG: u64 = 1;
     match scheduler::wait_child(pid, options & WNOHANG != 0) {
         scheduler::WaitChild::Exited(child, status) => {
+            crate::linux_signal::clear_pending(
+                scheduler::current_task_id(),
+                crate::linux_signal::SIGCHLD,
+            );
             if status_pointer != 0 {
                 let word = ((status & 0xff) << 8) as u32;
                 user_memory::copy_to_user(&word.to_le_bytes(), status_pointer)
@@ -387,6 +400,105 @@ fn linux_ppoll(
         }
         scheduler::sleep(1);
     }
+}
+
+/// `rt_sigprocmask(2)`: block/unblock/set the calling task's signal mask.
+fn linux_rt_sigprocmask(how: u64, set_pointer: u64, old_pointer: u64) -> u64 {
+    let task = scheduler::current_task_id();
+    let old = crate::linux_signal::blocked(task);
+    if set_pointer != 0 {
+        let mut raw = [0_u8; 8];
+        if user_memory::copy_from_user(set_pointer, &mut raw).is_err() {
+            return errno(EFAULT);
+        }
+        let set = u64::from_le_bytes(raw);
+        let mask = match how {
+            0 => old | set,          // SIG_BLOCK
+            1 => old & !set,         // SIG_UNBLOCK
+            2 => set,                // SIG_SETMASK
+            _ => return errno(EINVAL),
+        };
+        crate::linux_signal::set_blocked(task, mask);
+    }
+    if old_pointer != 0 && user_memory::copy_to_user(&old.to_le_bytes(), old_pointer).is_err() {
+        return errno(EFAULT);
+    }
+    0
+}
+
+/// `rt_sigaction(2)`: store/retrieve one disposition. The AArch64
+/// `struct sigaction` is `{ handler, flags, restorer, mask }` (32 bytes).
+fn linux_rt_sigaction(signal: u64, action_pointer: u64, old_pointer: u64) -> u64 {
+    if signal == 0 || signal > 64 {
+        return errno(EINVAL);
+    }
+    let task = scheduler::current_task_id();
+    if old_pointer != 0 {
+        let old = crate::linux_signal::action(task, signal as u32).unwrap_or_default();
+        let mut bytes = [0_u8; 32];
+        bytes[..8].copy_from_slice(&old.handler.to_le_bytes());
+        bytes[8..16].copy_from_slice(&old.flags.to_le_bytes());
+        bytes[16..24].copy_from_slice(&old.restorer.to_le_bytes());
+        if user_memory::copy_to_user(&bytes, old_pointer).is_err() {
+            return errno(EFAULT);
+        }
+    }
+    if action_pointer != 0 {
+        let mut bytes = [0_u8; 32];
+        if user_memory::copy_from_user(action_pointer, &mut bytes).is_err() {
+            return errno(EFAULT);
+        }
+        let action = crate::linux_signal::Action {
+            handler: u64::from_le_bytes(bytes[..8].try_into().unwrap()),
+            flags: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+            restorer: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        };
+        crate::linux_signal::set_action(task, signal as u32, action);
+    }
+    0
+}
+
+/// `kill(2)`/`tgkill(2)`. `SIGKILL` and default-terminating signals terminate
+/// the target; a default-ignored signal (including `SIGCHLD`) is a no-op; a
+/// user handler is recorded as pending but not invoked yet. `pid == 0` or a
+/// negative pid targets the caller (no process groups).
+fn linux_kill(pid: i64, signal: u64) -> u64 {
+    const ESRCH: u64 = 3;
+    if signal > 64 {
+        return errno(EINVAL);
+    }
+    let task = scheduler::current_task_id();
+    let target = if pid > 0 { pid as u64 } else { task };
+    if target != task && !scheduler::task_alive(target) {
+        return errno(ESRCH);
+    }
+    if signal == 0 {
+        return 0;
+    }
+    let signal = signal as u32;
+    let handler = if crate::linux_signal::has_table(target) {
+        crate::linux_signal::action(target, signal)
+            .map(|action| action.handler)
+            .unwrap_or(crate::linux_signal::SIG_DFL)
+    } else {
+        crate::linux_signal::SIG_DFL
+    };
+    if handler == crate::linux_signal::SIG_IGN {
+        return 0;
+    }
+    if handler == crate::linux_signal::SIG_DFL {
+        if crate::linux_signal::default_terminates(signal) || signal == crate::linux_signal::SIGKILL {
+            if target == task {
+                scheduler::exit_current_with_status(128 + signal as u64);
+            }
+            let _ = scheduler::kill_task(target);
+        }
+        return 0;
+    }
+    // A real handler: remember the signal. Frame construction/`rt_sigreturn`
+    // is not implemented yet.
+    crate::linux_signal::raise(target, signal);
+    0
 }
 
 fn linux_write(fd: u64, buffer: u64, count: u64) -> u64 {

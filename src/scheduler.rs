@@ -1914,6 +1914,8 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
         smp::bkl_acquire();
     }
     let id = current_task_id();
+    #[cfg(feature = "linux-abi")]
+    let parent = current_task_mut().and_then(|task| task.ppid);
     // Kernel-side trace: syscall::print is discarded for tasks that do not own
     // the console, so a task dying silently leaves no user-visible evidence.
     // console writes here are raw MMIO pokes and stay visible for every task.
@@ -1936,6 +1938,8 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
     crate::ipc::remove_task(id);
     #[cfg(feature = "linux-abi")]
     crate::linux_fd::close_task(id);
+    #[cfg(feature = "linux-abi")]
+    crate::linux_signal::close_task(id);
     vfs::close_task(id);
     let saved_daif = interrupts::save_and_disable_irq();
     if let Some(task) = current_task_mut() {
@@ -1952,6 +1956,13 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
         reparent_children(manager, id);
         wake_process_waiters(manager);
     }
+    #[cfg(feature = "linux-abi")]
+    if let Some(parent) = parent {
+        if task_alive(parent) && crate::linux_signal::has_table(parent) {
+            crate::linux_signal::raise(parent, crate::linux_signal::SIGCHLD);
+        }
+    }
+
     schedule_released();
     // A dead task must not park while holding the kernel lock. `schedule`
     // normally switches away here; when every other task is already running
@@ -1990,9 +2001,12 @@ pub fn kill_task(id: u64) -> bool {
     }
     // Side effects only after the target is proven live: a bogus CAP_KILL
     // target must not broadcast mailbox/console wakeups across the system.
+    let parent = manager.tasks[index].ppid;
     crate::ipc::remove_task(id);
     #[cfg(feature = "linux-abi")]
     crate::linux_fd::close_task(id);
+    #[cfg(feature = "linux-abi")]
+    crate::linux_signal::close_task(id);
     vfs::close_task(id);
     manager.tasks[index].state = TaskState::Dead;
     manager.tasks[index].bound_irq = None;
@@ -2000,6 +2014,12 @@ pub fn kill_task(id: u64) -> bool {
     recover_console(manager, id);
     reparent_children(manager, id);
     wake_process_waiters(manager);
+    #[cfg(feature = "linux-abi")]
+    if let Some(parent) = parent {
+        if task_alive(parent) && crate::linux_signal::has_table(parent) {
+            crate::linux_signal::raise(parent, crate::linux_signal::SIGCHLD);
+        }
+    }
     schedule_released();
     interrupts::restore_irq(saved_daif);
     true

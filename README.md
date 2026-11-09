@@ -311,10 +311,12 @@ EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 `openat`, `getdents64`, `newfstatat`, `dup`/`dup2`/`dup3`, `fcntl`, `getcwd`,
 `chdir`, `nanosleep`/`clock_nanosleep`, `clock_getres`, `gettimeofday`,
 `getrlimit`, `getuid`/`geteuid`/`getgid`/`getegid`, `sched_getaffinity`,
-`prctl`, `execve`, `clone` (fork semantics), `wait4`, `pipe2` and `ppoll`;
-anything else returns `-ENOSYS`. File descriptors are a per-process table in
-`src/linux_fd.rs` (console, synthetic `/dev` devices, VFS handles or pipes), so
-`dup2` redirects work; the filesystem view is read-only.
+`prctl`, `execve`, `clone` (fork semantics), `wait4`, `pipe2`, `ppoll`,
+`eventfd2`, `memfd_create`, `futex`, `rt_sigaction`, `rt_sigprocmask`, `kill`
+and `tgkill`; anything else returns `-ENOSYS`. File descriptors are a
+per-process table in `src/linux_fd.rs` (console, `/dev` devices, VFS handles,
+pipes, eventfds or memfds), so `dup2` redirects work; the filesystem view is
+read-only.
 
 The personality is fixed at spawn, so a foreign binary can never reach the
 Silver syscall table by choosing a colliding number. `linuxrun` is a
@@ -416,6 +418,29 @@ reads:
 ```text
 howl> linuxrun /sfs/linux-pipe
 pipe: ping
+```
+
+`eventfd2` (counter shared by dup/fork, `ppoll`-able), `memfd_create`
+(anonymous in-memory file with read/write/lseek/fstat) and a timed `futex`
+(`FUTEX_WAIT` validates the value and returns `-ETIMEDOUT`; there are no
+threads yet) are available:
+
+```text
+howl> linuxrun /sfs/linux-ipc
+ipc ok
+```
+
+Signals keep per-task dispositions, blocked masks and pending bits.
+`rt_sigaction`/`rt_sigprocmask` round-trip, `kill`/`tgkill` apply the default
+actions (`SIGKILL` and default-terminating signals end the target, ignored
+signals are no-ops) and a child's exit raises `SIGCHLD` in the parent.
+User-installed handlers are recorded but not invoked yet — building the
+AArch64 `rt_sigframe` and returning through `rt_sigreturn` is the next signal
+step. The test forks, waits, and `SIGKILL`s a sleeping child:
+
+```text
+howl> linuxrun /sfs/linux-signal
+signal ok
 ```
 
 Still missing: a per-task read scope (a Linux task can read any VFS path, which

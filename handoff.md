@@ -252,6 +252,27 @@ Redmi port is parked. The reference checklist is
   and both tasks exit 0. Three consecutive runs plus the glibc test and
   `health` stay at 2171/31612 frames with no zombies, open files or DMA
   leaks.
+  **Slice 9 (`eventfd2`, `memfd_create`, `futex`):** eventfd is a shared
+  `u64` counter (`read` drains it, `write` adds, `ppoll` reports `POLLIN`
+  when non-zero; `EFD_NONBLOCK` returns `-EAGAIN`), memfd is an anonymous
+  in-memory file with read/write/lseek/fstat and a shared offset, and
+  `FUTEX_WAIT` validates the user word then sleeps for the timeout (10 ms
+  default) reporting `-ETIMEDOUT`; `FUTEX_WAKE` returns zero waiters. Without
+  threads a contended wait cannot be woken, so this is a compatibility shim.
+  Anonymous `mmap` now rejects non-`MAP_ANONYMOUS` requests with `-ENODEV`
+  instead of silently returning zeroed memory.
+  **Slice 10 (signals):** `src/linux_signal.rs` keeps per-task dispositions
+  (aarch64 `struct sigaction`: handler/flags/restorer), the blocked mask and
+  pending bits. `rt_sigaction`/`rt_sigprocmask` round-trip, `kill`/`tgkill`
+  apply default actions (`SIGKILL` and default-terminating signals terminate;
+  ignored ones do nothing; `pid <= 0` targets the caller), and a child's exit
+  raises `SIGCHLD` in a parent that has a signal table (`SIG_IGN` suppresses
+  it). `wait4` clears the pending `SIGCHLD`. Custom handlers are stored but
+  **not invoked**: `rt_sigframe` construction/`rt_sigreturn` is still open.
+  Tests: `linux-ipc` prints `ipc ok`, `linux-signal` prints `signal ok`
+  (exercising sigaction/sigprocmask, wait/SIGCHLD and SIGKILL of a sleeping
+  child). Running all six Linux tests plus the glibc test and `health` stays
+  at 2171/31608 frames, zero zombies, zero open files, zero DMA leaks.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -278,9 +299,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 9 (`rt_sigaction`/`SIGCHLD` delivery,
-  `eventfd2`, `memfd_create` + `futex`, a per-task read scope), then
-  ET_DYN/PIE and `ld.so` so distro binaries and a real shell run; then headless
+- **Next steps:** Linux ABI slice 11 (ET_DYN/PIE + `PT_INTERP`/`AT_BASE`, then
+  file-backed `mmap`/`mprotect` and a larger rootfs so `ld.so` can map a real
+  libc; signal-frame delivery/`rt_sigreturn`; COW fork), then headless
   Wayland/GTK/D-Bus → Phosh. Network base maintenance (keep-alive, TLS
   roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
