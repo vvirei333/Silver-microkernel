@@ -550,6 +550,20 @@ The client acks only after the compositor has read the shared buffer, so this
 covers the whole transport: named sockets, `SCM_RIGHTS`, shared memfd and
 protocol framing.
 
+D-Bus runs on the same socket layer. `getsockopt(SO_PEERCRED)` reports the
+Linux personality's root credentials (`struct ucred`), which is what EXTERNAL
+authentication checks. The test is again a minimal daemon plus client: the
+client sends the NUL-prefixed `AUTH EXTERNAL 30` line, receives `OK <guid>`,
+sends `BEGIN`, then a real `org.freedesktop.DBus.Hello` method call with
+`PATH`/`INTERFACE`/`MEMBER`/`DESTINATION` header fields; the daemon parses the
+aligned header-field array and replies with a `method_return` carrying
+`REPLY_SERIAL=1` and the unique name `:1.0` in an `s` body:
+
+```text
+howl> linuxrun /sfs/linux-dbus
+dbus ok
+```
+
 Threads use `clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_SETTLS)`: they
 share the leader's address space and memory, get a separate user/kernel stack
 and per-thread `TPIDR_EL0` TLS, and exit through a futex-based join

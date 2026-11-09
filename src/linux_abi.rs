@@ -143,6 +143,7 @@ const ENOSYS: u64 = 38;
 const EPROTONOSUPPORT: u64 = 93;
 const EAFNOSUPPORT: u64 = 97;
 const ENOPROTOOPT: u64 = 92;
+const ENOTSOCK: u64 = 88;
 
 /// Linux returns `-errno`; sign-extend so `(long)x0 < 0` works in libc.
 const fn errno(code: u64) -> u64 {
@@ -1129,10 +1130,46 @@ fn linux_setsockopt(_fd: u64, level: u64) -> u64 {
 }
 
 fn linux_getsockopt(fd: u64, level: u64, name: u64, value: u64, length: u64) -> u64 {
+    const SO_PEERCRED: u64 = 17;
     if level != SOL_SOCKET {
         return errno(ENOPROTOOPT);
     }
     let task = scheduler::current_task_id();
+    if linux_fd::status_flags(task, fd).is_none() {
+        return errno(EBADF);
+    }
+    if name == SO_PEERCRED {
+        // `struct ucred { pid_t pid; uid_t uid; gid_t gid; }`. The Linux
+        // personality runs as root, so EXTERNAL authentication sees uid 0 on
+        // both sides.
+        if !linux_fd::is_socket(task, fd) {
+            return errno(ENOTSOCK);
+        }
+        let mut capacity = 0u32;
+        if length != 0 {
+            let mut raw = [0_u8; 4];
+            if user_memory::copy_from_user(length, &mut raw).is_err() {
+                return errno(EFAULT);
+            }
+            capacity = u32::from_le_bytes(raw);
+        }
+        if capacity < 12 {
+            return errno(EINVAL);
+        }
+        let mut credentials = [0_u8; 12];
+        credentials[4..8].copy_from_slice(&0u32.to_le_bytes()); // uid
+        credentials[8..12].copy_from_slice(&0u32.to_le_bytes()); // gid
+        if value != 0 && user_memory::copy_to_user(&credentials, value).is_err() {
+            return errno(EFAULT);
+        }
+        if length != 0 {
+            let used = 12u32.to_le_bytes();
+            if user_memory::copy_to_user(&used, length).is_err() {
+                return errno(EFAULT);
+            }
+        }
+        return 0;
+    }
     if linux_fd::status_flags(task, fd).is_none() {
         return errno(EBADF);
     }

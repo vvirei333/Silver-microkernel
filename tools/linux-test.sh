@@ -35,6 +35,7 @@
 #   linuxrun /sfs/linux-scratch # writable /tmp + mkdir/unlink/rename, prints 'scratch ok'
 #   linuxrun /sfs/linux-eventloop # epoll + timerfd + eventfd, prints 'event loop ok'
 #   linuxrun /sfs/linux-wayland # Wayland wire protocol + shm memfd, prints 'wayland ok'
+#   linuxrun /sfs/linux-dbus   # EXTERNAL auth + Hello/Reply, prints 'dbus ok'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -82,6 +83,7 @@ build threads
 build unixsock
 build namedsock
 build wayland
+build dbus
 
 # ET_DYN main + custom interpreter (no libc needed).
 "$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
@@ -119,6 +121,7 @@ python3 scripts/sfs_inject.py "$IMAGE" build/threads.elf linux-threads
 python3 scripts/sfs_inject.py "$IMAGE" build/unixsock.elf linux-unixsock
 python3 scripts/sfs_inject.py "$IMAGE" build/namedsock.elf linux-namedsock
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland.elf linux-wayland
+python3 scripts/sfs_inject.py "$IMAGE" build/dbus.elf linux-dbus
 
 # A real static libc binary (the SFS image is 16 MiB; all of these fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then

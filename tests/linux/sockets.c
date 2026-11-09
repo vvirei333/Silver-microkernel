@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* glibc AF_UNIX + SCM_RIGHTS + poll + O_NONBLOCK + EOF.
  *
  *   linuxrun /sfs/linux-sockets
@@ -97,6 +98,14 @@ int main(void) {
     errno = 0;
     if (read(pair[1], buffer, 1) != -1 || errno != EAGAIN) {
         return 15;
+    }
+
+    struct ucred credentials;
+    socklen_t credentials_length = sizeof(credentials);
+    if (getsockopt(pair[0], SOL_SOCKET, SO_PEERCRED, &credentials,
+                   &credentials_length) != 0 ||
+        credentials_length != sizeof(credentials) || credentials.uid != 0) {
+        return 18;
     }
 
     if (shutdown(pair[0], SHUT_WR) != 0) {

@@ -1570,6 +1570,14 @@ pub fn accept(task: u64, fd: u64, nonblock_flag: bool) -> Result<u64, u64> {
     }
 }
 
+/// True when `fd` names any kind of Unix socket.
+pub fn is_socket(task: u64, fd: u64) -> bool {
+    matches!(
+        lookup(task, fd),
+        Some(Target::Socket { .. } | Target::Unbound { .. } | Target::Listener { .. })
+    )
+}
+
 /// Local address bytes for `getsockname`; `None` means an unnamed pair.
 pub fn socket_local_name(task: u64, fd: u64) -> Option<Vec<u8>> {
     match lookup(task, fd)? {

@@ -537,6 +537,17 @@ Redmi port is parked. The reference checklist is
   `wl_callback.done`; the parent only prints `wayland ok` after the
   compositor read the shared buffer. Full series plus repeats and `health`:
   9596/31575 frames, zero zombies/open files/DMA leaks; fsck clean.
+  **Slice 27 (D-Bus auth and messaging):** `getsockopt(SO_PEERCRED)` returns a
+  `struct ucred` (pid/uid/gid 0, the root Linux personality) for any Unix
+  socket, which is what EXTERNAL authentication verifies. A freestanding
+  daemon/client pair performs the NUL-prefixed `AUTH EXTERNAL 30` handshake,
+  `OK <guid>`, `BEGIN`, then exchanges a binary
+  `org.freedesktop.DBus.Hello` method call and a `method_return` with
+  `REPLY_SERIAL` and an `s` body. The parser handles the 8-byte-aligned
+  header-field array, variant signatures (`s`/`o`/`u`/`g`) and the padded
+  body. Test: `linux-dbus` prints `dbus ok`; the glibc socket test also checks
+  `SO_PEERCRED`. Full series plus repeats and `health`: 9596/31575 frames,
+  zero zombies/open files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -563,9 +574,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 27 (D-Bus auth + message exchange on the
-  same socket pair, then a real toolkit against the Wayland transport).
-  Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 28 (D-Bus `UNIX_FD` passing and signals,
+  then a real toolkit/daemon against these transports). Network base
+  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.
