@@ -31,7 +31,9 @@ test build does not need the scanner. The same applies to
 `xdg-activation-client-protocol.h`/`xdg-activation-protocol.c` (from
 `xdg-activation-v1.xml`) and
 `fractional-scale-client-protocol.h`/`fractional-scale-protocol.c` (from
-`fractional-scale-v1.xml`).
+`fractional-scale-v1.xml`) and
+`presentation-time-client-protocol.h`/`presentation-time-protocol.c` (from
+`presentation-time.xml`).
 
 The test image injects the libraries into `/sfs`; `wayland-info` is patched
 with patchelf at test-build time to use `/sfs/ld-linux-aarch64.so.1` and an

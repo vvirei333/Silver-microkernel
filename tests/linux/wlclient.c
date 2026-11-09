@@ -19,6 +19,7 @@
 #include "xdg-output-client-protocol.h"
 #include "xdg-activation-client-protocol.h"
 #include "fractional-scale-client-protocol.h"
+#include "presentation-time-client-protocol.h"
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shared_memory;
@@ -41,6 +42,10 @@ static int activation_token_ok;
 static struct wp_fractional_scale_manager_v1 *fractional_manager;
 static struct wp_fractional_scale_v1 *fractional_scale;
 static int fractional_ok;
+static struct wp_presentation *presentation;
+static struct wp_presentation_feedback *presentation_feedback;
+static int presentation_clock_ok;
+static int presentation_ok;
 static struct wl_data_device *data_device;
 static struct wl_data_source *data_source;
 static struct wl_data_offer *clipboard_offer;
@@ -275,6 +280,48 @@ static const struct wp_fractional_scale_v1_listener fractional_listener = {
     .preferred_scale = fractional_preferred_scale,
 };
 
+static void presentation_clock(void *data, struct wp_presentation *presentation,
+                               uint32_t clock_id) {
+    (void)data; (void)presentation;
+    if (clock_id == 1) {
+        presentation_clock_ok = 1;
+    }
+}
+
+static const struct wp_presentation_listener presentation_listener = {
+    .clock_id = presentation_clock,
+};
+
+static void feedback_sync_output(void *data,
+                                 struct wp_presentation_feedback *feedback,
+                                 struct wl_output *output) {
+    (void)data; (void)feedback; (void)output;
+}
+
+static void feedback_presented(void *data,
+                               struct wp_presentation_feedback *feedback,
+                               uint32_t tv_sec_hi, uint32_t tv_sec_lo,
+                               uint32_t tv_nsec, uint32_t refresh,
+                               uint32_t seq_hi, uint32_t seq_lo,
+                               uint32_t flags) {
+    (void)data; (void)feedback; (void)tv_sec_hi; (void)tv_sec_lo;
+    (void)tv_nsec; (void)seq_hi; (void)seq_lo;
+    if (refresh == 16666666 && (flags & 1) != 0) {
+        presentation_ok = 1;
+    }
+}
+
+static void feedback_discarded(void *data,
+                               struct wp_presentation_feedback *feedback) {
+    (void)data; (void)feedback;
+}
+
+static const struct wp_presentation_feedback_listener feedback_listener = {
+    .sync_output = feedback_sync_output,
+    .presented = feedback_presented,
+    .discarded = feedback_discarded,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version) {
@@ -328,6 +375,11 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 1 ? version : 1;
         fractional_manager = wl_registry_bind(
             registry, name, &wp_fractional_scale_manager_v1_interface, use);
+    } else if (strcmp(interface, wp_presentation_interface.name) == 0) {
+        uint32_t use = version < 3 ? version : 3;
+        presentation = wl_registry_bind(registry, name,
+                                        &wp_presentation_interface, use);
+        wp_presentation_add_listener(presentation, &presentation_listener, NULL);
     }
 }
 
@@ -767,6 +819,26 @@ int main(int argc, char **argv) {
     }
     wp_fractional_scale_v1_destroy(fractional_scale);
     wp_fractional_scale_manager_v1_destroy(fractional_manager);
+    if (presentation == NULL || !presentation_clock_ok) {
+        fprintf(stderr, "wlclient: presentation clock missing\n");
+        return 8;
+    }
+    presentation_feedback = wp_presentation_feedback(presentation, surface);
+    if (presentation_feedback == NULL) {
+        return 8;
+    }
+    wp_presentation_feedback_add_listener(presentation_feedback,
+                                          &feedback_listener, NULL);
+    for (int attempt = 0; attempt < 4 && !presentation_ok; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (!presentation_ok) {
+        fprintf(stderr, "wlclient: presentation feedback missing\n");
+        return 8;
+    }
+    wp_presentation_destroy(presentation);
 
     xdg_activation_v1_activate(activation, "werewolf-token", surface);
     xdg_activation_token_v1_destroy(activation_token);
