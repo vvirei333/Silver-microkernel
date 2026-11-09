@@ -247,6 +247,7 @@ static unsigned buffer_id;
 static unsigned frame_id;
 static int pool_fd = -1;
 static int verified;
+static unsigned commits;
 
 static void send_global(long client, unsigned registry, unsigned name,
                         const char *interface) {
@@ -269,7 +270,7 @@ static int serve(long client) {
     for (;;) {
         long count = receive_message(client);
         if (count == 0) {
-            return verified;
+            return verified && commits >= 3;
         }
         if (count < 0) {
             return 0;
@@ -418,12 +419,16 @@ static int serve(long client) {
                     long mapped = sys6(222, 0, 4096, 1, 1, pool_fd, 0);
                     if (mapped > 0) {
                         unsigned *pixels = (unsigned *)mapped;
-                        if (pixels[0] == 0xFF112233u &&
-                            pixels[1] == 0xFF445566u) {
+                        int first = pixels[0] == 0xFF112233u &&
+                                    pixels[1] == 0xFF445566u;
+                        int second = pixels[0] == 0xFF778899u &&
+                                     pixels[1] == 0xFFAABBCCu;
+                        if (first || second) {
                             verified = 1;
                         }
                         sys3(215, mapped, 4096, 0);
                     }
+                    commits += 1;
                 }
                 if (buffer_id != 0) {
                     begin(buffer_id, 0 /* wl_buffer.release */);

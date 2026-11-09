@@ -29,6 +29,8 @@ static uint32_t seat_caps;
 static int keymap_ok;
 static int pointer_ok;
 static int key_enter;
+static int frame_done;
+static int buffer_releases;
 
 static void output_geometry(void *data, struct wl_output *out, int32_t x,
                             int32_t y, int32_t physical_width,
@@ -189,6 +191,26 @@ static void pointer_axis(void *data, struct wl_pointer *ptr, uint32_t time,
     (void)data; (void)ptr; (void)time; (void)axis; (void)value;
 }
 
+static void frame_done_cb(void *data, struct wl_callback *callback,
+                          uint32_t time) {
+    (void)data; (void)time;
+    frame_done = 1;
+    wl_callback_destroy(callback);
+}
+
+static const struct wl_callback_listener frame_listener = {
+    .done = frame_done_cb,
+};
+
+static void buffer_release(void *data, struct wl_buffer *buffer) {
+    (void)data; (void)buffer;
+    buffer_releases += 1;
+}
+
+static const struct wl_buffer_listener buffer_listener = {
+    .release = buffer_release,
+};
+
 static const struct wl_pointer_listener pointer_listener = {
     .enter = pointer_enter,
     .leave = pointer_leave,
@@ -329,17 +351,39 @@ int main(void) {
     pixels[0] = 0xFF112233u;
     pixels[1] = 0xFF445566u;
 
-    struct wl_shm_pool *pool = wl_shm_create_pool(shared_memory, fd, size);
-    struct wl_buffer *buffer = wl_shm_pool_create_buffer(
+    struct wl_shm_pool *pool = wl_shm_create_pool(shared_memory, fd, 4096);
+    struct wl_buffer *first = wl_shm_pool_create_buffer(
         pool, 0, width, height, stride, WL_SHM_FORMAT_ARGB8888);
-    if (pool == NULL || buffer == NULL) {
+    struct wl_buffer *second = wl_shm_pool_create_buffer(
+        pool, 2048, width, height, stride, WL_SHM_FORMAT_ARGB8888);
+    if (pool == NULL || first == NULL || second == NULL) {
         return 10;
     }
-    wl_surface_attach(surface, buffer, 0, 0);
-    wl_surface_damage(surface, 0, 0, width, height);
-    wl_surface_commit(surface);
+    wl_buffer_add_listener(first, &buffer_listener, NULL);
+    wl_buffer_add_listener(second, &buffer_listener, NULL);
+    pixels[0] = 0xFF112233u;
+    pixels[1] = 0xFF445566u;
+    uint32_t *second_pixels = (uint32_t *)((char *)pixels + 2048);
+    second_pixels[0] = 0xFF778899u;
+    second_pixels[1] = 0xFFAABBCCu;
 
-    if (wl_display_roundtrip(display) < 0) {
+    /* Three frames alternating buffers, each waiting for frame + release. */
+    for (int frame = 0; frame < 3; frame++) {
+        struct wl_buffer *buffer = (frame & 1) != 0 ? second : first;
+        struct wl_callback *callback = wl_surface_frame(surface);
+        wl_callback_add_listener(callback, &frame_listener, NULL);
+        frame_done = 0;
+        wl_surface_attach(surface, buffer, 0, 0);
+        wl_surface_damage(surface, 0, 0, width, height);
+        wl_surface_commit(surface);
+        while (!frame_done) {
+            if (wl_display_roundtrip(display) < 0) {
+                return 11;
+            }
+        }
+    }
+    if (buffer_releases < 3) {
+        fprintf(stderr, "wlclient: buffer releases missing\n");
         return 11;
     }
 

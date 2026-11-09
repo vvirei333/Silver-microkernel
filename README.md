@@ -587,6 +587,11 @@ compositor answers `wl_keyboard.keymap` with a memfd carried over
 position. (The passed descriptor shares the writer's open file description,
 so the client rewinds before reading the keymap.)
 
+The client animates: it creates two `wl_buffer`s from one pool, commits three
+alternating frames, and before each next frame waits for the compositor's
+`wl_callback.done` and `wl_buffer.release`. The compositor verifies both pixel
+patterns and requires all three commits before it reports success.
+
 A stock distro binary also runs against the compositor: `wayland-info` from
 `wayland-utils` (linked with the vendored `libwayland-client` and `libdrm`)
 enumerates everything the mini compositor advertises:
