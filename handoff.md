@@ -781,6 +781,12 @@ Redmi port is parked. The reference checklist is
   `lock_pointer` answers with `locked`; the client verifies both, destroys the
   objects and keeps running the rest of the test. `wayland-info` lists both
   globals. All multiplexed client, clipboard and protocol tests stay green.
+  **Slice 55 (text input v3):** `zwp_text_input_manager_v3` is advertised.
+  `get_text_input` creates a seat text-input object; enable sends `enter` for
+  the focused surface, commit sends `commit_string("werewolf")` followed by
+  `done(serial)`, and disable sends `leave`. The real client checks all three
+  events. `wayland-info` lists the global. All multiplexed client, clipboard
+  and protocol tests stay green.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -807,8 +813,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 55 (a larger GTK/GLib toolkit; Wayland:
-  the remaining GTK globals and compositor-side state). Network base
+- **Next steps:** Linux ABI slice 56 (a larger GTK/GLib toolkit; Wayland:
+  compositor-side state and remaining mobile globals). Network base
   maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on

@@ -595,8 +595,10 @@ region, name and description, `xdg_activation_v1` issues an activation token
 and accepts `activate`, `wp_fractional_scale_manager_v1` reports a preferred
 scale of 240/120 (2.0) for the surface, `wp_presentation` reports the
 CLOCK_MONOTONIC clock plus sync_output/presented feedback,
-`zwp_relative_pointer_manager_v1` delivers relative motion, and
-`zwp_pointer_constraints_v1` locks the pointer. The vendored `xdg-shell-client-protocol.h`/
+`zwp_relative_pointer_manager_v1` delivers relative motion,
+`zwp_pointer_constraints_v1` locks the pointer, and
+`zwp_text_input_manager_v3` drives enter/commit_string/done for an on-screen
+keyboard. The vendored `xdg-shell-client-protocol.h`/
 `.c` come from `wayland-protocols` 1.50.
 
 Input and output are advertised as well: `wl_output` v4 sends

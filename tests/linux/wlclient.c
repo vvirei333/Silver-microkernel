@@ -22,6 +22,7 @@
 #include "presentation-time-client-protocol.h"
 #include "relative-pointer-client-protocol.h"
 #include "pointer-constraints-client-protocol.h"
+#include "text-input-client-protocol.h"
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shared_memory;
@@ -54,6 +55,11 @@ static int relative_ok;
 static struct zwp_pointer_constraints_v1 *constraints;
 static struct zwp_locked_pointer_v1 *locked_pointer;
 static int locked_ok;
+static struct zwp_text_input_manager_v3 *text_input_manager;
+static struct zwp_text_input_v3 *text_input;
+static int text_input_entered;
+static int text_input_committed;
+static int text_input_done;
 static struct wl_data_device *data_device;
 static struct wl_data_source *data_source;
 static struct wl_data_offer *clipboard_offer;
@@ -359,6 +365,53 @@ static const struct zwp_locked_pointer_v1_listener locked_listener = {
     .unlocked = pointer_unlocked,
 };
 
+static void text_input_enter(void *data, struct zwp_text_input_v3 *input,
+                             struct wl_surface *surface) {
+    (void)data; (void)input; (void)surface;
+    text_input_entered = 1;
+}
+
+static void text_input_leave(void *data, struct zwp_text_input_v3 *input,
+                             struct wl_surface *surface) {
+    (void)data; (void)input; (void)surface;
+}
+
+static void text_input_preedit(void *data, struct zwp_text_input_v3 *input,
+                               const char *text, int32_t begin,
+                               int32_t end) {
+    (void)data; (void)input; (void)text; (void)begin; (void)end;
+}
+
+static void text_input_commit(void *data, struct zwp_text_input_v3 *input,
+                              const char *text) {
+    (void)data; (void)input;
+    if (text != NULL && strcmp(text, "werewolf") == 0) {
+        text_input_committed = 1;
+    }
+}
+
+static void text_input_delete(void *data, struct zwp_text_input_v3 *input,
+                              uint32_t before, uint32_t after) {
+    (void)data; (void)input; (void)before; (void)after;
+}
+
+static void text_input_done_event(void *data, struct zwp_text_input_v3 *input,
+                                  uint32_t serial) {
+    (void)data; (void)input;
+    if (serial >= 1) {
+        text_input_done = 1;
+    }
+}
+
+static const struct zwp_text_input_v3_listener text_input_listener = {
+    .enter = text_input_enter,
+    .leave = text_input_leave,
+    .preedit_string = text_input_preedit,
+    .commit_string = text_input_commit,
+    .delete_surrounding_text = text_input_delete,
+    .done = text_input_done_event,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version) {
@@ -427,6 +480,11 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 1 ? version : 1;
         constraints = wl_registry_bind(
             registry, name, &zwp_pointer_constraints_v1_interface, use);
+    } else if (strcmp(interface,
+                      zwp_text_input_manager_v3_interface.name) == 0) {
+        uint32_t use = version < 1 ? version : 1;
+        text_input_manager = wl_registry_bind(
+            registry, name, &zwp_text_input_manager_v3_interface, use);
     }
 }
 
@@ -1032,6 +1090,35 @@ int main(int argc, char **argv) {
     }
     zwp_locked_pointer_v1_destroy(locked_pointer);
     zwp_pointer_constraints_v1_destroy(constraints);
+
+    if (text_input_manager == NULL) {
+        fprintf(stderr, "wlclient: text input missing\n");
+        return 8;
+    }
+    text_input = zwp_text_input_manager_v3_get_text_input(text_input_manager,
+                                                          seat);
+    if (text_input == NULL) {
+        return 8;
+    }
+    zwp_text_input_v3_add_listener(text_input, &text_input_listener, NULL);
+    zwp_text_input_v3_enable(text_input);
+    zwp_text_input_v3_set_content_type(text_input, 0, 0);
+    zwp_text_input_v3_set_cursor_rectangle(text_input, 0, 0, 8, 8);
+    zwp_text_input_v3_commit(text_input);
+    for (int attempt = 0;
+         attempt < 6 &&
+         !(text_input_entered && text_input_committed && text_input_done);
+         attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (!text_input_entered || !text_input_committed || !text_input_done) {
+        fprintf(stderr, "wlclient: text input events missing\n");
+        return 8;
+    }
+    zwp_text_input_v3_destroy(text_input);
+    zwp_text_input_manager_v3_destroy(text_input_manager);
 
     const int width = 8;
     const int height = 8;

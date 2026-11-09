@@ -258,6 +258,10 @@ static unsigned relative_manager_id;
 static unsigned relative_pointer_id;
 static unsigned constraints_id;
 static unsigned locked_id;
+static unsigned text_input_manager_id;
+static unsigned text_input_id;
+static int text_input_enabled;
+static unsigned text_input_serial;
 static unsigned subsurface_surface_id;
 static int subsurface_ok;
 static unsigned data_source_id;
@@ -317,6 +321,10 @@ typedef struct {
     unsigned relative_pointer_id;
     unsigned constraints_id;
     unsigned locked_id;
+    unsigned text_input_manager_id;
+    unsigned text_input_id;
+    int text_input_enabled;
+    unsigned text_input_serial;
     unsigned subsurface_surface_id;
     int subsurface_ok;
     unsigned data_source_id;
@@ -362,6 +370,8 @@ typedef struct {
     X(presentation_id) X(feedback_id) \
     X(relative_manager_id) X(relative_pointer_id) \
     X(constraints_id) X(locked_id) \
+    X(text_input_manager_id) X(text_input_id) \
+    X(text_input_enabled) X(text_input_serial) \
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
     X(configure_serial) X(surface_id) X(popup_surface_id) \
     X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
@@ -527,6 +537,8 @@ static int serve(long client) {
                             "zwp_relative_pointer_manager_v1");
                 send_global(client, registry_id, 15,
                             "zwp_pointer_constraints_v1");
+                send_global(client, registry_id, 16,
+                            "zwp_text_input_manager_v3");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -609,12 +621,45 @@ static int serve(long client) {
                 } else if (text_equal(interface,
                                       "zwp_pointer_constraints_v1")) {
                     constraints_id = new_id;
+                } else if (text_equal(interface,
+                                      "zwp_text_input_manager_v3")) {
+                    text_input_manager_id = new_id;
                 } else if (text_equal(interface, "wp_presentation")) {
                     presentation_id = new_id;
                     begin(presentation_id, 0 /* clock_id */);
                     put_u32(1); /* CLOCK_MONOTONIC */
                     finish(); send_message(client, -1);
                 }
+            } else if (object == text_input_manager_id && opcode == 1) {
+                text_input_id = take_u32(); /* get_text_input */
+                (void)take_u32(); /* seat */
+            } else if (object == text_input_id && opcode == 1) {
+                text_input_enabled = 1;
+                if (surface_id != 0) {
+                    begin(text_input_id, 0 /* enter */);
+                    put_u32(surface_id);
+                    finish(); send_message(client, -1);
+                }
+            } else if (object == text_input_id && opcode == 2) {
+                if (text_input_enabled && surface_id != 0) {
+                    begin(text_input_id, 1 /* leave */);
+                    put_u32(surface_id);
+                    finish(); send_message(client, -1);
+                }
+                text_input_enabled = 0;
+            } else if (object == text_input_id && opcode == 7) {
+                if (text_input_enabled) {
+                    text_input_serial += 1;
+                    begin(text_input_id, 3 /* commit_string */);
+                    put_string("werewolf");
+                    finish(); send_message(client, -1);
+                    begin(text_input_id, 5 /* done */);
+                    put_u32(text_input_serial);
+                    finish(); send_message(client, -1);
+                }
+            } else if (object == text_input_id && opcode == 0) {
+                text_input_id = 0;
+                text_input_enabled = 0;
             } else if (object == relative_manager_id && opcode == 1) {
                 relative_pointer_id = take_u32();
                 (void)take_u32(); /* pointer */
@@ -1173,6 +1218,10 @@ static void reset_client(void) {
     relative_pointer_id = 0;
     constraints_id = 0;
     locked_id = 0;
+    text_input_manager_id = 0;
+    text_input_id = 0;
+    text_input_enabled = 0;
+    text_input_serial = 0;
     subsurface_surface_id = 0;
     subsurface_ok = 0;
     data_source_id = 0;

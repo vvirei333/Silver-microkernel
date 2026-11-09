@@ -64,8 +64,9 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
     (logical position/size/name/description), `xdg_activation_v1`
     (token/activate), `wp_fractional_scale_manager_v1` (preferred 2.0 scale),
     `wp_presentation` (clock id, sync_output, presented),
-    `zwp_relative_pointer_manager_v1` (relative motion) and
-    `zwp_pointer_constraints_v1` (locked pointer);
+    `zwp_relative_pointer_manager_v1` (relative motion),
+    `zwp_pointer_constraints_v1` (locked pointer) and
+    `zwp_text_input_manager_v3` (enter/commit_string/done);
   - `wl_output` v4 (geometry/mode/scale/name/description/done) and `wl_seat`
     v5 (name, pointer+keyboard), plus `wl_surface.enter` for the output;
   - `wl_keyboard.keymap` memfd over `SCM_RIGHTS`, `repeat_info`,

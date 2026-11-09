@@ -34,8 +34,9 @@ test build does not need the scanner. The same applies to
 `fractional-scale-v1.xml`) and
 `presentation-time-client-protocol.h`/`presentation-time-protocol.c` (from
 `presentation-time.xml`),
-`relative-pointer-client-protocol.h`/`relative-pointer-protocol.c` and
-`pointer-constraints-client-protocol.h`/`pointer-constraints-protocol.c`.
+`relative-pointer-client-protocol.h`/`relative-pointer-protocol.c`,
+`pointer-constraints-client-protocol.h`/`pointer-constraints-protocol.c` and
+`text-input-client-protocol.h`/`text-input-protocol.c`.
 
 The test image injects the libraries into `/sfs`; `wayland-info` is patched
 with patchelf at test-build time to use `/sfs/ld-linux-aarch64.so.1` and an

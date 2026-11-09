@@ -321,6 +321,8 @@ static int serve(long client) {
                             "zwp_relative_pointer_manager_v1");
                 send_global(client, registry_id, 15,
                             "zwp_pointer_constraints_v1");
+                send_global(client, registry_id, 16,
+                            "zwp_text_input_manager_v3");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -395,6 +397,9 @@ static int serve(long client) {
                     (void)new_id;
                 } else if (text_equal(interface,
                                       "zwp_pointer_constraints_v1")) {
+                    (void)new_id;
+                } else if (text_equal(interface,
+                                      "zwp_text_input_manager_v3")) {
                     (void)new_id;
                 } else if (text_equal(interface, "wl_seat")) {
                     seat_id = new_id;
