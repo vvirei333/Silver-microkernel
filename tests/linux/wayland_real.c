@@ -248,6 +248,7 @@ static unsigned frame_id;
 static int pool_fd = -1;
 static int verified;
 static unsigned commits;
+static int focused;
 
 static void send_global(long client, unsigned registry, unsigned name,
                         const char *interface) {
@@ -373,28 +374,9 @@ static int serve(long client) {
                 if (keymap >= 0) {
                     sys3(57, keymap, 0, 0);
                 }
-                begin(keyboard_id, 1 /* enter */);
-                put_u32(configure_serial);
-                put_u32(surface_id);
-                put_u32(0); /* keys array, empty */
-                finish();
-                send_message(client, -1);
             } else if (object == seat_id && opcode == 0) {
                 /* wl_seat.get_pointer(new_id): enter + motion. */
                 pointer_id = take_u32();
-                begin(pointer_id, 0 /* enter */);
-                put_u32(configure_serial);
-                put_u32(surface_id);
-                put_i32(100 << 8);
-                put_i32(50 << 8);
-                finish();
-                send_message(client, -1);
-                begin(pointer_id, 2 /* motion */);
-                put_u32(1);
-                put_i32(100 << 8);
-                put_i32(50 << 8);
-                finish();
-                send_message(client, -1);
             } else if (object == shm_id && opcode == 0) {
                 pool_id = take_u32(); /* create_pool */
                 (void)take_i32();
@@ -411,6 +393,24 @@ static int serve(long client) {
                 (void)take_i32();
                 (void)take_i32();
                 (void)take_u32();
+            } else if (object == surface_id && opcode == 0) {
+                /* wl_surface.destroy: drop focus with leave events. */
+                if (keyboard_id != 0) {
+                    begin(keyboard_id, 2 /* leave */);
+                    put_u32(configure_serial);
+                    put_u32(surface_id);
+                    finish();
+                    send_message(client, -1);
+                }
+                if (pointer_id != 0) {
+                    begin(pointer_id, 1 /* leave */);
+                    put_u32(configure_serial);
+                    put_u32(surface_id);
+                    finish();
+                    send_message(client, -1);
+                }
+                focused = 0;
+                surface_id = 0;
             } else if (object == surface_id && opcode == 3) {
                 frame_id = take_u32(); /* wl_surface.frame */
             } else if (object == surface_id && opcode == 6) {
@@ -429,6 +429,32 @@ static int serve(long client) {
                         sys3(215, mapped, 4096, 0);
                     }
                     commits += 1;
+                }
+                if (buffer_id != 0 && !focused) {
+                    focused = 1;
+                    if (keyboard_id != 0) {
+                        begin(keyboard_id, 1 /* enter */);
+                        put_u32(configure_serial);
+                        put_u32(surface_id);
+                        put_u32(0); /* keys array, empty */
+                        finish();
+                        send_message(client, -1);
+                    }
+                    if (pointer_id != 0) {
+                        begin(pointer_id, 0 /* enter */);
+                        put_u32(configure_serial);
+                        put_u32(surface_id);
+                        put_i32(100 << 8);
+                        put_i32(50 << 8);
+                        finish();
+                        send_message(client, -1);
+                        begin(pointer_id, 2 /* motion */);
+                        put_u32(1);
+                        put_i32(100 << 8);
+                        put_i32(50 << 8);
+                        finish();
+                        send_message(client, -1);
+                    }
                 }
                 if (buffer_id != 0) {
                     begin(buffer_id, 0 /* wl_buffer.release */);
@@ -610,6 +636,7 @@ static void reset_client(void) {
     configure_serial = 1;
     verified = 0;
     commits = 0;
+    focused = 0;
 }
 
 void _start(void) {

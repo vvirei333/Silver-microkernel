@@ -621,6 +621,15 @@ Redmi port is parked. The reference checklist is
   (architecture, capabilities, limits table, test matrix, build commands and
   roadmap) linked from the README. Full series plus repeats and `health`:
   21884/31575 frames, zero zombies/open files/DMA leaks; fsck clean.
+  **Slice 36 (per-surface focus):** keyboard and pointer focus is now driven by
+  the surface lifecycle. `get_keyboard` only delivers the keymap;
+  `get_pointer` only records the object. On the first commit with a buffer the
+  compositor sends `wl_keyboard.enter` and `wl_pointer.enter`/`motion` for that
+  surface and marks it focused; `wl_surface.destroy` sends `wl_keyboard.leave`
+  and `wl_pointer.leave` and drops focus. The real client checks enter/leave
+  and leaves the surface only after its frames. Two concurrent clients still
+  pass. Full series plus repeats and `health`: 21884/31575 frames, zero
+  zombies/open files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -647,9 +656,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 36 (per-surface focus: keyboard/pointer
-  enter/leave driven by surface commits; a full GTK stack still needs more
-  than 32 MiB or a streaming SFS). Network base maintenance (keep-alive, TLS
+- **Next steps:** Linux ABI slice 37 (streaming SFS to lift the RAM image
+  limit, then a larger toolkit). Network base maintenance (keep-alive, TLS
   roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on

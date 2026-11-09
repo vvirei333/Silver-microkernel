@@ -29,6 +29,8 @@ static uint32_t seat_caps;
 static int keymap_ok;
 static int pointer_ok;
 static int key_enter;
+static int key_left;
+static int pointer_left;
 static int frame_done;
 static int buffer_releases;
 
@@ -139,6 +141,7 @@ static void keyboard_enter(void *data, struct wl_keyboard *kb, uint32_t serial,
 static void keyboard_leave(void *data, struct wl_keyboard *kb, uint32_t serial,
                            struct wl_surface *surface) {
     (void)data; (void)kb; (void)serial; (void)surface;
+    key_left = 1;
 }
 
 static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial,
@@ -174,6 +177,7 @@ static void pointer_enter(void *data, struct wl_pointer *ptr, uint32_t serial,
 static void pointer_leave(void *data, struct wl_pointer *ptr, uint32_t serial,
                           struct wl_surface *surface) {
     (void)data; (void)ptr; (void)serial; (void)surface;
+    pointer_left = 1;
 }
 
 static void pointer_motion(void *data, struct wl_pointer *ptr, uint32_t time,
@@ -329,11 +333,6 @@ int main(void) {
     if (wl_display_roundtrip(display) < 0) {
         return 7;
     }
-    if (!output_done || !keymap_ok || !pointer_ok || !key_enter) {
-        fprintf(stderr, "wlclient: input events missing out=%d map=%d ptr=%d enter=%d\n",
-                output_done, keymap_ok, pointer_ok, key_enter);
-        return 7;
-    }
 
     const int width = 8;
     const int height = 8;
@@ -384,6 +383,24 @@ int main(void) {
     }
     if (buffer_releases < 3) {
         fprintf(stderr, "wlclient: buffer releases missing\n");
+        return 11;
+    }
+    if (!output_done || !keymap_ok || !pointer_ok || !key_enter) {
+        fprintf(stderr, "wlclient: input events missing out=%d map=%d ptr=%d enter=%d\n",
+                output_done, keymap_ok, pointer_ok, key_enter);
+        return 11;
+    }
+
+    /* Destroy the shell surface; the compositor must drop focus. */
+    xdg_toplevel_destroy(toplevel);
+    xdg_surface_destroy(xdg_surface);
+    wl_surface_destroy(surface);
+    if (wl_display_roundtrip(display) < 0) {
+        return 11;
+    }
+    if (!key_left || !pointer_left) {
+        fprintf(stderr, "wlclient: focus leave missing key=%d pointer=%d\n",
+                key_left, pointer_left);
         return 11;
     }
 

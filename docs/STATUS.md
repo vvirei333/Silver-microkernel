@@ -54,6 +54,8 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   - `wl_keyboard.keymap` memfd over `SCM_RIGHTS`, `wl_pointer` fixed coords;
   - two buffers, three animated frames, `wl_callback.done` +
     `wl_buffer.release` per frame;
+  - **per-surface focus**: keyboard/pointer enter on the first mapped commit,
+    leave on `wl_surface.destroy`;
   - **two concurrent clients** per compositor run;
   - stock `wayland-info` from `wayland-utils` enumerates the compositor.
 - Vendored aarch64 libs/headers in `third_party/wayland-aarch64` (MIT).
