@@ -734,6 +734,15 @@ Redmi port is parked. The reference checklist is
   and a `receiver` client; both still run the full surface/popup/frame test,
   then the source offers text and the receiver reads it. Server object ids are
   allocated per client from 0xFF000000. Both clients pass; health is clean.
+  **Slice 48 (decoration and viewporter):** the test compositor advertises
+  `zxdg_decoration_manager_v1` v2 and `wp_viewporter` v1. Decoration answers
+  `get_toplevel_decoration` with client-side mode and echoes
+  `set_mode`/`unset_mode` through configure events; viewporter accepts
+  `get_viewport`, `set_source` and `set_destination`. The real client binds
+  both, checks the decoration configure loop and applies a source/destination
+  crop-scale before the frame loop. `wayland-info` lists both new globals.
+  The protocol headers/code were generated with `wayland-scanner` from the
+  upstream XML and checked into `third_party/wayland-aarch64`.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -760,9 +769,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 48 (a larger GTK/GLib toolkit; Wayland:
-  xdg-decoration/viewporter and more GTK globals). Network base maintenance
-  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 49 (a larger GTK/GLib toolkit; Wayland:
+  xdg-output/subcompositor and the remaining GTK globals). Network base
+  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

@@ -14,6 +14,8 @@
 #include <unistd.h>
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
+#include "xdg-decoration-client-protocol.h"
+#include "viewporter-client-protocol.h"
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shared_memory;
@@ -21,12 +23,18 @@ static struct xdg_wm_base *shell;
 static struct wl_output *output;
 static struct wl_seat *seat;
 static struct wl_data_device_manager *data_manager;
+static struct zxdg_decoration_manager_v1 *decoration_manager;
+static struct zxdg_toplevel_decoration_v1 *decoration;
+static struct wp_viewporter *viewporter;
+static struct wp_viewport *viewport;
 static struct wl_data_device *data_device;
 static struct wl_data_source *data_source;
 static struct wl_data_offer *clipboard_offer;
 static int clipboard_selection;
 static int clipboard_source_sent;
 static int clipboard_mime_ok;
+static int decoration_client_side;
+static int decoration_configures;
 static struct wl_keyboard *keyboard;
 static struct wl_pointer *pointer;
 static uint32_t configure_serial;
@@ -168,6 +176,20 @@ static const struct wl_data_device_listener data_device_listener = {
     .selection = data_device_selection,
 };
 
+static void decoration_configure(
+    void *data, struct zxdg_toplevel_decoration_v1 *decoration,
+    uint32_t mode) {
+    (void)data; (void)decoration;
+    decoration_configures += 1;
+    if (mode == ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE) {
+        decoration_client_side = 1;
+    }
+}
+
+static const struct zxdg_toplevel_decoration_v1_listener decoration_listener = {
+    .configure = decoration_configure,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version) {
@@ -194,6 +216,15 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 1 ? version : 1;
         data_manager = wl_registry_bind(registry, name,
                                         &wl_data_device_manager_interface, use);
+    } else if (strcmp(interface,
+                      zxdg_decoration_manager_v1_interface.name) == 0) {
+        uint32_t use = version < 2 ? version : 2;
+        decoration_manager = wl_registry_bind(
+            registry, name, &zxdg_decoration_manager_v1_interface, use);
+    } else if (strcmp(interface, wp_viewporter_interface.name) == 0) {
+        uint32_t use = version < 1 ? version : 1;
+        viewporter = wl_registry_bind(registry, name,
+                                      &wp_viewporter_interface, use);
     }
 }
 
@@ -547,6 +578,17 @@ int main(int argc, char **argv) {
         return 7;
     }
     xdg_toplevel_add_listener(toplevel, &toplevel_listener, NULL);
+    if (decoration_manager == NULL) {
+        fprintf(stderr, "wlclient: decoration manager missing\n");
+        return 7;
+    }
+    decoration = zxdg_decoration_manager_v1_get_toplevel_decoration(
+        decoration_manager, toplevel);
+    if (decoration == NULL) {
+        return 7;
+    }
+    zxdg_toplevel_decoration_v1_add_listener(decoration, &decoration_listener,
+                                             NULL);
     xdg_toplevel_set_title(toplevel, "werewolf-client");
     xdg_toplevel_set_app_id(toplevel, "org.werewolf.test");
     /* A bufferless commit asks the compositor for an initial configure. */
@@ -557,6 +599,46 @@ int main(int argc, char **argv) {
         }
     }
     xdg_surface_ack_configure(xdg_surface, configure_serial);
+
+    for (int attempt = 0; attempt < 4 && !decoration_client_side; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (!decoration_client_side || decoration_configures < 1) {
+        fprintf(stderr, "wlclient: decoration configure missing\n");
+        return 8;
+    }
+    zxdg_toplevel_decoration_v1_set_mode(
+        decoration, ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE);
+    for (int attempt = 0; attempt < 4 && decoration_configures < 2; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    zxdg_toplevel_decoration_v1_unset_mode(decoration);
+    for (int attempt = 0; attempt < 4 && decoration_configures < 3; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (decoration_configures < 3) {
+        fprintf(stderr, "wlclient: decoration mode loop failed\n");
+        return 8;
+    }
+
+    if (viewporter == NULL) {
+        fprintf(stderr, "wlclient: viewporter missing\n");
+        return 8;
+    }
+    viewport = wp_viewporter_get_viewport(viewporter, surface);
+    if (viewport == NULL) {
+        return 8;
+    }
+    wp_viewport_set_source(viewport, wl_fixed_from_int(0),
+                           wl_fixed_from_int(0), wl_fixed_from_int(8),
+                           wl_fixed_from_int(8));
+    wp_viewport_set_destination(viewport, 16, 16);
 
     /* Toplevel state transitions: configure with MAXIMIZED, then empty, then
      * FULLSCREEN, then empty. */
@@ -778,6 +860,10 @@ int main(int argc, char **argv) {
     }
 
     /* Destroy the shell surface; the compositor must drop focus. */
+    wp_viewport_destroy(viewport);
+    wp_viewporter_destroy(viewporter);
+    zxdg_toplevel_decoration_v1_destroy(decoration);
+    zxdg_decoration_manager_v1_destroy(decoration_manager);
     xdg_toplevel_destroy(toplevel);
     xdg_surface_destroy(xdg_surface);
     wl_surface_destroy(surface);

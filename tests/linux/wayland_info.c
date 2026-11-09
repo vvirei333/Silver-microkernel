@@ -304,6 +304,9 @@ static int serve(long client) {
                 send_global_version(client, registry_id, 4, "wl_output", 4);
                 send_global_version(client, registry_id, 5, "wl_seat", 5);
                 send_global(client, registry_id, 6, "wl_data_device_manager");
+                send_global_version(client, registry_id, 7,
+                                    "zxdg_decoration_manager_v1", 2);
+                send_global(client, registry_id, 8, "wp_viewporter");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -355,6 +358,10 @@ static int serve(long client) {
                         finish(); send_message(client, -1);
                     }
                 } else if (text_equal(interface, "wl_data_device_manager")) {
+                    (void)new_id;
+                } else if (text_equal(interface, "zxdg_decoration_manager_v1")) {
+                    (void)new_id;
+                } else if (text_equal(interface, "wp_viewporter")) {
                     (void)new_id;
                 } else if (text_equal(interface, "wl_seat")) {
                     seat_id = new_id;

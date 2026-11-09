@@ -240,6 +240,10 @@ static unsigned output_id;
 static unsigned output_version;
 static unsigned data_manager_id;
 static unsigned data_device_id;
+static unsigned decoration_manager_id;
+static unsigned decoration_id;
+static unsigned viewporter_id;
+static unsigned viewport_id;
 static unsigned data_source_id;
 static unsigned data_offer_id;
 static char data_mimes[4][64];
@@ -279,6 +283,10 @@ typedef struct {
     unsigned output_version;
     unsigned data_manager_id;
     unsigned data_device_id;
+    unsigned decoration_manager_id;
+    unsigned decoration_id;
+    unsigned viewporter_id;
+    unsigned viewport_id;
     unsigned data_source_id;
     unsigned data_offer_id;
     unsigned seat_id;
@@ -314,6 +322,7 @@ typedef struct {
     X(registry_id) X(compositor_id) X(shm_id) X(shell_id) \
     X(xdg_surface_id) X(toplevel_id) X(output_id) X(output_version) \
     X(data_manager_id) X(data_device_id) X(data_source_id) X(data_offer_id) \
+    X(decoration_manager_id) X(decoration_id) X(viewporter_id) X(viewport_id) \
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
     X(configure_serial) X(surface_id) X(popup_surface_id) \
     X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
@@ -422,6 +431,16 @@ static void send_toplevel_state(long client, unsigned state) {
     send_message(client, -1);
 }
 
+static void send_decoration_mode(long client, unsigned mode) {
+    if (decoration_id == 0) {
+        return;
+    }
+    begin(decoration_id, 0 /* zxdg_toplevel_decoration_v1.configure */);
+    put_u32(mode);
+    finish();
+    send_message(client, -1);
+}
+
 static int serve(long client) {
     long count = receive_message(client);
     if (count == 0) {
@@ -454,6 +473,9 @@ static int serve(long client) {
                 send_global_version(client, registry_id, 4, "wl_output", 4);
                 send_global_version(client, registry_id, 5, "wl_seat", 5);
                 send_global(client, registry_id, 6, "wl_data_device_manager");
+                send_global_version(client, registry_id, 7,
+                                    "zxdg_decoration_manager_v1", 2);
+                send_global(client, registry_id, 8, "wp_viewporter");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -517,7 +539,35 @@ static int serve(long client) {
                     finish(); send_message(client, -1);
                 } else if (text_equal(interface, "wl_data_device_manager")) {
                     data_manager_id = new_id;
+                } else if (text_equal(interface, "zxdg_decoration_manager_v1")) {
+                    decoration_manager_id = new_id;
+                } else if (text_equal(interface, "wp_viewporter")) {
+                    viewporter_id = new_id;
                 }
+            } else if (object == decoration_manager_id && opcode == 1) {
+                /* get_toplevel_decoration(new_id, toplevel) */
+                decoration_id = take_u32();
+                (void)take_u32();
+                send_decoration_mode(client, 1 /* client-side */);
+            } else if (object == decoration_id && opcode == 1) {
+                unsigned mode = take_u32();
+                if (mode == 1 || mode == 2) {
+                    send_decoration_mode(client, mode);
+                }
+            } else if (object == decoration_id && opcode == 2) {
+                send_decoration_mode(client, 1 /* client-side */);
+            } else if (object == decoration_id && opcode == 0) {
+                decoration_id = 0;
+            } else if (object == viewporter_id && opcode == 1) {
+                viewport_id = take_u32(); /* get_viewport */
+                (void)take_u32(); /* surface */
+            } else if (object == viewport_id && opcode == 1) {
+                (void)take_i32(); (void)take_i32();
+                (void)take_i32(); (void)take_i32(); /* set_source */
+            } else if (object == viewport_id && opcode == 2) {
+                (void)take_i32(); (void)take_i32(); /* set_destination */
+            } else if (object == viewport_id && opcode == 0) {
+                viewport_id = 0;
             } else if (object == data_manager_id && opcode == 0) {
                 data_source_id = take_u32(); /* create_data_source */
             } else if (object == data_manager_id && opcode == 1) {
@@ -942,6 +992,10 @@ static void reset_client(void) {
     output_version = 0;
     data_manager_id = 0;
     data_device_id = 0;
+    decoration_manager_id = 0;
+    decoration_id = 0;
+    viewporter_id = 0;
+    viewport_id = 0;
     data_source_id = 0;
     data_offer_id = 0;
     data_mime_count = 0;
