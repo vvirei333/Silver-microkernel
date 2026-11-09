@@ -578,6 +578,16 @@ Redmi port is parked. The reference checklist is
   xdg-shell headers/generated code and its license are vendored. Full series
   plus repeats and `health`: 9596/31575 frames, zero zombies/open files/DMA
   leaks; fsck clean.
+  **Slice 31 (wl_seat and wl_output):** the compositor advertises `wl_output`
+  (geometry/mode/done) and `wl_seat` (pointer+keyboard capabilities). After the
+  surface is created the real libwayland client calls get_keyboard/
+  get_pointer; the compositor sends `wl_keyboard.keymap` with a memfd over
+  `SCM_RIGHTS`, then `wl_keyboard.enter`, and `wl_pointer.enter`/`motion` with
+  24.8 fixed coordinates. The client checks the keymap marker and the pointer
+  position. The keymap descriptor shares the writer's file description, so
+  the client rewinds (and the compositor seeks to zero) before reading. Full
+  series plus repeats and `health`: 9596/31575 frames, zero zombies/open
+  files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -604,9 +614,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 31 (wl_seat/wl_output and a real toolkit
-  client, filling the syscalls it probes). Network base maintenance
-  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 32 (a real toolkit library stack or a
+  compositor-side input focus path, filling the syscalls it probes). Network
+  base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

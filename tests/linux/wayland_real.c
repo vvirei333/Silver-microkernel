@@ -236,6 +236,10 @@ static unsigned shm_id;
 static unsigned shell_id;
 static unsigned xdg_surface_id;
 static unsigned toplevel_id;
+static unsigned output_id;
+static unsigned seat_id;
+static unsigned keyboard_id;
+static unsigned pointer_id;
 static unsigned configure_serial = 1;
 static unsigned surface_id;
 static unsigned pool_id;
@@ -290,6 +294,8 @@ static int serve(long client) {
                 send_global(client, registry_id, 1, "wl_compositor");
                 send_global(client, registry_id, 2, "wl_shm");
                 send_global(client, registry_id, 3, "xdg_wm_base");
+                send_global(client, registry_id, 4, "wl_output");
+                send_global(client, registry_id, 5, "wl_seat");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -306,6 +312,25 @@ static int serve(long client) {
                     send_message(client, -1);
                 } else if (text_equal(interface, "xdg_wm_base")) {
                     shell_id = new_id;
+                } else if (text_equal(interface, "wl_output")) {
+                    output_id = new_id;
+                    begin(output_id, 0 /* geometry */);
+                    put_i32(0); put_i32(0);
+                    put_i32(300); put_i32(200);
+                    put_i32(0); /* subpixel */
+                    put_string("Werewolf"); put_string("Panel");
+                    put_i32(0); /* transform */
+                    finish(); send_message(client, -1);
+                    begin(output_id, 1 /* mode */);
+                    put_u32(3); put_i32(1024); put_i32(768); put_i32(60000);
+                    finish(); send_message(client, -1);
+                    begin(output_id, 2 /* done */);
+                    finish(); send_message(client, -1);
+                } else if (text_equal(interface, "wl_seat")) {
+                    seat_id = new_id;
+                    begin(seat_id, 0 /* capabilities */);
+                    put_u32(3); /* pointer | keyboard */
+                    finish(); send_message(client, -1);
                 }
             } else if (object == compositor_id && opcode == 0) {
                 surface_id = take_u32(); /* create_surface */
@@ -329,6 +354,46 @@ static int serve(long client) {
                 send_message(client, -1);
             } else if (object == xdg_surface_id && opcode == 4) {
                 (void)take_u32(); /* ack_configure(serial) */
+            } else if (object == seat_id && opcode == 1) {
+                /* wl_seat.get_keyboard(new_id): keymap fd + enter. */
+                keyboard_id = take_u32();
+                const char text[] = "WEREWOLF_KEYMAP\n";
+                unsigned length = sizeof(text) - 1;
+                long keymap = sys3(279 /* memfd_create */, (long)"keymap", 0, 0);
+                if (keymap >= 0 && sys3(46 /* ftruncate */, keymap, length, 0) >= 0 &&
+                    sys3(64 /* write */, keymap, (long)text, length) == (long)length &&
+                    sys3(62 /* lseek */, keymap, 0, 0) == 0) {
+                    begin(keyboard_id, 0 /* keymap */);
+                    put_u32(1); /* XKB_V1 */
+                    put_u32(length);
+                    finish();
+                    send_message(client, (int)keymap);
+                }
+                if (keymap >= 0) {
+                    sys3(57, keymap, 0, 0);
+                }
+                begin(keyboard_id, 1 /* enter */);
+                put_u32(configure_serial);
+                put_u32(surface_id);
+                put_u32(0); /* keys array, empty */
+                finish();
+                send_message(client, -1);
+            } else if (object == seat_id && opcode == 0) {
+                /* wl_seat.get_pointer(new_id): enter + motion. */
+                pointer_id = take_u32();
+                begin(pointer_id, 0 /* enter */);
+                put_u32(configure_serial);
+                put_u32(surface_id);
+                put_i32(100 << 8);
+                put_i32(50 << 8);
+                finish();
+                send_message(client, -1);
+                begin(pointer_id, 2 /* motion */);
+                put_u32(1);
+                put_i32(100 << 8);
+                put_i32(50 << 8);
+                finish();
+                send_message(client, -1);
             } else if (object == shm_id && opcode == 0) {
                 pool_id = take_u32(); /* create_pool */
                 (void)take_i32();

@@ -578,6 +578,15 @@ compositor sends `xdg_toplevel.configure` and `xdg_surface.configure`, and
 still verifies the shared pixels. The vendored `xdg-shell-client-protocol.h`/
 `.c` come from `wayland-protocols` 1.50.
 
+Input and output are advertised as well: `wl_output` sends
+geometry/mode/done, and `wl_seat` reports pointer+keyboard capabilities. Once
+the surface exists the client calls `get_keyboard`/`get_pointer`; the
+compositor answers `wl_keyboard.keymap` with a memfd carried over
+`SCM_RIGHTS`, then `wl_keyboard.enter`, and `wl_pointer.enter`/`motion` with
+24.8 fixed coordinates. The client verifies the keymap text and the pointer
+position. (The passed descriptor shares the writer's open file description,
+so the client rewinds before reading the keymap.)
+
 D-Bus runs on the same socket layer. `getsockopt(SO_PEERCRED)` reports the
 Linux personality's root credentials (`struct ucred`), which is what EXTERNAL
 authentication checks. The test is again a minimal daemon plus client: the

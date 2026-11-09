@@ -18,8 +18,35 @@
 static struct wl_compositor *compositor;
 static struct wl_shm *shared_memory;
 static struct xdg_wm_base *shell;
+static struct wl_output *output;
+static struct wl_seat *seat;
+static struct wl_keyboard *keyboard;
+static struct wl_pointer *pointer;
 static uint32_t configure_serial;
 static int configured;
+static int output_done;
+static uint32_t seat_caps;
+static int keymap_ok;
+static int pointer_ok;
+static int key_enter;
+
+static void output_geometry(void *data, struct wl_output *out, int32_t x,
+                            int32_t y, int32_t physical_width,
+                            int32_t physical_height, int32_t subpixel,
+                            const char *make, const char *model,
+                            int32_t transform);
+static void output_mode(void *data, struct wl_output *out, uint32_t flags,
+                        int32_t width, int32_t height, int32_t refresh);
+static void output_done_event(void *data, struct wl_output *out);
+static const struct wl_output_listener output_listener = {
+    .geometry = output_geometry,
+    .mode = output_mode,
+    .done = output_done_event,
+};
+static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps);
+static const struct wl_seat_listener seat_listener = {
+    .capabilities = seat_capabilities,
+};
 
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
@@ -35,6 +62,12 @@ static void registry_global(void *data, struct wl_registry *registry,
     } else if (strcmp(interface, xdg_wm_base_interface.name) == 0) {
         uint32_t use = version < 1 ? version : 1;
         shell = wl_registry_bind(registry, name, &xdg_wm_base_interface, use);
+    } else if (strcmp(interface, wl_output_interface.name) == 0) {
+        output = wl_registry_bind(registry, name, &wl_output_interface, 1);
+        wl_output_add_listener(output, &output_listener, NULL);
+    } else if (strcmp(interface, wl_seat_interface.name) == 0) {
+        seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
+        wl_seat_add_listener(seat, &seat_listener, NULL);
     }
 }
 
@@ -59,6 +92,116 @@ static void shm_format(void *data, struct wl_shm *shm, uint32_t format) {
 static const struct wl_shm_listener shm_listener = {
     .format = shm_format,
 };
+
+static void output_geometry(void *data, struct wl_output *out, int32_t x,
+                            int32_t y, int32_t physical_width,
+                            int32_t physical_height, int32_t subpixel,
+                            const char *make, const char *model,
+                            int32_t transform) {
+    (void)data; (void)out; (void)x; (void)y; (void)physical_width;
+    (void)physical_height; (void)subpixel; (void)make; (void)model;
+    (void)transform;
+}
+
+static void output_mode(void *data, struct wl_output *out, uint32_t flags,
+                        int32_t width, int32_t height, int32_t refresh) {
+    (void)data; (void)out; (void)flags; (void)width; (void)height; (void)refresh;
+}
+
+static void output_done_event(void *data, struct wl_output *out) {
+    (void)data; (void)out;
+    output_done = 1;
+}
+
+static void keyboard_keymap(void *data, struct wl_keyboard *kb,
+                            uint32_t format, int32_t fd, uint32_t size) {
+    (void)data; (void)kb; (void)format;
+    char buffer[128] = {0};
+    uint32_t want = size < sizeof(buffer) - 1 ? size : sizeof(buffer) - 1;
+    /* SCM_RIGHTS shares the open file description, so the writer's offset
+     * is ours too; rewind before reading the keymap. */
+    lseek(fd, 0, SEEK_SET);
+    ssize_t got = read(fd, buffer, want);
+    close(fd);
+    if (got > 0 && strstr(buffer, "WEREWOLF_KEYMAP") != NULL) {
+        keymap_ok = 1;
+    }
+}
+
+static void keyboard_enter(void *data, struct wl_keyboard *kb, uint32_t serial,
+                           struct wl_surface *surface, struct wl_array *keys) {
+    (void)data; (void)kb; (void)serial; (void)surface; (void)keys;
+    key_enter = 1;
+}
+
+static void keyboard_leave(void *data, struct wl_keyboard *kb, uint32_t serial,
+                           struct wl_surface *surface) {
+    (void)data; (void)kb; (void)serial; (void)surface;
+}
+
+static void keyboard_key(void *data, struct wl_keyboard *kb, uint32_t serial,
+                         uint32_t time, uint32_t key, uint32_t state) {
+    (void)data; (void)kb; (void)serial; (void)time; (void)key; (void)state;
+}
+
+static void keyboard_modifiers(void *data, struct wl_keyboard *kb,
+                               uint32_t serial, uint32_t depressed,
+                               uint32_t latched, uint32_t locked,
+                               uint32_t group) {
+    (void)data; (void)kb; (void)serial; (void)depressed; (void)latched;
+    (void)locked; (void)group;
+}
+
+static const struct wl_keyboard_listener keyboard_listener = {
+    .keymap = keyboard_keymap,
+    .enter = keyboard_enter,
+    .leave = keyboard_leave,
+    .key = keyboard_key,
+    .modifiers = keyboard_modifiers,
+};
+
+static void pointer_enter(void *data, struct wl_pointer *ptr, uint32_t serial,
+                          struct wl_surface *surface, wl_fixed_t sx,
+                          wl_fixed_t sy) {
+    (void)data; (void)ptr; (void)serial; (void)surface;
+    if (wl_fixed_to_int(sx) == 100 && wl_fixed_to_int(sy) == 50) {
+        pointer_ok = 1;
+    }
+}
+
+static void pointer_leave(void *data, struct wl_pointer *ptr, uint32_t serial,
+                          struct wl_surface *surface) {
+    (void)data; (void)ptr; (void)serial; (void)surface;
+}
+
+static void pointer_motion(void *data, struct wl_pointer *ptr, uint32_t time,
+                           wl_fixed_t sx, wl_fixed_t sy) {
+    (void)data; (void)ptr; (void)time; (void)sx; (void)sy;
+}
+
+static void pointer_button(void *data, struct wl_pointer *ptr, uint32_t serial,
+                           uint32_t time, uint32_t button, uint32_t state) {
+    (void)data; (void)ptr; (void)serial; (void)time; (void)button; (void)state;
+}
+
+static void pointer_axis(void *data, struct wl_pointer *ptr, uint32_t time,
+                         uint32_t axis, wl_fixed_t value) {
+    (void)data; (void)ptr; (void)time; (void)axis; (void)value;
+}
+
+static const struct wl_pointer_listener pointer_listener = {
+    .enter = pointer_enter,
+    .leave = pointer_leave,
+    .motion = pointer_motion,
+    .button = pointer_button,
+    .axis = pointer_axis,
+};
+
+static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps) {
+    (void)data;
+    (void)s;
+    seat_caps = caps;
+}
 
 static void shell_ping(void *data, struct xdg_wm_base *base, uint32_t serial) {
     (void)data;
@@ -124,6 +267,11 @@ int main(void) {
     if (wl_display_roundtrip(display) < 0) {
         return 6;
     }
+    if (seat == NULL || (seat_caps & WL_SEAT_CAPABILITY_KEYBOARD) == 0 ||
+        (seat_caps & WL_SEAT_CAPABILITY_POINTER) == 0) {
+        fprintf(stderr, "wlclient: seat capabilities missing\n");
+        return 6;
+    }
 
     struct wl_surface *surface = wl_compositor_create_surface(compositor);
     if (surface == NULL) {
@@ -150,6 +298,20 @@ int main(void) {
         }
     }
     xdg_surface_ack_configure(xdg_surface, configure_serial);
+
+    /* Ask for input now that the surface exists, then receive keymap/enter. */
+    keyboard = wl_seat_get_keyboard(seat);
+    wl_keyboard_add_listener(keyboard, &keyboard_listener, NULL);
+    pointer = wl_seat_get_pointer(seat);
+    wl_pointer_add_listener(pointer, &pointer_listener, NULL);
+    if (wl_display_roundtrip(display) < 0) {
+        return 7;
+    }
+    if (!output_done || !keymap_ok || !pointer_ok || !key_enter) {
+        fprintf(stderr, "wlclient: input events missing out=%d map=%d ptr=%d enter=%d\n",
+                output_done, keymap_ok, pointer_ok, key_enter);
+        return 7;
+    }
 
     const int width = 8;
     const int height = 8;
