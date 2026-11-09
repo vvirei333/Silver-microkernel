@@ -15,7 +15,7 @@
 #   linuxrun /sfs/linux-ipc     # eventfd2+memfd+futex, prints 'ipc ok'
 #   linuxrun /sfs/linux-signal  # sigaction/sigprocmask/kill/SIGCHLD
 #   linuxrun /sfs/linux-pie     # ET_DYN + PT_INTERP, prints 'pie main', exit 7
-#   linuxrun /sfs/linux-bigfile # 32 MiB rootfs + 8 MiB file, prints 'rootfs ok'
+#   linuxrun /sfs/linux-bigfile # 64 MiB rootfs + 8 MiB file, prints 'rootfs ok'
 #   linuxrun /sfs/linux-mmapfile # file mmap + mprotect + MAP_FIXED, prints 'mmap ok'
 #   linuxrun /sfs/linux-sighandler # user handler + rt_sigframe/rt_sigreturn, prints 'sigframe ok'
 #   linuxrun /sfs/linux-asyncsig  # IRQ-delivered signal + sigaltstack, prints 'async sig ok'
@@ -53,11 +53,11 @@ CC="${LINUX_CC:-aarch64-linux-gnu-gcc}"
 IMAGE="${1:-disk.img}"
 
 # The kernel keeps the whole SFS in RAM. Grow the rootfs (preserving files)
-# before installing tests; it now defaults to 32 MiB / 1024 inodes.
+# before installing tests; it now defaults to 64 MiB / 2048 inodes.
 if [ ! -f "$IMAGE" ]; then
-    python3 scripts/make_sfs.py "$IMAGE" 32 1024
+    python3 scripts/make_sfs.py "$IMAGE" 64 2048
 fi
-python3 scripts/sfs_resize.py "$IMAGE" 32 1024
+python3 scripts/sfs_resize.py "$IMAGE" 64 2048
 
 mkdir -p build
 build() {
@@ -129,7 +129,7 @@ python3 scripts/sfs_inject.py "$IMAGE" build/wayland_real.elf linux-wlreal
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland_info.elf linux-wlinfo
 python3 scripts/sfs_inject.py "$IMAGE" build/dbus.elf linux-dbus
 
-# A real static libc binary (the SFS image is 32 MiB; all of these fit).
+# A real static libc binary (the SFS image is 64 MiB; all of these fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then
     printf 'readme!!' > build/readme.txt
     python3 scripts/sfs_inject.py "$IMAGE" build/readme.txt readme.txt

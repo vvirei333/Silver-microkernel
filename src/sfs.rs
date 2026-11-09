@@ -425,10 +425,10 @@ fn undo_new_entry(
 }
 
 /// Upper bound on the loaded image: the format keeps the whole image in
-/// kernel RAM, so the cap is the frame budget, not the disk. 16 MiB gives the
-/// Linux ABI room for `ld.so` plus a real libc (and the app bundles); the
-/// loader reads the whole device, not just the legacy 1 MiB prefix.
-const MAX_IMAGE_SECTORS: usize = 65536;
+/// kernel frames (not the heap), so the cap is the frame budget. 64 MiB
+/// leaves room for the 16 MiB kernel heap, user address spaces and the
+/// Linux ABI's ld.so/libc buffers.
+const MAX_IMAGE_SECTORS: usize = 131072;
 
 /// Reads the whole image into kernel memory and keeps ownership of the disk.
 /// The read size adapts to the device capacity (clamped to

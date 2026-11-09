@@ -69,16 +69,17 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 
 | Resource | Limit |
 |---|---|
-| SFS image | 32 MiB, 1024 inodes (loaded whole into RAM) |
-| Kernel heap | 48 MiB |
+| SFS image | 64 MiB, 2048 inodes (frame-backed, loaded whole into RAM) |
+| Kernel heap | 16 MiB |
 | Single SFS file | 8 MiB (block-tree maximum) |
 | Anonymous mmap per task | 24 MiB |
 | Tasks | 64 (zombies capped separately) |
 | Linux fds per process | 256 |
 | User VA | image `0x4000_0000`, heap `0x4080_0000`, mmap `0x40A0_0000+`, stack `0x7FE0_1000` |
 
-A full GTK/GLib stack does not fit in the current RAM rootfs; that is a
-capacity/format project, not an ABI gap.
+The image lives in kernel frames (not the heap), so the cap is the frame
+budget. A full GTK/GLib stack still exceeds the RAM image or the 8 MiB
+per-file format cap; lifting those needs streaming/format work, not ABI work.
 
 ## Test matrix
 

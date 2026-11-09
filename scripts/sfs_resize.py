@@ -13,7 +13,7 @@ inode reference, this tool builds a new image and copies the filesystem tree:
 Usage:
   sfs_resize.py [image] [megabytes] [inode_count]
 
-Defaults: disk.img, 32 MiB, 1024 inodes. A smaller target than the current image
+Defaults: disk.img, 64 MiB, 2048 inodes. A smaller target than the current image
 (or fewer inodes than are in use) is rejected; running the tool on an image
 that already has the requested geometry is a no-op.
 """
