@@ -382,7 +382,9 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
     /// socket is identified, so every pending request would match every reply.
     let mut pending_ping: Option<PendingPing> = None;
     /// Result waiting for the shell to accept it, if any.
-    let mut ping_reply: Option<([u8; 4], bool)> = None;
+    // (requester, address, success): a ping reply goes to the task that asked,
+    // not to whichever task currently owns the console.
+    let mut ping_reply: Option<(u64, [u8; 4], bool)> = None;
     /// A standalone DNS lookup started by a client.
     let mut pending_dns: Option<PendingDns> = None;
     /// Replies the loop still has to hand to their clients.
@@ -428,16 +430,19 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
                 net_ipc::OP_PING => {
                     if ping_reply.is_none() {
                         let address = net_ipc::ping_address(&message);
-                        ping_reply = start_ping(
+                        if let Some((address, success)) = start_ping(
                             address,
                             attached,
+                            message.sender,
                             &mut pending_ping,
                             &mut next_seq,
                             now_millis,
                             &mut sockets,
                             icmp_handle,
                             &capabilities.checksum,
-                        );
+                        ) {
+                            ping_reply = Some((message.sender, address, success));
+                        }
                     }
                 }
                 net_ipc::OP_SHARE => {
@@ -558,8 +563,9 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
             if let Some(pending) = &pending_ping {
                 if source == pending.address {
                     let address = pending.address;
+                    let requester = pending.requester;
                     pending_ping = None;
-                    ping_reply = Some((address, true));
+                    ping_reply = Some((requester, address, true));
                 }
             }
         }
@@ -570,15 +576,16 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
         if let Some(pending) = &pending_ping {
             if now_millis >= pending.deadline_millis {
                 let address = pending.address;
+                let requester = pending.requester;
                 pending_ping = None;
-                ping_reply = Some((address, false));
+                ping_reply = Some((requester, address, false));
             }
         }
 
-        // Store the ping result in the shared reply slot.
-        if let Some((address, success)) = ping_reply {
-            if let Some(shell) = resolve_task(syscall::PROGRAM_HOWL) {
-                if syscall::try_send(shell, &net_ipc::ping_reply(address, success)) {
+        // Deliver to the requester; drop it if that task has exited.
+        if let Some((requester, address, success)) = ping_reply {
+            if syscall::task_alive(requester) {
+                if syscall::try_send(requester, &net_ipc::ping_reply(address, success)) {
                     ping_reply = None;
                 }
             } else {
@@ -1699,8 +1706,9 @@ fn read_request(client_base: u64) -> Option<&'static str> {
 // ---------------------------------------------------------------------------
 // Ping
 
-/// One shell-requested echo in flight.
+/// One requester's echo in flight.
 struct PendingPing {
+    requester: u64,
     address: [u8; 4],
     deadline_millis: i64,
 }
@@ -1713,6 +1721,7 @@ struct PendingPing {
 fn start_ping(
     address: [u8; 4],
     attached: bool,
+    requester: u64,
     pending_ping: &mut Option<PendingPing>,
     next_seq: &mut u16,
     now_millis: i64,
@@ -1731,6 +1740,7 @@ fn start_ping(
     }
     *next_seq = next_seq.wrapping_add(1);
     *pending_ping = Some(PendingPing {
+        requester,
         address,
         deadline_millis: now_millis + PING_TIMEOUT_MILLIS as i64,
     });
@@ -1805,19 +1815,6 @@ fn handle_doorbell(message: &ipc::Message, interface: &mut Interface, attached: 
         }
         _ => {}
     }
-}
-
-/// Finds the newest live task running `program`.
-fn resolve_task(program: u64) -> Option<u64> {
-    let mut tasks = [EMPTY_TASK; TASK_LIST_CAPACITY];
-    let count = syscall::task_list(&mut tasks)?;
-    tasks[..count.min(TASK_LIST_CAPACITY)]
-        .iter()
-        .rev()
-        .find(|task| {
-            task.program == program && task.state != TASK_DEAD && task.state != TASK_STOPPED
-        })
-        .map(|task| task.id)
 }
 
 /// Resolves the live net driver task. The hint is the task ID silverd passed

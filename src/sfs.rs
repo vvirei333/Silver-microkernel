@@ -259,73 +259,85 @@ impl Reader {
     }
 
     /// Physical block backing logical `slot`, or `None` for a hole/EOF.
-    fn block_at(&self, inode: &Inode, slot: usize) -> Option<u32> {
+    /// Physical block backing logical `slot`. An I/O error and a hole are
+    /// different outcomes: mutations must not mistake a failed metadata read
+    /// for "unallocated" and then overwrite the pointer with a fresh block.
+    fn block_at_checked(&self, inode: &Inode, slot: usize) -> Result<Option<u32>, ()> {
         let block = if slot < DIRECT_BLOCKS {
             inode.blocks[slot]
         } else if slot < DIRECT_BLOCKS + INDIRECT_POINTERS {
             if inode.indirect == 0 {
-                return None;
+                return Ok(None);
             }
             let mut table = [0_u8; BLOCK_SIZE];
             if !read_block(inode.indirect, &mut table) {
-                return None;
+                return Err(());
             }
             u32_at(&table, (slot - DIRECT_BLOCKS) * 4)
         } else if slot < TRIPLE_FIRST_SLOT {
             let position = slot - DOUBLE_FIRST_SLOT;
             if position >= INDIRECT_SQUARED || inode.double == 0 {
-                return None;
+                return Ok(None);
             }
             let table_index = position / INDIRECT_POINTERS;
             let pointer = position % INDIRECT_POINTERS;
             let mut node = [0_u8; BLOCK_SIZE];
             if !read_block(inode.double, &mut node) {
-                return None;
+                return Err(());
             }
             let table_block = u32_at(&node, table_index * 4);
             if table_block == 0 {
-                return None;
+                return Ok(None);
             }
             let mut table = [0_u8; BLOCK_SIZE];
             if !read_block(table_block, &mut table) {
-                return None;
+                return Err(());
             }
             u32_at(&table, pointer * 4)
         } else {
             let position = slot - TRIPLE_FIRST_SLOT;
             if position >= INDIRECT_SQUARED * INDIRECT_POINTERS || inode.triple == 0 {
-                return None;
+                return Ok(None);
             }
             let outer = position / INDIRECT_SQUARED;
             let middle = (position % INDIRECT_SQUARED) / INDIRECT_POINTERS;
             let pointer = position % INDIRECT_POINTERS;
             let mut root = [0_u8; BLOCK_SIZE];
             if !read_block(inode.triple, &mut root) {
-                return None;
+                return Err(());
             }
             let double_block = u32_at(&root, outer * 4);
             if double_block == 0 {
-                return None;
+                return Ok(None);
             }
             let mut node = [0_u8; BLOCK_SIZE];
             if !read_block(double_block, &mut node) {
-                return None;
+                return Err(());
             }
             let table_block = u32_at(&node, middle * 4);
             if table_block == 0 {
-                return None;
+                return Ok(None);
             }
             let mut table = [0_u8; BLOCK_SIZE];
             if !read_block(table_block, &mut table) {
-                return None;
+                return Err(());
             }
             u32_at(&table, pointer * 4)
         };
-        if block == 0 || !self.valid_data_block(block) {
-            None
+        if block == 0 {
+            Ok(None)
+        } else if !self.valid_data_block(block) {
+            // A pointer outside the data region is corruption, not a hole.
+            Err(())
         } else {
-            Some(block)
+            Ok(Some(block))
         }
+    }
+
+    /// Read-only view: an I/O error is reported as a hole. Only use this when
+    /// no state can be mutated as a consequence.
+    fn block_at(&self, inode: &Inode, slot: usize) -> Option<u32> {
+        self.block_at_checked(inode, slot).ok().flatten()
     }
 
     fn resolve(&self, path: &str) -> Option<u32> {
@@ -773,7 +785,14 @@ impl Reader {
     fn truncate_inode(&self, index: u32, mut inode: Inode) -> bool {
         let mut freed: Vec<u32> = Vec::new();
         let mut slot = 0;
-        while let Some(block) = self.block_at(&inode, slot) {
+        loop {
+            let block = match self.block_at_checked(&inode, slot) {
+                Ok(Some(block)) => block,
+                Ok(None) => break,
+                // An I/O error must not turn into a partial truncate: the
+                // caller keeps the inode and the tree untouched.
+                Err(()) => return false,
+            };
             freed.push(block);
             slot += 1;
             if slot >= MAX_FILE_BLOCKS {
@@ -841,8 +860,10 @@ impl Reader {
             _ => return false,
         };
         for slot in 0..MAX_FILE_BLOCKS {
-            let Some(block) = self.block_at(&inode, slot) else {
-                break;
+            let block = match self.block_at_checked(&inode, slot) {
+                Ok(Some(block)) => block,
+                Ok(None) => break,
+                Err(()) => return false,
             };
             let mut bytes = [0_u8; BLOCK_SIZE];
             if !read_block(block, &mut bytes) {
@@ -860,7 +881,12 @@ impl Reader {
             }
         }
         let mut slot = 0;
-        while self.block_at(&inode, slot).is_some() {
+        loop {
+            match self.block_at_checked(&inode, slot) {
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(()) => return false,
+            }
             slot += 1;
             if slot >= MAX_FILE_BLOCKS {
                 return false;
@@ -1152,15 +1178,18 @@ impl Reader {
         let first_slot = start.min(inode.size as usize) / BLOCK_SIZE;
         let last_slot = end.div_ceil(BLOCK_SIZE);
         for slot in first_slot..last_slot {
-            if self.block_at(&inode, slot).is_none() {
-                let block = self.allocate_block()?;
-                if !zero_block(block) {
-                    let _ = self.free_block(block);
-                    return None;
-                }
-                if !self.install_block(&mut inode, slot, block) {
-                    let _ = self.free_block(block);
-                    return None;
+            match self.block_at_checked(&inode, slot).ok()? {
+                Some(_) => {}
+                None => {
+                    let block = self.allocate_block()?;
+                    if !zero_block(block) {
+                        let _ = self.free_block(block);
+                        return None;
+                    }
+                    if !self.install_block(&mut inode, slot, block) {
+                        let _ = self.free_block(block);
+                        return None;
+                    }
                 }
             }
         }
@@ -1170,7 +1199,7 @@ impl Reader {
             let slot = absolute / BLOCK_SIZE;
             let within = absolute % BLOCK_SIZE;
             let take = (BLOCK_SIZE - within).min(bytes.len() - position);
-            let block = self.block_at(&inode, slot)?;
+            let block = self.block_at_checked(&inode, slot).ok()??;
             let mut data = [0_u8; BLOCK_SIZE];
             if !read_block(block, &mut data) {
                 return None;

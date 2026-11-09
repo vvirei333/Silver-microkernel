@@ -402,7 +402,19 @@ impl FileSystem for RamFs {
         if source == destination {
             return Ok(());
         }
+        let source_components = rel_components(source)?;
         let destination_components = rel_components(destination)?;
+        // Validate everything that `rename` will check *before* removing the
+        // destination. The old order removed the destination first, so a typo
+        // or a vanished source destroyed the file that was supposed to be
+        // replaced and then returned an error.
+        if find_node(&self.root, &source_components).is_none() {
+            return Err(());
+        }
+        let Some((_, destination_parent)) = destination_components.split_last() else {
+            return Err(());
+        };
+        let _ = directory_mut(&mut self.root, destination_parent)?;
         let destination_node = find_node(&self.root, &destination_components);
         let destination_is_file = destination_node
             .map(|node| matches!(node.kind, NodeKind::File(_)))
