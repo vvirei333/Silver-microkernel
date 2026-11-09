@@ -550,6 +550,26 @@ The client acks only after the compositor has read the shared buffer, so this
 covers the whole transport: named sockets, `SCM_RIGHTS`, shared memfd and
 protocol framing.
 
+The same compositor also runs a **real `libwayland-client`**. The test image
+vendors the aarch64 `libwayland-client.so.0` and `libffi.so.8`
+(`third_party/wayland-aarch64`, MIT), builds `tests/linux/wlclient.c` against
+them, and `linuxrun /sfs/linux-wlreal` forks and execs that client. It binds
+`wl_compositor`/`wl_shm`, creates a memfd-backed ARGB buffer, attaches,
+damages, commits and round-trips:
+
+```text
+howl> linuxrun /sfs/linux-wlreal
+libwayland client ok
+libwayland ok
+```
+
+Getting there fixed two real bugs: `fstat` returned the descriptor number as
+`st_ino`, so `ld.so` deduplicated different libraries by `(st_dev, st_ino)` and
+reused the first link map; the synthetic inode is now a stable hash of the VFS
+path. The Wayland header order was also corrected to
+`object id, opcode, size` (the earlier self-consistent test used
+`object id, size, opcode`).
+
 D-Bus runs on the same socket layer. `getsockopt(SO_PEERCRED)` reports the
 Linux personality's root credentials (`struct ucred`), which is what EXTERNAL
 authentication checks. The test is again a minimal daemon plus client: the

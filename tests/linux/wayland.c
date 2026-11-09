@@ -96,15 +96,16 @@ static void put_string(const char *text) {
 static void begin(unsigned object, unsigned opcode) {
     message_length = 0;
     put_u32(object);
-    put_u16(8);
+    /* Wire order is object id, opcode, size (the size includes the header). */
     put_u16(opcode);
+    put_u16(8);
 }
 static void finish(void) {
     while (message_length % 4 != 0) {
         message[message_length++] = 0;
     }
-    message[4] = message_length & 0xff;
-    message[5] = (message_length >> 8) & 0xff;
+    message[6] = message_length & 0xff;
+    message[7] = (message_length >> 8) & 0xff;
 }
 
 static long send_message(long fd, int pass_fd) {
@@ -180,7 +181,7 @@ static unsigned object_of(void) {
     return incoming[0] | (incoming[1] << 8) | (incoming[2] << 16) |
            (incoming[3] << 24);
 }
-static unsigned opcode_of(void) { return incoming[6] | (incoming[7] << 8); }
+static unsigned opcode_of(void) { return incoming[4] | (incoming[5] << 8); }
 
 static int text_equal(const char *left, const char *right) {
     while (*left != 0 && *left == *right) {

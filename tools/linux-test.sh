@@ -35,6 +35,7 @@
 #   linuxrun /sfs/linux-scratch # writable /tmp + mkdir/unlink/rename, prints 'scratch ok'
 #   linuxrun /sfs/linux-eventloop # epoll + timerfd + eventfd, prints 'event loop ok'
 #   linuxrun /sfs/linux-wayland # Wayland wire protocol + shm memfd, prints 'wayland ok'
+#   linuxrun /sfs/linux-wlreal  # real libwayland-client against the mini compositor
 #   linuxrun /sfs/linux-dbus   # EXTERNAL auth + Hello/Reply, prints 'dbus ok'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
@@ -83,6 +84,7 @@ build threads
 build unixsock
 build namedsock
 build wayland
+build wayland_real
 build dbus
 
 # ET_DYN main + custom interpreter (no libc needed).
@@ -121,6 +123,7 @@ python3 scripts/sfs_inject.py "$IMAGE" build/threads.elf linux-threads
 python3 scripts/sfs_inject.py "$IMAGE" build/unixsock.elf linux-unixsock
 python3 scripts/sfs_inject.py "$IMAGE" build/namedsock.elf linux-namedsock
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland.elf linux-wayland
+python3 scripts/sfs_inject.py "$IMAGE" build/wayland_real.elf linux-wlreal
 python3 scripts/sfs_inject.py "$IMAGE" build/dbus.elf linux-dbus
 
 # A real static libc binary (the SFS image is 16 MiB; all of these fit).
@@ -172,6 +175,21 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     "$CC" -O2 -o build/eventloop tests/linux/eventloop.c
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/eventloop
+    WAYLAND=third_party/wayland-aarch64
+    if [ -f "$WAYLAND/lib/libwayland-client.so" ] && [ -f "$WAYLAND/lib/libffi.so.8" ]; then
+        "$CC" -O2 -I"$WAYLAND/include" -o build/wlclient tests/linux/wlclient.c \
+            -L"$WAYLAND/lib" -Wl,-rpath-link,"$WAYLAND/lib" \
+            -l:libwayland-client.so -l:libffi.so.8
+        patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+            --set-rpath '$ORIGIN' build/wlclient
+        python3 scripts/sfs_inject.py "$IMAGE" "$WAYLAND/lib/libwayland-client.so" libwayland-client.so.0
+        python3 scripts/sfs_inject.py "$IMAGE" "$WAYLAND/lib/libffi.so.8" libffi.so.8
+        python3 scripts/sfs_inject.py "$IMAGE" build/wlclient wlclient
+        WLREAL=" linuxrun /sfs/linux-wlreal"
+    else
+        WLREAL=""
+        echo "note: third_party/wayland-aarch64 is missing; skipped the real libwayland test" >&2
+    fi
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-hello linux-dyn
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-signal linux-dynsig
     python3 scripts/sfs_inject.py "$IMAGE" build/pthread-test linux-pthread
@@ -182,7 +200,7 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     python3 scripts/sfs_inject.py "$IMAGE" build/memfd-shared linux-memfd
     python3 scripts/sfs_inject.py "$IMAGE" build/scratch linux-scratch
     python3 scripts/sfs_inject.py "$IMAGE" build/eventloop linux-eventloop
-    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit linuxrun /sfs/linux-groupsig linuxrun /sfs/linux-exitgroup linuxrun /sfs/linux-sockets linuxrun /sfs/linux-memfd linuxrun /sfs/linux-scratch linuxrun /sfs/linux-eventloop"
+    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit linuxrun /sfs/linux-groupsig linuxrun /sfs/linux-exitgroup linuxrun /sfs/linux-sockets linuxrun /sfs/linux-memfd linuxrun /sfs/linux-scratch linuxrun /sfs/linux-eventloop$WLREAL"
 else
     DYN=""
     echo "note: patchelf or the dynamic AArch64 libc is missing; skipped the dynamic test" >&2

@@ -771,6 +771,19 @@ pub fn pwrite(task: u64, fd: u64, offset: u64, bytes: &[u8]) -> Result<usize, u6
     Ok(bytes.len())
 }
 
+/// Stable synthetic inode for a VFS path. The dynamic loader detects "same
+/// file mapped twice" by `(st_dev, st_ino)`; returning the descriptor number
+/// made two different libraries look identical because the loader reuses fd
+/// numbers, so it silently reused the first library's link map.
+pub fn path_ino(path: &str) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in path.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    if hash == 0 { 1 } else { hash }
+}
+
 /// Fills the aarch64 `struct stat` for a descriptor.
 pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
     let task = crate::scheduler::fd_table_owner(task);
@@ -788,7 +801,10 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
             } else {
                 S_IFREG | 0o644
             };
-            write_stat(buffer, mode, size as u64, fd)
+            let ino = vfs::fd_path(task, vfs_fd)
+                .map(|path| path_ino(&path))
+                .unwrap_or(fd.max(1));
+            write_stat(buffer, mode, size as u64, ino)
         }
         Target::Pipe { .. } => write_stat(buffer, S_IFIFO | 0o600, 0, fd.max(1)),
         Target::EventFd { .. } => write_stat(buffer, S_IFREG | 0o600, 0, fd.max(1)),

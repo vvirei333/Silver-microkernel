@@ -556,6 +556,19 @@ Redmi port is parked. The reference checklist is
   The client validates the reply serial, the received descriptor's contents
   (mapping it `MAP_SHARED`) and the signal. Full series plus repeats and
   `health`: 9596/31575 frames, zero zombies/open files/DMA leaks; fsck clean.
+  **Slice 29 (real libwayland):** a real aarch64 `libwayland-client.so.0`
+  (with `libffi.so.8`) now runs on the ABI. `linux-wlreal` forks and execs
+  `wlclient`, which connects to the mini compositor, binds
+  `wl_compositor`/`wl_shm`, builds a memfd ARGB buffer, commits and
+  round-trips; the compositor verifies the shared pixels. Two bugs were found:
+  `fstat` returned the descriptor number as `st_ino`, so `ld.so` treated every
+  library as the same file via `(st_dev, st_ino)` and reused the first link
+  map (now a stable FNV-1a hash of the VFS path, and `newfstatat` uses the
+  same); and the Wayland header order is object/opcode/size, not the
+  size/opcode used by the earlier self-consistent test. Vendored libs and
+  headers live in `third_party/wayland-aarch64` (MIT). Full series plus
+  repeats and `health`: 9596/31575 frames, zero zombies/open files/DMA leaks;
+  fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -582,8 +595,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 29 (run a real toolkit/daemon against
-  these transports; fill the remaining syscalls it probes). Network base
+- **Next steps:** Linux ABI slice 30 (xdg-shell in the mini compositor and a
+  real toolkit client, filling the syscalls it probes). Network base
   maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on

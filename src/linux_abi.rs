@@ -1490,13 +1490,23 @@ fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
         return errno(EACCES);
     }
     if let Ok(size) = crate::vfs::file_len(&cwd, &path) {
-        return match linux_fd::write_stat(buffer, S_IFREG | 0o644, size as u64, 0) {
+        return match linux_fd::write_stat(
+            buffer,
+            S_IFREG | 0o644,
+            size as u64,
+            linux_fd::path_ino(&resolved),
+        ) {
             Ok(()) => 0,
             Err(code) => errno(code),
         };
     }
     if crate::vfs::read_dir(&cwd, &path).is_ok() {
-        return match linux_fd::write_stat(buffer, S_IFDIR | 0o755, 0, 0) {
+        return match linux_fd::write_stat(
+            buffer,
+            S_IFDIR | 0o755,
+            0,
+            linux_fd::path_ino(&resolved),
+        ) {
             Ok(()) => 0,
             Err(code) => errno(code),
         };
@@ -1994,15 +2004,14 @@ fn linux_mmap(
         if let Ok((physical, owner)) =
             linux_fd::memfd_shared(task, fd, offset as usize, length as usize)
         {
-            return scheduler::mmap_shared_file(
+            let placed = scheduler::mmap_shared_file(
                 length as usize,
                 prot,
                 fixed,
                 physical,
                 owner,
-            )
-            .map(|placed| placed as u64)
-            .unwrap_or(errno(ENOMEM));
+            );
+            return placed.map(|placed| placed as u64).unwrap_or(errno(ENOMEM));
         }
         if prot & PROT_WRITE != 0 {
             return errno(EINVAL);
@@ -2018,9 +2027,8 @@ fn linux_mmap(
         Ok(read) => read,
         Err(error) => return errno(error),
     };
-    scheduler::mmap_file(length as usize, prot, fixed, &bytes[..read])
-        .map(|placed| placed as u64)
-        .unwrap_or(errno(ENOMEM))
+    let placed = scheduler::mmap_file(length as usize, prot, fixed, &bytes[..read]);
+    placed.map(|placed| placed as u64).unwrap_or(errno(ENOMEM))
 }
 
 fn linux_mprotect(address: u64, length: u64, prot: u64) -> u64 {
