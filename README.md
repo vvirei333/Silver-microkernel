@@ -46,7 +46,7 @@ milestone.
 
 ## Screenshot
 
-![WerewolfOS fastfetch](assets/silver-fastfetch.png)
+![WerewolfOS fastfetch](assets/silver-fastfetch-0.1.1.png)
 
 The `fastfetch` screen above is real output from WerewolfOS 0.1.1
 (Silver Microkernel) running in QEMU. The aligned summary includes processes,
