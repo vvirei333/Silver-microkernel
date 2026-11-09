@@ -587,6 +587,24 @@ compositor answers `wl_keyboard.keymap` with a memfd carried over
 position. (The passed descriptor shares the writer's open file description,
 so the client rewinds before reading the keymap.)
 
+A stock distro binary also runs against the compositor: `wayland-info` from
+`wayland-utils` (linked with the vendored `libwayland-client` and `libdrm`)
+enumerates everything the mini compositor advertises:
+
+```text
+howl> linuxrun /sfs/linux-wlinfo
+interface: 'wl_compositor',  version: 1, name: 1
+interface: 'wl_shm',         version: 1, name: 2
+         0 = 'AR24'
+interface: 'xdg_wm_base',    version: 1, name: 3
+interface: 'wl_output',      version: 1, name: 4
+       make: 'Werewolf', model: 'Panel',
+       width: 1024 px, height: 768 px, refresh: 60.000 Hz
+interface: 'wl_seat',        version: 1, name: 5
+       capabilities: pointer keyboard
+wayland-info ok
+```
+
 D-Bus runs on the same socket layer. `getsockopt(SO_PEERCRED)` reports the
 Linux personality's root credentials (`struct ucred`), which is what EXTERNAL
 authentication checks. The test is again a minimal daemon plus client: the

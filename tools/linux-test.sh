@@ -36,6 +36,7 @@
 #   linuxrun /sfs/linux-eventloop # epoll + timerfd + eventfd, prints 'event loop ok'
 #   linuxrun /sfs/linux-wayland # Wayland wire protocol + shm memfd, prints 'wayland ok'
 #   linuxrun /sfs/linux-wlreal  # real libwayland-client against the mini compositor
+#   linuxrun /sfs/linux-wlinfo  # stock wayland-info binary against the compositor
 #   linuxrun /sfs/linux-dbus   # EXTERNAL auth + Hello/Reply, prints 'dbus ok'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
@@ -85,6 +86,7 @@ build unixsock
 build namedsock
 build wayland
 build wayland_real
+build wayland_info
 build dbus
 
 # ET_DYN main + custom interpreter (no libc needed).
@@ -124,6 +126,7 @@ python3 scripts/sfs_inject.py "$IMAGE" build/unixsock.elf linux-unixsock
 python3 scripts/sfs_inject.py "$IMAGE" build/namedsock.elf linux-namedsock
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland.elf linux-wayland
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland_real.elf linux-wlreal
+python3 scripts/sfs_inject.py "$IMAGE" build/wayland_info.elf linux-wlinfo
 python3 scripts/sfs_inject.py "$IMAGE" build/dbus.elf linux-dbus
 
 # A real static libc binary (the SFS image is 16 MiB; all of these fit).
@@ -185,8 +188,13 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
             --set-rpath '$ORIGIN' build/wlclient
         python3 scripts/sfs_inject.py "$IMAGE" "$WAYLAND/lib/libwayland-client.so" libwayland-client.so.0
         python3 scripts/sfs_inject.py "$IMAGE" "$WAYLAND/lib/libffi.so.8" libffi.so.8
+        python3 scripts/sfs_inject.py "$IMAGE" "$WAYLAND/lib/libdrm.so.2" libdrm.so.2
+        cp "$WAYLAND/bin/wayland-info" build/wayland-info
+        patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+            --set-rpath '$ORIGIN' build/wayland-info
+        python3 scripts/sfs_inject.py "$IMAGE" build/wayland-info wayland-info
         python3 scripts/sfs_inject.py "$IMAGE" build/wlclient wlclient
-        WLREAL=" linuxrun /sfs/linux-wlreal"
+        WLREAL=" linuxrun /sfs/linux-wlreal linuxrun /sfs/linux-wlinfo"
     else
         WLREAL=""
         echo "note: third_party/wayland-aarch64 is missing; skipped the real libwayland test" >&2

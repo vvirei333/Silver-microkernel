@@ -588,6 +588,15 @@ Redmi port is parked. The reference checklist is
   the client rewinds (and the compositor seeks to zero) before reading. Full
   series plus repeats and `health`: 9596/31575 frames, zero zombies/open
   files/DMA leaks; fsck clean.
+  **Slice 32 (stock wayland-info):** the unmodified `wayland-info` binary from
+  `wayland-utils` 1.3.0 runs against the mini compositor. It is linked with
+  the vendored libwayland-client and libdrm; patchelf rewrites the interpreter
+  and rpath at test-build time. It enumerates wl_compositor, wl_shm (AR24
+  format), xdg_wm_base, wl_output (Werewolf/Panel, 1024x768@60, current
+  preferred) and wl_seat (pointer keyboard), then exits 0. A dedicated
+  harness (`wayland_info.c`) serves until EOF and prints `wayland-info ok`.
+  Full series plus repeats and `health`: 9596/31575 frames, zero zombies/open
+  files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -614,8 +623,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 32 (a real toolkit library stack or a
-  compositor-side input focus path, filling the syscalls it probes). Network
+- **Next steps:** Linux ABI slice 33 (compositor-side focus/animation with
+  real clients; the 16 MiB SFS rules out a full GTK stack for now). Network
   base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
