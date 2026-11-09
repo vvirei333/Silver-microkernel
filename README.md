@@ -316,8 +316,8 @@ EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 `eventfd2`, `memfd_create`, `futex`, `rt_sigaction`, `rt_sigprocmask`, `kill`
 and `tgkill`; anything else returns `-ENOSYS`. File descriptors are a
 per-process table in `src/linux_fd.rs` (console, `/dev` devices, VFS handles,
-pipes, eventfds or memfds), so `dup2` redirects work; the filesystem view is
-read-only.
+pipes, eventfds, memfds or Unix sockets), so `dup2` redirects work; the
+filesystem view is read-only.
 
 The personality is fixed at spawn, so a foreign binary can never reach the
 Silver syscall table by choosing a colliding number. `linuxrun` is a
@@ -439,6 +439,25 @@ pipe: ping
 howl> linuxrun /sfs/linux-ipc
 ipc ok
 ```
+
+`AF_UNIX` stream pairs are available through `socketpair(2)`. A message may
+carry descriptors with `SCM_RIGHTS`; `recvmsg` installs them in the receiver's
+table, and the reference counting follows `dup`/`fork`/`close` so a closed
+writer produces EOF. `ppoll` reports `POLLIN`/`POLLOUT`/`POLLHUP`, `O_NONBLOCK`
+comes from `fcntl`, and `shutdown` delivers the half-close. This is the
+transport Wayland and D-Bus use:
+
+```text
+howl> linuxrun /sfs/linux-unixsock
+unix socket ok
+
+howl> linuxrun /sfs/linux-sockets
+glibc socket ok
+```
+
+Named `AF_UNIX` sockets (`socket`/`bind`/`listen`/`accept`/`connect`) still
+need a writable runtime directory and return `-ENOSYS`; `socketpair(2)` is the
+first transport slice.
 
 Signals keep per-task dispositions, blocked masks and pending bits.
 `rt_sigaction`/`rt_sigprocmask` round-trip, `kill`/`tgkill` apply the default

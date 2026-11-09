@@ -458,6 +458,20 @@ Redmi port is parked. The reference checklist is
   `worker exiting`) and `linux-groupsig` (worker installs SIGUSR1, main
   raises it, prints `group signal ok`). Full series plus repeats and
   `health`: 9596/31583 frames, zero zombies/open files/DMA leaks; fsck clean.
+  **Slice 21 (Unix sockets):** `socketpair(2)` creates an `AF_UNIX` stream
+  pair whose shared state tracks directional message queues, per-end descriptor
+  reference counts and read/write half-closes. `sendmsg`/`recvmsg` carry
+  `SCM_RIGHTS` descriptors; the receiver installs them under fresh numbers and
+  truncation closes them with `MSG_CTRUNC`. Plain `read`/`write`, `sendto`/
+  `recvfrom`, `shutdown`, `getsockname`/`getpeername`, `setsockopt`/
+  `getsockopt` (`SO_TYPE`, `SO_ERROR`, buffers) and `fcntl(F_GETFL/F_SETFL)`
+  with `O_NONBLOCK` work; `ppoll` reports `POLLIN`/`POLLOUT`/`POLLHUP`. The fd
+  table grew to 256 slots. Tests: `linux-unixsock` (freestanding byte stream,
+  SCM_RIGHTS eventfd round trip, EAGAIN and EOF) prints `unix socket ok`;
+  `linux-sockets` (real glibc `socketpair`/`sendmsg`/`recvmsg` with `CMSG_*`,
+  `poll`, `O_NONBLOCK`, `shutdown`) prints `glibc socket ok`. Full series plus
+  repeats and `health`: 9596/31578 frames, zero zombies/open files/DMA leaks;
+  fsck clean. Named `AF_UNIX` sockets still need a writable runtime directory.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -484,8 +498,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 21 (headless Wayland/GTK/D-Bus → Phosh).
-  Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 22 (shared writable file mappings and a
+  writable runtime directory, then named `AF_UNIX` sockets), then headless
+  Wayland/GTK/D-Bus → Phosh. Network base maintenance (keep-alive, TLS
+  roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

@@ -88,6 +88,22 @@ const SYS_MADVISE: u64 = 233;
 const SYS_PRLIMIT64: u64 = 261;
 const SYS_GETRANDOM: u64 = 278;
 const SYS_RSEQ: u64 = 293;
+const SYS_SOCKET: u64 = 198;
+const SYS_SOCKETPAIR: u64 = 199;
+const SYS_BIND: u64 = 200;
+const SYS_LISTEN: u64 = 201;
+const SYS_ACCEPT: u64 = 202;
+const SYS_CONNECT: u64 = 203;
+const SYS_GETSOCKNAME: u64 = 204;
+const SYS_GETPEERNAME: u64 = 205;
+const SYS_SENDTO: u64 = 206;
+const SYS_RECVFROM: u64 = 207;
+const SYS_SETSOCKOPT: u64 = 208;
+const SYS_GETSOCKOPT: u64 = 209;
+const SYS_SHUTDOWN: u64 = 210;
+const SYS_SENDMSG: u64 = 211;
+const SYS_RECVMSG: u64 = 212;
+const SYS_ACCEPT4: u64 = 242;
 
 const EPERM: u64 = 1;
 const ENOENT: u64 = 2;
@@ -106,6 +122,9 @@ const ENOTTY: u64 = 25;const ESPIPE: u64 = 29;
 const EROFS: u64 = 30;
 const ERANGE: u64 = 34;
 const ENOSYS: u64 = 38;
+const EPROTONOSUPPORT: u64 = 93;
+const EAFNOSUPPORT: u64 = 97;
+const ENOPROTOOPT: u64 = 92;
 
 /// Linux returns `-errno`; sign-extend so `(long)x0 < 0` works in libc.
 const fn errno(code: u64) -> u64 {
@@ -114,6 +133,14 @@ const fn errno(code: u64) -> u64 {
 
 /// `PROT_*` are identical in Linux and the Silver ABI (R=1, W=2, X=4).
 const MAP_FIXED: u64 = 0x10;
+
+/// Unix-domain socket ABI constants.
+const AF_UNIX: u64 = 1;
+const SOL_SOCKET: u64 = 1;
+const SCM_RIGHTS: u64 = 1;
+const SOCK_NONBLOCK: u64 = 0o4000;
+const MSG_DONTWAIT: u64 = 0x40;
+const MSG_CTRUNC: i32 = 0x8;
 
 /// `openat` / `newfstatat` conventions.
 const AT_FDCWD: i64 = -100;
@@ -215,6 +242,22 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
             }
         }
         SYS_GETRANDOM => linux_getrandom(args[0], args[1], args[2]),
+        SYS_SOCKETPAIR => linux_socketpair(args[0], args[1], args[2], args[3]),
+        SYS_SENDMSG => linux_sendmsg(args[0], args[1], args[2]),
+        SYS_RECVMSG => linux_recvmsg(args[0], args[1], args[2]),
+        SYS_SENDTO => linux_sendto(args[0], args[1], args[2], args[3]),
+        SYS_RECVFROM => linux_recvfrom(args[0], args[1], args[2], args[3], args[4], args[5]),
+        SYS_SHUTDOWN => finish(
+            linux_fd::socket_shutdown(scheduler::current_task_id(), args[0], args[1]).map(|_| 0),
+        ),
+        SYS_GETSOCKNAME | SYS_GETPEERNAME => linux_sockname(args[1], args[2]),
+        SYS_SETSOCKOPT => linux_setsockopt(args[0], args[1]),
+        SYS_GETSOCKOPT => linux_getsockopt(args[0], args[1], args[2], args[3], args[4]),
+        // Named `AF_UNIX` sockets need a writable runtime directory; the
+        // transport that Wayland/D-Bus use over a pair is socketpair(2).
+        SYS_SOCKET | SYS_BIND | SYS_LISTEN | SYS_CONNECT | SYS_ACCEPT | SYS_ACCEPT4 => {
+            errno(ENOSYS)
+        }
         // glibc probes rseq and falls back when it is unsupported.
         SYS_RSEQ => errno(ENOSYS),
         _ => {
@@ -467,6 +510,334 @@ fn linux_ppoll(
         }
         scheduler::sleep(1);
     }
+}
+
+/// One `struct msghdr` from userspace (LP64 layout).
+struct MsgHdr {
+    iov: u64,
+    iovlen: u64,
+    control: u64,
+    controllen: u64,
+    flags: i32,
+}
+
+fn read_msghdr(pointer: u64) -> Result<MsgHdr, u64> {
+    if pointer == 0 {
+        return Err(EFAULT);
+    }
+    let mut raw = [0_u8; 56];
+    user_memory::copy_from_user(pointer, &mut raw).map_err(|_| EFAULT)?;
+    Ok(MsgHdr {
+        iov: u64::from_le_bytes(raw[16..24].try_into().unwrap()),
+        iovlen: u64::from_le_bytes(raw[24..32].try_into().unwrap()),
+        control: u64::from_le_bytes(raw[32..40].try_into().unwrap()),
+        controllen: u64::from_le_bytes(raw[40..48].try_into().unwrap()),
+        flags: i32::from_le_bytes(raw[48..52].try_into().unwrap()),
+    })
+}
+
+/// Gathers the `iovec` array into one contiguous payload.
+fn read_iovecs(header: &MsgHdr, limit: usize) -> Result<Vec<u8>, u64> {
+    if header.iovlen > 64 {
+        return Err(EINVAL);
+    }
+    let mut bytes = Vec::new();
+    for index in 0..header.iovlen {
+        let mut raw = [0_u8; 16];
+        user_memory::copy_from_user(header.iov + index * 16, &mut raw).map_err(|_| EFAULT)?;
+        let base = u64::from_le_bytes(raw[..8].try_into().unwrap());
+        let length = u64::from_le_bytes(raw[8..].try_into().unwrap());
+        let length = usize::try_from(length).map_err(|_| EINVAL)?;
+        if bytes.len().saturating_add(length) > limit {
+            return Err(EINVAL);
+        }
+        let start = bytes.len();
+        bytes.resize(start + length, 0);
+        if length != 0 {
+            user_memory::copy_from_user(base, &mut bytes[start..]).map_err(|_| EFAULT)?;
+        }
+    }
+    Ok(bytes)
+}
+
+/// Scatters up to `bytes.len()` bytes back into the caller's `iovec` array.
+fn write_iovecs(header: &MsgHdr, bytes: &[u8]) -> Result<(), u64> {
+    let mut offset = 0usize;
+    for index in 0..header.iovlen {
+        if offset == bytes.len() {
+            break;
+        }
+        let mut raw = [0_u8; 16];
+        user_memory::copy_from_user(header.iov + index * 16, &mut raw).map_err(|_| EFAULT)?;
+        let base = u64::from_le_bytes(raw[..8].try_into().unwrap());
+        let length = u64::from_le_bytes(raw[8..].try_into().unwrap());
+        let length = (length as usize).min(bytes.len() - offset);
+        if length != 0 {
+            user_memory::copy_to_user(&bytes[offset..offset + length], base)
+                .map_err(|_| EFAULT)?;
+            offset += length;
+        }
+    }
+    Ok(())
+}
+
+/// Extracts `SCM_RIGHTS` descriptors from a control buffer.
+fn parse_rights(control: u64, controllen: u64) -> Result<Vec<u64>, u64> {
+    let mut fds = Vec::new();
+    if control == 0 || controllen < 16 || controllen > 4096 {
+        return Ok(fds);
+    }
+    let mut raw = alloc::vec![0_u8; controllen as usize];
+    user_memory::copy_from_user(control, &mut raw).map_err(|_| EFAULT)?;
+    let mut offset = 0usize;
+    while offset + 16 <= raw.len() {
+        let length = u64::from_le_bytes(raw[offset..offset + 8].try_into().unwrap());
+        let level = i32::from_le_bytes(raw[offset + 8..offset + 12].try_into().unwrap());
+        let kind = i32::from_le_bytes(raw[offset + 12..offset + 16].try_into().unwrap());
+        if length < 16 || offset as u64 + length > controllen {
+            break;
+        }
+        if level == SOL_SOCKET as i32 && kind == SCM_RIGHTS as i32 {
+            let count = (length as usize - 16) / 4;
+            if count > 64 {
+                return Err(EINVAL);
+            }
+            for index in 0..count {
+                let start = offset + 16 + index * 4;
+                let fd = i32::from_le_bytes(raw[start..start + 4].try_into().unwrap());
+                if fd >= 0 {
+                    fds.push(fd as u64);
+                }
+            }
+        }
+        offset += (length as usize + 7) & !7;
+    }
+    Ok(fds)
+}
+
+/// Writes one `SCM_RIGHTS` control message. Returns flags to merge into
+/// `msg_flags` (`MSG_CTRUNC` when the buffer was too small; those descriptors
+/// are closed, as Linux does).
+fn write_rights(task: u64, control: u64, controllen: u64, fds: &[u64]) -> i32 {
+    if fds.is_empty() {
+        return 0;
+    }
+    let needed = 16 + fds.len() * 4;
+    let spaced = (needed + 7) & !7;
+    if control == 0 || (controllen as usize) < spaced {
+        for fd in fds {
+            let _ = linux_fd::close(task, *fd);
+        }
+        return MSG_CTRUNC;
+    }
+    let mut block = alloc::vec![0_u8; spaced];
+    block[..8].copy_from_slice(&(needed as u64).to_le_bytes());
+    block[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_le_bytes());
+    block[12..16].copy_from_slice(&(SCM_RIGHTS as i32).to_le_bytes());
+    for (index, fd) in fds.iter().enumerate() {
+        let start = 16 + index * 4;
+        block[start..start + 4].copy_from_slice(&(*fd as i32).to_le_bytes());
+    }
+    if user_memory::copy_to_user(&block, control).is_err() {
+        return MSG_CTRUNC;
+    }
+    0
+}
+
+fn linux_socketpair(domain: u64, kind: u64, protocol: u64, pair: u64) -> u64 {
+    if domain != AF_UNIX {
+        return errno(EAFNOSUPPORT);
+    }
+    let base = kind & 0xf;
+    if (base != 1 && base != 2) || protocol != 0 {
+        return errno(EPROTONOSUPPORT);
+    }
+    let nonblock = kind & SOCK_NONBLOCK != 0;
+    let task = scheduler::current_task_id();
+    match linux_fd::socketpair(task, nonblock) {
+        Ok((first, second)) => {
+            let mut raw = [0_u8; 8];
+            raw[..4].copy_from_slice(&(first as i32).to_le_bytes());
+            raw[4..].copy_from_slice(&(second as i32).to_le_bytes());
+            if user_memory::copy_to_user(&raw, pair).is_err() {
+                let _ = linux_fd::close(task, first);
+                let _ = linux_fd::close(task, second);
+                return errno(EFAULT);
+            }
+            0
+        }
+        Err(code) => errno(code),
+    }
+}
+
+fn linux_sendmsg(fd: u64, message: u64, flags: u64) -> u64 {
+    let header = match read_msghdr(message) {
+        Ok(header) => header,
+        Err(code) => return errno(code),
+    };
+    let bytes = match read_iovecs(&header, 1 << 20) {
+        Ok(bytes) => bytes,
+        Err(code) => return errno(code),
+    };
+    let pass = match parse_rights(header.control, header.controllen) {
+        Ok(pass) => pass,
+        Err(code) => return errno(code),
+    };
+    let task = scheduler::current_task_id();
+    finish(linux_fd::socket_send(
+        task,
+        fd,
+        &bytes,
+        &pass,
+        flags & MSG_DONTWAIT != 0,
+    ))
+}
+
+fn linux_recvmsg(fd: u64, message: u64, flags: u64) -> u64 {
+    let header = match read_msghdr(message) {
+        Ok(header) => header,
+        Err(code) => return errno(code),
+    };
+    let mut total = 0usize;
+    for index in 0..header.iovlen.min(64) {
+        let mut raw = [0_u8; 16];
+        if user_memory::copy_from_user(header.iov + index * 16, &mut raw).is_err() {
+            return errno(EFAULT);
+        }
+        let length = u64::from_le_bytes(raw[8..].try_into().unwrap());
+        total = match total.checked_add(length as usize) {
+            Some(total) if total <= 1 << 20 => total,
+            _ => return errno(EINVAL),
+        };
+    }
+    let mut bytes = alloc::vec![0_u8; total];
+    let task = scheduler::current_task_id();
+    let (read, fds) = match linux_fd::socket_recv(
+        task,
+        fd,
+        &mut bytes,
+        flags & MSG_DONTWAIT != 0,
+    ) {
+        Ok(result) => result,
+        Err(code) => return errno(code),
+    };
+    if write_iovecs(&header, &bytes[..read]).is_err() {
+        return errno(EFAULT);
+    }
+    let control_flags = write_rights(task, header.control, header.controllen, &fds);
+    let mut output = [0_u8; 16];
+    let size = if control_flags & MSG_CTRUNC != 0 || fds.is_empty() {
+        0u64
+    } else {
+        ((16 + fds.len() * 4 + 7) & !7) as u64
+    };
+    output[..8].copy_from_slice(&size.to_le_bytes());
+    let msg_flags = (header.flags & !MSG_CTRUNC) | control_flags;
+    output[8..12].copy_from_slice(&msg_flags.to_le_bytes());
+    if user_memory::copy_to_user(&output, message + 40).is_err() {
+        return errno(EFAULT);
+    }
+    read as u64
+}
+
+fn linux_sendto(fd: u64, buffer: u64, length: u64, flags: u64) -> u64 {
+    let length = (length as usize).min(1 << 20);
+    let mut bytes = alloc::vec![0_u8; length];
+    if user_memory::copy_from_user(buffer, &mut bytes).is_err() {
+        return errno(EFAULT);
+    }
+    finish(linux_fd::socket_send(
+        scheduler::current_task_id(),
+        fd,
+        &bytes,
+        &[],
+        flags & MSG_DONTWAIT != 0,
+    ))
+}
+
+fn linux_recvfrom(
+    fd: u64,
+    buffer: u64,
+    length: u64,
+    flags: u64,
+    address: u64,
+    address_length: u64,
+) -> u64 {
+    let length = (length as usize).min(1 << 20);
+    let mut bytes = alloc::vec![0_u8; length];
+    let task = scheduler::current_task_id();
+    let read = match linux_fd::socket_recv(task, fd, &mut bytes, flags & MSG_DONTWAIT != 0) {
+        Ok((read, _)) => read,
+        Err(code) => return errno(code),
+    };
+    if user_memory::copy_to_user(&bytes[..read], buffer).is_err() {
+        return errno(EFAULT);
+    }
+    linux_sockname(address, address_length);
+    read as u64
+}
+
+/// Writes an unnamed `sockaddr_un` (family only) and its length.
+fn linux_sockname(address: u64, length_pointer: u64) -> u64 {
+    let mut capacity = 0u32;
+    if length_pointer != 0 {
+        let mut raw = [0_u8; 4];
+        if user_memory::copy_from_user(length_pointer, &mut raw).is_err() {
+            return errno(EFAULT);
+        }
+        capacity = u32::from_le_bytes(raw);
+    }
+    if address != 0 && capacity >= 2 {
+        let family = (AF_UNIX as u16).to_le_bytes();
+        if user_memory::copy_to_user(&family, address).is_err() {
+            return errno(EFAULT);
+        }
+    }
+    if length_pointer != 0 {
+        let length = if address == 0 { 0u32 } else { 2u32 };
+        if user_memory::copy_to_user(&length.to_le_bytes(), length_pointer).is_err() {
+            return errno(EFAULT);
+        }
+    }
+    0
+}
+
+fn linux_setsockopt(_fd: u64, level: u64) -> u64 {
+    if level == SOL_SOCKET {
+        0
+    } else {
+        errno(ENOPROTOOPT)
+    }
+}
+
+fn linux_getsockopt(fd: u64, level: u64, name: u64, value: u64, length: u64) -> u64 {
+    if level != SOL_SOCKET {
+        return errno(ENOPROTOOPT);
+    }
+    let task = scheduler::current_task_id();
+    if linux_fd::status_flags(task, fd).is_none() {
+        return errno(EBADF);
+    }
+    let answer: i32 = match name {
+        3 => 1,          // SO_TYPE = SOCK_STREAM
+        4 => 0,          // SO_ERROR
+        7 | 8 => 212992, // SO_SNDBUF / SO_RCVBUF
+        38 => 0,         // SO_PROTOCOL
+        39 => AF_UNIX as i32,
+        _ => return errno(ENOPROTOOPT),
+    };
+    if value != 0 {
+        if user_memory::copy_to_user(&answer.to_le_bytes(), value).is_err() {
+            return errno(EFAULT);
+        }
+    }
+    if length != 0 {
+        let size = 4u32.to_le_bytes();
+        if user_memory::copy_to_user(&size, length).is_err() {
+            return errno(EFAULT);
+        }
+    }
+    0
 }
 
 /// `rt_sigprocmask(2)`: block/unblock/set the calling task's signal mask.
@@ -791,8 +1162,16 @@ fn linux_fcntl(fd: u64, command: u64, argument: u64) -> u64 {
         F_DUPFD | F_DUPFD_CLOEXEC => finish(linux_fd::dup_from(task, fd, argument)),
         // We do not model descriptor or status flags yet; report "none" and
         // accept changes as no-ops.
-        F_GETFD | F_GETFL => 0,
-        F_SETFD | F_SETFL => 0,
+        F_GETFD => 0,
+        F_GETFL => match linux_fd::status_flags(task, fd) {
+            Some(flags) => flags,
+            None => errno(EBADF),
+        },
+        F_SETFD => 0,
+        F_SETFL => {
+            let _ = linux_fd::set_nonblock(task, fd, argument & 0x800 != 0);
+            0
+        }
         _ => errno(EINVAL),
     }
 }

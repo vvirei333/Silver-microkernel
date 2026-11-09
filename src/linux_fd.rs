@@ -41,6 +41,33 @@ pub struct MemFdState {
     offset: usize,
 }
 
+/// One queued datagram/message on a Unix socket, with the descriptors that
+/// travelled with it. Ancillary descriptors stay in the queue until the
+/// receiver consumes the message, exactly like Linux.
+struct SocketMessage {
+    data: VecDeque<u8>,
+    fds: Vec<Target>,
+}
+
+/// One end of a connected `AF_UNIX` stream pair.
+#[derive(Default)]
+struct SocketEnd {
+    incoming: VecDeque<SocketMessage>,
+    /// This end called `shutdown(SHUT_WR)` or was closed: the peer reads EOF.
+    write_closed: bool,
+    /// This end will not read again: writes from the peer fail with `EPIPE`.
+    read_closed: bool,
+}
+
+/// Shared state of a `socketpair(2)`. `refs` counts the live descriptors
+/// naming each end, so closing the last one wakes the peer with EOF. The two
+/// queues are directional: end 0 writes into `ends[1].incoming`.
+struct SocketState {
+    ends: [SocketEnd; 2],
+    refs: [usize; 2],
+    stream: bool,
+}
+
 /// Linux fd targets. `Clone` (not `Copy`) because a pipe/eventfd/memfd target
 /// shares an `Arc`; cloning is what `dup`/`fork` do deliberately.
 #[derive(Clone)]
@@ -60,6 +87,11 @@ enum Target {
         nonblock: bool,
     },
     MemFd(Arc<Mutex<MemFdState>>),
+    Socket {
+        state: Arc<Mutex<SocketState>>,
+        end: u8,
+        nonblock: bool,
+    },
 }
 
 struct Table {
@@ -69,7 +101,7 @@ struct Table {
 
 static TABLES: Mutex<Vec<Table>> = Mutex::new(Vec::new());
 
-const MAX_FDS: usize = 64;
+const MAX_FDS: usize = 256;
 
 fn with_table<R>(task: u64, action: impl FnOnce(&mut Table) -> R) -> R {
     let task = crate::scheduler::fd_table_owner(task);
@@ -97,25 +129,57 @@ fn lookup(task: u64, fd: u64) -> Option<Target> {
 impl Target {
     /// A new descriptor referring to the same pipe end.
     fn retain_endpoint(&self) {
-        if let Target::Pipe { state, read } = self {
-            let mut pipe = state.lock();
-            if *read {
-                pipe.read_ends += 1;
-            } else {
-                pipe.write_ends += 1;
+        match self {
+            Target::Pipe { state, read } => {
+                let mut pipe = state.lock();
+                if *read {
+                    pipe.read_ends += 1;
+                } else {
+                    pipe.write_ends += 1;
+                }
             }
+            Target::Socket { state, end, .. } => {
+                state.lock().refs[*end as usize] += 1;
+            }
+            _ => {}
         }
     }
 
     /// One descriptor of this pipe end went away.
     fn release_endpoint(&self) {
-        if let Target::Pipe { state, read } = self {
-            let mut pipe = state.lock();
-            if *read {
-                pipe.read_ends = pipe.read_ends.saturating_sub(1);
-            } else {
-                pipe.write_ends = pipe.write_ends.saturating_sub(1);
+        match self {
+            Target::Pipe { state, read } => {
+                let mut pipe = state.lock();
+                if *read {
+                    pipe.read_ends = pipe.read_ends.saturating_sub(1);
+                } else {
+                    pipe.write_ends = pipe.write_ends.saturating_sub(1);
+                }
             }
+            Target::Socket { state, end, .. } => {
+                let dropped = {
+                    let mut socket = state.lock();
+                    let end = *end as usize;
+                    if socket.refs[end] == 0 {
+                        return;
+                    }
+                    socket.refs[end] -= 1;
+                    if socket.refs[end] != 0 {
+                        return;
+                    }
+                    // Last descriptor of this end: the peer must see EOF and
+                    // no future write may succeed.
+                    socket.ends[end].write_closed = true;
+                    socket.ends[end].read_closed = true;
+                    socket.ends[end].incoming.drain(..).collect::<Vec<_>>()
+                };
+                for message in dropped {
+                    for target in message.fds {
+                        target.release_endpoint();
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -316,6 +380,15 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         }
         Target::EventFd { state, nonblock } => eventfd_read(&state, nonblock, buffer),
         Target::MemFd(state) => memfd_read(&state, buffer, count),
+        Target::Socket { state, end, nonblock } => {
+            let mut chunk = alloc::vec![0_u8; (count as usize).min(64 * 1024)];
+            let (read, fds) = socket_recv_message(&state, end, nonblock, &mut chunk)?;
+            for target in fds {
+                let _ = insert_transferred(task, target);
+            }
+            user_memory::copy_to_user(&chunk[..read], buffer).map_err(|_| EFAULT)?;
+            Ok(read as u64)
+        }
     }
 }
 
@@ -391,6 +464,11 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         }
         Target::EventFd { state, .. } => eventfd_write(&state, buffer),
         Target::MemFd(state) => memfd_write(&state, buffer, count),
+        Target::Socket { state, end, .. } => {
+            let mut bytes = alloc::vec![0_u8; (count as usize).min(1 << 20)];
+            user_memory::copy_from_user(buffer, &mut bytes).map_err(|_| EFAULT)?;
+            socket_send_locked(&state, end, &bytes, Vec::new())
+        }
     }
 }
 
@@ -442,6 +520,7 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
             let size = state.lock().data.len() as u64;
             write_stat(buffer, S_IFREG | 0o600, size, fd.max(1))
         }
+        Target::Socket { .. } => write_stat(buffer, S_IFSOCK | 0o600, 0, fd.max(1)),
     }
 }
 
@@ -675,6 +754,254 @@ fn pipe_write(state: &Arc<Mutex<PipeState>>, buffer: u64, count: u64) -> Result<
     Ok(total as u64)
 }
 
+/// Moves a descriptor received with `SCM_RIGHTS` into `task`'s table. The
+/// caller passes a target that already owns one reference (the message
+/// queue); on success the table owns it, on failure that reference is
+/// released.
+fn insert_transferred(task: u64, target: Target) -> Option<u64> {
+    match insert(task, target.clone()) {
+        Some(fd) => {
+            // The table's copy becomes a counted endpoint, then the queue's
+            // reference is released: exactly one owner remains.
+            target.retain_endpoint();
+            target.release_endpoint();
+            Some(fd)
+        }
+        None => {
+            target.release_endpoint();
+            None
+        }
+    }
+}
+
+/// Creates an unnamed `AF_UNIX` stream pair (`socketpair(2)`).
+pub fn socketpair(task: u64, nonblock: bool) -> Result<(u64, u64), u64> {
+    let state = Arc::new(Mutex::new(SocketState {
+        ends: [SocketEnd::default(), SocketEnd::default()],
+        refs: [1, 1],
+        stream: true,
+    }));
+    let first = Target::Socket {
+        state: state.clone(),
+        end: 0,
+        nonblock,
+    };
+    let second = Target::Socket {
+        state,
+        end: 1,
+        nonblock,
+    };
+    let Some(first_fd) = insert(task, first.clone()) else {
+        first.release_endpoint();
+        second.release_endpoint();
+        return Err(EMFILE);
+    };
+    match insert(task, second.clone()) {
+        Some(second_fd) => Ok((first_fd, second_fd)),
+        None => {
+            second.release_endpoint();
+            let _ = close(task, first_fd);
+            Err(EMFILE)
+        }
+    }
+}
+
+/// Queues `bytes` (and any passed descriptors) on the peer end.
+fn socket_send_locked(
+    state: &Arc<Mutex<SocketState>>,
+    end: u8,
+    bytes: &[u8],
+    fds: Vec<Target>,
+) -> Result<u64, u64> {
+    let end = end as usize;
+    let peer = 1 - end;
+    let mut socket = state.lock();
+    if socket.ends[end].write_closed || socket.ends[peer].read_closed {
+        drop(socket);
+        for target in &fds {
+            target.release_endpoint();
+        }
+        return Err(EPIPE);
+    }
+    if !bytes.is_empty() || !fds.is_empty() {
+        socket.ends[peer].incoming.push_back(SocketMessage {
+            data: VecDeque::from(bytes.to_vec()),
+            fds,
+        });
+    }
+    drop(socket);
+    Ok(bytes.len() as u64)
+}
+
+/// `sendmsg(2)` core: copies `pass` descriptors from the sender's table into
+/// the message. The caller supplies the already gathered payload.
+pub fn socket_send(
+    task: u64,
+    fd: u64,
+    bytes: &[u8],
+    pass: &[u64],
+    _nonblock: bool,
+) -> Result<u64, u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::Socket { state, end, .. } = target else {
+        return Err(ENOTSOCK);
+    };
+    let mut passed: Vec<Target> = Vec::new();
+    for &passed_fd in pass {
+        let Some(passed_target) = lookup(task, passed_fd) else {
+            for target in &passed {
+                target.release_endpoint();
+            }
+            return Err(EBADF);
+        };
+        passed_target.retain_endpoint();
+        passed.push(passed_target);
+    }
+    socket_send_locked(&state, end, bytes, passed)
+}
+
+/// Pops one message, filling `buffer`. Returns the byte count and any
+/// descriptors that were attached. A short buffer keeps the remainder and
+/// the descriptors stay queued until the message is fully consumed.
+fn socket_recv_message(
+    state: &Arc<Mutex<SocketState>>,
+    end: u8,
+    nonblock: bool,
+    buffer: &mut [u8],
+) -> Result<(usize, Vec<Target>), u64> {
+    let end = end as usize;
+    let peer = 1 - end;
+    loop {
+        let mut socket = state.lock();
+        if socket.ends[end].read_closed {
+            return Ok((0, Vec::new()));
+        }
+        if let Some(message) = socket.ends[end].incoming.front_mut() {
+            let take = buffer.len().min(message.data.len());
+            for slot in buffer.iter_mut().take(take) {
+                *slot = message.data.pop_front().unwrap();
+            }
+            let fds = if message.data.is_empty() {
+                message.fds.drain(..).collect()
+            } else {
+                Vec::new()
+            };
+            if message.data.is_empty() {
+                socket.ends[end].incoming.pop_front();
+            }
+            return Ok((take, fds));
+        }
+        if socket.ends[peer].write_closed {
+            return Ok((0, Vec::new()));
+        }
+        drop(socket);
+        if nonblock {
+            return Err(EAGAIN);
+        }
+        scheduler::sleep(1);
+    }
+}
+
+/// `recvmsg(2)` core: returns the payload length and installs received
+/// descriptors into `task`'s table under fresh numbers.
+pub fn socket_recv(
+    task: u64,
+    fd: u64,
+    buffer: &mut [u8],
+    nonblock_hint: bool,
+) -> Result<(usize, Vec<u64>), u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::Socket {
+        state,
+        end,
+        nonblock,
+    } = target
+    else {
+        return Err(ENOTSOCK);
+    };
+    let (read, fds) = socket_recv_message(&state, end, nonblock || nonblock_hint, buffer)?;
+    let mut numbers = Vec::new();
+    for target in fds {
+        if let Some(number) = insert_transferred(task, target) {
+            numbers.push(number);
+        }
+    }
+    Ok((read, numbers))
+}
+
+/// `shutdown(2)`. `how`: 0 read, 1 write, 2 both.
+pub fn socket_shutdown(task: u64, fd: u64, how: u64) -> Result<(), u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::Socket { state, end, .. } = target else {
+        return Err(ENOTSOCK);
+    };
+    let end = end as usize;
+    let mut socket = state.lock();
+    let dropped = match how {
+        0 => {
+            socket.ends[end].read_closed = true;
+            socket.ends[end].incoming.drain(..).collect::<Vec<_>>()
+        }
+        1 => {
+            socket.ends[end].write_closed = true;
+            Vec::new()
+        }
+        2 => {
+            socket.ends[end].read_closed = true;
+            socket.ends[end].write_closed = true;
+            socket.ends[end].incoming.drain(..).collect::<Vec<_>>()
+        }
+        _ => return Err(EINVAL),
+    };
+    drop(socket);
+    for message in dropped {
+        for target in message.fds {
+            target.release_endpoint();
+        }
+    }
+    Ok(())
+}
+
+/// Open-file status flags for `fcntl(F_GETFL)`.
+pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
+    const O_WRONLY: u64 = 1;
+    const O_RDWR: u64 = 2;
+    const O_NONBLOCK: u64 = 0o4000;
+    let target = lookup(task, fd)?;
+    let (access, nonblock) = match target {
+        Target::Vfs(_) => (0, false),
+        Target::Pipe { read, .. } => (if read { 0 } else { O_WRONLY }, false),
+        Target::Socket { nonblock, .. } | Target::EventFd { nonblock, .. } => (O_RDWR, nonblock),
+        Target::Console
+        | Target::Null
+        | Target::Zero
+        | Target::Full
+        | Target::Random
+        | Target::MemFd(_) => (O_RDWR, false),
+    };
+    Some(access | if nonblock { O_NONBLOCK } else { 0 })
+}
+
+/// `fcntl(F_SETFL)` for the descriptors that can actually block.
+pub fn set_nonblock(task: u64, fd: u64, nonblock: bool) -> Result<(), u64> {
+    with_table(task, |table| {
+        match table
+            .slots
+            .get_mut(fd as usize)
+            .and_then(|slot| slot.as_mut())
+        {
+            Some(Target::Socket { nonblock: flag, .. })
+            | Some(Target::EventFd { nonblock: flag, .. }) => {
+                *flag = nonblock;
+                true
+            }
+            _ => false,
+        }
+    })
+    .then_some(())
+    .ok_or(EINVAL)
+}
+
 /// Readiness bits for `ppoll`. `None` means the descriptor is not open.
 pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
     const POLLIN: i16 = 0x001;
@@ -717,6 +1044,27 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
             ready
         }
         Target::MemFd(_) => POLLIN | POLLOUT,
+        Target::Socket { state, end, .. } => {
+            let socket = state.lock();
+            let end = end as usize;
+            let peer = 1 - end;
+            let mut ready = 0;
+            if !socket.ends[end].incoming.is_empty() {
+                ready |= POLLIN;
+            }
+            if socket.ends[end].read_closed {
+                ready |= POLLHUP;
+            } else if socket.ends[peer].write_closed {
+                // Drained queue plus a closed writer: EOF, still readable.
+                ready |= POLLIN | POLLHUP;
+            }
+            if !socket.ends[end].write_closed && !socket.ends[peer].read_closed {
+                ready |= POLLOUT;
+            } else {
+                ready |= POLLERR;
+            }
+            ready
+        }
     })
 }
 
@@ -772,7 +1120,9 @@ const ENOSPC: u64 = 28;
 const ESPIPE: u64 = 29;
 const EROFS: u64 = 30;
 const EPIPE: u64 = 32;
+const ENOTSOCK: u64 = 88;
 const EMFILE: u64 = 24;
+const S_IFSOCK: u32 = 0o140000;
 
 const S_IFCHR: u32 = 0o020000;
 const S_IFIFO: u32 = 0o010000;
