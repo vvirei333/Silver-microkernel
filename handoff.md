@@ -743,6 +743,13 @@ Redmi port is parked. The reference checklist is
   crop-scale before the frame loop. `wayland-info` lists both new globals.
   The protocol headers/code were generated with `wayland-scanner` from the
   upstream XML and checked into `third_party/wayland-aarch64`.
+  **Slice 49 (wl_subcompositor):** the compositor advertises
+  `wl_subcompositor` v1 and tracks a third surface as a subsurface. It accepts
+  `get_subsurface`, `set_position`, `place_above`/`place_below` and
+  `set_sync`/`set_desync`; the commit of the child surface is observed so the
+  final check requires it. The real client builds a child surface under the
+  toplevel, commits it, destroys it, and the multiplexed source/receiver
+  clients plus `wayland-info` all pass.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -769,9 +776,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 49 (a larger GTK/GLib toolkit; Wayland:
-  xdg-output/subcompositor and the remaining GTK globals). Network base
-  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 50 (a larger GTK/GLib toolkit; Wayland:
+  xdg-output and the remaining GTK globals). Network base maintenance
+  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

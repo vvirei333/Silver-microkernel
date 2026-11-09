@@ -27,6 +27,8 @@ static struct zxdg_decoration_manager_v1 *decoration_manager;
 static struct zxdg_toplevel_decoration_v1 *decoration;
 static struct wp_viewporter *viewporter;
 static struct wp_viewport *viewport;
+static struct wl_subcompositor *subcompositor;
+static struct wl_subsurface *subsurface;
 static struct wl_data_device *data_device;
 static struct wl_data_source *data_source;
 static struct wl_data_offer *clipboard_offer;
@@ -225,6 +227,10 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 1 ? version : 1;
         viewporter = wl_registry_bind(registry, name,
                                       &wp_viewporter_interface, use);
+    } else if (strcmp(interface, wl_subcompositor_interface.name) == 0) {
+        uint32_t use = version < 1 ? version : 1;
+        subcompositor = wl_registry_bind(registry, name,
+                                         &wl_subcompositor_interface, use);
     }
 }
 
@@ -827,6 +833,34 @@ int main(int argc, char **argv) {
             printf("clipboard receiver ok\n");
         }
     }
+
+    if (subcompositor == NULL) {
+        fprintf(stderr, "wlclient: subcompositor missing\n");
+        return 10;
+    }
+    struct wl_surface *child_surface =
+        wl_compositor_create_surface(compositor);
+    if (child_surface == NULL) {
+        return 10;
+    }
+    subsurface = wl_subcompositor_get_subsurface(subcompositor, child_surface,
+                                                 surface);
+    if (subsurface == NULL) {
+        return 10;
+    }
+    wl_subsurface_set_position(subsurface, 4, 4);
+    wl_subsurface_set_sync(subsurface);
+    wl_subsurface_set_desync(subsurface);
+    wl_subsurface_place_above(subsurface, surface);
+    wl_surface_attach(child_surface, second, 0, 0);
+    wl_surface_damage(child_surface, 0, 0, 8, 8);
+    wl_surface_commit(child_surface);
+    if (wl_display_roundtrip(display) < 0) {
+        return 10;
+    }
+    wl_subsurface_destroy(subsurface);
+    wl_surface_destroy(child_surface);
+    wl_subcompositor_destroy(subcompositor);
 
     /* Three frames alternating buffers, each waiting for frame + release. */
     for (int frame = 0; frame < 3; frame++) {

@@ -244,6 +244,10 @@ static unsigned decoration_manager_id;
 static unsigned decoration_id;
 static unsigned viewporter_id;
 static unsigned viewport_id;
+static unsigned subcompositor_id;
+static unsigned subsurface_id;
+static unsigned subsurface_surface_id;
+static int subsurface_ok;
 static unsigned data_source_id;
 static unsigned data_offer_id;
 static char data_mimes[4][64];
@@ -287,6 +291,10 @@ typedef struct {
     unsigned decoration_id;
     unsigned viewporter_id;
     unsigned viewport_id;
+    unsigned subcompositor_id;
+    unsigned subsurface_id;
+    unsigned subsurface_surface_id;
+    int subsurface_ok;
     unsigned data_source_id;
     unsigned data_offer_id;
     unsigned seat_id;
@@ -323,6 +331,7 @@ typedef struct {
     X(xdg_surface_id) X(toplevel_id) X(output_id) X(output_version) \
     X(data_manager_id) X(data_device_id) X(data_source_id) X(data_offer_id) \
     X(decoration_manager_id) X(decoration_id) X(viewporter_id) X(viewport_id) \
+    X(subcompositor_id) X(subsurface_id) X(subsurface_surface_id) X(subsurface_ok) \
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
     X(configure_serial) X(surface_id) X(popup_surface_id) \
     X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
@@ -476,6 +485,7 @@ static int serve(long client) {
                 send_global_version(client, registry_id, 7,
                                     "zxdg_decoration_manager_v1", 2);
                 send_global(client, registry_id, 8, "wp_viewporter");
+                send_global(client, registry_id, 9, "wl_subcompositor");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -543,7 +553,16 @@ static int serve(long client) {
                     decoration_manager_id = new_id;
                 } else if (text_equal(interface, "wp_viewporter")) {
                     viewporter_id = new_id;
+                } else if (text_equal(interface, "wl_subcompositor")) {
+                    subcompositor_id = new_id;
                 }
+            } else if (object == subcompositor_id && opcode == 1) {
+                /* wl_subcompositor.get_subsurface(new_id, surface, parent) */
+                subsurface_id = take_u32();
+                subsurface_surface_id = take_u32();
+                (void)take_u32();
+            } else if (object == subsurface_id && opcode == 0) {
+                subsurface_id = 0;
             } else if (object == decoration_manager_id && opcode == 1) {
                 /* get_toplevel_decoration(new_id, toplevel) */
                 decoration_id = take_u32();
@@ -623,8 +642,10 @@ static int serve(long client) {
                 unsigned new_surface = take_u32(); /* create_surface */
                 if (surface_id == 0) {
                     surface_id = new_surface;
-                } else {
+                } else if (popup_surface_id == 0) {
                     popup_surface_id = new_surface;
+                } else if (subsurface_surface_id == 0) {
+                    subsurface_surface_id = new_surface;
                 }
             } else if (object == shell_id && opcode == 1) {
                 positioner_id = take_u32(); /* create_positioner */
@@ -754,6 +775,8 @@ static int serve(long client) {
                 } else {
                     send_toplevel_state(client, 0);
                 }
+            } else if (object == subsurface_surface_id && opcode == 6) {
+                subsurface_ok = 1;
             } else if (object == popup_surface_id && opcode == 6) {
                 /* Popup commit: dismiss a grabbed popup once it is mapped. */
                 popup_committed = 1;
@@ -996,6 +1019,10 @@ static void reset_client(void) {
     decoration_id = 0;
     viewporter_id = 0;
     viewport_id = 0;
+    subcompositor_id = 0;
+    subsurface_id = 0;
+    subsurface_surface_id = 0;
+    subsurface_ok = 0;
     data_source_id = 0;
     data_offer_id = 0;
     data_mime_count = 0;
@@ -1140,7 +1167,8 @@ void _start(void) {
             sys3(57, clients[index].fd, 0, 0);
             clients[index].connected = 0;
         }
-        if (!clients[index].verified || clients[index].commits < 3) {
+        if (!clients[index].verified || clients[index].commits < 3 ||
+            !clients[index].subsurface_ok) {
             okay = 0;
         }
     }

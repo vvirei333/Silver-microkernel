@@ -307,6 +307,7 @@ static int serve(long client) {
                 send_global_version(client, registry_id, 7,
                                     "zxdg_decoration_manager_v1", 2);
                 send_global(client, registry_id, 8, "wp_viewporter");
+                send_global(client, registry_id, 9, "wl_subcompositor");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -362,6 +363,8 @@ static int serve(long client) {
                 } else if (text_equal(interface, "zxdg_decoration_manager_v1")) {
                     (void)new_id;
                 } else if (text_equal(interface, "wp_viewporter")) {
+                    (void)new_id;
+                } else if (text_equal(interface, "wl_subcompositor")) {
                     (void)new_id;
                 } else if (text_equal(interface, "wl_seat")) {
                     seat_id = new_id;

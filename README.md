@@ -587,8 +587,10 @@ compositor sends `xdg_toplevel.configure` and `xdg_surface.configure`, honours
 the matching state arrays, and still verifies the shared pixels. `xdg_popup`
 is implemented too: the client creates a positioner, gets a popup configure,
 maps it, grabs it and receives `popup_done`. `zxdg_decoration_manager_v1`
-negotiates client-side decorations (`set_mode`/`unset_mode`, configure) and
-`wp_viewporter` accepts source/destination crop-scale state. The vendored `xdg-shell-client-protocol.h`/
+negotiates client-side decorations (`set_mode`/`unset_mode`, configure),
+`wp_viewporter` accepts source/destination crop-scale state, and
+`wl_subcompositor` accepts child surfaces with position, place and
+sync/desync requests. The vendored `xdg-shell-client-protocol.h`/
 `.c` come from `wayland-protocols` 1.50.
 
 Input and output are advertised as well: `wl_output` v4 sends
