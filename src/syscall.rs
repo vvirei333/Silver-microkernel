@@ -588,7 +588,7 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
         if bytes.len() > LINUX_EXEC_LIMIT {
             return SYSCALL_ERROR;
         }
-        let Ok(image) = crate::linux_elf::load_linux_elf(&bytes) else {
+        let Ok(image) = crate::linux_elf::load_linux_program(&cwd, &bytes, LINUX_EXEC_LIMIT) else {
             return SYSCALL_ERROR;
         };
         // The same bundle policy applies: an unkeyed plain ELF has no digest

@@ -247,7 +247,7 @@ fn linux_execve(
     let Ok(bytes) = crate::vfs::read_file_limit(&cwd, &path, EXEC_LIMIT) else {
         return errno(ENOENT);
     };
-    let Ok(image) = crate::linux_elf::load_linux_elf(&bytes) else {
+    let Ok(image) = crate::linux_elf::load_linux_program(&cwd, &bytes, EXEC_LIMIT) else {
         return errno(ENOEXEC);
     };
     let Some(result) = scheduler::exec_linux_current(image, argv, envp) else {

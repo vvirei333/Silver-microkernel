@@ -4735,9 +4735,9 @@ fn linux_auxv(image: AuxvImage) -> Vec<(u64, u64)> {
     entries.push((AT_PHENT, image.phentsize));
     entries.push((AT_PHNUM, image.phnum));
     entries.push((AT_PAGESZ, PAGE_SIZE as u64));
-    entries.push((AT_BASE, 0));
+    entries.push((AT_BASE, image.interp_base as u64));
     entries.push((AT_FLAGS, 0));
-    entries.push((AT_ENTRY, image.entry as u64));
+    entries.push((AT_ENTRY, image.program_entry as u64));
     entries.push((AT_UID, 0));
     entries.push((AT_EUID, 0));
     entries.push((AT_GID, 0));
@@ -4752,6 +4752,8 @@ fn linux_auxv(image: AuxvImage) -> Vec<(u64, u64)> {
 #[derive(Copy, Clone)]
 struct AuxvImage {
     entry: usize,
+    program_entry: usize,
+    interp_base: usize,
     phdr_address: usize,
     phentsize: u64,
     phnum: u64,
@@ -4762,6 +4764,8 @@ impl AuxvImage {
     fn native(image: &LoadedImage) -> Self {
         Self {
             entry: image.entry,
+            program_entry: image.entry,
+            interp_base: 0,
             phdr_address: image.phdr_address,
             phentsize: image.phentsize,
             phnum: image.phnum,
@@ -4771,6 +4775,8 @@ impl AuxvImage {
     fn linux(image: &LinuxImage) -> Self {
         Self {
             entry: image.entry,
+            program_entry: image.program_entry,
+            interp_base: image.interp_base,
             phdr_address: image.phdr_address,
             phentsize: image.phentsize,
             phnum: image.phnum,

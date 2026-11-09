@@ -14,6 +14,7 @@
 #   linuxrun /sfs/linux-pipe    # pipe2+ppoll+fork, prints 'pipe: ping'
 #   linuxrun /sfs/linux-ipc     # eventfd2+memfd+futex, prints 'ipc ok'
 #   linuxrun /sfs/linux-signal  # sigaction/sigprocmask/kill/SIGCHLD
+#   linuxrun /sfs/linux-pie     # ET_DYN + PT_INTERP, prints 'pie main', exit 7
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -43,6 +44,14 @@ build pipe
 build ipc
 build signal
 
+# ET_DYN main + custom interpreter (no libc needed).
+"$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
+    -Wl,--dynamic-linker=/sfs/ld-test -Wl,-z,max-page-size=4096 \
+    -o build/pie-main.elf tests/linux/piemain.c
+"$CC" -nostdlib -ffreestanding -static -O2 \
+    -Wl,-T,tests/linux/chain.ld -Wl,-z,max-page-size=4096 \
+    -o build/ld-test.elf tests/linux/interp.c
+
 python3 scripts/sfs_inject.py "$IMAGE" build/hello.elf linux-hello
 python3 scripts/sfs_inject.py "$IMAGE" build/rw.elf linux-rw
 python3 scripts/sfs_inject.py "$IMAGE" build/chain.elf linux-chain
@@ -50,6 +59,8 @@ python3 scripts/sfs_inject.py "$IMAGE" build/fork.elf linux-fork
 python3 scripts/sfs_inject.py "$IMAGE" build/pipe.elf linux-pipe
 python3 scripts/sfs_inject.py "$IMAGE" build/ipc.elf linux-ipc
 python3 scripts/sfs_inject.py "$IMAGE" build/signal.elf linux-signal
+python3 scripts/sfs_inject.py "$IMAGE" build/pie-main.elf linux-pie
+python3 scripts/sfs_inject.py "$IMAGE" build/ld-test.elf ld-test
 
 # A real static libc binary (the SFS image is 1 MiB; all three together fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then

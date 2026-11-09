@@ -54,8 +54,10 @@ const ELFCLASS64: u8 = 2;
 const ELFDATA2LSB: u8 = 1;
 
 pub(crate) const ET_EXEC: u16 = 2;
+pub(crate) const ET_DYN: u16 = 3;
 pub(crate) const EM_AARCH64: u16 = 183;
 pub(crate) const PT_LOAD: u32 = 1;
+pub(crate) const PT_INTERP: u32 = 3;
 pub(crate) const PF_X: u32 = 1;
 pub(crate) const PF_W: u32 = 2;
 pub(crate) const PF_R: u32 = 4;

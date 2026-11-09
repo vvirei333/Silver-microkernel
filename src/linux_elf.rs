@@ -50,6 +50,8 @@ pub enum LinuxElfError {
     OverlappingSegments,
     ImageTooLarge,
     OutOfMemory,
+    /// `PT_INTERP` names a file that does not exist in the VFS.
+    InterpreterMissing,
 }
 
 /// One contiguous physical run mapped at `virtual_address`.
@@ -66,7 +68,16 @@ pub struct LinuxRun {
 /// A fully loaded Linux image plus the metadata the scheduler needs to map it
 /// and release its frames.
 pub struct LinuxImage {
+    /// Address the kernel starts at: the interpreter entry when one is
+    /// attached, otherwise the program entry.
     pub entry: usize,
+    /// The main executable's entry (`AT_ENTRY`), even when an interpreter is
+    /// attached.
+    pub program_entry: usize,
+    /// Load bias of the interpreter (`AT_BASE`), or 0.
+    pub interp_base: usize,
+    /// `PT_INTERP` path, once parsed.
+    pub interp_path: Option<alloc::string::String>,
     pub phdr_address: usize,
     pub phentsize: u64,
     pub phnum: u64,
@@ -116,6 +127,9 @@ impl LinuxImage {
         }
         Some(LinuxImage {
             entry: self.entry,
+            program_entry: self.program_entry,
+            interp_base: self.interp_base,
+            interp_path: self.interp_path.clone(),
             phdr_address: self.phdr_address,
             phentsize: self.phentsize,
             phnum: self.phnum,
@@ -123,6 +137,32 @@ impl LinuxImage {
             runs,
             released: AtomicBool::new(false),
         })
+    }
+
+    /// Attaches an already-loaded interpreter image at `base` (the `AT_BASE`
+    /// value) and switches the start address to the interpreter entry.
+    pub fn attach_interpreter(&mut self, mut interp: LinuxImage, base: usize) -> bool {
+        if interp.interp_path.is_some() || interp.interp_base != 0 {
+            return false;
+        }
+        for run in &interp.runs {
+            let start = run.virtual_address;
+            let end = start + run.page_count * PAGE_SIZE;
+            for existing in &self.runs {
+                let existing_start = existing.virtual_address;
+                let existing_end = existing_start + existing.page_count * PAGE_SIZE;
+                if start < existing_end && existing_start < end {
+                    return false;
+                }
+            }
+        }
+        self.entry = interp.entry;
+        self.interp_base = base;
+        self.upper_bound = self.upper_bound.max(interp.upper_bound);
+        self.runs.append(&mut interp.runs);
+        // The empty shell must not release anything on drop.
+        interp.released.store(true, Ordering::Release);
+        true
     }
 
     /// Returns every run to the allocator. Idempotent, like
@@ -166,6 +206,7 @@ pub fn error_name(error: LinuxElfError) -> &'static str {
         LinuxElfError::OverlappingSegments => "overlapping segments",
         LinuxElfError::ImageTooLarge => "image too large",
         LinuxElfError::OutOfMemory => "out of memory",
+        LinuxElfError::InterpreterMissing => "interpreter missing",
     }
 }
 
@@ -179,6 +220,53 @@ struct Segment {
 
 /// Parses, validates, allocates and fills a Linux ABI image.
 pub fn load_linux_elf(bytes: &[u8]) -> Result<LinuxImage, LinuxElfError> {
+    load_linux_elf_at(bytes, 0)
+}
+
+/// Preferred bases for PIE images: the main program and its interpreter must
+/// not overlap, and both must stay below the fixed user-stack window.
+pub const MAIN_BIAS: usize = 0x1000_0000;
+pub const INTERP_BIAS: usize = 0x2000_0000;
+
+/// Loads a program the way `execve` does: chooses a bias for `ET_DYN`, then
+/// resolves and attaches a `PT_INTERP` interpreter from the VFS.
+pub fn load_linux_program(
+    cwd: &str,
+    bytes: &[u8],
+    limit: usize,
+) -> Result<LinuxImage, LinuxElfError> {
+    let e_type = u16::from_le_bytes(
+        bytes
+            .get(16..18)
+            .ok_or(LinuxElfError::Truncated)?
+            .try_into()
+            .map_err(|_| LinuxElfError::Truncated)?,
+    );
+    let bias = if e_type == elf::ET_DYN {
+        MAIN_BIAS
+    } else {
+        0
+    };
+    let mut image = load_linux_elf_at(bytes, bias)?;
+    if let Some(path) = image.interp_path.clone() {
+        let length =
+            crate::vfs::file_len(cwd, &path).map_err(|_| LinuxElfError::InterpreterMissing)?;
+        if length > limit {
+            return Err(LinuxElfError::ImageTooLarge);
+        }
+        let interp_bytes = crate::vfs::read_file_limit(cwd, &path, limit)
+            .map_err(|_| LinuxElfError::InterpreterMissing)?;
+        let interp = load_linux_elf_at(&interp_bytes, INTERP_BIAS)?;
+        if !image.attach_interpreter(interp, INTERP_BIAS) {
+            return Err(LinuxElfError::OverlappingSegments);
+        }
+    }
+    Ok(image)
+}
+
+/// Loads a foreign image at `bias`. `ET_EXEC` images use 0; `ET_DYN`/PIE
+/// images are placed at a non-zero base chosen by the caller.
+pub fn load_linux_elf_at(bytes: &[u8], bias: usize) -> Result<LinuxImage, LinuxElfError> {
     let header = Elf64Ehdr::parse(bytes).map_err(map_error)?;
     if &header.ident[..4] != b"\x7FELF" {
         return Err(LinuxElfError::BadMagic);
@@ -189,14 +277,16 @@ pub fn load_linux_elf(bytes: &[u8]) -> Result<LinuxImage, LinuxElfError> {
     if header.ident[5] != 1 {
         return Err(LinuxElfError::BadDataEncoding);
     }
-    if header.e_type != elf::ET_EXEC {
+    if header.e_type != elf::ET_EXEC && header.e_type != elf::ET_DYN {
         return Err(LinuxElfError::NotExecutable);
     }
     if header.e_machine != elf::EM_AARCH64 {
         return Err(LinuxElfError::WrongMachine);
     }
 
-    let entry = header.e_entry as usize;
+    let entry = (header.e_entry as usize)
+        .checked_add(bias)
+        .ok_or(LinuxElfError::SegmentOutOfRange)?;
     let program_offset = header.e_phoff as usize;
     let program_size = header.e_phentsize as usize;
     let program_count = header.e_phnum as usize;
@@ -209,11 +299,26 @@ pub fn load_linux_elf(bytes: &[u8]) -> Result<LinuxImage, LinuxElfError> {
 
     let mut segments = Vec::new();
     let mut total_pages = 0usize;
+    let mut interp_path: Option<alloc::string::String> = None;
     for index in 0..program_count {
         let header_offset = program_offset
             .checked_add(index.checked_mul(program_size).ok_or(LinuxElfError::Truncated)?)
             .ok_or(LinuxElfError::Truncated)?;
         let ph = Elf64Phdr::parse(bytes, header_offset).map_err(map_error)?;
+        if ph.p_type == elf::PT_INTERP {
+            let start = ph.p_offset as usize;
+            let length = ph.p_filesz as usize;
+            let end = start.checked_add(length).ok_or(LinuxElfError::Truncated)?;
+            let raw = bytes.get(start..end).ok_or(LinuxElfError::Truncated)?;
+            let text = raw.split(|&byte| byte == 0).next().unwrap_or(&[]);
+            if text.is_empty() || text.len() > 255 {
+                return Err(LinuxElfError::BadProgramHeader);
+            }
+            let path = core::str::from_utf8(text)
+                .map_err(|_| LinuxElfError::BadProgramHeader)?;
+            interp_path = Some(alloc::string::String::from(path));
+            continue;
+        }
         if ph.p_type != elf::PT_LOAD {
             continue;
         }
@@ -232,7 +337,9 @@ pub fn load_linux_elf(bytes: &[u8]) -> Result<LinuxImage, LinuxElfError> {
             PageKind::ReadOnly
         };
         let file_offset = ph.p_offset as usize;
-        let virtual_address = ph.p_vaddr as usize;
+        let virtual_address = (ph.p_vaddr as usize)
+            .checked_add(bias)
+            .ok_or(LinuxElfError::SegmentOutOfRange)?;
         let file_size = ph.p_filesz as usize;
         let memory_size = ph.p_memsz as usize;
         if memory_size == 0 {
@@ -370,6 +477,9 @@ pub fn load_linux_elf(bytes: &[u8]) -> Result<LinuxImage, LinuxElfError> {
 
     Ok(LinuxImage {
         entry,
+        program_entry: entry,
+        interp_base: 0,
+        interp_path,
         phdr_address,
         phentsize: program_size as u64,
         phnum: program_count as u64,

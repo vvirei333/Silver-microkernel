@@ -445,8 +445,23 @@ signal ok
 
 Still missing: a per-task read scope (a Linux task can read any VFS path, which
 is acceptable on the single-user console but must be closed before untrusted
-apps), signal delivery and thread creation, `pipe`/`poll`/`eventfd`, and
-`ET_DYN` (PIE) relocation — link with `-no-pie`.
+apps), user-installed signal handlers (dispositions are recorded, see below),
+file-backed `mmap`, and a rootfs large enough for a real `ld.so` + libc.
+
+`ET_DYN`/PIE images load with a bias (`0x1000_0000` for the program,
+`0x2000_0000` for its interpreter), and `PT_INTERP` is resolved from the VFS
+and attached to the same image; the kernel starts at the interpreter entry and
+passes `AT_PHDR`/`AT_ENTRY` (main program) and `AT_BASE` (interpreter bias).
+A self-contained test pairs a PIE main with a tiny ET_EXEC interpreter that
+reads `AT_ENTRY` from the auxiliary vector and jumps to it:
+
+```text
+howl> linuxrun /sfs/linux-pie
+pie main
+```
+
+A real glibc `ld.so` additionally needs file-backed `mmap`/`mprotect` and a
+rootfs bigger than the 1 MiB SFS image; that is the next step.
 
 ## Bundle manifests and signing — complete
 

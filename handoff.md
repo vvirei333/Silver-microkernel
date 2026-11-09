@@ -273,6 +273,19 @@ Redmi port is parked. The reference checklist is
   (exercising sigaction/sigprocmask, wait/SIGCHLD and SIGKILL of a sleeping
   child). Running all six Linux tests plus the glibc test and `health` stays
   at 2171/31608 frames, zero zombies, zero open files, zero DMA leaks.
+  **Slice 11 (ET_DYN + PT_INTERP):** `load_linux_elf_at` accepts `ET_DYN` and
+  adds a caller-chosen bias; `load_linux_program` picks `MAIN_BIAS`
+  (0x1000_0000) for PIE, parses `PT_INTERP`, reads the interpreter from the
+  VFS and attaches its runs at `INTERP_BIAS` (0x2000_0000). `LinuxImage`
+  tracks `program_entry` (for `AT_ENTRY`), `interp_base` (for `AT_BASE`) and
+  `interp_path`; `entry` becomes the interpreter entry, so the trampoline and
+  `execve` start there. `fork` duplicates both. Test: `tests/linux/piemain.c`
+  is `-pie --dynamic-linker=/sfs/ld-test` and `tests/linux/interp.c` is a
+  reloc-free ET_EXEC interpreter that walks auxv to `AT_ENTRY` and branches;
+  `linuxrun /sfs/linux-pie` prints `pie main` and exits 7. A real libc
+  interpreter still needs file-backed `mmap`/`mprotect` and a bigger rootfs.
+  Running pie, signal, pipe, glibc and `health` together stays at 2171/31608
+  frames with no zombies/open files/DMA leaks.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -299,11 +312,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 11 (ET_DYN/PIE + `PT_INTERP`/`AT_BASE`, then
-  file-backed `mmap`/`mprotect` and a larger rootfs so `ld.so` can map a real
-  libc; signal-frame delivery/`rt_sigreturn`; COW fork), then headless
-  Wayland/GTK/D-Bus → Phosh. Network base maintenance (keep-alive, TLS
-  roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 12 (file-backed `mmap` + real `mprotect`, a
+  rootfs larger than 1 MiB, then a real `ld.so`/libc; signal-frame delivery
+  and `rt_sigreturn`; COW fork), then headless Wayland/GTK/D-Bus → Phosh.
+  Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.
