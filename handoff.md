@@ -787,6 +787,14 @@ Redmi port is parked. The reference checklist is
   `done(serial)`, and disable sends `leave`. The real client checks all three
   events. `wayland-info` lists the global. All multiplexed client, clipboard
   and protocol tests stay green.
+  **Slice 56 (real GLib/GObject):** vendored the Arch Linux ARM `glib2`
+  2.90.1 and `pcre2` 10.49 libraries and headers under
+  `third_party/glib-aarch64`. `tests/linux/glib.c` prints the GLib version,
+  instantiates a `GObject` subclass, formats a string and runs a `GMainLoop`
+  with a timeout source. The dynamic binary runs as
+  `linuxrun /sfs/glibtest` and prints `glib 2.90.1`, `gobject wolf-42`,
+  `glib mainloop ok`; the existing libc/dynamic tests still run. This is the
+  first real GLib app under the ABI, not a hand-written syscall test.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -813,8 +821,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 56 (a larger GTK/GLib toolkit; Wayland:
-  compositor-side state and remaining mobile globals). Network base
+- **Next steps:** Linux ABI slice 57 (GTK3/GTK4 toolkit on top of GLib and
+  the Wayland compositor; Wayland: compositor-side state). Network base
   maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on

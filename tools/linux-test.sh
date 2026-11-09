@@ -38,6 +38,7 @@
 #   linuxrun /sfs/linux-wlreal  # real libwayland-client against the mini compositor
 #   linuxrun /sfs/linux-wlinfo  # stock wayland-info binary against the compositor
 #   linuxrun /sfs/linux-dbus   # EXTERNAL auth + Hello/Reply, prints 'dbus ok'
+#   linuxrun /sfs/glibtest      # real GLib 2.90 + GObject main loop
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -89,6 +90,19 @@ build wayland_real
 build wayland_info
 build dbus
 
+# Real GLib/GObject (dynamically linked against the vendored aarch64 libs).
+GLIB=third_party/glib-aarch64
+if [ -f "$GLIB/lib/libglib-2.0.so.0" ] && [ -f "$GLIB/lib/libgobject-2.0.so.0" ]; then
+    "$CC" -O2 -I"$GLIB/include/glib-2.0" -I"$GLIB/lib/glib-2.0/include" \
+        -o build/glibtest tests/linux/glib.c \
+        -L"$GLIB/lib" -Lthird_party/wayland-aarch64/lib \
+        -Wl,-rpath-link,"$GLIB/lib" \
+        -Wl,-rpath-link,third_party/wayland-aarch64/lib \
+        -l:libglib-2.0.so.0 -l:libgobject-2.0.so.0 -l:libffi.so.8
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/glibtest
+fi
+
 # ET_DYN main + custom interpreter (no libc needed).
 "$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
     -Wl,--dynamic-linker=/sfs/ld-test -Wl,-z,max-page-size=4096 \
@@ -128,6 +142,15 @@ python3 scripts/sfs_inject.py "$IMAGE" build/wayland.elf linux-wayland
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland_real.elf linux-wlreal
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland_info.elf linux-wlinfo
 python3 scripts/sfs_inject.py "$IMAGE" build/dbus.elf linux-dbus
+if [ -f build/glibtest ]; then
+    python3 scripts/sfs_inject.py "$IMAGE" "$GLIB/lib/libglib-2.0.so.0" libglib-2.0.so.0
+    python3 scripts/sfs_inject.py "$IMAGE" "$GLIB/lib/libgobject-2.0.so.0" libgobject-2.0.so.0
+    python3 scripts/sfs_inject.py "$IMAGE" "$GLIB/lib/libpcre2-8.so.0" libpcre2-8.so.0
+    python3 scripts/sfs_inject.py "$IMAGE" build/glibtest glibtest
+    GLIBTEST=" linuxrun /sfs/glibtest"
+else
+    GLIBTEST=""
+fi
 
 # A real static libc binary (the SFS image is 64 MiB; all of these fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then
