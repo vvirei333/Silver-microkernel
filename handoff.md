@@ -818,6 +818,28 @@ Redmi port is parked. The reference checklist is
   sfs_inject.py` gained a free-block cursor so a 75 MiB bulk install takes
   ~1.7 s instead of tens of minutes. `wayland_real.c` also gained a
   `SERVE_ONLY` build that accepts one external client (the GTK harness).
+  **Slice 60 (security audit follow-up):** the external audit's critical and
+  high findings are closed. The kernel gained a ChaCha20 CSPRNG
+  (`src/entropy.rs`, CNTVCT jitter + RNDR + boot state, re-keyed every
+  1 MiB) behind `getrandom(2)`, `/dev/urandom`, `AT_RANDOM` and the new
+  `SYS_RANDOM`; TLS lost its ticks-seeded xorshift. `embedded-tls` now
+  requires BasicConstraints `cA=TRUE`, `keyCertSign` and `pathLenConstraint`
+  on every non-anchor issuer, which closes the
+  `[forgedLeaf, legitimateLeaf]` impersonation. `net_server` hands each
+  client its own DMA window instead of one shared 1 MiB buffer, and ping
+  replies follow the requester. Kernel-side: `parse_rights` cannot wrap,
+  `exit_group`/`kill` clean futex/fd/signal/mailbox/VFS tables, `execve`
+  refuses from a `CLONE_VM` sibling, `kill(2)` is bounded to the process
+  tree + Linux tasks, the Linux write path enforces the manifest quota, and
+  SFS re-runs a streaming fsck at mount. Also fixed: `RamFs::replace` no
+  longer deletes the target before a failing rename, SFS mutations no longer
+  treat an I/O error as a hole, and the boot-stub assembler flags live in
+  the same `global_asm!` block that tests them (the old split invocations
+  could fail an incremental build).
+  Deliberately not changed: `copy_to_user`'s validate/copy pair is
+  serialized by the kernel lock (every syscall, including `munmap`, holds
+  it), so the reported CLONE_VM race is not reachable; `LX-7` (Linux tasks
+  get a `/tmp` grant) remains a design decision.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -844,9 +866,13 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 58 (GTK3/GTK4 toolkit on top of GLib and
-  the Wayland compositor; Wayland: compositor-side state). Network base
-  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 61 — GTK3 still needs the non-contiguous /
+  streamed file-backed mapping and a larger per-task mmap window (slice 59's
+  blocker); then GTK4 and the Phosh track. Remaining audit lows: LX-8 (fd
+  identity is path-based), LX-9 (epoll fd numbers), LX-10 (timerfd
+  overflow), LX-11 (writev accounting / console loop), LX-12 (timespec
+  rounding), W-6 (ivshmem BAR check), W-7 (outbox backpressure), W-10
+  (stale link). Network base maintenance: keep-alive, RTC, TLS 1.2.
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.
