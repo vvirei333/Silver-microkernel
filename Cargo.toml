@@ -1,6 +1,6 @@
 [package]
 name = "silver_microkernel"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "AArch64 mobile microkernel with a Rust foundation"
 license = "MIT"

@@ -22,13 +22,17 @@ backends, kernel surface objects, input driver, home screen, `fog-paint`/
 Redmi port is parked. The reference checklist is
 [`docs/REFERENCE.md`](docs/REFERENCE.md).
 
-- **Host tests:** 217/217 (`cargo test --lib`).
+- **Host tests:** 220/220 (`cargo test --lib`).
 - **Builds:** `no_std` (product), `no_std,linux-abi` (Linux module on),
   `no_std,linux-abi-trace`, `no_std,fog`, `no_std,fog,fog-reloc`,
   `no_std,fog,fog-auto-reset`, `no_std,fog,fog-hw-selftests`,
   `no_std,tablet` (parked), `no_std,smp-selftest`, `no_std,demo-tasks`.
 - **Console OS (QEMU serial):** boots to `howl ready` with no graphics tasks;
   `help`, `uname`, `ls /`, `health` all answer. `health` reports no DMA leaks.
+  The kernel/userspace version is **0.1.1**. `fastfetch` prints an aligned
+  two-column summary — OS/kernel, codename, arch, platform, shell, FS, uptime,
+  memory with a percentage, processes, open files, SFS usage and DMA state —
+  followed by the 16-colour bar, and `uname` reports `Silver Kernel v0.1.1`.
 - **Network:** `net_server` runs DHCP (with the static fallback), DNS, TCP and
   HTTP. `ip` prints the lease, `ping 10.0.2.2` is OK, `dns example.com`
   resolves, `wget http://example.com/ /tmp/e.html` stores a 577-byte page, and

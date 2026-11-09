@@ -814,7 +814,7 @@ fn linux_uname(buffer: u64) -> u64 {
     let fields: [&[u8]; 6] = [
         b"Linux",
         b"werewolf",
-        b"0.1.0",
+        b"0.1.1",
         b"#1 SMP",
         b"aarch64",
         b"(none)",

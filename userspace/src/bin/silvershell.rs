@@ -201,7 +201,7 @@ fn execute(command: &str) {
         Some("help") => {
             syscall::print("howl commands:\r\n");
             syscall::print("  help       Show this command list\r\n");
-            syscall::print("  fastfetch  Show OS, uptime and memory information\r\n");
+            syscall::print("  fastfetch  Show the aligned system summary\r\n");
             syscall::print("  sfsinfo    Show the mounted SFS superblock\r\n");
             syscall::print("  memtest    mmap 1 MiB, write/read it back\r\n");
             syscall::print("  ping <ip>  Send one ICMP echo request\r\n");
@@ -275,7 +275,7 @@ fn execute(command: &str) {
         Some("cd") => change_directory(words.next()),
         Some("pwd") => print_working_directory(),
         Some("clear") => clear_screen(),
-        Some("uname") => syscall::print("Silver Kernel v0.1.0 aarch64 (WerewolfOS)\r\n"),
+        Some("uname") => syscall::print("Silver Kernel v0.1.1 aarch64 (WerewolfOS)\r\n"),
         Some("health") => show_health(),
         Some("du") => show_usage(words.next()),
         Some("ps") => show_tasks(),
@@ -1341,43 +1341,146 @@ fn parse_number(text: &str) -> Option<u64> {
 fn fastfetch() {
     let uptime = syscall::uptime_ticks();
     let memory = syscall::memory_info();
+    let health = syscall::health_info();
+    let disk = syscall::fs_usage("/sfs");
 
     print_logo();
     syscall::print("\r\n");
-    field("werewolf@howl");
-    field("-------------");
-    field("OS: WerewolfOS");
-    field("Kernel: Silver Microkernel");
-    field("Version: 0.x");
-    field("Codename: First Howl");
-    field("Arch: AArch64");
-    field("Platform: QEMU / ARM64");
-    field("Type: Microkernel");
-    field("Shell: Howl");
-    field("FS: SFS");
-    field("Status: Experimental");
+    plain("werewolf@howl");
+    plain("-------------");
+    field("OS:", "WerewolfOS 0.1.1");
+    field("Kernel:", "Silver Microkernel 0.1.1");
+    field("Codename:", "First Howl");
+    field("Arch:", "AArch64");
+    field("Platform:", "QEMU / ARM64");
+    field("Type:", "Microkernel");
+    field("Shell:", "Howl");
+    field("FS:", "SFS");
+    field("Status:", "Experimental");
 
-    syscall::print("Uptime: ");
+    heading("Uptime:");
     print_uptime(uptime);
     syscall::print("\r\n");
 
-    syscall::print("Memory: ");
+    heading("Memory:");
     if let Some(info) = memory {
         print_mib(info.used_bytes);
         syscall::print(" / ");
         print_mib(info.total_bytes);
+        syscall::print(" (");
+        print_percent(info.used_bytes, info.total_bytes);
+        syscall::print(")");
     } else {
         syscall::print("unavailable");
     }
     syscall::print("\r\n");
 
-    syscall::print("Free RAM: ");
+    heading("Free RAM:");
     if let Some(info) = memory {
         print_mib(info.free_bytes);
     } else {
         syscall::print("unavailable");
     }
     syscall::print("\r\n");
+
+    heading("Processes:");
+    if let Some(info) = health {
+        syscall::print_dec_u64(info.live_tasks);
+        syscall::print(" live / ");
+        syscall::print_dec_u64(info.zombies);
+        syscall::print(" zombie");
+    } else {
+        syscall::print("unavailable");
+    }
+    syscall::print("\r\n");
+
+    heading("Open files:");
+    if let Some(info) = health {
+        syscall::print_dec_u64(info.open_files);
+    } else {
+        syscall::print("unavailable");
+    }
+    syscall::print("\r\n");
+
+    heading("Disk (/sfs):");
+    if let Some(usage) = disk {
+        print_size(usage.blocks.saturating_mul(512));
+        syscall::print(" used / ");
+        syscall::print_dec_u64(usage.inodes);
+        syscall::print(" inodes");
+    } else {
+        syscall::print("unavailable");
+    }
+    syscall::print("\r\n");
+
+    heading("DMA:");
+    if let Some(info) = health {
+        syscall::print_dec_u64(info.dma_leaked_pages);
+        syscall::print(" leaked / ");
+        syscall::print_dec_u64(info.dma_quarantined_pages);
+        syscall::print(" quarantined");
+    } else {
+        syscall::print("unavailable");
+    }
+    syscall::print("\r\n");
+
+    print_color_bar();
+}
+
+/// Fastfetch prints its labels as the left column and values as the right.
+/// Padding to a fixed column keeps the numbers aligned instead of the old
+/// `OS: ...` one-string-per-line style.
+const FIELD_WIDTH: usize = 13;
+
+fn plain(text: &str) {
+    syscall::print(text);
+    syscall::print("\r\n");
+}
+
+fn heading(label: &str) {
+    syscall::print(label);
+    let mut column = label.len();
+    while column < FIELD_WIDTH {
+        syscall::print(" ");
+        column += 1;
+    }
+}
+
+fn field(label: &str, value: &str) {
+    heading(label);
+    syscall::print(value);
+    syscall::print("\r\n");
+}
+
+/// A 16-colour strip, like the one at the bottom of fastfetch. Two spaces per
+/// block keeps it readable on the 80-column serial console.
+fn print_color_bar() {
+    syscall::print("\r\n");
+    syscall::print(
+        "\x1b[40m  \x1b[41m  \x1b[42m  \x1b[43m  \x1b[44m  \x1b[45m  \x1b[46m  \x1b[47m  \x1b[0m\r\n",
+    );
+    syscall::print(
+        "\x1b[100m  \x1b[101m  \x1b[102m  \x1b[103m  \x1b[104m  \x1b[105m  \x1b[106m  \x1b[107m  \x1b[0m\r\n",
+    );
+}
+
+fn print_percent(used: u64, total: u64) {
+    let percent = if total == 0 {
+        0
+    } else {
+        used.saturating_mul(100) / total
+    };
+    syscall::print_dec_u64(percent);
+    syscall::print("%");
+}
+
+fn print_size(bytes: u64) {
+    if bytes >= MIB {
+        print_mib(bytes);
+    } else {
+        syscall::print_dec_u64(bytes / 1024);
+        syscall::print(" KiB");
+    }
 }
 
 fn print_logo() {
@@ -1397,11 +1500,6 @@ fn print_logo() {
         syscall::print(line.trim_end());
         syscall::print("\r\n");
     }
-}
-
-fn field(text: &str) {
-    syscall::print(text);
-    syscall::print("\r\n");
 }
 
 fn print_uptime(ticks: u64) {
