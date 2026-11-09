@@ -1462,9 +1462,10 @@ pub extern "C" fn kernel_main() -> ! {
     }
     ram_log::log("HEAP OK");
 
-    // Snapshot the on-disk SFS before the EL0 block driver claims the device,
-    // then serve it read-only from the kernel VFS. Additive: a missing device
-    // leaves the boot path unchanged.
+    // Mount the on-disk SFS in streaming mode: the kernel owns virtio-blk and
+    // reads 512-byte blocks on demand through a bounded cache instead of
+    // loading the whole image into RAM. Additive: a missing device leaves the
+    // boot path unchanged.
     if sfs::load() {
         sfs::report();
         ram_log::log("KSFS loaded");
@@ -1628,8 +1629,8 @@ pub extern "C" fn kernel_main() -> ! {
     ram_log::log("GICv3+TIMER OK");
     vfs::init();
     seed::seed();
-    // The kernel SFS snapshot is mounted read-write: the kernel owns the
-    // virtio-blk device and every VFS write is flushed through to disk.
+    // The kernel streams SFS reads from virtio-blk. Mutations are disabled in
+    // this slice; /tmp is the writable filesystem.
     if sfs::loaded() {
         let _ = vfs::mkdir("/", "/sfs");
         if vfs::mount("/", "/sfs", "sfs", "", 0, |_| false).is_ok() {

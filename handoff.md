@@ -638,6 +638,17 @@ Redmi port is parked. The reference checklist is
   step, not demand streaming: the whole image is still resident. Full series
   plus repeats and `health`: 21884/31575 frames, zero zombies/open files/DMA
   leaks; fsck clean.
+  **Slice 38 (streaming SFS):** `src/sfs.rs` is now a streaming, read-only
+  backend. The kernel owns virtio-blk, reads the superblock at mount and then
+  serves inodes, directories, indirect tables and file data from a 512-block
+  (256 KiB) write-through cache. The whole image is no longer allocated or
+  read at boot; `MAX_IMAGE_SECTORS` and the image buffer are gone. `fstat`-style
+  usage scans the bitmap and inode table on demand. All Linux tests, real
+  libwayland, wayland-info, D-Bus and the 8 MiB payload read correctly;
+  resident frames dropped from 21884 to **5500/31515**. SFS mutations are
+  disabled until the block-allocation/write path is ported; `/tmp` stays
+  writable. Full series plus repeats and `health`: zero zombies/open
+  files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -664,9 +675,10 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 38 (SFS block-device abstraction for true
-  demand streaming and larger files, then a larger toolkit). Network base
-  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 39 (restore SFS writes on top of the
+  streaming cache and extend the block tree past 8 MiB files, then a larger
+  toolkit). Network base maintenance (keep-alive, TLS roots/RTC/RNG,
+  TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

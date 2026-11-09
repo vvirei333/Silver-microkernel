@@ -1,517 +1,552 @@
-//! Kernel SFS: device glue and the VFS `FileSystem` implementation.
+//! Kernel SFS: a streaming, read-only VFS backend.
 //!
-//! All on-disk format rules live in [`crate::sfs_format`], parameterized by
-//! the [`sfs_format::SfsDisk`] trait so they are testable on the host; this
-//! module owns the image buffer, the virtio-backed disk adapter, and the
-//! write-through discipline: the in-memory image stays authoritative for
-//! reads, every mutation is written through to the device sector by sector.
+//! The kernel owns the virtio-blk device and reads 512-byte blocks on demand
+//! through a small write-through cache; the whole image is no longer loaded
+//! into RAM. Metadata (superblock, inodes, directories, indirect tables) and
+//! file data all come from the same block cache, so the RAM footprint is
+//! bounded by [`CACHE_BLOCKS`] instead of the image size.
 //!
-//! The kernel owns the disk (`virtio_blk`) and loads the whole image at boot.
-//! Write syscalls are gated by `CAP_FS_WRITE` upstream (see `syscall.rs`).
+//! SFS mutations (create/unlink/rename/write) are not available in streaming
+//! mode: writes would need to allocate blocks and update the bitmap/inode
+//! tables, which is the next format slice. `/tmp` remains writable on RamFs.
+//! The offline tools (`scripts/sfs_*.py`) and `sfs_format` host tests still
+//! own the write format.
 
 use alloc::vec::Vec;
 
 use crate::console;
-use crate::frame_allocator;
-use crate::memory::phys_to_virt;
-use crate::sfs_format::{self, SfsDisk};
-use crate::vfs::{DirEntry, FileSystem, MAX_NAME_LEN};
+use crate::mutex::Mutex;
+use crate::sfs_format::{BLOCK_SIZE, DIRECT_BLOCKS, INDIRECT_POINTERS, INODE_SIZE};
+use crate::vfs::{DirEntry, FileSystem, FsUsage, MAX_NAME_LEN};
 use crate::virtio_blk;
 
-use sfs_format::{Superblock, BLOCK_SIZE};
+const MAGIC: u32 = 0x5346_5321;
+const INODE_KIND_FREE: u32 = 0;
+const INODE_KIND_FILE: u32 = 1;
+const INODE_KIND_DIR: u32 = 2;
+const DIR_ENTRY_SIZE: usize = 32;
+const DIR_ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DIR_ENTRY_SIZE;
+const NAME_LIMIT: usize = 27;
+const MAX_FILE_BLOCKS: usize =
+    DIRECT_BLOCKS + INDIRECT_POINTERS + INDIRECT_POINTERS * INDIRECT_POINTERS;
 
-/// The format's fixed geometry; used to size the boot read before the
-/// superblock is parsed.
-const IMAGE_SECTORS: usize = 2048;
+/// 512 cached blocks = 256 KiB. Enough for the inode table scan and a few
+/// directory/file blocks without rereading them on every step.
+const CACHE_BLOCKS: usize = 512;
 
-static mut IMAGE_PTR: *mut u8 = core::ptr::null_mut();
-static mut IMAGE_LEN: usize = 0;
+const _: () = assert!(BLOCK_SIZE == 512);
 
-fn image() -> Result<&'static [u8], ()> {
-    unsafe {
-        if IMAGE_PTR.is_null() {
-            return Err(());
-        }
-        Ok(core::slice::from_raw_parts(IMAGE_PTR, IMAGE_LEN))
+#[derive(Copy, Clone, Debug)]
+struct Superblock {
+    total_blocks: u32,
+    root_inode: u32,
+    inode_count: u32,
+    inode_table_block: u32,
+    bitmap_block: u32,
+    data_block_start: u32,
+}
+
+#[derive(Copy, Clone)]
+struct Inode {
+    kind: u32,
+    size: u32,
+    blocks: [u32; DIRECT_BLOCKS],
+    indirect: u32,
+    double: u32,
+}
+
+impl Inode {
+    fn is_dir(&self) -> bool {
+        self.kind == INODE_KIND_DIR
+    }
+    fn is_file(&self) -> bool {
+        self.kind == INODE_KIND_FILE
     }
 }
 
-fn image_mut() -> Result<&'static mut [u8], ()> {
-    unsafe {
-        if IMAGE_PTR.is_null() {
-            return Err(());
-        }
-        Ok(core::slice::from_raw_parts_mut(IMAGE_PTR, IMAGE_LEN))
-    }
+struct State {
+    superblock: Option<Superblock>,
+    device_blocks: u32,
 }
 
-pub fn loaded() -> bool {
-    unsafe { !IMAGE_PTR.is_null() }
+static STATE: Mutex<State> = Mutex::new(State {
+    superblock: None,
+    device_blocks: 0,
+});
+
+struct Cache {
+    keys: [u32; CACHE_BLOCKS],
+    data: [[u8; BLOCK_SIZE]; CACHE_BLOCKS],
+    next: usize,
 }
 
-/// Persists format mutations through the kernel's virtio-blk driver.
-struct Disk;
+static CACHE: Mutex<Cache> = Mutex::new(Cache {
+    keys: [u32::MAX; CACHE_BLOCKS],
+    data: [[0_u8; BLOCK_SIZE]; CACHE_BLOCKS],
+    next: 0,
+});
 
-impl SfsDisk for Disk {
-    fn write_sector(&mut self, sector: u64, data: &[u8; BLOCK_SIZE]) -> bool {
-        virtio_blk::write_sector(sector, data)
-    }
+fn u32_at(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }
 
-pub struct Sfs;
-
-impl FileSystem for Sfs {
-    fn create_file(&mut self, path: &str) -> Result<(), ()> {
-        let parts = sfs_format::split_path(path)?;
-        let (&name, parent_parts) = parts.split_last().ok_or(())?;
-        let image = image_mut()?;
-        let superblock = sfs_format::superblock(image)?;
-        let parent = sfs_format::resolve_dir(image, &superblock, parent_parts).ok_or(())?;
-        match sfs_format::find_entry(image, &superblock, parent, name) {
-            Some((block, slot)) => {
-                let index = sfs_format::u32_at(image, block * BLOCK_SIZE + slot * sfs_format::DIR_ENTRY_SIZE);
-                let (kind, _, _, _, _) = sfs_format::inode_get(image, &superblock, index).ok_or(())?;
-                if kind != sfs_format::INODE_KIND_FILE {
-                    return Err(());
-                }
-                if sfs_format::truncate(image, &superblock, &mut Disk, index) {
-                    Ok(())
-                } else {
-                    Err(())
-                }
+/// Reads one block through the cache; the cache is never held across I/O.
+fn read_block(block: u32, out: &mut [u8; BLOCK_SIZE]) -> bool {
+    {
+        let cache = CACHE.lock();
+        for index in 0..CACHE_BLOCKS {
+            if cache.keys[index] == block {
+                out.copy_from_slice(&cache.data[index]);
+                return true;
             }
-            None => sfs_format::create_inode(image, &superblock, &mut Disk, parent, name, sfs_format::INODE_KIND_FILE)
-                .map(|_| ())
-                .ok_or(()),
         }
     }
+    if !virtio_blk::read_sector(block as u64, out) {
+        return false;
+    }
+    let mut cache = CACHE.lock();
+    let index = cache.next;
+    cache.next = (index + 1) % CACHE_BLOCKS;
+    cache.keys[index] = block;
+    cache.data[index].copy_from_slice(out);
+    true
+}
 
-    fn make_directory(&mut self, path: &str) -> Result<(), ()> {
-        let parts = sfs_format::split_path(path)?;
-        let (&name, parent_parts) = parts.split_last().ok_or(())?;
-        let image = image_mut()?;
-        let superblock = sfs_format::superblock(image)?;
-        let parent = sfs_format::resolve_dir(image, &superblock, parent_parts).ok_or(())?;
-        if sfs_format::find_entry(image, &superblock, parent, name).is_some() {
-            return Err(());
+fn parse_superblock(block: &[u8; BLOCK_SIZE], device_blocks: u32) -> Option<Superblock> {
+    if u32_at(block, 0) != MAGIC {
+        return None;
+    }
+    let block_size = u32_at(block, 8);
+    let total_blocks = u32_at(block, 12);
+    let root_inode = u32_at(block, 16);
+    let inode_count = u32_at(block, 20);
+    let bitmap_block = u32_at(block, 24);
+    let inode_table_block = u32_at(block, 28);
+    let data_block_start = u32_at(block, 36);
+    if block_size as usize != BLOCK_SIZE
+        || total_blocks == 0
+        || total_blocks > device_blocks
+        || inode_count == 0
+        || root_inode >= inode_count
+        || bitmap_block >= total_blocks
+        || inode_table_block >= total_blocks
+        || data_block_start >= total_blocks
+    {
+        return None;
+    }
+    let bitmap_blocks = (total_blocks as usize)
+        .div_ceil(8)
+        .div_ceil(BLOCK_SIZE) as u32;
+    let inode_blocks = ((inode_count as usize) * INODE_SIZE).div_ceil(BLOCK_SIZE) as u32;
+    if bitmap_block.checked_add(bitmap_blocks)? > total_blocks
+        || inode_table_block.checked_add(inode_blocks)? > total_blocks
+    {
+        return None;
+    }
+    Some(Superblock {
+        total_blocks,
+        root_inode,
+        inode_count,
+        inode_table_block,
+        bitmap_block,
+        data_block_start,
+    })
+}
+
+fn reader() -> Option<Reader> {
+    let state = STATE.lock();
+    Some(Reader {
+        superblock: state.superblock?,
+        device_blocks: state.device_blocks,
+    })
+}
+
+#[derive(Copy, Clone)]
+struct Reader {
+    superblock: Superblock,
+    device_blocks: u32,
+}
+
+impl Reader {
+    fn inode(&self, index: u32) -> Option<Inode> {
+        if index >= self.superblock.inode_count {
+            return None;
         }
-        sfs_format::create_inode(image, &superblock, &mut Disk, parent, name, sfs_format::INODE_KIND_DIR)
-            .map(|_| ())
-            .ok_or(())
+        let offset = (index as usize) * INODE_SIZE;
+        let block = self.superblock.inode_table_block + (offset / BLOCK_SIZE) as u32;
+        let within = offset % BLOCK_SIZE;
+        if within + INODE_SIZE > BLOCK_SIZE {
+            return None;
+        }
+        let mut bytes = [0_u8; BLOCK_SIZE];
+        if !read_block(block, &mut bytes) {
+            return None;
+        }
+        Some(Inode {
+            kind: u32_at(&bytes, within),
+            size: u32_at(&bytes, within + 4),
+            blocks: [
+                u32_at(&bytes, within + 8),
+                u32_at(&bytes, within + 12),
+                u32_at(&bytes, within + 16),
+                u32_at(&bytes, within + 20),
+            ],
+            indirect: u32_at(&bytes, within + 24),
+            double: u32_at(&bytes, within + 28),
+        })
     }
 
-    fn remove_file(&mut self, path: &str) -> Result<(), ()> {
-        let parts = sfs_format::split_path(path)?;
-        let (&name, parent_parts) = parts.split_last().ok_or(())?;
-        let image = image_mut()?;
-        let superblock = sfs_format::superblock(image)?;
-        let parent = sfs_format::resolve_dir(image, &superblock, parent_parts).ok_or(())?;
-        let (block, slot) = sfs_format::find_entry(image, &superblock, parent, name).ok_or(())?;
-        let index = sfs_format::u32_at(image, block * BLOCK_SIZE + slot * sfs_format::DIR_ENTRY_SIZE);
-        let (kind, size, blocks, indirect, double) =
-            sfs_format::inode_get(image, &superblock, index).ok_or(())?;
-        if kind != sfs_format::INODE_KIND_FILE {
-            return Err(());
-        }
-        if !sfs_format::remove_dir_entry(image, &superblock, &mut Disk, parent, block, slot) {
-            return Err(());
-        }
-        let empty = [0_u32; sfs_format::DIRECT_BLOCKS];
-        sfs_format::inode_put(image, &superblock, &mut Disk, index, sfs_format::INODE_KIND_FREE, 0, &empty, 0, 0);
-        // Release only after the inode stopped referencing the blocks: a crash
-        // in between leaks them instead of cross-linking two files.
-        sfs_format::free_inode_blocks(image, &superblock, kind, size, &blocks, indirect, double);
-        sfs_format::flush_bitmap(image, &superblock, &mut Disk);
-        Ok(())
+    fn valid_data_block(&self, block: u32) -> bool {
+        block >= self.superblock.data_block_start && block < self.superblock.total_blocks
     }
 
-    fn remove_directory(&mut self, path: &str) -> Result<(), ()> {
-        let parts = sfs_format::split_path(path)?;
-        let (&name, parent_parts) = parts.split_last().ok_or(())?;
-        let image = image_mut()?;
-        let superblock = sfs_format::superblock(image)?;
-        let parent = sfs_format::resolve_dir(image, &superblock, parent_parts).ok_or(())?;
-        let (block, slot) = sfs_format::find_entry(image, &superblock, parent, name).ok_or(())?;
-        let index = sfs_format::u32_at(image, block * BLOCK_SIZE + slot * sfs_format::DIR_ENTRY_SIZE);
-        let (kind, _, blocks, indirect, _) =
-            sfs_format::inode_get(image, &superblock, index).ok_or(())?;
-        // A directory that ever held an entry keeps its block, because entries
-        // are cleared in place; only a never-used directory is removable.
-        if kind != sfs_format::INODE_KIND_DIR
-            || indirect != 0
-            || blocks.iter().any(|&block| block != 0)
-        {
-            return Err(());
-        }
-        if !sfs_format::remove_dir_entry(image, &superblock, &mut Disk, parent, block, slot) {
-            return Err(());
-        }
-        let empty = [0_u32; sfs_format::DIRECT_BLOCKS];
-        sfs_format::inode_put(image, &superblock, &mut Disk, index, sfs_format::INODE_KIND_FREE, 0, &empty, 0, 0);
-        sfs_format::flush_bitmap(image, &superblock, &mut Disk);
-        Ok(())
-    }
-
-    fn rename(&mut self, source: &str, destination: &str) -> Result<(), ()> {
-        let source_parts = sfs_format::split_path(source)?;
-        let dest_parts = sfs_format::split_path(destination)?;
-        let (&old_name, old_parent_parts) = source_parts.split_last().ok_or(())?;
-        let (&new_name, new_parent_parts) = dest_parts.split_last().ok_or(())?;
-        let image = image_mut()?;
-        let superblock = sfs_format::superblock(image)?;
-        let old_parent = sfs_format::resolve_dir(image, &superblock, old_parent_parts).ok_or(())?;
-        let new_parent = sfs_format::resolve_dir(image, &superblock, new_parent_parts).ok_or(())?;
-        if sfs_format::find_entry(image, &superblock, new_parent, new_name).is_some() {
-            return Err(());
-        }
-        let (block, slot) = sfs_format::find_entry(image, &superblock, old_parent, old_name).ok_or(())?;
-        let index = sfs_format::u32_at(image, block * BLOCK_SIZE + slot * sfs_format::DIR_ENTRY_SIZE);
-
-        if old_parent == new_parent {
-            if !sfs_format::rename_entry_in_place(image, &superblock, &mut Disk, block, slot, new_name) {
-                return Err(());
+    /// Physical block backing logical `slot`, or `None` for a hole/EOF.
+    fn block_at(&self, inode: &Inode, slot: usize) -> Option<u32> {
+        let block = if slot < DIRECT_BLOCKS {
+            inode.blocks[slot]
+        } else if slot < DIRECT_BLOCKS + INDIRECT_POINTERS {
+            if inode.indirect == 0 {
+                return None;
             }
-            return Ok(());
-        }
-
-        sfs_format::add_entry(image, &superblock, &mut Disk, new_parent, new_name, index).ok_or(())?;
-        if !sfs_format::remove_dir_entry(image, &superblock, &mut Disk, old_parent, block, slot) {
-            // The entry now exists under both parents. Undo the new one so a
-            // failed rename never leaves a hard link behind, and report the
-            // operation as failed.
-            let _ = undo_new_entry(image, &superblock, new_parent, new_name);
-            return Err(());
-        }
-        Ok(())
-    }
-
-    fn replace(&mut self, source: &str, destination: &str) -> Result<(), ()> {
-        let image = image_mut()?;
-        let superblock = sfs_format::superblock(image)?;
-        if sfs_format::replace_entry(image, &superblock, &mut Disk, source, destination) {
-            Ok(())
+            let mut table = [0_u8; BLOCK_SIZE];
+            if !read_block(inode.indirect, &mut table) {
+                return None;
+            }
+            u32_at(&table, (slot - DIRECT_BLOCKS) * 4)
         } else {
-            Err(())
+            let position = slot - DIRECT_BLOCKS - INDIRECT_POINTERS;
+            if position >= INDIRECT_POINTERS * INDIRECT_POINTERS || inode.double == 0 {
+                return None;
+            }
+            let table_index = position / INDIRECT_POINTERS;
+            let pointer = position % INDIRECT_POINTERS;
+            let mut node = [0_u8; BLOCK_SIZE];
+            if !read_block(inode.double, &mut node) {
+                return None;
+            }
+            let table_block = u32_at(&node, table_index * 4);
+            if table_block == 0 {
+                return None;
+            }
+            let mut table = [0_u8; BLOCK_SIZE];
+            if !read_block(table_block, &mut table) {
+                return None;
+            }
+            u32_at(&table, pointer * 4)
+        };
+        if block == 0 || !self.valid_data_block(block) {
+            None
+        } else {
+            Some(block)
         }
     }
 
-    fn is_directory(&self, path: &str) -> Result<bool, ()> {
-        let image = image()?;
-        let superblock = sfs_format::superblock(image)?;
-        let parts = sfs_format::split_path(path)?;
-        if parts.is_empty() {
-            return Ok(true);
+    fn resolve(&self, path: &str) -> Option<u32> {
+        let mut current = self.superblock.root_inode;
+        for part in path.split('/') {
+            if part.is_empty() {
+                continue;
+            }
+            current = self.find_child(current, part)?;
         }
-        let (_, kind, _) = sfs_format::lookup(image, &superblock, path).ok_or(())?;
-        Ok(kind == sfs_format::INODE_KIND_DIR)
+        Some(current)
     }
 
-    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, ()> {
-        let image = image()?;
-        let superblock = sfs_format::superblock(image)?;
-        let parts = sfs_format::split_path(path)?;
-        let dir = sfs_format::resolve_dir(image, &superblock, &parts).ok_or(())?;
-        let (_, _, blocks, indirect, _) = sfs_format::inode_get(image, &superblock, dir).ok_or(())?;
-        let mut entries = Vec::new();
-        for block_slot in 0..sfs_format::MAX_FILE_BLOCKS {
-            let Some(block) =
-                sfs_format::inode_slot_block(image, &superblock, &blocks, indirect, 0, block_slot)
-            else {
+    fn find_child(&self, directory: u32, name: &str) -> Option<u32> {
+        let inode = self.inode(directory)?;
+        if !inode.is_dir() {
+            return None;
+        }
+        for slot in 0..MAX_FILE_BLOCKS {
+            let Some(block) = self.block_at(&inode, slot) else {
                 break;
             };
-            let start = sfs_format::block_start(image, &superblock, block).ok_or(())?;
-            for slot in 0..sfs_format::DIR_ENTRIES_PER_BLOCK {
-                let entry = start + slot * sfs_format::DIR_ENTRY_SIZE;
-                let index = sfs_format::u32_at(image, entry);
-                if index == 0 {
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut bytes) {
+                return None;
+            }
+            for entry in 0..DIR_ENTRIES_PER_BLOCK {
+                let offset = entry * DIR_ENTRY_SIZE;
+                let child = u32_at(&bytes, offset);
+                if child == 0 {
                     continue;
                 }
-                let length = image[entry + 4] as usize;
-                if length == 0 || length > sfs_format::NAME_MAX {
+                let length = bytes[offset + 4] as usize;
+                if length == 0 || length > NAME_LIMIT {
                     continue;
                 }
-                let (kind, _, _, _, _) = sfs_format::inode_get(image, &superblock, index).ok_or(())?;
-                let mut name = [0_u8; MAX_NAME_LEN];
-                name[..length].copy_from_slice(&image[entry + 5..entry + 5 + length]);
-                entries.push(DirEntry {
-                    name,
-                    name_len: length as u64,
-                    kind: if kind == sfs_format::INODE_KIND_DIR { 2 } else { 1 },
-                });
+                if &bytes[offset + 5..offset + 5 + length] == name.as_bytes() {
+                    return Some(child);
+                }
             }
         }
-        Ok(entries)
+        None
     }
 
-    fn read_at(&self, path: &str, offset: usize, limit: usize) -> Result<Vec<u8>, ()> {
-        let image = image()?;
-        let superblock = sfs_format::superblock(image)?;
-        let (index, _, size) = sfs_format::lookup(image, &superblock, path).ok_or(())?;
-        if offset >= size as usize {
-            return Ok(Vec::new());
+    fn read_at(&self, path: &str, offset: usize, limit: usize) -> Option<Vec<u8>> {
+        let index = self.resolve(path)?;
+        let inode = self.inode(index)?;
+        if !inode.is_file() {
+            return None;
         }
-        let end = offset.saturating_add(limit).min(size as usize);
-        let (_, _, blocks, indirect, double) = sfs_format::inode_get(image, &superblock, index).ok_or(())?;
+        let size = inode.size as usize;
+        if offset >= size {
+            return Some(Vec::new());
+        }
+        let end = offset.saturating_add(limit).min(size);
         let mut data = Vec::with_capacity(end - offset);
         let mut position = offset;
         while position < end {
             let slot = position / BLOCK_SIZE;
-            let block = sfs_format::inode_slot_block(image, &superblock, &blocks, indirect, double, slot)
-                .ok_or(())?;
-            let start = sfs_format::block_start(image, &superblock, block).ok_or(())?;
+            let block = self.block_at(&inode, slot)?;
             let within = position % BLOCK_SIZE;
             let take = (BLOCK_SIZE - within).min(end - position);
-            data.extend_from_slice(&image[start + within..start + within + take]);
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut bytes) {
+                return None;
+            }
+            data.extend_from_slice(&bytes[within..within + take]);
             position += take;
         }
-        Ok(data)
+        Some(data)
     }
 
-    fn write_at(
-        &mut self,
-        path: &str,
-        offset: usize,
-        bytes: &[u8],
-        append: bool,
-    ) -> Result<(usize, usize), ()> {
-        let parts = sfs_format::split_path(path)?;
-        let (&name, parent_parts) = parts.split_last().ok_or(())?;
-        let image = image_mut()?;
-        let superblock = sfs_format::superblock(image)?;
-        let parent = sfs_format::resolve_dir(image, &superblock, parent_parts).ok_or(())?;
-        let index = match sfs_format::find_entry(image, &superblock, parent, name) {
-            Some((block, slot)) => {
-                let index = sfs_format::u32_at(image, block * BLOCK_SIZE + slot * sfs_format::DIR_ENTRY_SIZE);
-                let (kind, _, _, _, _) = sfs_format::inode_get(image, &superblock, index).ok_or(())?;
-                if kind != sfs_format::INODE_KIND_FILE {
-                    return Err(());
+    fn entries(&self, directory: u32) -> Option<Vec<DirEntry>> {
+        let inode = self.inode(directory)?;
+        if !inode.is_dir() {
+            return None;
+        }
+        let mut entries = Vec::new();
+        for slot in 0..MAX_FILE_BLOCKS {
+            let Some(block) = self.block_at(&inode, slot) else {
+                break;
+            };
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut bytes) {
+                return None;
+            }
+            for entry in 0..DIR_ENTRIES_PER_BLOCK {
+                let offset = entry * DIR_ENTRY_SIZE;
+                let index = u32_at(&bytes, offset);
+                if index == 0 {
+                    continue;
                 }
-                index
-            }
-            None => sfs_format::create_inode(image, &superblock, &mut Disk, parent, name, sfs_format::INODE_KIND_FILE)
-                .ok_or(())?,
-        };
-
-        let (_, current_size, old_blocks, old_indirect, old_double) =
-            sfs_format::inode_get(image, &superblock, index).ok_or(())?;
-        let base = if append {
-            current_size as usize
-        } else if offset == 0 {
-            if !sfs_format::truncate(image, &superblock, &mut Disk, index) {
-                return Err(());
-            }
-            0
-        } else {
-            if offset > current_size as usize {
-                return Err(());
-            }
-            offset
-        };
-
-        // Fast path: a positioned write that stays inside the existing block
-        // map touches only the covered data sectors — no reallocation, no
-        // inode rewrite, no bitmap churn.
-        if !append && offset != 0 && base + bytes.len() <= current_size as usize {
-            if sfs_format::overwrite_in_place(image, &superblock, &mut Disk, index, offset, bytes) {
-                return Ok((bytes.len(), base + bytes.len()));
-            }
-            // Fall through to the full rewrite on any fast-path refusal.
-        }
-
-        if append || offset != 0 {
-            let mut content = sfs_format::read_inode_bytes(image, &superblock, index).ok_or(())?;
-            let end = base.saturating_add(bytes.len());
-            if end > content.len() {
-                content.resize(end, 0);
-            }
-            content[base..end].copy_from_slice(bytes);
-            if !sfs_format::store(
-                image,
-                &superblock,
-                &mut Disk,
-                index,
-                &content,
-                &old_blocks,
-                old_indirect,
-                old_double,
-                current_size,
-            ) {
-                return Err(());
-            }
-            return Ok((bytes.len(), end));
-        }
-
-        let empty = [0_u32; sfs_format::DIRECT_BLOCKS];
-        if !sfs_format::store(image, &superblock, &mut Disk, index, bytes, &empty, 0, 0, 0) {
-            return Err(());
-        }
-        Ok((bytes.len(), bytes.len()))
-    }
-
-    fn len(&self, path: &str) -> Result<usize, ()> {
-        let image = image()?;
-        let superblock = sfs_format::superblock(image)?;
-        if sfs_format::split_path(path)?.is_empty() {
-            return Ok(0);
-        }
-        let (_, kind, size) = sfs_format::lookup(image, &superblock, path).ok_or(())?;
-        if kind != sfs_format::INODE_KIND_FILE {
-            return Err(());
-        }
-        Ok(size as usize)
-    }
-
-    fn seed_file(&mut self, path: &str, contents: &[u8]) -> Result<(), ()> {
-        if contents.len() > sfs_format::MAX_FILE_BLOCKS * BLOCK_SIZE {
-            return Err(());
-        }
-        let parts = sfs_format::split_path(path)?;
-        let (&name, parent_parts) = parts.split_last().ok_or(())?;
-        let image = image_mut()?;
-        let superblock = sfs_format::superblock(image)?;
-        let parent = sfs_format::resolve_dir(image, &superblock, parent_parts).ok_or(())?;
-        let index = match sfs_format::find_entry(image, &superblock, parent, name) {
-            Some((block, slot)) => {
-                let index = sfs_format::u32_at(image, block * BLOCK_SIZE + slot * sfs_format::DIR_ENTRY_SIZE);
-                let (kind, _, _, _, _) = sfs_format::inode_get(image, &superblock, index).ok_or(())?;
-                if kind != sfs_format::INODE_KIND_FILE {
-                    return Err(());
+                let length = bytes[offset + 4] as usize;
+                if length == 0 || length > NAME_LIMIT {
+                    continue;
                 }
-                index
+                let child = self.inode(index)?;
+                let mut name = [0_u8; MAX_NAME_LEN];
+                name[..length].copy_from_slice(&bytes[offset + 5..offset + 5 + length]);
+                entries.push(DirEntry {
+                    name,
+                    name_len: length as u64,
+                    kind: if child.is_dir() { 2 } else { 1 },
+                });
             }
-            None => sfs_format::create_inode(image, &superblock, &mut Disk, parent, name, sfs_format::INODE_KIND_FILE)
-                .ok_or(())?,
-        };
-        if !sfs_format::truncate(image, &superblock, &mut Disk, index) {
-            return Err(());
         }
-        let empty = [0_u32; sfs_format::DIRECT_BLOCKS];
-        if !sfs_format::store(image, &superblock, &mut Disk, index, contents, &empty, 0, 0, 0) {
-            return Err(());
-        }
-        sfs_format::flush_bitmap(image, &superblock, &mut Disk);
-        Ok(())
+        Some(entries)
     }
 
-    fn usage(&self, path: &str) -> Option<crate::vfs::FsUsage> {
-        let image = image().ok()?;
-        let superblock = sfs_format::superblock(image).ok()?;
-        let usage = sfs_format::usage_under(image, &superblock, path)?;
-        Some(crate::vfs::FsUsage {
-            inodes: usage.inodes,
-            data_blocks: usage.data_blocks,
-            metadata_blocks: usage.metadata_blocks,
+    fn usage(&self) -> Option<FsUsage> {
+        let superblock = self.superblock;
+        let bitmap_blocks = (superblock.total_blocks as usize)
+            .div_ceil(8)
+            .div_ceil(BLOCK_SIZE) as u32;
+        let mut used_blocks = 0u32;
+        for index in 0..bitmap_blocks {
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(superblock.bitmap_block + index, &mut bytes) {
+                return None;
+            }
+            for (byte_index, byte) in bytes.iter().enumerate() {
+                let bit_base = ((index as usize * BLOCK_SIZE + byte_index) * 8) as u32;
+                for bit in 0..8 {
+                    if bit_base + bit >= superblock.total_blocks {
+                        break;
+                    }
+                    if byte & (1 << bit) != 0 {
+                        used_blocks += 1;
+                    }
+                }
+            }
+        }
+        let inode_blocks = ((superblock.inode_count as usize) * INODE_SIZE)
+            .div_ceil(BLOCK_SIZE) as u32;
+        let mut used_inodes = 0u32;
+        for index in 0..inode_blocks {
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(superblock.inode_table_block + index, &mut bytes) {
+                return None;
+            }
+            for slot in 0..(BLOCK_SIZE / INODE_SIZE) {
+                let offset = slot * INODE_SIZE;
+                let inode_index = index as usize * (BLOCK_SIZE / INODE_SIZE) + slot;
+                if inode_index >= superblock.inode_count as usize {
+                    break;
+                }
+                if u32_at(&bytes, offset) != INODE_KIND_FREE {
+                    used_inodes += 1;
+                }
+            }
+        }
+        Some(FsUsage {
+            inodes: used_inodes,
+            data_blocks: used_blocks,
+            metadata_blocks: 0,
         })
     }
 
-    fn usage_supported(&self) -> bool {
-        true
+    fn is_directory(&self, path: &str) -> bool {
+        self.resolve(path)
+            .and_then(|index| self.inode(index))
+            .map(|inode| inode.is_dir())
+            .unwrap_or(false)
+    }
+
+    fn len(&self, path: &str) -> Option<usize> {
+        self.resolve(path)
+            .and_then(|index| self.inode(index))
+            .map(|inode| inode.size as usize)
     }
 }
 
-/// Undo of a cross-parent rename's first half: removes the entry `add_entry`
-/// just created. Best effort — the caller already reports failure.
-fn undo_new_entry(
-    image: &mut [u8],
-    superblock: &Superblock,
-    parent: u32,
-    name: &str,
-) -> Result<(), ()> {
-    let (block, slot) = sfs_format::find_entry(image, superblock, parent, name).ok_or(())?;
-    if !sfs_format::remove_dir_entry(image, superblock, &mut Disk, parent, block, slot) {
-        return Err(());
-    }
-    Ok(())
+pub fn loaded() -> bool {
+    STATE.lock().superblock.is_some()
 }
 
-/// Upper bound on the loaded image: the format keeps the whole image in
-/// kernel frames (not the heap), so the cap is the frame budget. 64 MiB
-/// leaves room for the 16 MiB kernel heap, user address spaces and the
-/// Linux ABI's ld.so/libc buffers.
-const MAX_IMAGE_SECTORS: usize = 131072;
-
-/// Reads the whole image into kernel memory and keeps ownership of the disk.
-/// The read size adapts to the device capacity (clamped to
-/// [`MAX_IMAGE_SECTORS`]), so both the legacy 1 MiB disk and larger ones
-/// mount; the superblock decides what is really used.
+/// Mounts the on-disk SFS in streaming mode. Only block 0 and the root inode
+/// are touched up front; everything else is read on demand.
 pub fn load() -> bool {
     if !virtio_blk::init() {
         console::write_str("KSFS: no block device\r\n");
         return false;
     }
-    let capacity = virtio_blk::sector_count() as usize;
-    let device_sectors = if capacity == 0 {
-        IMAGE_SECTORS
-    } else {
-        capacity
-    };
-    let sectors = device_sectors.clamp(IMAGE_SECTORS, MAX_IMAGE_SECTORS);
-    let Some((physical, _tag)) = frame_allocator::alloc_contiguous_pages_tagged(sectors * BLOCK_SIZE / 4096) else {
-        console::write_str("KSFS: image allocation failed\r\n");
+    let device_blocks = virtio_blk::sector_count();
+    if device_blocks == 0 || device_blocks > u32::MAX as u64 {
+        console::write_str("KSFS: bad device size\r\n");
+        return false;
+    }
+    let mut superblock_bytes = [0_u8; BLOCK_SIZE];
+    if !virtio_blk::read_sector(0, &mut superblock_bytes) {
+        console::write_str("KSFS: superblock read failed\r\n");
+        return false;
+    }
+    let Some(superblock) =
+        parse_superblock(&superblock_bytes, device_blocks as u32)
+    else {
+        console::write_str("KSFS: bad superblock\r\n");
         return false;
     };
-    console::write_str("KSFS: image at 0x");
-    console::write_hex_u64(physical as u64);
-    console::write_str(" sectors=");
-    console::write_dec_u64(sectors as u64);
-    console::write_str("\r\n");
-    let bytes = sectors * BLOCK_SIZE;
-    let base = phys_to_virt(physical);
-    let mut sector = [0_u8; BLOCK_SIZE];
-    for index in 0..sectors {
-        if !virtio_blk::read_sector(index as u64, &mut sector) {
-            console::write_str("KSFS: image read failed\r\n");
-            return false;
-        }
-        unsafe {
-            core::ptr::copy_nonoverlapping(
-                sector.as_ptr(),
-                (base + index * BLOCK_SIZE) as *mut u8,
-                BLOCK_SIZE,
-            );
-        }
+    {
+        let mut state = STATE.lock();
+        state.superblock = Some(superblock);
+        state.device_blocks = device_blocks as u32;
     }
-    unsafe {
-        IMAGE_PTR = base as *mut u8;
-        IMAGE_LEN = bytes;
-    }
-    // Refuse an image whose metadata cannot be trusted instead of mounting a
-    // filesystem where every operation is guaranteed to fail.
-    let snapshot = unsafe { core::slice::from_raw_parts(IMAGE_PTR, IMAGE_LEN) };
-    let check = sfs_format::superblock(snapshot).and_then(|superblock| {
-        sfs_format::fsck(snapshot, &superblock).map(|report| (superblock, report))
-    });
-    let (superblock, report) = match check {
-        Ok(found) => found,
-        Err(()) => {
-            unsafe {
-                IMAGE_PTR = core::ptr::null_mut();
-                IMAGE_LEN = 0;
-            }
-            console::write_str("KSFS: image inconsistent\r\n");
-            return false;
-        }
+    let Some(root) = reader().and_then(|reader| reader.inode(superblock.root_inode)) else {
+        console::write_str("KSFS: root inode unreadable\r\n");
+        STATE.lock().superblock = None;
+        return false;
     };
-    if report.leaks > 0 {
-        console::write_str("KSFS: ");
-        console::write_dec_u64(report.leaks as u64);
-        console::write_str(" leaked block(s)\r\n");
+    if !root.is_dir() {
+        console::write_str("KSFS: root is not a directory\r\n");
+        STATE.lock().superblock = None;
+        return false;
     }
-    let _ = superblock;
+    console::write_str("KSFS: streaming, blocks=");
+    console::write_dec_u64(u64::from(superblock.total_blocks));
+    console::write_str(" inodes=");
+    console::write_dec_u64(u64::from(superblock.inode_count));
+    console::write_str(" cache=");
+    console::write_dec_u64(CACHE_BLOCKS as u64);
+    console::write_str(" blocks\r\n");
     true
 }
 
 /// Diagnostic summary printed once at boot.
 pub fn report() -> bool {
-    let Ok(image) = image() else {
-        return false;
-    };
-    let Ok(superblock) = sfs_format::superblock(image) else {
-        console::write_str("KSFS: bad superblock\r\n");
+    let Some(reader) = reader() else {
+        console::write_str("KSFS: not mounted\r\n");
         return false;
     };
     console::write_str("KSFS: mounted, blocks=");
-    console::write_dec_u64(u64::from(superblock.total_blocks));
+    console::write_dec_u64(u64::from(reader.superblock.total_blocks));
     console::write_str("\r\n");
     true
+}
+
+pub struct Sfs;
+
+impl FileSystem for Sfs {
+    fn create_file(&mut self, _path: &str) -> Result<(), ()> {
+        Err(())
+    }
+
+    fn make_directory(&mut self, _path: &str) -> Result<(), ()> {
+        Err(())
+    }
+
+    fn remove_file(&mut self, _path: &str) -> Result<(), ()> {
+        Err(())
+    }
+
+    fn remove_directory(&mut self, _path: &str) -> Result<(), ()> {
+        Err(())
+    }
+
+    fn rename(&mut self, _source: &str, _destination: &str) -> Result<(), ()> {
+        Err(())
+    }
+
+    fn replace(&mut self, _source: &str, _destination: &str) -> Result<(), ()> {
+        Err(())
+    }
+
+    fn is_directory(&self, path: &str) -> Result<bool, ()> {
+        let reader = reader().ok_or(())?;
+        Ok(reader.is_directory(path))
+    }
+
+    fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, ()> {
+        let reader = reader().ok_or(())?;
+        let index = reader.resolve(path).ok_or(())?;
+        reader.entries(index).ok_or(())
+    }
+
+    fn read_at(&self, path: &str, offset: usize, limit: usize) -> Result<Vec<u8>, ()> {
+        let reader = reader().ok_or(())?;
+        reader.read_at(path, offset, limit).ok_or(())
+    }
+
+    fn write_at(
+        &mut self,
+        _path: &str,
+        _offset: usize,
+        _bytes: &[u8],
+        _append: bool,
+    ) -> Result<(usize, usize), ()> {
+        Err(())
+    }
+
+    fn len(&self, path: &str) -> Result<usize, ()> {
+        let reader = reader().ok_or(())?;
+        reader.len(path).ok_or(())
+    }
+
+    fn seed_file(&mut self, _path: &str, _contents: &[u8]) -> Result<(), ()> {
+        Err(())
+    }
+
+    fn usage(&self, _path: &str) -> Option<FsUsage> {
+        reader()?.usage()
+    }
+
+    fn usage_supported(&self) -> bool {
+        true
+    }
 }

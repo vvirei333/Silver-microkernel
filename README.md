@@ -686,9 +686,11 @@ File-backed `mmap` and a real `mprotect` are implemented:
 `MAP_PRIVATE` copies the file range into private frames, `MAP_FIXED` replaces
 an existing range (the loader's `PROT_NONE` reservation followed by per-segment
 fixed mappings), and `mprotect` rewrites PTE permissions on both the anonymous
-window and the main image. The rootfs is not a limit: it is 64 MiB with 2048
-inodes and lives in kernel frames (not the heap), the kernel heap is 16 MiB,
-and the per-file cap is 8 MiB (the SFS block tree's maximum).
+window and the main image. SFS is streamed: the kernel reads 512-byte blocks
+from virtio-blk on demand through a 256 KiB cache, so the 64 MiB / 2048-inode
+image no longer occupies RAM (the kernel heap is 16 MiB). The per-file cap is
+still 8 MiB (the SFS block tree's maximum), and this streaming backend is
+read-only; `/tmp` is the writable filesystem.
 
 A writable `MAP_SHARED` mapping of a `memfd` is a true shared window: the
 memfd owns one contiguous physical run, every process that maps the file (its

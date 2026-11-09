@@ -29,7 +29,8 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 - AArch64 kernel with SMP (`-smp 4` selftest), per-task address spaces, COW
   fork, wait/exit, capabilities, IPC mailboxes and mutexes.
 - virtio-blk-pci + virtio-net, GENI UART, PSCI power off/reset.
-- SFS rootfs loaded into a 48 MiB kernel heap; writable RamFs at `/tmp`.
+- SFS rootfs read on demand through a 256 KiB block cache (streaming); the
+  image no longer occupies RAM. Writable RamFs at `/tmp`.
 - Console shell (`howl`) with file, process, mount, network and health commands.
 - Fastfetch-style boot banner, kernel/userspace version **0.1.1**.
 
@@ -69,17 +70,18 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 
 | Resource | Limit |
 |---|---|
-| SFS image | 64 MiB, 2048 inodes (frame-backed, loaded whole into RAM) |
+| SFS image | 64 MiB, 2048 inodes, read on demand (256 KiB block cache) |
 | Kernel heap | 16 MiB |
-| Single SFS file | 8 MiB (block-tree maximum) |
+| Single SFS file | 8 MiB (block-tree maximum; read-only streaming backend) |
 | Anonymous mmap per task | 24 MiB |
 | Tasks | 64 (zombies capped separately) |
 | Linux fds per process | 256 |
 | User VA | image `0x4000_0000`, heap `0x4080_0000`, mmap `0x40A0_0000+`, stack `0x7FE0_1000` |
 
-The image lives in kernel frames (not the heap), so the cap is the frame
-budget. A full GTK/GLib stack still exceeds the RAM image or the 8 MiB
-per-file format cap; lifting those needs streaming/format work, not ABI work.
+SFS is mounted **read-only** while streaming: the block cache covers reads,
+but block allocation and bitmap/inode mutation are the next format slice.
+`/tmp` remains writable. A full GTK/GLib stack is now limited by the 8 MiB
+per-file format cap, not by RAM.
 
 ## Test matrix
 
