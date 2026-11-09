@@ -101,6 +101,9 @@ pub enum PageKind {
     ReadOnly,
     /// `RW-`: mutable data + zero-filled BSS, never executable.
     Data,
+    /// Logically `RW-` (data), but currently mapped read-only because `fork`
+    /// shares the frame copy-on-write. A write fault promotes it back to Data.
+    Cow,
 }
 
 /// ELF64 file header (`Elf64_Ehdr`). `#[repr(C)]` yields the exact on-disk

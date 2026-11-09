@@ -382,6 +382,31 @@ Redmi port is parked. The reference checklist is
   while the parent busy-loops in EL0, then raises `SIGUSR2` to an
   `SA_ONSTACK` handler and checks that SP is inside the registered buffer:
   `async sig ok`. Remaining gaps: COW fork, threads, a per-task read scope.
+  **Slice 16 (COW fork):** `fork` shares every user frame instead of copying.
+  The frame allocator now keeps a `u16` refcount per page; `free_*` releases an
+  owner and only clears the bitmap for the last one, and `share_*` adds an
+  owner after validating the generation. `LinuxImage::share` shares image runs
+  and turns writable pages into `PageKind::Cow`; `create_task_space(..., cow)`
+  maps stack/private read-only without zeroing; new
+  `map_shared_user_pages_at`/`map_shared_user_heap_pages` map shared runs
+  without clearing them. The parent is switched to read-only in the same
+  operation.
+  A data-abort vector now saves the full EL0 bank and calls
+  `silver_handle_user_fault`; `scheduler::cow_fault` locates the image run,
+  stack, private page, heap page or mmap region, copies the whole containing
+  run, remaps it with the original permissions and drops the old reference.
+  Kernel `copy_to_user` also runs `cow_prepare` so `wait4`, `read` and signal
+  frames can write into a COW stack page.
+  Two more bugs found: the sync vector used x11 as scratch before saving the
+  user bank (a COW return clobbered live x11), and the first fork version left
+  `ForkParts` owning the shared stack/private page, double-freeing them at
+  teardown.
+  Test `linux-cowfork` writes distinct bytes to image data, a 1 MiB BSS
+  array, an anonymous mapping, `brk` and a real stack array from parent and
+  child, verifies isolation and repeated writes: `cow fork ok`. Three
+  consecutive runs plus the full Linux series and `health` stay at
+  9596/31586 frames with zero zombies/open files/DMA leaks; offline fsck
+  clean. Remaining gaps: threads (`CLONE_VM`), a per-task read scope.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -408,9 +433,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 16 (COW fork, then threads and a per-task
-  read scope), then headless Wayland/GTK/D-Bus → Phosh. Network base
-  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 17 (threads/`CLONE_VM` and a per-task read
+  scope), then headless Wayland/GTK/D-Bus → Phosh. Network base maintenance
+  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

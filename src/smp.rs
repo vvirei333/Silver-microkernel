@@ -1145,7 +1145,7 @@ pub fn boot_secondary_cpus() {
             crate::console::write_str(", leaving it offline\r\n");
             return;
         };
-        let Some((ttbr0, space_token)) = crate::mmu::create_task_space(private, 0, None) else {
+        let Some((ttbr0, space_token)) = crate::mmu::create_task_space(private, 0, None, false) else {
             crate::frame_allocator::free_page_tagged(private, private_generation);
             crate::frame_allocator::free_contiguous_pages_tagged(stack, 2, stack_generation);
             crate::console::write_str("SMP: no task space for CPU");
@@ -1504,7 +1504,7 @@ struct TlbProbeScratch {
 impl TlbProbeScratch {
     fn new() -> Option<Self> {
         let (private, private_generation) = crate::frame_allocator::alloc_page_tagged()?;
-        let Some((ttbr0, token)) = crate::mmu::create_task_space(private, 0, None) else {
+        let Some((ttbr0, token)) = crate::mmu::create_task_space(private, 0, None, false) else {
             crate::frame_allocator::free_page_tagged(private, private_generation);
             return None;
         };

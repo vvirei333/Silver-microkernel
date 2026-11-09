@@ -239,6 +239,7 @@ pub const USER_MMAP_MAX_PAGES: usize = (USER_MMAP_MAX_VA - USER_MMAP_VA) / GRANU
 
 /// `prot` bits for anonymous mappings. Read is always granted; these flags
 /// select write and execute in `user_anonymous_page`.
+pub const PROT_READ: u64 = 1;
 pub const PROT_WRITE: u64 = 2;
 pub const PROT_EXEC: u64 = 4;
 
@@ -795,6 +796,7 @@ pub fn create_task_space(
     private_page: usize,
     user_stack_start: usize,
     image: Option<&crate::elf::LoadedImage>,
+    cow: bool,
 ) -> Option<(usize, TableToken)> {
     if image.is_some_and(|image| {
         image.page_count == 0 || image.page_count > ENTRIES * IMAGE_L3_TABLES
@@ -902,7 +904,9 @@ pub fn create_task_space(
                     let physical = image.physical_start + index * GRANULE;
                     let descriptor = match image.kinds[index] {
                         crate::elf::PageKind::Text => user_text_page(physical),
-                        crate::elf::PageKind::ReadOnly => user_rodata_page(physical),
+                        crate::elf::PageKind::ReadOnly | crate::elf::PageKind::Cow => {
+                            user_rodata_page(physical)
+                        }
                         crate::elf::PageKind::Data => user_data_page(physical),
                     };
                     write_entry(table, index - start, descriptor);
@@ -916,12 +920,20 @@ pub fn create_task_space(
             for index in 0..USER_STACK_PAGES {
                 let physical = user_stack_start + index * GRANULE;
                 // The stack is EL0-visible: never expose a recycled frame that
-                // still contains another task's or the kernel's data.
-                zero_page(physical);
+                // still contains another task's or the kernel's data. A COW
+                // child shares the parent's live stack, so it must neither be
+                // zeroed nor mapped writable.
+                if !cow {
+                    zero_page(physical);
+                }
                 write_entry(
                     l3_stack,
                     USER_STACK_L3_INDEX + index,
-                    user_data_page(physical),
+                    if cow {
+                        user_rodata_page(physical)
+                    } else {
+                        user_data_page(physical)
+                    },
                 );
             }
             debug_assert_eq!(
@@ -932,11 +944,22 @@ pub fn create_task_space(
         }
 
         // The private 4 KiB window is writable and readable from EL0, so it
-        // gets the same guarantee as the stack and heap.
-        zero_page(private_page);
+        // gets the same guarantee as the stack and heap. In a COW child the
+        // frame is shared and lives read-only.
+        if !cow {
+            zero_page(private_page);
+        }
         write_entry(l1_priv, 0, l2_priv as u64 | DESC_TABLE);
         write_entry(l2_priv, 0, l3_priv as u64 | DESC_TABLE);
-        write_entry(l3_priv, 0, user_data_page(private_page));
+        write_entry(
+            l3_priv,
+            0,
+            if cow {
+                user_rodata_page(private_page)
+            } else {
+                user_data_page(private_page)
+            },
+        );
     }
 
     for page in pages {
@@ -995,6 +1018,24 @@ pub fn install_ap_identity(ttbr0: usize) -> bool {
 /// paying a full table clean plus `dsb`/`tlbi` per page — `brk` can grow the
 /// heap by hundreds of pages at a time.
 pub fn map_user_heap_pages(ttbr0: usize, first_index: usize, physical_pages: &[usize]) -> bool {
+    map_user_heap_pages_inner(ttbr0, first_index, physical_pages, false)
+}
+
+/// Maps already-populated heap pages for a forked child as read-only COW.
+pub fn map_shared_user_heap_pages(
+    ttbr0: usize,
+    first_index: usize,
+    physical_pages: &[usize],
+) -> bool {
+    map_user_heap_pages_inner(ttbr0, first_index, physical_pages, true)
+}
+
+fn map_user_heap_pages_inner(
+    ttbr0: usize,
+    first_index: usize,
+    physical_pages: &[usize],
+    cow: bool,
+) -> bool {
     let count = physical_pages.len();
     let root = root_of(ttbr0);
     let Some(last) = first_index.checked_add(count) else {
@@ -1026,8 +1067,12 @@ pub fn map_user_heap_pages(ttbr0: usize, first_index: usize, physical_pages: &[u
         }
         for (offset, &physical) in physical_pages.iter().enumerate() {
             let index = first_index + offset;
-            zero_page(physical);
-            write_entry(l3_heap, index, user_data_page(physical));
+            if cow {
+                write_entry(l3_heap, index, user_rodata_page(physical));
+            } else {
+                zero_page(physical);
+                write_entry(l3_heap, index, user_data_page(physical));
+            }
             clean_entry_line(l3_heap, index);
         }
     }
@@ -1080,14 +1125,39 @@ pub fn unmap_user_heap_page(ttbr0: usize, index: usize) -> Option<usize> {
 /// `false` is returned, so the caller's data-frame release is safe and the
 /// address space is left unchanged.
 ///
-/// Only the user image/heap/stack window (`l2_user`, `[DRAM_BASE, DRAM_BASE+1G)`)
-/// is traversed, so `virtual_address` must lie inside it.
+/// Maps an anonymous run, zeroing every frame before publishing it.
 pub fn map_user_pages_at(
     ttbr0: usize,
     virtual_address: usize,
     physical_start: usize,
     page_count: usize,
     prot: u64,
+) -> bool {
+    map_user_pages_at_inner(ttbr0, virtual_address, physical_start, page_count, prot, true, false)
+}
+
+/// Maps frames that already contain live data (a forked child's shared COW
+/// pages): no zeroing, and writable `prot` becomes read-only so the first
+/// write traps into the COW handler.
+pub fn map_shared_user_pages_at(
+    ttbr0: usize,
+    virtual_address: usize,
+    physical_start: usize,
+    page_count: usize,
+    prot: u64,
+) -> bool {
+    map_user_pages_at_inner(ttbr0, virtual_address, physical_start, page_count, prot, false, true)
+}
+
+/// Shared implementation of the two entry points above.
+fn map_user_pages_at_inner(
+    ttbr0: usize,
+    virtual_address: usize,
+    physical_start: usize,
+    page_count: usize,
+    prot: u64,
+    zero: bool,
+    cow: bool,
 ) -> bool {
     if page_count == 0 || virtual_address % GRANULE != 0 || physical_start % GRANULE != 0 {
         return false;
@@ -1166,12 +1236,16 @@ pub fn map_user_pages_at(
             // and becomes EL0-readable the moment the descriptor is written.
             // A concurrent walk (or the returning task itself) must never be
             // able to observe leftover data, so the PTE is installed only
-            // after the whole granule has been cleared.
-            zero_page(physical_start + index * GRANULE);
+            // after the whole granule has been cleared. Shared COW pages
+            // already hold live content and must not be cleared.
+            if zero {
+                zero_page(physical_start + index * GRANULE);
+            }
+            let page_prot = if cow { prot & !PROT_WRITE } else { prot };
             write_entry(
                 l3,
                 l3_index,
-                user_anonymous_page(physical_start + index * GRANULE, prot),
+                user_anonymous_page(physical_start + index * GRANULE, page_prot),
             );
             clean_entry_line(l3, l3_index);
             done += 1;
@@ -1263,8 +1337,9 @@ pub fn protect_user_pages_at(
         return false;
     };
     // The image lives below the anonymous window (MAIN_BIAS/INTERP_BIAS);
-    // `mprotect` must work there too, not only on `mmap` regions.
-    if virtual_address < GRANULE || end > USER_STACK_GUARD_VA {
+    // `mprotect` must work there too, not only on `mmap` regions. The stack
+    // sits above the guard page, so the upper bound is the stack end.
+    if virtual_address < GRANULE || end > USER_STACK_VA + USER_STACK_SIZE {
         return false;
     }
 
@@ -1304,6 +1379,227 @@ pub fn protect_user_pages_at(
             let l3 = descriptor_address(read_entry(l2, l2_index)) as usize;
             let physical = descriptor_address(read_entry(l3, l3_index)) as usize;
             write_entry(l3, l3_index, user_anonymous_page(physical, prot));
+            clean_entry_line(l3, l3_index);
+        }
+    }
+    finish_table_changes_for(ttbr0);
+    true
+}
+
+/// Makes every `Cow` page in a shared image read-only in `ttbr0`. Text and
+/// read-only pages are already immutable.
+#[cfg(feature = "linux-abi")]
+pub fn protect_cow_image(
+    ttbr0: usize,
+    image: &crate::linux_elf::LinuxImage,
+) -> bool {
+    for run in &image.runs {
+        for (index, kind) in run.kinds.iter().enumerate() {
+            if *kind == crate::elf::PageKind::Cow
+                && !protect_user_pages_at(
+                    ttbr0,
+                    run.virtual_address + index * GRANULE,
+                    1,
+                    PROT_READ,
+                )
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Makes the private 4 KiB window read-only. `fork` uses it after sharing the
+/// private page with a child.
+pub fn protect_private_page(ttbr0: usize) -> bool {
+    let root = root_of(ttbr0);
+    unsafe {
+        let l0_entry = read_entry(root, PRIVATE_WINDOW_L0_INDEX);
+        if l0_entry & DESC_TABLE != DESC_TABLE {
+            return false;
+        }
+        let l1 = descriptor_address(l0_entry) as usize;
+        let l1_entry = read_entry(l1, 0);
+        if l1_entry & DESC_TABLE != DESC_TABLE {
+            return false;
+        }
+        let l2 = descriptor_address(l1_entry) as usize;
+        let l2_entry = read_entry(l2, 0);
+        if l2_entry & DESC_TABLE != DESC_TABLE {
+            return false;
+        }
+        let l3 = descriptor_address(l2_entry) as usize;
+        let entry = read_entry(l3, 0);
+        if entry & DESC_PAGE != DESC_PAGE {
+            return false;
+        }
+        let physical = descriptor_address(entry) as usize;
+        write_entry(l3, 0, user_rodata_page(physical));
+        clean_entry_line(l3, 0);
+    }
+    finish_table_changes_for(ttbr0);
+    true
+}
+
+/// Re-points the private 4 KiB window at a fresh frame with RW permissions.
+pub fn remap_private_page(ttbr0: usize, physical: usize) -> bool {
+    if physical % GRANULE != 0 {
+        return false;
+    }
+    let root = root_of(ttbr0);
+    unsafe {
+        let l0_entry = read_entry(root, PRIVATE_WINDOW_L0_INDEX);
+        if l0_entry & DESC_TABLE != DESC_TABLE {
+            return false;
+        }
+        let l1 = descriptor_address(l0_entry) as usize;
+        let l1_entry = read_entry(l1, 0);
+        if l1_entry & DESC_TABLE != DESC_TABLE {
+            return false;
+        }
+        let l2 = descriptor_address(l1_entry) as usize;
+        let l2_entry = read_entry(l2, 0);
+        if l2_entry & DESC_TABLE != DESC_TABLE {
+            return false;
+        }
+        let l3 = descriptor_address(l2_entry) as usize;
+        if read_entry(l3, 0) & DESC_PAGE != DESC_PAGE {
+            return false;
+        }
+        write_entry(l3, 0, user_data_page(physical));
+        clean_entry_line(l3, 0);
+    }
+    finish_table_changes_for(ttbr0);
+    true
+}
+
+/// Re-points an existing user range at a new physical run with one uniform
+/// protection. Used by the COW fault path after it copied a stack/heap/mmap
+/// run. All target slots must already be live pages.
+pub fn remap_user_pages_at(
+    ttbr0: usize,
+    virtual_address: usize,
+    physical_start: usize,
+    page_count: usize,
+    prot: u64,
+) -> bool {
+    if page_count == 0
+        || virtual_address % GRANULE != 0
+        || physical_start % GRANULE != 0
+        || (prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0)
+    {
+        return false;
+    }
+    let Some(span) = page_count.checked_mul(GRANULE) else {
+        return false;
+    };
+    let Some(end) = virtual_address.checked_add(span) else {
+        return false;
+    };
+    if virtual_address < GRANULE || end > USER_STACK_VA + USER_STACK_SIZE {
+        return false;
+    }
+    let root = root_of(ttbr0);
+    unsafe {
+        let l1_user = follow_table(root, 0);
+        for index in 0..page_count {
+            let va = virtual_address + index * GRANULE;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_index = (va >> 21) & (ENTRIES - 1);
+            let l3_index = (va >> 12) & 0x1FF;
+            let l2_entry = read_entry(l1_user, l1_index);
+            if l2_entry & DESC_TABLE != DESC_TABLE {
+                return false;
+            }
+            let l2 = descriptor_address(l2_entry) as usize;
+            let l3_entry = read_entry(l2, l2_index);
+            if l3_entry & DESC_TABLE != DESC_TABLE {
+                return false;
+            }
+            let l3 = descriptor_address(l3_entry) as usize;
+            if read_entry(l3, l3_index) & DESC_PAGE != DESC_PAGE {
+                return false;
+            }
+        }
+        for index in 0..page_count {
+            let va = virtual_address + index * GRANULE;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_index = (va >> 21) & (ENTRIES - 1);
+            let l3_index = (va >> 12) & 0x1FF;
+            let l2 = descriptor_address(read_entry(l1_user, l1_index)) as usize;
+            let l3 = descriptor_address(read_entry(l2, l2_index)) as usize;
+            write_entry(
+                l3,
+                l3_index,
+                user_anonymous_page(physical_start + index * GRANULE, prot),
+            );
+            clean_entry_line(l3, l3_index);
+        }
+    }
+    finish_table_changes_for(ttbr0);
+    true
+}
+
+/// Re-points an existing image range at a new physical run, preserving each
+/// page's permission class. The COW path uses this after copying a whole
+/// image run and promoting `Cow` pages back to `Data`.
+pub fn remap_user_kinds_at(
+    ttbr0: usize,
+    virtual_address: usize,
+    physical_start: usize,
+    kinds: &[crate::elf::PageKind],
+) -> bool {
+    if kinds.is_empty() || virtual_address % GRANULE != 0 || physical_start % GRANULE != 0 {
+        return false;
+    }
+    let Some(span) = kinds.len().checked_mul(GRANULE) else {
+        return false;
+    };
+    let Some(end) = virtual_address.checked_add(span) else {
+        return false;
+    };
+    if virtual_address < GRANULE || end > USER_STACK_VA + USER_STACK_SIZE {
+        return false;
+    }
+    let root = root_of(ttbr0);
+    unsafe {
+        let l1_user = follow_table(root, 0);
+        for index in 0..kinds.len() {
+            let va = virtual_address + index * GRANULE;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_index = (va >> 21) & (ENTRIES - 1);
+            let l3_index = (va >> 12) & 0x1FF;
+            let l2_entry = read_entry(l1_user, l1_index);
+            if l2_entry & DESC_TABLE != DESC_TABLE {
+                return false;
+            }
+            let l2 = descriptor_address(l2_entry) as usize;
+            let l3_entry = read_entry(l2, l2_index);
+            if l3_entry & DESC_TABLE != DESC_TABLE {
+                return false;
+            }
+            let l3 = descriptor_address(l3_entry) as usize;
+            if read_entry(l3, l3_index) & DESC_PAGE != DESC_PAGE {
+                return false;
+            }
+        }
+        for (index, kind) in kinds.iter().enumerate() {
+            let va = virtual_address + index * GRANULE;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_index = (va >> 21) & (ENTRIES - 1);
+            let l3_index = (va >> 12) & 0x1FF;
+            let l2 = descriptor_address(read_entry(l1_user, l1_index)) as usize;
+            let l3 = descriptor_address(read_entry(l2, l2_index)) as usize;
+            let physical = physical_start + index * GRANULE;
+            let descriptor = match kind {
+                crate::elf::PageKind::Text => user_text_page(physical),
+                crate::elf::PageKind::ReadOnly | crate::elf::PageKind::Cow => {
+                    user_rodata_page(physical)
+                }
+                crate::elf::PageKind::Data => user_data_page(physical),
+            };
+            write_entry(l3, l3_index, descriptor);
             clean_entry_line(l3, l3_index);
         }
     }
@@ -1482,7 +1778,9 @@ pub fn install_linux_run(
             let physical = physical_start + index * GRANULE;
             let descriptor = match kinds[index] {
                 crate::elf::PageKind::Text => user_text_page(physical),
-                crate::elf::PageKind::ReadOnly => user_rodata_page(physical),
+                crate::elf::PageKind::ReadOnly | crate::elf::PageKind::Cow => {
+                    user_rodata_page(physical)
+                }
                 crate::elf::PageKind::Data => user_data_page(physical),
             };
             write_entry(l3, l3_index, descriptor);
@@ -2221,7 +2519,7 @@ pub fn run_self_test() -> bool {
         frame_allocator::free_page_tagged(private, private_generation);
         return false;
     };
-    let Some((root, space)) = create_task_space(private, 0, None) else {
+    let Some((root, space)) = create_task_space(private, 0, None, false) else {
         frame_allocator::free_page_tagged(data, data_generation);
         frame_allocator::free_page_tagged(private, private_generation);
         return false;
@@ -2266,7 +2564,7 @@ pub fn run_dma_window_self_test() -> bool {
         frame_allocator::free_contiguous_pages_tagged(physical, pages, generation);
         return false;
     };
-    let Some((space, token)) = create_task_space(private, 0, None) else {
+    let Some((space, token)) = create_task_space(private, 0, None, false) else {
         frame_allocator::free_page_tagged(private, private_generation);
         frame_allocator::free_contiguous_pages_tagged(physical, pages, generation);
         return false;
@@ -2313,7 +2611,7 @@ pub fn run_tlb_self_test() -> bool {
         return false;
     };
 
-    let Some((root, space)) = create_task_space(private, 0, None) else {
+    let Some((root, space)) = create_task_space(private, 0, None, false) else {
         frame_allocator::free_page_tagged(private, private_generation);
         frame_allocator::free_page_tagged(second, second_generation);
         frame_allocator::free_page_tagged(first, first_generation);
@@ -2394,7 +2692,7 @@ pub fn run_dma_zero_self_test() -> bool {
         frame_allocator::free_page_tagged(private, private_generation);
         return false;
     };
-    let Some((space, token)) = create_task_space(private, 0, None) else {
+    let Some((space, token)) = create_task_space(private, 0, None, false) else {
         frame_allocator::free_page_tagged(frame, frame_generation);
         frame_allocator::free_page_tagged(private, private_generation);
         return false;
@@ -2458,7 +2756,7 @@ pub fn run_heap_table_self_test() -> bool {
         frame_allocator::free_page_tagged(private, private_generation);
         return false;
     };
-    let Some((space, token)) = create_task_space(private, 0, None) else {
+    let Some((space, token)) = create_task_space(private, 0, None, false) else {
         frame_allocator::free_page_tagged(second, second_generation);
         frame_allocator::free_page_tagged(first, first_generation);
         frame_allocator::free_page_tagged(private, private_generation);
@@ -2519,14 +2817,14 @@ pub fn run_asid_self_test() -> bool {
         return false;
     };
 
-    let Some((space_a, token_a)) = create_task_space(private_a, 0, None) else {
+    let Some((space_a, token_a)) = create_task_space(private_a, 0, None, false) else {
         frame_allocator::free_page_tagged(frame_b, frame_generation_b);
         frame_allocator::free_page_tagged(frame_a, frame_generation_a);
         frame_allocator::free_page_tagged(private_b, private_generation_b);
         frame_allocator::free_page_tagged(private_a, private_generation_a);
         return false;
     };
-    let Some((space_b, token_b)) = create_task_space(private_b, 0, None) else {
+    let Some((space_b, token_b)) = create_task_space(private_b, 0, None, false) else {
         destroy_task_space(token_a, private_a, private_generation_a, asid_of(space_a));
         frame_allocator::free_page_tagged(frame_b, frame_generation_b);
         frame_allocator::free_page_tagged(frame_a, frame_generation_a);

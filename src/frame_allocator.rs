@@ -14,6 +14,9 @@ struct FrameAllocatorState {
     /// the tag it received from that allocation; a stale free after the frame
     /// was recycled fails instead of returning a live frame.
     generation: [u32; MAX_PHYSICAL_PAGES],
+    /// Owners of a live frame. A fresh allocation is 1; `fork` bumps it for
+    /// copy-on-write and a release only decrements until the last owner.
+    refcount: [u16; MAX_PHYSICAL_PAGES],
     next_generation: u32,
     available: MemoryRegion,
     total_pages: usize,
@@ -28,6 +31,7 @@ struct FrameAllocatorState {
 static STATE: SpinLock<FrameAllocatorState> = SpinLock::new(FrameAllocatorState {
     bitmap: [0; BITMAP_WORDS],
     generation: [0; MAX_PHYSICAL_PAGES],
+    refcount: [0; MAX_PHYSICAL_PAGES],
     next_generation: 1,
     available: MemoryRegion::new(0, 0),
     total_pages: 0,
@@ -64,6 +68,7 @@ pub fn init(available: MemoryRegion) -> usize {
     let mut state = STATE.lock();
     state.bitmap.fill(ALL_PAGES_USED);
     state.generation.fill(0);
+    state.refcount.fill(0);
     state.next_generation = 1;
     state.available = MemoryRegion::new(start, usable_end);
     state.total_pages = total_pages;
@@ -242,6 +247,7 @@ pub fn alloc_page_tagged() -> Option<(usize, u32)> {
         };
         mark_used(&mut state, page_index);
         state.generation[page_index] = tag;
+        state.refcount[page_index] = 1;
         state.free_pages -= 1;
         return Some((state.available.start + page_index * PAGE_SIZE, tag));
     }
@@ -293,6 +299,7 @@ pub fn alloc_contiguous_pages_tagged(page_count: usize) -> Option<(usize, u32)> 
             for index in run_start..run_start + page_count {
                 mark_used(&mut state, index);
                 state.generation[index] = tag;
+                state.refcount[index] = 1;
             }
             state.free_pages -= page_count;
             return Some((state.available.start + run_start * PAGE_SIZE, tag));
@@ -358,6 +365,7 @@ pub fn alloc_contiguous_pages_aligned_tagged(
         for index in run_start..run_start + page_count {
             mark_used(&mut state, index);
             state.generation[index] = tag;
+            state.refcount[index] = 1;
         }
         state.free_pages -= page_count;
         return Some((address, tag));
@@ -409,8 +417,13 @@ fn free_page_tagged_inner(address: usize, generation: u32, diagnose: bool) -> bo
         return false;
     }
 
+    if state.refcount[page_index] > 1 {
+        state.refcount[page_index] -= 1;
+        return true;
+    }
     state.bitmap[word_index] &= !mask;
     state.generation[page_index] = 0;
+    state.refcount[page_index] = 0;
     state.free_pages += 1;
     true
 }
@@ -454,10 +467,65 @@ pub fn free_contiguous_pages_tagged(start: usize, page_count: usize, generation:
     }
 
     for page_index in first..last {
+        if state.refcount[page_index] > 1 {
+            state.refcount[page_index] -= 1;
+            continue;
+        }
         state.bitmap[page_index / BITS_PER_WORD] &= !(1_u64 << (page_index % BITS_PER_WORD));
         state.generation[page_index] = 0;
+        state.refcount[page_index] = 0;
+        state.free_pages += 1;
     }
-    state.free_pages += page_count;
+    true
+}
+
+/// Adds one owner to a live frame for copy-on-write. Fails when the frame is
+/// free, its generation is stale, or the refcount is saturated.
+pub fn share_page_tagged(address: usize, generation: u32) -> bool {
+    let mut state = STATE.lock();
+    if address % PAGE_SIZE != 0 || !state.available.contains(address) {
+        return false;
+    }
+    let page_index = (address - state.available.start) / PAGE_SIZE;
+    if page_index >= state.total_pages
+        || state.bitmap[page_index / BITS_PER_WORD] & (1_u64 << (page_index % BITS_PER_WORD)) == 0
+        || state.generation[page_index] != generation
+        || state.refcount[page_index] == u16::MAX
+    {
+        return false;
+    }
+    state.refcount[page_index] += 1;
+    true
+}
+
+/// Contiguous variant of [`share_page_tagged`]. Validates the whole run first,
+/// so a stale generation never leaves half the run shared.
+pub fn share_contiguous_pages_tagged(start: usize, page_count: usize, generation: u32) -> bool {
+    if page_count == 0 || start % PAGE_SIZE != 0 {
+        return false;
+    }
+    let mut state = STATE.lock();
+    if !state.available.contains(start) {
+        return false;
+    }
+    let first = (start - state.available.start) / PAGE_SIZE;
+    let Some(last) = first.checked_add(page_count) else {
+        return false;
+    };
+    if last > state.total_pages {
+        return false;
+    }
+    for page_index in first..last {
+        if state.bitmap[page_index / BITS_PER_WORD] & (1_u64 << (page_index % BITS_PER_WORD)) == 0
+            || state.generation[page_index] != generation
+            || state.refcount[page_index] == u16::MAX
+        {
+            return false;
+        }
+    }
+    for page_index in first..last {
+        state.refcount[page_index] += 1;
+    }
     true
 }
 

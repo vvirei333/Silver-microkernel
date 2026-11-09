@@ -43,13 +43,34 @@ pub fn copy_from_user(source: u64, destination: &mut [u8]) -> Result<(), UserFau
     Ok(())
 }
 
+/// A fork-shared stack/region is mapped read-only until a write fault copies
+/// it. A syscall that copies a result out (wait status, read buffer, signal
+/// frame) must trigger the same COW path the EL0 fault handler would.
+#[cfg(feature = "linux-abi")]
+fn cow_prepare(pointer: u64, length: usize) {
+    let mut page = pointer & !(COPY_CHUNK as u64 - 1);
+    let Some(end) = pointer.checked_add(length as u64) else {
+        return;
+    };
+    while page < end {
+        if !mmu::valid_user_slice_mut(page, 1) {
+            let _ = crate::scheduler::cow_fault(page as usize, 1 << 6);
+        }
+        page = page.saturating_add(COPY_CHUNK as u64);
+    }
+}
+
 pub fn copy_to_user(source: &[u8], destination: u64) -> Result<(), UserFault> {
     let mut done = 0usize;
     while done < source.len() {
         let take = (source.len() - done).min(COPY_CHUNK);
         let window = &source[done..done + take];
         if !mmu::valid_user_slice_mut(destination + done as u64, take as u64) {
-            return Err(UserFault);
+            #[cfg(feature = "linux-abi")]
+            cow_prepare(destination + done as u64, take);
+            if !mmu::valid_user_slice_mut(destination + done as u64, take as u64) {
+                return Err(UserFault);
+            }
         }
         for (index, value) in window.iter().copied().enumerate() {
             unsafe {

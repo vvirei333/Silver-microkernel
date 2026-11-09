@@ -40,6 +40,41 @@ pub extern "C" fn silver_handle_task_fault(esr: u64, elr: u64, far: u64) -> ! {
     // reap_dead_tasks then releases its stack, TTBR0 tables and ELF image.
     scheduler::exit_current();
 }
+/// EL0 fault entry from the vector. Returns `0` when a write to a COW page was
+/// repaired (the trampoline retries the instruction); any other fault falls
+/// through to the normal task kill, which never returns.
+#[cfg(feature = "linux-abi")]
+#[no_mangle]
+pub extern "C" fn silver_handle_user_fault(
+    _frame: *mut u64,
+    esr: u64,
+    elr: u64,
+    far: u64,
+) -> u64 {
+    let recovered = {
+        let _kernel_lock = crate::smp::BklGuard::new();
+        crate::scheduler::cow_fault(far as usize, esr)
+    };
+    if recovered {
+        0
+    } else {
+        silver_handle_task_fault(esr, elr, far)
+    }
+}
+
+/// Without the Linux ABI there are no COW pages: any EL0 fault is final, but
+/// the vector still references this symbol.
+#[cfg(not(feature = "linux-abi"))]
+#[no_mangle]
+pub extern "C" fn silver_handle_user_fault(
+    _frame: *mut u64,
+    esr: u64,
+    elr: u64,
+    far: u64,
+) -> u64 {
+    silver_handle_task_fault(esr, elr, far)
+}
+
 #[no_mangle]
 pub extern "C" fn silver_handle_exception(kind: u64, esr: u64, elr: u64, far: u64) -> ! {
     // EL1 / kernel path: an exception taken from EL1 (or a boot/allocator/IRQ

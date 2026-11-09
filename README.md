@@ -392,13 +392,16 @@ hello from linux abi
 Program exited with status 42
 ```
 
-`fork` is a real `clone(SIGCHLD)` with an **eager deep copy** (no COW yet): the
-image, heap, anonymous mappings, private page and user stack get fresh frames,
-the fd table and cwd are duplicated, and the child resumes from the same
-`svc` with `x0 = 0` while the parent receives the pid. `wait4` blocks until
-the child is a zombie, reaps it, and returns the Linux status word. A
-freestanding test forks, the child `execve`s the hello binary, and the parent
-checks `WEXITSTATUS(status) == 42`:
+`fork` is a real `clone(SIGCHLD)` with **copy-on-write**: the image, heap,
+anonymous mappings, private page and user stack are shared through frame
+refcounts, writable pages are mapped read-only in both address spaces, and the
+first write faults into a handler that copies the containing run and remaps it
+writable. Text and rodata stay read-only for both. The fd table and cwd are
+duplicated, and the child resumes from the same `svc` with `x0 = 0` while the
+parent receives the pid. `wait4` blocks until the child is a zombie, reaps it,
+and returns the Linux status word. A freestanding test forks, the child
+`execve`s the hello binary, and the parent checks
+`WEXITSTATUS(status) == 42`:
 
 ```text
 howl> linuxrun /sfs/linux-fork
@@ -408,7 +411,13 @@ parent saw child 42
 
 Forked Linux children may write to the console even though only the foreground
 task owns it in the Silver model; that matches a terminal shared by a process
-tree.
+tree. The COW test writes distinct values into image data, an anonymous
+mapping, `brk` and the stack from both processes and verifies isolation:
+
+```text
+howl> linuxrun /sfs/linux-cowfork
+cow fork ok
+```
 
 `pipe2` creates a real 4 KiB kernel pipe shared by both descriptors and
 inherited across `fork`; a blocking read/write sleeps and re-checks the buffer
@@ -461,7 +470,7 @@ async sig ok
 
 Still missing: a per-task read scope (a Linux task can read any VFS path, which
 is acceptable on the single-user console but must be closed before untrusted
-apps), COW fork (fork is still an eager deep copy) and threads.
+apps) and threads.
 File-backed `mmap` and a real `mprotect` are implemented:
 `MAP_PRIVATE` copies the file range into private frames, `MAP_FIXED` replaces
 an existing range (the loader's `PROT_NONE` reservation followed by per-segment

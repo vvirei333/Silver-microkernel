@@ -2805,6 +2805,35 @@ pub fn signal_trampoline() -> Option<usize> {
     current_task_mut()?.signal_trampoline()
 }
 
+/// COW write-fault entry point. Returns `true` when the faulting page was
+/// copied and remapped, so the exception trampoline can retry the instruction.
+#[cfg(feature = "linux-abi")]
+pub fn cow_fault(address: usize, esr: u64) -> bool {
+    current_task_mut()
+        .map(|task| task.cow_fault(address, esr))
+        .unwrap_or(false)
+}
+
+/// Allocates a fresh run and copies an old shared run into it.
+#[cfg(feature = "linux-abi")]
+fn cow_copy_run(
+    old_physical: usize,
+    page_count: usize,
+    old_generation: u32,
+) -> Option<(usize, u32)> {
+    let (physical, generation) =
+        frame_allocator::alloc_user_contiguous_pages_tagged(page_count)?;
+    unsafe {
+        core::ptr::copy_nonoverlapping(
+            phys_to_virt(old_physical) as *const u8,
+            phys_to_virt(physical) as *mut u8,
+            page_count * PAGE_SIZE,
+        );
+    }
+    let _ = old_generation;
+    Some((physical, generation))
+}
+
 /// Unmaps an anonymous region previously returned by `mmap_anonymous`.
 pub fn munmap(address: usize, length: usize) -> bool {
     current_task_mut()
@@ -3339,7 +3368,7 @@ pub fn exec_linux_current(
         return None;
     };
     let Some((new_ttbr0, new_token)) =
-        mmu::create_task_space(new_private, new_stack_start, None)
+        mmu::create_task_space(new_private, new_stack_start, None, false)
     else {
         frame_allocator::free_page_tagged(new_private, new_private_generation);
         frame_allocator::free_contiguous_pages_tagged(
@@ -3476,14 +3505,13 @@ impl Drop for ForkParts {
 
 /// Forks the current Linux task (`clone` with `SIGCHLD`, no shared VM).
 ///
-/// The child is a deep copy of the address space: image, heap, anonymous
-/// mappings, private page and user stack get fresh frames; the kernel stack is
-/// new and starts with a copy of the parent's SVC frame whose `x0` is zero, so
-/// the child returns from `clone` as a new process. File descriptors and the
-/// Linux fd table are duplicated, and the child's parent is the caller.
-///
-/// Eager copying keeps this simple and correct; copy-on-write is a later
-/// optimisation.
+/// The child shares the parent's image, heap, anonymous mappings, private
+/// page and user stack copy-on-write: frames gain a refcount, writable pages
+/// are mapped read-only in both spaces, and the first write copies the
+/// containing run through `cow_fault`. The kernel stack is new and starts with
+/// a copy of the parent's SVC frame whose `x0` is zero, so the child returns
+/// from `clone` as a new process. File descriptors and the Linux fd table are
+/// duplicated, and the child's parent is the caller.
 #[cfg(feature = "linux-abi")]
 pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u64> {
     let manager = scheduler_manager()?;
@@ -3497,7 +3525,9 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
     let (
         parent_image,
         parent_stack,
+        parent_stack_generation,
         parent_private,
+        parent_private_generation,
         parent_heap,
         parent_mmap,
         parent_cwd,
@@ -3516,9 +3546,11 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             return None;
         }
         (
-            parent.linux_image.as_ref()?.duplicate()?,
+            parent.linux_image.as_ref()?.share()?,
             parent.user_stack,
+            parent.user_stack_generation,
             parent.private_page,
+            parent.private_page_generation,
             parent.heap_pages.clone(),
             parent.mmap_regions.clone(),
             parent.cwd.clone(),
@@ -3546,36 +3578,42 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         mmap: Vec::new(),
     };
 
-    let Some((stack_start, stack_generation)) =
-        frame_allocator::alloc_user_contiguous_pages_tagged(TASK_USER_STACK_PAGES)
-    else {
+    // Copy-on-write: share the parent's pages instead of allocating copies.
+    // `ForkParts::drop` decrements these refs if a later step fails.
+    if !frame_allocator::share_contiguous_pages_tagged(
+        parent_stack.start,
+        TASK_USER_STACK_PAGES,
+        parent_stack_generation,
+    ) {
         return None;
-    };
-    parts.stack = Some((stack_start, stack_generation));
-    let Some((private_page, private_generation)) = frame_allocator::alloc_user_page_tagged() else {
+    }
+    parts.stack = Some((parent_stack.start, parent_stack_generation));
+    if !frame_allocator::share_page_tagged(parent_private, parent_private_generation) {
         return None;
-    };
-    parts.private = Some((private_page, private_generation));
+    }
+    parts.private = Some((parent_private, parent_private_generation));
 
     let mut heap = Vec::with_capacity(parent_heap.len());
-    for &(_, _) in &parent_heap {
-        let Some(page) = frame_allocator::alloc_user_page_tagged() else {
+    for &(page, generation) in &parent_heap {
+        if !frame_allocator::share_page_tagged(page, generation) {
             return None;
-        };
-        heap.push(page);
+        }
+        heap.push((page, generation));
     }
     parts.heap = heap;
     for region in &parent_mmap {
-        let Some((physical_start, generation)) =
-            frame_allocator::alloc_user_contiguous_pages_tagged(region.page_count)
-        else {
+        if !frame_allocator::share_contiguous_pages_tagged(
+            region.physical_start,
+            region.page_count,
+            region.generation,
+        ) {
             return None;
-        };
+        }
         parts.mmap.push(MmapRegion {
             virtual_address: region.virtual_address,
             page_count: region.page_count,
-            physical_start,
-            generation,
+            physical_start: region.physical_start,
+            generation: region.generation,
             prot: region.prot,
         });
     }
@@ -3614,23 +3652,29 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         core::arch::asm!("mrs {}, sp_el0", out(reg) user_stack_pointer);
     }
 
-    let Some((ttbr0, token)) = mmu::create_task_space(private_page, stack_start, None) else {
+    let (stack_start, stack_generation) = parts.stack.take()?;
+    let (private_page, private_generation) = parts.private.take()?;
+    let Some((ttbr0, token)) = mmu::create_task_space(private_page, stack_start, None, true) else {
         kernel_stack::free(kernel_stack_start);
         return None;
     };
     parts.space = Some((token, mmu::asid_of(ttbr0) as u32));
+    // The space owns the private page now; the stack is data, not a page
+    // table, so keep it in the guard for failure cleanup and take it again at
+    // publication.
+    parts.stack = Some((stack_start, stack_generation));
 
     if !mmu::install_linux_image(ttbr0, parts.image.as_ref()?) {
         kernel_stack::free(kernel_stack_start);
         return None;
     }
     let heap_physical: Vec<usize> = parts.heap.iter().map(|&(page, _)| page).collect();
-    if !heap_physical.is_empty() && !mmu::map_user_heap_pages(ttbr0, 0, &heap_physical) {
+    if !heap_physical.is_empty() && !mmu::map_shared_user_heap_pages(ttbr0, 0, &heap_physical) {
         kernel_stack::free(kernel_stack_start);
         return None;
     }
     for region in &parts.mmap {
-        if !mmu::map_user_pages_at(
+        if !mmu::map_shared_user_pages_at(
             ttbr0,
             region.virtual_address,
             region.physical_start,
@@ -3642,33 +3686,46 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         }
     }
 
-    // The mappings above zeroed the fresh frames; copy the parent's contents
-    // into them now.
-    unsafe {
-        core::ptr::copy_nonoverlapping(
-            phys_to_virt(parent_stack.start) as *const u8,
-            phys_to_virt(stack_start) as *mut u8,
-            TASK_USER_STACK_SIZE,
-        );
-        core::ptr::copy_nonoverlapping(
-            phys_to_virt(parent_private) as *const u8,
-            phys_to_virt(private_page) as *mut u8,
-            PAGE_SIZE,
-        );
-        for (index, &(old_page, _)) in parent_heap.iter().enumerate() {
-            core::ptr::copy_nonoverlapping(
-                phys_to_virt(old_page) as *const u8,
-                phys_to_virt(parts.heap[index].0) as *mut u8,
-                PAGE_SIZE,
-            );
+    // The child now maps the same frames as the parent. Flip both address
+    // spaces to read-only so the first write on either side faults into the
+    // COW handler. Text/rodata stays as it was.
+    {
+        let parent = manager.tasks.get_mut(parent_index)?;
+        let pages_ok = mmu::protect_user_pages_at(
+            parent.ttbr0,
+            mmu::USER_STACK_VA,
+            TASK_USER_STACK_PAGES,
+            mmu::PROT_READ,
+        ) && mmu::protect_private_page(parent.ttbr0)
+            && (parent_heap.is_empty()
+                || mmu::protect_user_pages_at(
+                    parent.ttbr0,
+                    mmu::USER_HEAP_VA,
+                    parent_heap.len(),
+                    mmu::PROT_READ,
+                ));
+        if !pages_ok {
+            kernel_stack::free(kernel_stack_start);
+            return None;
         }
-        for (index, region) in parent_mmap.iter().enumerate() {
-            core::ptr::copy_nonoverlapping(
-                phys_to_virt(region.physical_start) as *const u8,
-                phys_to_virt(parts.mmap[index].physical_start) as *mut u8,
-                region.page_count * PAGE_SIZE,
-            );
+        for region in &parent_mmap {
+            if region.prot & mmu::PROT_WRITE != 0
+                && !mmu::protect_user_pages_at(
+                    parent.ttbr0,
+                    region.virtual_address,
+                    region.page_count,
+                    mmu::PROT_READ,
+                )
+            {
+                kernel_stack::free(kernel_stack_start);
+                return None;
+            }
         }
+        if !mmu::protect_cow_image(parent.ttbr0, parts.image.as_ref()?) {
+            kernel_stack::free(kernel_stack_start);
+            return None;
+        }
+        parent.linux_image.as_mut()?.mark_data_cow();
     }
 
     let child_id = manager.next_id;
@@ -3686,8 +3743,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
 
     let (space_token, space_asid) = parts.space.take().unwrap();
     let _ = space_asid;
-    let (private_page, private_generation) = parts.private.take().unwrap();
-    let (stack_start, stack_generation) = parts.stack.take().unwrap();
+    let (stack_start, stack_generation) = parts.stack.take()?;
 
     let task = Task {
         fs_write_prefix: parent_prefix,
@@ -4985,7 +5041,7 @@ impl Task {
         let user_image = image;
 
         let Some((ttbr0, space_token)) =
-            mmu::create_task_space(private_page, user_stack.start, user_image.as_ref())
+            mmu::create_task_space(private_page, user_stack.start, user_image.as_ref(), false)
         else {
             if let Some(image) = &user_image {
                 image.release();
@@ -5360,6 +5416,202 @@ impl Task {
         let address = self.mmap_region(PAGE_SIZE, mmu::PROT_EXEC, None, Some(&CODE))?;
         self.signal_trampoline = Some(address);
         Some(address)
+    }
+
+    /// Handles a write to a page shared by `fork`. Copies the containing run,
+    /// remaps it writable in this address space and drops this task's reference
+    /// to the old run. A write to a genuinely read-only page returns `false`,
+    /// which the fault path turns into the normal task kill.
+    #[cfg(feature = "linux-abi")]
+    fn cow_fault(&mut self, address: usize, esr: u64) -> bool {
+        const WNR: u64 = 1 << 6;
+        if esr & WNR == 0 || self.ttbr0 == 0 {
+            return false;
+        }
+        let page = address & !(PAGE_SIZE - 1);
+        let ttbr0 = self.ttbr0;
+
+        if let Some(image) = self.linux_image.as_mut() {
+            if let Some(run) = image.runs.iter_mut().find(|run| {
+                page >= run.virtual_address
+                    && page < run.virtual_address + run.page_count * PAGE_SIZE
+            }) {
+                let index = (page - run.virtual_address) / PAGE_SIZE;
+                if !matches!(
+                    run.kinds[index],
+                    crate::elf::PageKind::Cow | crate::elf::PageKind::Data
+                ) {
+                    return false;
+                }
+                let old_physical = run.physical_start;
+                let old_generation = run.generation;
+                let count = run.page_count;
+                let virtual_address = run.virtual_address;
+                let Some((new_physical, new_generation)) =
+                    cow_copy_run(old_physical, count, old_generation)
+                else {
+                    return false;
+                };
+                let mut kinds = run.kinds.clone();
+                for kind in &mut kinds {
+                    if *kind == crate::elf::PageKind::Cow {
+                        *kind = crate::elf::PageKind::Data;
+                    }
+                }
+                if !mmu::remap_user_kinds_at(ttbr0, virtual_address, new_physical, &kinds) {
+                    frame_allocator::free_contiguous_pages_tagged(
+                        new_physical,
+                        count,
+                        new_generation,
+                    );
+                    return false;
+                }
+                frame_allocator::free_contiguous_pages_tagged(
+                    old_physical,
+                    count,
+                    old_generation,
+                );
+                run.physical_start = new_physical;
+                run.generation = new_generation;
+                run.kinds = kinds;
+                return true;
+            }
+        }
+
+        if page >= mmu::USER_STACK_VA && page < mmu::USER_STACK_VA + TASK_USER_STACK_SIZE {
+            let old_physical = self.user_stack.start;
+            let old_generation = self.user_stack_generation;
+            let Some((new_physical, new_generation)) =
+                cow_copy_run(old_physical, TASK_USER_STACK_PAGES, old_generation)
+            else {
+                return false;
+            };
+            if !mmu::remap_user_pages_at(
+                ttbr0,
+                mmu::USER_STACK_VA,
+                new_physical,
+                TASK_USER_STACK_PAGES,
+                mmu::PROT_WRITE,
+            ) {
+                frame_allocator::free_contiguous_pages_tagged(
+                    new_physical,
+                    TASK_USER_STACK_PAGES,
+                    new_generation,
+                );
+                return false;
+            }
+            frame_allocator::free_contiguous_pages_tagged(
+                old_physical,
+                TASK_USER_STACK_PAGES,
+                old_generation,
+            );
+            self.user_stack = MemoryRegion::new(
+                new_physical,
+                new_physical + TASK_USER_STACK_SIZE,
+            );
+            self.user_stack_generation = new_generation;
+            return true;
+        }
+
+        if page == mmu::PRIVATE_WINDOW_VA {
+            let old_physical = self.private_page;
+            let old_generation = self.private_page_generation;
+            let Some((new_physical, new_generation)) =
+                cow_copy_run(old_physical, 1, old_generation)
+            else {
+                return false;
+            };
+            if !mmu::remap_private_page(ttbr0, new_physical) {
+                frame_allocator::free_contiguous_pages_tagged(
+                    new_physical,
+                    1,
+                    new_generation,
+                );
+                return false;
+            }
+            frame_allocator::free_contiguous_pages_tagged(old_physical, 1, old_generation);
+            self.private_page = new_physical;
+            self.private_page_generation = new_generation;
+            return true;
+        }
+
+        if page >= mmu::USER_HEAP_VA {
+            let index = (page - mmu::USER_HEAP_VA) / PAGE_SIZE;
+            if index < self.heap_pages.len() {
+                let (old_physical, old_generation) = self.heap_pages[index];
+                let Some((new_physical, new_generation)) =
+                    cow_copy_run(old_physical, 1, old_generation)
+                else {
+                    return false;
+                };
+                if !mmu::remap_user_pages_at(
+                    ttbr0,
+                    mmu::USER_HEAP_VA + index * PAGE_SIZE,
+                    new_physical,
+                    1,
+                    mmu::PROT_WRITE,
+                ) {
+                    frame_allocator::free_contiguous_pages_tagged(
+                        new_physical,
+                        1,
+                        new_generation,
+                    );
+                    return false;
+                }
+                frame_allocator::free_contiguous_pages_tagged(
+                    old_physical,
+                    1,
+                    old_generation,
+                );
+                self.heap_pages[index] = (new_physical, new_generation);
+                return true;
+            }
+        }
+
+        if let Some(index) = self.mmap_regions.iter().position(|region| {
+            page >= region.virtual_address
+                && page < region.virtual_address + region.page_count * PAGE_SIZE
+        }) {
+            let region = &self.mmap_regions[index];
+            if region.prot & mmu::PROT_WRITE == 0 {
+                return false;
+            }
+            let old_physical = region.physical_start;
+            let old_generation = region.generation;
+            let count = region.page_count;
+            let virtual_address = region.virtual_address;
+            let prot = region.prot;
+            let Some((new_physical, new_generation)) =
+                cow_copy_run(old_physical, count, old_generation)
+            else {
+                return false;
+            };
+            if !mmu::remap_user_pages_at(
+                ttbr0,
+                virtual_address,
+                new_physical,
+                count,
+                prot,
+            ) {
+                frame_allocator::free_contiguous_pages_tagged(
+                    new_physical,
+                    count,
+                    new_generation,
+                );
+                return false;
+            }
+            frame_allocator::free_contiguous_pages_tagged(
+                old_physical,
+                count,
+                old_generation,
+            );
+            let region = &mut self.mmap_regions[index];
+            region.physical_start = new_physical;
+            region.generation = new_generation;
+            return true;
+        }
+
+        false
     }
 
     /// Unmaps any page-aligned range, even when it spans several mappings or

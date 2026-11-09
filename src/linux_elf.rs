@@ -60,7 +60,7 @@ pub struct LinuxRun {
     pub virtual_address: usize,
     pub physical_start: usize,
     pub page_count: usize,
-    generation: u32,
+    pub generation: u32,
     /// Permission class per page, index `0` is `virtual_address`.
     pub kinds: Vec<PageKind>,
 }
@@ -137,6 +137,66 @@ impl LinuxImage {
             runs,
             released: AtomicBool::new(false),
         })
+    }
+
+    /// Shares every run with a forked child. The refcount is bumped for each
+    /// page and writable data pages become `PageKind::Cow`, so both address
+    /// spaces map them read-only until a write fault copies the run.
+    pub fn share(&self) -> Option<LinuxImage> {
+        let mut runs: Vec<LinuxRun> = Vec::with_capacity(self.runs.len());
+        for run in &self.runs {
+            if !frame_allocator::share_contiguous_pages_tagged(
+                run.physical_start,
+                run.page_count,
+                run.generation,
+            ) {
+                for prior in &runs {
+                    frame_allocator::free_contiguous_pages_tagged(
+                        prior.physical_start,
+                        prior.page_count,
+                        prior.generation,
+                    );
+                }
+                return None;
+            }
+            let mut kinds = run.kinds.clone();
+            for kind in &mut kinds {
+                if *kind == PageKind::Data {
+                    *kind = PageKind::Cow;
+                }
+            }
+            runs.push(LinuxRun {
+                virtual_address: run.virtual_address,
+                physical_start: run.physical_start,
+                page_count: run.page_count,
+                generation: run.generation,
+                kinds,
+            });
+        }
+        Some(LinuxImage {
+            entry: self.entry,
+            program_entry: self.program_entry,
+            interp_base: self.interp_base,
+            interp_path: self.interp_path.clone(),
+            phdr_address: self.phdr_address,
+            phentsize: self.phentsize,
+            phnum: self.phnum,
+            upper_bound: self.upper_bound,
+            runs,
+            released: AtomicBool::new(false),
+        })
+    }
+
+    /// Converts writable image pages to the shared COW state. Called on the
+    /// parent after `share`; the parent's PTEs are made read-only separately.
+    pub fn mark_data_cow(&mut self) {
+        for run in &mut self.runs {
+            for kind in &mut run.kinds {
+                if *kind == PageKind::Data {
+                    *kind = PageKind::Cow;
+                }
+            }
+        }
     }
 
     /// Attaches an already-loaded interpreter image at `base` (the `AT_BASE`
