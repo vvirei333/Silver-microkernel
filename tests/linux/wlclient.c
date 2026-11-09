@@ -25,6 +25,8 @@ static struct wl_pointer *pointer;
 static uint32_t configure_serial;
 static int configured;
 static int output_done;
+static int toplevel_maximized;
+static int toplevel_fullscreen;
 static int output_scale;
 static int surface_entered;
 static int output_name_ok;
@@ -325,7 +327,16 @@ static void toplevel_configure(void *data, struct xdg_toplevel *toplevel,
     (void)toplevel;
     (void)width;
     (void)height;
-    (void)states;
+    toplevel_maximized = 0;
+    toplevel_fullscreen = 0;
+    uint32_t *state;
+    wl_array_for_each(state, states) {
+        if (*state == XDG_TOPLEVEL_STATE_MAXIMIZED) {
+            toplevel_maximized = 1;
+        } else if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN) {
+            toplevel_fullscreen = 1;
+        }
+    }
 }
 
 static void toplevel_close(void *data, struct xdg_toplevel *toplevel) {
@@ -391,6 +402,53 @@ int main(void) {
         if (wl_display_roundtrip(display) < 0) {
             return 7;
         }
+    }
+    xdg_surface_ack_configure(xdg_surface, configure_serial);
+
+    /* Toplevel state transitions: configure with MAXIMIZED, then empty, then
+     * FULLSCREEN, then empty. */
+    xdg_toplevel_set_maximized(toplevel);
+    for (int attempt = 0; attempt < 4 && !toplevel_maximized; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (!toplevel_maximized) {
+        fprintf(stderr, "wlclient: maximized configure missing\n");
+        return 8;
+    }
+    xdg_surface_ack_configure(xdg_surface, configure_serial);
+    xdg_toplevel_unset_maximized(toplevel);
+    for (int attempt = 0; attempt < 4 && toplevel_maximized; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (toplevel_maximized) {
+        fprintf(stderr, "wlclient: unmaximized configure missing\n");
+        return 8;
+    }
+    xdg_surface_ack_configure(xdg_surface, configure_serial);
+    xdg_toplevel_set_fullscreen(toplevel, NULL);
+    for (int attempt = 0; attempt < 4 && !toplevel_fullscreen; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (!toplevel_fullscreen) {
+        fprintf(stderr, "wlclient: fullscreen configure missing\n");
+        return 8;
+    }
+    xdg_surface_ack_configure(xdg_surface, configure_serial);
+    xdg_toplevel_unset_fullscreen(toplevel);
+    for (int attempt = 0; attempt < 4 && toplevel_fullscreen; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (toplevel_fullscreen) {
+        fprintf(stderr, "wlclient: unfullscreen configure missing\n");
+        return 8;
     }
     xdg_surface_ack_configure(xdg_surface, configure_serial);
 

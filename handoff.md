@@ -690,6 +690,13 @@ Redmi port is parked. The reference checklist is
   and verifies name/description/repeat plus the existing scale/enter/input
   events; the stock `wayland-info` harness advertises the same versions and
   prints them. Both clients and `wayland-info` pass.
+  **Slice 43 (xdg_toplevel states):** the compositor answers
+  `set_maximized`, `unset_maximized`, `set_fullscreen` and
+  `unset_fullscreen` with `xdg_toplevel.configure` state arrays
+  (`MAXIMIZED`/`FULLSCREEN` or empty) followed by a matching
+  `xdg_surface.configure` serial. The real libwayland client drives all four
+  transitions, acks each serial and verifies the state array. Two concurrent
+  clients still pass and `health` is clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -716,9 +723,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 43 (stream ELF segments or raise the
-  whole-file/exec cap, then a larger toolkit; Wayland: data-device/clipboard
-  and xdg-decoration for GTK). Network base maintenance (keep-alive, TLS
+- **Next steps:** Linux ABI slice 44 (stream ELF segments or raise the
+  whole-file/exec cap, then a larger toolkit; Wayland: xdg popup and
+  data-device/clipboard for GTK). Network base maintenance (keep-alive, TLS
   roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on

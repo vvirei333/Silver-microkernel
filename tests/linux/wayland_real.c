@@ -275,6 +275,25 @@ static void send_done(long client, unsigned callback, unsigned data) {
     send_message(client, -1);
 }
 
+/// Sends a toplevel configure with zero or one state, then the matching
+/// xdg_surface.configure serial.
+static void send_toplevel_state(long client, unsigned state) {
+    begin(toplevel_id, 0 /* xdg_toplevel.configure */);
+    put_i32(1024);
+    put_i32(768);
+    put_u32(state != 0 ? 1 : 0);
+    if (state != 0) {
+        put_u32(state);
+    }
+    finish();
+    send_message(client, -1);
+    begin(xdg_surface_id, 0 /* xdg_surface.configure */);
+    put_u32(configure_serial);
+    configure_serial += 1;
+    finish();
+    send_message(client, -1);
+}
+
 static int serve(long client) {
     for (;;) {
         long count = receive_message(client);
@@ -451,6 +470,19 @@ static int serve(long client) {
                 }
                 focused = 0;
                 surface_id = 0;
+            } else if (object == toplevel_id &&
+                       (opcode == 9 || opcode == 10 || opcode == 11 || opcode == 12)) {
+                /* set_maximized, unset_maximized, set_fullscreen, unset_fullscreen */
+                if (opcode == 9) {
+                    send_toplevel_state(client, 1 /* maximized */);
+                } else if (opcode == 10) {
+                    send_toplevel_state(client, 0);
+                } else if (opcode == 11) {
+                    (void)take_u32(); /* output */
+                    send_toplevel_state(client, 2 /* fullscreen */);
+                } else {
+                    send_toplevel_state(client, 0);
+                }
             } else if (object == surface_id && opcode == 3) {
                 frame_id = take_u32(); /* wl_surface.frame */
             } else if (object == surface_id && opcode == 6) {

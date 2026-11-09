@@ -55,7 +55,8 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 - Hand-written mini compositor plus a **real `libwayland-client`**:
   - core `wl_display`/`wl_registry`/`wl_compositor` v4/`wl_shm`/`wl_surface`;
   - `wl_shm` advertises both ARGB8888 and XRGB8888;
-  - `xdg_wm_base` / `xdg_surface` / `xdg_toplevel` (configure/ack);
+  - `xdg_wm_base` / `xdg_surface` / `xdg_toplevel` (configure/ack), with
+    maximized and fullscreen configure states;
   - `wl_output` v4 (geometry/mode/scale/name/description/done) and `wl_seat`
     v5 (name, pointer+keyboard), plus `wl_surface.enter` for the output;
   - `wl_keyboard.keymap` memfd over `SCM_RIGHTS`, `repeat_info`,
