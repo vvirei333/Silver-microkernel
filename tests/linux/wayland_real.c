@@ -1267,6 +1267,8 @@ void _start(void) {
         static const char *argv[] = {"/sfs/gtkdemo", 0};
         static const char *envp[] = {
             "XDG_RUNTIME_DIR=/tmp",
+            "HOME=/tmp",
+            "XKB_CONFIG_ROOT=/sfs/xkb",
             "WAYLAND_DISPLAY=wayland-test",
             "GDK_BACKEND=wayland",
             "LD_LIBRARY_PATH=/sfs",

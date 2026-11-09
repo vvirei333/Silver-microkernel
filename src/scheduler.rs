@@ -220,6 +220,11 @@ struct MmapRegion {
     prot: u64,
     /// Set for a `MAP_SHARED` memfd window: the frames are memfd-owned.
     shared: SharedMapping,
+    /// File-backed `MAP_PRIVATE` pages are allocated one frame at a time (a
+    /// library segment is far larger than the contiguous allocator can still
+    /// find after a few hundred mappings). Empty for anonymous and shared
+    /// regions, whose frames are one contiguous run in `physical_start`.
+    frames: Vec<(usize, u32)>,
 }
 
 /// Syscall ABI a task is running on.
@@ -1974,14 +1979,14 @@ fn has_task_capacity(manager: &TaskManager) -> bool {
 /// Upper bound on a task's anonymous mappings. The virtual window allows far
 /// more entries than the 128 MiB DRAM can back; this cap bounds the metadata
 /// Vec itself, not just the frames.
-const MAX_MMAP_REGIONS: usize = 128;
+const MAX_MMAP_REGIONS: usize = 1024;
 
-/// Per-task cap on anonymous mapping bytes. The mmap window is ~1 GiB but DRAM
-/// is shared by every task, so one EL0 task must not be able to claim the whole
-/// machine and starve the scheduler, IPC and the kernel heap. 16 MiB covers the
-/// demo/`memtest` workloads with room to spare while keeping the global frame
-/// allocator as the last line of defence rather than the first.
-const MAX_MMAP_BYTES_PER_TASK: usize = 24 * 1024 * 1024;
+/// Per-task cap on mapping bytes. The mmap window is ~1 GiB but DRAM is
+/// shared by every task, so one EL0 task must not be able to claim the whole
+/// machine and starve the scheduler, IPC and the kernel heap. The GTK3
+/// library set is ~80 MiB of segments; 160 MiB leaves room for its heap while
+/// the global frame reserve stays the last line of defence.
+const MAX_MMAP_BYTES_PER_TASK: usize = 160 * 1024 * 1024;
 
 pub fn exit_current() -> ! {
     exit_current_with_status(0)
@@ -3036,6 +3041,22 @@ pub fn mmap_file(
     with_group_owner(|task| task.mmap_file(length, prot, fixed, contents))?
 }
 
+/// Maps a file-backed region one frame per page, filling each page through
+/// `fill(offset, buffer)`. This is the path a dynamic loader uses for large
+/// shared objects: it does not need a contiguous run and never reads the whole
+/// file into the kernel heap.
+pub fn mmap_file_paged<F>(
+    length: usize,
+    prot: u64,
+    fixed: Option<usize>,
+    fill: F,
+) -> Option<usize>
+where
+    F: FnMut(usize, &mut [u8]) -> bool,
+{
+    with_group_owner(|task| task.mmap_file_paged(length, prot, fixed, fill))?
+}
+
 /// Maps a memfd `MAP_SHARED` window. The frames stay owned by the memfd, so
 /// every process that maps the same file sees the same bytes.
 #[cfg(feature = "linux-abi")]
@@ -3745,6 +3766,12 @@ impl Drop for ForkParts {
             let _ = frame_allocator::free_page_tagged(page, generation);
         }
         for region in &self.mmap {
+            if !region.frames.is_empty() {
+                for &(page, generation) in &region.frames {
+                    let _ = frame_allocator::free_page_tagged(page, generation);
+                }
+                continue;
+            }
             let _ = frame_allocator::free_contiguous_pages_tagged(
                 region.physical_start,
                 region.page_count,
@@ -3866,6 +3893,39 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             parts.mmap.push(region.clone());
             continue;
         }
+        if !region.frames.is_empty() {
+            // File-backed pages are not one contiguous run, so each frame is
+            // copied on its own. `MAP_PRIVATE` still means private here: the
+            // child must not observe the parent's writes or vice versa.
+            let mut copied: Vec<(usize, u32)> = Vec::new();
+            for &(page, _generation) in &region.frames {
+                let Some((new_page, new_generation)) = frame_allocator::alloc_user_page_tagged()
+                else {
+                    for (page, generation) in copied {
+                        let _ = frame_allocator::free_page_tagged(page, generation);
+                    }
+                    return None;
+                };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        phys_to_virt(page) as *const u8,
+                        phys_to_virt(new_page) as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+                copied.push((new_page, new_generation));
+            }
+            parts.mmap.push(MmapRegion {
+                virtual_address: region.virtual_address,
+                page_count: region.page_count,
+                physical_start: 0,
+                generation: 0,
+                prot: region.prot,
+                shared: SharedMapping::default(),
+                frames: copied,
+            });
+            continue;
+        }
         if !frame_allocator::share_contiguous_pages_tagged(
             region.physical_start,
             region.page_count,
@@ -3880,6 +3940,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             generation: region.generation,
             prot: region.prot,
             shared: SharedMapping::default(),
+            frames: Vec::new(),
         });
     }
 
@@ -5756,18 +5817,15 @@ impl Task {
         self.release_frames(before.saturating_sub(self.heap_pages.len()));
     }
 
-    /// Allocates and maps `length` bytes into the task's TTBR0. Anonymous
-    /// mappings pass `fixed = None`; file-backed mappings may request an exact
-    /// address (Linux `MAP_FIXED`) and pass the file bytes to copy into the
-    /// freshly allocated frames.
-    fn mmap_region(
+    /// Validates a mapping request and reserves its virtual span, frame
+    /// budget and bookkeeping slot. Shared by the contiguous (anonymous /
+    /// memfd) path and the per-page file path.
+    fn mmap_prepare(
         &mut self,
         length: usize,
         prot: u64,
         fixed: Option<usize>,
-        contents: Option<&[u8]>,
-        shared: Option<(usize, SharedMapping)>,
-    ) -> Option<usize> {
+    ) -> Option<(usize, usize, usize)> {
         // W^X: a single mapping must never be writable and executable at the
         // same time. Validate before placement, frame allocation, PTE
         // publication or `mmap_regions` bookkeeping, so a rejected request
@@ -5822,12 +5880,27 @@ impl Task {
         }
 
         // Charge the data pages before the frame allocation. Page tables added
-        // by `map_user_pages_at` beyond the fixed space cost at most one L3 per
-        // 2 MiB (0.2%), which the flat `SPACE_TABLE_FRAMES` charge covers for
-        // budgeting purposes.
+        // beyond the fixed space cost at most one L3 per 2 MiB (0.2%), which
+        // the flat `SPACE_TABLE_FRAMES` charge covers for budgeting purposes.
         if !self.charge_frames(page_count) {
             return None;
         }
+        Some((virtual_address, page_count, span))
+    }
+
+    /// Allocates and maps `length` bytes into the task's TTBR0. Anonymous
+    /// mappings pass `fixed = None`; file-backed mappings may request an exact
+    /// address (Linux `MAP_FIXED`) and pass the file bytes to copy into the
+    /// freshly allocated frames.
+    fn mmap_region(
+        &mut self,
+        length: usize,
+        prot: u64,
+        fixed: Option<usize>,
+        contents: Option<&[u8]>,
+        shared: Option<(usize, SharedMapping)>,
+    ) -> Option<usize> {
+        let (virtual_address, page_count, span) = self.mmap_prepare(length, prot, fixed)?;
         let (physical_start, generation, owner) = match shared {
             // Frames already owned by a memfd: map them where they are and
             // keep the lifetime handle. They must never be freed here.
@@ -5894,6 +5967,7 @@ impl Task {
             generation,
             prot,
             shared: owner,
+            frames: Vec::new(),
         };
         let position = self
             .mmap_regions
@@ -5903,6 +5977,97 @@ impl Task {
         self.mmap_regions.insert(position, region);
         self.mmap_bytes += span;
         Some(virtual_address)
+    }
+
+    /// Maps a file-backed `MAP_PRIVATE` range one frame per page. `fill` is
+    /// called with the mapping-relative offset and a zeroed page buffer; it
+    /// returns `false` to abort (an I/O error must not publish a half image).
+    fn mmap_file_paged<F>(
+        &mut self,
+        length: usize,
+        prot: u64,
+        fixed: Option<usize>,
+        mut fill: F,
+    ) -> Option<usize>
+    where
+        F: FnMut(usize, &mut [u8]) -> bool,
+    {
+        let (virtual_address, page_count, span) = self.mmap_prepare(length, prot, fixed)?;
+        let mut frames: Vec<(usize, u32)> = Vec::new();
+        if frames.try_reserve(page_count).is_err() {
+            self.release_frames(page_count);
+            return None;
+        }
+        let mut page = alloc::vec![0_u8; PAGE_SIZE];
+        for index in 0..page_count {
+            let Some((physical, generation)) = frame_allocator::alloc_user_page_tagged() else {
+                self.abort_paged_mapping(virtual_address, index, &mut frames, page_count);
+                return None;
+            };
+            for byte in page.iter_mut() {
+                *byte = 0;
+            }
+            if !fill(index * PAGE_SIZE, &mut page) {
+                let _ = frame_allocator::free_page_tagged(physical, generation);
+                self.abort_paged_mapping(virtual_address, index, &mut frames, page_count);
+                return None;
+            }
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    page.as_ptr(),
+                    phys_to_virt(physical) as *mut u8,
+                    PAGE_SIZE,
+                );
+            }
+            if !mmu::map_user_page_at(
+                self.ttbr0,
+                virtual_address + index * PAGE_SIZE,
+                physical,
+                prot,
+            ) {
+                let _ = frame_allocator::free_page_tagged(physical, generation);
+                self.abort_paged_mapping(virtual_address, index, &mut frames, page_count);
+                return None;
+            }
+            frames.push((physical, generation));
+        }
+        let region = MmapRegion {
+            virtual_address,
+            page_count,
+            physical_start: 0,
+            generation: 0,
+            prot,
+            shared: SharedMapping::default(),
+            frames,
+        };
+        let position = self
+            .mmap_regions
+            .iter()
+            .position(|existing| existing.virtual_address > virtual_address)
+            .unwrap_or(self.mmap_regions.len());
+        self.mmap_regions.insert(position, region);
+        self.mmap_bytes += span;
+        Some(virtual_address)
+    }
+
+    /// Rolls back the already-published prefix of a paged file mapping.
+    fn abort_paged_mapping(
+        &mut self,
+        virtual_address: usize,
+        mapped: usize,
+        frames: &mut Vec<(usize, u32)>,
+        charged: usize,
+    ) {
+        if mapped > 0 && !mmu::unmap_user_pages_at(self.ttbr0, virtual_address, mapped) {
+            MMAP_LEAKED_FRAMES.fetch_add(mapped, Ordering::Relaxed);
+            console::write_str("MMAP LEAK: rollback could not unmap range 0x");
+            console::write_hex_u64(virtual_address as u64);
+            console::write_str("\r\n");
+        }
+        for (page, generation) in frames.drain(..) {
+            let _ = frame_allocator::free_page_tagged(page, generation);
+        }
+        self.release_frames(charged);
     }
 
     fn mmap_anonymous(&mut self, length: usize, prot: u64) -> Option<usize> {
@@ -6206,6 +6371,7 @@ impl Task {
             if left > 0 && right > 0 && self.mmap_regions.len() >= MAX_MMAP_REGIONS {
                 return false;
             }
+            let paged = !self.mmap_regions[index].frames.is_empty();
             let removed_physical = physical_start + start_page * PAGE_SIZE;
 
             // Fail closed: `unmap_user_pages_at` is all-or-nothing, so on
@@ -6219,16 +6385,30 @@ impl Task {
                 console::write_str(" pages)\r\n");
                 return false;
             }
-            // Free only the removed slice of the original contiguous run;
-            // every page in it shares the run's generation. A shared memfd
-            // window leaves its frames to the memfd object.
-            if !shared
+            if paged {
+                // One frame at a time: that is how a file-backed segment was
+                // allocated in the first place.
+                let removed: Vec<(usize, u32)> = self.mmap_regions[index]
+                    .frames
+                    .drain(start_page..start_page + count)
+                    .collect();
+                for (page, frame_generation) in removed {
+                    if !frame_allocator::free_page_tagged(page, frame_generation) {
+                        console::write_str("MMAP: allocator refused page 0x");
+                        console::write_hex_u64(page as u64);
+                        console::write_str(" - leaked\r\n");
+                    }
+                }
+            } else if !shared
                 && !frame_allocator::free_contiguous_pages_tagged(
                     removed_physical,
                     count,
                     generation,
                 )
             {
+                // Free only the removed slice of the original contiguous run;
+                // every page in it shares the run's generation. A shared memfd
+                // window leaves its frames to the memfd object.
                 console::write_str("MMAP: allocator refused run 0x");
                 console::write_hex_u64(removed_physical as u64);
                 console::write_str(" - leaked\r\n");
@@ -6239,24 +6419,31 @@ impl Task {
                     self.mmap_regions.remove(index);
                 }
                 (true, false) => {
-                    self.mmap_regions[index].page_count = left;
+                    let region = &mut self.mmap_regions[index];
+                    region.page_count = left;
+                    region.prot = prot;
                 }
                 (false, true) => {
                     let region = &mut self.mmap_regions[index];
                     region.virtual_address = inter_end;
-                    region.physical_start = removed_physical + count * PAGE_SIZE;
                     region.page_count = right;
                     region.prot = prot;
+                    if !paged {
+                        region.physical_start = removed_physical + count * PAGE_SIZE;
+                    }
                 }
                 (true, true) => {
-                    let tail = MmapRegion {
-                        virtual_address: inter_end,
-                        physical_start: removed_physical + count * PAGE_SIZE,
-                        page_count: right,
-                        generation,
-                        prot,
-                        shared: self.mmap_regions[index].shared.clone(),
-                    };
+                    let mut tail = self.mmap_regions[index].clone();
+                    tail.virtual_address = inter_end;
+                    tail.page_count = right;
+                    tail.prot = prot;
+                    if paged {
+                        // The drain above left left+right frames; split the
+                        // tail off after the retained prefix.
+                        tail.frames = self.mmap_regions[index].frames.split_off(start_page);
+                    } else {
+                        tail.physical_start = removed_physical + count * PAGE_SIZE;
+                    }
                     self.mmap_regions[index].page_count = left;
                     self.mmap_regions.insert(index + 1, tail);
                 }
@@ -6400,15 +6587,16 @@ impl Task {
         }
         let offset_pages =
             (address - self.mmap_regions[index].virtual_address) / PAGE_SIZE;
-        let region = &self.mmap_regions[index];
-        let tail = MmapRegion {
-            virtual_address: address,
-            physical_start: region.physical_start + offset_pages * PAGE_SIZE,
-            page_count: region.page_count - offset_pages,
-            generation: region.generation,
-            prot: region.prot,
-            shared: region.shared.clone(),
-        };
+        let mut tail = self.mmap_regions[index].clone();
+        tail.virtual_address = address;
+        tail.page_count = self.mmap_regions[index].page_count - offset_pages;
+        if tail.frames.is_empty() {
+            tail.physical_start =
+                self.mmap_regions[index].physical_start + offset_pages * PAGE_SIZE;
+        } else {
+            tail.frames = tail.frames.split_off(offset_pages);
+            self.mmap_regions[index].frames.truncate(offset_pages);
+        }
         self.mmap_regions[index].page_count = offset_pages;
         self.mmap_regions.insert(index + 1, tail);
         true
@@ -6543,6 +6731,16 @@ fn release_space_resources(
             if region.shared.is_some() {
                 // The memfd owns these frames; dropping `region.shared` above
                 // drops this mapping's reference to the file.
+                continue;
+            }
+            if !region.frames.is_empty() {
+                for &(page, generation) in &region.frames {
+                    if !frame_allocator::free_page_tagged(page, generation) {
+                        console::write_str("MMAP: release refused page 0x");
+                        console::write_hex_u64(page as u64);
+                        console::write_str(" - leaked\r\n");
+                    }
+                }
                 continue;
             }
             frame_allocator::free_contiguous_pages_tagged(

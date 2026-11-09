@@ -1545,22 +1545,26 @@ fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
     if !scheduler::current_read_path_allowed(&resolved) {
         return errno(EACCES);
     }
-    if let Ok(size) = crate::vfs::file_len(&cwd, &path) {
+    // Directories first: the SFS backend reports a directory inode's size as
+    // 0, so `file_len` succeeds for one and used to classify it as a regular
+    // file. Toolkits stat XDG/data directories and reject a "file" where a
+    // directory is required (xkbcommon refused its own config root).
+    if crate::vfs::read_dir(&cwd, &path).is_ok() {
         return match linux_fd::write_stat(
             buffer,
-            S_IFREG | 0o644,
-            size as u64,
+            S_IFDIR | 0o755,
+            0,
             linux_fd::path_ino(&resolved),
         ) {
             Ok(()) => 0,
             Err(code) => errno(code),
         };
     }
-    if crate::vfs::read_dir(&cwd, &path).is_ok() {
+    if let Ok(size) = crate::vfs::file_len(&cwd, &path) {
         return match linux_fd::write_stat(
             buffer,
-            S_IFDIR | 0o755,
-            0,
+            S_IFREG | 0o644,
+            size as u64,
             linux_fd::path_ino(&resolved),
         ) {
             Ok(()) => 0,
@@ -2073,17 +2077,20 @@ fn linux_mmap(
             return errno(EINVAL);
         }
     }
-    // MAP_PRIVATE: copy the file range into fresh frames.
-    if length as usize > crate::vfs::MAX_FILE_BYTES {
+    // MAP_PRIVATE: copy the file range into fresh frames, one page at a time.
+    // A library segment is routinely larger than the whole-file read cap
+    // (`MAX_FILE_BYTES`, 8 MiB — libgtk-3 is ~8.5 MiB), and the contiguous
+    // allocator cannot find a 2000-page run after a few hundred mappings.
+    const MAX_FILE_MMAP_BYTES: usize = 64 * 1024 * 1024;
+    if length as usize > MAX_FILE_MMAP_BYTES {
         return errno(ENOMEM);
     }
     let task = scheduler::current_task_id();
-    let mut bytes = alloc::vec![0_u8; length as usize];
-    let read = match linux_fd::pread(task, fd, offset, &mut bytes) {
-        Ok(read) => read,
-        Err(error) => return errno(error),
-    };
-    let placed = scheduler::mmap_file(length as usize, prot, fixed, &bytes[..read]);
+    let placed = scheduler::mmap_file_paged(length as usize, prot, fixed, |page_offset, buffer| {
+        // The buffer arrives zeroed; a short read leaves the rest as the
+        // zero-fill Linux expects past EOF.
+        linux_fd::pread(task, fd, offset + page_offset as u64, buffer).is_ok()
+    });
     placed.map(|placed| placed as u64).unwrap_or(errno(ENOMEM))
 }
 

@@ -3166,3 +3166,94 @@ adaptive image load up to 8 MiB, `scripts/make_sfs.py` formatter.
 clean; shell write/append/rename/mkdir/rm/rmdir smoke PASS.
 Next: fog/Redmi 10C boot PoC (see SMP_STATUS and the T20.1 review), then
 drivers: GCC/pinctrl → GENI I2C → touch.
+
+## 2026-11-10 — GTK3 loads and runs in the guest (Phosh prerequisite)
+
+Milestone: the real GTK3 3.24.52 stack now gets through `ld.so`, loads every
+library, starts a `GMainLoop`, creates the Wayland window and only stops when
+it wants to rasterise its first icon. Before this session the guest died at
+`libz.so.1: failed to map segment from shared object`.
+
+### What was blocking and what changed
+
+- **File-backed `MAP_PRIVATE` is now paged, not contiguous.** The old path
+  read the whole file into a kernel `Vec` (capped by `MAX_FILE_BYTES` = 8 MiB;
+  `libgtk-3.so` is 8.5 MiB) and asked the frame allocator for one contiguous
+  run (up to 2 000 pages). After a few hundred mappings that run no longer
+  exists. `linux_mmap` now calls `scheduler::mmap_file_paged`, which allocates
+  one frame per page, fills it through a `pread` closure and publishes it with
+  `mmu::map_user_page_at`. `MmapRegion` gained a `frames: Vec<(phys, gen)>`
+  for these regions; `munmap`, `mprotect` splits, `fork` (deep copy) and
+  teardown all handle it. The 8 MiB whole-file cap is gone for mmap; the new
+  bound is 64 MiB per call, still checked against the per-task quota.
+- **Limits for a toolkit process.** `MAX_MMAP_REGIONS` 128 → 1024 (GTK maps
+  hundreds of segments), `MAX_MMAP_BYTES_PER_TASK` 24 → 160 MiB,
+  `TASK_LIMIT_DIVISOR` 4 → 2, QEMU DRAM 128 → 256 MiB (health now reports
+  64 224 frames). `build_and_qemu.sh` already passed `-m 256M`; the kernel
+  just refused to use it.
+- **`newfstatat` classified directories as files.** SFS reports a directory
+  inode's size as 0, so `file_len` succeeded and `st_mode` said `S_IFREG`.
+  xkbcommon stat'ed its own config root, saw a file, and refused every include
+  path. Directories are now probed first (`read_dir`).
+- **`vfs::open` accepted paths that do not exist**, storing an `OpenFile` and
+  failing the first read with `EBADF`. xkbcommon probes `rules/evdev.pre`
+  (absent in xkeyboard-config 2.49), got a bogus fd and reported "Bad file
+  descriptor". `open` now probes `len()` and returns `ENOENT`.
+- **`scripts/sfs_inject.py` can write into subdirectories**: `mkdir`,
+  `write_file_at("xkb/rules/evdev", …)`; plain `write_file` is unchanged.
+
+### Verified
+
+- `cargo test --lib`: 221/221.
+- Kernel build, QEMU boot on 256 MiB, `health` 64 224 frames, Linux series
+  still green (hello/rw/chain/fork/pipe/ipc/signal/libc/threads/unixsock/
+  exitgroup/asyncsig/dyn/pthread/groupsig), `wget https://example.com` → 200.
+- Guest GTK log now ends at:
+  `Could not load a pixbuf … window-minimize-symbolic.symbolic.png` →
+  `Gtk:ERROR … image-missing.png: Unrecognized image file format` →
+  `Bail out!` (SIGABRT, exit 134). Everything before that is clean.
+
+### Temporary GTK image (lives in /tmp, not in the repo)
+
+`/tmp/opencode/gtk/disk_gtk.img` — 256 MiB, copy of `disk.img` resized with
+`scripts/sfs_resize.py 256 4096`, then:
+- 67 GTK/GLib/GIO libraries plus `ld-linux-aarch64.so.1`, `libc.so.6`,
+  `libm.so.6` at `/sfs` (set built from `LD_DEBUG=libs` "calling init" lines;
+  host root `/tmp/opencode/gtk/root`, Arch ARM packages);
+- `gtkdemo` (interpreter `/sfs/ld-linux-aarch64.so.1`), `gtk-serve`
+  (`-DSERVE_ONLY` build of `tests/linux/wayland_real.c`);
+- `/sfs/xkb/**` (298 files from Arch `xkeyboard-config` 2.49, extracted from
+  the package's `xkeyboard-config-2` tree; `XKB_CONFIG_ROOT=/sfs/xkb`);
+- `/sfs/etc/passwd`, `/sfs/etc/group`, `/sfs/gschemas.compiled`,
+  `/sfs/DejaVuSans.ttf`, `/sfs/fonts.conf` (`cachedir /tmp/fontcache`);
+- env from the harness: `HOME=/tmp`, `XDG_RUNTIME_DIR=/tmp`,
+  `WAYLAND_DISPLAY=wayland-test`, `GDK_BACKEND=wayland`, `LD_LIBRARY_PATH=/sfs`,
+  `FONTCONFIG_FILE=/sfs/fonts.conf`, `GSETTINGS_SCHEMA_DIR=/sfs`.
+
+Repro: back up `disk.img`, copy the GTK image over it, boot
+`./build_and_qemu.sh --no-viewer`, run `linuxrun-gtk-serve`. Restore
+`disk.img` with `git checkout -- disk.img` afterwards.
+
+### Next (in order)
+
+1. **gdk-pixbuf image loader.** `gdk-pixbuf-query-loaders` from the installed
+   2.44.8 package prints an empty loader list (only a missing
+   `libopenraw_pixbuf.so` warning); Arch's package ships loaders as modules
+   and/or glycin. Need a PNG loader for GTK's GResource icons: ship
+   `libpixbufloader-png.so` + a `loaders.cache` and set
+   `GDK_PIXBUF_MODULE_FILE`/`GDK_PIXBUF_MODULEDIR`, or build gdk-pixbuf with
+   built-in PNG. Quick proof-of-window workaround: make the demo window
+   undecorated (`gtk_window_set_decorated(FALSE)`) so no CSD icon is loaded,
+   but real Phosh apps need the loader.
+2. **fontconfig writes.** `faccessat` still returns `EROFS` for every `W_OK`
+   check, including `/tmp`, so fontconfig cannot create `/tmp/fontcache`.
+   Allow `W_OK` under `LINUX_SCRATCH_PREFIX`.
+3. **Post-abort faults.** After gtkdemo aborts, two helper tasks (9, 11) take
+   an EL0 page fault inside library code (e.g. `0x418D94EC`) before gtk-serve
+   exits 1. Understand whether these are GTK threads killed by `exit_group` or
+   a real teardown bug; re-check once the icon abort is gone.
+4. Then: Phosh. The mini compositor still lacks the wlroots protocol set Phosh
+   needs (`wlr-layer-shell`, `wlr-screencopy`, `wlr-foreign-toplevel`,
+   `wlr-output-management`, idle-inhibit, gamma-control, ...), and Phosh is
+   GTK3 with gnome-session/upower/gsettings expectations. GTK4 + libadwaita
+   follow.

@@ -1163,6 +1163,21 @@ pub fn map_shared_writable_pages_at(
     map_user_pages_at_inner(ttbr0, virtual_address, physical_start, page_count, prot, false, false)
 }
 
+/// Maps one frame that already holds live data at `virtual_address`.
+///
+/// File-backed segments allocate a frame per page (a large library cannot be
+/// satisfied by one contiguous run), so they cannot use
+/// [`map_user_pages_at`]. The frame is not cleared: the caller filled it from
+/// the file before publishing the descriptor.
+pub fn map_user_page_at(
+    ttbr0: usize,
+    virtual_address: usize,
+    physical: usize,
+    prot: u64,
+) -> bool {
+    map_user_pages_at_inner(ttbr0, virtual_address, physical, 1, prot, false, false)
+}
+
 /// Shared implementation of the two entry points above.
 fn map_user_pages_at_inner(
     ttbr0: usize,

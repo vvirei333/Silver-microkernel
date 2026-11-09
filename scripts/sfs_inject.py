@@ -268,8 +268,34 @@ class Image:
             self.set_used(triple, False)
         self.set_inode(index, INODE_KIND_FREE, 0, [0, 0, 0, 0], 0, 0, 0)
 
+    def mkdir(self, path: str) -> int:
+        """Creates `path` (relative to the root) and returns its inode."""
+        index = self.root
+        for part in (piece for piece in path.split("/") if piece):
+            child = self.find_entry(index, part)
+            if child is None:
+                child = self.alloc_inode(INODE_KIND_DIR)
+                block = self.alloc_block()
+                for byte in range(BLOCK):
+                    self.data[block * BLOCK + byte] = 0
+                self.set_inode(child, INODE_KIND_DIR, 0, [block, 0, 0, 0], 0, 0, 0)
+                self.add_entry(index, part, child)
+            index = child
+        return index
+
     def write_file(self, name: str, payload: bytes) -> None:
-        existing = self.find_entry(self.root, name)
+        self.write_file_in(self.root, name, payload)
+
+    def write_file_at(self, path: str, payload: bytes) -> None:
+        """Writes a file at a slash-separated path, creating parents."""
+        parts = [piece for piece in path.split("/") if piece]
+        if not parts:
+            raise SystemExit("empty destination path")
+        parent = self.mkdir("/".join(parts[:-1])) if len(parts) > 1 else self.root
+        self.write_file_in(parent, parts[-1], payload)
+
+    def write_file_in(self, dir_index: int, name: str, payload: bytes) -> None:
+        existing = self.find_entry(dir_index, name)
         if existing is not None:
             self.free_file(existing)
             index = existing
@@ -294,7 +320,7 @@ class Image:
             index, INODE_KIND_FILE, len(payload), blocks, indirect, double, triple
         )
         if existing is None:
-            self.add_entry(self.root, name, index)
+            self.add_entry(dir_index, name, index)
 
     def save(self) -> None:
         with open(self.path, "wb") as handle:

@@ -37,8 +37,10 @@ pub fn user_alloc_ok(free: usize, requested: usize, total: usize) -> bool {
     remaining >= requested
 }
 
-/// Fraction of the usable frames a single task may charge: one quarter.
-pub const TASK_LIMIT_DIVISOR: usize = 4;
+/// Fraction of the usable frames a single task may charge. A toolkit process
+/// maps ~80 MiB of libraries before it runs, so a quarter of a 256 MiB
+/// machine is not enough; half still leaves the kernel reserve intact.
+pub const TASK_LIMIT_DIVISOR: usize = 2;
 
 /// Floor for the per-task charge on a tiny window, so the flat spawn cost
 /// (page tables, stacks, private page) still fits.
@@ -95,9 +97,9 @@ mod tests {
     }
 
     #[test]
-    fn task_limit_is_a_quarter_with_a_floor() {
-        assert_eq!(task_frame_limit(32_768), 8_192);
-        assert_eq!(task_frame_limit(64), 16);
+    fn task_limit_is_half_with_a_floor() {
+        assert_eq!(task_frame_limit(32_768), 16_384);
+        assert_eq!(task_frame_limit(64), 32);
         // A window smaller than the floor may use all of itself, never more.
         assert_eq!(task_frame_limit(8), 8);
         assert_eq!(task_frame_limit(0), 0);

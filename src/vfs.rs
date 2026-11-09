@@ -810,12 +810,12 @@ impl Vfs {
         if self.mounts[mount].fs.is_directory(&relative)? {
             return Err(());
         }
+        // Opening a path that does not exist must fail here. Without this
+        // probe the old code recorded an OpenFile for any non-directory name
+        // and only failed on the first read, as EBADF instead of ENOENT.
+        let length = self.mounts[mount].fs.len(&relative)?;
         let append = flags & OPEN_APPEND != 0;
-        let offset = if append {
-            self.mounts[mount].fs.len(&relative)?
-        } else {
-            0
-        };
+        let offset = if append { length } else { 0 };
 
         if self
             .open_files
