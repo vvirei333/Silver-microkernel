@@ -564,6 +564,12 @@ howl> linuxrun /sfs/linux-dbus
 dbus ok
 ```
 
+The same test also negotiates `NEGOTIATE_UNIX_FD`/`AGREE_UNIX_FD`, then sends a
+`SendFd` call whose `h` body argument is backed by a memfd passed with
+`SCM_RIGHTS` (`UNIX_FDS=1` header field). The daemon maps and verifies it,
+returns a second memfd in the `method_return`, and emits a `Changed` signal
+with an `s` body; the client validates the returned descriptor and the signal.
+
 Threads use `clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_SETTLS)`: they
 share the leader's address space and memory, get a separate user/kernel stack
 and per-thread `TPIDR_EL0` TLS, and exit through a futex-based join

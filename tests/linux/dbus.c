@@ -154,6 +154,13 @@ static void field_signature(unsigned code, char signature) {
 }
 
 static void body_begin(void) { body_length = 0; }
+static void body_u32(unsigned value) {
+    body[body_length++] = value & 0xff;
+    body[body_length++] = (value >> 8) & 0xff;
+    body[body_length++] = (value >> 16) & 0xff;
+    body[body_length++] = (value >> 24) & 0xff;
+}
+
 static void body_text(const char *text) {
     unsigned length = 0;
     while (text[length] != 0) {
@@ -235,6 +242,7 @@ struct fields {
     char signature[16];
     unsigned reply_serial;
     int has_reply_serial;
+    unsigned unix_fds;
 };
 
 static int parse_message(struct fields *result) {
@@ -298,6 +306,8 @@ static int parse_message(struct fields *result) {
             if (code == 5) {
                 result->reply_serial = value;
                 result->has_reply_serial = 1;
+            } else if (code == 9) {
+                result->unix_fds = value;
             }
         } else if (signature[0] == 'g') {
             char nested[16];
@@ -339,6 +349,115 @@ static long receive_buffer(long fd) {
     }
     incoming_length = (unsigned)count;
     return count;
+}
+
+struct iovec {
+    void *base;
+    unsigned long length;
+};
+
+struct message_header {
+    void *name;
+    unsigned int name_length;
+    unsigned int pad;
+    struct iovec *iov;
+    unsigned long iov_length;
+    void *control;
+    unsigned long control_length;
+    int flags;
+    int pad2;
+};
+struct control_message {
+    unsigned long length;
+    int level;
+    int kind;
+};
+union message_control {
+    struct control_message header;
+    unsigned char raw[64];
+};
+
+static long send_with_fd(long fd, int pass_fd) {
+    struct iovec vector = {message, message_length};
+    struct message_header header;
+    union message_control control;
+    for (unsigned long index = 0; index < sizeof(header); index++) {
+        ((unsigned char *)&header)[index] = 0;
+    }
+    header.iov = &vector;
+    header.iov_length = 1;
+    if (pass_fd >= 0) {
+        control.header.length = sizeof(struct control_message) + sizeof(int);
+        control.header.level = 1;
+        control.header.kind = 1;
+        *(int *)((unsigned char *)&control.header + sizeof(struct control_message)) =
+            pass_fd;
+        header.control = control.raw;
+        header.control_length = sizeof(struct control_message) + sizeof(int);
+    }
+    return sys3(211 /* sendmsg */, fd, (long)&header, 0);
+}
+
+/* Reads one queued D-Bus message and any descriptor that came with it. */
+static long receive_with_fd(long fd, int *out_fd) {
+    struct iovec vector = {incoming, sizeof(incoming)};
+    struct message_header header;
+    union message_control control;
+    for (unsigned long index = 0; index < sizeof(header); index++) {
+        ((unsigned char *)&header)[index] = 0;
+    }
+    header.iov = &vector;
+    header.iov_length = 1;
+    header.control = control.raw;
+    header.control_length = sizeof(control.raw);
+    long count = sys3(212 /* recvmsg */, fd, (long)&header, 0);
+    if (count <= 0) {
+        return count;
+    }
+    incoming_length = (unsigned)count;
+    *out_fd = -1;
+    if (header.control_length >= sizeof(struct control_message) + sizeof(int)) {
+        struct control_message *got = &control.header;
+        if (got->level == 1 && got->kind == 1) {
+            *out_fd = *(int *)((unsigned char *)got +
+                               sizeof(struct control_message));
+        }
+    }
+    return count;
+}
+
+static long make_memfd(const char *text) {
+    long fd = sys3(279 /* memfd_create */, (long)"dbus-fd", 0, 0);
+    if (fd < 0 || sys3(46 /* ftruncate */, fd, 4096, 0) < 0) {
+        return -1;
+    }
+    long mapped = sys6(222 /* mmap */, 0, 4096, 3 /* RW */, 1 /* SHARED */, fd, 0);
+    if (mapped < 0) {
+        return -1;
+    }
+    char *bytes = (char *)mapped;
+    unsigned index = 0;
+    while (text[index] != 0) {
+        bytes[index] = text[index];
+        index++;
+    }
+    sys3(215, mapped, 4096, 0);
+    return fd;
+}
+
+static int memfd_equals(int fd, const char *text) {
+    long mapped = sys6(222, 0, 4096, 1 /* READ */, 1 /* SHARED */, fd, 0);
+    if (mapped < 0) {
+        return 0;
+    }
+    const char *bytes = (const char *)mapped;
+    unsigned index = 0;
+    while (text[index] != 0 && bytes[index] == text[index]) {
+        index++;
+    }
+    int same = text[index] == 0;
+    sys3(215, mapped, 4096, 0);
+    return same;
 }
 
 /* ------------------------------------------------------------------- server */
@@ -383,6 +502,15 @@ static int server_authenticate(long client) {
     if (send_buffer(client, ok, length) < 0) {
         return 0;
     }
+    /* NEGOTIATE_UNIX_FD -> AGREE_UNIX_FD */
+    if (receive_buffer(client) <= 0 || incoming[0] != 'N') {
+        return 0;
+    }
+    const char agree[] = "AGREE_UNIX_FD\r\n";
+    if (send_buffer(client, (const unsigned char *)agree,
+                    sizeof(agree) - 1) < 0) {
+        return 0;
+    }
     if (receive_buffer(client) < 6 || incoming[0] != 'B') {
         return 0;
     }
@@ -418,6 +546,56 @@ static int server_run(long client) {
     body_begin();
     body_text(":1.0");
     unsigned length = message_finish();
+    if (send_buffer(client, message, length) <= 0) {
+        return 0;
+    }
+
+    /* Second call: SendFd, carrying a memfd with SCM_RIGHTS. */
+    int passed = -1;
+    if (receive_with_fd(client, &passed) <= 0) {
+        return 0;
+    }
+    unsigned call_serial = incoming[8] | (incoming[9] << 8) |
+                           (incoming[10] << 16) | (incoming[11] << 24);
+    struct fields fd_call;
+    if (!parse_message(&fd_call)) {
+        return 0;
+    }
+    if (!text_equal(fd_call.member, "SendFd") || fd_call.unix_fds != 1 ||
+        !text_equal(fd_call.signature, "h") || passed < 0 ||
+        !memfd_equals(passed, "payload")) {
+        return 0;
+    }
+    sys3(57, passed, 0, 0);
+
+    long reply_fd = make_memfd("reply");
+    if (reply_fd < 0) {
+        return 0;
+    }
+    message_begin(2, 4);
+    field_u32(5, call_serial);
+    field_text(7, "org.example", 0);
+    field_signature(8, 'h');
+    field_u32(9, 1);
+    body_begin();
+    body_u32(0);
+    length = message_finish();
+    int sent = send_with_fd(client, (int)reply_fd) > 0;
+    sys3(57, reply_fd, 0, 0);
+    if (!sent) {
+        return 0;
+    }
+
+    /* Then a signal. */
+    message_begin(4 /* signal */, 5);
+    field_text(1, "/org/example/Test", 1);
+    field_text(2, "org.example.Test", 0);
+    field_text(3, "Changed", 0);
+    field_text(7, "org.example", 0);
+    field_signature(8, 's');
+    body_begin();
+    body_text("hello");
+    length = message_finish();
     return send_buffer(client, message, length) > 0;
 }
 
@@ -433,6 +611,12 @@ static int client_run(void) {
     }
     if (receive_buffer(client) <= 0 || incoming[0] != 'O') {
         return fail("dbus: auth rejected\n", 20);
+    }
+    if (send_buffer(client, (const unsigned char *)"NEGOTIATE_UNIX_FD\r\n", 19) < 0) {
+        return fail("dbus: negotiate failed\n", 24);
+    }
+    if (receive_buffer(client) <= 0 || incoming[0] != 'A') {
+        return fail("dbus: no unix fd support\n", 26);
     }
     if (send_buffer(client, (const unsigned char *)"BEGIN\r\n", 7) < 0) {
         return fail("dbus: begin failed\n", 19);
@@ -473,6 +657,63 @@ static int client_run(void) {
     take_string(unique, sizeof(unique));
     if (unique[0] != ':' || unique[1] == 0) {
         return fail("dbus: bad unique name\n", 23);
+    }
+
+    /* SendFd with a memfd, then read the reply fd and the signal. */
+    long fd = make_memfd("payload");
+    if (fd < 0) {
+        return fail("dbus: memfd failed\n", 20);
+    }
+    message_begin(1, 3);
+    field_text(1, "/org/example/Test", 1);
+    field_text(2, "org.example.Test", 0);
+    field_text(3, "SendFd", 0);
+    field_text(6, "org.example", 0);
+    field_signature(8, 'h');
+    field_u32(9, 1);
+    body_begin();
+    body_u32(0);
+    length = message_finish();
+    int sent = send_with_fd(client, (int)fd) > 0;
+    sys3(57, fd, 0, 0);
+    if (!sent) {
+        return fail("dbus: send fd failed\n", 22);
+    }
+
+    int received = -1;
+    if (receive_with_fd(client, &received) <= 0) {
+        return fail("dbus: no fd reply\n", 19);
+    }
+    struct fields fd_reply;
+    if (!parse_message(&fd_reply) || !fd_reply.has_reply_serial ||
+        fd_reply.reply_serial != 3 || fd_reply.unix_fds != 1 ||
+        !text_equal(fd_reply.signature, "h") || received < 0) {
+        return fail("dbus: bad fd reply\n", 20);
+    }
+    if (!memfd_equals(received, "reply")) {
+        return fail("dbus: reply fd data\n", 21);
+    }
+    sys3(57, received, 0, 0);
+
+    if (receive_buffer(client) <= 0 || incoming[1] != 4) {
+        return fail("dbus: no signal\n", 17);
+    }
+    struct fields signal_fields;
+    if (!parse_message(&signal_fields) ||
+        !text_equal(signal_fields.member, "Changed") ||
+        !text_equal(signal_fields.signature, "s")) {
+        return fail("dbus: bad signal\n", 18);
+    }
+    unsigned signal_body = 16 + (incoming[12] | (incoming[13] << 8) |
+                                 (incoming[14] << 16) | (incoming[15] << 24));
+    while (signal_body % 8 != 0) {
+        signal_body++;
+    }
+    offset = signal_body;
+    char signal_text[16];
+    take_string(signal_text, sizeof(signal_text));
+    if (!text_equal(signal_text, "hello")) {
+        return fail("dbus: signal body\n", 19);
     }
 
     sys3(57, client, 0, 0);

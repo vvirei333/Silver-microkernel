@@ -548,6 +548,14 @@ Redmi port is parked. The reference checklist is
   body. Test: `linux-dbus` prints `dbus ok`; the glibc socket test also checks
   `SO_PEERCRED`. Full series plus repeats and `health`: 9596/31575 frames,
   zero zombies/open files/DMA leaks; fsck clean.
+  **Slice 28 (D-Bus UNIX_FD and signals):** the D-Bus test now negotiates
+  `NEGOTIATE_UNIX_FD`/`AGREE_UNIX_FD`, sends a `SendFd` method call with
+  `UNIX_FDS=1` and an `h` body argument backed by a memfd passed over
+  `SCM_RIGHTS`, has the daemon map and verify the payload, returns a second
+  memfd in the `method_return`, and emits a `Changed` signal with an `s` body.
+  The client validates the reply serial, the received descriptor's contents
+  (mapping it `MAP_SHARED`) and the signal. Full series plus repeats and
+  `health`: 9596/31575 frames, zero zombies/open files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -574,8 +582,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 28 (D-Bus `UNIX_FD` passing and signals,
-  then a real toolkit/daemon against these transports). Network base
+- **Next steps:** Linux ABI slice 29 (run a real toolkit/daemon against
+  these transports; fill the remaining syscalls it probes). Network base
   maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
