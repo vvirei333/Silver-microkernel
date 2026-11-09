@@ -353,7 +353,7 @@ fn linux_execve(
     argv_pointer: u64,
     envp_pointer: u64,
 ) -> u64 {
-    const EXEC_LIMIT: usize = crate::vfs::MAX_FILE_BYTES;
+    const EXEC_LIMIT: usize = 32 * 1024 * 1024;
     let Some(path) = user_string(path_pointer) else {
         return errno(EFAULT);
     };
@@ -377,10 +377,7 @@ fn linux_execve(
         Ok(length) if length <= EXEC_LIMIT => {}
         _ => return errno(ENOENT),
     }
-    let Ok(bytes) = crate::vfs::read_file_limit(&cwd, &resolved, EXEC_LIMIT) else {
-        return errno(ENOENT);
-    };
-    let Ok(image) = crate::linux_elf::load_linux_program(&cwd, &bytes, EXEC_LIMIT) else {
+    let Ok(image) = crate::linux_elf::load_linux_program_path(&cwd, &resolved, EXEC_LIMIT) else {
         return errno(ENOEXEC);
     };
     let Some(result) = scheduler::exec_linux_current(image, argv, envp) else {

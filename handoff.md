@@ -704,6 +704,17 @@ Redmi port is parked. The reference checklist is
   verifies the 40/30/200/120 configure, commits the popup, grabs it and waits
   for `popup_done` before destroying the popup surface. Two concurrent clients
   pass; `health` stays clean.
+  **Slice 45 (streaming Linux exec):** `linux_elf.rs` gained an `ElfSource`
+  abstraction: the existing slice path is unchanged, and a new VFS source
+  streams the main executable. Only the ELF header, program headers, `PT_INTERP`
+  string and the (small) interpreter are buffered; each `PT_LOAD` is zeroed and
+  then filled in 512-byte chunks from `vfs::read_at` directly into its frames.
+  `LINUX_EXEC_LIMIT` rises to 32 MiB and `MAX_IMAGE_PAGES` to 8192. Unsigned
+  plain ELFs no longer materialise the file for bundle verification; a manifest
+  that claims a digest still reads the file and stays under 8 MiB. A temporary
+  9.4 MiB aarch64 ELF (a binary-blob object linked into a tiny program) ran as
+  `stream exec ok`, proving the >8 MiB path; the full Linux series, real
+  libwayland and `wayland-info` still pass, and fsck/health stay clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -730,10 +741,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 45 (stream ELF segments or raise the
-  whole-file/exec cap, then a larger toolkit; Wayland: data-device/clipboard
-  and xdg-decoration for GTK). Network base maintenance (keep-alive, TLS
-  roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 46 (a larger GTK/GLib toolkit and a
+  clipboard/data-device path; Wayland: data-device and xdg-decoration).
+  Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

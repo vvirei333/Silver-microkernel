@@ -97,11 +97,11 @@ const FS_BLOCK_SIZE: usize = 512;
 /// cloned into kernel memory before `elf::load_elf` rejects its segments. This
 /// matches the VFS file cap: the heap is only 2 MiB.
 const EXEC_FILE_LIMIT: usize = vfs::MAX_FILE_BYTES;
-/// A foreign (Linux) binary is larger than the general VFS cap: a static
-/// libc `hello` is ~800 KiB. The read is transient and exactly file-sized;
-/// `vfs::read_file_limit` still refuses anything past this bound.
+/// A foreign (Linux) main executable is streamed from the VFS, so it may be
+/// larger than the whole-file read cap. The bound is the image frame budget
+/// (`linux_elf::MAX_IMAGE_PAGES`), not a transient heap buffer.
 #[cfg(feature = "linux-abi")]
-const LINUX_EXEC_LIMIT: usize = vfs::MAX_FILE_BYTES;
+const LINUX_EXEC_LIMIT: usize = 32 * 1024 * 1024;
 /// Upper bound on a versioned spawn-arguments block copied from userspace.
 const SPAWN_ARGS_LIMIT: usize = 4096;
 
@@ -605,39 +605,48 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
 fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
-        match vfs::file_len(&cwd, path) {
-            Ok(length) if length <= LINUX_EXEC_LIMIT => {}
+        let length = match vfs::file_len(&cwd, path) {
+            Ok(length) if length <= LINUX_EXEC_LIMIT => length,
             _ => return SYSCALL_ERROR,
-        }
-        let Ok(bytes) = vfs::read_file_limit(&cwd, path, LINUX_EXEC_LIMIT) else {
-            return SYSCALL_ERROR;
         };
-        if bytes.len() > LINUX_EXEC_LIMIT {
-            return SYSCALL_ERROR;
-        }
-        let image = match crate::linux_elf::load_linux_program(&cwd, &bytes, LINUX_EXEC_LIMIT) {
-            Ok(image) => image,
-            Err(error) => {
-                crate::console::write_str("LINUX: cannot load ");
-                crate::console::write_str(path);
-                crate::console::write_str(": ");
-                crate::console::write_str(crate::linux_elf::error_name(error));
-                crate::console::write_str("\r\n");
+        // The same bundle policy applies. A plain ELF has no digest, so its
+        // bytes never need to be materialised; only a manifest that actually
+        // claims a digest makes us read the file for verification.
+        let policy = bundle_write_scope(&cwd, path);
+        let verdict = if policy.hash.is_some() || policy.signature.is_some() {
+            if length > vfs::MAX_FILE_BYTES {
                 return SYSCALL_ERROR;
             }
+            let Ok(bytes) = vfs::read_file_limit(&cwd, path, vfs::MAX_FILE_BYTES) else {
+                return SYSCALL_ERROR;
+            };
+            silver_microkernel::bundle::verify(
+                &bytes,
+                &policy,
+                silver_microkernel::bundle_sig::trusted_key(),
+            )
+        } else {
+            silver_microkernel::bundle::verify(
+                &[],
+                &policy,
+                silver_microkernel::bundle_sig::trusted_key(),
+            )
         };
-        // The same bundle policy applies: an unkeyed plain ELF has no digest
-        // and passes, while a signed manifest still has to verify.
-        let policy = bundle_write_scope(&cwd, path);
-        if silver_microkernel::bundle::verify(
-            &bytes,
-            &policy,
-            silver_microkernel::bundle_sig::trusted_key(),
-        )
-        .is_err()
-        {
+        if verdict.is_err() {
             return SYSCALL_ERROR;
         }
+        let image =
+            match crate::linux_elf::load_linux_program_path(&cwd, path, LINUX_EXEC_LIMIT) {
+                Ok(image) => image,
+                Err(error) => {
+                    crate::console::write_str("LINUX: cannot load ");
+                    crate::console::write_str(path);
+                    crate::console::write_str(": ");
+                    crate::console::write_str(crate::linux_elf::error_name(error));
+                    crate::console::write_str("\r\n");
+                    return SYSCALL_ERROR;
+                }
+            };
         let argv = vec![path.as_bytes().to_vec()];
         let envp = vec![
             b"PATH=/bin:/sbin:/usr/bin:/usr/sbin".to_vec(),

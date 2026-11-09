@@ -354,11 +354,13 @@ Program exited with status 0
 
 The last one is a **real static glibc binary** (libc initialisation, stdio,
 `open`/`read`/`close`, `opendir`/`readdir`, `exit`), which is the point of the
-track. The loader reads up to 8 MiB through `vfs::read_file_limit`; the
-general whole-file VFS cap is the same 8 MiB. The SFS block tree itself now
-reaches about 1 GiB through a third indirect level, so streamed file I/O is
-not limited by that transient whole-file buffer, and the read is exactly
-file-sized.
+track. A Linux main executable is streamed from the VFS: only the ELF header,
+program headers and interpreter are buffered, while `PT_LOAD` bytes are copied
+chunk by chunk into their final frames. The main image may therefore reach
+32 MiB, while whole-file reads and the interpreter path stay capped at 8 MiB
+(`MAX_FILE_BYTES`). The SFS block tree itself reaches about 1 GiB through a
+third indirect level, so streamed file I/O is not limited by that transient
+whole-file buffer.
 `fstat`, `ioctl(TIOCGWINSZ)`, `writev`, `close`, `lseek`, `readlinkat` and
 `sched_yield` are implemented, and `--features linux-abi-trace` logs any
 still-unsupported number (capped) so the next slice is driven by what a libc
@@ -701,9 +703,10 @@ fixed mappings), and `mprotect` rewrites PTE permissions on both the anonymous
 window and the main image. SFS is streamed: the kernel reads 512-byte blocks
 from virtio-blk on demand through a 256 KiB cache, so the 64 MiB / 2048-inode
 image no longer occupies RAM (the kernel heap is 16 MiB). The per-file cap is
-still 8 MiB for whole-file reads and `exec` (`MAX_FILE_BYTES`), but the SFS
-block tree now has a third indirect level, so files are limited by the image
-size instead. Streaming SFS supports create/truncate/write, mkdir/remove and
+still 8 MiB for whole-file reads (`MAX_FILE_BYTES`), but the Linux main
+executable is streamed into its frames and may reach 32 MiB. The SFS block
+tree now has a third indirect level, so files are limited by the image size
+instead. Streaming SFS supports create/truncate/write, mkdir/remove and
 rename/replace through the cache, with same-parent renames written in place
 and cross-directory moves rolled back if the source entry cannot be detached;
 large deletes batch bitmap updates instead of writing the bitmap per block.

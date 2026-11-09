@@ -23,10 +23,10 @@ use crate::{
     mmu,
 };
 
-/// Upper bound on one image, in pages (16 MiB). Foreign binaries are loaded
-/// from the 512 KiB VFS file limit, so this is a defence against a crafted
-/// `p_memsz`, not a real constraint.
-const MAX_IMAGE_PAGES: usize = 4096;
+/// Upper bound on one image, in pages (32 MiB). The main executable streams
+/// from the VFS, so this is the real frame budget rather than a whole-file
+/// buffer cap; it still rejects a crafted `p_memsz`.
+const MAX_IMAGE_PAGES: usize = 8192;
 /// A normal ELF has a handful of `PT_LOAD` segments; more is suspicious.
 const MAX_SEGMENTS: usize = 16;
 
@@ -309,25 +309,127 @@ pub fn load_linux_program(
     };
     let mut image = load_linux_elf_at(bytes, bias)?;
     if let Some(path) = image.interp_path.clone() {
-        let length =
-            crate::vfs::file_len(cwd, &path).map_err(|_| LinuxElfError::InterpreterMissing)?;
-        if length > limit {
-            return Err(LinuxElfError::ImageTooLarge);
-        }
-        let interp_bytes = crate::vfs::read_file_limit(cwd, &path, limit)
-            .map_err(|_| LinuxElfError::InterpreterMissing)?;
-        let interp = load_linux_elf_at(&interp_bytes, INTERP_BIAS)?;
-        if !image.attach_interpreter(interp, INTERP_BIAS) {
-            return Err(LinuxElfError::OverlappingSegments);
-        }
+        attach_interpreter(&mut image, cwd, &path, limit)?;
     }
     Ok(image)
+}
+
+/// Streams a main executable from the VFS: only the ELF header, program
+/// headers and interpreter are buffered, while `PT_LOAD` bytes are copied
+/// chunk by chunk into their frames. The whole-file 8 MiB exec limit no longer
+/// applies to the main program.
+pub fn load_linux_program_path(
+    cwd: &str,
+    path: &str,
+    limit: usize,
+) -> Result<LinuxImage, LinuxElfError> {
+    let length = crate::vfs::file_len(cwd, path)
+        .map_err(|_| LinuxElfError::InterpreterMissing)?;
+    if length > limit {
+        return Err(LinuxElfError::ImageTooLarge);
+    }
+    let source = VfsSource {
+        cwd,
+        path,
+        length,
+    };
+    let mut header = [0_u8; 64];
+    if !source.read(0, &mut header) {
+        return Err(LinuxElfError::Truncated);
+    }
+    let e_type = u16::from_le_bytes([header[16], header[17]]);
+    let bias = if e_type == elf::ET_DYN { MAIN_BIAS } else { 0 };
+    let mut image = load_linux_elf_from_source(&source, bias)?;
+    if let Some(interp_path) = image.interp_path.clone() {
+        attach_interpreter(&mut image, cwd, &interp_path, crate::vfs::MAX_FILE_BYTES)?;
+    }
+    Ok(image)
+}
+
+fn attach_interpreter(
+    image: &mut LinuxImage,
+    cwd: &str,
+    path: &str,
+    limit: usize,
+) -> Result<(), LinuxElfError> {
+    let length = crate::vfs::file_len(cwd, path).map_err(|_| LinuxElfError::InterpreterMissing)?;
+    if length > limit {
+        return Err(LinuxElfError::ImageTooLarge);
+    }
+    let bytes = crate::vfs::read_file_limit(cwd, path, limit)
+        .map_err(|_| LinuxElfError::InterpreterMissing)?;
+    let interp = load_linux_elf_at(&bytes, INTERP_BIAS)?;
+    if !image.attach_interpreter(interp, INTERP_BIAS) {
+        return Err(LinuxElfError::OverlappingSegments);
+    }
+    Ok(())
+}
+
+/// Byte source for the ELF loader. The slice implementation keeps the host
+/// tests and the small interpreter path allocation-free; the VFS implementation
+/// lets a large main executable stream segment bytes into its final frames.
+trait ElfSource {
+    fn len(&self) -> usize;
+    /// Reads exactly `out.len()` bytes at `offset`; false on any short read.
+    fn read(&self, offset: usize, out: &mut [u8]) -> bool;
+}
+
+struct SliceSource<'a>(&'a [u8]);
+
+impl ElfSource for SliceSource<'_> {
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    fn read(&self, offset: usize, out: &mut [u8]) -> bool {
+        let Some(end) = offset.checked_add(out.len()) else {
+            return false;
+        };
+        let Some(bytes) = self.0.get(offset..end) else {
+            return false;
+        };
+        out.copy_from_slice(bytes);
+        true
+    }
+}
+
+struct VfsSource<'a> {
+    cwd: &'a str,
+    path: &'a str,
+    length: usize,
+}
+
+impl ElfSource for VfsSource<'_> {
+    fn len(&self) -> usize {
+        self.length
+    }
+
+    fn read(&self, offset: usize, out: &mut [u8]) -> bool {
+        match crate::vfs::read_at(self.cwd, self.path, offset, out.len()) {
+            Ok(bytes) if bytes.len() == out.len() => {
+                out.copy_from_slice(&bytes);
+                true
+            }
+            _ => false,
+        }
+    }
 }
 
 /// Loads a foreign image at `bias`. `ET_EXEC` images use 0; `ET_DYN`/PIE
 /// images are placed at a non-zero base chosen by the caller.
 pub fn load_linux_elf_at(bytes: &[u8], bias: usize) -> Result<LinuxImage, LinuxElfError> {
-    let header = Elf64Ehdr::parse(bytes).map_err(map_error)?;
+    load_linux_elf_from_source(&SliceSource(bytes), bias)
+}
+
+fn load_linux_elf_from_source(
+    source: &dyn ElfSource,
+    bias: usize,
+) -> Result<LinuxImage, LinuxElfError> {
+    let mut header_bytes = [0_u8; 64];
+    if !source.read(0, &mut header_bytes) {
+        return Err(LinuxElfError::Truncated);
+    }
+    let header = Elf64Ehdr::parse(&header_bytes).map_err(map_error)?;
     if &header.ident[..4] != b"\x7FELF" {
         return Err(LinuxElfError::BadMagic);
     }
@@ -364,12 +466,21 @@ pub fn load_linux_elf_at(bytes: &[u8], bias: usize) -> Result<LinuxImage, LinuxE
         let header_offset = program_offset
             .checked_add(index.checked_mul(program_size).ok_or(LinuxElfError::Truncated)?)
             .ok_or(LinuxElfError::Truncated)?;
-        let ph = Elf64Phdr::parse(bytes, header_offset).map_err(map_error)?;
+        let mut phdr_bytes = [0_u8; elf::PHDR_SIZE];
+        if !source.read(header_offset, &mut phdr_bytes) {
+            return Err(LinuxElfError::Truncated);
+        }
+        let ph = Elf64Phdr::parse(&phdr_bytes, 0).map_err(map_error)?;
         if ph.p_type == elf::PT_INTERP {
             let start = ph.p_offset as usize;
             let length = ph.p_filesz as usize;
-            let end = start.checked_add(length).ok_or(LinuxElfError::Truncated)?;
-            let raw = bytes.get(start..end).ok_or(LinuxElfError::Truncated)?;
+            if length == 0 || length > 256 {
+                return Err(LinuxElfError::BadProgramHeader);
+            }
+            let mut raw = vec![0_u8; length];
+            if !source.read(start, &mut raw) {
+                return Err(LinuxElfError::Truncated);
+            }
             let text = raw.split(|&byte| byte == 0).next().unwrap_or(&[]);
             if text.is_empty() || text.len() > 255 {
                 return Err(LinuxElfError::BadProgramHeader);
@@ -414,7 +525,7 @@ pub fn load_linux_elf_at(bytes: &[u8], bias: usize) -> Result<LinuxImage, LinuxE
         let file_end = file_offset
             .checked_add(file_size)
             .ok_or(LinuxElfError::SegmentOutOfRange)?;
-        if file_end > bytes.len()
+        if file_end > source.len()
             || memory_end > mmu::USER_STACK_GUARD_VA
             || virtual_address < PAGE_SIZE
         {
@@ -512,7 +623,8 @@ pub fn load_linux_elf_at(bytes: &[u8], bias: usize) -> Result<LinuxImage, LinuxE
             kinds: vec![segment.kind; pages],
         };
         // Zero the whole run first (BSS is the tail the file does not cover),
-        // then copy the file bytes from the segment's page offset.
+        // then stream the file bytes from the segment's page offset directly
+        // into their final frames. No whole-file buffer is allocated.
         unsafe {
             core::ptr::write_bytes(
                 phys_to_virt(physical_start) as *mut u8,
@@ -520,15 +632,38 @@ pub fn load_linux_elf_at(bytes: &[u8], bias: usize) -> Result<LinuxImage, LinuxE
                 pages * PAGE_SIZE,
             );
             let page_offset = segment.virtual_address - page_start;
+            let source_start = segment
+                .file_offset
+                .checked_sub(page_offset)
+                .ok_or(LinuxElfError::SegmentOutOfRange)?;
             let copy_len = (page_offset + segment.file_size)
                 .min(pages * PAGE_SIZE)
-                .min(bytes.len() - (segment.file_offset - page_offset));
-            if copy_len != 0 {
+                .min(source.len().saturating_sub(source_start));
+            let mut copied = 0usize;
+            let mut chunk = [0_u8; 512];
+            while copied < copy_len {
+                let take = (copy_len - copied).min(chunk.len());
+                if !source.read(source_start + copied, &mut chunk[..take]) {
+                    for prior in &runs {
+                        frame_allocator::free_contiguous_pages_tagged(
+                            prior.physical_start,
+                            prior.page_count,
+                            prior.generation,
+                        );
+                    }
+                    frame_allocator::free_contiguous_pages_tagged(
+                        physical_start,
+                        pages,
+                        generation,
+                    );
+                    return Err(LinuxElfError::Truncated);
+                }
                 core::ptr::copy_nonoverlapping(
-                    bytes.as_ptr().add(segment.file_offset - page_offset),
-                    phys_to_virt(physical_start) as *mut u8,
-                    copy_len,
+                    chunk.as_ptr(),
+                    (phys_to_virt(physical_start) as *mut u8).add(copied),
+                    take,
                 );
+                copied += take;
             }
         }
         upper_bound = upper_bound.max(segment.virtual_address + segment.memory_size);

@@ -82,7 +82,8 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 | SFS image | 64 MiB, 2048 inodes, read on demand (256 KiB block cache) |
 | Kernel heap | 16 MiB |
 | Single SFS file | ~1 GiB tree / image-bound (triple indirect) |
-| Whole-file read / exec | 8 MiB (`MAX_FILE_BYTES`; streamed file I/O has no such cap) |
+| Main Linux executable | 32 MiB, streamed into its frames |
+| Whole-file read | 8 MiB (`MAX_FILE_BYTES`; interpreter and signed bundles) |
 | Anonymous mmap per task | 24 MiB |
 | Tasks | 64 (zombies capped separately) |
 | Linux fds per process | 256 |
@@ -92,8 +93,10 @@ SFS writes allocate blocks through the streaming cache (bitmap, inode table
 and directory blocks are read-modify-written in place). Same-parent and
 cross-directory rename (files and directories), rollback on a failed move,
 and replace-over-destination are implemented. The block tree now has direct,
-single, double and triple indirect levels; whole-file reads and `exec` are
-still capped separately at 8 MiB so they cannot allocate an unbounded buffer.
+single, double and triple indirect levels. The Linux main executable is
+streamed from the VFS into its frames, so `exec` reaches 32 MiB; whole-file
+reads and the interpreter path stay capped at 8 MiB so they cannot allocate
+an unbounded buffer.
 
 ## Test matrix
 

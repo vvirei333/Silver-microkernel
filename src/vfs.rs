@@ -1410,6 +1410,17 @@ pub fn read_file_limit(cwd: &str, path: &str, limit: usize) -> Result<Vec<u8>, (
     })
 }
 
+/// Reads a bounded range without materialising the whole file. Used by the
+/// streaming Linux ELF loader, which copies segment bytes into their final
+/// frames as it parses them.
+pub fn read_at(cwd: &str, path: &str, offset: usize, limit: usize) -> Result<Vec<u8>, ()> {
+    with_vfs(|vfs| {
+        let resolved = resolve_path(cwd, path)?;
+        let (mount, relative) = vfs.resolve(&resolved);
+        vfs.mounts[mount].fs.read_at(&relative, offset, limit)
+    })
+}
+
 /// Returns a file's length without reading it. Used to reject an oversized
 /// `SYS_SPAWN_PATH` target before kernel memory is allocated.
 pub fn file_len(cwd: &str, path: &str) -> Result<usize, ()> {
