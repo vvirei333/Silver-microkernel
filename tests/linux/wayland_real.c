@@ -246,6 +246,8 @@ static unsigned viewporter_id;
 static unsigned viewport_id;
 static unsigned subcompositor_id;
 static unsigned subsurface_id;
+static unsigned xdg_output_manager_id;
+static unsigned xdg_output_id;
 static unsigned subsurface_surface_id;
 static int subsurface_ok;
 static unsigned data_source_id;
@@ -293,6 +295,8 @@ typedef struct {
     unsigned viewport_id;
     unsigned subcompositor_id;
     unsigned subsurface_id;
+    unsigned xdg_output_manager_id;
+    unsigned xdg_output_id;
     unsigned subsurface_surface_id;
     int subsurface_ok;
     unsigned data_source_id;
@@ -332,6 +336,7 @@ typedef struct {
     X(data_manager_id) X(data_device_id) X(data_source_id) X(data_offer_id) \
     X(decoration_manager_id) X(decoration_id) X(viewporter_id) X(viewport_id) \
     X(subcompositor_id) X(subsurface_id) X(subsurface_surface_id) X(subsurface_ok) \
+    X(xdg_output_manager_id) X(xdg_output_id) \
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
     X(configure_serial) X(surface_id) X(popup_surface_id) \
     X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
@@ -486,6 +491,8 @@ static int serve(long client) {
                                     "zxdg_decoration_manager_v1", 2);
                 send_global(client, registry_id, 8, "wp_viewporter");
                 send_global(client, registry_id, 9, "wl_subcompositor");
+                send_global_version(client, registry_id, 10,
+                                    "zxdg_output_manager_v1", 3);
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -555,7 +562,31 @@ static int serve(long client) {
                     viewporter_id = new_id;
                 } else if (text_equal(interface, "wl_subcompositor")) {
                     subcompositor_id = new_id;
+                } else if (text_equal(interface, "zxdg_output_manager_v1")) {
+                    xdg_output_manager_id = new_id;
                 }
+            } else if (object == xdg_output_manager_id && opcode == 1) {
+                /* zxdg_output_manager_v1.get_xdg_output(new_id, output) */
+                xdg_output_id = take_u32();
+                (void)take_u32();
+                begin(xdg_output_id, 0 /* logical_position */);
+                put_i32(0); put_i32(0);
+                finish(); send_message(client, -1);
+                begin(xdg_output_id, 1 /* logical_size */);
+                put_i32(1024); put_i32(768);
+                finish(); send_message(client, -1);
+                begin(xdg_output_id, 3 /* name */);
+                put_string("Werewolf panel");
+                finish(); send_message(client, -1);
+                begin(xdg_output_id, 4 /* description */);
+                put_string("WerewolfOS 1024x768 panel");
+                finish(); send_message(client, -1);
+                if (output_id != 0) {
+                    begin(output_id, 2 /* wl_output.done */);
+                    finish(); send_message(client, -1);
+                }
+            } else if (object == xdg_output_id && opcode == 0) {
+                xdg_output_id = 0;
             } else if (object == subcompositor_id && opcode == 1) {
                 /* wl_subcompositor.get_subsurface(new_id, surface, parent) */
                 subsurface_id = take_u32();
@@ -1021,6 +1052,8 @@ static void reset_client(void) {
     viewport_id = 0;
     subcompositor_id = 0;
     subsurface_id = 0;
+    xdg_output_manager_id = 0;
+    xdg_output_id = 0;
     subsurface_surface_id = 0;
     subsurface_ok = 0;
     data_source_id = 0;

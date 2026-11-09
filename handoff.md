@@ -750,6 +750,14 @@ Redmi port is parked. The reference checklist is
   final check requires it. The real client builds a child surface under the
   toplevel, commits it, destroys it, and the multiplexed source/receiver
   clients plus `wayland-info` all pass.
+  **Slice 50 (xdg-output):** the compositor advertises
+  `zxdg_output_manager_v1` v3. `get_xdg_output` returns logical position
+  (0,0), logical size (1024x768), name, description and a matching
+  `wl_output.done`; the real client binds v3, verifies every event and tears
+  the object down. The stock `wayland-info` harness advertises the same
+  global and prints the logical region. Both multiplexed clients,
+  cross-client clipboard, decoration/viewporter/subcompositor and
+  wayland-info pass.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -776,9 +784,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 50 (a larger GTK/GLib toolkit; Wayland:
-  xdg-output and the remaining GTK globals). Network base maintenance
-  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 51 (a larger GTK/GLib toolkit; Wayland:
+  xdg-activation/presentation and the remaining GTK globals). Network base
+  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

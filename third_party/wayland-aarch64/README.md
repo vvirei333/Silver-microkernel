@@ -25,7 +25,9 @@ test build does not need the scanner. The same applies to
 `xdg-decoration-client-protocol.h`/`xdg-decoration-protocol.c` (from
 `xdg-decoration-unstable-v1.xml`) and
 `viewporter-client-protocol.h`/`viewporter-protocol.c` (from
-`viewporter.xml`).
+`viewporter.xml`) and
+`xdg-output-client-protocol.h`/`xdg-output-protocol.c` (from
+`xdg-output-unstable-v1.xml`).
 
 The test image injects the libraries into `/sfs`; `wayland-info` is patched
 with patchelf at test-build time to use `/sfs/ld-linux-aarch64.so.1` and an

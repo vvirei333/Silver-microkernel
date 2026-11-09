@@ -590,7 +590,8 @@ maps it, grabs it and receives `popup_done`. `zxdg_decoration_manager_v1`
 negotiates client-side decorations (`set_mode`/`unset_mode`, configure),
 `wp_viewporter` accepts source/destination crop-scale state, and
 `wl_subcompositor` accepts child surfaces with position, place and
-sync/desync requests. The vendored `xdg-shell-client-protocol.h`/
+sync/desync requests, and `zxdg_output_manager_v1` reports the logical output
+region, name and description. The vendored `xdg-shell-client-protocol.h`/
 `.c` come from `wayland-protocols` 1.50.
 
 Input and output are advertised as well: `wl_output` v4 sends

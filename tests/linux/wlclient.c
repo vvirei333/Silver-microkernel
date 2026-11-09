@@ -16,6 +16,7 @@
 #include "xdg-shell-client-protocol.h"
 #include "xdg-decoration-client-protocol.h"
 #include "viewporter-client-protocol.h"
+#include "xdg-output-client-protocol.h"
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shared_memory;
@@ -29,6 +30,9 @@ static struct wp_viewporter *viewporter;
 static struct wp_viewport *viewport;
 static struct wl_subcompositor *subcompositor;
 static struct wl_subsurface *subsurface;
+static struct zxdg_output_manager_v1 *xdg_output_manager;
+static struct zxdg_output_v1 *xdg_output;
+static int xdg_output_ok;
 static struct wl_data_device *data_device;
 static struct wl_data_source *data_source;
 static struct wl_data_offer *clipboard_offer;
@@ -192,6 +196,51 @@ static const struct zxdg_toplevel_decoration_v1_listener decoration_listener = {
     .configure = decoration_configure,
 };
 
+static void xdg_output_position(void *data, struct zxdg_output_v1 *output,
+                                  int32_t x, int32_t y) {
+    (void)data; (void)output;
+    if (x != 0 || y != 0) {
+        xdg_output_ok = 0;
+    }
+}
+
+static void xdg_output_size(void *data, struct zxdg_output_v1 *output,
+                            int32_t width, int32_t height) {
+    (void)data; (void)output;
+    if (width == 1024 && height == 768) {
+        xdg_output_ok = 1;
+    }
+}
+
+static void xdg_output_name(void *data, struct zxdg_output_v1 *output,
+                            const char *name) {
+    (void)data; (void)output;
+    if (name == NULL || strcmp(name, "Werewolf panel") != 0) {
+        xdg_output_ok = 0;
+    }
+}
+
+static void xdg_output_description(void *data, struct zxdg_output_v1 *output,
+                                   const char *description) {
+    (void)data; (void)output;
+    if (description == NULL ||
+        strcmp(description, "WerewolfOS 1024x768 panel") != 0) {
+        xdg_output_ok = 0;
+    }
+}
+
+static void xdg_output_done(void *data, struct zxdg_output_v1 *output) {
+    (void)data; (void)output;
+}
+
+static const struct zxdg_output_v1_listener xdg_output_listener = {
+    .logical_position = xdg_output_position,
+    .logical_size = xdg_output_size,
+    .done = xdg_output_done,
+    .name = xdg_output_name,
+    .description = xdg_output_description,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version) {
@@ -231,6 +280,11 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 1 ? version : 1;
         subcompositor = wl_registry_bind(registry, name,
                                          &wl_subcompositor_interface, use);
+    } else if (strcmp(interface,
+                      zxdg_output_manager_v1_interface.name) == 0) {
+        uint32_t use = version < 3 ? version : 3;
+        xdg_output_manager = wl_registry_bind(
+            registry, name, &zxdg_output_manager_v1_interface, use);
     }
 }
 
@@ -548,6 +602,26 @@ int main(int argc, char **argv) {
     if (seat == NULL || (seat_caps & WL_SEAT_CAPABILITY_KEYBOARD) == 0 ||
         (seat_caps & WL_SEAT_CAPABILITY_POINTER) == 0) {
         fprintf(stderr, "wlclient: seat capabilities missing\n");
+        return 6;
+    }
+
+    if (xdg_output_manager == NULL || output == NULL) {
+        fprintf(stderr, "wlclient: xdg-output missing\n");
+        return 6;
+    }
+    xdg_output = zxdg_output_manager_v1_get_xdg_output(xdg_output_manager,
+                                                       output);
+    if (xdg_output == NULL) {
+        return 6;
+    }
+    zxdg_output_v1_add_listener(xdg_output, &xdg_output_listener, NULL);
+    for (int attempt = 0; attempt < 4 && !xdg_output_ok; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 6;
+        }
+    }
+    if (!xdg_output_ok) {
+        fprintf(stderr, "wlclient: xdg-output events missing\n");
         return 6;
     }
 
@@ -894,6 +968,8 @@ int main(int argc, char **argv) {
     }
 
     /* Destroy the shell surface; the compositor must drop focus. */
+    zxdg_output_v1_destroy(xdg_output);
+    zxdg_output_manager_v1_destroy(xdg_output_manager);
     wp_viewport_destroy(viewport);
     wp_viewporter_destroy(viewporter);
     zxdg_toplevel_decoration_v1_destroy(decoration);

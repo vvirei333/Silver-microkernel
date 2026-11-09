@@ -184,6 +184,7 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
             "$WAYLAND/lib/xdg-shell-protocol.c" \
             "$WAYLAND/lib/xdg-decoration-protocol.c" \
             "$WAYLAND/lib/viewporter-protocol.c" \
+            "$WAYLAND/lib/xdg-output-protocol.c" \
             -L"$WAYLAND/lib" -Wl,-rpath-link,"$WAYLAND/lib" \
             -l:libwayland-client.so -l:libffi.so.8
         patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \

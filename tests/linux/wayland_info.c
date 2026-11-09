@@ -238,6 +238,8 @@ static unsigned xdg_surface_id;
 static unsigned toplevel_id;
 static unsigned output_id;
 static unsigned output_version;
+static unsigned xdg_output_manager_id;
+static unsigned xdg_output_id;
 static unsigned seat_id;
 static unsigned seat_version;
 static unsigned keyboard_id;
@@ -308,6 +310,8 @@ static int serve(long client) {
                                     "zxdg_decoration_manager_v1", 2);
                 send_global(client, registry_id, 8, "wp_viewporter");
                 send_global(client, registry_id, 9, "wl_subcompositor");
+                send_global_version(client, registry_id, 10,
+                                    "zxdg_output_manager_v1", 3);
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -366,6 +370,8 @@ static int serve(long client) {
                     (void)new_id;
                 } else if (text_equal(interface, "wl_subcompositor")) {
                     (void)new_id;
+                } else if (text_equal(interface, "zxdg_output_manager_v1")) {
+                    xdg_output_manager_id = new_id;
                 } else if (text_equal(interface, "wl_seat")) {
                     seat_id = new_id;
                     seat_version = version;
@@ -376,6 +382,25 @@ static int serve(long client) {
                     }
                     begin(seat_id, 0 /* capabilities */);
                     put_u32(3); /* pointer | keyboard */
+                    finish(); send_message(client, -1);
+                }
+            } else if (object == xdg_output_manager_id && opcode == 1) {
+                xdg_output_id = take_u32();
+                (void)take_u32();
+                begin(xdg_output_id, 0);
+                put_i32(0); put_i32(0);
+                finish(); send_message(client, -1);
+                begin(xdg_output_id, 1);
+                put_i32(1024); put_i32(768);
+                finish(); send_message(client, -1);
+                begin(xdg_output_id, 3);
+                put_string("Werewolf panel");
+                finish(); send_message(client, -1);
+                begin(xdg_output_id, 4);
+                put_string("WerewolfOS 1024x768 panel");
+                finish(); send_message(client, -1);
+                if (output_id != 0) {
+                    begin(output_id, 2);
                     finish(); send_message(client, -1);
                 }
             } else if (object == compositor_id && opcode == 0) {
