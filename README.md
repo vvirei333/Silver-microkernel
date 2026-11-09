@@ -689,8 +689,9 @@ fixed mappings), and `mprotect` rewrites PTE permissions on both the anonymous
 window and the main image. SFS is streamed: the kernel reads 512-byte blocks
 from virtio-blk on demand through a 256 KiB cache, so the 64 MiB / 2048-inode
 image no longer occupies RAM (the kernel heap is 16 MiB). The per-file cap is
-still 8 MiB (the SFS block tree's maximum), and this streaming backend is
-read-only; `/tmp` is the writable filesystem.
+still 8 MiB (the SFS block tree's maximum). Streaming SFS supports
+create/truncate/write and mkdir/remove through the cache; `rename`/`replace`
+are the remaining mutation gaps. `/tmp` is the scratch filesystem.
 
 A writable `MAP_SHARED` mapping of a `memfd` is a true shared window: the
 memfd owns one contiguous physical run, every process that maps the file (its

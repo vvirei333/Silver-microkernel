@@ -250,14 +250,19 @@ static int verified;
 static unsigned commits;
 static int focused;
 
-static void send_global(long client, unsigned registry, unsigned name,
-                        const char *interface) {
+static void send_global_version(long client, unsigned registry, unsigned name,
+                                const char *interface, unsigned version) {
     begin(registry, 0 /* wl_registry.global */);
     put_u32(name);
     put_string(interface);
-    put_u32(1);
+    put_u32(version);
     finish();
     send_message(client, -1);
+}
+
+static void send_global(long client, unsigned registry, unsigned name,
+                        const char *interface) {
+    send_global_version(client, registry, name, interface, 1);
 }
 
 static void send_done(long client, unsigned callback, unsigned data) {
@@ -296,7 +301,7 @@ static int serve(long client) {
                 send_global(client, registry_id, 1, "wl_compositor");
                 send_global(client, registry_id, 2, "wl_shm");
                 send_global(client, registry_id, 3, "xdg_wm_base");
-                send_global(client, registry_id, 4, "wl_output");
+                send_global_version(client, registry_id, 4, "wl_output", 2);
                 send_global(client, registry_id, 5, "wl_seat");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
@@ -325,6 +330,9 @@ static int serve(long client) {
                     finish(); send_message(client, -1);
                     begin(output_id, 1 /* mode */);
                     put_u32(3); put_i32(1024); put_i32(768); put_i32(60000);
+                    finish(); send_message(client, -1);
+                    begin(output_id, 3 /* scale */);
+                    put_i32(2);
                     finish(); send_message(client, -1);
                     begin(output_id, 2 /* done */);
                     finish(); send_message(client, -1);

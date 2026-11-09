@@ -86,6 +86,10 @@ static CACHE: Mutex<Cache> = Mutex::new(Cache {
     next: 0,
 });
 
+fn put_u32_at(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
         bytes[offset],
@@ -156,6 +160,47 @@ fn parse_superblock(block: &[u8; BLOCK_SIZE], device_blocks: u32) -> Option<Supe
         bitmap_block,
         data_block_start,
     })
+}
+
+/// Writes one block through to the device and updates the cache.
+fn write_block(block: u32, data: &[u8; BLOCK_SIZE]) -> bool {
+    if !virtio_blk::write_sector(block as u64, data) {
+        return false;
+    }
+    let mut cache = CACHE.lock();
+    for index in 0..CACHE_BLOCKS {
+        if cache.keys[index] == block {
+            cache.data[index].copy_from_slice(data);
+            return true;
+        }
+    }
+    let index = cache.next;
+    cache.next = (index + 1) % CACHE_BLOCKS;
+    cache.keys[index] = block;
+    cache.data[index].copy_from_slice(data);
+    true
+}
+
+fn zero_block(block: u32) -> bool {
+    write_block(block, &[0_u8; BLOCK_SIZE])
+}
+
+fn split_path(path: &str) -> Option<(Vec<&str>, &str)> {
+    let mut parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let name = parts.pop()?;
+    Some((parts, name))
+}
+
+fn read_status_bits(block: u32, used: bool) -> Option<[u8; BLOCK_SIZE]> {
+    let mut bytes = [0_u8; BLOCK_SIZE];
+    if !read_block(block, &mut bytes) {
+        return None;
+    }
+    let _ = used;
+    Some(bytes)
 }
 
 fn reader() -> Option<Reader> {
@@ -414,6 +459,440 @@ impl Reader {
             .and_then(|index| self.inode(index))
             .map(|inode| inode.size as usize)
     }
+
+    fn resolve_parts(&self, parts: &[&str]) -> Option<u32> {
+        let mut current = self.superblock.root_inode;
+        for part in parts {
+            current = self.find_child(current, part)?;
+        }
+        Some(current)
+    }
+
+    fn write_inode(&self, index: u32, inode: Inode) -> bool {
+        if index >= self.superblock.inode_count {
+            return false;
+        }
+        let offset = (index as usize) * INODE_SIZE;
+        let block = self.superblock.inode_table_block + (offset / BLOCK_SIZE) as u32;
+        let within = offset % BLOCK_SIZE;
+        let mut bytes = [0_u8; BLOCK_SIZE];
+        if !read_block(block, &mut bytes) {
+            return false;
+        }
+        put_u32_at(&mut bytes, within, inode.kind);
+        put_u32_at(&mut bytes, within + 4, inode.size);
+        for (slot, value) in inode.blocks.iter().enumerate() {
+            put_u32_at(&mut bytes, within + 8 + slot * 4, *value);
+        }
+        put_u32_at(&mut bytes, within + 24, inode.indirect);
+        put_u32_at(&mut bytes, within + 28, inode.double);
+        write_block(block, &bytes)
+    }
+
+    fn allocate_block(&self) -> Option<u32> {
+        let total = self.superblock.total_blocks;
+        let bitmap_blocks = (total as usize).div_ceil(8).div_ceil(BLOCK_SIZE) as u32;
+        for index in 0..bitmap_blocks {
+            let block = self.superblock.bitmap_block + index;
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut bytes) {
+                return None;
+            }
+            for byte in 0..BLOCK_SIZE {
+                if bytes[byte] == 0xff {
+                    continue;
+                }
+                for bit in 0..8 {
+                    let candidate =
+                        ((index as usize * BLOCK_SIZE + byte) * 8 + bit) as u32;
+                    if candidate >= self.superblock.data_block_start
+                        && candidate < total
+                        && bytes[byte] & (1 << bit) == 0
+                    {
+                        bytes[byte] |= 1 << bit;
+                        if !write_block(block, &bytes) {
+                            return None;
+                        }
+                        return Some(candidate);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn free_block(&self, block: u32) -> bool {
+        if block < self.superblock.data_block_start || block >= self.superblock.total_blocks {
+            return false;
+        }
+        let offset = (block as usize) / 8;
+        let bitmap_block = self.superblock.bitmap_block + (offset / BLOCK_SIZE) as u32;
+        let byte = offset % BLOCK_SIZE;
+        let mut bytes = [0_u8; BLOCK_SIZE];
+        if !read_block(bitmap_block, &mut bytes) {
+            return false;
+        }
+        bytes[byte] &= !(1 << (block % 8));
+        write_block(bitmap_block, &bytes)
+    }
+
+    fn allocate_inode(&self, kind: u32) -> Option<u32> {
+        let inode_blocks = ((self.superblock.inode_count as usize) * INODE_SIZE)
+            .div_ceil(BLOCK_SIZE) as u32;
+        for index in 0..inode_blocks {
+            let block = self.superblock.inode_table_block + index;
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut bytes) {
+                return None;
+            }
+            for slot in 0..(BLOCK_SIZE / INODE_SIZE) {
+                let offset = slot * INODE_SIZE;
+                let candidate = index as usize * (BLOCK_SIZE / INODE_SIZE) + slot;
+                if candidate >= self.superblock.inode_count as usize {
+                    break;
+                }
+                if u32_at(&bytes, offset) == INODE_KIND_FREE {
+                    let inode = Inode {
+                        kind,
+                        size: 0,
+                        blocks: [0; DIRECT_BLOCKS],
+                        indirect: 0,
+                        double: 0,
+                    };
+                    if !self.write_inode(candidate as u32, inode) {
+                        return None;
+                    }
+                    return Some(candidate as u32);
+                }
+            }
+        }
+        None
+    }
+
+    fn install_block(&self, inode: &mut Inode, slot: usize, block: u32) -> bool {
+        if slot < DIRECT_BLOCKS {
+            if inode.blocks[slot] != 0 {
+                return false;
+            }
+            inode.blocks[slot] = block;
+            return true;
+        }
+        if slot < DIRECT_BLOCKS + INDIRECT_POINTERS {
+            if inode.indirect == 0 {
+                let Some(table) = self.allocate_block() else {
+                    return false;
+                };
+                if !zero_block(table) {
+                    let _ = self.free_block(table);
+                    return false;
+                }
+                inode.indirect = table;
+            }
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(inode.indirect, &mut bytes) {
+                return false;
+            }
+            put_u32_at(&mut bytes, (slot - DIRECT_BLOCKS) * 4, block);
+            return write_block(inode.indirect, &bytes);
+        }
+        let position = slot - DIRECT_BLOCKS - INDIRECT_POINTERS;
+        if position >= INDIRECT_POINTERS * INDIRECT_POINTERS {
+            return false;
+        }
+        let table_index = position / INDIRECT_POINTERS;
+        let pointer = position % INDIRECT_POINTERS;
+        if inode.double == 0 {
+            let Some(table) = self.allocate_block() else {
+                return false;
+            };
+            if !zero_block(table) {
+                let _ = self.free_block(table);
+                return false;
+            }
+            inode.double = table;
+        }
+        let mut node = [0_u8; BLOCK_SIZE];
+        if !read_block(inode.double, &mut node) {
+            return false;
+        }
+        let mut table = u32_at(&node, table_index * 4);
+        if table == 0 {
+            let Some(allocated) = self.allocate_block() else {
+                return false;
+            };
+            if !zero_block(allocated) {
+                let _ = self.free_block(allocated);
+                return false;
+            }
+            put_u32_at(&mut node, table_index * 4, allocated);
+            if !write_block(inode.double, &node) {
+                return false;
+            }
+            table = allocated;
+        }
+        let mut bytes = [0_u8; BLOCK_SIZE];
+        if !read_block(table, &mut bytes) {
+            return false;
+        }
+        put_u32_at(&mut bytes, pointer * 4, block);
+        write_block(table, &bytes)
+    }
+
+    fn truncate_inode(&self, index: u32, mut inode: Inode) -> bool {
+        let mut slot = 0;
+        while let Some(block) = self.block_at(&inode, slot) {
+            let _ = self.free_block(block);
+            slot += 1;
+            if slot >= MAX_FILE_BLOCKS {
+                break;
+            }
+        }
+        if inode.indirect != 0 {
+            let _ = self.free_block(inode.indirect);
+        }
+        if inode.double != 0 {
+            let mut node = [0_u8; BLOCK_SIZE];
+            if read_block(inode.double, &mut node) {
+                for table_index in 0..INDIRECT_POINTERS {
+                    let table = u32_at(&node, table_index * 4);
+                    if table != 0 {
+                        let _ = self.free_block(table);
+                    }
+                }
+            }
+            let _ = self.free_block(inode.double);
+        }
+        inode.size = 0;
+        inode.blocks = [0; DIRECT_BLOCKS];
+        inode.indirect = 0;
+        inode.double = 0;
+        self.write_inode(index, inode)
+    }
+
+    fn dir_add(&self, parent: u32, name: &str, child: u32) -> bool {
+        if name.len() == 0 || name.len() > NAME_LIMIT {
+            return false;
+        }
+        let mut inode = match self.inode(parent) {
+            Some(inode) if inode.is_dir() => inode,
+            _ => return false,
+        };
+        for slot in 0..MAX_FILE_BLOCKS {
+            let Some(block) = self.block_at(&inode, slot) else {
+                break;
+            };
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut bytes) {
+                return false;
+            }
+            for entry in 0..DIR_ENTRIES_PER_BLOCK {
+                let offset = entry * DIR_ENTRY_SIZE;
+                if u32_at(&bytes, offset) == 0 {
+                    put_u32_at(&mut bytes, offset, child);
+                    bytes[offset + 4] = name.len() as u8;
+                    bytes[offset + 5..offset + 5 + name.len()]
+                        .copy_from_slice(name.as_bytes());
+                    return write_block(block, &bytes);
+                }
+            }
+        }
+        let mut slot = 0;
+        while self.block_at(&inode, slot).is_some() {
+            slot += 1;
+            if slot >= MAX_FILE_BLOCKS {
+                return false;
+            }
+        }
+        let Some(block) = self.allocate_block() else {
+            return false;
+        };
+        if !zero_block(block) {
+            let _ = self.free_block(block);
+            return false;
+        }
+        let mut bytes = [0_u8; BLOCK_SIZE];
+        put_u32_at(&mut bytes, 0, child);
+        bytes[4] = name.len() as u8;
+        bytes[5..5 + name.len()].copy_from_slice(name.as_bytes());
+        if !write_block(block, &bytes) {
+            let _ = self.free_block(block);
+            return false;
+        }
+        if !self.install_block(&mut inode, slot, block) {
+            let _ = self.free_block(block);
+            return false;
+        }
+        self.write_inode(parent, inode)
+    }
+
+    fn dir_remove(&self, parent: u32, name: &str) -> Option<u32> {
+        let inode = self.inode(parent)?;
+        if !inode.is_dir() {
+            return None;
+        }
+        for slot in 0..MAX_FILE_BLOCKS {
+            let Some(block) = self.block_at(&inode, slot) else {
+                break;
+            };
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut bytes) {
+                return None;
+            }
+            for entry in 0..DIR_ENTRIES_PER_BLOCK {
+                let offset = entry * DIR_ENTRY_SIZE;
+                let child = u32_at(&bytes, offset);
+                if child == 0 {
+                    continue;
+                }
+                let length = bytes[offset + 4] as usize;
+                if length == 0 || length > NAME_LIMIT {
+                    continue;
+                }
+                if &bytes[offset + 5..offset + 5 + length] == name.as_bytes() {
+                    put_u32_at(&mut bytes, offset, 0);
+                    for byte in &mut bytes[offset + 4..offset + DIR_ENTRY_SIZE] {
+                        *byte = 0;
+                    }
+                    if !write_block(block, &bytes) {
+                        return None;
+                    }
+                    return Some(child);
+                }
+            }
+        }
+        None
+    }
+
+    fn create(&self, path: &str, kind: u32) -> Option<u32> {
+        let (parents, name) = split_path(path)?;
+        let parent = self.resolve_parts(&parents)?;
+        if let Some(existing) = self.find_child(parent, name) {
+            let inode = self.inode(existing)?;
+            if inode.kind != kind {
+                return None;
+            }
+            if kind == INODE_KIND_FILE && !self.truncate_inode(existing, inode) {
+                return None;
+            }
+            return Some(existing);
+        }
+        let index = self.allocate_inode(kind)?;
+        let inode = Inode {
+            kind,
+            size: 0,
+            blocks: [0; DIRECT_BLOCKS],
+            indirect: 0,
+            double: 0,
+        };
+        if !self.write_inode(index, inode) || !self.dir_add(parent, name, index) {
+            return None;
+        }
+        Some(index)
+    }
+
+    fn write_file(
+        &self,
+        index: u32,
+        offset: usize,
+        bytes: &[u8],
+        append: bool,
+    ) -> Option<(usize, usize)> {
+        let mut inode = self.inode(index)?;
+        if !inode.is_file() {
+            return None;
+        }
+        let start = if append { inode.size as usize } else { offset };
+        let end = start.checked_add(bytes.len())?;
+        if end > MAX_FILE_BLOCKS * BLOCK_SIZE {
+            return None;
+        }
+        let needed = end.div_ceil(BLOCK_SIZE);
+        for slot in 0..needed {
+            if self.block_at(&inode, slot).is_none() {
+                let block = self.allocate_block()?;
+                if !zero_block(block) {
+                    let _ = self.free_block(block);
+                    return None;
+                }
+                if !self.install_block(&mut inode, slot, block) {
+                    let _ = self.free_block(block);
+                    return None;
+                }
+            }
+        }
+        let mut position = 0usize;
+        while position < bytes.len() {
+            let absolute = start + position;
+            let slot = absolute / BLOCK_SIZE;
+            let within = absolute % BLOCK_SIZE;
+            let take = (BLOCK_SIZE - within).min(bytes.len() - position);
+            let block = self.block_at(&inode, slot)?;
+            let mut data = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut data) {
+                return None;
+            }
+            data[within..within + take].copy_from_slice(&bytes[position..position + take]);
+            if !write_block(block, &data) {
+                return None;
+            }
+            position += take;
+        }
+        if end > inode.size as usize {
+            inode.size = end as u32;
+            if !self.write_inode(index, inode) {
+                return None;
+            }
+        }
+        Some((bytes.len(), end))
+    }
+
+    fn remove(&self, path: &str, directory: bool) -> bool {
+        let Some((parents, name)) = split_path(path) else {
+            return false;
+        };
+        let Some(parent) = self.resolve_parts(&parents) else {
+            return false;
+        };
+        let Some(child) = self.find_child(parent, name) else {
+            return false;
+        };
+        let Some(inode) = self.inode(child) else {
+            return false;
+        };
+        if directory != inode.is_dir() {
+            return false;
+        }
+        if directory {
+            for slot in 0..MAX_FILE_BLOCKS {
+                let Some(block) = self.block_at(&inode, slot) else {
+                    break;
+                };
+                let mut bytes = [0_u8; BLOCK_SIZE];
+                if !read_block(block, &mut bytes) {
+                    return false;
+                }
+                for entry in 0..DIR_ENTRIES_PER_BLOCK {
+                    if u32_at(&bytes, entry * DIR_ENTRY_SIZE) != 0 {
+                        return false;
+                    }
+                }
+            }
+        }
+        if self.dir_remove(parent, name).is_none() {
+            return false;
+        }
+        if !self.truncate_inode(child, inode) {
+            return false;
+        }
+        let freed = Inode {
+            kind: INODE_KIND_FREE,
+            size: 0,
+            blocks: [0; DIRECT_BLOCKS],
+            indirect: 0,
+            double: 0,
+        };
+        self.write_inode(child, freed)
+    }
 }
 
 pub fn loaded() -> bool {
@@ -483,20 +962,24 @@ pub fn report() -> bool {
 pub struct Sfs;
 
 impl FileSystem for Sfs {
-    fn create_file(&mut self, _path: &str) -> Result<(), ()> {
-        Err(())
+    fn create_file(&mut self, path: &str) -> Result<(), ()> {
+        let reader = reader().ok_or(())?;
+        reader.create(path, INODE_KIND_FILE).map(|_| ()).ok_or(())
     }
 
-    fn make_directory(&mut self, _path: &str) -> Result<(), ()> {
-        Err(())
+    fn make_directory(&mut self, path: &str) -> Result<(), ()> {
+        let reader = reader().ok_or(())?;
+        reader.create(path, INODE_KIND_DIR).map(|_| ()).ok_or(())
     }
 
-    fn remove_file(&mut self, _path: &str) -> Result<(), ()> {
-        Err(())
+    fn remove_file(&mut self, path: &str) -> Result<(), ()> {
+        let reader = reader().ok_or(())?;
+        if reader.remove(path, false) { Ok(()) } else { Err(()) }
     }
 
-    fn remove_directory(&mut self, _path: &str) -> Result<(), ()> {
-        Err(())
+    fn remove_directory(&mut self, path: &str) -> Result<(), ()> {
+        let reader = reader().ok_or(())?;
+        if reader.remove(path, true) { Ok(()) } else { Err(()) }
     }
 
     fn rename(&mut self, _source: &str, _destination: &str) -> Result<(), ()> {
@@ -525,12 +1008,16 @@ impl FileSystem for Sfs {
 
     fn write_at(
         &mut self,
-        _path: &str,
-        _offset: usize,
-        _bytes: &[u8],
-        _append: bool,
+        path: &str,
+        offset: usize,
+        bytes: &[u8],
+        append: bool,
     ) -> Result<(usize, usize), ()> {
-        Err(())
+        let reader = reader().ok_or(())?;
+        let index = reader.resolve(path).ok_or(())?;
+        reader
+            .write_file(index, offset, bytes, append)
+            .ok_or(())
     }
 
     fn len(&self, path: &str) -> Result<usize, ()> {
@@ -538,8 +1025,13 @@ impl FileSystem for Sfs {
         reader.len(path).ok_or(())
     }
 
-    fn seed_file(&mut self, _path: &str, _contents: &[u8]) -> Result<(), ()> {
-        Err(())
+    fn seed_file(&mut self, path: &str, contents: &[u8]) -> Result<(), ()> {
+        let reader = reader().ok_or(())?;
+        let index = reader.create(path, INODE_KIND_FILE).ok_or(())?;
+        reader
+            .write_file(index, 0, contents, false)
+            .map(|_| ())
+            .ok_or(())
     }
 
     fn usage(&self, _path: &str) -> Option<FsUsage> {

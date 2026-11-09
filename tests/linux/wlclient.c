@@ -25,6 +25,7 @@ static struct wl_pointer *pointer;
 static uint32_t configure_serial;
 static int configured;
 static int output_done;
+static int output_scale;
 static uint32_t seat_caps;
 static int keymap_ok;
 static int pointer_ok;
@@ -42,10 +43,12 @@ static void output_geometry(void *data, struct wl_output *out, int32_t x,
 static void output_mode(void *data, struct wl_output *out, uint32_t flags,
                         int32_t width, int32_t height, int32_t refresh);
 static void output_done_event(void *data, struct wl_output *out);
+static void output_scale_event(void *data, struct wl_output *out, int32_t factor);
 static const struct wl_output_listener output_listener = {
     .geometry = output_geometry,
     .mode = output_mode,
     .done = output_done_event,
+    .scale = output_scale_event,
 };
 static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps);
 static const struct wl_seat_listener seat_listener = {
@@ -67,7 +70,7 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 1 ? version : 1;
         shell = wl_registry_bind(registry, name, &xdg_wm_base_interface, use);
     } else if (strcmp(interface, wl_output_interface.name) == 0) {
-        output = wl_registry_bind(registry, name, &wl_output_interface, 1);
+        output = wl_registry_bind(registry, name, &wl_output_interface, 2);
         wl_output_add_listener(output, &output_listener, NULL);
     } else if (strcmp(interface, wl_seat_interface.name) == 0) {
         seat = wl_registry_bind(registry, name, &wl_seat_interface, 1);
@@ -115,6 +118,12 @@ static void output_mode(void *data, struct wl_output *out, uint32_t flags,
 static void output_done_event(void *data, struct wl_output *out) {
     (void)data; (void)out;
     output_done = 1;
+}
+
+static void output_scale_event(void *data, struct wl_output *out,
+                               int32_t factor) {
+    (void)data; (void)out;
+    output_scale = factor;
 }
 
 static void keyboard_keymap(void *data, struct wl_keyboard *kb,
@@ -385,9 +394,11 @@ int main(void) {
         fprintf(stderr, "wlclient: buffer releases missing\n");
         return 11;
     }
-    if (!output_done || !keymap_ok || !pointer_ok || !key_enter) {
-        fprintf(stderr, "wlclient: input events missing out=%d map=%d ptr=%d enter=%d\n",
-                output_done, keymap_ok, pointer_ok, key_enter);
+    if (!output_done || output_scale != 2 || !keymap_ok || !pointer_ok ||
+        !key_enter) {
+        fprintf(stderr,
+                "wlclient: input events missing out=%d scale=%d map=%d ptr=%d enter=%d\n",
+                output_done, output_scale, keymap_ok, pointer_ok, key_enter);
         return 11;
     }
 

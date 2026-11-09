@@ -649,6 +649,15 @@ Redmi port is parked. The reference checklist is
   disabled until the block-allocation/write path is ported; `/tmp` stays
   writable. Full series plus repeats and `health`: zero zombies/open
   files/DMA leaks; fsck clean.
+  **Slice 39 (writes on streaming SFS, wl_output v2):** the streaming cache
+  gained block allocation/free, inode allocation, directory add/remove and
+  file write/truncate. Creating, writing, growing via indirect/double-indirect
+  tables, `mkdir`, `rm` and `rmdir` work through the cache and persist to the
+  device; `rename`/`replace` remain disabled. The shell test writes, reads,
+  nests and removes files (fsck clean afterwards). Wayland advertises
+  `wl_output` v2 and sends `scale(2)`; the real client binds v2 and checks it.
+  Full series plus repeats and `health`: 5500/31515 frames, zero zombies/open
+  files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -675,10 +684,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 39 (restore SFS writes on top of the
-  streaming cache and extend the block tree past 8 MiB files, then a larger
-  toolkit). Network base maintenance (keep-alive, TLS roots/RTC/RNG,
-  TLS 1.2).
+- **Next steps:** Linux ABI slice 40 (third indirect level for >8 MiB files
+  across kernel and image tools, plus SFS rename/replace). Network base
+  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

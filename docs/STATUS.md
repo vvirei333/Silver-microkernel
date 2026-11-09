@@ -30,7 +30,8 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   fork, wait/exit, capabilities, IPC mailboxes and mutexes.
 - virtio-blk-pci + virtio-net, GENI UART, PSCI power off/reset.
 - SFS rootfs read on demand through a 256 KiB block cache (streaming); the
-  image no longer occupies RAM. Writable RamFs at `/tmp`.
+  image no longer occupies RAM. Create/truncate/write/mkdir/remove work on the
+  same cache (rename/replace still pending). Writable RamFs at `/tmp`.
 - Console shell (`howl`) with file, process, mount, network and health commands.
 - Fastfetch-style boot banner, kernel/userspace version **0.1.1**.
 
@@ -78,10 +79,10 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 | Linux fds per process | 256 |
 | User VA | image `0x4000_0000`, heap `0x4080_0000`, mmap `0x40A0_0000+`, stack `0x7FE0_1000` |
 
-SFS is mounted **read-only** while streaming: the block cache covers reads,
-but block allocation and bitmap/inode mutation are the next format slice.
-`/tmp` remains writable. A full GTK/GLib stack is now limited by the 8 MiB
-per-file format cap, not by RAM.
+SFS writes allocate blocks through the streaming cache (bitmap, inode table
+and directory blocks are read-modify-written in place); `rename`/`replace`
+are the remaining mutation gaps. The per-file cap is still 8 MiB until the
+block tree grows a third indirect level.
 
 ## Test matrix
 
