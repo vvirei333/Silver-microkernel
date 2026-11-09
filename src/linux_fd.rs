@@ -190,6 +190,24 @@ struct SocketState {
     stream: bool,
 }
 
+/// One descriptor registered with an epoll instance.
+struct EpollEntry {
+    fd: u64,
+    events: u32,
+    data: u64,
+}
+
+struct EpollState {
+    entries: Vec<EpollEntry>,
+}
+
+/// A `timerfd_create` timer. Deadlines are in scheduler ticks (100 Hz).
+struct TimerFdState {
+    /// Zero means disarmed.
+    deadline: u64,
+    interval: u64,
+}
+
 /// State of a bound `AF_UNIX` listening socket. The registry holds one Arc
 /// per bound path; the fd table holds another. Pending entries own the server
 /// end of each accepted-not-yet-accepted connection.
@@ -234,6 +252,11 @@ enum Target {
     /// A bound `AF_UNIX` socket; `listen(2)` flips it to accepting.
     Listener {
         state: Arc<Mutex<ListenerState>>,
+        nonblock: bool,
+    },
+    Epoll(Arc<Mutex<EpollState>>),
+    TimerFd {
+        state: Arc<Mutex<TimerFdState>>,
         nonblock: bool,
     },
 }
@@ -590,6 +613,8 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             Ok(read as u64)
         }
         Target::Unbound { .. } | Target::Listener { .. } => Err(ENOTCONN),
+        Target::TimerFd { state, nonblock } => timerfd_read(&state, nonblock, buffer),
+        Target::Epoll(_) => Err(EINVAL),
     }
 }
 
@@ -677,6 +702,7 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             socket_send_locked(&state, end, &bytes, Vec::new())
         }
         Target::Unbound { .. } | Target::Listener { .. } => Err(ENOTCONN),
+        Target::TimerFd { .. } | Target::Epoll(_) => Err(EINVAL),
     }
 }
 
@@ -772,6 +798,9 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
         }
         Target::Socket { .. } | Target::Unbound { .. } | Target::Listener { .. } => {
             write_stat(buffer, S_IFSOCK | 0o600, 0, fd.max(1))
+        }
+        Target::Epoll(_) | Target::TimerFd { .. } => {
+            write_stat(buffer, S_IFREG | 0o600, 0, fd.max(1))
         }
     }
 }
@@ -880,6 +909,221 @@ pub fn memfd(task: u64) -> Result<u64, u64> {
         }))),
     )
     .ok_or(EMFILE)
+}
+
+/// `epoll_create1(2)`.
+pub fn epoll_create(task: u64) -> Result<u64, u64> {
+    insert(
+        task,
+        Target::Epoll(Arc::new(Mutex::new(EpollState {
+            entries: Vec::new(),
+        }))),
+    )
+    .ok_or(EMFILE)
+}
+
+/// `epoll_ctl(2)`: add (`1`), delete (`2`) or modify (`3`) one interest.
+pub fn epoll_ctl(
+    task: u64,
+    epfd: u64,
+    operation: u64,
+    fd: u64,
+    events: u32,
+    data: u64,
+) -> Result<(), u64> {
+    let target = lookup(task, epfd).ok_or(EBADF)?;
+    let Target::Epoll(state) = target else {
+        return Err(EINVAL);
+    };
+    if lookup(task, fd).is_none() {
+        return Err(EBADF);
+    }
+    let mut epoll = state.lock();
+    match operation {
+        1 => {
+            if epoll.entries.iter().any(|entry| entry.fd == fd) {
+                return Err(EEXIST);
+            }
+            if epoll.entries.len() >= 64 {
+                return Err(ENOSPC);
+            }
+            epoll.entries.push(EpollEntry { fd, events, data });
+            Ok(())
+        }
+        2 => {
+            let Some(index) = epoll.entries.iter().position(|entry| entry.fd == fd) else {
+                return Err(ENOENT);
+            };
+            epoll.entries.remove(index);
+            Ok(())
+        }
+        3 => {
+            let Some(entry) = epoll.entries.iter_mut().find(|entry| entry.fd == fd) else {
+                return Err(ENOENT);
+            };
+            entry.events = events;
+            entry.data = data;
+            Ok(())
+        }
+        _ => Err(EINVAL),
+    }
+}
+
+/// Level-triggered readiness translated from the poll bits.
+fn epoll_ready_mask(task: u64, fd: u64, requested: u32) -> u32 {
+    const EPOLLIN: u32 = 0x001;
+    const EPOLLOUT: u32 = 0x004;
+    const EPOLLERR: u32 = 0x008;
+    const EPOLLHUP: u32 = 0x010;
+    let Some(bits) = poll_ready(task, fd) else {
+        return 0;
+    };
+    let mut ready = 0;
+    if bits & 0x001 != 0 && requested & EPOLLIN != 0 {
+        ready |= EPOLLIN;
+    }
+    if bits & 0x004 != 0 && requested & EPOLLOUT != 0 {
+        ready |= EPOLLOUT;
+    }
+    if bits & 0x008 != 0 {
+        ready |= EPOLLERR;
+    }
+    if bits & 0x010 != 0 {
+        ready |= EPOLLHUP;
+    }
+    ready
+}
+
+/// `epoll_wait(2)` / `epoll_pwait(2)`. Blocks until one entry is ready or the
+/// timeout expires. A negative timeout means "infinite", capped like `ppoll`
+/// so a stuck client cannot wedge a task forever.
+pub fn epoll_wait(
+    task: u64,
+    epfd: u64,
+    max_events: usize,
+    timeout_ms: i64,
+) -> Result<Vec<(u32, u64)>, u64> {
+    let target = lookup(task, epfd).ok_or(EBADF)?;
+    let Target::Epoll(state) = target else {
+        return Err(EINVAL);
+    };
+    let start = crate::timer::ticks();
+    let deadline = if timeout_ms < 0 {
+        Some(start + crate::timer::milliseconds_to_ticks(60_000))
+    } else {
+        Some(start + crate::timer::milliseconds_to_ticks(timeout_ms as u64))
+    };
+    loop {
+        let mut ready = Vec::new();
+        {
+            let epoll = state.lock();
+            for entry in &epoll.entries {
+                if ready.len() >= max_events {
+                    break;
+                }
+                let mask = epoll_ready_mask(task, entry.fd, entry.events);
+                if mask != 0 {
+                    ready.push((mask, entry.data));
+                }
+            }
+        }
+        let expired = deadline.map(|deadline| crate::timer::ticks() >= deadline);
+        if !ready.is_empty() || expired == Some(true) || timeout_ms == 0 {
+            return Ok(ready);
+        }
+        scheduler::sleep(1);
+    }
+}
+
+/// `timerfd_create(2)`.
+pub fn timerfd_create(task: u64, nonblock: bool) -> Result<u64, u64> {
+    insert(
+        task,
+        Target::TimerFd {
+            state: Arc::new(Mutex::new(TimerFdState {
+                deadline: 0,
+                interval: 0,
+            })),
+            nonblock,
+        },
+    )
+    .ok_or(EMFILE)
+}
+
+/// Arms a timerfd. `interval` and `value` are in scheduler ticks; `absolute`
+/// means `value` is a CLOCK_MONOTONIC deadline rather than a delay.
+pub fn timerfd_settime(
+    task: u64,
+    fd: u64,
+    interval: u64,
+    value: u64,
+    absolute: bool,
+) -> Result<(), u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::TimerFd { state, .. } = target else {
+        return Err(EINVAL);
+    };
+    let mut timer = state.lock();
+    timer.interval = interval;
+    timer.deadline = if value == 0 {
+        0
+    } else if absolute {
+        value
+    } else {
+        crate::timer::ticks().saturating_add(value)
+    };
+    Ok(())
+}
+
+/// Returns `(interval, remaining)` in scheduler ticks.
+pub fn timerfd_gettime(task: u64, fd: u64) -> Result<(u64, u64), u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::TimerFd { state, .. } = target else {
+        return Err(EINVAL);
+    };
+    let timer = state.lock();
+    let remaining = if timer.deadline == 0 {
+        0
+    } else {
+        timer.deadline.saturating_sub(crate::timer::ticks())
+    };
+    Ok((timer.interval, remaining))
+}
+
+fn timerfd_read(
+    state: &Arc<Mutex<TimerFdState>>,
+    nonblock: bool,
+    buffer: u64,
+) -> Result<u64, u64> {
+    loop {
+        let expired = {
+            let mut timer = state.lock();
+            let now = crate::timer::ticks();
+            if timer.deadline != 0 && now >= timer.deadline {
+                let count = if timer.interval != 0 {
+                    1 + (now - timer.deadline) / timer.interval
+                } else {
+                    1
+                };
+                if timer.interval != 0 {
+                    timer.deadline = timer.deadline.saturating_add(count * timer.interval);
+                } else {
+                    timer.deadline = 0;
+                }
+                Some(count)
+            } else {
+                None
+            }
+        };
+        if let Some(count) = expired {
+            user_memory::copy_to_user(&count.to_le_bytes(), buffer).map_err(|_| EFAULT)?;
+            return Ok(8);
+        }
+        if nonblock {
+            return Err(EAGAIN);
+        }
+        scheduler::sleep(1);
+    }
 }
 
 fn eventfd_read(
@@ -1503,12 +1747,14 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::Unbound { nonblock }
         | Target::Listener { nonblock, .. }
         | Target::EventFd { nonblock, .. } => (O_RDWR, nonblock),
+        Target::TimerFd { nonblock, .. } => (O_RDWR, nonblock),
         Target::Console
         | Target::Null
         | Target::Zero
         | Target::Full
         | Target::Random
-        | Target::MemFd(_) => (O_RDWR, false),
+        | Target::MemFd(_)
+        | Target::Epoll(_) => (O_RDWR, false),
     };
     Some(access | if nonblock { O_NONBLOCK } else { 0 })
 }
@@ -1524,6 +1770,7 @@ pub fn set_nonblock(task: u64, fd: u64, nonblock: bool) -> Result<(), u64> {
             Some(Target::Socket { nonblock: flag, .. })
             | Some(Target::Unbound { nonblock: flag })
             | Some(Target::Listener { nonblock: flag, .. })
+            | Some(Target::TimerFd { nonblock: flag, .. })
             | Some(Target::EventFd { nonblock: flag, .. }) => {
                 *flag = nonblock;
                 true
@@ -1606,6 +1853,15 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
                 POLLIN
             }
         }
+        Target::TimerFd { state, .. } => {
+            let timer = state.lock();
+            if timer.deadline != 0 && crate::timer::ticks() >= timer.deadline {
+                POLLIN
+            } else {
+                0
+            }
+        }
+        Target::Epoll(_) => POLLIN | POLLOUT,
     })
 }
 

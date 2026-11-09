@@ -91,6 +91,13 @@ const SYS_GETRANDOM: u64 = 278;
 const SYS_RSEQ: u64 = 293;
 const SYS_PREAD64: u64 = 67;
 const SYS_PWRITE64: u64 = 68;
+const SYS_EPOLL_CREATE1: u64 = 20;
+const SYS_EPOLL_CTL: u64 = 21;
+const SYS_EPOLL_PWAIT: u64 = 22;
+const SYS_EPOLL_PWAIT2: u64 = 441;
+const SYS_TIMERFD_CREATE: u64 = 85;
+const SYS_TIMERFD_SETTIME: u64 = 86;
+const SYS_TIMERFD_GETTIME: u64 = 87;
 const SYS_MKDIRAT: u64 = 34;
 const SYS_UNLINKAT: u64 = 35;
 const SYS_RENAMEAT: u64 = 38;
@@ -171,6 +178,13 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
         SYS_WRITEV => linux_writev(args[0], args[1], args[2]),
         SYS_READ => finish(linux_fd::read(scheduler::current_task_id(), args[0], args[1], args[2])),
         SYS_OPENAT => linux_openat(args[0], args[1], args[2], args[3]),
+        SYS_EPOLL_CREATE1 => linux_epoll_create(args[0]),
+        SYS_EPOLL_CTL => linux_epoll_ctl(args[0], args[1], args[2], args[3]),
+        SYS_EPOLL_PWAIT => linux_epoll_wait(args[0], args[1], args[2], args[3] as i64),
+        SYS_EPOLL_PWAIT2 => linux_epoll_wait2(args[0], args[1], args[2], args[3]),
+        SYS_TIMERFD_CREATE => linux_timerfd_create(args[0], args[1]),
+        SYS_TIMERFD_SETTIME => linux_timerfd_settime(args[0], args[1], args[2], args[3]),
+        SYS_TIMERFD_GETTIME => linux_timerfd_gettime(args[0], args[1]),
         SYS_EVENTFD2 => finish(linux_fd::eventfd(
             scheduler::current_task_id(),
             args[0],
@@ -466,6 +480,171 @@ fn linux_wait4(pid: i64, status_pointer: u64, options: u64) -> Result<u64, u64> 
 }
 
 /// `pipe2(2)`: installs a read and a write descriptor.
+fn linux_epoll_create(flags: u64) -> u64 {
+    // EPOLL_CLOEXEC is the only flag; this ABI has no exec-time descriptor
+    // closing anyway.
+    if flags & !0x80000 != 0 {
+        return errno(EINVAL);
+    }
+    finish(linux_fd::epoll_create(scheduler::current_task_id()))
+}
+
+fn linux_epoll_ctl(epfd: u64, operation: u64, fd: u64, event_pointer: u64) -> u64 {
+    const EPOLL_CTL_DEL: u64 = 2;
+    let (events, data) = if operation == EPOLL_CTL_DEL {
+        (0u32, 0u64)
+    } else {
+        if event_pointer == 0 {
+            return errno(EFAULT);
+        }
+        let mut raw = [0_u8; 16];
+        if user_memory::copy_from_user(event_pointer, &mut raw).is_err() {
+            return errno(EFAULT);
+        }
+        (
+            u32::from_le_bytes(raw[0..4].try_into().unwrap()),
+            u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+        )
+    };
+    finish(
+        linux_fd::epoll_ctl(
+            scheduler::current_task_id(),
+            epfd,
+            operation,
+            fd,
+            events,
+            data,
+        )
+        .map(|_| 0),
+    )
+}
+
+fn linux_epoll_wait(
+    epfd: u64,
+    events_pointer: u64,
+    max_events: u64,
+    timeout_ms: i64,
+) -> u64 {
+    if max_events == 0 || max_events > 64 {
+        return errno(EINVAL);
+    }
+    let ready = match linux_fd::epoll_wait(
+        scheduler::current_task_id(),
+        epfd,
+        max_events as usize,
+        timeout_ms,
+    ) {
+        Ok(ready) => ready,
+        Err(code) => return errno(code),
+    };
+    for (index, (events, data)) in ready.iter().enumerate() {
+        let mut raw = [0_u8; 16];
+        raw[0..4].copy_from_slice(&events.to_le_bytes());
+        raw[8..16].copy_from_slice(&data.to_le_bytes());
+        if user_memory::copy_to_user(&raw, events_pointer + (index * 16) as u64).is_err() {
+            return errno(EFAULT);
+        }
+    }
+    ready.len() as u64
+}
+
+/// `epoll_pwait2`: the timeout is a `timespec` pointer, not milliseconds.
+fn linux_epoll_wait2(
+    epfd: u64,
+    events_pointer: u64,
+    max_events: u64,
+    timeout_pointer: u64,
+) -> u64 {
+    let timeout_ms = if timeout_pointer == 0 {
+        -1
+    } else {
+        let mut raw = [0_u8; 16];
+        if user_memory::copy_from_user(timeout_pointer, &mut raw).is_err() {
+            return errno(EFAULT);
+        }
+        let seconds = i64::from_le_bytes(raw[..8].try_into().unwrap());
+        let nanoseconds = i64::from_le_bytes(raw[8..].try_into().unwrap());
+        if seconds < 0 {
+            -1
+        } else {
+            seconds
+                .saturating_mul(1000)
+                .saturating_add(nanoseconds / 1_000_000)
+        }
+    };
+    linux_epoll_wait(epfd, events_pointer, max_events, timeout_ms)
+}
+
+fn ticks_from_timespec(seconds: u64, nanoseconds: u64) -> u64 {
+    seconds
+        .saturating_mul(100)
+        .saturating_add(nanoseconds / 10_000_000)
+}
+
+fn write_itimerspec(pointer: u64, interval: u64, remaining: u64) -> Result<(), u64> {
+    let mut raw = [0_u8; 32];
+    raw[0..8].copy_from_slice(&(interval / 100).to_le_bytes());
+    raw[8..16].copy_from_slice(&((interval % 100) * 10_000_000).to_le_bytes());
+    raw[16..24].copy_from_slice(&(remaining / 100).to_le_bytes());
+    raw[24..32].copy_from_slice(&((remaining % 100) * 10_000_000).to_le_bytes());
+    user_memory::copy_to_user(&raw, pointer).map_err(|_| EFAULT)
+}
+
+fn linux_timerfd_create(_clock: u64, flags: u64) -> u64 {
+    if flags & !(0x800 | 0x80000) != 0 {
+        return errno(EINVAL);
+    }
+    finish(linux_fd::timerfd_create(
+        scheduler::current_task_id(),
+        flags & 0x800 != 0,
+    ))
+}
+
+fn linux_timerfd_settime(fd: u64, flags: u64, new_pointer: u64, old_pointer: u64) -> u64 {
+    const TFD_TIMER_ABSTIME: u64 = 1;
+    if flags & !3 != 0 || new_pointer == 0 {
+        return errno(EINVAL);
+    }
+    let task = scheduler::current_task_id();
+    if old_pointer != 0 {
+        let (interval, remaining) = match linux_fd::timerfd_gettime(task, fd) {
+            Ok(state) => state,
+            Err(code) => return errno(code),
+        };
+        if write_itimerspec(old_pointer, interval, remaining).is_err() {
+            return errno(EFAULT);
+        }
+    }
+    let mut raw = [0_u8; 32];
+    if user_memory::copy_from_user(new_pointer, &mut raw).is_err() {
+        return errno(EFAULT);
+    }
+    let interval = ticks_from_timespec(
+        u64::from_le_bytes(raw[0..8].try_into().unwrap()),
+        u64::from_le_bytes(raw[8..16].try_into().unwrap()),
+    );
+    let value = ticks_from_timespec(
+        u64::from_le_bytes(raw[16..24].try_into().unwrap()),
+        u64::from_le_bytes(raw[24..32].try_into().unwrap()),
+    );
+    finish(
+        linux_fd::timerfd_settime(task, fd, interval, value, flags & TFD_TIMER_ABSTIME != 0)
+            .map(|_| 0),
+    )
+}
+
+fn linux_timerfd_gettime(fd: u64, current_pointer: u64) -> u64 {
+    let (interval, remaining) =
+        match linux_fd::timerfd_gettime(scheduler::current_task_id(), fd) {
+            Ok(state) => state,
+            Err(code) => return errno(code),
+        };
+    if write_itimerspec(current_pointer, interval, remaining).is_err() {
+        return errno(EFAULT);
+    }
+    0
+}
+
 fn linux_pipe2(fds_pointer: u64, _flags: u64) -> u64 {
     let task = scheduler::current_task_id();
     let Ok((read_fd, write_fd)) = linux_fd::pipe(task) else {

@@ -316,8 +316,8 @@ EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 `eventfd2`, `memfd_create`, `futex`, `rt_sigaction`, `rt_sigprocmask`, `kill`
 and `tgkill`; anything else returns `-ENOSYS`. File descriptors are a
 per-process table in `src/linux_fd.rs` (console, `/dev` devices, VFS handles,
-pipes, eventfds, memfds or Unix sockets), so `dup2` redirects work; the
-filesystem view is read-only.
+pipes, eventfds, memfds, timerfds, epoll instances or Unix sockets), so `dup2`
+redirects work; the filesystem view is read-only.
 
 The personality is fixed at spawn, so a foreign binary can never reach the
 Silver syscall table by choosing a colliding number. `linuxrun` is a
@@ -519,6 +519,17 @@ rename-over-destination, a file inside a runtime directory, and cleanup:
 ```text
 howl> linuxrun /sfs/linux-scratch
 scratch ok
+```
+
+Event loops have their primitives: `epoll_create1`/`epoll_ctl`/
+`epoll_pwait` (and `epoll_pwait2`) with level-triggered `EPOLLIN`/`EPOLLOUT`/
+`EPOLLERR`/`EPOLLHUP`, and `timerfd_create`/`settime`/`gettime` with interval
+and absolute deadlines. Pipes, eventfds, sockets and timers are all pollable
+through one epoll instance:
+
+```text
+howl> linuxrun /sfs/linux-eventloop
+event loop ok
 ```
 
 Threads use `clone(CLONE_VM|CLONE_THREAD|CLONE_SIGHAND|CLONE_SETTLS)`: they

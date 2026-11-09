@@ -514,6 +514,17 @@ Redmi port is parked. The reference checklist is
   directory, removes everything, and confirms `/sfs` still returns `EROFS`;
   prints `scratch ok`. Full series plus repeats and `health`:
   9596/31577 frames, zero zombies/open files/DMA leaks; fsck clean.
+  **Slice 25 (event loop primitives):** `epoll_create1`/`epoll_ctl`/
+  `epoll_pwait`/`epoll_pwait2` provided level-triggered readiness for every
+  pollable target (pipes, eventfd, sockets, listeners, timerfd), with
+  `EPOLLERR`/`EPOLLHUP` always reported and a bounded infinite timeout like
+  `ppoll`. `timerfd_create`/`settime`/`gettime` implement one-shot and
+  interval timers over the 100 Hz scheduler tick, including absolute
+  deadlines and expirations on `read`. Test: `linux-eventloop` (glibc
+  `epoll_create1`, three registered descriptors, timeout with no events,
+  pipe readiness, a 50 ms timer, an eventfd, `EPOLL_CTL_DEL`, disarm and
+  `gettime`) prints `event loop ok`. Full series plus repeats and `health`:
+  9596/31575 frames, zero zombies/open files/DMA leaks; fsck clean.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -540,10 +551,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 25 (start the Wayland/GTK/D-Bus stack on
-  top of socketpair/named sockets, shared memfd and the writable runtime
-  directory). Network base maintenance (keep-alive, TLS roots/RTC/RNG,
-  TLS 1.2).
+- **Next steps:** Linux ABI slice 26 (Wayland wire protocol over the named
+  socket + SCM_RIGHTS memfd path, then D-Bus). Network base maintenance
+  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.
