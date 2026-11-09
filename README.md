@@ -489,16 +489,28 @@ threads ok
 ```
 
 Real glibc `pthread_create`/`pthread_join` works through the same path (8 MiB
-stack from `getrlimit(RLIMIT_STACK)`, 8 MiB stack mmap, futex join):
+stack from `getrlimit(RLIMIT_STACK)`, 8 MiB stack mmap, futex join). The
+worker allocates with `malloc` and prints through the shared descriptor table:
 
 ```text
 howl> linuxrun /sfs/linux-pthread
+worker x
 pthread 42
 ```
 
-First thread slice limitation: fd table, heap and mmap bookkeeping remain
-leader-owned; a worker that opens files or grows `brk` itself needs the next
-thread group refactor. `exit_group` with live workers is also not complete.
+Threads share the leader's descriptor table, heap, mmap regions and image;
+`brk`/`mmap`/`mprotect`/COW faults from a worker are applied to the group
+leader. `exit_group` from the leader marks siblings Dead, lets the reaper
+retire them, then releases the shared space; a sleeping worker is killed:
+
+```text
+howl> linuxrun /sfs/linux-pthread-exit
+exit group ok
+```
+
+Remaining thread limitation: `exit_group` called from a non-leader still exits
+only that thread, and signal dispositions remain per-task rather than
+per-thread-group.
 File-backed `mmap` and a real `mprotect` are implemented:
 `MAP_PRIVATE` copies the file range into private frames, `MAP_FIXED` replaces
 an existing range (the loader's `PROT_NONE` reservation followed by per-segment

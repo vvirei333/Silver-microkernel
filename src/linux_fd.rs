@@ -72,6 +72,7 @@ static TABLES: Mutex<Vec<Table>> = Mutex::new(Vec::new());
 const MAX_FDS: usize = 64;
 
 fn with_table<R>(task: u64, action: impl FnOnce(&mut Table) -> R) -> R {
+    let task = crate::scheduler::fd_table_owner(task);
     let mut tables = TABLES.lock();
     let index = match tables.iter().position(|table| table.task == task) {
         Some(index) => index,
@@ -164,6 +165,7 @@ fn insert_from(task: u64, target: Target, minimum: u64) -> Option<u64> {
 /// `openat(2)`. Write flags are rejected for real files (the VFS view is
 /// read-only), but synthetic devices accept writes.
 pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
+    let task = crate::scheduler::fd_table_owner(task);
     const O_WRONLY: u64 = 0o1;
     const O_RDWR: u64 = 0o2;
     const O_CREAT: u64 = 0o100;
@@ -207,6 +209,7 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
 }
 
 pub fn close(task: u64, fd: u64) -> Result<(), u64> {
+    let task = crate::scheduler::fd_table_owner(task);
     let target = with_table(task, |table| {
         let slot = table.slots.get_mut(fd as usize)?;
         slot.take()
@@ -263,6 +266,7 @@ pub fn dup2(task: u64, oldfd: u64, newfd: u64) -> Result<u64, u64> {
 }
 
 pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
+    let task = crate::scheduler::fd_table_owner(task);
     if count == 0 {
         return Ok(0);
     }
@@ -317,6 +321,7 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
 
 /// Positional read used by file-backed `mmap`. Does not move the fd offset.
 pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize, u64> {
+    let task = crate::scheduler::fd_table_owner(task);
     let target = lookup(task, fd).ok_or(EBADF)?;
     match target {
         Target::Vfs(vfs_fd) => {
@@ -357,6 +362,7 @@ pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize
 }
 
 pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
+    let task = crate::scheduler::fd_table_owner(task);
     let target = lookup(task, fd).ok_or(EBADF)?;
     match target {
         Target::Console => {
@@ -389,6 +395,7 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
 }
 
 pub fn lseek(task: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, u64> {
+    let task = crate::scheduler::fd_table_owner(task);
     match lookup(task, fd).ok_or(EBADF)? {
         Target::Vfs(vfs_fd) => vfs::lseek(task, vfs_fd, offset, whence).map_err(|_| EINVAL),
         Target::MemFd(state) => {
@@ -412,6 +419,7 @@ pub fn lseek(task: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, u64> {
 
 /// Fills the aarch64 `struct stat` for a descriptor.
 pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
+    let task = crate::scheduler::fd_table_owner(task);
     let target = lookup(task, fd).ok_or(EBADF)?;
     match target {
         Target::Console => write_stat(buffer, S_IFCHR | 0o620, 0, fd.max(1)),
@@ -448,6 +456,7 @@ pub fn directory_path(task: u64, fd: u64) -> Option<String> {
 }
 
 pub fn getdents64(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
+    let task = crate::scheduler::fd_table_owner(task);
     const HEADER: usize = 19; // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1)
     let Target::Vfs(vfs_fd) = lookup(task, fd).ok_or(EBADF)? else {
         return Err(ENOTDIR);

@@ -177,7 +177,8 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
             scheduler::yield_current();
             0
         }
-        SYS_EXIT | SYS_EXIT_GROUP => scheduler::exit_current_with_status(args[0]),
+        SYS_EXIT => scheduler::exit_current_with_status(args[0]),
+        SYS_EXIT_GROUP => scheduler::exit_group(args[0]),
         SYS_EXECVE => linux_execve(frame, args[0], args[1], args[2]),
         SYS_CLONE => linux_clone(frame, args[0], args[1], args[2], args[3], args[4]),
         SYS_WAIT4 => finish(linux_wait4(args[0] as i64, args[1], args[2])),

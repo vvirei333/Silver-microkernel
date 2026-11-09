@@ -433,6 +433,18 @@ Redmi port is parked. The reference checklist is
   9596/31585 frames, zero zombies/open files/DMA leaks; offline fsck clean.
   Limitations: fd table, heap and mmap bookkeeping are still leader-owned, and
   `exit_group` with live workers is not complete.
+  **Slice 19 (shared thread-group resources):** Linux fd operations resolve
+  the group leader's descriptor table (`fd_table_owner`), and VFS open/read/
+  write/close/lseek/fstat/getdents map the owner too, so a worker shares fds.
+  `brk`, anonymous/file `mmap`, `munmap`, `mprotect`, COW faults and the signal
+  trampoline run on the group leader, so heap/mmap/image state has one owner.
+  `exit_group` from the leader marks every sibling Dead, yields until the
+  reaper removes them, then exits and releases the shared space; a sleeping
+  worker is killed. Tests: `linux-pthread` now mallocs and prints from the
+  worker (`worker x`, `pthread 42`); `linux-pthread-exit` leaves a sleeping
+  worker and returns from main (`exit group ok`). Full series plus repeated
+  runs and `health`: 9596/31584 frames, zero zombies/open files/DMA leaks.
+  Remaining: non-leader `exit_group` and per-thread-group signal dispositions.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -459,9 +471,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 19 (shared thread-group fd/heap/mmap
-  ownership and `exit_group`), then headless Wayland/GTK/D-Bus → Phosh.
-  Network base maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 20 (non-leader `exit_group`, shared signal
+  dispositions, then headless Wayland/GTK/D-Bus → Phosh). Network base
+  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

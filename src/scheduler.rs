@@ -2588,6 +2588,72 @@ pub fn current_tgid() -> u64 {
         .unwrap_or(0)
 }
 
+/// Task id that owns the descriptor table. Threads share the leader's table.
+pub fn fd_table_owner(task: u64) -> u64 {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.iter().find(|entry| entry.id == task))
+        .map(|entry| if entry.is_thread { entry.tgid } else { entry.id })
+        .unwrap_or(task)
+}
+
+/// Runs `action` on the group leader (the current task for a process, the
+/// leader for a thread), so heap/mmap/image operations land in the shared
+/// process state.
+fn with_group_owner<R>(action: impl FnOnce(&mut Task) -> R) -> Option<R> {
+    let owner = current_tgid();
+    let manager = scheduler_manager()?;
+    manager
+        .tasks
+        .iter_mut()
+        .find(|task| task.id == owner)
+        .map(action)
+}
+
+/// `exit_group(2)` from the thread-group leader: mark every sibling Dead,
+/// let the reaper retire them, then exit the leader and release the shared
+/// address space. A non-leader falls back to exiting only itself; transferring
+/// process ownership safely is a later refactor.
+#[cfg(feature = "linux-abi")]
+pub fn exit_group(status: u64) -> ! {
+    let current = current_task_id();
+    let tgid = current_tgid();
+    let is_leader = scheduler_manager()
+        .and_then(|manager| manager.tasks.iter().find(|task| task.id == current))
+        .map(|task| !task.is_thread)
+        .unwrap_or(false);
+    if !is_leader {
+        exit_current_with_status(status);
+    }
+    if let Some(manager) = scheduler_manager() {
+        for task in manager.tasks.iter_mut() {
+            if task.id != current
+                && task.tgid == tgid
+                && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+            {
+                task.state = TaskState::Dead;
+                task.bound_irq = None;
+                task.exit_status = Some(1);
+            }
+        }
+    }
+    loop {
+        let done = scheduler_manager()
+            .map(|manager| {
+                manager.tasks.iter().all(|task| {
+                    task.id == current
+                        || task.tgid != tgid
+                        || matches!(task.state, TaskState::Zombie)
+                })
+            })
+            .unwrap_or(true);
+        if done {
+            break;
+        }
+        sleep(1);
+    }
+    exit_current_with_status(status)
+}
+
 /// Syscall ABI of the running task. Kernel tasks (no user image) are Native.
 pub fn current_personality() -> Personality {
     scheduler_manager()
@@ -2820,19 +2886,19 @@ fn state_code(state: TaskState) -> u64 {
 }
 
 pub fn change_program_break(requested: usize) -> Option<usize> {
-    current_task_mut()?.change_program_break(requested)
+    with_group_owner(|task| task.change_program_break(requested))?
 }
 
 /// Allocates `length` bytes of anonymous memory for the current task and maps
 /// them into a kernel-chosen free virtual range with `prot` permissions.
 pub fn mmap_anonymous(length: usize, prot: u64) -> Option<usize> {
-    current_task_mut()?.mmap_anonymous(length, prot)
+    with_group_owner(|task| task.mmap_anonymous(length, prot))?
 }
 
 /// Anonymous `MAP_FIXED`: place the mapping at an exact virtual address,
 /// replacing any existing mapping in the range.
 pub fn mmap_anonymous_at(length: usize, prot: u64, address: usize) -> Option<usize> {
-    current_task_mut()?.mmap_region(length, prot, Some(address), None)
+    with_group_owner(|task| task.mmap_region(length, prot, Some(address), None))?
 }
 
 /// Maps a file-backed region for the current task. `fixed` implements Linux
@@ -2844,30 +2910,26 @@ pub fn mmap_file(
     fixed: Option<usize>,
     contents: &[u8],
 ) -> Option<usize> {
-    current_task_mut()?.mmap_file(length, prot, fixed, contents)
+    with_group_owner(|task| task.mmap_file(length, prot, fixed, contents))?
 }
 
 /// Changes protections on an existing mapping of the current task.
 pub fn mprotect(address: usize, length: usize, prot: u64) -> bool {
-    current_task_mut()
-        .map(|task| task.mprotect_range(address, length, prot))
-        .unwrap_or(false)
+    with_group_owner(|task| task.mprotect_range(address, length, prot)).unwrap_or(false)
 }
 
 /// Returns the current task's kernel-provided signal restorer page, creating
 /// it on first use.
 #[cfg(feature = "linux-abi")]
 pub fn signal_trampoline() -> Option<usize> {
-    current_task_mut()?.signal_trampoline()
+    with_group_owner(|task| task.signal_trampoline())?
 }
 
 /// COW write-fault entry point. Returns `true` when the faulting page was
 /// copied and remapped, so the exception trampoline can retry the instruction.
 #[cfg(feature = "linux-abi")]
 pub fn cow_fault(address: usize, esr: u64) -> bool {
-    current_task_mut()
-        .map(|task| task.cow_fault(address, esr))
-        .unwrap_or(false)
+    with_group_owner(|task| task.cow_fault(address, esr)).unwrap_or(false)
 }
 
 /// Allocates a fresh run and copies an old shared run into it.
@@ -2892,9 +2954,7 @@ fn cow_copy_run(
 
 /// Unmaps an anonymous region previously returned by `mmap_anonymous`.
 pub fn munmap(address: usize, length: usize) -> bool {
-    current_task_mut()
-        .map(|task| task.munmap(address, length))
-        .unwrap_or(false)
+    with_group_owner(|task| task.munmap(address, length)).unwrap_or(false)
 }
 
 pub fn start() -> ! {

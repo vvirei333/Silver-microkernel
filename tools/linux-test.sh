@@ -25,6 +25,7 @@
 #   linuxrun /sfs/linux-dyn     # real ld.so + dynamic libc, prints 'dynamic hello'
 #   linuxrun /sfs/linux-dynsig  # glibc sigaction + raise, prints 'dyn signal 10'
 #   linuxrun /sfs/linux-pthread # glibc pthread_create/join, prints 'pthread 42'
+#   linuxrun /sfs/linux-pthread-exit # exit_group kills a live worker
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
 #
@@ -132,10 +133,14 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     "$CC" -O2 -pthread -o build/pthread-test tests/linux/pthread.c
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/pthread-test
+    "$CC" -O2 -pthread -o build/pthread-exit tests/linux/pthread_exit.c
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/pthread-exit
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-hello linux-dyn
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-signal linux-dynsig
     python3 scripts/sfs_inject.py "$IMAGE" build/pthread-test linux-pthread
-    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread"
+    python3 scripts/sfs_inject.py "$IMAGE" build/pthread-exit linux-pthread-exit
+    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit"
 else
     DYN=""
     echo "note: patchelf or the dynamic AArch64 libc is missing; skipped the dynamic test" >&2
