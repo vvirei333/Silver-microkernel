@@ -6,7 +6,7 @@ use crate::der_certificate::ECDSA_SHA384;
 use crate::der_certificate::ED25519;
 use crate::der_certificate::{
     DecodedCertificate, ECDSA_SHA256, HOSTNAME_MAXLEN, MAX_SAN_DNS_NAMES, Time,
-    extract_common_name, extract_san_dns_names,
+    extract_basic_constraints, extract_common_name, extract_key_cert_sign, extract_san_dns_names,
 };
 #[cfg(feature = "rsa")]
 use crate::der_certificate::{RSA_PKCS1_SHA256, RSA_PKCS1_SHA384, RSA_PKCS1_SHA512};
@@ -237,6 +237,38 @@ fn verify_chain(
     let mut prev = anchor;
     for index in (0..start).rev() {
         let current = &cert.entries[index];
+        // `prev` is an intermediate supplied by the server (the anchor is
+        // pinned and trusted directly). It must be a CA: without this check a
+        // chain `[forgedLeaf(SAN=victim), legitimateLeaf]` validates, because
+        // the legitimate end entity really did sign the forged leaf and its
+        // hostname is never inspected. RFC 5280 requires cA=TRUE and, when
+        // present, keyCertSign on every issuer that is not a trust anchor.
+        if index + 1 < start {
+            if let CertificateEntryRef::X509(der) = prev {
+                let decoded =
+                    DecodedCertificate::from_der(der).map_err(|_| TlsError::DecodeError)?;
+                let (ca, path_len) = extract_basic_constraints(&decoded.tbs_certificate)
+                    .map_err(|_| TlsError::DecodeError)?
+                    .unwrap_or((false, None));
+                if !ca {
+                    return Err(TlsError::InvalidCertificate);
+                }
+                if extract_key_cert_sign(&decoded.tbs_certificate)
+                    .map_err(|_| TlsError::DecodeError)?
+                    == Some(false)
+                {
+                    return Err(TlsError::InvalidCertificate);
+                }
+                // pathLenConstraint counts the non-self-issued intermediate
+                // CAs below this certificate; the leaf does not count, so at
+                // this position there are `index` of them.
+                if let Some(limit) = path_len {
+                    if index as u64 > limit {
+                        return Err(TlsError::InvalidCertificate);
+                    }
+                }
+            }
+        }
         names = verify_certificate(prev, current, now)?;
         prev = current;
     }

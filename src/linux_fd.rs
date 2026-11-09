@@ -571,13 +571,7 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         Target::Random => {
             let length = (count as usize).min(64 * 1024);
             let mut bytes = alloc::vec![0_u8; length];
-            let mut state = crate::timer::ticks() ^ 0x9E37_79B9_7F4A_7C15;
-            for byte in &mut bytes {
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                *byte = state as u8;
-            }
+            crate::entropy::fill(&mut bytes);
             user_memory::copy_to_user(&bytes, buffer).map_err(|_| EFAULT)?;
             Ok(length as u64)
         }

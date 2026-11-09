@@ -302,17 +302,19 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
     write_u32(dma_vaddr, net_ipc::RX_LENGTH, 0);
     write_u32(dma_vaddr, net_ipc::TX_LENGTH, 0);
 
-    // Client data window (URLs in, HTTP bodies out).
-    let Some((client_vaddr, client_paddr)) = syscall::alloc_dma(net_ipc::CLIENT_SIZE) else {
-        fail(EXIT_NO_DMA, "NET SERVER: CLIENT WINDOW FAILED\r\n");
-    };
-    write_u16(client_vaddr, net_ipc::CLIENT_REQUEST, 0);
+    // Client data windows (URLs in, HTTP bodies out). Allocated per client so
+    // one task cannot read or rewrite another task's request.
+    let mut clients = ClientWindows::new();
 
     let device = unsafe { &mut *core::ptr::addr_of_mut!(DEVICE) };
     let fetch = unsafe { &mut *core::ptr::addr_of_mut!(FETCH) };
 
     let mut config = Config::new(HardwareAddress::Ethernet(EthernetAddress(DEFAULT_MAC)));
-    config.random_seed = syscall::uptime_ticks();
+    // TCP initial sequence numbers and DHCP transaction ids come from
+    // this seed; uptime ticks are public and would make them predictable.
+    let mut seed = [0_u8; 8];
+    let _ = syscall::random(&mut seed);
+    config.random_seed = u64::from_le_bytes(seed);
     let mut interface = Interface::new(config, device, Instant::from_millis(0));
 
     // Start from the static QEMU/slirp configuration so the stack works even
@@ -414,6 +416,14 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
                 handle_doorbell(&message, &mut interface, &mut attached);
                 continue;
             }
+            // Every client operation reads or writes its own window. A task
+            // without a slot (more than MAX_CLIENTS live clients, or DMA
+            // exhaustion) gets an explicit empty share reply instead of
+            // touching someone else's buffer.
+            let Some((client_base, client_paddr)) = clients.acquire(message.sender) else {
+                outbox.push(message.sender, net_ipc::share_reply(0, 0));
+                continue;
+            };
             match message.payload[0] {
                 net_ipc::OP_PING => {
                     if ping_reply.is_none() {
@@ -439,7 +449,7 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
                 net_ipc::OP_DNS => {
                     start_dns(
                         &mut message,
-                        client_vaddr,
+                        client_base,
                         &mut interface,
                         &mut sockets,
                         dns_handle,
@@ -451,7 +461,7 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
                 net_ipc::OP_HTTP | net_ipc::OP_HTTP_POST => {
                     start_http(
                         &mut message,
-                        client_vaddr,
+                        client_base,
                         &mut interface,
                         &mut sockets,
                         dns_handle,
@@ -627,7 +637,6 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
             &mut sockets,
             dns_handle,
             tcp_handle,
-            client_vaddr,
             dma_vaddr,
             dma_paddr,
             driver,
@@ -702,6 +711,62 @@ fn apply_ipv4(interface: &mut Interface, address: [u8; 4], prefix: u8, router: O
 /// for different clients must not overwrite one another when several requests
 /// arrive in the same drain.
 const OUTBOX_SLOTS: usize = 8;
+
+/// Per-client shared windows. One global window let any task that sent
+/// `OP_SHARE` read and overwrite another client's request and response: the
+/// physical address was handed to everyone. Each client now gets its own DMA
+/// window, keyed by task id, and only that task can reach it through this
+/// server.
+const MAX_CLIENTS: usize = 4;
+
+#[derive(Copy, Clone)]
+struct ClientWindow {
+    owner: u64,
+    paddr: u64,
+    vaddr: u64,
+}
+
+struct ClientWindows {
+    slots: [Option<ClientWindow>; MAX_CLIENTS],
+}
+
+impl ClientWindows {
+    const fn new() -> Self {
+        Self {
+            slots: [None; MAX_CLIENTS],
+        }
+    }
+
+    /// Returns `(vaddr, paddr)` for `owner`, allocating a window on first use.
+    /// Dead owners are dropped first; their DMA frames stay charged to this
+    /// server, so the slot is the only thing that can be reused.
+    fn acquire(&mut self, owner: u64) -> Option<(u64, u64)> {
+        if let Some(window) = self
+            .slots
+            .iter()
+            .flatten()
+            .find(|window| window.owner == owner)
+        {
+            return Some((window.vaddr, window.paddr));
+        }
+        for slot in self.slots.iter_mut() {
+            if let Some(window) = slot {
+                if !syscall::task_alive(window.owner) {
+                    *slot = None;
+                }
+            }
+        }
+        let (vaddr, paddr) = syscall::alloc_dma(net_ipc::CLIENT_SIZE)?;
+        write_u16(vaddr, net_ipc::CLIENT_REQUEST, 0);
+        let slot = self.slots.iter_mut().find(|slot| slot.is_none())?;
+        *slot = Some(ClientWindow {
+            owner,
+            paddr,
+            vaddr,
+        });
+        Some((vaddr, paddr))
+    }
+}
 
 struct Outbox {
     slots: [(u64, ipc::Message); OUTBOX_SLOTS],
@@ -801,6 +866,10 @@ enum FetchStage {
 struct Fetch {
     stage: FetchStage,
     requester: u64,
+    /// Virtual address of the requester's own window. Replies are written
+    /// there long after the request message is gone, so the base must travel
+    /// with the transaction instead of coming from the current sender.
+    client_base: u64,
     request_id: u32,
     query: Option<dns::QueryHandle>,
     host: [u8; HOST_MAX],
@@ -827,6 +896,7 @@ impl Fetch {
         Self {
             stage: FetchStage::Idle,
             requester: 0,
+            client_base: 0,
             request_id: 0,
             query: None,
             host: [0; HOST_MAX],
@@ -928,6 +998,7 @@ fn start_http(
         net_ipc::fence();
     }
     fetch.requester = message.sender;
+    fetch.client_base = client_base;
     fetch.request_id = request_id;
     fetch.sent = 0;
     fetch.received = 0;
@@ -1091,7 +1162,6 @@ fn run_tls_fetch(
     device: &mut FrameDevice,
     sockets: &mut SocketSet<'_>,
     tcp_handle: SocketHandle,
-    client_base: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
     driver: Option<u64>,
@@ -1104,7 +1174,7 @@ fn run_tls_fetch(
     let write_buffer = unsafe { &mut *core::ptr::addr_of_mut!(TLS_WRITE_BUFFER) };
     let response = unsafe {
         core::slice::from_raw_parts_mut(
-            (client_base + net_ipc::CLIENT_BODY) as *mut u8,
+            (fetch.client_base + net_ipc::CLIENT_BODY) as *mut u8,
             net_ipc::CLIENT_BODY_MAX,
         )
     };
@@ -1138,7 +1208,7 @@ fn run_tls_fetch(
     match result {
         Ok(length) if length > 0 => {
             fetch.received = length.min(net_ipc::CLIENT_BODY_MAX);
-            finish_fetch(fetch, client_base, outbox);
+            finish_fetch(fetch, outbox);
         }
         _ => fail_fetch(fetch, net_ipc::NET_ERR_TLS, 0, outbox),
     }
@@ -1152,7 +1222,6 @@ fn drive_fetch(
     sockets: &mut SocketSet<'_>,
     dns_handle: SocketHandle,
     tcp_handle: SocketHandle,
-    client_base: u64,
     dma_vaddr: u64,
     dma_paddr: u64,
     driver: Option<u64>,
@@ -1255,7 +1324,6 @@ fn drive_fetch(
                 device,
                 sockets,
                 tcp_handle,
-                client_base,
                 dma_vaddr,
                 dma_paddr,
                 driver,
@@ -1288,7 +1356,7 @@ fn drive_fetch(
                 let available = net_ipc::CLIENT_BODY_MAX - fetch.received;
                 let slice = unsafe {
                     core::slice::from_raw_parts_mut(
-                        (client_base + net_ipc::CLIENT_BODY) as *mut u8,
+                        (fetch.client_base + net_ipc::CLIENT_BODY) as *mut u8,
                         net_ipc::CLIENT_BODY_MAX,
                     )
                 };
@@ -1304,7 +1372,7 @@ fn drive_fetch(
             ) || (matches!(socket.state(), tcp::State::CloseWait) && !socket.may_recv())
                 || fetch.received >= net_ipc::CLIENT_BODY_MAX;
             if finished {
-                finish_fetch(fetch, client_base, outbox);
+                finish_fetch(fetch, outbox);
             }
         }
         FetchStage::Idle => {}
@@ -1323,10 +1391,10 @@ fn is_redirect(status: u16) -> bool {
     matches!(status, 301 | 302 | 303 | 307 | 308)
 }
 
-fn finish_fetch(fetch: &mut Fetch, client_base: u64, outbox: &mut Outbox) {
+fn finish_fetch(fetch: &mut Fetch, outbox: &mut Outbox) {
     let buffer = unsafe {
         core::slice::from_raw_parts_mut(
-            (client_base + net_ipc::CLIENT_BODY) as *mut u8,
+            (fetch.client_base + net_ipc::CLIENT_BODY) as *mut u8,
             net_ipc::CLIENT_BODY_MAX,
         )
     };

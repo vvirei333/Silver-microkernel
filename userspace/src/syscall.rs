@@ -42,6 +42,7 @@ const SYS_FS_RMDIR: u64 = 37;
 const SYS_FS_RENAME: u64 = 38;
 const SYS_FS_REPLACE: u64 = 87;
 const SYS_FS_USAGE: u64 = 88;
+const SYS_RANDOM: u64 = 90;
 const SYS_CONSOLE_SET: u64 = 39;
 const SYS_TASK_RESUME: u64 = 40;
 const SYS_WAIT_EVENT: u64 = 41;
@@ -218,6 +219,16 @@ pub fn read() -> Option<u8> {
 
 pub fn uptime_ticks() -> u64 {
     unsafe { syscall0(SYS_UPTIME) }
+}
+
+/// Fills `buffer` from the kernel CSPRNG. Returns `false` when the kernel
+/// rejects the destination, which only happens for a wild pointer.
+pub fn random(buffer: &mut [u8]) -> bool {
+    if buffer.is_empty() {
+        return true;
+    }
+    (unsafe { syscall2(SYS_RANDOM, buffer.as_mut_ptr() as u64, buffer.len() as u64) })
+        == buffer.len() as u64
 }
 
 pub fn memory_info() -> Option<MemoryInfo> {

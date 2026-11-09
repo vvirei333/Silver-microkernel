@@ -54,44 +54,34 @@ fn verifier() -> &'static mut Verifier {
     }
 }
 
-/// A small xorshift64* stream seeded from the cycle counter and uptime.
-/// This is not a hardware entropy source; it keeps handshakes unlinkable but
-/// a future `getrandom`/RTC milestone should replace it.
-static mut SEED_COUNTER: u64 = 0x243F_6A88_85A3_08D3;
-
+/// TLS randomness comes from the kernel CSPRNG (`SYS_RANDOM`). The local
+/// fallback exists only for the impossible case where the syscall rejects the
+/// destination buffer; it is never the primary source. The previous version
+/// seeded an xorshift from uptime ticks, a counter and a stack address, all of
+/// which an observer can derive from `clock_gettime`, so handshake randomness
+/// (including ephemeral keys) was predictable.
 pub struct TlsRng {
-    state: u64,
+    fallback: u64,
 }
 
 impl TlsRng {
     pub fn new() -> Self {
-        // `cntvct_el0` is not readable from EL0 (the kernel traps it), so mix
-        // the uptime, a stack address and a per-call counter. This is not a
-        // hardware entropy source; a `getrandom` syscall should replace it.
-        let stack_marker = 0u8;
-        let address = (&stack_marker as *const u8) as u64;
-        let counter = unsafe {
-            let slot = &mut *core::ptr::addr_of_mut!(SEED_COUNTER);
-            *slot = slot.wrapping_add(0x9E37_79B9_7F4A_7C15);
-            *slot
-        };
-        let mut state = syscall::uptime_ticks()
-            .rotate_left(17)
-            .wrapping_add(counter)
-            .wrapping_add(address)
-            .wrapping_add(0xD1B5_4A32_D192_ED03);
+        // Mix a few syscall samples so even the fallback is not a fixed seed.
+        let mut seed = [0_u8; 8];
+        let _ = syscall::random(&mut seed);
+        let mut state = u64::from_le_bytes(seed) ^ 0xA076_1D64_78BD_642F;
         if state == 0 {
             state = 0x1234_5678_9ABC_DEF0;
         }
-        Self { state }
+        Self { fallback: state }
     }
 
     fn next(&mut self) -> u64 {
-        let mut value = self.state;
+        let mut value = self.fallback;
         value ^= value >> 12;
         value ^= value << 25;
         value ^= value >> 27;
-        self.state = value;
+        self.fallback = value;
         value.wrapping_mul(0x2545_F491_4F6C_DD1D)
     }
 }
@@ -102,10 +92,18 @@ impl RngCore for TlsRng {
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.next()
+        let mut bytes = [0_u8; 8];
+        if syscall::random(&mut bytes) {
+            u64::from_le_bytes(bytes)
+        } else {
+            self.next()
+        }
     }
 
     fn fill_bytes(&mut self, destination: &mut [u8]) {
+        if syscall::random(destination) {
+            return;
+        }
         for chunk in destination.chunks_mut(8) {
             let bytes = self.next().to_le_bytes();
             chunk.copy_from_slice(&bytes[..chunk.len()]);

@@ -3588,13 +3588,15 @@ pub fn exec_linux_current(
     envp: Vec<Vec<u8>>,
 ) -> Option<ExecResult> {
     let auxv = linux_auxv(AuxvImage::linux(&image));
-    let layout = silver_microkernel::build_linux_stack(
+    let mut layout = silver_microkernel::build_linux_stack(
         &argv,
         &envp,
         &auxv,
         mmu::USER_STACK_VA + mmu::USER_STACK_SIZE,
         mmu::USER_STACK_SIZE - 1024,
     )?;
+    // AT_RANDOM (the first 16 bytes) must be fresh per exec.
+    crate::entropy::fill(&mut layout.block[..16]);
     let entry = image.entry;
     let image_frames = image.page_count();
     // The task keeps its kernel stack, fixed tables, private page and user
@@ -5406,7 +5408,7 @@ impl Task {
     ) -> Option<Self> {
         // Build the argv/envp stack image before allocating anything: a
         // malformed or oversized argument list must fail without leaking.
-        let argv_block = if argv.is_empty() && envp.is_empty() {
+        let mut argv_block = if argv.is_empty() && envp.is_empty() {
             None
         } else {
             if user.is_none() {
@@ -5442,6 +5444,17 @@ impl Task {
                 )?,
             })
         };
+        // `build_linux_stack` reserves the first 16 bytes for AT_RANDOM. The
+        // host-test builder is deterministic; the real kernel replaces those
+        // bytes with CSPRNG output here. Native stacks have no such prefix.
+        #[cfg(feature = "linux-abi")]
+        if personality == Personality::Linux {
+            if let Some(block) = argv_block.as_mut() {
+                if block.block.len() >= 16 {
+                    crate::entropy::fill(&mut block.block[..16]);
+                }
+            }
+        }
         if argv_block.is_none() && !(argv.is_empty() && envp.is_empty()) {
             crate::console::write_str("TASK: argv/envp stack failed\r\n");
             return None;

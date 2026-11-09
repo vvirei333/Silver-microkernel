@@ -87,6 +87,9 @@ pub const SYS_MEMINFO_V2: u64 = 85;
 pub const SYS_HEALTH: u64 = 86;
 pub const SYS_FS_REPLACE: u64 = 87;
 pub const SYS_FS_USAGE: u64 = 88;
+/// Fills an EL0 buffer from the kernel CSPRNG: `random(buffer, length)`.
+/// Returns the byte count, or `SYSCALL_ERROR` on a bad buffer.
+pub const SYS_RANDOM: u64 = 90;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -287,6 +290,7 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
         SYS_UPTIME => timer::ticks(),
         SYS_MEMINFO => sys_meminfo(frame[0]),
         SYS_MEMINFO_V2 => sys_meminfo_v2(frame[0]),
+        SYS_RANDOM => sys_random(frame[0], frame[1]),
         SYS_HEALTH => sys_health(frame[0]),
         SYS_TASK_LIST => sys_task_list(frame[0], frame[1]),
         SYS_SPAWN_ARGS => sys_spawn_with_args(frame[0], frame[1], frame[2], frame[3]),
@@ -1100,6 +1104,19 @@ fn sys_meminfo_v2(info_ptr: u64) -> u64 {
         return SYSCALL_ERROR;
     }
     0
+}
+
+fn sys_random(buffer: u64, length: u64) -> u64 {
+    let length = length.min(4096) as usize;
+    if length == 0 {
+        return 0;
+    }
+    let mut bytes = alloc::vec![0_u8; length];
+    crate::entropy::fill(&mut bytes);
+    if user_memory::copy_to_user(&bytes, buffer).is_err() {
+        return SYSCALL_ERROR;
+    }
+    length as u64
 }
 
 fn sys_health(info_ptr: u64) -> u64 {

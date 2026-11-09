@@ -22,6 +22,8 @@ mod condvar;
 mod console;
 #[cfg(not(feature = "std"))]
 mod elf;
+#[cfg(not(feature = "std"))]
+mod entropy;
 #[cfg(feature = "linux-abi")]
 mod linux_elf;
 /// Without the `linux-abi` feature the Linux image type still exists as an
@@ -130,30 +132,32 @@ compile_error!("Features 'std' and 'no_std' are mutually exclusive");
 compile_error!("The bare-metal kernel currently supports only AArch64");
 
 #[cfg(all(not(feature = "std"), target_arch = "aarch64"))]
-// RAM-log boot markers, tablet only: with the MMU off every write is Device
-// memory, so a store to the unassigned 0xA2200000 would abort on QEMU. The
-// assembler flag RAM_LOG_MARKS (set in the tiny global_asm below) switches the
-// marker code in the boot stub at assembly time.
-#[cfg(feature = "tablet")]
-core::arch::global_asm!(".set RAM_LOG_MARKS, 1");
-#[cfg(not(feature = "tablet"))]
-core::arch::global_asm!(".set RAM_LOG_MARKS, 0");
-// Fog images are linked for one physical address. Standard fog builds do not
-// move the image: if ABL placed it elsewhere the stub publishes the measured
-// pc/link/delta and parks, because only the live FDT can prove a destination
-// free. `fog-reloc` is the explicit opt-in for the copy path.
-#[cfg(feature = "fog")]
-core::arch::global_asm!(".set FOG_BUILD, 1");
-#[cfg(not(feature = "fog"))]
-core::arch::global_asm!(".set FOG_BUILD, 0");
-#[cfg(feature = "fog-reloc")]
-core::arch::global_asm!(".set FOG_RELOC, 1");
-#[cfg(not(feature = "fog-reloc"))]
-core::arch::global_asm!(".set FOG_RELOC, 0");
-// The boot-stub paint ladder is gone with the graphics subsystem; the flag
-// stays so the historical `.if FOG_PAINT` blocks assemble to nothing.
-core::arch::global_asm!(".set FOG_PAINT, 0");
+// Assembler flags for the boot stub. They must be emitted by the *same*
+// `global_asm!` invocation that tests them: separate invocations have no
+// defined order, and an incremental rebuild could place `.if FOG_BUILD`
+// before its `.set`.
+const RAM_LOG_MARKS_FLAG: u32 = if cfg!(feature = "tablet") { 1 } else { 0 };
+#[cfg(all(not(feature = "std"), target_arch = "aarch64"))]
+const FOG_BUILD_FLAG: u32 = if cfg!(feature = "fog") { 1 } else { 0 };
+#[cfg(all(not(feature = "std"), target_arch = "aarch64"))]
+const FOG_RELOC_FLAG: u32 = if cfg!(feature = "fog-reloc") { 1 } else { 0 };
 
+#[cfg(all(not(feature = "std"), target_arch = "aarch64"))]
+core::arch::global_asm!(
+    r#"
+    .set RAM_LOG_MARKS, {ram_log_marks}
+    .set FOG_BUILD, {fog_build}
+    .set FOG_RELOC, {fog_reloc}
+    // The boot-stub paint ladder is gone with the graphics subsystem; the
+    // flag stays so the historical `.if FOG_PAINT` blocks assemble away.
+    .set FOG_PAINT, 0
+"#,
+    ram_log_marks = const RAM_LOG_MARKS_FLAG,
+    fog_build = const FOG_BUILD_FLAG,
+    fog_reloc = const FOG_RELOC_FLAG,
+);
+
+#[cfg(all(not(feature = "std"), target_arch = "aarch64"))]
 core::arch::global_asm!(
     r#"
     // Debug-only full-buffer fill. MMU is off, so this is a physical store

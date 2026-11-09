@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/random.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -66,14 +67,26 @@ int main(void) {
     close(saved);
     close(nullfd);
 
-    /* /dev/urandom */
+    /* /dev/urandom: two reads must not repeat, and getrandom(2) must agree
+       with the same pool (the old ticks-based xorshift was predictable). */
     int randomfd = open("/dev/urandom", O_RDONLY);
     unsigned char noise[8];
+    unsigned char noise2[8];
     if (randomfd < 0 || read(randomfd, noise, sizeof(noise)) != (ssize_t)sizeof(noise)) {
         perror("/dev/urandom");
         return 8;
     }
+    if (read(randomfd, noise2, sizeof(noise2)) != (ssize_t)sizeof(noise2)
+        || memcmp(noise, noise2, sizeof(noise)) == 0) {
+        fprintf(stderr, "urandom repeated\n");
+        return 9;
+    }
     close(randomfd);
+    if (getrandom(noise2, sizeof(noise2), 0) != (ssize_t)sizeof(noise2)) {
+        perror("getrandom");
+        return 10;
+    }
+    printf("random ok\n");
 
     /* chdir/getcwd */
     char cwd[256];

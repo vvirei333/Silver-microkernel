@@ -17,6 +17,8 @@ pub const HOSTNAME_MAXLEN: usize = 64;
 const DNS_NAME_TAG: u8 = 0x82;
 const COMMON_NAME_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.4.3");
 const SUBJECT_ALT_NAME_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.17");
+const BASIC_CONSTRAINTS_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.19");
+const KEY_USAGE_OID: ObjectIdentifier = ObjectIdentifier::new_unwrap("2.5.29.15");
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Sequence, ValueOrd)]
 pub struct AlgorithmIdentifier<'a> {
@@ -281,4 +283,178 @@ pub fn extract_san_dns_names<'a>(
         }
     }
     Ok(dns_names)
+}
+
+/// Minimal DER TLV reader for extension values. Extension bodies are tiny, so
+/// the short-form length is the only form that can occur; rejecting the long
+/// form keeps the arithmetic trivially bounded.
+fn der_tlv(input: &[u8]) -> Option<(u8, &[u8], usize)> {
+    let tag = *input.first()?;
+    let length = *input.get(1)? as usize;
+    if length & 0x80 != 0 {
+        return None;
+    }
+    let end = 2usize.checked_add(length)?;
+    if input.len() < end {
+        return None;
+    }
+    Some((tag, &input[2..end], end))
+}
+
+/// Parses the DER content of a BasicConstraints extension. Split from the
+/// extension walk so it can be unit-tested without constructing a certificate.
+fn parse_basic_constraints(body: &[u8]) -> Option<(bool, Option<u64>)> {
+    let mut body = body;
+    let mut ca = false;
+    if matches!(body.first(), Some(0x01)) {
+        let (tag, value, used) = der_tlv(body)?;
+        if tag != 0x01 || value.len() != 1 {
+            return None;
+        }
+        ca = value[0] != 0;
+        body = &body[used..];
+    }
+    let mut path_len = None;
+    if matches!(body.first(), Some(0x02)) {
+        let (tag, value, used) = der_tlv(body)?;
+        if tag != 0x02 || value.is_empty() || value.len() > 4 {
+            return None;
+        }
+        let mut number = 0_u64;
+        for byte in value {
+            number = (number << 8) | u64::from(*byte);
+        }
+        path_len = Some(number);
+        body = &body[used..];
+    }
+    if !body.is_empty() {
+        return None;
+    }
+    Some((ca, path_len))
+}
+
+/// Parses `BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+/// pathLenConstraint INTEGER OPTIONAL }`. `None` means the extension is absent
+/// (a v1/v2 certificate or an end entity that omits it).
+pub fn extract_basic_constraints(
+    tbs: &TbsCertificate<'_>,
+) -> Result<Option<(bool, Option<u64>)>, der::Error> {
+    let Some(extensions) = &tbs.extensions else {
+        return Ok(None);
+    };
+    for extension in extensions.iter() {
+        if extension.extn_id != BASIC_CONSTRAINTS_OID {
+            continue;
+        }
+        extension.extn_value.tag().assert_eq(Tag::OctetString)?;
+        let Some((tag, body, _)) = der_tlv(extension.extn_value.value()) else {
+            return Err(der::ErrorKind::Value { tag: Tag::Sequence }.into());
+        };
+        if tag != 0x30 {
+            return Err(der::ErrorKind::Value { tag: Tag::Sequence }.into());
+        }
+        return parse_basic_constraints(body)
+            .map(Some)
+            .ok_or_else(|| der::ErrorKind::Value { tag: Tag::Sequence }.into());
+    }
+    Ok(None)
+}
+
+/// Parses the BIT STRING content of a KeyUsage extension (first byte is the
+/// count of unused trailing bits). Split out for testing.
+fn parse_key_usage(body: &[u8]) -> Option<bool> {
+    if body.is_empty() {
+        return None;
+    }
+    let unused = body[0] as usize;
+    let bits = &body[1..];
+    if unused > 7 || bits.is_empty() {
+        return Some(false);
+    }
+    // Bit 5 is the third-most-significant bit of the first content byte. When
+    // the whole bit string is shorter than six bits it cannot name
+    // keyCertSign at all.
+    if bits.len() == 1 && unused > 2 {
+        return Some(false);
+    }
+    Some(bits[0] & 0x04 != 0)
+}
+
+/// Parses `KeyUsage ::= BIT STRING` and returns whether `keyCertSign` (bit 5)
+/// is asserted. `None` means the extension is absent, which RFC 5280 permits
+/// for CA certificates that predate the profile.
+pub fn extract_key_cert_sign(tbs: &TbsCertificate<'_>) -> Result<Option<bool>, der::Error> {
+    let Some(extensions) = &tbs.extensions else {
+        return Ok(None);
+    };
+    for extension in extensions.iter() {
+        if extension.extn_id != KEY_USAGE_OID {
+            continue;
+        }
+        extension.extn_value.tag().assert_eq(Tag::OctetString)?;
+        let Some((tag, body, _)) = der_tlv(extension.extn_value.value()) else {
+            return Err(der::ErrorKind::Value { tag: Tag::BitString }.into());
+        };
+        if tag != 0x03 {
+            return Err(der::ErrorKind::Value { tag: Tag::BitString }.into());
+        }
+        return parse_key_usage(body)
+            .map(Some)
+            .ok_or_else(|| der::ErrorKind::Value { tag: Tag::BitString }.into());
+    }
+    Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_basic_constraints, parse_key_usage};
+
+    #[test]
+    fn basic_constraints_requires_ca() {
+        // SEQUENCE {} (CA defaults to FALSE)
+        assert_eq!(parse_basic_constraints(&[]), Some((false, None)));
+        // SEQUENCE { BOOLEAN FALSE }
+        assert_eq!(
+            parse_basic_constraints(&[0x01, 0x01, 0x00]),
+            Some((false, None))
+        );
+        // SEQUENCE { BOOLEAN TRUE }
+        assert_eq!(
+            parse_basic_constraints(&[0x01, 0x01, 0xFF]),
+            Some((true, None))
+        );
+    }
+
+    #[test]
+    fn basic_constraints_reads_path_length() {
+        // SEQUENCE { BOOLEAN TRUE, INTEGER 0 }
+        assert_eq!(
+            parse_basic_constraints(&[0x01, 0x01, 0xFF, 0x02, 0x01, 0x00]),
+            Some((true, Some(0)))
+        );
+        // SEQUENCE { BOOLEAN TRUE, INTEGER 3 }
+        assert_eq!(
+            parse_basic_constraints(&[0x01, 0x01, 0xFF, 0x02, 0x01, 0x03]),
+            Some((true, Some(3)))
+        );
+    }
+
+    #[test]
+    fn basic_constraints_rejects_trailing_data() {
+        assert_eq!(
+            parse_basic_constraints(&[0x01, 0x01, 0xFF, 0x05, 0x00]),
+            None
+        );
+    }
+
+    #[test]
+    fn key_usage_needs_key_cert_sign() {
+        // unused=1, bits=0b0000_010x: keyCertSign (bit 5) set.
+        assert_eq!(parse_key_usage(&[0x01, 0x04]), Some(true));
+        // digitalSignature only.
+        assert_eq!(parse_key_usage(&[0x07, 0x80]), Some(false));
+        // KeyUsage with no bits to spare for bit 5.
+        assert_eq!(parse_key_usage(&[0x07, 0x80]), Some(false));
+        assert_eq!(parse_key_usage(&[]), None);
+    }
 }

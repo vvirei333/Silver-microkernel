@@ -2153,13 +2153,7 @@ fn linux_getrandom(buffer: u64, length: u64, flags: u64) -> u64 {
     }
     let length = length.min(256) as usize;
     let mut bytes = alloc::vec![0_u8; length];
-    let mut state = timer::ticks() ^ 0x2545_F491_4F6C_DD1D;
-    for byte in &mut bytes {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        *byte = state as u8;
-    }
+    crate::entropy::fill(&mut bytes);
     if user_memory::copy_to_user(&bytes, buffer).is_err() {
         return errno(EFAULT);
     }

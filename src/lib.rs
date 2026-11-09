@@ -122,8 +122,8 @@ pub fn build_argv_envp(
 ///
 /// The 16 bytes below `sp` are reserved for `AT_RANDOM` (the stack canary
 /// seed), and the entry for `AT_RANDOM` is appended automatically — callers
-/// must not pass it. The bytes are a deterministic pseudo-random stream, not
-/// entropy; they only need to differ per task.
+/// must not pass it. The bytes come from the kernel CSPRNG in the real
+/// kernel; host tests use a deterministic stream.
 #[cfg(any(test, feature = "linux-abi"))]
 pub fn build_linux_stack(
     argv: &[Vec<u8>],
@@ -170,8 +170,11 @@ fn build_stack(
     let sp = block_start.checked_add(random_prefix)?;
     let mut block = alloc::vec![0u8; total];
     if random_prefix != 0 {
-        // AT_RANDOM points at these bytes. A deterministic xorshift keeps the
-        // host tests reproducible while still differing per stack address.
+        // AT_RANDOM seeds the stack canary and is read by every process. This
+        // builder is shared with host tests and cannot reach the kernel CSPRNG
+        // (it lives in the binary), so it writes a deterministic placeholder;
+        // both kernel call sites overwrite the 16 bytes with fresh entropy
+        // before the stack is published.
         let mut state = (block_start as u64) ^ 0x9E37_79B9_7F4A_7C15;
         for byte in &mut block[..random_prefix] {
             state ^= state << 13;
