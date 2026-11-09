@@ -35,6 +35,11 @@ struct Table {
     actions: Vec<Option<Action>>,
     blocked: u64,
     pending: u64,
+    /// Registered `sigaltstack` (sp, size), if any.
+    altstack: Option<(u64, u64)>,
+    /// True while a handler is running on the alternate stack, so a nested
+    /// signal falls back to the normal stack instead of overwriting it.
+    on_altstack: bool,
 }
 
 static TABLES: Mutex<Vec<Table>> = Mutex::new(Vec::new());
@@ -46,6 +51,7 @@ pub const SIG_IGN: u64 = 1;
 const SA_NODEFER: u64 = 0x4000_0000;
 const SA_RESETHAND: u64 = 0x8000_0000;
 const SA_RESTORER: u64 = 0x0400_0000;
+const SA_ONSTACK: u64 = 0x0800_0000;
 
 /// Frame layout in the user stack, from the kernel UAPI:
 /// `struct rt_sigframe { struct siginfo info; struct ucontext uc; }`.
@@ -77,6 +83,8 @@ fn with_table<R>(task: u64, action: impl FnOnce(&mut Table) -> R) -> R {
                 actions,
                 blocked: 0,
                 pending: 0,
+                altstack: None,
+                on_altstack: false,
             });
             tables.len() - 1
         }
@@ -140,6 +148,27 @@ pub fn clear_pending(task: u64, signal: u32) {
 
 pub fn pending(task: u64) -> u64 {
     with_table(task, |table| table.pending)
+}
+
+pub fn altstack(task: u64) -> Option<(u64, u64)> {
+    with_table(task, |table| table.altstack)
+}
+
+pub fn set_altstack(task: u64, stack: Option<(u64, u64)>) {
+    with_table(task, |table| {
+        table.altstack = stack;
+        if stack.is_none() {
+            table.on_altstack = false;
+        }
+    });
+}
+
+pub fn on_altstack(task: u64) -> bool {
+    with_table(task, |table| table.on_altstack)
+}
+
+fn set_on_altstack(task: u64, active: bool) {
+    with_table(task, |table| table.on_altstack = active);
 }
 
 pub fn close_task(task: u64) {
@@ -233,16 +262,30 @@ pub fn deliver_pending(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) {
         };
 
         let user_sp = read_user_sp();
-        let Some(signal_sp) = user_sp.checked_sub(SIGFRAME_SIZE as u64) else {
+        let alt = if action.flags & SA_ONSTACK != 0 && !on_altstack(task) {
+            altstack(task).filter(|(sp, size)| {
+                (*size >= SIGFRAME_SIZE as u64) && sp.checked_add(*size).is_some()
+            })
+        } else {
+            None
+        };
+        let (stack_top, stack_floor, using_alt) = match alt {
+            Some((sp, size)) => (sp + size, sp, true),
+            None => (
+                (mmu::USER_STACK_VA + mmu::USER_STACK_SIZE) as u64,
+                mmu::USER_STACK_VA as u64,
+                false,
+            ),
+        };
+        let frame_top = if using_alt { stack_top } else { user_sp };
+        let Some(signal_sp) = frame_top.checked_sub(SIGFRAME_SIZE as u64) else {
             terminate(SIGSEGV);
         };
         let signal_sp = signal_sp & !15;
         let Some(end) = signal_sp.checked_add(SIGFRAME_SIZE as u64) else {
             terminate(SIGSEGV);
         };
-        if signal_sp < mmu::USER_STACK_VA as u64
-            || end > (mmu::USER_STACK_VA + mmu::USER_STACK_SIZE) as u64
-        {
+        if signal_sp < stack_floor || end > stack_top {
             // A frame below the stack window means the stack overran its
             // guard; report the classic SIGSEGV instead of corrupting memory.
             terminate(SIGSEGV);
@@ -267,6 +310,9 @@ pub fn deliver_pending(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) {
         if user_memory::copy_to_user(&block, signal_sp).is_err() {
             clear_pending(task, signal);
             terminate(SIGSEGV);
+        }
+        if using_alt {
+            set_on_altstack(task, true);
         }
 
         // Enter the handler with (sig, siginfo, ucontext) and a restorer in
@@ -315,5 +361,7 @@ pub fn restore_frame(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) {
     frame[31] = pc;
     frame[32] = pstate;
     write_user_sp(sp);
-    set_blocked(scheduler::current_task_id(), mask);
+    let task = scheduler::current_task_id();
+    set_blocked(task, mask);
+    set_on_altstack(task, false);
 }

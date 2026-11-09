@@ -369,6 +369,19 @@ Redmi port is parked. The reference checklist is
   uses real glibc `sigaction`/`raise` (`dyn signal 10`). Remaining gaps:
   asynchronous delivery to a task already running in EL0, `sigaltstack`,
   COW fork and threads.
+  **Slice 15 (async signals + sigaltstack):** the IRQ trampoline now calls
+  `silver_irq_signal_return` with the saved EL0 bank before publishing
+  ELR/SPSR, so a pending handler is entered on the next timer tick even when
+  the task never issues a syscall. Only EL0t contexts are eligible; the hook
+  is a no-op for kernel interrupts and native tasks. `kill` wakes a
+  `Sleeping`/`Blocked` target through `scheduler::wake_for_signal` so the
+  signal interrupts sleep/blocked waits. `sigaltstack` stores a per-task
+  alternate stack; `SA_ONSTACK` frames are built at its top, and a nested
+  signal falls back to the normal stack (`on_altstack` is cleared by
+  `rt_sigreturn`). Test `linux-asyncsig` forks, has the child kill the parent
+  while the parent busy-loops in EL0, then raises `SIGUSR2` to an
+  `SA_ONSTACK` handler and checks that SP is inside the registered buffer:
+  `async sig ok`. Remaining gaps: COW fork, threads, a per-task read scope.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -395,10 +408,9 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 15 (asynchronous signal delivery while a task
-  runs in EL0, `sigaltstack`, then COW fork and threads; a per-task read
-  scope), then headless Wayland/GTK/D-Bus → Phosh. Network base maintenance
-  (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
+- **Next steps:** Linux ABI slice 16 (COW fork, then threads and a per-task
+  read scope), then headless Wayland/GTK/D-Bus → Phosh. Network base
+  maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
   the Linux ABI + Phosh track**, not another reader increment.

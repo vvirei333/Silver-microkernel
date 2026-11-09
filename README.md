@@ -442,7 +442,11 @@ with `(sig, siginfo, ucontext)`, and `rt_sigreturn` restores the interrupted
 registers and mask. glibc passes no `SA_RESTORER` on AArch64, so the kernel
 supplies a cached RX trampoline (`mov x8, #139; svc #0`), just like the
 sigpage; an explicit restorer is used when `SA_RESTORER` is set.
-`SA_SIGINFO`, `SA_NODEFER` and `SA_RESETHAND` are honored.
+`SA_SIGINFO`, `SA_NODEFER`, `SA_RESETHAND` and `SA_ONSTACK` are honored.
+Signals are entered both at syscall return and from the timer-IRQ return path,
+so a task already running in EL0 is interrupted; `kill` wakes a sleeping or
+blocked target. A registered `sigaltstack` is used for `SA_ONSTACK` handlers,
+and a nested signal falls back to the normal stack.
 
 ```text
 howl> linuxrun /sfs/linux-sighandler
@@ -450,12 +454,14 @@ sigframe ok
 
 howl> linuxrun /sfs/linux-dynsig
 dyn signal 10
+
+howl> linuxrun /sfs/linux-asyncsig
+async sig ok
 ```
 
 Still missing: a per-task read scope (a Linux task can read any VFS path, which
 is acceptable on the single-user console but must be closed before untrusted
-apps), signal delivery while a task is already running in EL0 (signals are
-currently entered at syscall return), `sigaltstack`, and threads.
+apps), COW fork (fork is still an eager deep copy) and threads.
 File-backed `mmap` and a real `mprotect` are implemented:
 `MAP_PRIVATE` copies the file range into private frames, `MAP_FIXED` replaces
 an existing range (the loader's `PROT_NONE` reservation followed by per-segment

@@ -1835,6 +1835,35 @@ pub fn wake_task(id: u64) {
     smp::ipi_reschedule_others();
 }
 
+/// Wakes a task so a pending signal can be observed. Unlike [`wake_task`],
+/// this also interrupts `TaskState::Sleeping`; the syscall that called
+/// `sleep` re-checks its condition after the wake and the SVC return hook
+/// delivers the handler.
+pub fn wake_for_signal(id: u64) {
+    let saved_daif = interrupts::save_and_disable_irq();
+    smp::bkl_acquire();
+    let mut woke = false;
+    if let Some(manager) = scheduler_manager() {
+        if let Some(index) = manager.tasks.iter().position(|task| task.id == id) {
+            let task = &mut manager.tasks[index];
+            match task.state {
+                TaskState::Sleeping(_) | TaskState::Blocked | TaskState::BlockedUntil(_) => {
+                    task.state = TaskState::Ready;
+                    task.waiting_on = None;
+                    enqueue_ready(manager, smp::this_cpu_id(), index);
+                    woke = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    smp::bkl_release();
+    interrupts::restore_irq(saved_daif);
+    if woke {
+        smp::ipi_reschedule_others();
+    }
+}
+
 pub fn register_mutex(state: *mut mutex::MutexState) {
     if let Some(task) = current_task_mut() {
         if !task.owned_mutexes.contains(&state) {

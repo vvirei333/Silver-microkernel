@@ -1216,6 +1216,11 @@ exception_irq_dispatch:
     adrp x9, {probe}
     mov w10, #17
     str w10, [x9, #:lo12:{probe}]
+    // Async Linux signals: deliver pending handlers now, while the user
+    // register bank is still on this stack and before the epilogue publishes
+    // ELR/SPSR. The hook is a no-op for native tasks and EL1 interrupts.
+    mov x0, sp
+    bl silver_irq_signal_return
     // Fall through to the epilogue (see the SVC trampoline above).
 exception_irq_epilogue:
     ldr x9, [sp, #248]

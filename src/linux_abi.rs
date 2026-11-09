@@ -177,7 +177,7 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
             crate::linux_signal::restore_frame(frame);
             0
         }
-        SYS_SIGALTSTACK => 0,
+        SYS_SIGALTSTACK => linux_sigaltstack(args[0], args[1]),
         SYS_KILL => linux_kill(args[0] as i64, args[1]),
         SYS_TGKILL => linux_kill(args[1] as i64, args[2]),
         SYS_UNAME => linux_uname(args[0]),
@@ -469,6 +469,54 @@ fn linux_rt_sigaction(signal: u64, action_pointer: u64, old_pointer: u64) -> u64
     0
 }
 
+/// `sigaltstack(2)`: register/read the alternate signal stack. The kernel
+/// `stack_t` is `{ sp, flags(int), pad, size }` (24 bytes).
+fn linux_sigaltstack(stack_pointer: u64, old_pointer: u64) -> u64 {
+    const SS_ONSTACK: u64 = 1;
+    const SS_DISABLE: u64 = 2;
+    const MINSIGSTKSZ: u64 = 2048;
+    let task = scheduler::current_task_id();
+
+    if old_pointer != 0 {
+        let mut bytes = [0_u8; 24];
+        if let Some((sp, size)) = crate::linux_signal::altstack(task) {
+            bytes[..8].copy_from_slice(&sp.to_le_bytes());
+            let flags = if crate::linux_signal::on_altstack(task) {
+                SS_ONSTACK
+            } else {
+                0
+            };
+            bytes[8..12].copy_from_slice(&(flags as i32).to_le_bytes());
+            bytes[16..24].copy_from_slice(&size.to_le_bytes());
+        } else {
+            bytes[8..12].copy_from_slice(&(SS_DISABLE as i32).to_le_bytes());
+        }
+        if user_memory::copy_to_user(&bytes, old_pointer).is_err() {
+            return errno(EFAULT);
+        }
+    }
+
+    if stack_pointer != 0 {
+        let mut bytes = [0_u8; 24];
+        if user_memory::copy_from_user(stack_pointer, &mut bytes).is_err() {
+            return errno(EFAULT);
+        }
+        let sp = u64::from_le_bytes(bytes[..8].try_into().unwrap());
+        let flags = u32::from_le_bytes(bytes[8..12].try_into().unwrap()) as u64;
+        let size = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
+        if flags & SS_DISABLE != 0 {
+            crate::linux_signal::set_altstack(task, None);
+        } else if flags & SS_ONSTACK != 0 || sp == 0 || size < MINSIGSTKSZ {
+            return errno(EINVAL);
+        } else if sp.checked_add(size).is_none() {
+            return errno(EINVAL);
+        } else {
+            crate::linux_signal::set_altstack(task, Some((sp, size)));
+        }
+    }
+    0
+}
+
 /// `kill(2)`/`tgkill(2)`. `SIGKILL` and default-terminating signals terminate
 /// the target; a default-ignored signal (including `SIGCHLD`) is a no-op; a
 /// user handler is recorded as pending and entered when the target next
@@ -507,9 +555,12 @@ fn linux_kill(pid: i64, signal: u64) -> u64 {
         }
         return 0;
     }
-    // A real handler: remember the signal. Frame construction/`rt_sigreturn`
-    // is not implemented yet.
+    // A real handler: remember the signal and, for another task, wake it from
+    // sleep/block so its next return to EL0 (SVC or IRQ) enters the handler.
     crate::linux_signal::raise(target, signal);
+    if target != task {
+        scheduler::wake_for_signal(target);
+    }
     0
 }
 

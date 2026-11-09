@@ -18,6 +18,7 @@
 #   linuxrun /sfs/linux-bigfile # 16 MiB rootfs + 3 MiB file, prints 'rootfs ok'
 #   linuxrun /sfs/linux-mmapfile # file mmap + mprotect + MAP_FIXED, prints 'mmap ok'
 #   linuxrun /sfs/linux-sighandler # user handler + rt_sigframe/rt_sigreturn, prints 'sigframe ok'
+#   linuxrun /sfs/linux-asyncsig  # IRQ-delivered signal + sigaltstack, prints 'async sig ok'
 #   linuxrun /sfs/linux-dyn     # real ld.so + dynamic libc, prints 'dynamic hello'
 #   linuxrun /sfs/linux-dynsig  # glibc sigaction + raise, prints 'dyn signal 10'
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
@@ -60,6 +61,7 @@ build signal
 build bigfile
 build mmapfile
 build sighandler
+build asyncsig
 
 # ET_DYN main + custom interpreter (no libc needed).
 "$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
@@ -90,6 +92,7 @@ python3 scripts/sfs_inject.py "$IMAGE" build/big.bin big.bin
 python3 scripts/sfs_inject.py "$IMAGE" build/bigfile.elf linux-bigfile
 python3 scripts/sfs_inject.py "$IMAGE" build/mmapfile.elf linux-mmapfile
 python3 scripts/sfs_inject.py "$IMAGE" build/sighandler.elf linux-sighandler
+python3 scripts/sfs_inject.py "$IMAGE" build/asyncsig.elf linux-asyncsig
 
 # A real static libc binary (the SFS image is 16 MiB; all of these fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then
