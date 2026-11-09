@@ -312,6 +312,7 @@ static int serve(long client) {
                 send_global(client, registry_id, 9, "wl_subcompositor");
                 send_global_version(client, registry_id, 10,
                                     "zxdg_output_manager_v1", 3);
+                send_global(client, registry_id, 11, "xdg_activation_v1");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -372,6 +373,8 @@ static int serve(long client) {
                     (void)new_id;
                 } else if (text_equal(interface, "zxdg_output_manager_v1")) {
                     xdg_output_manager_id = new_id;
+                } else if (text_equal(interface, "xdg_activation_v1")) {
+                    (void)new_id;
                 } else if (text_equal(interface, "wl_seat")) {
                     seat_id = new_id;
                     seat_version = version;

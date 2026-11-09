@@ -17,6 +17,7 @@
 #include "xdg-decoration-client-protocol.h"
 #include "viewporter-client-protocol.h"
 #include "xdg-output-client-protocol.h"
+#include "xdg-activation-client-protocol.h"
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shared_memory;
@@ -33,6 +34,9 @@ static struct wl_subsurface *subsurface;
 static struct zxdg_output_manager_v1 *xdg_output_manager;
 static struct zxdg_output_v1 *xdg_output;
 static int xdg_output_ok;
+static struct xdg_activation_v1 *activation;
+static struct xdg_activation_token_v1 *activation_token;
+static int activation_token_ok;
 static struct wl_data_device *data_device;
 static struct wl_data_source *data_source;
 static struct wl_data_offer *clipboard_offer;
@@ -241,6 +245,19 @@ static const struct zxdg_output_v1_listener xdg_output_listener = {
     .description = xdg_output_description,
 };
 
+static void activation_token_done(void *data,
+                                  struct xdg_activation_token_v1 *token,
+                                  const char *value) {
+    (void)data; (void)token;
+    if (value != NULL && strcmp(value, "werewolf-token") == 0) {
+        activation_token_ok = 1;
+    }
+}
+
+static const struct xdg_activation_token_v1_listener activation_listener = {
+    .done = activation_token_done,
+};
+
 static void registry_global(void *data, struct wl_registry *registry,
                             uint32_t name, const char *interface,
                             uint32_t version) {
@@ -285,6 +302,10 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 3 ? version : 3;
         xdg_output_manager = wl_registry_bind(
             registry, name, &zxdg_output_manager_v1_interface, use);
+    } else if (strcmp(interface, xdg_activation_v1_interface.name) == 0) {
+        uint32_t use = version < 1 ? version : 1;
+        activation = wl_registry_bind(registry, name,
+                                      &xdg_activation_v1_interface, use);
     }
 }
 
@@ -679,6 +700,32 @@ int main(int argc, char **argv) {
         }
     }
     xdg_surface_ack_configure(xdg_surface, configure_serial);
+
+    if (activation == NULL) {
+        fprintf(stderr, "wlclient: activation missing\n");
+        return 8;
+    }
+    activation_token = xdg_activation_v1_get_activation_token(activation);
+    if (activation_token == NULL) {
+        return 8;
+    }
+    xdg_activation_token_v1_add_listener(activation_token,
+                                         &activation_listener, NULL);
+    xdg_activation_token_v1_set_app_id(activation_token, "org.werewolf.test");
+    xdg_activation_token_v1_set_surface(activation_token, surface);
+    xdg_activation_token_v1_commit(activation_token);
+    for (int attempt = 0; attempt < 4 && !activation_token_ok; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (!activation_token_ok) {
+        fprintf(stderr, "wlclient: activation token missing\n");
+        return 8;
+    }
+    xdg_activation_v1_activate(activation, "werewolf-token", surface);
+    xdg_activation_token_v1_destroy(activation_token);
+    xdg_activation_v1_destroy(activation);
 
     for (int attempt = 0; attempt < 4 && !decoration_client_side; attempt++) {
         if (wl_display_roundtrip(display) < 0) {

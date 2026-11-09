@@ -248,6 +248,8 @@ static unsigned subcompositor_id;
 static unsigned subsurface_id;
 static unsigned xdg_output_manager_id;
 static unsigned xdg_output_id;
+static unsigned activation_id;
+static unsigned activation_token_id;
 static unsigned subsurface_surface_id;
 static int subsurface_ok;
 static unsigned data_source_id;
@@ -297,6 +299,8 @@ typedef struct {
     unsigned subsurface_id;
     unsigned xdg_output_manager_id;
     unsigned xdg_output_id;
+    unsigned activation_id;
+    unsigned activation_token_id;
     unsigned subsurface_surface_id;
     int subsurface_ok;
     unsigned data_source_id;
@@ -337,6 +341,7 @@ typedef struct {
     X(decoration_manager_id) X(decoration_id) X(viewporter_id) X(viewport_id) \
     X(subcompositor_id) X(subsurface_id) X(subsurface_surface_id) X(subsurface_ok) \
     X(xdg_output_manager_id) X(xdg_output_id) \
+    X(activation_id) X(activation_token_id) \
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
     X(configure_serial) X(surface_id) X(popup_surface_id) \
     X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
@@ -493,6 +498,7 @@ static int serve(long client) {
                 send_global(client, registry_id, 9, "wl_subcompositor");
                 send_global_version(client, registry_id, 10,
                                     "zxdg_output_manager_v1", 3);
+                send_global(client, registry_id, 11, "xdg_activation_v1");
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -564,7 +570,21 @@ static int serve(long client) {
                     subcompositor_id = new_id;
                 } else if (text_equal(interface, "zxdg_output_manager_v1")) {
                     xdg_output_manager_id = new_id;
+                } else if (text_equal(interface, "xdg_activation_v1")) {
+                    activation_id = new_id;
                 }
+            } else if (object == activation_id && opcode == 1) {
+                activation_token_id = take_u32(); /* get_activation_token */
+            } else if (object == activation_token_id && opcode == 3) {
+                begin(activation_token_id, 0 /* xdg_activation_token_v1.done */);
+                put_string("werewolf-token");
+                finish(); send_message(client, -1);
+            } else if (object == activation_token_id && opcode == 4) {
+                activation_token_id = 0;
+            } else if (object == activation_id && opcode == 2) {
+                char token[64];
+                take_string(token, sizeof(token));
+                (void)take_u32(); /* surface */
             } else if (object == xdg_output_manager_id && opcode == 1) {
                 /* zxdg_output_manager_v1.get_xdg_output(new_id, output) */
                 xdg_output_id = take_u32();
@@ -1054,6 +1074,8 @@ static void reset_client(void) {
     subsurface_id = 0;
     xdg_output_manager_id = 0;
     xdg_output_id = 0;
+    activation_id = 0;
+    activation_token_id = 0;
     subsurface_surface_id = 0;
     subsurface_ok = 0;
     data_source_id = 0;

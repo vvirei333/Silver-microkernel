@@ -758,6 +758,12 @@ Redmi port is parked. The reference checklist is
   global and prints the logical region. Both multiplexed clients,
   cross-client clipboard, decoration/viewporter/subcompositor and
   wayland-info pass.
+  **Slice 51 (xdg-activation):** `xdg_activation_v1` is advertised. The
+  compositor issues a token on `xdg_activation_token_v1.commit` (after
+  `set_app_id`/`set_surface`), accepts `activate(token, surface)`, and the
+  real client verifies the token string before activating. `wayland-info`
+  lists the global. All multiplexed client, clipboard and protocol tests stay
+  green.
 - **Known issue:** the plain-HTTP path started within a fraction of a second of
   `howl ready` timed out once (DHCP race suspected; `wget` works seconds
   later). Wolfser now waits up to 6 s for a configured lease before an HTTP
@@ -784,8 +790,8 @@ Redmi port is parked. The reference checklist is
   probe is QEMU-only, GENI UART TX fails fast instead of stalling per byte, and
   the newer MMU boot proofs are skipped on fog by default
   (`fog-hw-selftests` opts in). The graphics bring-up evidence is historical.
-- **Next steps:** Linux ABI slice 51 (a larger GTK/GLib toolkit; Wayland:
-  xdg-activation/presentation and the remaining GTK globals). Network base
+- **Next steps:** Linux ABI slice 52 (a larger GTK/GLib toolkit; Wayland:
+  presentation/fractional-scale and the remaining GTK globals). Network base
   maintenance (keep-alive, TLS roots/RTC/RNG, TLS 1.2).
   Wolfser is frozen except for bug fixes: applications, including the browser,
   come from Linux — **YouTube/JS/media require a WebKit/Gecko-class engine on
