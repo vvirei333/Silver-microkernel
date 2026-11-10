@@ -673,6 +673,11 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
             // sandbox enabled and the loader is then spawned through a
             // namespace tool this kernel does not provide.
             b"GLYCIN_DISABLE_SANDBOX=i-know-the-risks".to_vec(),
+            // async-global-executor's default pool is sized from
+            // `available_parallelism` (2 here). glycin needs a few more
+            // workers: zbus's `executor.tick()` loop and its socket reader
+            // otherwise starve each other and the Init reply is never read.
+            b"ASYNC_GLOBAL_EXECUTOR_THREADS=4".to_vec(),
         ];
         scheduler::spawn_linux_elf_with_args(image, policy.write_prefix, policy.quota, argv, envp)
             .unwrap_or(SYSCALL_ERROR)

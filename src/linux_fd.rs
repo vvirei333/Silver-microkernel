@@ -54,6 +54,10 @@ pub struct MemFdState {
     frames: Option<MemFdFrames>,
     /// Number of live mappings. Reallocating the run is only safe at zero.
     maps: usize,
+    /// `F_SEAL_*` bits added with `F_ADD_SEALS`. We do not enforce the seals
+    /// (there is no unprivileged writer that could race), but toolkits check
+    /// the call succeeds and read the mask back.
+    seals: u32,
 }
 
 impl MemFdState {
@@ -996,6 +1000,7 @@ pub fn memfd(task: u64) -> Result<u64, u64> {
             offset: 0,
             frames: None,
             maps: 0,
+            seals: 0,
         }))),
     )
     .ok_or(EMFILE)
@@ -1363,6 +1368,31 @@ pub fn memfd_truncate(task: u64, fd: u64, length: usize) -> Result<(), u64> {
     }
     file.data.resize(length, 0);
     Ok(())
+}
+
+/// `fcntl(F_ADD_SEALS)` on a memfd.
+pub fn memfd_add_seals(task: u64, fd: u64, seals: u32) -> Result<(), u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::MemFd(state) = target else {
+        return Err(EINVAL);
+    };
+    let mut file = state.lock();
+    // F_SEAL_SEAL is permanent once set.
+    if file.seals & 0x1 != 0 {
+        return Err(EPERM);
+    }
+    file.seals |= seals & 0x1f;
+    Ok(())
+}
+
+/// `fcntl(F_GET_SEALS)` on a memfd.
+pub fn memfd_get_seals(task: u64, fd: u64) -> Result<u32, u64> {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::MemFd(state) = target else {
+        return Err(EINVAL);
+    };
+    let seals = state.lock().seals;
+    Ok(seals)
 }
 
 /// `fallocate(2)` with mode 0: grow the file if `offset + length` exceeds it.
@@ -2025,6 +2055,7 @@ pub(crate) fn write_stat(buffer: u64, mode: u32, size: u64, ino: u64) -> Result<
     user_memory::copy_to_user(&stat, buffer).map_err(|_| EFAULT)
 }
 
+const EPERM: u64 = 1;
 const ENOENT: u64 = 2;
 const EBADF: u64 = 9;
 const EAGAIN: u64 = 11;

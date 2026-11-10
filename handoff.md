@@ -3519,3 +3519,75 @@ on glycin's side of the fence: the `executor.tick()` loop
 reactor. The loader's stderr is piped, so the relay wrapper described above
 is the way to see its logs (`D-Bus connection to glycin created` is the last
 line it prints).
+
+## Step 2 complete: glycin decodes images end to end
+
+`glycintest` now prints, for a real 64x64 PNG:
+
+```text
+glycin step 4: image=0x... err=(none)
+glycin step 5: frame=0x... err=(none)
+glycin ok 64x64
+```
+
+That proves the whole chain: glycin_core -> private zbus connection -> loader
+spawn -> `Init` with the image fd in SCM_RIGHTS -> memfd frame back to the
+caller. Fixes that closed the last gaps (besides the EPOLLONESHOT commit):
+
+- **`fcntl(F_ADD_SEALS)` / `F_GET_SEALS`** on a memfd. glycin seals the frame
+  pool (`F_SEAL_SHRINK|F_SEAL_GROW`) and treated our `EINVAL` as
+  "Failed to allocate memory: EINVAL".
+- **`getrandom(GRND_INSECURE)`** is accepted (zbus generates its GUID with
+  it); all three flags return kernel CSPRNG bytes.
+- **`sched_getaffinity` reports the real CPU mask** instead of one CPU, so
+  Rust's `available_parallelism` matches the 2-vCPU QEMU guest.
+- **`ASYNC_GLOBAL_EXECUTOR_THREADS=4`** in the Linux launcher environment.
+  With the default pool the zbus `executor.tick()` loop and the connection
+  reader starve each other and the `Init` reply is never read; four workers
+  make it deterministic. This is a user-space scheduling workaround, not a
+  kernel rule.
+
+### Remaining for GTK3 icons: memory corruption in the gdk-pixbuf path
+
+`gdk-pixbuf` does list `image/png` in the guest (`pixformats`: 28 formats) and
+`glycin` decodes the same file through its file, stream and bytes APIs
+(`glycinsrc`). Loading through `gdk_pixbuf_new_from_file` now reaches glycin
+but then hits heap corruption:
+
+```text
+malloc(): unaligned tcache chunk detected   (exit 134)
+```
+
+and one run died with an instruction abort at a libc address
+(`FAR=ELR=0x413594EC`, level-0 translation fault). A direct pixel copy into
+a heap buffer (`glycinsrc`, row-by-row `memcpy` from
+`gly_frame_get_buf_bytes`) did not complete cleanly either, so the next probe
+is the **frame transport**: the memfd `MAP_SHARED` window and the lazy heap
+(`new_heap` PROT_NONE -> `mprotect`) are the two places where a page could be
+mapped twice or with the wrong contents. The host's gdk-pixbuf loads the same
+PNG, so this is our memory layer, not the toolkit.
+
+GTK4/GDK use `GdkTexture` and talk to glycin directly, so GTK3 icons are the
+only consumer of this path.
+
+Diagnostics for the corruption (temporary `describe_fault`, now removed) gave
+the first concrete clue: the fatal access is a **data abort at a page with no
+mapping at all**, at the start of a 16 KiB hole in the library layout:
+
+```text
+reg 0x40E39000 n=3   prot=1 (RO)      <- end of one segment
+   0x40E3C000        no region, PTE=0 <- first access faults here
+reg 0x40E40000 n=575 prot=5 (RX)      <- next segment
+```
+
+The layout is the classic ELF order (RX, RO, RW), so the missing pages are a
+library's writable data segment that `ld.so` expected at `0x40E3C000`. Other
+runs instead report `free(): invalid pointer` or `malloc(): unaligned tcache
+chunk detected` in glycin's worker threads. No `mmap` syscall returned an
+error in those runs.
+
+Next probe: trace `mmap`/`munmap` (address, length, prot, flags, fd, result)
+for the load of the library that owns `0x40E39000` and check whether its RW
+segment mapping was ever issued and recorded, or whether a later `munmap` of
+a lazy reservation removed it. The fault handler only consults
+`mmap_regions`, so the diagnostic should also print `linux_image.runs`.

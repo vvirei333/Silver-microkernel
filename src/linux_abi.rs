@@ -1661,6 +1661,9 @@ fn linux_fcntl(fd: u64, command: u64, argument: u64) -> u64 {
     const F_GETFL: u64 = 3;
     const F_SETFL: u64 = 4;
     const F_DUPFD_CLOEXEC: u64 = 1030;
+    const F_ADD_SEALS: u64 = 1033;
+    const F_GET_SEALS: u64 = 1034;
+    const EPERM: u64 = 1;
     let task = scheduler::current_task_id();
     match command {
         F_DUPFD => finish(linux_fd::dup_from(task, fd, argument, false)),
@@ -1679,6 +1682,13 @@ fn linux_fcntl(fd: u64, command: u64, argument: u64) -> u64 {
             let _ = linux_fd::set_nonblock(task, fd, argument & 0x800 != 0);
             0
         }
+        F_ADD_SEALS => {
+            finish(linux_fd::memfd_add_seals(task, fd, argument as u32).map(|_| 0))
+        }
+        F_GET_SEALS => match linux_fd::memfd_get_seals(task, fd) {
+            Ok(seals) => u64::from(seals),
+            Err(code) => errno(code),
+        },
         _ => errno(EINVAL),
     }
 }
@@ -1935,12 +1945,21 @@ fn linux_sched_getaffinity(size: u64, mask: u64) -> u64 {
     if size < 8 {
         return errno(EINVAL);
     }
-    let mut bytes = [0_u8; 8];
-    bytes[0] = 1; // one CPU
+    let size = (size as usize).min(1024);
+    // Report the CPUs the machine actually has. Rust's
+    // `available_parallelism` and async-global-executor size their worker
+    // pool from this; answering "one CPU" on an SMP guest collapses the
+    // executor to a single thread, which starves zbus's reader behind the
+    // executor's `tick()` loop.
+    let cpus = crate::smp::cpu_count().clamp(1, size * 8);
+    let mut bytes = alloc::vec![0_u8; size];
+    for cpu in 0..cpus {
+        bytes[cpu / 8] |= 1 << (cpu % 8);
+    }
     if user_memory::copy_to_user(&bytes, mask).is_err() {
         return errno(EFAULT);
     }
-    8
+    size as u64
 }
 
 fn linux_uname(buffer: u64) -> u64 {
@@ -2263,7 +2282,9 @@ fn linux_pwrite(fd: u64, buffer: u64, count: u64, offset: u64) -> u64 {
 }
 
 fn linux_getrandom(buffer: u64, length: u64, flags: u64) -> u64 {
-    if flags & !0x3 != 0 {
+    // GRND_NONBLOCK(1) | GRND_RANDOM(2) | GRND_INSECURE(4). The kernel CSPRNG
+    // never blocks, so all three are answered with real random bytes.
+    if flags & !0x7 != 0 {
         return errno(EINVAL);
     }
     let length = length.min(256) as usize;
