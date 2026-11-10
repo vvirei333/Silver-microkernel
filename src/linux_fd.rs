@@ -195,6 +195,11 @@ struct EpollEntry {
     fd: u64,
     events: u32,
     data: u64,
+    /// `EPOLLONESHOT` entries are disabled after one report until the next
+    /// `EPOLL_CTL_MOD`. async-io/polling relies on this: without it an
+    /// always-writable eventfd keeps its reactor spinning and the real
+    /// socket is never serviced.
+    armed: bool,
 }
 
 struct EpollState {
@@ -1032,7 +1037,12 @@ pub fn epoll_ctl(
             if epoll.entries.len() >= 64 {
                 return Err(ENOSPC);
             }
-            epoll.entries.push(EpollEntry { fd, events, data });
+            epoll.entries.push(EpollEntry {
+                fd,
+                events,
+                data,
+                armed: true,
+            });
             Ok(())
         }
         2 => {
@@ -1048,6 +1058,7 @@ pub fn epoll_ctl(
             };
             entry.events = events;
             entry.data = data;
+            entry.armed = true;
             Ok(())
         }
         _ => Err(EINVAL),
@@ -1055,6 +1066,8 @@ pub fn epoll_ctl(
 }
 
 /// Level-triggered readiness translated from the poll bits.
+const EPOLLONESHOT: u32 = 0x4000_0000;
+
 fn epoll_ready_mask(task: u64, fd: u64, requested: u32) -> u32 {
     const EPOLLIN: u32 = 0x001;
     const EPOLLOUT: u32 = 0x004;
@@ -1101,14 +1114,20 @@ pub fn epoll_wait(
     loop {
         let mut ready = Vec::new();
         {
-            let epoll = state.lock();
-            for entry in &epoll.entries {
+            let mut epoll = state.lock();
+            for entry in epoll.entries.iter_mut() {
                 if ready.len() >= max_events {
                     break;
+                }
+                if !entry.armed {
+                    continue;
                 }
                 let mask = epoll_ready_mask(task, entry.fd, entry.events);
                 if mask != 0 {
                     ready.push((mask, entry.data));
+                    if entry.events & EPOLLONESHOT != 0 {
+                        entry.armed = false;
+                    }
                 }
             }
         }

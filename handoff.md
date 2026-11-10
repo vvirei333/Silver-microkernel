@@ -3493,3 +3493,29 @@ probe is the instruction/protocol exchange that follows the handshake
 (who sends the first method call, and whether its reply wakes the waiting
 main context). The loader's stderr is piped by glycin, so debugging uses a
 wrapper that relays it into the ivshmem BAR at `0x3F0000`.
+
+### `EPOLLONESHOT` and the exact place glycin stops now
+
+`epoll` ignored `EPOLLONESHOT`. async-io/polling registers every source with
+`EPOLLIN|EPOLLOUT|EPOLLONESHOT` and re-arms only the directions that still
+have waiters. Because the flag was ignored, an always-writable eventfd was
+reported forever: the reactor spun re-arming instead of servicing the real
+socket. Entries now disarm after one report and re-arm on `EPOLL_CTL_MOD`.
+
+With that fixed the socket exchange is visible and correct up to one point:
+
+```text
+glycin  -> loader  276 bytes + 1 fd   (Init; the image socket travels in SCM_RIGHTS)
+loader  -> glycin   16 + 260 bytes    (receives them, reads the image)
+loader  -> glycin  240 bytes          (Init reply)
+```
+
+The loader's reply is never read. glycin's async-io reactor (`epoll` fd 3)
+had fd 9 registered with `EPOLLIN`, reported the *handshake* message, and
+then parked; zbus never issues an `EPOLL_CTL_MOD` for fd 9 again, i.e. the
+connection's reader task is not polled after the handshake. The next probe is
+on glycin's side of the fence: the `executor.tick()` loop
+(`async-global-executor` task) and whether its wakeup reaches the async-io
+reactor. The loader's stderr is piped, so the relay wrapper described above
+is the way to see its logs (`D-Bus connection to glycin created` is the last
+line it prints).
