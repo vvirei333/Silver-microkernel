@@ -268,6 +268,13 @@ static unsigned constraints_id;
 static unsigned locked_id;
 static unsigned text_input_manager_id;
 static unsigned text_input_id;
+static unsigned layer_shell_id;
+static unsigned layer_surface_id;
+static unsigned layer_surface_surface;
+static unsigned layer_width;
+static unsigned layer_height;
+static int layer_configured;
+static int layer_acked;
 static int text_input_enabled;
 static unsigned text_input_serial;
 static unsigned subsurface_surface_id;
@@ -351,6 +358,13 @@ typedef struct {
     unsigned locked_id;
     unsigned text_input_manager_id;
     unsigned text_input_id;
+    unsigned layer_shell_id;
+    unsigned layer_surface_id;
+    unsigned layer_surface_surface;
+    unsigned layer_width;
+    unsigned layer_height;
+    int layer_configured;
+    int layer_acked;
     int text_input_enabled;
     unsigned text_input_serial;
     unsigned subsurface_surface_id;
@@ -399,6 +413,8 @@ typedef struct {
     X(relative_manager_id) X(relative_pointer_id) \
     X(constraints_id) X(locked_id) \
     X(text_input_manager_id) X(text_input_id) \
+    X(layer_shell_id) X(layer_surface_id) X(layer_surface_surface) \
+    X(layer_width) X(layer_height) X(layer_configured) X(layer_acked) \
     X(text_input_enabled) X(text_input_serial) \
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
     X(configure_serial) X(surface_id) X(popup_surface_id) \
@@ -571,6 +587,8 @@ static int serve(long client) {
                             "zwp_pointer_constraints_v1");
                 send_global(client, registry_id, 16,
                             "zwp_text_input_manager_v3");
+                send_global_version(client, registry_id, 17,
+                                    "zwlr_layer_shell_v1", 4);
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -656,6 +674,8 @@ static int serve(long client) {
                 } else if (text_equal(interface,
                                       "zwp_text_input_manager_v3")) {
                     text_input_manager_id = new_id;
+                } else if (text_equal(interface, "zwlr_layer_shell_v1")) {
+                    layer_shell_id = new_id;
                 } else if (text_equal(interface, "wp_presentation")) {
                     presentation_id = new_id;
                     begin(presentation_id, 0 /* clock_id */);
@@ -975,6 +995,37 @@ static int serve(long client) {
                 buffer_height = (int)take_u32();
                 buffer_stride = take_u32();
                 buffer_format = take_u32();
+            } else if (object == layer_shell_id && opcode == 0) {
+                /* get_layer_surface(new_id, surface, output, layer, ns) */
+                layer_surface_id = take_u32();
+                layer_surface_surface = take_u32();
+                (void)take_u32(); /* output, may be null */
+                (void)take_u32(); /* layer */
+                char space[64];
+                take_string(space, sizeof(space));
+            } else if (object == layer_surface_id && opcode == 0) {
+                layer_width = take_u32();
+                layer_height = take_u32();
+            } else if (object == layer_surface_id && opcode == 1) {
+                (void)take_u32(); /* anchor */
+            } else if (object == layer_surface_id && opcode == 2) {
+                (void)take_u32(); /* exclusive zone */
+            } else if (object == layer_surface_id && opcode == 3) {
+                (void)take_u32(); (void)take_u32();
+                (void)take_u32(); (void)take_u32(); /* margins */
+            } else if (object == layer_surface_id && opcode == 4) {
+                (void)take_u32(); /* keyboard interactivity */
+            } else if (object == layer_surface_id && opcode == 5) {
+                (void)take_u32(); /* get_popup */
+            } else if (object == layer_surface_id && opcode == 6) {
+                (void)take_u32(); /* ack_configure */
+                layer_acked = 1;
+            } else if (object == layer_surface_id && opcode == 7) {
+                layer_surface_id = 0;
+                layer_surface_surface = 0;
+                layer_configured = 0;
+            } else if (object == layer_surface_id && opcode == 8) {
+                (void)take_u32(); /* set_layer */
             } else if (is_surface(object) && opcode == 0) {
                 /* wl_surface.destroy: drop focus with leave events. */
                 surface_ids[object] = 0;
@@ -1039,6 +1090,17 @@ static int serve(long client) {
                         finish(); send_message(client, -1);
                         popup_grab = 0;
                     }
+                }
+                if (object == layer_surface_surface && layer_surface_id != 0 &&
+                    !layer_configured) {
+                    begin(layer_surface_id, 0 /* configure */);
+                    put_u32(configure_serial);
+                    configure_serial += 1;
+                    put_u32(layer_width);
+                    put_u32(layer_height);
+                    finish();
+                    send_message(client, -1);
+                    layer_configured = 1;
                 }
                 if (!surface_entered && output_id != 0) {
                     surface_entered = 1;
@@ -1356,6 +1418,13 @@ static void reset_client(void) {
     locked_id = 0;
     text_input_manager_id = 0;
     text_input_id = 0;
+    layer_shell_id = 0;
+    layer_surface_id = 0;
+    layer_surface_surface = 0;
+    layer_width = 0;
+    layer_height = 0;
+    layer_configured = 0;
+    layer_acked = 0;
     text_input_enabled = 0;
     text_input_serial = 0;
     subsurface_surface_id = 0;

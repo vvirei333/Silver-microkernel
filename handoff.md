@@ -3721,3 +3721,45 @@ Next probes, in order:
 
 The earlier "freeing heap frame" diagnostic remains a false positive (the
 owner scan matched the mmap region being unmapped).
+
+## 2026-11-11 — Phosh step 3: wlr-layer-shell handshake
+
+Phosh draws its panel, lock screen, OSK and notifications as layer-shell
+surfaces, so the mini compositor now speaks
+`zwlr_layer_shell_v1` version 4 (the wlroots protocol XML is vendored at
+`third_party/wayland-aarch64/protocol/wlr-layer-shell-unstable-v1.xml`;
+the client header and private code are generated with `wayland-scanner`).
+
+- **Server** (`tests/linux/wayland_real.c`): advertises global id 17 and
+  handles `get_layer_surface`, `set_size`, `set_anchor`,
+  `set_exclusive_zone`, `set_margin`, `set_keyboard_interactivity`,
+  `get_popup`, `ack_configure`, `destroy` and `set_layer`. The first
+  `wl_surface.commit` of the layer surface emits `configure(serial, w, h)`;
+  the per-client state (surface id, requested width/height, configured/acked
+  flags) is part of `ClientState`, so the save/restore path keeps it across
+  the two-client test.
+- **Client** (`tests/linux/wlclient.c`, `source` role): binds the global,
+  creates a 256x64 `TOP|LEFT` layer surface with a 64 px exclusive zone,
+  commits without a buffer, waits for `configure`, acknowledges it and
+  destroys the surface. Prints `layer-shell ok`.
+
+`linuxrun /sfs/linux-wlreal` passes: both clients exit 0 and the harness
+prints `libwayland 2 clients ok` (the layer-shell line interleaves with the
+clipboard output on the shared console).
+
+Not done yet, and needed before a real Phosh session:
+
+1. **Composite** layer surfaces into the WIN1 sink honouring anchors,
+   margins, exclusive zones and layer order (the handshake alone does not
+   paint them), and allow more than one client/surface in `gtk-serve`.
+2. **GTK4 + libadwaita + gtk-layer-shell** in the SFS image. Phosh 0.58 is
+   built on GNOME 50 (GTK4) and wlroots 0.20.2; the current image only has
+   GTK3, so Phosh itself cannot be installed yet.
+3. Remaining wlroots protocols Phosh uses: `wlr-foreign-toplevel-management`,
+   `wlr-screencopy`, `wlr-output-management`, `idle-inhibit`,
+   `gamma-control`, plus phoc's `phosh-private` role.
+4. Input injection from the host viewer (none yet), and the two open memory
+   bugs below.
+
+Open bugs unchanged: the `{0x218, 0}` heap-suffix corruption (see above)
+and gdk-pixbuf's PNG refusal.

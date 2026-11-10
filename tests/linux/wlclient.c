@@ -23,6 +23,7 @@
 #include "relative-pointer-client-protocol.h"
 #include "pointer-constraints-client-protocol.h"
 #include "text-input-client-protocol.h"
+#include "wlr-layer-shell-client-protocol.h"
 
 static struct wl_compositor *compositor;
 static struct wl_shm *shared_memory;
@@ -58,6 +59,32 @@ static int locked_ok;
 static struct zwp_text_input_manager_v3 *text_input_manager;
 static struct zwp_text_input_v3 *text_input;
 static int text_input_entered;
+
+static struct zwlr_layer_shell_v1 *layer_shell;
+static struct zwlr_layer_surface_v1 *layer_surface;
+static int layer_configured;
+
+static void layer_surface_configure(void *data,
+                                    struct zwlr_layer_surface_v1 *surface,
+                                    uint32_t serial, uint32_t width,
+                                    uint32_t height) {
+    (void)data;
+    (void)width;
+    (void)height;
+    layer_configured = 1;
+    zwlr_layer_surface_v1_ack_configure(surface, serial);
+}
+
+static void layer_surface_closed(void *data,
+                                 struct zwlr_layer_surface_v1 *surface) {
+    (void)data;
+    (void)surface;
+}
+
+static const struct zwlr_layer_surface_v1_listener layer_surface_listener = {
+    .configure = layer_surface_configure,
+    .closed = layer_surface_closed,
+};
 static int text_input_committed;
 static int text_input_done;
 static struct wl_data_device *data_device;
@@ -485,6 +512,11 @@ static void registry_global(void *data, struct wl_registry *registry,
         uint32_t use = version < 1 ? version : 1;
         text_input_manager = wl_registry_bind(
             registry, name, &zwp_text_input_manager_v3_interface, use);
+    }
+    else if (strcmp(interface, zwlr_layer_shell_v1_interface.name) == 0) {
+        uint32_t use = version < 4 ? version : 4;
+        layer_shell = wl_registry_bind(registry, name,
+                                       &zwlr_layer_shell_v1_interface, use);
     }
 }
 
@@ -1319,6 +1351,44 @@ int main(int argc, char **argv) {
                 output_description_ok, seat_name_ok, keyboard_repeat_ok,
                 keymap_ok, pointer_ok, key_enter);
         return 11;
+    }
+
+    if (is_source && layer_shell != NULL) {
+        struct wl_surface *layer_wl = wl_compositor_create_surface(compositor);
+        if (layer_wl == NULL) {
+            return 8;
+        }
+        layer_surface = zwlr_layer_shell_v1_get_layer_surface(
+            layer_shell, layer_wl, NULL, ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+            "wlclient-test");
+        if (layer_surface == NULL) {
+            return 8;
+        }
+        zwlr_layer_surface_v1_add_listener(layer_surface,
+                                           &layer_surface_listener, NULL);
+        zwlr_layer_surface_v1_set_size(layer_surface, 256, 64);
+        zwlr_layer_surface_v1_set_anchor(
+            layer_surface,
+            ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+        zwlr_layer_surface_v1_set_exclusive_zone(layer_surface, 64);
+        zwlr_layer_surface_v1_set_keyboard_interactivity(
+            layer_surface,
+            ZWLR_LAYER_SURFACE_V1_KEYBOARD_INTERACTIVITY_NONE);
+        wl_surface_commit(layer_wl);
+        for (int attempt = 0; attempt < 8 && !layer_configured; attempt++) {
+            if (wl_display_roundtrip(display) < 0) {
+                return 8;
+            }
+        }
+        if (!layer_configured) {
+            fprintf(stderr, "wlclient: layer-shell configure missing\n");
+            return 8;
+        }
+        zwlr_layer_surface_v1_destroy(layer_surface);
+        wl_surface_destroy(layer_wl);
+        printf("layer-shell ok\n");
+        fflush(stdout);
     }
 
     /* Destroy the shell surface; the compositor must drop focus. */
