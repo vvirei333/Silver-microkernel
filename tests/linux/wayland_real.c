@@ -63,7 +63,11 @@ struct sockaddr_un {
 
 static unsigned char message[1024];
 static unsigned long message_length;
-static unsigned char incoming[1024];
+/* GTK batches registry, shm, configure and surface traffic well past
+  1 KiB. A short buffer used to drop the tail of a recvmsg, desynchronising
+  the stream so later requests (notably wl_surface.commit) were never seen. */
+static unsigned char incoming[65536];
+static unsigned long incoming_pending;
 static unsigned message_start;
 static unsigned long incoming_length;
 static unsigned long incoming_offset;
@@ -131,7 +135,10 @@ static long send_message(long fd, int pass_fd) {
 
 /* Reads one queued message; returns 0 on EOF. */
 static long receive_message(long fd) {
-    struct iovec vector = {incoming, sizeof(incoming)};
+    struct iovec vector = {
+        incoming + incoming_pending,
+        sizeof(incoming) - incoming_pending,
+    };
     struct msghdr header;
     union control control;
     for (unsigned long index = 0; index < sizeof(header); index++) {
@@ -145,7 +152,8 @@ static long receive_message(long fd) {
     if (count <= 0) {
         return count;
     }
-    incoming_length = (unsigned long)count;
+    incoming_length = incoming_pending + (unsigned long)count;
+    incoming_pending = 0;
     incoming_offset = 8;
     incoming_fd = -1;
     if (header.control_length >= sizeof(struct cmsghdr) + sizeof(int)) {
@@ -275,6 +283,15 @@ static unsigned pointer_id;
 static unsigned configure_serial = 1;
 static unsigned surface_id;
 static unsigned popup_surface_id;
+/// Every wl_surface the client created, indexed by object id. GTK creates
+/// several (toplevel, cursor, ...), so a single `surface_id` tracked only the
+/// first one and missed the toplevel's attach/commit.
+#define SURFACE_IDS 256
+static unsigned char surface_ids[SURFACE_IDS];
+
+static int is_surface(unsigned id) {
+    return id < SURFACE_IDS && surface_ids[id] != 0;
+}
 static unsigned popup_xdg_surface_id;
 static unsigned popup_id;
 static unsigned positioner_id;
@@ -286,6 +303,12 @@ static unsigned frame_id;
 static int pool_fd = -1;
 static int verified;
 static unsigned commits;
+static int buffer_width;
+static int buffer_height;
+#ifdef SERVE_ONLY
+static int frame_reported;
+#endif
+static unsigned attached_buffer; /* written by attach; release is deferred */
 static int focused;
 static int surface_entered;
 static int selection_changed;
@@ -489,6 +512,10 @@ static void send_decoration_mode(long client, unsigned mode) {
     finish();
     send_message(client, -1);
 }
+
+
+
+
 
 static int serve(long client) {
     long count = receive_message(client);
@@ -825,6 +852,9 @@ static int serve(long client) {
                 data_offer_id = 0;
             } else if (object == compositor_id && opcode == 0) {
                 unsigned new_surface = take_u32(); /* create_surface */
+                if (new_surface < SURFACE_IDS) {
+                    surface_ids[new_surface] = 1;
+                }
                 if (surface_id == 0) {
                     surface_id = new_surface;
                 } else if (popup_surface_id == 0) {
@@ -842,6 +872,16 @@ static int serve(long client) {
                     popup_xdg_surface_id = new_xdg_surface;
                 } else {
                     xdg_surface_id = new_xdg_surface;
+                    /* Surface ids are not assigned by creation order: GTK
+                       creates cursor/auxiliary surfaces before the toplevel.
+                       The xdg_surface binding names the real toplevel. */
+                    if (subsurface_surface_id == surface) {
+                        subsurface_surface_id = 0;
+                    }
+                    if (popup_surface_id == surface) {
+                        popup_surface_id = 0;
+                    }
+                    surface_id = surface;
                 }
             } else if (object == xdg_surface_id && opcode == 1) {
                 /* xdg_surface.get_toplevel(new_id): send configure. */
@@ -889,14 +929,15 @@ static int serve(long client) {
             } else if (object == seat_id && opcode == 1) {
                 /* wl_seat.get_keyboard(new_id): keymap fd + enter. */
                 keyboard_id = take_u32();
-                const char text[] = "WEREWOLF_KEYMAP\n";
-                unsigned length = sizeof(text) - 1;
+                /* Send NO_KEYMAP: a protocol-valid empty keymap. The old
+                   "WEREWOLF_KEYMAP" placeholder made xkbcommon fail to parse
+                   the compositor keymap on every GTK client. */
+                unsigned length = 0;
                 long keymap = sys3(279 /* memfd_create */, (long)"keymap", 0, 0);
                 if (keymap >= 0 && sys3(46 /* ftruncate */, keymap, length, 0) >= 0 &&
-                    sys3(64 /* write */, keymap, (long)text, length) == (long)length &&
                     sys3(62 /* lseek */, keymap, 0, 0) == 0) {
                     begin(keyboard_id, 0 /* keymap */);
-                    put_u32(1); /* XKB_V1 */
+                    put_u32(0); /* NO_KEYMAP */
                     put_u32(length);
                     finish();
                     send_message(client, (int)keymap);
@@ -925,28 +966,31 @@ static int serve(long client) {
             } else if (object == pool_id && opcode == 0) {
                 buffer_id = take_u32(); /* create_buffer */
                 (void)take_i32();
-                (void)take_i32();
-                (void)take_i32();
+                buffer_width = take_i32();
+                buffer_height = take_i32();
                 (void)take_i32();
                 (void)take_u32();
-            } else if (object == surface_id && opcode == 0) {
+            } else if (is_surface(object) && opcode == 0) {
                 /* wl_surface.destroy: drop focus with leave events. */
+                surface_ids[object] = 0;
                 if (keyboard_id != 0) {
                     begin(keyboard_id, 2 /* leave */);
                     put_u32(configure_serial);
-                    put_u32(surface_id);
+                    put_u32(object);
                     finish();
                     send_message(client, -1);
                 }
                 if (pointer_id != 0) {
                     begin(pointer_id, 1 /* leave */);
                     put_u32(configure_serial);
-                    put_u32(surface_id);
+                    put_u32(object);
                     finish();
                     send_message(client, -1);
                 }
                 focused = 0;
-                surface_id = 0;
+                if (surface_id == object) {
+                    surface_id = 0;
+                }
             } else if (object == toplevel_id &&
                        (opcode == 9 || opcode == 10 || opcode == 11 || opcode == 12)) {
                 /* set_maximized, unset_maximized, set_fullscreen, unset_fullscreen */
@@ -960,32 +1004,54 @@ static int serve(long client) {
                 } else {
                     send_toplevel_state(client, 0);
                 }
-            } else if (object == subsurface_surface_id && opcode == 6) {
-                subsurface_ok = 1;
-            } else if (object == popup_surface_id && opcode == 6) {
-                /* Popup commit: dismiss a grabbed popup once it is mapped. */
-                popup_committed = 1;
-                if (popup_grab && popup_id != 0) {
-                    begin(popup_id, 1 /* xdg_popup.popup_done */);
-                    finish(); send_message(client, -1);
-                    popup_grab = 0;
-                }
             } else if (object == popup_surface_id && opcode == 0) {
                 popup_surface_id = 0;
                 popup_xdg_surface_id = 0;
                 popup_id = 0;
-            } else if (object == surface_id && opcode == 3) {
+            } else if (is_surface(object) && opcode == 1) {
+                /* wl_surface.attach(buffer, x, y) */
+                attached_buffer = take_u32();
+                (void)take_i32();
+            } else if (is_surface(object) && opcode == 3) {
                 frame_id = take_u32(); /* wl_surface.frame */
-            } else if (object == surface_id && opcode == 6) {
+                /* Complete the callback immediately: GTK's frame clock waits
+                   for it before painting, and a missing done event kept the
+                   first buffer from ever being committed during the demo. */
+                begin(frame_id, 0 /* wl_callback.done */);
+                put_u32(0); /* timestamp */
+                finish();
+                send_message(client, -1);
+                frame_id = 0;
+            } else if (is_surface(object) && opcode == 6) {
                 /* wl_surface.commit: report the output, then verify pixels. */
+                if (object == subsurface_surface_id) {
+                    subsurface_ok = 1;
+                }
+                if (object == popup_surface_id) {
+                    popup_committed = 1;
+                    if (popup_grab && popup_id != 0) {
+                        begin(popup_id, 1 /* xdg_popup.popup_done */);
+                        finish(); send_message(client, -1);
+                        popup_grab = 0;
+                    }
+                }
                 if (!surface_entered && output_id != 0) {
                     surface_entered = 1;
-                    begin(surface_id, 0 /* wl_surface.enter */);
+                    begin(object, 0 /* wl_surface.enter */);
                     put_u32(output_id);
                     finish();
                     send_message(client, -1);
                 }
                 if (pool_fd >= 0 && buffer_id != 0) {
+#ifdef SERVE_ONLY
+                    if (!frame_reported) {
+                        frame_reported = 1;
+                        static const char frame_msg[] =
+                            "gtk-serve: shm frame committed\n";
+                        sys3(64, 1, (long)frame_msg, sizeof(frame_msg) - 1);
+                    }
+#endif
+                    /* fallthrough */
                     long mapped = sys6(222, 0, 4096, 1, 1, pool_fd, 0);
                     if (mapped > 0) {
                         unsigned *pixels = (unsigned *)mapped;
@@ -1036,6 +1102,17 @@ static int serve(long client) {
                 }
             }
             message_start += size;
+        }
+        /* Keep a truncated tail for the next recvmsg. Dropping it shifted
+           every following message by a few bytes. */
+        if (message_start < incoming_length) {
+            unsigned long leftover = incoming_length - message_start;
+            for (unsigned long index = 0; index < leftover; index++) {
+                incoming[index] = incoming[message_start + index];
+            }
+            incoming_pending = leftover;
+        } else {
+            incoming_pending = 0;
         }
     }
     return 0;
@@ -1190,6 +1267,7 @@ static void reset_client(void) {
         sys3(57, pool_fd, 0, 0);
         pool_fd = -1;
     }
+    attached_buffer = 0;
     registry_id = 0;
     compositor_id = 0;
     shm_id = 0;
@@ -1259,6 +1337,8 @@ void _start(void) {
     if (sys3(201 /* listen */, server, 4, 0) < 0) {
         fail("gtk-serve: listen failed\n", 23);
     }
+    /* fontconfig only writes a cache into a directory that already exists */
+    sys3(34 /* mkdirat */, -100, (long)"/tmp/fontcache", 0777);
     long child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
     if (child < 0) {
         fail("gtk-serve: fork failed\n", 21);

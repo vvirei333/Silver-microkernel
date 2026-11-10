@@ -1510,7 +1510,12 @@ fn linux_faccessat(dirfd: u64, path_ptr: u64, mode: u64) -> u64 {
     if !scheduler::current_read_path_allowed(&resolved) {
         return errno(EACCES);
     }
-    if mode & W_OK != 0 {
+    if mode & W_OK != 0
+        && !silver_microkernel::path_is_under(&resolved, crate::scheduler::LINUX_SCRATCH_PREFIX)
+    {
+        // SFS is read-only; the Linux scratch tree (`/tmp`) is the one place
+        // a toolkit may create caches. A blanket EROFS made fontconfig
+        // declare every cache directory unwritable.
         return errno(EROFS);
     }
     if resolved.starts_with("/dev/")

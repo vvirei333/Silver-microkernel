@@ -552,7 +552,17 @@ static void output_description_event(void *data, struct wl_output *out,
 
 static void keyboard_keymap(void *data, struct wl_keyboard *kb,
                             uint32_t format, int32_t fd, uint32_t size) {
-    (void)data; (void)kb; (void)format;
+    (void)data; (void)kb;
+    /* NO_KEYMAP (format 0, size 0) is the protocol-valid "no keymap" answer
+       the mini compositor sends to real toolkits; XKB_V1 carries the test
+       marker. Both prove the event and the descriptor arrived. */
+    if (size == 0) {
+        keymap_ok = format == 0;
+        if (fd >= 0) {
+            close(fd);
+        }
+        return;
+    }
     char buffer[128] = {0};
     uint32_t want = size < sizeof(buffer) - 1 ? size : sizeof(buffer) - 1;
     /* SCM_RIGHTS shares the open file description, so the writer's offset

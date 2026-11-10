@@ -3257,3 +3257,58 @@ Repro: back up `disk.img`, copy the GTK image over it, boot
    `wlr-output-management`, idle-inhibit, gamma-control, ...), and Phosh is
    GTK3 with gnome-session/upower/gsettings expectations. GTK4 + libadwaita
    follow.
+
+### GTK3 frame pipeline closed (same day, follow-up)
+
+The window is not just created: the compositor now receives and verifies a
+real shm frame from GTK. Guest output is
+
+```text
+gtk window shown
+gtk-serve: shm frame committed
+gtk mainloop ok
+gtk client ok
+```
+
+Compositor/test fixes that were needed:
+
+- **Input buffer was 1 KiB.** GTK's registry/shm/configure batches overflowed
+  it, the tail was dropped and the stream desynchronised, so
+  `wl_surface.commit` was never seen. `incoming` is now 64 KiB and a
+  truncated tail is carried into the next `recvmsg` (`incoming_pending`).
+- **Surface roles were assigned by creation order.** GTK creates auxiliary
+  surfaces before the toplevel; the real toplevel ended up in
+  `subsurface_surface_id` and its commit was swallowed by the subsurface
+  branch. A `surface_ids[]` registry tracks every `wl_surface`, every commit
+  goes through one handler, and `xdg_wm_base.get_xdg_surface` names the real
+  toplevel.
+- **Frame callbacks were never completed.** `wl_surface.frame` now gets an
+  immediate `wl_callback.done`; this is what made GTK paint.
+- **Keymap.** The compositor sends `NO_KEYMAP` (format 0, size 0) instead of
+  the `WEREWOLF_KEYMAP` marker; `wlclient` accepts both and the GTK
+  xkbcommon warning is gone. A real keymap comes with keyboard support.
+- **fontconfig cache.** `faccessat(W_OK)` is allowed under `/tmp`, and
+  `gtk-serve` creates `/tmp/fontcache` before exec; the "no writable cache
+  directories" warning is gone.
+
+Do **not** release the attached `wl_buffer` immediately after commit: GTK
+still owns the buffer through its staging cairo surface and aborts with a
+cairo reference-count assertion. A real compositor must release after
+compositing (or double-buffer), not inline in the commit handler.
+
+`linuxrun /sfs/linux-wlreal` (two clients + clipboard) still passes after
+these changes, and the updated 256 MiB image is saved at
+`/home/ivan/phosh-state/disk_gtk3.img`.
+
+### Where Phosh is blocked now
+
+1. **Image loaders.** Arch's gdk-pixbuf 2.44.8 links `libglycin-2` and ships
+   no built-in PNG loader (`gdk-pixbuf-query-loaders` lists nothing). The
+   demo is undecorated so it never asks for a CSD icon. Real apps and Phosh
+   need either glycin's loaders (`/usr/lib/glycin-loaders/2+/glycin-image-rs`
+   + config) or a gdk-pixbuf PNG module.
+2. **Display sink.** The mini compositor verifies frames but presents
+   nothing. A real compositor must composite into the ivshmem surface (or
+   another framebuffer) so the host viewer shows the desktop.
+3. **wlroots protocol set** for Phosh: layer-shell, screencopy,
+   foreign-toplevel, output-management, idle-inhibit, gamma-control, etc.
