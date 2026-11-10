@@ -3659,3 +3659,65 @@ acquires content this process wrote in an earlier pass; that points at an
 aliased live mapping rather than a lost store. The kernel allocation audit
 did not find a user-side double grant, so page-table frames and other
 kernel-side allocations are the remaining suspects, or a device write.
+
+### Heap corruption: the shape of the damage (new)
+
+A stronger probe of `chunktest` (single-threaded `malloc(200 KiB)` /
+`memset` / verify / `free`) turned the random single-byte reports into a
+precise picture. The probe used three temporary debug syscalls (now removed,
+recreate from this note):
+
+- `4243(va)` prints the frame behind a user page, whether the allocator still
+  has it, whether it is a registered page table, its generation, the task that
+  tracks it, and the byte as read through the kernel linear map;
+- `4244(va)` returns that frame;
+- `4245(lo, hi)` scans DRAM for runs of the repeated record.
+
+What the probe shows when a round fails:
+
+- The damage is a **suffix of the malloc block**: all bytes from some offset
+  `X` to the end of the 200 KiB request are replaced, and every byte before
+  `X` still holds the pattern. `X` is 16-byte aligned and varies run to run
+  (36896, 152672, 164704, ...).
+- The replacement is a **constant 16-byte record `{u64 0x218, u64 0}`**,
+  repeated exactly to the block end. `0x18` in earlier reports is simply the
+  low byte of `0x218`.
+- The glibc chunk header in front of the block is untouched
+  (`prev_size = 0`, `size = 204817`).
+- Reading the same byte through the **kernel linear map** returns the same
+  value (`kbyte = 0`), so this is real memory content, not a stale user-TLB
+  view of another frame.
+- At that moment the frame is still **allocated** in the allocator bitmap
+  (`alloc=1`), is **not** a live page table (`table=0`), and is still tracked
+  by the failing task as its own heap data (`owner=<task>`), with the
+  generation the task recorded. So it is not a table-frame alias and not a
+  frame handed to another task.
+- A fresh `memset` over the whole block then **sticks**
+  (`rewrite mismatches=0`): the mapping is writable and correct once the bad
+  moment has passed.
+- The failure reproduces with `-smp 1`, so it is not cross-CPU TLB/migration.
+- glibc issues exactly three `brk` calls (two queries and one growth to the
+  2 MiB cap) and never shrinks, so trim/regrow is not involved either.
+
+`0x218` (536) is in the same range as the frame generations observed at
+detection (662-700), so a `(generation, frame = 0)` pair is a plausible
+reading of the record, but that is unconfirmed.
+
+Next probes, in order:
+
+1. **Find the writer** with a QEMU gdb hardware watchpoint while the serial
+   console is driven over a unix socket. Watch the last 8 bytes of the block
+   (user VA `0x4083_2008`) *and* the kernel linear alias
+   `KERNEL_VIRT_BASE + PA + 0x1FF8` of the same frame: a user-VA watchpoint
+   alone misses a kernel linear-map writer. Auto-continue in a gdb command
+   script and log `$pc` plus the written value; the block suffix makes the
+   last bytes a reliable trigger.
+2. **Identify `0x218`**: scan DRAM for runs of `{0x218, 0}` outside the block
+   (syscall 4245 above) and inspect the surrounding memory. If the record is
+   part of a kernel `Vec`, the neighbour bytes identify the structure.
+3. If the writer is the kernel, audit every kernel path that writes a user
+   frame through the linear map (`zero_page`, `cow_copy_run`, `copy_to_user`
+   users) against the frame being live user data.
+
+The earlier "freeing heap frame" diagnostic remains a false positive (the
+owner scan matched the mmap region being unmapped).
