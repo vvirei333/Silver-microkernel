@@ -208,6 +208,9 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     "$CC" -O2 -o build/memfd-shared tests/linux/memfd_shared.c
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/memfd-shared
+    "$CC" -O2 -pthread -o build/threadfork tests/linux/threadfork.c
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/threadfork
     "$CC" -O2 -o build/scratch tests/linux/scratch.c
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/scratch
@@ -252,9 +255,10 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     python3 scripts/sfs_inject.py "$IMAGE" build/exitgroup-thread linux-exitgroup
     python3 scripts/sfs_inject.py "$IMAGE" build/sockets linux-sockets
     python3 scripts/sfs_inject.py "$IMAGE" build/memfd-shared linux-memfd
+    python3 scripts/sfs_inject.py "$IMAGE" build/threadfork linux-threadfork
     python3 scripts/sfs_inject.py "$IMAGE" build/scratch linux-scratch
     python3 scripts/sfs_inject.py "$IMAGE" build/eventloop linux-eventloop
-    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit linuxrun /sfs/linux-groupsig linuxrun /sfs/linux-exitgroup linuxrun /sfs/linux-sockets linuxrun /sfs/linux-memfd linuxrun /sfs/linux-scratch linuxrun /sfs/linux-eventloop$WLREAL"
+    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit linuxrun /sfs/linux-groupsig linuxrun /sfs/linux-exitgroup linuxrun /sfs/linux-sockets linuxrun /sfs/linux-memfd linuxrun /sfs/linux-threadfork linuxrun /sfs/linux-scratch linuxrun /sfs/linux-eventloop$WLREAL"
 else
     DYN=""
     echo "note: patchelf or the dynamic AArch64 libc is missing; skipped the dynamic test" >&2

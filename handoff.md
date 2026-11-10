@@ -3439,3 +3439,57 @@ retested now.
 
 **Step 2 status:** loader reaches its own startup, D-Bus fd is the only
 remaining blocker. **Step 3 (wlr-layer-shell/Phosh) not started.**
+
+### Step 2: glycin reaches the D-Bus layer; the kernel gaps it exposed
+
+The loader now starts, receives its `--dbus-fd`, and completes the zbus
+handshake (`D-Bus connection to glycin created`). Getting there required
+fixing eight real Linux-ABI gaps, each found by reproducing it in a small
+program:
+
+1. **`FD_CLOEXEC` is now modelled per descriptor.** `fcntl(F_GETFD)` reports
+   it, `F_SETFD` sets it, `F_DUPFD_CLOEXEC` duplicates with it, `pipe2` and
+   `socketpair` honour `O_CLOEXEC`/`SOCK_CLOEXEC`, and a successful `execve`
+   closes every marked descriptor. Without this, Rust's `Command::spawn`
+   blocked forever reading the child end of its exec-error socketpair:
+   the child never closed it, so the parent never saw EOF. This was the
+   single biggest cause of the earlier "Bad file descriptor" and hangs.
+2. **`SOCK_SEQPACKET` socketpairs** are accepted (kept as byte streams).
+   That is the type Rust uses for the exec-error channel.
+3. **`ioctl(FIONBIO)`** toggles non-blocking on sockets/pipes. Rust's
+   `set_nonblocking` uses it; without it glycin's socket setup got `EBADF`.
+4. **`epoll_pwait` accepts large `maxevents`** (glibc asks for 1024; the old
+   cap of 64 returned `EINVAL` and glycin's async runtime spun).
+5. **`SO_PEERCRED` reports a non-zero pid.** zbus reads peer credentials
+   during negotiation; pid 0 made glycin discard the connection object with
+   an `io::Error` of errno 0 (`Success`).
+6. **Lazy `PROT_NONE` reservations.** glibc's `new_heap` maps
+   `2 * 64 MiB` PROT_NONE/MAP_NORESERVE and expects success; eager frame
+   allocation answered `ENOMEM` and glibc retried the same unaligned 64 MiB
+   mapping forever. Anonymous mappings with `prot == 0` are now tracked
+   lazily (VA only, no frames, no charge) and backed on first touch after
+   `mprotect`/`MAP_FIXED`. All other anonymous mappings stay eager.
+7. **`fork()` from a thread.** The child is a copy of the *process*, so
+   `fork_current` snapshots the group leader (image, heap, mmaps) while
+   keeping the caller's resume frame and TLS; `wait_child` matches on the
+   thread-group id. Lazy pages the leader had already touched (a pthread TCB
+   and stack) are deep-copied into the child; handing it an empty
+   reservation made its first libc call dereference a null TCB field.
+8. **`mmap` for `MAP_FIXED` over lazy ranges**, `munmap` and `mprotect` use
+   lenient page-table walks that skip holes instead of failing.
+
+Glycin also needs the *exact* opt-out value
+`GLYCIN_DISABLE_SANDBOX=i-know-the-risks`; with `1` it still chose bwrap and
+failed to spawn. With the correct value it spawns the loader directly and
+passes `--dbus-fd` successfully.
+
+`linux-memfd` (broken before) and the new `linux-threadfork` test pass, as do
+`linux-sockets`, `linux-pthread` and the two-client Wayland test.
+
+**Remaining in step 2:** after the zbus connection is up, glycin's
+`gly_loader_load` still does not complete within its 60 s limit and reports
+no result. The loader logs `D-Bus connection to glycin created`; the next
+probe is the instruction/protocol exchange that follows the handshake
+(who sends the first method call, and whether its reply wakes the waiting
+main context). The loader's stderr is piped by glycin, so debugging uses a
+wrapper that relays it into the ivshmem BAR at `0x3F0000`.

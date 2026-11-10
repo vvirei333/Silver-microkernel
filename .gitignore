@@ -6,3 +6,6 @@
 keys/*.key
 /build
 .vscode/
+
+# Python bytecode from the image injection helper.
+__pycache__/

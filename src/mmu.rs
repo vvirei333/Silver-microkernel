@@ -1415,6 +1415,62 @@ pub fn protect_user_pages_at(
     true
 }
 
+/// Like [`protect_user_pages_at`], but pages that are not backed yet are
+/// skipped instead of rejected. `mprotect` on a lazily reserved range covers
+/// pages that will only get a frame on first access.
+pub fn protect_user_pages_at_lenient(
+    ttbr0: usize,
+    virtual_address: usize,
+    page_count: usize,
+    prot: u64,
+) -> bool {
+    if page_count == 0 || virtual_address % GRANULE != 0 {
+        return false;
+    }
+    if prot & PROT_WRITE != 0 && prot & PROT_EXEC != 0 {
+        return false;
+    }
+    let Some(span) = page_count.checked_mul(GRANULE) else {
+        return false;
+    };
+    let Some(end) = virtual_address.checked_add(span) else {
+        return false;
+    };
+    if virtual_address < GRANULE || end > USER_STACK_VA + USER_STACK_SIZE {
+        return false;
+    }
+
+    let root = root_of(ttbr0);
+    unsafe {
+        let l1_user = follow_table(root, 0);
+        for index in 0..page_count {
+            let va = virtual_address + index * GRANULE;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_index = (va >> 21) & (ENTRIES - 1);
+            let l3_index = (va >> 12) & 0x1FF;
+            let l2_entry = read_entry(l1_user, l1_index);
+            if l2_entry & DESC_TABLE != DESC_TABLE {
+                continue;
+            }
+            let l2 = descriptor_address(l2_entry) as usize;
+            let l3_entry = read_entry(l2, l2_index);
+            if l3_entry & DESC_TABLE != DESC_TABLE {
+                continue;
+            }
+            let l3 = descriptor_address(l3_entry) as usize;
+            let entry = read_entry(l3, l3_index);
+            if entry & DESC_PAGE != DESC_PAGE {
+                continue;
+            }
+            let physical = descriptor_address(entry) as usize;
+            write_entry(l3, l3_index, user_anonymous_page(physical, prot));
+            clean_entry_line(l3, l3_index);
+        }
+    }
+    finish_table_changes_for(ttbr0);
+    true
+}
+
 /// Makes every `Cow` page in a shared image read-only in `ttbr0`. Text and
 /// read-only pages are already immutable.
 #[cfg(feature = "linux-abi")]
@@ -1651,6 +1707,58 @@ pub fn remap_user_kinds_at(
 /// table free leaks that table rather than risking a foreign frame. Callers
 /// must therefore treat `true` as permission to release the data frames, not
 /// as a page-table accounting result.
+/// Like [`unmap_user_pages_at`], but pages that were never backed are
+/// skipped. A lazily reserved range has holes by design, and `munmap` or a
+/// `MAP_FIXED` replacement must be able to cover them.
+pub fn unmap_user_pages_at_lenient(
+    ttbr0: usize,
+    virtual_address: usize,
+    page_count: usize,
+) -> bool {
+    if page_count == 0 || virtual_address % GRANULE != 0 || virtual_address < DRAM_BASE {
+        return false;
+    }
+    let Some(span) = page_count.checked_mul(GRANULE) else {
+        return false;
+    };
+    let Some(end) = virtual_address.checked_add(span) else {
+        return false;
+    };
+    if end > DRAM_BASE + 0x4000_0000 {
+        return false;
+    }
+    let root = root_of(ttbr0);
+    unsafe {
+        let l1_user = follow_table(root, 0);
+        let l2_user = follow_table(l1_user, 1);
+        for index in 0..page_count {
+            let va = virtual_address + index * GRANULE;
+            let l2_index = (va - DRAM_BASE) / BLOCK_2M;
+            let l3_index = (va >> 12) & 0x1FF;
+            let l2_entry = read_entry(l2_user, l2_index);
+            if l2_entry & DESC_TABLE != DESC_TABLE {
+                continue;
+            }
+            let l3 = descriptor_address(l2_entry) as usize;
+            if read_entry(l3, l3_index) & DESC_PAGE != DESC_PAGE {
+                continue;
+            }
+            write_entry(l3, l3_index, 0);
+            clean_entry_line(l3, l3_index);
+            let persistent = l2_index == USER_HEAP_L2_INDEX
+                || l2_index == USER_STACK_L2_INDEX;
+            if !persistent && table_empty(l3) {
+                write_entry(l2_user, l2_index, 0);
+                clean_entry_line(l2_user, l2_index);
+                finish_table_changes_for(ttbr0);
+                free_table_frame_owned(l3, root);
+            }
+        }
+    }
+    finish_table_changes_for(ttbr0);
+    true
+}
+
 pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usize) -> bool {
     if page_count == 0 || virtual_address % GRANULE != 0 || virtual_address < DRAM_BASE {
         return false;

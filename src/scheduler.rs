@@ -1,7 +1,7 @@
 use core::cell::UnsafeCell;
 use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use alloc::collections::VecDeque;
+use alloc::collections::{BTreeMap, VecDeque};
 use alloc::sync::Arc;
 use alloc::{string::String, vec::Vec};
 
@@ -225,6 +225,43 @@ struct MmapRegion {
     /// find after a few hundred mappings). Empty for anonymous and shared
     /// regions, whose frames are one contiguous run in `physical_start`.
     frames: Vec<(usize, u32)>,
+    /// Anonymous reservation whose frames are allocated on first touch.
+    /// Linux hands out large `PROT_NONE` reservations (glibc's 128 MiB
+    /// `new_heap` probe) expecting no memory to be committed; an eager
+    /// allocator answers `ENOMEM` and glibc retries forever.
+    lazy: bool,
+    /// Faulted pages of a lazy region, keyed by page offset. Sparse, because
+    /// a 128 MiB reservation usually has only a few MiB touched.
+    pages: BTreeMap<u32, (usize, u32)>,
+}
+
+impl MmapRegion {
+    /// Frees the faulted pages with offsets in `[start, start + count)` and
+    /// returns how many frames were released.
+    fn free_pages_range(&mut self, start: u32, count: u32) -> usize {
+        let end = start.saturating_add(count);
+        let keys: Vec<u32> = self.pages.range(start..end).map(|(&key, _)| key).collect();
+        let mut freed = 0;
+        for key in keys {
+            if let Some((page, generation)) = self.pages.remove(&key) {
+                let _ = frame_allocator::free_page_tagged(page, generation);
+                freed += 1;
+            }
+        }
+        freed
+    }
+
+    /// Splits off the pages at or above `at` into a new map keyed from zero.
+    fn take_pages_from(&mut self, at: u32) -> BTreeMap<u32, (usize, u32)> {
+        let keys: Vec<u32> = self.pages.range(at..).map(|(&key, _)| key).collect();
+        let mut tail = BTreeMap::new();
+        for key in keys {
+            if let Some(value) = self.pages.remove(&key) {
+                tail.insert(key - at, value);
+            }
+        }
+        tail
+    }
 }
 
 /// Syscall ABI a task is running on.
@@ -1986,7 +2023,10 @@ const MAX_MMAP_REGIONS: usize = 1024;
 /// machine and starve the scheduler, IPC and the kernel heap. The GTK3
 /// library set is ~80 MiB of segments; 160 MiB leaves room for its heap while
 /// the global frame reserve stays the last line of defence.
-const MAX_MMAP_BYTES_PER_TASK: usize = 160 * 1024 * 1024;
+// A large value because lazily reserved ranges (glibc's 128 MiB heap probe)
+// count toward it while committing no frames. The real bound on memory is the
+// per-task frame ledger, charged one page at a time.
+const MAX_MMAP_BYTES_PER_TASK: usize = 1024 * 1024 * 1024;
 
 pub fn exit_current() -> ! {
     exit_current_with_status(0)
@@ -3026,7 +3066,24 @@ pub fn mmap_anonymous(length: usize, prot: u64) -> Option<usize> {
 /// Anonymous `MAP_FIXED`: place the mapping at an exact virtual address,
 /// replacing any existing mapping in the range.
 pub fn mmap_anonymous_at(length: usize, prot: u64, address: usize) -> Option<usize> {
-    with_group_owner(|task| task.mmap_region(length, prot, Some(address), None, None))?
+    with_group_owner(|task| task.mmap_region(length, prot, Some(address), None, None, false))?
+}
+
+/// Lazily-backed anonymous mapping for the Linux personality: the range is
+/// reserved now and each page is allocated on first access.
+#[cfg(feature = "linux-abi")]
+pub fn mmap_anonymous_lazy(length: usize, prot: u64) -> Option<usize> {
+    with_group_owner(|task| task.mmap_region(length, prot, None, None, None, true))?
+}
+
+/// `MAP_FIXED` form of [`mmap_anonymous_lazy`].
+#[cfg(feature = "linux-abi")]
+pub fn mmap_anonymous_at_lazy(
+    length: usize,
+    prot: u64,
+    address: usize,
+) -> Option<usize> {
+    with_group_owner(|task| task.mmap_region(length, prot, Some(address), None, None, true))?
 }
 
 /// Maps a file-backed region for the current task. `fixed` implements Linux
@@ -3817,6 +3874,12 @@ impl Drop for ForkParts {
             let _ = frame_allocator::free_page_tagged(page, generation);
         }
         for region in &self.mmap {
+            if region.lazy {
+                for &(page, generation) in region.pages.values() {
+                    let _ = frame_allocator::free_page_tagged(page, generation);
+                }
+                continue;
+            }
             if !region.frames.is_empty() {
                 for &(page, generation) in &region.frames {
                     let _ = frame_allocator::free_page_tagged(page, generation);
@@ -3850,8 +3913,16 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
     if !has_task_capacity(manager) {
         return None;
     }
-    let parent_id = current_task_id();
-    let parent_index = smp::current_index();
+    // A plain `fork` may be called from a thread. The child is a single-thread
+    // process whose address space is a copy of the *process* (the group
+    // leader), not of the calling thread, and the leader owns the image,
+    // heap and mmap regions. The resume frame and TLS still come from the
+    // caller.
+    let parent_id = current_tgid();
+    let parent_index = manager
+        .tasks
+        .iter()
+        .position(|task| task.id == parent_id)?;
 
     // Snapshot everything needed from the parent before mutating the table.
     let (
@@ -3876,11 +3947,14 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         parent_priority,
     ) = {
         let parent = manager.tasks.get(parent_index)?;
-        if parent.personality != Personality::Linux || parent.user_image.is_some() {
-            return None;
+        if parent.personality != Personality::Linux || parent.user_image.is_some() { return None;
         }
         (
-            parent.linux_image.as_ref()?.share()?,
+            match parent.linux_image.as_ref()?.share() {
+                Some(image) => image,
+                None => { return None;
+                }
+            },
             parent.user_stack,
             parent.user_stack_generation,
             parent.private_page,
@@ -3901,8 +3975,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             parent.priority,
         )
     };
-    if parent_stack.is_empty() {
-        return None;
+    if parent_stack.is_empty() { return None;
     }
 
     let mut parts = ForkParts {
@@ -3920,19 +3993,16 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         parent_stack.start,
         TASK_USER_STACK_PAGES,
         parent_stack_generation,
-    ) {
-        return None;
+    ) { return None;
     }
     parts.stack = Some((parent_stack.start, parent_stack_generation));
-    if !frame_allocator::share_page_tagged(parent_private, parent_private_generation) {
-        return None;
+    if !frame_allocator::share_page_tagged(parent_private, parent_private_generation) { return None;
     }
     parts.private = Some((parent_private, parent_private_generation));
 
     let mut heap = Vec::with_capacity(parent_heap.len());
     for &(page, generation) in &parent_heap {
-        if !frame_allocator::share_page_tagged(page, generation) {
-            return None;
+        if !frame_allocator::share_page_tagged(page, generation) { return None;
         }
         heap.push((page, generation));
     }
@@ -3942,6 +4012,43 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             // A MAP_SHARED window is not copied: the child maps the same
             // memfd frames writable, so both sides see each other's writes.
             parts.mmap.push(region.clone());
+            continue;
+        }
+        if region.lazy {
+            // Copy the pages the parent has already touched. They hold live
+            // data (a pthread TCB and stack, glibc heaps), so handing the
+            // child a zeroed reservation would make its first libc call
+            // dereference a null TCB field. Untouched pages stay lazy.
+            let mut pages: BTreeMap<u32, (usize, u32)> = BTreeMap::new();
+            for (&offset, &(page, _generation)) in &region.pages {
+                let Some((new_page, new_generation)) =
+                    frame_allocator::alloc_user_page_tagged()
+                else {
+                    for (page, generation) in pages.values() {
+                        let _ = frame_allocator::free_page_tagged(*page, *generation);
+                    }
+                    return None;
+                };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        phys_to_virt(page) as *const u8,
+                        phys_to_virt(new_page) as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+                pages.insert(offset, (new_page, new_generation));
+            }
+            parts.mmap.push(MmapRegion {
+                virtual_address: region.virtual_address,
+                page_count: region.page_count,
+                physical_start: 0,
+                generation: 0,
+                prot: region.prot,
+                shared: SharedMapping::default(),
+                frames: Vec::new(),
+                lazy: true,
+                pages,
+            });
             continue;
         }
         if !region.frames.is_empty() {
@@ -3974,6 +4081,8 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
                 prot: region.prot,
                 shared: SharedMapping::default(),
                 frames: copied,
+                lazy: false,
+                pages: BTreeMap::new(),
             });
             continue;
         }
@@ -3981,8 +4090,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             region.physical_start,
             region.page_count,
             region.generation,
-        ) {
-            return None;
+        ) { return None;
         }
         parts.mmap.push(MmapRegion {
             virtual_address: region.virtual_address,
@@ -3992,11 +4100,23 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             prot: region.prot,
             shared: SharedMapping::default(),
             frames: Vec::new(),
+            lazy: false,
+            pages: BTreeMap::new(),
         });
     }
 
     let heap_frames = parts.heap.len();
-    let mmap_frames: usize = parts.mmap.iter().map(|region| region.page_count).sum();
+    let mmap_frames: usize = parts
+        .mmap
+        .iter()
+        .map(|region| {
+            if region.lazy {
+                region.pages.len()
+            } else {
+                region.page_count
+            }
+        })
+        .sum();
     let ledger_frames = TASK_STACK_PAGES
         + mmu::SPACE_TABLE_FRAMES
         + 1
@@ -4032,8 +4152,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
     let (stack_start, stack_generation) = parts.stack.take()?;
     let (private_page, private_generation) = parts.private.take()?;
     let Some((ttbr0, token)) = mmu::create_task_space(private_page, stack_start, None, true) else {
-        kernel_stack::free(kernel_stack_start);
-        return None;
+        kernel_stack::free(kernel_stack_start); return None;
     };
     parts.space = Some((token, mmu::asid_of(ttbr0) as u32));
     // The space owns the private page now; the stack is data, not a page
@@ -4042,16 +4161,28 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
     parts.stack = Some((stack_start, stack_generation));
 
     if !mmu::install_linux_image(ttbr0, parts.image.as_ref()?) {
-        kernel_stack::free(kernel_stack_start);
-        return None;
+        kernel_stack::free(kernel_stack_start); return None;
     }
     let heap_physical: Vec<usize> = parts.heap.iter().map(|&(page, _)| page).collect();
     if !heap_physical.is_empty() && !mmu::map_shared_user_heap_pages(ttbr0, 0, &heap_physical) {
-        kernel_stack::free(kernel_stack_start);
-        return None;
+        kernel_stack::free(kernel_stack_start); return None;
     }
     for region in &parts.mmap {
-        let mapped = if !region.frames.is_empty() {
+        let mapped = if region.lazy {
+            let mut ok = true;
+            for (&offset, &(page, _generation)) in &region.pages {
+                if !mmu::map_user_page_at(
+                    ttbr0,
+                    region.virtual_address + offset as usize * PAGE_SIZE,
+                    page,
+                    region.prot,
+                ) {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
+        } else if !region.frames.is_empty() {
             // A paged file-backed region was deep-copied above; each frame is
             // mapped separately. Mapping `physical_start` (zero for this
             // variant) would point every page at physical 0, which is exactly
@@ -4087,8 +4218,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             )
         };
         if !mapped {
-            kernel_stack::free(kernel_stack_start);
-            return None;
+            kernel_stack::free(kernel_stack_start); return None;
         }
     }
 
@@ -4111,12 +4241,16 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
                     mmu::PROT_READ,
                 ));
         if !pages_ok {
-            kernel_stack::free(kernel_stack_start);
-            return None;
+            kernel_stack::free(kernel_stack_start); return None;
         }
         for region in &parent_mmap {
             if region.shared.is_some() {
                 // Shared windows stay writable on both sides.
+                continue;
+            }
+            if region.lazy {
+                // Nothing is committed on either side yet; faults allocate
+                // private frames in whichever address space touches first.
                 continue;
             }
             if !region.frames.is_empty() {
@@ -4138,8 +4272,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             }
         }
         if !mmu::protect_cow_image(parent.ttbr0, parts.image.as_ref()?) {
-            kernel_stack::free(kernel_stack_start);
-            return None;
+            kernel_stack::free(kernel_stack_start); return None;
         }
         parent.linux_image.as_mut()?.mark_data_cow();
     }
@@ -4147,8 +4280,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
     let child_id = manager.next_id;
     // Duplicate descriptors last: no fallible step may follow this.
     if !vfs::dup_owner(parent_id, child_id) {
-        kernel_stack::free(kernel_stack_start);
-        return None;
+        kernel_stack::free(kernel_stack_start); return None;
     }
     crate::linux_fd::fork_table(parent_id, child_id);
 
@@ -4230,7 +4362,9 @@ pub enum WaitChild {
 /// child; a positive value matches exactly that pid.
 #[cfg(feature = "linux-abi")]
 pub fn wait_child(pid: i64, nohang: bool) -> WaitChild {
-    let parent = current_task_id();
+    // A thread waits on behalf of its whole process: the child of a fork
+    // performed by any thread is parented to the group leader.
+    let parent = current_tgid();
     let Some(manager) = scheduler_manager() else {
         return WaitChild::NoChild;
     };
@@ -5912,6 +6046,7 @@ impl Task {
         length: usize,
         prot: u64,
         fixed: Option<usize>,
+        lazy: bool,
     ) -> Option<(usize, usize, usize)> {
         // W^X: a single mapping must never be writable and executable at the
         // same time. Validate before placement, frame allocation, PTE
@@ -5969,7 +6104,9 @@ impl Task {
         // Charge the data pages before the frame allocation. Page tables added
         // beyond the fixed space cost at most one L3 per 2 MiB (0.2%), which
         // the flat `SPACE_TABLE_FRAMES` charge covers for budgeting purposes.
-        if !self.charge_frames(page_count) {
+        // A lazy mapping commits nothing here: each page is charged when it
+        // faults in, so an untouched 128 MiB reservation costs only its VA.
+        if !lazy && !self.charge_frames(page_count) {
             return None;
         }
         Some((virtual_address, page_count, span))
@@ -5986,8 +6123,31 @@ impl Task {
         fixed: Option<usize>,
         contents: Option<&[u8]>,
         shared: Option<(usize, SharedMapping)>,
+        lazy: bool,
     ) -> Option<usize> {
-        let (virtual_address, page_count, span) = self.mmap_prepare(length, prot, fixed)?;
+        let (virtual_address, page_count, span) =
+            self.mmap_prepare(length, prot, fixed, lazy)?;
+        if lazy {
+            let region = MmapRegion {
+                virtual_address,
+                page_count,
+                physical_start: 0,
+                generation: 0,
+                prot,
+                shared: SharedMapping::default(),
+                frames: Vec::new(),
+                lazy: true,
+                pages: BTreeMap::new(),
+            };
+            let position = self
+                .mmap_regions
+                .iter()
+                .position(|existing| existing.virtual_address > virtual_address)
+                .unwrap_or(self.mmap_regions.len());
+            self.mmap_regions.insert(position, region);
+            self.mmap_bytes += span;
+            return Some(virtual_address);
+        }
         let (physical_start, generation, owner) = match shared {
             // Frames already owned by a memfd: map them where they are and
             // keep the lifetime handle. They must never be freed here.
@@ -6055,6 +6215,8 @@ impl Task {
             prot,
             shared: owner,
             frames: Vec::new(),
+            lazy: false,
+            pages: BTreeMap::new(),
         };
         let position = self
             .mmap_regions
@@ -6079,7 +6241,8 @@ impl Task {
     where
         F: FnMut(usize, &mut [u8]) -> bool,
     {
-        let (virtual_address, page_count, span) = self.mmap_prepare(length, prot, fixed)?;
+        let (virtual_address, page_count, span) =
+            self.mmap_prepare(length, prot, fixed, false)?;
         let mut frames: Vec<(usize, u32)> = Vec::new();
         if frames.try_reserve(page_count).is_err() {
             self.release_frames(page_count);
@@ -6126,6 +6289,8 @@ impl Task {
             prot,
             shared: SharedMapping::default(),
             frames,
+            lazy: false,
+            pages: BTreeMap::new(),
         };
         let position = self
             .mmap_regions
@@ -6158,7 +6323,7 @@ impl Task {
     }
 
     fn mmap_anonymous(&mut self, length: usize, prot: u64) -> Option<usize> {
-        self.mmap_region(length, prot, None, None, None)
+        self.mmap_region(length, prot, None, None, None, false)
     }
 
     fn mmap_file(
@@ -6168,7 +6333,7 @@ impl Task {
         fixed: Option<usize>,
         contents: &[u8],
     ) -> Option<usize> {
-        self.mmap_region(length, prot, fixed, Some(contents), None)
+        self.mmap_region(length, prot, fixed, Some(contents), None, false)
     }
 
     /// Maps a memfd `MAP_SHARED` window over frames owned by the memfd.
@@ -6192,6 +6357,7 @@ impl Task {
                     owner: Some(owner),
                 },
             )),
+            false,
         )
     }
 
@@ -6208,9 +6374,45 @@ impl Task {
         const CODE: [u8; 12] = [
             0x68, 0x11, 0x80, 0xd2, 0x01, 0x00, 0x00, 0xd4, 0x00, 0x00, 0x20, 0xd4,
         ];
-        let address = self.mmap_region(PAGE_SIZE, mmu::PROT_EXEC, None, Some(&CODE), None)?;
+        let address =
+            self.mmap_region(PAGE_SIZE, mmu::PROT_EXEC, None, Some(&CODE), None, false)?;
         self.signal_trampoline = Some(address);
         Some(address)
+    }
+
+    /// Backs one page of a lazy anonymous region. `esr` decides whether a
+    /// write is permitted; untouched pages are zero-filled.
+    #[cfg(feature = "linux-abi")]
+    fn lazy_page_fault(&mut self, index: usize, page: usize, esr: u64) -> bool {
+        const WNR: u64 = 1 << 6;
+        let prot = self.mmap_regions[index].prot;
+        let write = esr & WNR != 0;
+        if prot == 0 || (write && prot & mmu::PROT_WRITE == 0) {
+            return false;
+        }
+        let offset = ((page - self.mmap_regions[index].virtual_address) / PAGE_SIZE) as u32;
+        if self.mmap_regions[index].pages.contains_key(&offset) {
+            return false;
+        }
+        if !self.charge_frames(1) {
+            return false;
+        }
+        let Some((physical, generation)) = frame_allocator::alloc_user_page_tagged() else {
+            self.release_frames(1);
+            return false;
+        };
+        unsafe {
+            core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, PAGE_SIZE);
+        }
+        if !mmu::map_user_page_at(self.ttbr0, page, physical, prot) {
+            frame_allocator::free_page_tagged(physical, generation);
+            self.release_frames(1);
+            return false;
+        }
+        self.mmap_regions[index]
+            .pages
+            .insert(offset, (physical, generation));
+        true
     }
 
     /// Handles a write to a page shared by `fork`. Copies the containing run,
@@ -6220,11 +6422,26 @@ impl Task {
     #[cfg(feature = "linux-abi")]
     fn cow_fault(&mut self, address: usize, esr: u64) -> bool {
         const WNR: u64 = 1 << 6;
-        if esr & WNR == 0 || self.ttbr0 == 0 {
+        if self.ttbr0 == 0 {
             return false;
         }
         let page = address & !(PAGE_SIZE - 1);
         let ttbr0 = self.ttbr0;
+
+        // A lazily reserved anonymous page backs itself on first access,
+        // read or write. This is how a large `PROT_NONE` reservation from
+        // glibc becomes a usable heap after `mprotect`.
+        if let Some(index) = self.mmap_regions.iter().position(|region| {
+            region.lazy
+                && page >= region.virtual_address
+                && page < region.virtual_address + region.page_count * PAGE_SIZE
+        }) {
+            return self.lazy_page_fault(index, page, esr);
+        }
+
+        if esr & WNR == 0 {
+            return false;
+        }
 
         if let Some(image) = self.linux_image.as_mut() {
             if let Some(run) = image.runs.iter_mut().find(|run| {
@@ -6476,20 +6693,37 @@ impl Task {
                 return false;
             }
             let paged = !self.mmap_regions[index].frames.is_empty();
+            let lazy = self.mmap_regions[index].lazy;
             let removed_physical = physical_start + start_page * PAGE_SIZE;
 
             // Fail closed: `unmap_user_pages_at` is all-or-nothing, so on
-            // failure nothing was unmapped and the region stays tracked.
-            if !mmu::unmap_user_pages_at(self.ttbr0, inter_start, count) {
+            // failure nothing was unmapped and the region stays tracked. A
+            // lazy region has holes and uses the lenient walk.
+            let unmapped = if lazy {
+                mmu::unmap_user_pages_at_lenient(self.ttbr0, inter_start, count)
+            } else {
+                mmu::unmap_user_pages_at(self.ttbr0, inter_start, count)
+            };
+            if !unmapped {
                 MMAP_LEAKED_FRAMES.fetch_add(count, Ordering::Relaxed);
                 console::write_str("MMAP LEAK: range 0x");
-                console::write_hex_u64(removed_physical as u64);
+                console::write_hex_u64(if lazy {
+                    inter_start as u64
+                } else {
+                    removed_physical as u64
+                });
                 console::write_str(" left mapped after refused unmap (");
                 console::write_dec_u64(count as u64);
                 console::write_str(" pages)\r\n");
                 return false;
             }
-            if paged {
+            if lazy {
+                // Only touched pages were ever charged; release exactly the
+                // frames inside the removed range.
+                let freed = self.mmap_regions[index]
+                    .free_pages_range(start_page as u32, count as u32);
+                self.release_frames(freed);
+            } else if paged {
                 // One frame at a time: that is how a file-backed segment was
                 // allocated in the first place.
                 let removed: Vec<(usize, u32)> = self.mmap_regions[index]
@@ -6532,7 +6766,14 @@ impl Task {
                     region.virtual_address = inter_end;
                     region.page_count = right;
                     region.prot = prot;
-                    if !paged {
+                    if lazy {
+                        // Page offsets are relative to the region start.
+                        let shift = (start_page + count) as u32;
+                        let pages = core::mem::take(&mut region.pages);
+                        for (key, value) in pages {
+                            region.pages.insert(key - shift, value);
+                        }
+                    } else if !paged {
                         region.physical_start = removed_physical + count * PAGE_SIZE;
                     }
                 }
@@ -6541,7 +6782,10 @@ impl Task {
                     tail.virtual_address = inter_end;
                     tail.page_count = right;
                     tail.prot = prot;
-                    if paged {
+                    if lazy {
+                        tail.pages = self.mmap_regions[index]
+                            .take_pages_from((start_page + count) as u32);
+                    } else if paged {
                         // The drain above left left+right frames; split the
                         // tail off after the retained prefix.
                         tail.frames = self.mmap_regions[index].frames.split_off(start_page);
@@ -6553,7 +6797,9 @@ impl Task {
                 }
             }
             self.mmap_bytes = self.mmap_bytes.saturating_sub(count * PAGE_SIZE);
-            self.release_frames(count);
+            if !lazy {
+                self.release_frames(count);
+            }
         }
         true
     }
@@ -6606,7 +6852,9 @@ impl Task {
             if self.mmap_regions.len() + 2 > MAX_MMAP_REGIONS {
                 return false;
             }
-            if !mmu::protect_user_pages_at(self.ttbr0, address, page_count, prot) {
+            // Lazy reservations may not have a frame behind every page yet;
+            // a lenient walk records the protection for the ones that do.
+            if !mmu::protect_user_pages_at_lenient(self.ttbr0, address, page_count, prot) {
                 return false;
             }
             if !self.split_region_at(address) || !self.split_region_at(end) {
@@ -6694,7 +6942,9 @@ impl Task {
         let mut tail = self.mmap_regions[index].clone();
         tail.virtual_address = address;
         tail.page_count = self.mmap_regions[index].page_count - offset_pages;
-        if tail.frames.is_empty() {
+        if tail.lazy {
+            tail.pages = self.mmap_regions[index].take_pages_from(offset_pages as u32);
+        } else if tail.frames.is_empty() {
             tail.physical_start =
                 self.mmap_regions[index].physical_start + offset_pages * PAGE_SIZE;
         } else {
@@ -6831,10 +7081,25 @@ fn release_space_resources(
     dma_revokes: &[(usize, usize, mmu::RevokeResult)],
 ) {
     for region in &resources.mmap_regions {
-        if mmu::unmap_user_pages_at(resources.ttbr0, region.virtual_address, region.page_count) {
+        let unmapped = if region.lazy {
+            mmu::unmap_user_pages_at_lenient(resources.ttbr0, region.virtual_address, region.page_count)
+        } else {
+            mmu::unmap_user_pages_at(resources.ttbr0, region.virtual_address, region.page_count)
+        };
+        if unmapped {
             if region.shared.is_some() {
                 // The memfd owns these frames; dropping `region.shared` above
                 // drops this mapping's reference to the file.
+                continue;
+            }
+            if region.lazy {
+                for &(page, generation) in region.pages.values() {
+                    if !frame_allocator::free_page_tagged(page, generation) {
+                        console::write_str("MMAP: release refused page 0x");
+                        console::write_hex_u64(page as u64);
+                        console::write_str(" - leaked\r\n");
+                    }
+                }
                 continue;
             }
             if !region.frames.is_empty() {
@@ -6857,7 +7122,11 @@ fn release_space_resources(
             // safe outcome.
             MMAP_LEAKED_FRAMES.fetch_add(region.page_count, Ordering::Relaxed);
             console::write_str("MMAP LEAK: teardown could not unmap range 0x");
-            console::write_hex_u64(region.physical_start as u64);
+            console::write_hex_u64(if region.lazy {
+                region.virtual_address as u64
+            } else {
+                region.physical_start as u64
+            });
             console::write_str(" (");
             console::write_dec_u64(region.page_count as u64);
             console::write_str(" pages)\r\n");

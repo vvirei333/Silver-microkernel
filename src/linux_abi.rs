@@ -158,6 +158,7 @@ const AF_UNIX: u64 = 1;
 const SOL_SOCKET: u64 = 1;
 const SCM_RIGHTS: u64 = 1;
 const SOCK_NONBLOCK: u64 = 0o4000;
+const SOCK_CLOEXEC: u64 = 0o2000000;
 const MSG_DONTWAIT: u64 = 0x40;
 const MSG_CTRUNC: i32 = 0x8;
 
@@ -174,6 +175,16 @@ const S_IFREG: u32 = 0o100000;
 pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
     let number = frame[8];
     let args = [frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]];
+    let result = dispatch_inner(frame, number, args);
+
+    result
+}
+
+fn dispatch_inner(
+    frame: &mut [u64; crate::syscall::FRAME_QUADWORDS],
+    number: u64,
+    args: [u64; 6],
+) -> u64 {
     match number {
         SYS_WRITE => linux_write(args[0], args[1], args[2]),
         SYS_WRITEV => linux_writev(args[0], args[1], args[2]),
@@ -390,6 +401,10 @@ fn linux_execve(
     let Some(result) = scheduler::exec_linux_current(image, argv, envp) else {
         return errno(ENOMEM);
     };
+    // A successful exec closes every `FD_CLOEXEC` descriptor. Rust's
+    // `Command::spawn` relies on this to close the child end of its
+    // exec-error socketpair and unblock the parent.
+    linux_fd::close_cloexec(scheduler::current_task_id());
     // ELR is frame word 31 (x0-x30, ELR, SPSR). The user stack pointer lives
     // in SP_EL0, which the trampoline does not touch.
     frame[31] = result.entry as u64;
@@ -543,7 +558,10 @@ fn linux_epoll_wait(
     max_events: u64,
     timeout_ms: i64,
 ) -> u64 {
-    if max_events == 0 || max_events > 64 {
+    // glibc's `epoll_pwait` asks for 1024 slots; only the entries actually
+    // ready are written, so any user-chosen size is safe here. Reject only a
+    // zero or absurd request.
+    if max_events == 0 || max_events > 65_536 {
         return errno(EINVAL);
     }
     let ready = match linux_fd::epoll_wait(
@@ -663,11 +681,21 @@ fn linux_timerfd_gettime(fd: u64, current_pointer: u64) -> u64 {
     0
 }
 
-fn linux_pipe2(fds_pointer: u64, _flags: u64) -> u64 {
+fn linux_pipe2(fds_pointer: u64, flags: u64) -> u64 {
+    const O_NONBLOCK: u64 = 0o4000;
+    const O_CLOEXEC: u64 = 0o2000000;
     let task = scheduler::current_task_id();
     let Ok((read_fd, write_fd)) = linux_fd::pipe(task) else {
         return errno(EMFILE);
     };
+    if flags & O_NONBLOCK != 0 {
+        let _ = linux_fd::set_nonblock(task, read_fd, true);
+        let _ = linux_fd::set_nonblock(task, write_fd, true);
+    }
+    if flags & O_CLOEXEC != 0 {
+        let _ = linux_fd::set_cloexec(task, read_fd, true);
+        let _ = linux_fd::set_cloexec(task, write_fd, true);
+    }
     let mut pair = [0_u8; 8];
     pair[..4].copy_from_slice(&(read_fd as u32).to_le_bytes());
     pair[4..].copy_from_slice(&(write_fd as u32).to_le_bytes());
@@ -907,13 +935,21 @@ fn linux_socketpair(domain: u64, kind: u64, protocol: u64, pair: u64) -> u64 {
         return errno(EAFNOSUPPORT);
     }
     let base = kind & 0xf;
-    if (base != 1 && base != 2) || protocol != 0 {
+    // Rust's `Command` creates its exec-error channel with
+    // `socketpair(AF_UNIX, SOCK_SEQPACKET|SOCK_CLOEXEC)`. The kernel keeps
+    // byte-stream semantics internally, which is sufficient for that channel
+    // and for every other `socketpair` user we have.
+    if (base != 1 && base != 2 && base != 5) || protocol != 0 {
         return errno(EPROTONOSUPPORT);
     }
     let nonblock = kind & SOCK_NONBLOCK != 0;
     let task = scheduler::current_task_id();
     match linux_fd::socketpair(task, nonblock) {
         Ok((first, second)) => {
+            if kind & SOCK_CLOEXEC != 0 {
+                let _ = linux_fd::set_cloexec(task, first, true);
+                let _ = linux_fd::set_cloexec(task, second, true);
+            }
             let mut raw = [0_u8; 8];
             raw[..4].copy_from_slice(&(first as i32).to_le_bytes());
             raw[4..].copy_from_slice(&(second as i32).to_le_bytes());
@@ -1190,6 +1226,10 @@ fn linux_getsockopt(fd: u64, level: u64, name: u64, value: u64, length: u64) -> 
             return errno(EINVAL);
         }
         let mut credentials = [0_u8; 12];
+        // zbus asks for peer credentials while negotiating a private
+        // connection; a zero pid is "unknown" and some peers reject it.
+        let pid = scheduler::current_task_id().min(u32::MAX as u64) as u32;
+        credentials[0..4].copy_from_slice(&pid.to_le_bytes());
         credentials[4..8].copy_from_slice(&0u32.to_le_bytes()); // uid
         credentials[8..12].copy_from_slice(&0u32.to_le_bytes()); // gid
         if value != 0 && user_memory::copy_to_user(&credentials, value).is_err() {
@@ -1466,6 +1506,27 @@ fn linux_writev(fd: u64, iovec: u64, count: u64) -> u64 {
 /// console. Everything else reports "not a tty".
 fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
     const TIOCGWINSZ: u64 = 0x5413;
+    const FIONBIO: u64 = 0x5421;
+    let task = scheduler::current_task_id();
+    // Rust's runtime (and socket2) set non-blocking through `ioctl(FIONBIO)`
+    // on sockets and pipes. The fd is not a terminal, so the tty branch below
+    // must not answer EBADF for it.
+    if request == FIONBIO {
+        if linux_fd::status_flags(task, fd).is_none() {
+            return errno(EBADF);
+        }
+        let mut raw = [0_u8; 4];
+        if user_memory::copy_from_user(argument, &mut raw).is_err() {
+            return errno(EFAULT);
+        }
+        let enabled = u32::from_le_bytes(raw) != 0;
+        return match linux_fd::set_nonblock(task, fd, enabled) {
+            // A file-backed descriptor is always "ready"; treat the request
+            // as a successful no-op like Linux does for regular files.
+            Ok(()) => 0,
+            Err(_) => 0,
+        };
+    }
     if fd > 2 {
         return errno(EBADF);
     }
@@ -1602,15 +1663,18 @@ fn linux_fcntl(fd: u64, command: u64, argument: u64) -> u64 {
     const F_DUPFD_CLOEXEC: u64 = 1030;
     let task = scheduler::current_task_id();
     match command {
-        F_DUPFD | F_DUPFD_CLOEXEC => finish(linux_fd::dup_from(task, fd, argument)),
-        // We do not model descriptor or status flags yet; report "none" and
-        // accept changes as no-ops.
-        F_GETFD => 0,
+        F_DUPFD => finish(linux_fd::dup_from(task, fd, argument, false)),
+        F_DUPFD_CLOEXEC => finish(linux_fd::dup_from(task, fd, argument, true)),
+        F_GETFD => match linux_fd::get_cloexec(task, fd) {
+            Ok(true) => 1,
+            Ok(false) => 0,
+            Err(code) => errno(code),
+        },
         F_GETFL => match linux_fd::status_flags(task, fd) {
             Some(flags) => flags,
             None => errno(EBADF),
         },
-        F_SETFD => 0,
+        F_SETFD => finish(linux_fd::set_cloexec(task, fd, argument & 1 != 0).map(|_| 0)),
         F_SETFL => {
             let _ = linux_fd::set_nonblock(task, fd, argument & 0x800 != 0);
             0
@@ -2061,8 +2125,22 @@ fn linux_mmap(
     };
 
     if flags & MAP_ANONYMOUS != 0 {
+        // A pure `PROT_NONE` reservation commits nothing on Linux; glibc's
+        // 128 MiB `new_heap` probe must succeed even when the process already
+        // has many library mappings, and ld.so reserves whole library spans
+        // this way before `MAP_FIXED`-mapping the segments over them. Such a
+        // range is tracked lazily and backed only after `mprotect` makes a
+        // part of it accessible. Every other anonymous mapping stays eager,
+        // so the common path changes neither layout nor timing.
+        let lazy = prot == 0;
         let placed = match fixed {
-            Some(address) => scheduler::mmap_anonymous_at(length as usize, prot, address),
+            Some(address) if lazy => {
+                scheduler::mmap_anonymous_at_lazy(length as usize, prot, address)
+            }
+            Some(address) => {
+                scheduler::mmap_anonymous_at(length as usize, prot, address)
+            }
+            None if lazy => scheduler::mmap_anonymous_lazy(length as usize, prot),
             None => scheduler::mmap_anonymous(length as usize, prot),
         };
         return placed.map(|placed| placed as u64).unwrap_or(errno(ENOMEM));

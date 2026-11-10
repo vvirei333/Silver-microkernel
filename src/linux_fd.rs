@@ -266,6 +266,10 @@ enum Target {
 struct Table {
     task: u64,
     slots: Vec<Option<Target>>,
+    /// Descriptor numbers carrying `FD_CLOEXEC`. `execve` closes exactly
+    /// these, which is how Rust's `Command` learns that `execvp` succeeded
+    /// (the parent reads EOF from the exec-error socketpair).
+    cloexec: Vec<u64>,
 }
 
 static TABLES: Mutex<Vec<Table>> = Mutex::new(Vec::new());
@@ -282,7 +286,11 @@ fn with_table<R>(task: u64, action: impl FnOnce(&mut Table) -> R) -> R {
             slots.push(Some(Target::Console));
             slots.push(Some(Target::Console));
             slots.push(Some(Target::Console));
-            tables.push(Table { task, slots });
+            tables.push(Table {
+                task,
+                slots,
+                cloexec: Vec::new(),
+            });
             tables.len() - 1
         }
     };
@@ -501,8 +509,11 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
 pub fn close(task: u64, fd: u64) -> Result<(), u64> {
     let task = crate::scheduler::fd_table_owner(task);
     let target = with_table(task, |table| {
-        let slot = table.slots.get_mut(fd as usize)?;
-        slot.take()
+        let slot = table.slots.get_mut(fd as usize)?.take();
+        if slot.is_some() {
+            table.cloexec.retain(|&marked| marked != fd);
+        }
+        slot
     })
     .ok_or(EBADF)?;
     target.release_endpoint();
@@ -519,11 +530,61 @@ pub fn dup(task: u64, fd: u64) -> Result<u64, u64> {
     Ok(new_fd)
 }
 
-pub fn dup_from(task: u64, fd: u64, minimum: u64) -> Result<u64, u64> {
+pub fn dup_from(task: u64, fd: u64, minimum: u64, cloexec: bool) -> Result<u64, u64> {
     let target = lookup(task, fd).ok_or(EBADF)?;
     let new_fd = insert_from(task, target.clone(), minimum).ok_or(EMFILE)?;
     target.retain_endpoint();
+    if cloexec {
+        let _ = set_cloexec(task, new_fd, true);
+    }
     Ok(new_fd)
+}
+
+/// `fcntl(F_GETFD)`: reports `FD_CLOEXEC`.
+pub fn get_cloexec(task: u64, fd: u64) -> Result<bool, u64> {
+    with_table(task, |table| {
+        if table.slots.get(fd as usize).and_then(|slot| slot.as_ref()).is_none() {
+            return Err(EBADF);
+        }
+        Ok(table.cloexec.contains(&fd))
+    })
+}
+
+/// `fcntl(F_SETFD)`.
+pub fn set_cloexec(task: u64, fd: u64, enabled: bool) -> Result<(), u64> {
+    with_table(task, |table| {
+        if table.slots.get(fd as usize).and_then(|slot| slot.as_ref()).is_none() {
+            return Err(EBADF);
+        }
+        table.cloexec.retain(|&marked| marked != fd);
+        if enabled {
+            table.cloexec.push(fd);
+        }
+        Ok(())
+    })
+}
+
+/// Closes every descriptor marked `FD_CLOEXEC`. Called after a successful
+/// `execve`, exactly like the kernel does on exec.
+pub fn close_cloexec(task: u64) {
+    let task = crate::scheduler::fd_table_owner(task);
+    let targets: Vec<Target> = with_table(task, |table| {
+        let mut closed = Vec::new();
+        for fd in core::mem::take(&mut table.cloexec) {
+            if let Some(slot) = table.slots.get_mut(fd as usize) {
+                if let Some(target) = slot.take() {
+                    closed.push(target);
+                }
+            }
+        }
+        closed
+    });
+    for target in targets {
+        target.release_endpoint();
+        if let Target::Vfs(vfs_fd) = target {
+            let _ = vfs::close(task, vfs_fd);
+        }
+    }
 }
 
 pub fn dup2(task: u64, oldfd: u64, newfd: u64) -> Result<u64, u64> {
@@ -551,7 +612,10 @@ pub fn dup2(task: u64, oldfd: u64, newfd: u64) -> Result<u64, u64> {
         }
     }
     target.retain_endpoint();
-    with_table(task, |table| table.slots[newfd as usize] = Some(target));
+    with_table(task, |table| {
+        table.slots[newfd as usize] = Some(target);
+        table.cloexec.retain(|&marked| marked != newfd);
+    });
     Ok(newfd)
 }
 
@@ -1410,7 +1474,9 @@ pub fn socketpair(task: u64, nonblock: bool) -> Result<(u64, u64), u64> {
         return Err(EMFILE);
     };
     match insert(task, second.clone()) {
-        Some(second_fd) => Ok((first_fd, second_fd)),
+        Some(second_fd) => {
+            Ok((first_fd, second_fd))
+        }
         None => {
             second.release_endpoint();
             let _ = close(task, first_fd);
@@ -1920,8 +1986,13 @@ pub fn fork_table(parent: u64, child: u64) {
     for slot in slots.iter().flatten() {
         slot.retain_endpoint();
     }
+    let cloexec = source.cloexec.clone();
     tables.retain(|table| table.task != child);
-    tables.push(Table { task: child, slots });
+    tables.push(Table {
+        task: child,
+        slots,
+        cloexec,
+    });
 }
 
 pub(crate) fn write_stat(buffer: u64, mode: u32, size: u64, ino: u64) -> Result<(), u64> {

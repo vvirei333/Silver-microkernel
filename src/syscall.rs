@@ -669,7 +669,10 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
             // gdk-pixbuf on Arch is built against glycin; its loaders live
             // under the SFS root, and bubblewrap is unavailable here.
             b"GLYCIN_DATA_DIR=/sfs/share".to_vec(),
-            b"GLYCIN_DISABLE_SANDBOX=1".to_vec(),
+            // glycin only honours this exact value; "1" leaves the bwrap
+            // sandbox enabled and the loader is then spawned through a
+            // namespace tool this kernel does not provide.
+            b"GLYCIN_DISABLE_SANDBOX=i-know-the-risks".to_vec(),
         ];
         scheduler::spawn_linux_elf_with_args(image, policy.write_prefix, policy.quota, argv, envp)
             .unwrap_or(SYSCALL_ERROR)
