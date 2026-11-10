@@ -3591,3 +3591,71 @@ for the load of the library that owns `0x40E39000` and check whether its RW
 segment mapping was ever issued and recorded, or whether a later `munmap` of
 a lazy reservation removed it. The fault handler only consults
 `mmap_regions`, so the diagnostic should also print `linux_image.runs`.
+
+### MMU: non-global user mappings and ASID reuse
+
+Two TLB correctness fixes while chasing heap corruption:
+
+- Every user leaf descriptor now sets the **nG** bit (bit 11). Without it a
+  translation was global, so the per-space flush (`tlbi aside1is`) after a PTE
+  edit could not invalidate it.
+- `alloc_asid` broadcasts `tlbi vmalle1is` before handing a recycled ASID to
+  a new address space. All tasks map the same user VAs (image, heap, stack);
+  a stale entry from the previous owner would alias the new space into a
+  frame it does not own.
+
+Existing tests (`linux-memfd`, `linux-threadfork`, `linux-futexping`, the
+two-client Wayland test, host unit tests) stay green, and glycin still
+decodes the 64x64 PNG.
+
+### Still open: silent zeroing of a heap page
+
+A minimal repro remains:
+
+```c
+for (round = 0; round < 20000; round++) {
+    block = malloc(200 * 1024);
+    memset(block, pattern, 200 * 1024);
+    verify every 97th byte;
+    free(block);
+}
+```
+
+`chunktest` fails after a few hundred rounds: one byte in the middle of the
+block reads 0 (sometimes 0x18, a glibc chunk-header value). Facts gathered:
+
+- single-threaded, so no concurrent malloc user;
+- the page's PTE stays stable for the whole run (checked with a debug syscall
+  returning the physical frame);
+- no user allocation/free path ever reports reusing a heap frame;
+- disabling trim and raising the mmap threshold does not help;
+- removing the virtio-net device does not help;
+- the earlier "freeing heap frame" diagnostic was a **false positive**: the
+  owner scan matched the mmap region that was being unmapped.
+- `brktest` (same 200 KB block written and verified without malloc) can pass
+  2000 rounds, but is not a reliable control.
+
+Next probe: extend the ownership audit to **kernel allocations** (page-table
+frames via the table registry, kernel linear-map writes) or run QEMU with a
+watchpoint on the physical frame. A shadow allocation bitmap inside the frame
+allocator would also catch a double grant directly.
+
+### gdk-pixbuf still refuses PNG
+
+`gdk-pixbuf` lists `image/png` (28 formats) but `gdk_pixbuf_new_from_file`
+still says "Couldn't recognize the image file format". `mmap(MAP_PRIVATE)` of
+`/sfs/test.png` is byte-identical to `pread` (checked), and glycin decodes the
+same file through file/stream/bytes. The next probe is
+`gdk_pixbuf_get_file_info` (does the sniff succeed?) and whether the format
+entry has a working module: the aarch64 build may expect a
+`libpixbufloader-glycin.so`/cache the image does not have, while the host
+build registers the glycin formats in code.
+
+Additional fact from the corruption probe: glibc only calls
+`madvise(heap, 2 MiB, MADV_DONTDUMP)` (advice 14), which is a dump filter and
+correctly a no-op here, so trimming/`MADV_DONTNEED` is not involved. The bad
+byte is sometimes an **older round's pattern**, i.e. the frame keeps or
+acquires content this process wrote in an earlier pass; that points at an
+aliased live mapping rather than a lost store. The kernel allocation audit
+did not find a user-side double grant, so page-table frames and other
+kernel-side allocations are the remaining suspects, or a device write.

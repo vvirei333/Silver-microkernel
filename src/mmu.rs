@@ -254,6 +254,10 @@ const AP_EL1_RW: u64 = 0b00 << 6;
 const AP_EL0_RW: u64 = 0b01 << 6;
 const AP_BOTH_RO: u64 = 0b11 << 6;
 const AF: u64 = 1 << 10;
+/// Non-global: this translation belongs to the ASID in TTBR0. Without it the
+/// per-space flushes (`tlbi ... aside1`) would not invalidate the entry and a
+/// translation cached for another address space could satisfy this VA.
+const NG: u64 = 1 << 11;
 const SH_NONE: u64 = 0b00 << 8;
 const SH_INNER: u64 = 0b11 << 8;
 const UXN: u64 = 1 << 54;
@@ -304,20 +308,38 @@ impl AsidPool {
 static ASIDS: SpinLock<AsidPool> = SpinLock::new(AsidPool::new());
 
 fn alloc_asid() -> Option<u16> {
-    let mut pool = ASIDS.lock();
-    pool.live[0] |= 1; // reserve ASID 0 for the boot/kernel TTBR0
-    for word in 0..ASID_WORDS {
-        let free = !pool.live[word];
-        if free != 0 {
-            let bit = free.trailing_zeros() as usize;
-            pool.live[word] |= 1u64 << bit;
-            let asid = (word * 64 + bit) as u16;
-            if asid != 0 {
-                return Some(asid);
+    let asid = {
+        let mut pool = ASIDS.lock();
+        pool.live[0] |= 1; // reserve ASID 0 for the boot/kernel TTBR0
+        let mut found = None;
+        for word in 0..ASID_WORDS {
+            let free = !pool.live[word];
+            if free != 0 {
+                let bit = free.trailing_zeros() as usize;
+                pool.live[word] |= 1u64 << bit;
+                let candidate = (word * 64 + bit) as u16;
+                if candidate != 0 {
+                    found = Some(candidate);
+                    break;
+                }
             }
         }
+        found
+    }?;
+    // A released ASID can still have cached translations from the address
+    // space that used it before. Every task maps the same user VAs (image,
+    // heap, stack), so a stale entry would alias the new space into a frame
+    // it does not own. Invalidate the ASID on every PE before first use.
+    unsafe {
+        core::arch::asm!(
+            "dsb ishst",
+            "tlbi vmalle1is",
+            "dsb ish",
+            "isb",
+            options(nostack),
+        );
     }
-    None
+    Some(asid)
 }
 
 fn release_asid(asid: u16) {
@@ -3169,6 +3191,7 @@ fn user_text_page(output_address: usize) -> u64 {
         | AP_BOTH_RO
         | SH_INNER
         | AF
+        | NG
         | PXN
 }
 
@@ -3185,6 +3208,7 @@ fn user_data_page(output_address: usize) -> u64 {
         | AP_EL0_RW
         | SH_INNER
         | AF
+        | NG
         | UXN
         | PXN
 }
@@ -3200,6 +3224,7 @@ fn user_anonymous_page(output_address: usize, prot: u64) -> u64 {
         | (ATTR_NORMAL << 2)
         | SH_INNER
         | AF
+        | NG
         | PXN;
     if prot & PROT_WRITE != 0 {
         descriptor |= AP_EL0_RW;
@@ -3220,6 +3245,7 @@ fn user_device_page(output_address: usize) -> u64 {
         | AP_EL0_RW
         | SH_NONE
         | AF
+        | NG
         | UXN
         | PXN
 }
@@ -3232,6 +3258,7 @@ fn user_dma_page(output_address: usize) -> u64 {
         | AP_EL0_RW
         | SH_INNER
         | AF
+        | NG
         | UXN
         | PXN
 }
