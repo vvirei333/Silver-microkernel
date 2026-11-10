@@ -1517,21 +1517,38 @@ fn print_size(bytes: u64) {
 }
 
 fn print_logo() {
-    let start = LOGO
-        .lines()
-        .position(|line| !line.trim().is_empty())
-        .unwrap_or(0);
-    let end = LOGO
-        .lines()
-        .enumerate()
-        .filter(|(_, line)| !line.trim().is_empty())
-        .map(|(index, _)| index + 1)
-        .last()
-        .unwrap_or(start);
-
-    for line in LOGO.lines().skip(start).take(end - start) {
-        syscall::print(line.trim_end());
-        syscall::print("\r\n");
+    // Deliberately no `Lines`/`trim` iterator chain here. The optimizer used
+    // to leave the iterator's `start` field in an unwritten stack slot, and on
+    // some boots it picked up a stale pointer; `str::trim` then read it and
+    // killed the shell before the prompt (intermittent since the userspace
+    // image layout changed). A plain byte scan has no such state.
+    let bytes = LOGO.as_bytes();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        let mut end = start;
+        while end < bytes.len() && bytes[end] != b'\n' {
+            end += 1;
+        }
+        let mut content = false;
+        for &byte in &bytes[start..end] {
+            if byte != b' ' && byte != b'\r' && byte != b'\t' {
+                content = true;
+                break;
+            }
+        }
+        if content {
+            let mut trimmed = end;
+            while trimmed > start
+                && (bytes[trimmed - 1] == b' ' || bytes[trimmed - 1] == b'\r')
+            {
+                trimmed -= 1;
+            }
+            if let Ok(line) = core::str::from_utf8(&bytes[start..trimmed]) {
+                syscall::print(line);
+            }
+            syscall::print("\r\n");
+        }
+        start = end.saturating_add(1);
     }
 }
 

@@ -666,6 +666,10 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
             // The SFS root is mounted at /sfs, so that is where shared
             // libraries live. A real distro would use /lib and /usr/lib.
             b"LD_LIBRARY_PATH=/sfs".to_vec(),
+            // gdk-pixbuf on Arch is built against glycin; its loaders live
+            // under the SFS root, and bubblewrap is unavailable here.
+            b"GLYCIN_DATA_DIR=/sfs/share".to_vec(),
+            b"GLYCIN_DISABLE_SANDBOX=1".to_vec(),
         ];
         scheduler::spawn_linux_elf_with_args(image, policy.write_prefix, policy.quota, argv, envp)
             .unwrap_or(SYSCALL_ERROR)

@@ -3312,3 +3312,37 @@ these changes, and the updated 256 MiB image is saved at
    another framebuffer) so the host viewer shows the desktop.
 3. **wlroots protocol set** for Phosh: layer-shell, screencopy,
    foreign-toplevel, output-management, idle-inhibit, gamma-control, etc.
+
+### Boot flakiness fixed: `print_logo`'s iterator state
+
+The intermittent pre-prompt shell fault (~1 in 3 boots on the 64 MiB image)
+was finally caught with a saved-x30 print. The caller was `fastfetch`, and
+the faulting `trim_matches` received `x0=0x4000F416`, `x1=0xFFFFFFFFFFFF8DB1`.
+`print_logo`'s `LOGO.lines().position(...).filter(...).skip(...).take(...)`
+chain had its `start` field spilled to an **unwritten stack slot**
+(`fastfetch+0x134: ldr x9, [sp,#200]`, no store anywhere in the frame);
+on some boots that slot held a stale pointer, and `Lines::next` computed
+`haystack + start` from it. `print_logo` is now a plain byte scan with no
+`Lines`/`trim` state. **10/10 clean boots** afterwards, up from ~2/3.
+
+### Glycin image loader: shipped, but the D-Bus handshake hangs
+
+`gdk-pixbuf` 2.44.8 is glycin-only on Arch. The loader was shipped at
+`/sfs/usr/lib/glycin-loaders/2+/glycin-image-rs` (interpreter patched to
+`/sfs/ld-linux-aarch64.so.1`), its config rewritten to that path under
+`/sfs/share/glycin-loaders/2+/conf.d`, and the launcher exports
+`GLYCIN_DATA_DIR=/sfs/share` + `GLYCIN_DISABLE_SANDBOX=1`. `glycintest`
+now finds the loader directory and **spawns the loader task**, which exits
+0, but the parent stays blocked: glycin passes a private GDBus connection
+via `--dbus-fd` and waits for the first D-Bus message. The next probe is
+`SO_PEERCRED`/socketpair behaviour in the Linux socket layer; until that
+works, GTK windows must stay undecorated (no CSD icons) and real apps
+cannot load PNG icons.
+
+### Next: present the frame
+
+The compositor still verifies shm frames instead of displaying them. The
+next architectural step is a display sink: either a `/dev/ivshmem`-style
+mmap for Linux compositors, or a native presenter that receives the
+composited surface. Only after that does Phosh's layer-shell work become
+visible.
