@@ -4546,6 +4546,18 @@ pub fn fs_quota_allows(add_blocks: u32, add_inodes: u32) -> bool {
             .is_some_and(|total| total <= max_inodes)
 }
 
+/// Maps the host-shared ivshmem window into the current Linux task. The BAR
+/// is programmed once by [`crate::ivshmem::ensure`]; each task gets its own
+/// Non-Cacheable user mapping in the MMIO window.
+#[cfg(feature = "linux-abi")]
+pub fn map_ivshmem(length: usize) -> Option<usize> {
+    if length == 0 || length > crate::ivshmem::BAR_SIZE {
+        return None;
+    }
+    let base = crate::ivshmem::ensure()?;
+    with_group_owner(|task| mmu::map_phys_nc_to_user(task, base, length))?
+}
+
 pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
     map_phys_to_current_mode(phys_addr, size, false)
 }

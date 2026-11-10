@@ -10,7 +10,7 @@ use crate::{exceptions, frame_allocator, memory, console};
 /// per-file cap below is 8 MiB. The old 2 MiB heap could not hold a real
 /// `libc.so.6` (about 2.2 MiB). The demo resource probe still needs at least
 /// 512 pages for its 512 KiB `RamFs` growth; this is strictly more.
-pub const HEAP_PAGES: usize = 4096;
+pub const HEAP_PAGES: usize = 8192;
 pub const HEAP_SIZE: usize = HEAP_PAGES * crate::memory::PAGE_SIZE;
 
 struct KernelAllocator {

@@ -305,6 +305,11 @@ static int verified;
 static unsigned commits;
 static int buffer_width;
 static int buffer_height;
+static unsigned buffer_offset;
+static unsigned buffer_stride;
+static unsigned buffer_format;
+static unsigned char *screen;
+static unsigned screen_seq;
 #ifdef SERVE_ONLY
 static int frame_reported;
 #endif
@@ -730,7 +735,7 @@ static int serve(long client) {
                 fractional_id = take_u32(); /* get_fractional_scale */
                 (void)take_u32(); /* surface */
                 begin(fractional_id, 0 /* preferred_scale */);
-                put_u32(240); /* 2.0 */
+                put_u32(240); /* 2.0: logical 512x384 -> 1024x768 buffer */
                 finish(); send_message(client, -1);
             } else if (object == fractional_id && opcode == 0) {
                 fractional_id = 0;
@@ -887,9 +892,9 @@ static int serve(long client) {
                 /* xdg_surface.get_toplevel(new_id): send configure. */
                 toplevel_id = take_u32();
                 begin(toplevel_id, 0 /* xdg_toplevel.configure */);
-                put_i32(8); /* width */
-                put_i32(8); /* height */
-                put_u32(0); /* states array: empty */
+                put_i32(512); /* width: logical; scale 2 -> 1024 px */
+                put_i32(384);  /* height: scale 2 -> 768 px */
+                put_u32(0);    /* states array: empty */
                 finish();
                 send_message(client, -1);
                 begin(xdg_surface_id, 0 /* xdg_surface.configure */);
@@ -965,11 +970,11 @@ static int serve(long client) {
                 }
             } else if (object == pool_id && opcode == 0) {
                 buffer_id = take_u32(); /* create_buffer */
-                (void)take_i32();
-                buffer_width = take_i32();
-                buffer_height = take_i32();
-                (void)take_i32();
-                (void)take_u32();
+                buffer_offset = take_u32();
+                buffer_width = (int)take_u32();
+                buffer_height = (int)take_u32();
+                buffer_stride = take_u32();
+                buffer_format = take_u32();
             } else if (is_surface(object) && opcode == 0) {
                 /* wl_surface.destroy: drop focus with leave events. */
                 surface_ids[object] = 0;
@@ -1043,6 +1048,7 @@ static int serve(long client) {
                     send_message(client, -1);
                 }
                 if (pool_fd >= 0 && buffer_id != 0) {
+                    commits += 1;
 #ifdef SERVE_ONLY
                     if (!frame_reported) {
                         frame_reported = 1;
@@ -1050,8 +1056,60 @@ static int serve(long client) {
                             "gtk-serve: shm frame committed\n";
                         sys3(64, 1, (long)frame_msg, sizeof(frame_msg) - 1);
                     }
-#endif
-                    /* fallthrough */
+                    if (screen != 0 && buffer_width > 0 && buffer_height > 0 &&
+                        buffer_stride >= (unsigned)buffer_width * 4) {
+                        unsigned length = buffer_offset +
+                                          buffer_stride * (unsigned)buffer_height;
+                        long mapped = sys6(222 /* mmap */, 0, length,
+                                           1 /* read */, 1 /* MAP_SHARED */,
+                                           pool_fd, 0);
+                        if (mapped > 0) {
+                            /* The WIN1 header owns the first 4 KiB, so a
+                               4 MiB BAR holds 4 MiB - 4 KiB of pixels. A
+                               1024x1024 GTK frame is exactly the whole BAR
+                               and used to run off the mapping by one page. */
+                            unsigned max_pixels = (4u * 1024u * 1024u - 0x1000u) / 4u;
+                            unsigned rows = (unsigned)buffer_height;
+                            if ((unsigned)buffer_width * rows > max_pixels) {
+                                rows = max_pixels / (unsigned)buffer_width;
+                            }
+                            if (screen_seq == 0) {
+                                *(volatile unsigned *)(screen + 0x00) = 0x57494E31u;
+                                *(volatile unsigned *)(screen + 0x08) = (unsigned)buffer_width;
+                                *(volatile unsigned *)(screen + 0x0C) = rows;
+                                *(volatile unsigned *)(screen + 0x10) = (unsigned)buffer_width * 4;
+                                *(volatile unsigned *)(screen + 0x14) = 1; /* RGBA8888 */
+                                *(volatile unsigned *)(screen + 0x18) = 0;
+                                *(volatile unsigned *)(screen + 0x2C) = 1; /* show window */
+                            }
+                            const unsigned *src = (const unsigned *)
+                                (mapped + buffer_offset);
+                            unsigned *dst = (unsigned *)(screen + 0x1000);
+                            int opaque = buffer_format == 1; /* XRGB8888 */
+                            for (unsigned y = 0; y < rows; y++) {
+                                const unsigned *row =
+                                    (const unsigned *)((const unsigned char *)src +
+                                                       (unsigned)y * buffer_stride);
+                                for (int x = 0; x < buffer_width; x++) {
+                                    unsigned pixel = row[x];
+                                    unsigned swizzled =
+                                        (pixel & 0xFF00FF00u) |
+                                        ((pixel & 0x00FF0000u) >> 16) |
+                                        ((pixel & 0x000000FFu) << 16);
+                                    if (opaque) {
+                                        swizzled |= 0xFF000000u;
+                                    }
+                                    dst[(unsigned)y * (unsigned)buffer_width +
+                                        (unsigned)x] = swizzled;
+                                }
+                            }
+                            __asm__ volatile("dsb sy" ::: "memory");
+                            screen_seq += 1;
+                            *(volatile unsigned *)(screen + 0x18) = screen_seq * 2;
+                            sys3(215 /* munmap */, mapped, length, 0);
+                        }
+                    }
+#else
                     long mapped = sys6(222, 0, 4096, 1, 1, pool_fd, 0);
                     if (mapped > 0) {
                         unsigned *pixels = (unsigned *)mapped;
@@ -1064,7 +1122,7 @@ static int serve(long client) {
                         }
                         sys3(215, mapped, 4096, 0);
                     }
-                    commits += 1;
+#endif
                 }
                 if (buffer_id != 0 && !focused) {
                     focused = 1;
@@ -1337,6 +1395,25 @@ void _start(void) {
     if (sys3(201 /* listen */, server, 4, 0) < 0) {
         fail("gtk-serve: listen failed\n", 23);
     }
+    {
+        /* Host-shared display sink. The viewer maps the same 4 MiB file and
+           expects the WIN1 header + RGBA pixels at 0x1000. */
+        long shm = sys3(56 /* openat */, -100, (long)"/dev/ivshmem", 2 /* O_RDWR */);
+        if (shm >= 0) {
+            long mapped = sys6(222 /* mmap */, 0, 4 * 1024 * 1024,
+                               3 /* RW */, 1 /* MAP_SHARED */, shm, 0);
+            if (mapped > 0) {
+                screen = (unsigned char *)mapped;
+                static const char ready[] = "gtk-serve: screen mapped\n";
+                sys3(64, 1, (long)ready, sizeof(ready) - 1);
+            } else {
+                static const char no[] = "gtk-serve: screen mmap failed\n";
+                sys3(64, 1, (long)no, sizeof(no) - 1);
+            }
+            sys3(57 /* close */, shm, 0, 0);
+        }
+    }
+
     /* fontconfig only writes a cache into a directory that already exists */
     sys3(34 /* mkdirat */, -100, (long)"/tmp/fontcache", 0777);
     long child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);

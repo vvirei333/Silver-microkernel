@@ -2064,6 +2064,18 @@ fn linux_mmap(
     // what Wayland's `wl_shm` buffers use. Other files still copy into
     // private frames, and a writable shared mapping of a read-only SFS file
     // is refused rather than silently losing its write-back.
+    if flags & MAP_SHARED != 0
+        && linux_fd::is_ivshmem(scheduler::current_task_id(), fd)
+    {
+        // Host-shared display surface. The kernel owns the BAR placement and
+        // maps it Non-Cacheable; only offset 0 of the window is meaningful.
+        if offset != 0 || length as usize > crate::ivshmem::BAR_SIZE {
+            return errno(EINVAL);
+        }
+        return scheduler::map_ivshmem(length as usize)
+            .map(|placed| placed as u64)
+            .unwrap_or(errno(ENOMEM));
+    }
     if flags & MAP_SHARED != 0 {
         let task = scheduler::current_task_id();
         if let Ok((physical, owner)) =

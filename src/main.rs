@@ -58,6 +58,8 @@ mod irq_policy;
 mod interrupts;
 #[cfg(not(feature = "std"))]
 mod ipc;
+#[cfg(all(not(feature = "std"), feature = "linux-abi"))]
+mod ivshmem;
 #[cfg(not(feature = "std"))]
 mod kernel_stack;
 #[cfg(not(feature = "std"))]

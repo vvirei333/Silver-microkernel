@@ -3346,3 +3346,43 @@ next architectural step is a display sink: either a `/dev/ivshmem`-style
 mmap for Linux compositors, or a native presenter that receives the
 composited surface. Only after that does Phosh's layer-shell work become
 visible.
+
+### Display sink: `/dev/ivshmem` and a WIN1 blit (step 1 of the Phosh track)
+
+The compositor no longer verifies frames into the void. Linux tasks can now
+open `/dev/ivshmem`; `mmap(MAP_SHARED)` maps the QEMU BAR Non-Cacheable and
+`gtk-serve` blits each committed shm frame into the host-shared surface using
+the native Wolfser header (`WIN1`, width/height/stride at 0x08..0x10, pixels
+at 0x1000, `window_request` at 0x2C).
+
+- `src/ivshmem.rs`: finds the ivshmem PCI function through ECAM, enables
+  memory space, sizes BAR2 (offset 0x18, 64-bit), programs it at
+  `0x1040_0000` (the same window Wolfser uses) and exposes `ensure()`.
+- `linux_fd`: `Target::Ivshmem`, `/dev/ivshmem`, `is_ivshmem`.
+- `scheduler::map_ivshmem` maps the BAR into the current Linux task through
+  the MMIO window (`mmu::map_phys_nc_to_user`), no capability required.
+- `linux_mmap`: `MAP_SHARED` on that device maps offset 0 / up to 4 MiB.
+- The compositor writes the header, swizzles Wayland ARGB8888 to the viewer's
+  RGBA8888, drops XRGB alpha, and clips to `(4 MiB - 4 KiB)` so a
+  full-BAR 1024x1024 frame cannot run past the mapping.
+- The output is logical 512x384 at `wl_output.scale=2`, i.e. a 1024x768
+  buffer, which fits one BAR with the header.
+- `HEAP_PAGES` 4096 -> 8192 (32 MiB): a GTK 1024x768 window creates a ~12 MiB
+  shm pool, which must not abort the kernel heap allocator.
+
+Proof: `QT_QPA_PLATFORM=offscreen build/window-viewer/werewolf-window
+--shm /dev/shm/werewolf-window --snapshot /tmp/opencode/gtk_orig.png
+--timeout 120` while the guest runs `linuxrun-gtk-serve` prints
+
+```text
+snapshot: 1024x768 frame=2 nonwhite-samples=126
+```
+
+and the PNG is the real GTK window ("WerewolfOS GTK demo" centred on the GTK
+background). Host viewer, compositor and client all agree on the frame.
+
+Known issue found while validating: `linuxrun /sfs/linux-memfd` faults right
+after `fork()` when a `MAP_SHARED` memfd is mapped. **HEAD reproduces it**
+(worktree build), so it is a pre-existing regression from the earlier
+256 MiB/mmap work, not this slice. The fault is EC=0 / FAR=0 in libc after
+fork; the memfd fd/pread/pwrite steps before fork pass. Track it separately.
