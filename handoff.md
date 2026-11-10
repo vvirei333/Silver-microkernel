@@ -3386,3 +3386,56 @@ after `fork()` when a `MAP_SHARED` memfd is mapped. **HEAD reproduces it**
 (worktree build), so it is a pre-existing regression from the earlier
 256 MiB/mmap work, not this slice. The fault is EC=0 / FAR=0 in libc after
 fork; the memfd fd/pread/pwrite steps before fork pass. Track it separately.
+
+### glibc fork fixed; glycin now stops at the D-Bus fd (next)
+
+`linuxrun /sfs/glibcfork` (a minimal dynamically linked glibc program) used to
+fault in both parent and child immediately after `fork`. Three real bugs:
+
+1. **Paged file-backed regions were mapped at physical 0 in the child.**
+   `fork` deep-copies `MmapRegion.frames` (libc's text/data are paged file
+   mappings), but the install loop still passed `region.physical_start` — which
+   is 0 for that variant — to `map_shared_user_pages_at`. The child's first
+   instruction after `svc` fetched from physical 0. The loop now maps each
+   frame with `map_user_page_at`.
+2. **The parent was made read-only for COW over those same paged regions.**
+   The child already has a private copy, so the parent must stay writable.
+3. **`cow_fault` treated a paged region as one contiguous run** (again
+   `physical_start = 0`) if a write fault did happen. It now copies and
+   replaces the single frame.
+
+Also implemented `CLONE_CHILD_SETTID` / `CLONE_CHILD_CLEARTID` for plain
+`fork`: glibc's `_Fork` passes the child TID address in the TCB; without the
+write the child keeps a stale TID. `scheduler::set_child_tid` breaks the page
+COW in the child, switches to the child's TTBR0, validates and writes the u32,
+then restores the parent's space.
+
+Result:
+
+```text
+before fork
+after fork p=0   (child)
+after fork p=8   (parent)
+wait done status=0
+```
+
+**Glycin:** with fork fixed, `glycin-image-rs` starts and logs
+`Loader glycin-image-rs v2.2.4 startup`, then panics with
+
+```text
+Failed to create private DBus connection:
+InputOutput(Os { code: 9, kind: Uncategorized, message: "Bad file descriptor" })
+```
+
+The loader is given the D-Bus fd via `--dbus-fd 3`; zbus sees EBADF. Next
+probe: a tiny `socketpair` + `dup2(fd, 3)` + `execve` test that prints
+`fcntl(3, F_GETFD)` / `getsockopt(3, SO_TYPE)`, to decide whether the fd is
+lost across our `execve` or whether `dup2`/`getsockopt` is at fault. The loader
+also needs `RUNPATH=/sfs:$ORIGIN` (injected) because glycin spawns it with a
+sanitized environment; that part is solved.
+
+`linux-memfd` was failing because of the same glibc-fork bugs; it should be
+retested now.
+
+**Step 2 status:** loader reaches its own startup, D-Bus fd is the only
+remaining blocker. **Step 3 (wlr-layer-shell/Phosh) not started.**

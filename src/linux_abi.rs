@@ -449,7 +449,20 @@ fn linux_clone(
         return errno(EINVAL);
     }
     match scheduler::fork_current(frame) {
-        Some(pid) => pid,
+        Some(pid) => {
+            if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
+                let _ = user_memory::copy_to_user(&(pid as u32).to_le_bytes(), parent_tid);
+            }
+            if flags & (CLONE_CHILD_SETTID | CLONE_CHILD_CLEARTID) != 0 && child_tid != 0 {
+                let _ = scheduler::set_child_tid(
+                    pid,
+                    child_tid,
+                    pid as u32,
+                    flags & CLONE_CHILD_CLEARTID != 0,
+                );
+            }
+            pid
+        }
         None => errno(EAGAIN),
     }
 }

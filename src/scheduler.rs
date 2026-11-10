@@ -3588,6 +3588,57 @@ pub fn spawn_linux_elf_with_args(
 
 /// Result of a successful `execve`: the EL0 entry point and stack pointer the
 /// syscall trampoline must resume at.
+/// Writes the child TID into the child's copy of `address` after a plain
+/// `fork`. glibc's `_Fork` passes `CLONE_CHILD_SETTID`; without this the
+/// child TCB keeps the parent's/garbage TID and the first libc call after
+/// fork faults. The page is broken out of COW in the child first, then the
+/// write is performed with the child's TTBR0 installed.
+#[cfg(feature = "linux-abi")]
+pub fn set_child_tid(child_id: u64, address: u64, value: u32, clear_on_exit: bool) -> bool {
+    let (child_ttbr0, parent_ttbr0) = {
+        let manager = match scheduler_manager() {
+            Some(manager) => manager,
+            None => return false,
+        };
+        let Some(child) = manager.tasks.iter().find(|task| task.id == child_id) else {
+            return false;
+        };
+        if child.ttbr0 == 0 || child.running_on.is_some() {
+            return false;
+        }
+        let parent_ttbr0 = manager
+            .tasks
+            .get(smp::current_index())
+            .map(|task| task.ttbr0)
+            .unwrap_or(0);
+        (child.ttbr0, parent_ttbr0)
+    };
+    // The TCB lives in a private page inherited read-only; break it in the
+    // child. A page that is already writable returns false here and is
+    // handled by the validation below.
+    if let Some(child) = scheduler_manager()
+        .and_then(|manager| manager.tasks.iter_mut().find(|task| task.id == child_id))
+    {
+        let _ = child.cow_fault(address as usize, 1 << 6);
+    }
+    mmu::switch_address_space(child_ttbr0);
+    let writable = mmu::valid_user_slice_mut(address, 4);
+    let written = writable
+        && crate::user_memory::copy_to_user(&value.to_le_bytes(), address).is_ok();
+    mmu::switch_address_space(parent_ttbr0);
+    if !written {
+        return false;
+    }
+    if clear_on_exit {
+        if let Some(child) = scheduler_manager()
+            .and_then(|manager| manager.tasks.iter_mut().find(|task| task.id == child_id))
+        {
+            child.clear_child_tid = Some(address);
+        }
+    }
+    true
+}
+
 #[cfg(feature = "linux-abi")]
 pub struct ExecResult {
     pub entry: usize,
@@ -4000,7 +4051,25 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         return None;
     }
     for region in &parts.mmap {
-        let mapped = if region.shared.is_some() {
+        let mapped = if !region.frames.is_empty() {
+            // A paged file-backed region was deep-copied above; each frame is
+            // mapped separately. Mapping `physical_start` (zero for this
+            // variant) would point every page at physical 0, which is exactly
+            // how a dynamically linked child lost libc's text after fork.
+            let mut ok = true;
+            for (index, &(page, _generation)) in region.frames.iter().enumerate() {
+                if !mmu::map_user_page_at(
+                    ttbr0,
+                    region.virtual_address + index * PAGE_SIZE,
+                    page,
+                    region.prot,
+                ) {
+                    ok = false;
+                    break;
+                }
+            }
+            ok
+        } else if region.shared.is_some() {
             mmu::map_shared_writable_pages_at(
                 ttbr0,
                 region.virtual_address,
@@ -4048,6 +4117,12 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         for region in &parent_mmap {
             if region.shared.is_some() {
                 // Shared windows stay writable on both sides.
+                continue;
+            }
+            if !region.frames.is_empty() {
+                // The child got a private deep copy, so the parent keeps its
+                // frames writable; a COW fault here would mistake the region
+                // for a contiguous run (physical_start is 0 for this form).
                 continue;
             }
             if region.prot & mmu::PROT_WRITE != 0
@@ -6298,6 +6373,23 @@ impl Task {
             // silently breaking the sharing contract.
             if region.shared.is_some() || region.prot & mmu::PROT_WRITE == 0 {
                 return false;
+            }
+            if !region.frames.is_empty() {
+                let index = (page - region.virtual_address) / PAGE_SIZE;
+                let prot = region.prot;
+                let (old_physical, old_generation) = region.frames[index];
+                let Some((new_physical, new_generation)) =
+                    cow_copy_run(old_physical, 1, old_generation)
+                else {
+                    return false;
+                };
+                if !mmu::map_user_page_at(ttbr0, page, new_physical, prot) {
+                    frame_allocator::free_page_tagged(new_physical, new_generation);
+                    return false;
+                }
+                frame_allocator::free_page_tagged(old_physical, old_generation);
+                self.mmap_regions[index].frames[index] = (new_physical, new_generation);
+                return true;
             }
             let old_physical = region.physical_start;
             let old_generation = region.generation;
