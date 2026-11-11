@@ -101,6 +101,7 @@ mod user_memory;
 mod sfs;
 mod sfs_format;
 mod user_program;
+mod drm;
 mod virtio_blk;
 mod virtio_gpu;
 #[cfg(all(not(feature = "std"), feature = "smp"))]
@@ -1689,7 +1690,9 @@ pub extern "C" fn kernel_main() -> ! {
             seed::seed_apps();
             // `--gpu` attaches a virtio-gpu; the driver sets up a 2D scanout
             // and draws a test pattern when the device is present.
-            let _ = virtio_gpu::init();
+            if virtio_gpu::init() {
+                drm::report();
+            }
         }
     }
     #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]

@@ -39,6 +39,9 @@ const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
 /// `VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM`: the byte order the compositor writes
 /// (red first), so its frames go out unchanged.
 const FORMAT_R8G8B8A8_UNORM: u32 = 67;
+/// `VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM`: the byte order of DRM `XRGB8888`
+/// buffers, whose u32 value is 0x00RRGGBB.
+const FORMAT_B8G8R8A8_UNORM: u32 = 1;
 
 const CTRL_HDR_LEN: usize = 24;
 const DISPLAY_INFO_LEN: usize = CTRL_HDR_LEN + 16 * 24;
@@ -67,6 +70,8 @@ struct Display {
 }
 
 static mut DISPLAY: Option<Display> = None;
+/// Resource 1 belongs to the scanout framebuffer; DRM buffers start at 2.
+static mut NEXT_RESOURCE: u32 = 2;
 
 fn pci_address(bus: u8, device: u8, function: u8, offset: usize) -> Option<usize> {
     if offset % 4 != 0 || offset >= 0x1000 {
@@ -392,20 +397,20 @@ unsafe fn display_size(queue: &mut Queue) -> Option<(u32, u32)> {
     None
 }
 
-/// Creates the 2D resource, attaches the framebuffer and points scanout 0 at
-/// it.
-unsafe fn create_scanout(
+/// Creates a 2D resource and attaches a contiguous run of frames to it.
+unsafe fn create_resource(
     queue: &mut Queue,
     resource_id: u32,
     framebuffer_pa: usize,
     length: usize,
     width: u32,
     height: u32,
+    format: u32,
 ) -> bool {
     let mut command = [0u8; CTRL_HDR_LEN + 16];
     header(&mut command, VIRTIO_GPU_CMD_RESOURCE_CREATE_2D);
     put32(&mut command, CTRL_HDR_LEN, resource_id);
-    put32(&mut command, CTRL_HDR_LEN + 4, FORMAT_R8G8B8A8_UNORM);
+    put32(&mut command, CTRL_HDR_LEN + 4, format);
     put32(&mut command, CTRL_HDR_LEN + 8, width);
     put32(&mut command, CTRL_HDR_LEN + 12, height);
     match control(queue, &command) {
@@ -426,6 +431,16 @@ unsafe fn create_scanout(
         None => return false,
     }
 
+    true
+}
+
+/// Points scanout 0 at `resource_id`.
+unsafe fn set_scanout(
+    queue: &mut Queue,
+    resource_id: u32,
+    width: u32,
+    height: u32,
+) -> bool {
     // struct virtio_gpu_set_scanout { rect r; u32 scanout_id; u32 resource_id; }
     let mut command = [0u8; CTRL_HDR_LEN + 24];
     header(&mut command, VIRTIO_GPU_CMD_SET_SCANOUT);
@@ -441,10 +456,16 @@ unsafe fn create_scanout(
     true
 }
 
-/// Copies the framebuffer to the host and flushes the whole scanout.
-unsafe fn upload(display: &mut Display, length: usize) -> bool {
-    let width = display.width;
-    let height = display.height;
+/// Copies `length` bytes at `pa` into `resource_id` and flushes the whole
+/// surface.
+unsafe fn upload_resource(
+    queue: &mut Queue,
+    resource_id: u32,
+    pa: usize,
+    length: usize,
+    width: u32,
+    height: u32,
+) -> bool {
     // struct virtio_gpu_transfer_to_host_2d { rect r; u64 offset; u32
     // resource_id; u32 padding; }
     let mut command = [0u8; CTRL_HDR_LEN + 32];
@@ -452,9 +473,9 @@ unsafe fn upload(display: &mut Display, length: usize) -> bool {
     put32(&mut command, CTRL_HDR_LEN + 8, width);
     put32(&mut command, CTRL_HDR_LEN + 12, height);
     put64(&mut command, CTRL_HDR_LEN + 16, 0);
-    put32(&mut command, CTRL_HDR_LEN + 24, display.resource_id);
-    clean(phys_to_virt(display.framebuffer_pa), length);
-    match control(&mut display.queue, &command) {
+    put32(&mut command, CTRL_HDR_LEN + 24, resource_id);
+    clean(phys_to_virt(pa), length);
+    match control(queue, &command) {
         Some(VIRTIO_GPU_RESP_OK_NODATA) => {}
         Some(kind) => return failed("transfer", kind),
         None => return false,
@@ -465,8 +486,8 @@ unsafe fn upload(display: &mut Display, length: usize) -> bool {
     header(&mut command, VIRTIO_GPU_CMD_RESOURCE_FLUSH);
     put32(&mut command, CTRL_HDR_LEN + 8, width);
     put32(&mut command, CTRL_HDR_LEN + 12, height);
-    put32(&mut command, CTRL_HDR_LEN + 16, display.resource_id);
-    match control(&mut display.queue, &command) {
+    put32(&mut command, CTRL_HDR_LEN + 16, resource_id);
+    match control(queue, &command) {
         Some(VIRTIO_GPU_RESP_OK_NODATA) => {}
         Some(kind) => return failed("flush", kind),
         None => return false,
@@ -509,7 +530,18 @@ pub fn init() -> bool {
         core::ptr::write_bytes(phys_to_virt(framebuffer_pa) as *mut u8, 0, pages * 4096);
 
         let resource_id = 1;
-        if !create_scanout(&mut queue, resource_id, framebuffer_pa, length, width, height) {
+        if !create_resource(
+            &mut queue,
+            resource_id,
+            framebuffer_pa,
+            length,
+            width,
+            height,
+            FORMAT_R8G8B8A8_UNORM,
+        ) {
+            return false;
+        }
+        if !set_scanout(&mut queue, resource_id, width, height) {
             return false;
         }
 
@@ -547,7 +579,14 @@ pub fn init() -> bool {
             }
         }
 
-        if !upload(&mut display, length) {
+        if !upload_resource(
+            &mut display.queue,
+            display.resource_id,
+            display.framebuffer_pa,
+            length,
+            display.width,
+            display.height,
+        ) {
             return false;
         }
         DISPLAY = Some(display);
@@ -579,7 +618,14 @@ pub fn present(pixels: &[u8]) -> bool {
             phys_to_virt(display.framebuffer_pa) as *mut u8,
             length,
         );
-        upload(display, length)
+        upload_resource(
+            &mut display.queue,
+            display.resource_id,
+            display.framebuffer_pa,
+            length,
+            display.width,
+            display.height,
+        )
     }
 }
 
@@ -592,7 +638,58 @@ pub fn flush() -> bool {
             return false;
         };
         let length = (display.width as usize) * (display.height as usize) * 4;
-        upload(display, length)
+        upload_resource(
+            &mut display.queue,
+            display.resource_id,
+            display.framebuffer_pa,
+            length,
+            display.width,
+            display.height,
+        )
+    }
+}
+
+/// Creates a 2D resource backed by `length` bytes at `pa` and returns its id.
+pub fn create_resource_pages(
+    pa: usize,
+    length: usize,
+    width: u32,
+    height: u32,
+    bgr: bool,
+) -> Option<u32> {
+    unsafe {
+        let display = (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut()?;
+        let id = NEXT_RESOURCE;
+        NEXT_RESOURCE = NEXT_RESOURCE.wrapping_add(1);
+        let format = if bgr {
+            FORMAT_B8G8R8A8_UNORM
+        } else {
+            FORMAT_R8G8B8A8_UNORM
+        };
+        if !create_resource(&mut display.queue, id, pa, length, width, height, format) {
+            return None;
+        }
+        Some(id)
+    }
+}
+
+/// Presents an existing resource: transfers its pixels and flushes it, then
+/// points scanout 0 at it.
+pub fn present_resource(
+    resource_id: u32,
+    pa: usize,
+    length: usize,
+    width: u32,
+    height: u32,
+) -> bool {
+    unsafe {
+        let Some(display) = (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut() else {
+            return false;
+        };
+        if !upload_resource(&mut display.queue, resource_id, pa, length, width, height) {
+            return false;
+        }
+        set_scanout(&mut display.queue, resource_id, width, height)
     }
 }
 

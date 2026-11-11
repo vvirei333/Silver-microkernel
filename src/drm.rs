@@ -1,0 +1,759 @@
+//! A small DRM/KMS device backed by virtio-gpu.
+//!
+//! `/dev/dri/card0` exposes the part of the DRM API a compositor needs to
+//! take over the display: one CRTC, one connected connector with a single
+//! mode, dumb buffers, framebuffer objects and page flips. Dumb buffers are
+//! contiguous frames; `MAP_DUMB` hands out their physical address as the mmap
+//! offset and `mmap` maps them Normal Non-Cacheable, the same protocol as
+//! every other DMA surface.
+//!
+//! A page flip creates (once) a virtio-gpu 2D resource for the buffer, points
+//! scanout 0 at it and transfers the pixels, so a flip is a real mode-set on
+//! the device. Completion is reported as a `DRM_EVENT_VBLANK` on `read`.
+//!
+//! There is no plane, cursor or property API yet: this is the smallest device
+//! that `drmModeGetResources`, `drmModeCreateDumbBuffer`,
+//! `drmModeAddFB2`/`drmModeAddFB` and `drmModePageFlip` accept.
+
+use crate::console;
+use crate::frame_allocator;
+use crate::memory::phys_to_virt;
+use crate::user_memory;
+
+pub const MAX_BUFFERS: usize = 8;
+
+const DRM_IOCTL_VERSION: u64 = 0xC040_6400;
+const DRM_IOCTL_GET_CAP: u64 = 0xC010_640C;
+const DRM_IOCTL_MODE_GETRESOURCES: u64 = 0xC040_64A0;
+const DRM_IOCTL_MODE_GETCRTC: u64 = 0xC068_64A1;
+const DRM_IOCTL_MODE_SETCRTC: u64 = 0xC068_64A2;
+const DRM_IOCTL_MODE_GETENCODER: u64 = 0xC014_64A6;
+const DRM_IOCTL_MODE_GETCONNECTOR: u64 = 0xC050_64A7;
+const DRM_IOCTL_MODE_ADDFB: u64 = 0xC020_64AE;
+const DRM_IOCTL_MODE_RMFB: u64 = 0xC004_64AF;
+const DRM_IOCTL_MODE_PAGE_FLIP: u64 = 0xC018_64B0;
+const DRM_IOCTL_MODE_CREATE_DUMB: u64 = 0xC020_64B2;
+const DRM_IOCTL_MODE_MAP_DUMB: u64 = 0xC010_64B3;
+const DRM_IOCTL_MODE_DESTROY_DUMB: u64 = 0xC004_64B4;
+const DRM_IOCTL_MODE_ADDFB2: u64 = 0xC068_64B8;
+
+const DRM_CAP_DUMB_BUFFER: u64 = 1;
+const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 6;
+
+const DRM_MODE_CONNECTED: u32 = 1;
+const DRM_MODE_CONNECTOR_VIRTUAL: u32 = 15;
+const DRM_MODE_ENCODER_VIRTUAL: u32 = 20;
+const DRM_MODE_TYPE_PREFERRED: u32 = 0x8;
+
+const DRM_EVENT_VBLANK: u32 = 0x01;
+
+const CRTC_ID: u32 = 1;
+const CONNECTOR_ID: u32 = 1;
+const ENCODER_ID: u32 = 1;
+
+const PIXEL_FORMAT_XRGB8888: u32 = 0x3432_5258; // 'XR24'
+const PIXEL_FORMAT_ARGB8888: u32 = 0x3432_5241; // 'AR24'
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Version {
+    major: i32,
+    minor: i32,
+    patchlevel: i32,
+    _pad: i32,
+    name_len: u64,
+    name: u64,
+    date_len: u64,
+    date: u64,
+    desc_len: u64,
+    desc: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GetCap {
+    capability: u64,
+    value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CardRes {
+    fb_id_ptr: u64,
+    crtc_id_ptr: u64,
+    connector_id_ptr: u64,
+    encoder_id_ptr: u64,
+    count_fbs: u32,
+    count_crtcs: u32,
+    count_connectors: u32,
+    count_encoders: u32,
+    min_width: u32,
+    max_width: u32,
+    min_height: u32,
+    max_height: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ModeInfo {
+    clock: u32,
+    hdisplay: u16,
+    hsync_start: u16,
+    hsync_end: u16,
+    htotal: u16,
+    hskew: u16,
+    vdisplay: u16,
+    vsync_start: u16,
+    vsync_end: u16,
+    vtotal: u16,
+    vscan: u16,
+    vrefresh: u32,
+    flags: u32,
+    kind: u32,
+    name: [u8; 32],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GetConnector {
+    encoders_ptr: u64,
+    modes_ptr: u64,
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    count_modes: u32,
+    count_props: u32,
+    count_encoders: u32,
+    encoder_id: u32,
+    connector_id: u32,
+    connector_type: u32,
+    connector_type_id: u32,
+    connection: u32,
+    mm_width: u32,
+    mm_height: u32,
+    subpixel: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GetEncoder {
+    encoder_id: u32,
+    encoder_type: u32,
+    crtc_id: u32,
+    possible_crtcs: u32,
+    possible_clones: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct Crtc {
+    set_connectors_ptr: u64,
+    count_connectors: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    x: u32,
+    y: u32,
+    gamma_size: u32,
+    mode_valid: u32,
+    mode: ModeInfo,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CreateDumb {
+    height: u32,
+    width: u32,
+    bpp: u32,
+    flags: u32,
+    handle: u32,
+    pitch: u32,
+    size: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct MapDumb {
+    handle: u32,
+    pad: u32,
+    offset: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DestroyDumb {
+    handle: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FbCmd {
+    fb_id: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    bpp: u32,
+    depth: u32,
+    handle: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct FbCmd2 {
+    fb_id: u32,
+    width: u32,
+    height: u32,
+    pixel_format: u32,
+    flags: u32,
+    handles: [u32; 4],
+    pitches: [u32; 4],
+    offsets: [u32; 4],
+    modifier: [u64; 4],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PageFlip {
+    crtc_id: u32,
+    fb_id: u32,
+    flags: u32,
+    reserved: u32,
+    user_data: u64,
+}
+
+#[derive(Clone, Copy)]
+struct Dumb {
+    handle: u32,
+    pa: usize,
+    pages: usize,
+    generation: u32,
+    width: u32,
+    height: u32,
+    pitch: u32,
+    bpp: u32,
+    /// Framebuffer id bound to this buffer (0 until `ADDFB`).
+    fb: u32,
+    /// virtio-gpu resource backing this buffer (0 until first flip).
+    resource: u32,
+    in_use: bool,
+}
+
+const EMPTY_DUMB: Dumb = Dumb {
+    handle: 0,
+    pa: 0,
+    pages: 0,
+    generation: 0,
+    width: 0,
+    height: 0,
+    pitch: 0,
+    bpp: 0,
+    fb: 0,
+    resource: 0,
+    in_use: false,
+};
+
+static mut BUFFERS: [Dumb; MAX_BUFFERS] = [EMPTY_DUMB; MAX_BUFFERS];
+static mut NEXT_HANDLE: u32 = 1;
+static mut NEXT_FB: u32 = 1;
+
+// One pending page-flip event. A compositor polls and reads it; there is no
+// reason to queue more than one flip ahead.
+static mut EVENT: [u8; 32] = [0; 32];
+static mut EVENT_PENDING: bool = false;
+
+unsafe fn load<T: Copy>(address: u64) -> Option<T> {
+    if address == 0 {
+        return None;
+    }
+    let mut value = core::mem::MaybeUninit::<T>::uninit();
+    let bytes = core::slice::from_raw_parts_mut(
+        value.as_mut_ptr() as *mut u8,
+        core::mem::size_of::<T>(),
+    );
+    user_memory::copy_from_user(address, bytes).ok()?;
+    Some(value.assume_init())
+}
+
+unsafe fn store<T: Copy>(address: u64, value: &T) -> bool {
+    if address == 0 {
+        return false;
+    }
+    let bytes = core::slice::from_raw_parts(
+        value as *const T as *const u8,
+        core::mem::size_of::<T>(),
+    );
+    user_memory::copy_to_user(bytes, address).is_ok()
+}
+
+unsafe fn store_u32(address: u64, value: u32) -> bool {
+    store(address, &value)
+}
+
+unsafe fn store_mode(address: u64, mode: &ModeInfo) -> bool {
+    store(address, mode)
+}
+
+fn display_mode() -> ModeInfo {
+    let (width, height) = crate::virtio_gpu::size().unwrap_or((1024, 768));
+    let mut name = [0u8; 32];
+    let label = b"1024x768";
+    name[..label.len()].copy_from_slice(label);
+    ModeInfo {
+        clock: 65_000,
+        hdisplay: width as u16,
+        hsync_start: width as u16 + 24,
+        hsync_end: width as u16 + 120,
+        htotal: width as u16 + 136,
+        hskew: 0,
+        vdisplay: height as u16,
+        vsync_start: height as u16 + 3,
+        vsync_end: height as u16 + 6,
+        vtotal: height as u16 + 9,
+        vscan: 0,
+        vrefresh: 60,
+        flags: 0,
+        kind: DRM_MODE_TYPE_PREFERRED,
+        name,
+    }
+}
+
+unsafe fn buffer(handle: u32) -> Option<&'static mut Dumb> {
+    let table = &mut *core::ptr::addr_of_mut!(BUFFERS);
+    table
+        .iter_mut()
+        .find(|entry| entry.in_use && entry.handle == handle)
+}
+
+unsafe fn buffer_for_fb(fb: u32) -> Option<&'static mut Dumb> {
+    let table = &mut *core::ptr::addr_of_mut!(BUFFERS);
+    table.iter_mut().find(|entry| entry.in_use && entry.fb == fb)
+}
+
+unsafe fn buffer_for_offset(offset: usize) -> Option<&'static mut Dumb> {
+    let table = &mut *core::ptr::addr_of_mut!(BUFFERS);
+    table
+        .iter_mut()
+        .find(|entry| entry.in_use && entry.pa == offset)
+}
+
+/// Presents `entry` on scanout 0 and reports completion.
+unsafe fn present(entry: &mut Dumb) -> bool {
+    let length = entry.pitch as usize * entry.height as usize;
+    if entry.resource == 0 {
+        // DRM `XRGB8888`/`ARGB8888` are 0x00RRGGBB / 0xAARRGGBB values, which
+        // is B8G8R8A8 in memory.
+        let Some(created) = crate::virtio_gpu::create_resource_pages(
+            entry.pa,
+            length,
+            entry.width,
+            entry.height,
+            true,
+        ) else {
+            return false;
+        };
+        entry.resource = created;
+    }
+    crate::virtio_gpu::present_resource(
+        entry.resource,
+        entry.pa,
+        length,
+        entry.width,
+        entry.height,
+    )
+}
+
+unsafe fn queue_vblank(user_data: u64) {
+    let event = &mut *core::ptr::addr_of_mut!(EVENT);
+    event[0..4].copy_from_slice(&DRM_EVENT_VBLANK.to_le_bytes());
+    event[4..8].copy_from_slice(&32u32.to_le_bytes());
+    event[8..16].copy_from_slice(&user_data.to_le_bytes());
+    // tv_sec/tv_usec stay zero: there is no clock the guest can trust here.
+    event[24..28].copy_from_slice(&1u32.to_le_bytes()); // sequence
+    event[28..32].copy_from_slice(&CRTC_ID.to_le_bytes());
+    EVENT_PENDING = true;
+}
+
+/// Reads one pending DRM event. Returns `None` when there is nothing queued.
+pub fn read_event() -> Option<[u8; 32]> {
+    unsafe {
+        if !EVENT_PENDING {
+            return None;
+        }
+        EVENT_PENDING = false;
+        Some(*(core::ptr::addr_of!(EVENT) as *const [u8; 32]))
+    }
+}
+
+pub fn event_pending() -> bool {
+    unsafe { EVENT_PENDING }
+}
+
+/// Maps a dumb buffer by the offset `MAP_DUMB` returned.
+pub fn map_dumb(length: usize, offset: usize) -> Option<usize> {
+    unsafe {
+        let entry = buffer_for_offset(offset)?;
+        if length == 0 || length > entry.pages * 4096 {
+            return None;
+        }
+        crate::scheduler::map_drm_dumb(entry.pa, length)
+    }
+}
+
+fn version_string(buffer: &[u8], pointer: u64, length: u64) {
+    if pointer == 0 || length == 0 {
+        return;
+    }
+    let take = (length as usize).min(buffer.len());
+    let _ = user_memory::copy_to_user(&buffer[..take], pointer);
+}
+
+/// Handles one ioctl. Returns `Some(0)` (or a small positive value) when the
+/// request belongs to DRM, `None` when it is not a DRM request at all.
+pub fn ioctl(request: u64, argument: u64) -> Option<u64> {
+    unsafe {
+        Some(match request {
+            DRM_IOCTL_VERSION => {
+                let Some(mut version) = load::<Version>(argument) else {
+                    return Some(u64::MAX);
+                };
+                version.major = 1;
+                version.minor = 0;
+                version.patchlevel = 0;
+                version.name_len = 13;
+                version.date_len = 10;
+                version.desc_len = 0;
+                version.desc = 0;
+                if !store(argument, &version) {
+                    return Some(u64::MAX);
+                }
+                version_string(b"werewolf-drm\0", version.name, 13);
+                version_string(b"2026-11-12\0", version.date, 10);
+                0
+            }
+            DRM_IOCTL_GET_CAP => {
+                let Some(mut cap) = load::<GetCap>(argument) else {
+                    return Some(u64::MAX);
+                };
+                cap.value = match cap.capability {
+                    DRM_CAP_DUMB_BUFFER => 1,
+                    DRM_CAP_TIMESTAMP_MONOTONIC => 1,
+                    _ => 0,
+                };
+                if !store(argument, &cap) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_GETRESOURCES => {
+                let Some(mut res) = load::<CardRes>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let (width, height) = crate::virtio_gpu::size().unwrap_or((1024, 768));
+                let fbs: u32 = {
+                    let table = &*core::ptr::addr_of!(BUFFERS);
+                    table.iter().filter(|entry| entry.in_use && entry.fb != 0).count() as u32
+                };
+                let count_fbs = res.count_fbs;
+                let count_crtcs = res.count_crtcs;
+                let count_connectors = res.count_connectors;
+                let count_encoders = res.count_encoders;
+                res.count_fbs = fbs;
+                res.count_crtcs = 1;
+                res.count_connectors = 1;
+                res.count_encoders = 1;
+                res.min_width = 320;
+                res.max_width = width;
+                res.min_height = 200;
+                res.max_height = height;
+                if !store(argument, &res) {
+                    return Some(u64::MAX);
+                }
+                if res.fb_id_ptr != 0 && count_fbs >= fbs {
+                    let mut index = 0u32;
+                    let table = &*core::ptr::addr_of!(BUFFERS);
+                    for entry in table.iter().filter(|entry| entry.in_use && entry.fb != 0) {
+                        if !store_u32(res.fb_id_ptr + (index as u64) * 4, entry.fb) {
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                if res.crtc_id_ptr != 0 && count_crtcs >= 1 {
+                    let _ = store_u32(res.crtc_id_ptr, CRTC_ID);
+                }
+                if res.connector_id_ptr != 0 && count_connectors >= 1 {
+                    let _ = store_u32(res.connector_id_ptr, CONNECTOR_ID);
+                }
+                if res.encoder_id_ptr != 0 && count_encoders >= 1 {
+                    let _ = store_u32(res.encoder_id_ptr, ENCODER_ID);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_GETCRTC => {
+                let Some(mut crtc) = load::<Crtc>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if crtc.crtc_id != CRTC_ID {
+                    return Some(u64::MAX);
+                }
+                crtc.fb_id = 0;
+                crtc.x = 0;
+                crtc.y = 0;
+                crtc.gamma_size = 0;
+                crtc.mode_valid = 1;
+                crtc.mode = display_mode();
+                if !store(argument, &crtc) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_SETCRTC => {
+                let Some(crtc) = load::<Crtc>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if crtc.crtc_id != CRTC_ID {
+                    return Some(u64::MAX);
+                }
+                if crtc.fb_id == 0 {
+                    return Some(0);
+                }
+                match buffer_for_fb(crtc.fb_id) {
+                    Some(entry) => {
+                        if present(entry) {
+                            0
+                        } else {
+                            u64::MAX
+                        }
+                    }
+                    None => u64::MAX,
+                }
+            }
+            DRM_IOCTL_MODE_GETENCODER => {
+                let Some(mut encoder) = load::<GetEncoder>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if encoder.encoder_id != 0 && encoder.encoder_id != ENCODER_ID {
+                    return Some(u64::MAX);
+                }
+                encoder.encoder_id = ENCODER_ID;
+                encoder.encoder_type = DRM_MODE_ENCODER_VIRTUAL;
+                encoder.crtc_id = CRTC_ID;
+                encoder.possible_crtcs = 1;
+                encoder.possible_clones = 0;
+                if !store(argument, &encoder) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_GETCONNECTOR => {
+                let Some(mut connector) = load::<GetConnector>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if connector.connector_id != 0 && connector.connector_id != CONNECTOR_ID {
+                    return Some(u64::MAX);
+                }
+                let count_modes = connector.count_modes;
+                let count_encoders = connector.count_encoders;
+                connector.connector_id = CONNECTOR_ID;
+                connector.encoder_id = ENCODER_ID;
+                connector.connector_type = DRM_MODE_CONNECTOR_VIRTUAL;
+                connector.connector_type_id = 1;
+                connector.connection = DRM_MODE_CONNECTED;
+                connector.mm_width = 271;
+                connector.mm_height = 203;
+                connector.count_modes = 1;
+                connector.count_encoders = 1;
+                connector.count_props = 0;
+                connector.props_ptr = 0;
+                connector.prop_values_ptr = 0;
+                if !store(argument, &connector) {
+                    return Some(u64::MAX);
+                }
+                if connector.modes_ptr != 0 && count_modes >= 1 {
+                    let _ = store_mode(connector.modes_ptr, &display_mode());
+                }
+                if connector.encoders_ptr != 0 && count_encoders >= 1 {
+                    let _ = store_u32(connector.encoders_ptr, ENCODER_ID);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_CREATE_DUMB => {
+                let Some(mut request) = load::<CreateDumb>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if request.width == 0 || request.height == 0 || request.bpp == 0 {
+                    return Some(u64::MAX);
+                }
+                let pitch = (request.width * (request.bpp / 8) + 63) & !63;
+                let length = pitch as usize * request.height as usize;
+                let pages = length.div_ceil(4096);
+                let Some((pa, generation)) = frame_allocator::alloc_contiguous_pages_tagged(pages)
+                else {
+                    return Some(u64::MAX);
+                };
+                core::ptr::write_bytes(phys_to_virt(pa) as *mut u8, 0, pages * 4096);
+                let table = &mut *core::ptr::addr_of_mut!(BUFFERS);
+                let Some(slot) = table.iter_mut().find(|entry| !entry.in_use) else {
+                    frame_allocator::free_contiguous_pages_tagged(pa, pages, generation);
+                    return Some(u64::MAX);
+                };
+                let handle = NEXT_HANDLE;
+                NEXT_HANDLE = NEXT_HANDLE.wrapping_add(1);
+                *slot = Dumb {
+                    handle,
+                    pa,
+                    pages,
+                    generation,
+                    width: request.width,
+                    height: request.height,
+                    pitch,
+                    bpp: request.bpp,
+                    fb: 0,
+                    resource: 0,
+                    in_use: true,
+                };
+                request.handle = handle;
+                request.pitch = pitch;
+                request.size = (pages * 4096) as u64;
+                if !store(argument, &request) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_MAP_DUMB => {
+                let Some(mut request) = load::<MapDumb>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(entry) = buffer(request.handle) else {
+                    return Some(u64::MAX);
+                };
+                request.offset = entry.pa as u64;
+                if !store(argument, &request) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_DESTROY_DUMB => {
+                let Some(request) = load::<DestroyDumb>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(entry) = buffer(request.handle) else {
+                    return Some(u64::MAX);
+                };
+                if entry.fb != 0 {
+                    return Some(u64::MAX);
+                }
+                frame_allocator::free_contiguous_pages_tagged(
+                    entry.pa,
+                    entry.pages,
+                    entry.generation,
+                );
+                entry.in_use = false;
+                0
+            }
+            DRM_IOCTL_MODE_ADDFB | DRM_IOCTL_MODE_ADDFB2 => {
+                let (handle, width, height, pitch, fb_id, bpp) = if request
+                    == DRM_IOCTL_MODE_ADDFB
+                {
+                    let Some(command) = load::<FbCmd>(argument) else {
+                        return Some(u64::MAX);
+                    };
+                    (
+                        command.handle,
+                        command.width,
+                        command.height,
+                        command.pitch,
+                        command.fb_id,
+                        command.bpp,
+                    )
+                } else {
+                    let Some(command) = load::<FbCmd2>(argument) else {
+                        return Some(u64::MAX);
+                    };
+                    if command.pixel_format != PIXEL_FORMAT_XRGB8888
+                        && command.pixel_format != PIXEL_FORMAT_ARGB8888
+                    {
+                        return Some(u64::MAX);
+                    }
+                    (
+                        command.handles[0],
+                        command.width,
+                        command.height,
+                        command.pitches[0],
+                        command.fb_id,
+                        32,
+                    )
+                };
+                let Some(entry) = buffer(handle) else {
+                    return Some(u64::MAX);
+                };
+                if width != entry.width || height != entry.height || pitch != entry.pitch {
+                    return Some(u64::MAX);
+                }
+                let assigned = if fb_id != 0 { fb_id } else { NEXT_FB };
+                if fb_id == 0 {
+                    NEXT_FB = NEXT_FB.wrapping_add(1);
+                }
+                entry.fb = assigned;
+                entry.bpp = bpp;
+                if request == DRM_IOCTL_MODE_ADDFB {
+                    let Some(mut command) = load::<FbCmd>(argument) else {
+                        return Some(u64::MAX);
+                    };
+                    command.fb_id = assigned;
+                    if !store(argument, &command) {
+                        return Some(u64::MAX);
+                    }
+                } else {
+                    let Some(mut command) = load::<FbCmd2>(argument) else {
+                        return Some(u64::MAX);
+                    };
+                    command.fb_id = assigned;
+                    if !store(argument, &command) {
+                        return Some(u64::MAX);
+                    }
+                }
+                0
+            }
+            DRM_IOCTL_MODE_RMFB => {
+                let Some(fb) = load::<u32>(argument) else {
+                    return Some(u64::MAX);
+                };
+                match buffer_for_fb(fb) {
+                    Some(entry) => {
+                        entry.fb = 0;
+                        0
+                    }
+                    None => u64::MAX,
+                }
+            }
+            DRM_IOCTL_MODE_PAGE_FLIP => {
+                let Some(flip) = load::<PageFlip>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if flip.crtc_id != CRTC_ID {
+                    return Some(u64::MAX);
+                }
+                let Some(entry) = buffer_for_fb(flip.fb_id) else {
+                    return Some(u64::MAX);
+                };
+                if !present(entry) {
+                    return Some(u64::MAX);
+                }
+                queue_vblank(flip.user_data);
+                0
+            }
+            _ => return None,
+        })
+    }
+}
+
+/// Prints the device the driver exposes. Called once at boot.
+pub fn report() {
+    let (width, height) = crate::virtio_gpu::size().unwrap_or((1024, 768));
+    console::write_str("DRM: /dev/dri/card0 ");
+    console::write_dec_u64(width as u64);
+    console::write_str("x");
+    console::write_dec_u64(height as u64);
+    console::write_str(" crtc 1 connector 1\r\n");
+}

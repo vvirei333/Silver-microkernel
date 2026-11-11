@@ -4690,3 +4690,27 @@ so the scanout is exactly the compositor's output size.
 Verified with a screendump of the Phosh lockscreen through the GPU path:
 wallpaper, moon, clock and date all arrive with the right colours (a
 byte-order mistake would show as red/blue swapped).
+
+### DRM/KMS card0
+
+`/dev/dri/card0` is a small DRM device on top of virtio-gpu:
+
+- `DRM_IOCTL_VERSION`, `GET_CAP` (`DUMB_BUFFER`, `TIMESTAMP_MONOTONIC`),
+- `MODE_GETRESOURCES` / `GETCRTC` / `GETENCODER` / `GETCONNECTOR` (one CRTC,
+  one connected virtual connector, one 1024x768 preferred mode, two-pass
+  pointer/count protocol),
+- `MODE_CREATE_DUMB` / `MAP_DUMB` / `DESTROY_DUMB`,
+- `MODE_ADDFB` / `ADDFB2` / `RMFB` (XRGB8888 and ARGB8888),
+- `MODE_SETCRTC` and `MODE_PAGE_FLIP` with a `DRM_EVENT_VBLANK` on `read`.
+
+A dumb buffer is a contiguous frame run. `MAP_DUMB` returns its physical
+address as the mmap offset and `mmap` maps it Normal Non-Cacheable. The first
+flip creates a 2D resource for the buffer (format `B8G8R8A8_UNORM`, which is
+what an `XRGB8888` u32 looks like in memory), then every flip transfers and
+flushes it and points scanout 0 at it. The 32-byte vblank event carries the
+flip's `user_data` and is reported by `poll`/`read`.
+
+`tests/linux/drmtest.c` walks the whole API: it prints the counts and mode,
+creates and maps a dumb buffer, adds an fb, fills four quadrants and flips.
+The log ends with `drm test ok`, `event bytes 32`, `event type 1`, and a host
+screendump shows red/green/blue/white in the expected corners.

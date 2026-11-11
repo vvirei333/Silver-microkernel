@@ -1511,6 +1511,11 @@ fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
     /// `_IO('W', 0x01)`: present the current `/dev/gpufb` contents.
     const GPU_IOCTL_FLUSH: u64 = 0x5701;
     let task = scheduler::current_task_id();
+    if linux_fd::is_drm(task, fd) {
+        if let Some(result) = crate::drm::ioctl(request, argument) {
+            return result;
+        }
+    }
     if request == GPU_IOCTL_FLUSH && linux_fd::is_gpufb(task, fd) {
         return if crate::virtio_gpu::flush() {
             0
@@ -2186,6 +2191,16 @@ fn linux_mmap(
     // what Wayland's `wl_shm` buffers use. Other files still copy into
     // private frames, and a writable shared mapping of a read-only SFS file
     // is refused rather than silently losing its write-back.
+    if flags & MAP_SHARED != 0 && linux_fd::is_drm(scheduler::current_task_id(), fd) {
+        // DRM dumb buffers: the offset is the buffer's guest-physical address,
+        // handed out by DRM_IOCTL_MODE_MAP_DUMB.
+        if offset == 0 {
+            return errno(EINVAL);
+        }
+        return crate::drm::map_dumb(length as usize, offset as usize)
+            .map(|placed| placed as u64)
+            .unwrap_or(errno(EINVAL));
+    }
     if flags & MAP_SHARED != 0 && linux_fd::is_gpufb(scheduler::current_task_id(), fd) {
         // The virtio-gpu scanout. The kernel owns the contiguous frames; the
         // mapping is Non-Cacheable so the device sees the compositor's writes.

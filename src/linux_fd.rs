@@ -247,6 +247,8 @@ enum Target {
     Ivshmem,
     /// virtio-gpu scanout framebuffer (`/dev/gpufb`).
     GpuFb,
+    /// DRM/KMS card (`/dev/dri/card0`), backed by virtio-gpu.
+    Drm,
     Vfs(u64),
     Pipe {
         state: Arc<Mutex<PipeState>>,
@@ -469,6 +471,7 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         // Only present when the machine has a virtio-gpu the driver brought
         // up; the compositor then presents through the GPU as well.
         "/dev/gpufb" if crate::virtio_gpu::size().is_some() => Some(Target::GpuFb),
+        "/dev/dri/card0" if crate::virtio_gpu::size().is_some() => Some(Target::Drm),
         _ => None,
     };
     if let Some(device) = device {
@@ -647,6 +650,14 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         // stdin is not wired to the console yet; report EOF so a reader does
         // not spin.
         Target::Console => Ok(0),
+        Target::Drm => match crate::drm::read_event() {
+            Some(event) => {
+                user_memory::copy_to_user(&event, buffer).map_err(|_| EFAULT)?;
+                Ok(event.len() as u64)
+            }
+            // The caller polls before reading; an empty queue is not an error.
+            None => Ok(0),
+        },
         Target::Null | Target::Full | Target::Ivshmem | Target::GpuFb => Ok(0),
         Target::Zero => {
             let chunk = alloc::vec![0_u8; (count as usize).min(64 * 1024)];
@@ -759,7 +770,12 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
                 Ok(count)
             }
         }
-        Target::Null | Target::Zero | Target::Random | Target::Ivshmem | Target::GpuFb => Ok(count),
+        Target::Null
+        | Target::Zero
+        | Target::Random
+        | Target::Ivshmem
+        | Target::GpuFb
+        | Target::Drm => Ok(count),
         Target::Full => Err(ENOSPC),
         Target::Vfs(vfs_fd) => {
             let mut bytes = alloc::vec![0_u8; (count as usize).min(1 << 20)];
@@ -886,7 +902,8 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
         | Target::Full
         | Target::Random
         | Target::Ivshmem
-        | Target::GpuFb => write_stat(buffer, S_IFCHR | 0o666, 0, fd.max(1)),
+        | Target::GpuFb
+        | Target::Drm => write_stat(buffer, S_IFCHR | 0o666, 0, fd.max(1)),
         Target::Vfs(vfs_fd) => {
             let size = vfs::fd_len(task, vfs_fd).map_err(|_| EBADF)?;
             let kind = vfs::fd_kind(task, vfs_fd).unwrap_or(vfs::FD_KIND_FILE);
@@ -1923,6 +1940,7 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::Random
         | Target::Ivshmem
         | Target::GpuFb
+        | Target::Drm
         | Target::MemFd(_)
         | Target::Epoll(_) => (O_RDWR, false),
     };
@@ -1963,6 +1981,13 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
         Target::Console | Target::Null => POLLIN | POLLOUT,
         Target::Zero | Target::Random => POLLIN,
         Target::Ivshmem | Target::GpuFb => POLLIN | POLLOUT,
+        Target::Drm => {
+            if crate::drm::event_pending() {
+                POLLIN | POLLOUT
+            } else {
+                POLLOUT
+            }
+        }
         Target::Full => POLLOUT | POLLERR,
         Target::Vfs(_) => POLLIN,
         Target::Pipe { state, read } => {
@@ -2114,6 +2139,12 @@ const S_IFREG: u32 = 0o100000;
 pub fn is_ivshmem(task: u64, fd: u64) -> bool {
     let task = crate::scheduler::fd_table_owner(task);
     matches!(lookup(task, fd), Some(Target::Ivshmem))
+}
+
+/// True when `fd` names the DRM/KMS card.
+pub fn is_drm(task: u64, fd: u64) -> bool {
+    let task = crate::scheduler::fd_table_owner(task);
+    matches!(lookup(task, fd), Some(Target::Drm))
 }
 
 /// True when `fd` names the virtio-gpu scanout framebuffer.

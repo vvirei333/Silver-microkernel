@@ -4831,6 +4831,12 @@ pub fn map_ivshmem(length: usize) -> Option<usize> {
     with_group_owner(|task| mmu::map_phys_nc_to_user(task, base, length))?
 }
 
+/// Maps a DRM dumb buffer into the calling process. The caller has already
+/// checked that the physical range belongs to a live dumb buffer.
+pub fn map_drm_dumb(phys_addr: usize, length: usize) -> Option<usize> {
+    with_group_owner(|task| mmu::map_shared_dma_to_user(task, phys_addr, length))?
+}
+
 /// Maps the virtio-gpu scanout framebuffer into the calling process. The
 /// compositor writes frames straight into it and asks the kernel to flush.
 /// The mapping is Normal Non-Cacheable, the same protocol as every other DMA
