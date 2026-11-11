@@ -949,6 +949,13 @@ _start:
     mrs x0, sctlr_el1
     orr x0, x0, #1
     orr x0, x0, #(1 << 22)  // PAN on: user access requires LDTR/STTR
+    // EL0 access to CTR_EL0 (UCT) and to DC ZVA (DZE). glibc's memset reads
+    // CTR_EL0 to decide whether it may zero a block with DC ZVA; without UCT
+    // that MRS traps (EC 0x18) and the process dies. UCI lets `__clear_cache`
+    // work for JITs (Mesa's shader cache).
+    orr x0, x0, #(1 << 15)
+    orr x0, x0, #(1 << 14)
+    orr x0, x0, #(1 << 26)
     msr sctlr_el1, x0
     isb
     tlbi vmalle1

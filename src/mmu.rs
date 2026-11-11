@@ -715,6 +715,11 @@ fn configure_and_enable() {
             "mrs {sctlr}, sctlr_el1",
             "orr {sctlr}, {sctlr}, #1",
             "orr {sctlr}, {sctlr}, #(1 << 22)",
+            // UCT, DZE and UCI: EL0 may read CTR_EL0, use DC ZVA and run
+            // cache maintenance by VA (glibc memset and JIT clear_cache).
+            "orr {sctlr}, {sctlr}, #(1 << 15)",
+            "orr {sctlr}, {sctlr}, #(1 << 14)",
+            "orr {sctlr}, {sctlr}, #(1 << 26)",
             "msr sctlr_el1, {sctlr}",
             "isb",
             "tlbi vmalle1is",
@@ -2373,6 +2378,29 @@ pub fn map_dma_to_user_space(ttbr0: usize, phys_addr: usize, size: usize) -> Opt
 ///
 /// Device-quiescence precondition: same as [`map_dma_to_user`] — a CPU
 /// mapping being gone does not mean the device has stopped.
+/// [`map_shared_dma_to_user`] for surfaces the CPU writes and the device
+/// reads. The mapping is Normal Cacheable so ordinary libc code (including
+/// `dc zva`) works; every transfer cleans the range first.
+pub fn map_shared_normal_to_user(
+    task: &crate::scheduler::Task,
+    phys_addr: usize,
+    size: usize,
+) -> Option<usize> {
+    checked_range_end(phys_addr, size, DRAM_BASE, DRAM_END)?;
+    let (physical_start, physical_offset, page_count) =
+        aligned_page_span(phys_addr, size, GRANULE)?;
+    if page_count > ENTRIES * USER_MMIO_L2_GROUPS {
+        return None;
+    }
+    map_user_pages(
+        task.ttbr0,
+        physical_start,
+        page_count,
+        physical_offset,
+        user_shared_normal_page,
+    )
+}
+
 pub fn map_shared_dma_to_user(
     task: &crate::scheduler::Task,
     phys_addr: usize,
@@ -3218,6 +3246,15 @@ fn user_data_page(output_address: usize) -> u64 {
 /// (read permission is assumed present for every mapping). Callers must reject
 /// `PROT_WRITE | PROT_EXEC` before reaching this helper; `map_user_pages_at`
 /// also enforces that W^X rule defensively.
+/// Cacheable builder for shared DMA surfaces. `dc zva` (which glibc's
+/// `memset` uses for large zeroing) is only architecturally defined on
+/// Normal Cacheable memory, so a Non-Cacheable mapping makes ordinary libc
+/// code fault. The device sees the data because the owner cleans the range
+/// before every transfer.
+fn user_shared_normal_page(output_address: usize) -> u64 {
+    user_anonymous_page(output_address, PROT_READ | PROT_WRITE)
+}
+
 fn user_anonymous_page(output_address: usize, prot: u64) -> u64 {
     let mut descriptor = descriptor_address(output_address as u64)
         | DESC_PAGE

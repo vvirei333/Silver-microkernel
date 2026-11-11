@@ -4834,7 +4834,7 @@ pub fn map_ivshmem(length: usize) -> Option<usize> {
 /// Maps a DRM dumb buffer into the calling process. The caller has already
 /// checked that the physical range belongs to a live dumb buffer.
 pub fn map_drm_dumb(phys_addr: usize, length: usize) -> Option<usize> {
-    with_group_owner(|task| mmu::map_shared_dma_to_user(task, phys_addr, length))?
+    with_group_owner(|task| mmu::map_shared_normal_to_user(task, phys_addr, length))?
 }
 
 /// Maps the virtio-gpu scanout framebuffer into the calling process. The
@@ -4846,7 +4846,7 @@ pub fn map_gpufb(length: usize) -> Option<usize> {
     if length == 0 || length > size {
         return None;
     }
-    with_group_owner(|task| mmu::map_shared_dma_to_user(task, base, length))?
+    with_group_owner(|task| mmu::map_shared_normal_to_user(task, base, length))?
 }
 
 pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {

@@ -4761,3 +4761,55 @@ The direct blit is the single-window fast path and now runs only when the
 surface is not a layer surface (`layer_slot == 0`); layer surfaces are
 published exclusively by `layer_compose()`. Eight screendumps of the running
 Phosh lockscreen, ~20 s apart, are now byte-identical.
+
+### EL0 system registers: UCT, DZE and UCI
+
+The kernel set `SCTLR_EL1.M` and `PAN` but left `UCT`, `DZE` and `UCI`
+clear. glibc's `memset` reads `CTR_EL0` to decide whether it may zero a block
+with `DC ZVA`; without `UCT` that `MRS` traps to EL1 (`EC = 0x18`, which the
+fault path printed as a page fault with a nonsense "alignment fault" DFSC —
+`ISS` means something different for EC 0x18). Every process that memset a
+large buffer died. The boot and AP paths now set all three bits, so EL0 can
+read `CTR_EL0`, use `DC ZVA` and run `__clear_cache`.
+
+### Mesa: EGL/GLES on the render node
+
+`tools/install_mesa.py` resolves the aarch64 Mesa closure from a staged Arch
+root, renames `libgallium-26.2.6-arch1.1.so` to `libgallium-26.2.6.so` (the
+SFS name limit is 27 bytes), patches the soname and every `DT_NEEDED`, and
+writes the files plus `egl_vendor.json` into the image. `libdril_dri.so` is
+shipped both as itself and as `virtio_gpu_dri.so`.
+
+`tests/linux/egltest.c` runs the stack with no window system: it preloads
+libgallium (the DRI stub resolves the driver entry points from it), creates a
+GBM device on `/dev/dri/renderD128`, gets an EGL display from
+`EGL_PLATFORM_GBM_KHR`, makes a GLES2 context current, clears an FBO and reads
+the pixel back:
+
+```text
+egl: version 1.5
+gl: renderer llvmpipe (LLVM 23.1.4, 128 bits)
+gl: framebuffer complete
+gl: readback 64 128 191 255
+egl test ok
+```
+
+`EGL_PLATFORM_DEVICE_EXT` returns `EGL_BAD_PARAMETER` (Mesa's device platform
+enumerates DRM devices through libdrm/sysfs, which the guest has no sysfs
+for); GBM takes the fd directly and works. The surfaceless platform with
+`EGL_DEFAULT_DISPLAY` is swrast by definition, which is why the first attempt
+reported llvmpipe.
+
+Mesa reaches the render node (`GET_CAPS`, then `GETPARAM` 1..7) but asks for
+capset **6** (`VIRTGPU_DRM_CAPSET_DRM`, size 160) before creating the context.
+QEMU only exposes that capset with `drm_native_context=on`, which requires
+`blob=on`; with blobs the modern virtio capability block moves from BAR4 to
+BAR2 (BAR4 becomes the 512 MiB shared-memory BAR), and the driver's hardcoded
+BAR4 window breaks — the 2D scanout stops working. Until the driver parses the
+PCI capabilities and serves the DRM capset, Mesa falls back to llvmpipe.
+
+Also raised `MAX_FILE_MMAP_BYTES` to 256 MiB: the loader maps libLLVM
+(171 MiB) as one segment, and the old 64 MiB cap made `dlopen` fail. DRM and
+`/dev/gpufb` mappings are now Normal Cacheable (the DMA path cleans before
+every transfer), because `DC ZVA` on Non-Cacheable memory is not
+architecturally defined.

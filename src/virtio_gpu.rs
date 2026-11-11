@@ -95,9 +95,22 @@ static mut DISPLAY: Option<Display> = None;
 static mut NEXT_RESOURCE: u32 = 2;
 /// True when the device negotiated `VIRTIO_GPU_F_VIRGL`.
 static VIRGL: AtomicBool = AtomicBool::new(false);
-/// Cached virgl capability set, filled by `virgl_caps`.
-static mut CAPS: [u8; 4096] = [0; 4096];
-static mut CAPS_LEN: usize = 0;
+/// Cached capability sets, keyed by capset id (1 virgl, 2 virgl2, 6 drm).
+#[derive(Clone, Copy)]
+struct CapsEntry {
+    id: u32,
+    version: u32,
+    len: usize,
+    data: [u8; 4096],
+}
+
+static EMPTY_CAPS: CapsEntry = CapsEntry {
+    id: 0,
+    version: 0,
+    len: 0,
+    data: [0; 4096],
+};
+static mut CAPS: [CapsEntry; 4] = [EMPTY_CAPS; 4];
 
 fn pci_address(bus: u8, device: u8, function: u8, offset: usize) -> Option<usize> {
     if offset % 4 != 0 || offset >= 0x1000 {
@@ -964,65 +977,132 @@ pub fn transfer_3d(
     }
 }
 
-/// Reads the device's virgl capability set once and caches it.
-pub fn virgl_caps() -> Option<(&'static [u8], u32)> {
+/// Bitmask of capset ids the device advertises (bit `id` set).
+pub fn supported_capsets() -> u64 {
     unsafe {
-        if CAPS_LEN != 0 {
-            let caps = &*core::ptr::addr_of!(CAPS);
-            return Some((&caps[..CAPS_LEN], 2));
+        let display = match (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut() {
+            Some(display) => display,
+            None => return 0,
+        };
+        let mut mask = 0u64;
+        for index in 0..8u32 {
+            let mut command = [0u8; CTRL_HDR_LEN + 8];
+            header(&mut command, VIRTIO_GPU_CMD_GET_CAPSET_INFO);
+            put32(&mut command, CTRL_HDR_LEN, index);
+            let Some(kind) = control(&mut display.queue, &command) else {
+                break;
+            };
+            if kind != VIRTIO_GPU_RESP_OK_CAPSET_INFO {
+                break;
+            }
+            let response = display.queue.command + 4096;
+            let word = |offset: usize| -> u32 {
+                u32::from_le_bytes([
+                    core::ptr::read_volatile((response + offset) as *const u8),
+                    core::ptr::read_volatile((response + offset + 1) as *const u8),
+                    core::ptr::read_volatile((response + offset + 2) as *const u8),
+                    core::ptr::read_volatile((response + offset + 3) as *const u8),
+                ])
+            };
+            let entry_id = word(CTRL_HDR_LEN);
+            let size = word(CTRL_HDR_LEN + 8);
+            if size == 0 {
+                continue;
+            }
+            if entry_id < 64 {
+                mask |= 1 << entry_id;
+            }
+        }
+        mask
+    }
+}
+
+/// Reads one capability set from the device and caches it by capset id.
+/// `GET_CAPSET_INFO` takes an index into the device's capset list (QEMU's
+/// list is `[VIRGL, VIRGL2, DRM]` when the DRM native context is enabled),
+/// while `GET_CAPSET` takes the id the device reports.
+pub fn capset_caps(id: u32) -> Option<(&'static [u8], u32)> {
+    unsafe {
+        let table = &mut *core::ptr::addr_of_mut!(CAPS);
+        if let Some(index) = table
+            .iter()
+            .position(|entry| entry.len != 0 && entry.id == id)
+        {
+            let entry = &table[index];
+            return Some((&entry.data[..entry.len], entry.version));
         }
         let display = (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut()?;
         if !virgl_available() {
             return None;
         }
-        // `GET_CAPSET_INFO` takes a *capset index* into the device's list of
-        // capsets (QEMU's list is [VIRGL, VIRGL2]), not a capset id. Index 1
-        // is VIRGL2; `GET_CAPSET` below takes the id the device reports.
-        let mut command = [0u8; CTRL_HDR_LEN + 8];
-        header(&mut command, VIRTIO_GPU_CMD_GET_CAPSET_INFO);
-        put32(&mut command, CTRL_HDR_LEN, 1);
-        let kind = control(&mut display.queue, &command)?;
-        if kind != VIRTIO_GPU_RESP_OK_CAPSET_INFO {
-            failed("capset info", kind);
+        let mut found_id = 0u32;
+        let mut found_version = 0u32;
+        let mut found_size = 0usize;
+        for index in 0..8u32 {
+            let mut command = [0u8; CTRL_HDR_LEN + 8];
+            header(&mut command, VIRTIO_GPU_CMD_GET_CAPSET_INFO);
+            put32(&mut command, CTRL_HDR_LEN, index);
+            let Some(kind) = control(&mut display.queue, &command) else {
+                break;
+            };
+            if kind != VIRTIO_GPU_RESP_OK_CAPSET_INFO {
+                break;
+            }
+            let response = display.queue.command + 4096;
+            let word = |offset: usize| -> u32 {
+                u32::from_le_bytes([
+                    core::ptr::read_volatile((response + offset) as *const u8),
+                    core::ptr::read_volatile((response + offset + 1) as *const u8),
+                    core::ptr::read_volatile((response + offset + 2) as *const u8),
+                    core::ptr::read_volatile((response + offset + 3) as *const u8),
+                ])
+            };
+            let entry_id = word(CTRL_HDR_LEN);
+            let size = word(CTRL_HDR_LEN + 8) as usize;
+            if size == 0 {
+                // End of the list (or an entry the host cannot describe).
+                continue;
+            }
+            if entry_id == id {
+                found_id = entry_id;
+                found_version = word(CTRL_HDR_LEN + 4);
+                found_size = size;
+                break;
+            }
+        }
+        if found_size == 0 || found_size > 4096 {
             return None;
         }
-        let response = display.queue.command + 4096;
-        let mut word = |offset: usize| -> u32 {
-            u32::from_le_bytes([
-                core::ptr::read_volatile((response + offset) as *const u8),
-                core::ptr::read_volatile((response + offset + 1) as *const u8),
-                core::ptr::read_volatile((response + offset + 2) as *const u8),
-                core::ptr::read_volatile((response + offset + 3) as *const u8),
-            ])
-        };
-        let capset_id = word(CTRL_HDR_LEN);
-        let max_version = word(CTRL_HDR_LEN + 4);
-        let max_size = word(CTRL_HDR_LEN + 8) as usize;
-        if max_size == 0 || max_size > CAPS.len() {
-            console::write_str("VIRTIO-GPU: capset too large\r\n");
-            return None;
-        }
-        // struct virtio_gpu_get_capset { u32 capset_id; u32 capset_version; }
         let mut command = [0u8; CTRL_HDR_LEN + 8];
         header(&mut command, VIRTIO_GPU_CMD_GET_CAPSET);
-        put32(&mut command, CTRL_HDR_LEN, capset_id);
-        put32(&mut command, CTRL_HDR_LEN + 4, max_version.min(2));
+        put32(&mut command, CTRL_HDR_LEN, found_id);
+        put32(&mut command, CTRL_HDR_LEN + 4, found_version.min(2));
         let kind = control(&mut display.queue, &command)?;
         if kind != VIRTIO_GPU_RESP_OK_CAPSET {
             failed("capset", kind);
             return None;
         }
-        let source = response + CTRL_HDR_LEN + 8;
-        invalidate(source, max_size);
-        let caps = &mut *core::ptr::addr_of_mut!(CAPS);
-        core::ptr::copy_nonoverlapping(source as *const u8, caps.as_mut_ptr(), max_size);
-        CAPS_LEN = max_size;
-        console::write_str("VIRTIO-GPU: virgl caps ");
-        console::write_dec_u64(max_size as u64);
-        console::write_str(" bytes, capset ");
-        console::write_dec_u64(capset_id as u64);
-        console::write_str("\r\n");
-        Some((&caps[..max_size], max_version))
+        let source = display.queue.command + 4096 + CTRL_HDR_LEN + 8;
+        invalidate(source, found_size);
+        let slot = table.iter_mut().position(|entry| entry.len == 0)?;
+        table[slot].id = found_id;
+        table[slot].version = found_version;
+        table[slot].len = found_size;
+        core::ptr::copy_nonoverlapping(
+            source as *const u8,
+            table[slot].data.as_mut_ptr(),
+            found_size,
+        );
+        console::write_str("VIRTIO-GPU: capset ");
+        console::write_dec_u64(found_id as u64);
+        console::write_str(" ");
+        console::write_dec_u64(found_size as u64);
+        console::write_str(" bytes\r\n");
+        let index = table
+            .iter()
+            .position(|entry| entry.id == found_id && entry.len != 0)?;
+        let entry = &table[index];
+        Some((&entry.data[..entry.len], entry.version))
     }
 }
 

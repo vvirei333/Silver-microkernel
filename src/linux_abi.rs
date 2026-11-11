@@ -2248,7 +2248,10 @@ fn linux_mmap(
     // A library segment is routinely larger than the whole-file read cap
     // (`MAX_FILE_BYTES`, 8 MiB — libgtk-3 is ~8.5 MiB), and the contiguous
     // allocator cannot find a 2000-page run after a few hundred mappings.
-    const MAX_FILE_MMAP_BYTES: usize = 64 * 1024 * 1024;
+    // Mesa's `libgallium` pulls in `libLLVM`, which is 171 MiB; the loader
+    // maps each PT_LOAD segment with one mmap. The mapping is still paged
+    // (one frame per file page), so the cap only bounds a single request.
+    const MAX_FILE_MMAP_BYTES: usize = 256 * 1024 * 1024;
     if length as usize > MAX_FILE_MMAP_BYTES {
         return errno(ENOMEM);
     }

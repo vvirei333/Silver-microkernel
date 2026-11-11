@@ -985,12 +985,12 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                     VIRTGPU_PARAM_HOST_VISIBLE => 0,
                     VIRTGPU_PARAM_CROSS_DEVICE => 0,
                     VIRTGPU_PARAM_CONTEXT_INIT => virgl as u64,
-                    // Capsets 1 (virgl) and 2 (virgl2).
+                    // Bit per capset id the device advertises.
                     VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS => {
-                        if virgl {
-                            0b110
-                        } else {
+                        if !virgl {
                             0
+                        } else {
+                            crate::virtio_gpu::supported_capsets()
                         }
                     }
                     VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME => 0,
@@ -1013,10 +1013,11 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                 let Some(mut getcaps) = load::<VirtgpuGetCaps>(argument) else {
                     return Some(u64::MAX);
                 };
-                let Some((caps, version)) = crate::virtio_gpu::virgl_caps() else {
+                let Some((caps, version)) = crate::virtio_gpu::capset_caps(getcaps.cap_set_id)
+                else {
                     return Some(u64::MAX);
                 };
-                if getcaps.cap_set_id != 2 || getcaps.cap_set_ver > version {
+                if getcaps.cap_set_ver > version {
                     return Some(u64::MAX);
                 }
                 let take = (getcaps.size as usize).min(caps.len());
