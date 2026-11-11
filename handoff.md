@@ -4429,3 +4429,58 @@ hit server ok
 - `zphoc_layer_shell_effects_v1.stack_below()` is still ignored, so Phosh's
   "background" surfaces are ordered by creation instead of by the requested
   stacking.
+
+## 2026-11-11 — Wallpaper, symbolic icons and persistent buffers
+
+### The buffer was being dropped after every commit
+
+Wayland says a `wl_surface.commit` without `attach` keeps the current buffer;
+only `attach(NULL)` clears it. The compositor cleared `attached_buffers[]` after
+every commit, so GTK's repeated "present without attach" looked like
+`attach(NULL)`: the layer entry was forgotten, the surface vanished, and the
+screen flickered black or showed only part of a layer. Keeping the attachment
+fixes the flicker and the half-drawn wallpaper.
+
+### Theme assets
+
+`tools/gen_theme_assets.py` draws everything from scratch (no third-party
+artwork):
+
+- a 1024x768 night-sky wallpaper (`share/backgrounds/werewolf.png`), and
+- 59 monochrome symbolic icons for the names Phosh asks for (cellular/wifi
+  signal levels, bluetooth, brightness, volume, battery, arrows, padlock,
+  gear, refresh, `image-missing`).
+
+The SFS directory entry holds at most 27 bytes of name, and names such as
+`network-wireless-signal-excellent-symbolic.png` are longer. The icons are
+therefore packed into `theme.pack` (magic `WPK1`: u16 name, u32 length, bytes)
+and `phosh-serve` unpacks it into `/tmp/xdg/share` before it execs Phosh, with
+`XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share:/sfs/usr/share`.
+
+### GSettings without dconf
+
+There is no D-Bus/dconf in the guest, so GLib falls back to its keyfile
+backend. `phosh-serve` now writes `/tmp/.config/glib-2.0/settings/keyfile`
+with `org.gnome.desktop.background.picture-uri` (the wallpaper),
+`picture-options=zoom` and `org.gnome.desktop.interface.icon-theme=hicolor`
+before starting Phosh. Phosh then paints the wallpaper and finds the icons.
+
+The builder (`tools/build_phosh_image.py`) now generates and injects the
+wallpaper and `theme.pack` automatically, so rebuilding the image keeps them.
+
+### Verified
+
+- 222 host unit tests; `linux-wlreal`, `layer-serve` and `layer-hit` still
+  green.
+- Phosh paints the wallpaper (moon, stars, pines), the clock, and the quick
+  settings with a speaker icon, a chevron and the Bluetooth glyph. Log shows
+  `theme: unpacked 59`.
+
+### Known gaps
+
+- Phosh still starts with quick settings expanded; its layer surfaces are
+  sized against a taller screen than 384 logical, so the home surface covers
+  the top of the wallpaper. The next protocol gap is sending a fresh
+  `configure` after `set_size`/`set_anchor` (and honouring `stack_below`).
+- The Cellular and Wi-Fi tiles fall back to `image-missing`; the exact icon
+  names Phosh requests for them are not covered yet.

@@ -125,6 +125,23 @@ for name,data in list(files.items()):
         subprocess.run(['patchelf','--replace-needed',old,new,tmp],check=False)
     files[name]=open(tmp,'rb').read()
 
+# Wallpaper and symbolic icons. Icon names are longer than the SFS 27-byte
+# directory entry, so they ship as one archive that phosh-serve unpacks into
+# /tmp/xdg at startup (see tests/linux/wayland_real.c).
+import subprocess as _sp
+theme_dir = '/tmp/alarm/theme'
+_sp.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                     'gen_theme_assets.py')],
+        check=True, env=dict(os.environ, THEME_OUT=theme_dir))
+files['share/backgrounds/werewolf.png'] = open(
+    os.path.join(theme_dir, 'share/backgrounds/werewolf.png'), 'rb').read()
+pack_path = '/tmp/alarm/theme.pack'
+_sp.run([sys.executable, '-c',
+         'import sys; sys.path.insert(0, %r); import gen_theme_assets as g; '
+         'print(g.make_pack(%r))' % (os.path.dirname(os.path.abspath(__file__)), pack_path)],
+        check=True, env=dict(os.environ, THEME_OUT=theme_dir))
+files['theme.pack'] = open(pack_path, 'rb').read()
+
 for name,data in files.items():
     img.write_file_at(name,data)
 img.save()

@@ -2449,9 +2449,10 @@ static int serve(long client) {
                     begin(committed_buffer, 0 /* wl_buffer.release */);
                     finish();
                     send_message(client, -1);
-                    if (object < SURFACE_IDS) {
-                        attached_buffers[object] = 0;
-                    }
+                    /* Do NOT clear attached_buffers here: a commit without
+                       attach keeps the current buffer. Clearing it made the
+                       next commit look like attach(NULL), so GTK's repeated
+                       present-without-attach dropped the whole layer. */
                 }
                 if (frame_id != 0) {
                     send_done(client, frame_id, 0);
@@ -2732,6 +2733,105 @@ static void reset_client(void) {
 }
 
 #ifdef SERVE_ONLY
+/* GTK icon names are longer than the 27-byte SFS directory entry, so the icon
+ * theme ships as one short-named archive and is unpacked into the ramfs. */
+static unsigned char pack_buffer[64 * 1024];
+
+static unsigned pack_u16(const unsigned char *data) {
+    return (unsigned)data[0] | ((unsigned)data[1] << 8);
+}
+
+static unsigned pack_u32(const unsigned char *data) {
+    return (unsigned)data[0] | ((unsigned)data[1] << 8) |
+           ((unsigned)data[2] << 16) | ((unsigned)data[3] << 24);
+}
+
+static void make_dirs(char *path) {
+    for (char *cursor = path + 1; *cursor != 0; cursor++) {
+        if (*cursor == '/') {
+            *cursor = 0;
+            sys3(34 /* mkdirat */, -100, (long)path, 0777);
+            *cursor = '/';
+        }
+    }
+}
+
+static void extract_theme(void) {
+    long fd = sys3(56 /* openat */, -100, (long)"/sfs/theme.pack", 0);
+    if (fd < 0) {
+        return;
+    }
+    long count = sys3(63 /* read */, fd, (long)pack_buffer, sizeof(pack_buffer));
+    sys3(57 /* close */, fd, 0, 0);
+    if (count < 8 || pack_buffer[0] != 'W' || pack_buffer[1] != 'P' ||
+        pack_buffer[2] != 'K' || pack_buffer[3] != '1') {
+        return;
+    }
+    unsigned files = pack_u32(pack_buffer + 4);
+    unsigned offset = 8;
+    unsigned written = 0;
+    for (unsigned index = 0; index < files; index++) {
+        if (offset + 2 > (unsigned)count) {
+            return;
+        }
+        unsigned name_length = pack_u16(pack_buffer + offset);
+        offset += 2;
+        if (offset + name_length + 4 > (unsigned)count) {
+            return;
+        }
+        static const char root[] = "/tmp/xdg/";
+        char path[160];
+        unsigned base = 0;
+        while (root[base] != 0) {
+            path[base] = root[base];
+            base++;
+        }
+        if (base + name_length + 1 >= sizeof(path)) {
+            return;
+        }
+        for (unsigned byte = 0; byte < name_length; byte++) {
+            path[base + byte] = (char)pack_buffer[offset + byte];
+        }
+        path[base + name_length] = 0;
+        offset += name_length;
+        unsigned data_length = pack_u32(pack_buffer + offset);
+        offset += 4;
+        if (offset + data_length > (unsigned)count) {
+            return;
+        }
+        make_dirs(path);
+        long out = sys3(56 /* openat */, -100, (long)path,
+                        0x241 /* O_WRONLY|O_CREAT|O_TRUNC */);
+        if (out >= 0) {
+            sys3(64 /* write */, out, (long)(pack_buffer + offset), data_length);
+            sys3(57 /* close */, out, 0, 0);
+        }
+        offset += data_length;
+        written += 1;
+    }
+    static const char prefix[] = "theme: unpacked ";
+    char text[sizeof(prefix) + 12];
+    unsigned length = sizeof(prefix) - 1;
+    for (unsigned index = 0; index < length; index++) {
+        text[index] = prefix[index];
+    }
+    unsigned value = written;
+    char digits[12];
+    unsigned count_digits = 0;
+    if (value == 0) {
+        digits[count_digits++] = '0';
+    }
+    while (value != 0) {
+        digits[count_digits++] = (char)('0' + value % 10);
+        value /= 10;
+    }
+    while (count_digits != 0) {
+        text[length++] = digits[--count_digits];
+    }
+    text[length++] = '\n';
+    sys3(64, 1, (long)text, length);
+}
+
 void _start(void) {
     long server = sys3(198, 1, 1, 0);
     if (server < 0 || bind_path(server) < 0) {
@@ -2764,6 +2864,36 @@ void _start(void) {
         }
     }
 
+    extract_theme();
+
+    /* GLib's keyfile settings backend reads $XDG_CONFIG_HOME/glib-2.0/
+       settings/keyfile before it falls back to schema defaults. There is no
+       dconf/D-Bus in the guest, so seed the desktop defaults here: the
+       wallpaper and the icon theme. Phosh reads them during startup. */
+    sys3(34 /* mkdirat */, -100, (long)"/tmp/.config", 0777);
+    sys3(34, -100, (long)"/tmp/.config/glib-2.0", 0777);
+    sys3(34, -100, (long)"/tmp/.config/glib-2.0/settings", 0777);
+    {
+        long settings_fd = sys3(56 /* openat */, -100,
+                                (long)"/tmp/.config/glib-2.0/settings/keyfile",
+                                0x241 /* O_WRONLY|O_CREAT|O_TRUNC */);
+        if (settings_fd >= 0) {
+            static const char settings[] =
+                "[org/gnome/desktop/background]\n"
+                "picture-uri='file:///sfs/share/backgrounds/werewolf.png'\n"
+                "picture-uri-dark='file:///sfs/share/backgrounds/werewolf.png'\n"
+                "picture-options='zoom'\n"
+                "primary-color='#0a0e1c'\n"
+                "[org/gnome/desktop/screensaver]\n"
+                "picture-uri='file:///sfs/share/backgrounds/werewolf.png'\n"
+                "[org/gnome/desktop/interface]\n"
+                "icon-theme='hicolor'\n";
+            sys3(64 /* write */, settings_fd, (long)settings,
+                 sizeof(settings) - 1);
+            sys3(57 /* close */, settings_fd, 0, 0);
+        }
+    }
+
     /* fontconfig only writes a cache into a directory that already exists */
     sys3(34 /* mkdirat */, -100, (long)"/tmp/fontcache", 0777);
     long child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
@@ -2789,10 +2919,10 @@ void _start(void) {
             "WAYLAND_DISPLAY=wayland-test",
             "GDK_BACKEND=wayland",
             "LD_LIBRARY_PATH=/sfs",
-            "XDG_DATA_DIRS=/sfs/share",
+            "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share",
             "GSETTINGS_SCHEMA_DIR=/sfs",
             "FONTCONFIG_FILE=/sfs/fonts.conf",
-            "XDG_DATA_DIRS=/sfs/share:/sfs/usr/share",
+            "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share:/sfs/usr/share",
             "GSK_RENDERER=cairo",
             "GTK_A11Y=none",
             "XDG_CURRENT_DESKTOP=Phosh",
