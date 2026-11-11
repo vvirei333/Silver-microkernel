@@ -3832,3 +3832,29 @@ before any window appears. All GTK4 core dependencies (glib, gobject, gio,
 pango, cairo, gdk-pixbuf, harfbuzz, wayland, xkbcommon) are byte-identical
 to the GTK3 image, so this is not an ABI mix — it is the open heap
 corruption below. GTK4 is the first workload that hits it on startup.
+
+### Heap corruption: the writer is asynchronous
+
+New facts from the static-glibc chunktest (block at `0x40801170`, 200 KiB):
+
+- A **second immediate `memset` does not help**: the block still corrupts
+  (round 606, 597 with `-smp 1`). So the damage is not a lost store from the
+  first memset; something writes **between the memsets/verify**.
+- The bad run starts at a 16-byte-aligned offset and extends to the **end of
+  the block** (e.g. `11232..204800`); the header before the block is intact.
+- The content is the constant 16-byte record
+  `{u32 0x218, u32 0, u64 0}`. That is the exact layout of a
+  `Vec<(u32, u64)>` element, i.e. an epoll result `(events, data)` with
+  `events = EPOLLWRBAND|EPOLLERR|EPOLLHUP`, `data = 0`.
+- `brk` is quiet: query, one small growth to `0x40800AE0`, one growth to the
+  2 MiB cap `0x40A00000`; **no shrink**, so trim/regrow is not involved.
+- `-smp 1` reproduces, so the writer is not another CPU.
+- The kernel heap is `0x40526000..0x42526000` (32 MiB, `HEAP_PAGES=8192`);
+  the corrupt frames are around `0x42BD6000`, above it, so the record is
+  not the kernel heap's epoll `Vec` storage. The writer is still open.
+
+Next probe: a QEMU gdb hardware watchpoint on the user VA's last 8 bytes and
+on the kernel linear alias (`KERNEL_VIRT_BASE + PA + 0x1FF8`) to catch the
+writer's PC, or a kernel PTE read-only trap to tell a user write from a
+kernel linear-map write. QEMU HMP `pmemsave` rejected the filename argument
+("invalid char 't' in expression"), so use the gdbstub instead.
