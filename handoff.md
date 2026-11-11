@@ -4630,3 +4630,17 @@ device exposes before the control queue and DRM work start.
 `-device NAME,help` even when the device is unknown, which made the old check
 always pass). The base modules `qemu-hw-display-virtio-gpu{,-pci}` are still
 needed for any virtio-gpu device to exist.
+
+### virtio-gpu is visible
+
+With the base and GL modules installed, QEMU exposes `virtio-gpu-gl-pci` and
+`egl-headless`. A `--gpu` boot now reports the device from the kernel probe:
+
+```text
+VIRTIO-GPU: device 4.0 id 0x0000000000001050
+VIRTIO-GPU: BAR4 0x000000000000000C
+```
+
+BAR4 is unassigned (`0x0C` = 64-bit memory BAR, address 0), so the driver must
+program a BAR address the way virtio-blk does. `--gpu` prefers the GL device
+with `-display egl-headless` and falls back to the 2D device.

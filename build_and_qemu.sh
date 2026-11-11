@@ -134,13 +134,16 @@ if [ "$VIEWER" -eq 1 ]; then
 fi
 
 GPU_ARGS=()
+GPU_DISPLAY=(-display none)
 if [ "$GPU" -eq 1 ]; then
     # `-device NAME,help` exits 0 even when the device is unknown, so the
     # device list is the reliable check.
     GPU_DEVICES="$(qemu-system-aarch64 -device help 2>&1)"
-    if printf '%s\n' "$GPU_DEVICES" | grep -q 'name "virtio-gpu-gl-pci"'; then
+    if printf '%s\n' "$GPU_DEVICES" | grep -q 'name "virtio-gpu-gl-pci"' &&
+       qemu-system-aarch64 -display help 2>&1 | grep -qx "egl-headless"; then
         GPU_ARGS+=(-device virtio-gpu-gl-pci)
-        echo "GPU: virtio-gpu-gl-pci (virgl)"
+        GPU_DISPLAY=(-display egl-headless)
+        echo "GPU: virtio-gpu-gl-pci (virgl, egl-headless)"
     elif printf '%s\n' "$GPU_DEVICES" | grep -q 'name "virtio-gpu-pci"'; then
         GPU_ARGS+=(-device virtio-gpu-pci)
         echo "GPU: virtio-gpu-pci (2D)"
@@ -161,5 +164,5 @@ qemu-system-aarch64 \
     -device virtio-net-pci,disable-legacy=on \
     -object memory-backend-file,id=ivshmem0,share=on,mem-path="$SHM",size=4M \
     -device ivshmem-plain,memdev=ivshmem0 \
-    -display none \
+    "${GPU_DISPLAY[@]}" \
     -serial mon:stdio
