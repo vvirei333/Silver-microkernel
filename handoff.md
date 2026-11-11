@@ -3891,3 +3891,37 @@ boot, compare with the user block PA; or run QEMU with a DMA trace. Also note
 the `-smp 1` boot emits ~145k `MUTEX: unregister with no current task` lines
 (a boot diagnostic loop before a current task exists); production boots with
 `-smp 2` and does not show it, but it makes single-CPU debugging noisy.
+
+### Heap corruption: watchpoint validated, stale-TLB ruled out
+
+The QEMU gdb hardware watchpoint works: on `-smp 1` it fired on the user
+VA of the block tail (`0x40833168`) with the memset's pattern
+(`0x0101010101010101`). The earlier silent run was therefore meaningful:
+a watchpoint on the **kernel linear alias** of the tail frame never fired
+while the block corrupted, so there is no CPU write through the kernel map.
+
+Other results:
+
+- Anonymous `mmap` frames are properly zeroed (8 rounds of 512 KiB read all
+  zero after `munmap`/`mmap`), so the `{0x218, 0}` content is written, not
+  left over from an unzeroed frame.
+- Refusing `brk` growth (forcing glibc to use mmap for the whole heap) does
+  **not** stop the corruption; the block then lives in the mmap region and
+  still corrupts.
+- In that mode the block's VA/PA changes across rounds (glibc `mmap`/`munmap`
+  per allocation), so comparing a boot-time PA with the corrupt round's PA is
+  invalid. The 16-byte record follows the *current* block.
+- Calling `mprotect(block, PROT_READ|PROT_WRITE)` after detection (a TLB
+  flush) does not change the mismatches (`1346` before and after), so a
+  simple stale TLB for the block VA is ruled out.
+- The page table has no duplicate user VAs, the frame refcount is 1, and a
+  cross-task scan of the corrupt tail PA finds only the current task.
+
+Also fixed the `-smp 1` boot flood: `unregister_mutex` no longer prints when
+there is no current task (that print re-entered the console lock and emitted
+~145k lines before the shell).
+
+Next: log the block VA and PA **per round** and watch a round that is stable
+shortly before the failure, or write-protect the block page in the PTE and
+trap the first writer (a kernel linear-map write will not fault, a user or
+user-VA write will).

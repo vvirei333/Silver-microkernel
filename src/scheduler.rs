@@ -1968,7 +1968,10 @@ pub fn register_mutex(state: *mut mutex::MutexState) {
 
 pub fn unregister_mutex(state: *mut mutex::MutexState) {
     let Some(task) = current_task_mut() else {
-        crate::console::write_str("MUTEX: unregister with no current task\r\n");
+        // Early boot has no task context yet (the console lock itself is
+        // released there). Printing from this path re-enters the console and
+        // floods the UART (~145k lines on one CPU), so stay silent; the
+        // stale-state diagnostic below still covers the task-context case.
         return;
     };
     let before = task.owned_mutexes.len();
