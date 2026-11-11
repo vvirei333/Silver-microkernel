@@ -816,6 +816,70 @@ static const struct xdg_toplevel_listener toplevel_listener = {
     .close = toplevel_close,
 };
 
+static int run_layer_only(struct wl_display *display) {
+    struct wl_registry *registry = wl_display_get_registry(display);
+    if (registry == NULL) {
+        return 8;
+    }
+    wl_registry_add_listener(registry, &registry_listener, NULL);
+    if (wl_display_roundtrip(display) < 0) {
+        return 8;
+    }
+    if (compositor == NULL || shared_memory == NULL || layer_shell == NULL) {
+        fprintf(stderr, "wlclient: layer globals missing\n");
+        return 8;
+    }
+    struct wl_surface *surface = wl_compositor_create_surface(compositor);
+    if (surface == NULL) {
+        return 8;
+    }
+    struct zwlr_layer_surface_v1 *layer = zwlr_layer_shell_v1_get_layer_surface(
+        layer_shell, surface, NULL, ZWLR_LAYER_SHELL_V1_LAYER_TOP, "layer-only");
+    if (layer == NULL) {
+        return 8;
+    }
+    zwlr_layer_surface_v1_add_listener(layer, &layer_surface_listener, NULL);
+    zwlr_layer_surface_v1_set_size(layer, 256, 64);
+    zwlr_layer_surface_v1_set_anchor(
+        layer, ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP | ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT);
+    size_t bytes = 256 * 64 * 4;
+    int fd = memfd_create("layer-only", 0);
+    if (fd < 0 || ftruncate(fd, (off_t)bytes) < 0) {
+        return 8;
+    }
+    unsigned *pixels = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (pixels == MAP_FAILED) {
+        return 8;
+    }
+    for (size_t index = 0; index < 256 * 64; index++) {
+        pixels[index] = 0xFFFF0000u;
+    }
+    struct wl_shm_pool *pool = wl_shm_create_pool(shared_memory, fd, (int)bytes);
+    struct wl_buffer *buffer = wl_shm_pool_create_buffer(
+        pool, 0, 256, 64, 256 * 4, WL_SHM_FORMAT_ARGB8888);
+    wl_surface_commit(surface);
+    for (int attempt = 0; attempt < 8 && !layer_configured; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    if (!layer_configured) {
+        fprintf(stderr, "wlclient: layer configure missing\n");
+        return 8;
+    }
+    wl_surface_attach(surface, buffer, 0, 0);
+    wl_surface_damage(surface, 0, 0, 256, 64);
+    wl_surface_commit(surface);
+    for (int attempt = 0; attempt < 4; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+    }
+    printf("layer client ok\n");
+    fflush(stdout);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     int is_source = argc > 1 && strcmp(argv[1], "source") == 0;
     int is_receiver = argc > 1 && strcmp(argv[1], "receiver") == 0;
@@ -823,6 +887,11 @@ int main(int argc, char **argv) {
     if (display == NULL) {
         fprintf(stderr, "wlclient: connect failed\n");
         return 2;
+    }
+    if (argc > 1 && strcmp(argv[1], "layer") == 0) {
+        int result = run_layer_only(display);
+        wl_display_disconnect(display);
+        return result;
     }
     struct wl_registry *registry = wl_display_get_registry(display);
     if (registry == NULL) {
@@ -1366,6 +1435,26 @@ int main(int argc, char **argv) {
         }
         zwlr_layer_surface_v1_add_listener(layer_surface,
                                            &layer_surface_listener, NULL);
+        int layer_fd = memfd_create("layer", 0);
+        if (layer_fd < 0) {
+            return 8;
+        }
+        size_t layer_size = 256 * 64 * 4;
+        if (ftruncate(layer_fd, (off_t)layer_size) < 0) {
+            return 8;
+        }
+        unsigned *layer_pixels = mmap(NULL, layer_size, PROT_READ | PROT_WRITE,
+                                      MAP_SHARED, layer_fd, 0);
+        if (layer_pixels == MAP_FAILED) {
+            return 8;
+        }
+        for (size_t i = 0; i < 256 * 64; i++) {
+            layer_pixels[i] = 0xFFFF0000u; /* opaque red */
+        }
+        struct wl_shm_pool *layer_pool =
+            wl_shm_create_pool(shared_memory, layer_fd, (int)layer_size);
+        struct wl_buffer *layer_buffer = wl_shm_pool_create_buffer(
+            layer_pool, 0, 256, 64, 256 * 4, WL_SHM_FORMAT_ARGB8888);
         zwlr_layer_surface_v1_set_size(layer_surface, 256, 64);
         zwlr_layer_surface_v1_set_anchor(
             layer_surface,
@@ -1384,6 +1473,14 @@ int main(int argc, char **argv) {
         if (!layer_configured) {
             fprintf(stderr, "wlclient: layer-shell configure missing\n");
             return 8;
+        }
+        wl_surface_attach(layer_wl, layer_buffer, 0, 0);
+        wl_surface_damage(layer_wl, 0, 0, 256, 64);
+        wl_surface_commit(layer_wl);
+        for (int attempt = 0; attempt < 4; attempt++) {
+            if (wl_display_roundtrip(display) < 0) {
+                return 8;
+            }
         }
         zwlr_layer_surface_v1_destroy(layer_surface);
         wl_surface_destroy(layer_wl);

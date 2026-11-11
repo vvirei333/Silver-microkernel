@@ -150,6 +150,10 @@ python3 scripts/sfs_inject.py "$IMAGE" build/unixsock.elf linux-unixsock
 python3 scripts/sfs_inject.py "$IMAGE" build/namedsock.elf linux-namedsock
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland.elf linux-wayland
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland_real.elf linux-wlreal
+"$CC" -static -nostdlib -ffreestanding -O2 -DSERVE_ONLY -DSERVE_LAYER \
+    -Wl,-T,tests/linux/wayland_real.ld -Wl,-z,max-page-size=4096 \
+    -o build/layer_serve.elf tests/linux/wayland_real.c
+python3 scripts/sfs_inject.py "$IMAGE" build/layer_serve.elf layer-serve
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland_info.elf linux-wlinfo
 python3 scripts/sfs_inject.py "$IMAGE" build/dbus.elf linux-dbus
 if [ -f build/glibtest ]; then

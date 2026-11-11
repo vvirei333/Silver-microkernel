@@ -3763,3 +3763,44 @@ Not done yet, and needed before a real Phosh session:
 
 Open bugs unchanged: the `{0x218, 0}` heap-suffix corruption (see above)
 and gdk-pixbuf's PNG refusal.
+
+### Layer surfaces now composite into the WIN1 sink
+
+`gtk-serve` keeps a small layer table (4 entries) with the anchor, margins,
+layer, buffer geometry and the pool descriptor. On a layer-surface commit it
+composes the whole 1024x768 WIN1 frame: background clear, then layers from
+background to overlay, honouring TOP/BOTTOM/LEFT/RIGHT anchors and margins,
+clipping to the output, swizzling ARGB to the RX 8888 layout the viewer
+expects, and finally rewriting the header. It prints
+`layer compose px=0x...` with the top-left pixel.
+
+A dedicated `layer-serve` build (`-DSERVE_ONLY -DSERVE_LAYER`) forks
+`/sfs/wlclient layer`, a new minimal mode that creates a 256x64 red TOP|LEFT
+layer surface with an shm buffer. Verified:
+
+```
+layer compose px=0xff0000ff
+layer client ok
+layer server ok
+```
+
+Limitations to address in the multi-client refactor:
+
+- `gtk-serve` still accepts a single connection; the 2-client poll loop in
+  `wayland_real.c` needs to be shared with the sink build.
+- The compositor still uses the most recently created buffer's geometry for
+  the commit; a real fix keys `(width, height, stride, format, offset)` by
+  buffer id.
+- No input path yet (host viewer to seat).
+
+### GTK4: closure is too large to merge into the GTK3 image
+
+`fakeroot pacman` against the Arch Linux ARM mirrors works for staging
+(`/tmp/alarm/pacman.conf`, aarch64 core/extra/alarm/aur), but the closure for
+`gtk4 libadwaita gtk-layer-shell` is **213 packages / 198.9 MiB compressed**
+before installation. Merging that into the 256 MiB GTK3 image would overwrite
+the working GTK3/glib stack and cannot fit the guest's 256 MiB of RAM. The
+next step is a **separate GTK4 image** built from an ALARM root (or a
+minimal set of *new* libraries: gtk4, graphene, libadwaita, gtk4-layer-shell,
+gdk-pixbuf loaders), not a merge. The layer-shell server work above does not
+depend on this.

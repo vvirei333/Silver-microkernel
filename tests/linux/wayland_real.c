@@ -275,6 +275,24 @@ static unsigned layer_width;
 static unsigned layer_height;
 static int layer_configured;
 static int layer_acked;
+#define MAX_LAYERS 4
+typedef struct {
+    int used;
+    unsigned surface;
+    unsigned layer;
+    unsigned anchor;
+    int margin[4];
+    unsigned width;
+    unsigned height;
+    unsigned stride;
+    unsigned format;
+    unsigned offset;
+    int fd;
+} LayerEntry;
+static LayerEntry layer_entries[MAX_LAYERS];
+static unsigned layer_anchor;
+static unsigned layer_layer;
+static int layer_margin[4];
 static int text_input_enabled;
 static unsigned text_input_serial;
 static unsigned subsurface_surface_id;
@@ -537,6 +555,148 @@ static void send_decoration_mode(long client, unsigned mode) {
 
 
 
+
+static void layer_record_commit(void) {
+    if (layer_surface_surface == 0) {
+        return;
+    }
+    LayerEntry *entry = 0;
+    for (unsigned index = 0; index < MAX_LAYERS; index++) {
+        if (layer_entries[index].used &&
+            layer_entries[index].surface == layer_surface_surface) {
+            entry = &layer_entries[index];
+            break;
+        }
+    }
+    if (entry == 0) {
+        for (unsigned index = 0; index < MAX_LAYERS; index++) {
+            if (!layer_entries[index].used) {
+                entry = &layer_entries[index];
+                break;
+            }
+        }
+    }
+    if (entry == 0) {
+        return;
+    }
+    entry->used = 1;
+    entry->surface = layer_surface_surface;
+    entry->layer = layer_layer;
+    entry->anchor = layer_anchor;
+    for (unsigned index = 0; index < 4; index++) {
+        entry->margin[index] = layer_margin[index];
+    }
+    entry->width = (unsigned)buffer_width;
+    entry->height = (unsigned)buffer_height;
+    entry->stride = buffer_stride;
+    entry->format = buffer_format;
+    entry->offset = buffer_offset;
+    entry->fd = pool_fd;
+}
+
+#ifdef SERVE_ONLY
+static void layer_compose(void) {
+    if (screen == 0) {
+        return;
+    }
+    const unsigned out_width = 1024;
+    const unsigned out_height = 768;
+    unsigned *destination = (unsigned *)(screen + 0x1000);
+    for (unsigned index = 0; index < out_width * out_height; index++) {
+        destination[index] = 0xFF101014u;
+    }
+    unsigned drawn = 0;
+    for (unsigned wanted = 0; wanted <= 3; wanted++) {
+        for (unsigned index = 0; index < MAX_LAYERS; index++) {
+            LayerEntry *entry = &layer_entries[index];
+            if (!entry->used || entry->layer != wanted || entry->width == 0 ||
+                entry->height == 0 || entry->fd < 0) {
+                continue;
+            }
+            unsigned length = entry->offset + entry->stride * entry->height;
+            long mapped = sys6(222 /* mmap */, 0, length, 1 /* read */,
+                               1 /* MAP_SHARED */, entry->fd, 0);
+            if (mapped <= 0) {
+                continue;
+            }
+            int x;
+            int y;
+            /* anchor bits: 1 top, 2 bottom, 4 left, 8 right */
+            if ((entry->anchor & 4) != 0 && (entry->anchor & 8) != 0) {
+                x = entry->margin[3];
+            } else if ((entry->anchor & 8) != 0) {
+                x = (int)out_width - (int)entry->width - entry->margin[1];
+            } else if ((entry->anchor & 4) != 0) {
+                x = entry->margin[3];
+            } else {
+                x = ((int)out_width - (int)entry->width) / 2;
+            }
+            if ((entry->anchor & 1) != 0 && (entry->anchor & 2) != 0) {
+                y = entry->margin[0];
+            } else if ((entry->anchor & 2) != 0) {
+                y = (int)out_height - (int)entry->height - entry->margin[2];
+            } else if ((entry->anchor & 1) != 0) {
+                y = entry->margin[0];
+            } else {
+                y = ((int)out_height - (int)entry->height) / 2;
+            }
+            const unsigned char *source =
+                (const unsigned char *)(mapped + entry->offset);
+            for (unsigned row = 0; row < entry->height; row++) {
+                int out_y = y + (int)row;
+                if (out_y < 0 || out_y >= (int)out_height) {
+                    continue;
+                }
+                const unsigned *source_row =
+                    (const unsigned *)(source + row * entry->stride);
+                for (unsigned column = 0; column < entry->width; column++) {
+                    int out_x = x + (int)column;
+                    if (out_x < 0 || out_x >= (int)out_width) {
+                        continue;
+                    }
+                    unsigned pixel = source_row[column];
+                    unsigned swizzled = (pixel & 0xFF00FF00u) |
+                                        ((pixel & 0x00FF0000u) >> 16) |
+                                        ((pixel & 0x000000FFu) << 16);
+                    if (entry->format == 1) {
+                        swizzled |= 0xFF000000u;
+                    }
+                    if ((swizzled >> 24) != 0) {
+                        destination[(unsigned)out_y * out_width +
+                                    (unsigned)out_x] = swizzled;
+                    }
+                }
+            }
+            sys3(215 /* munmap */, mapped, length, 0);
+            drawn += 1;
+        }
+    }
+    *(volatile unsigned *)(screen + 0x00) = 0x57494E31u;
+    *(volatile unsigned *)(screen + 0x08) = out_width;
+    *(volatile unsigned *)(screen + 0x0C) = out_height;
+    *(volatile unsigned *)(screen + 0x10) = out_width * 4;
+    *(volatile unsigned *)(screen + 0x14) = 1;
+    *(volatile unsigned *)(screen + 0x18) = 0;
+    *(volatile unsigned *)(screen + 0x2C) = 1;
+    __asm__ volatile("dsb sy" ::: "memory");
+    if (drawn != 0) {
+        static const char prefix[] = "layer compose px=0x";
+        char text[sizeof(prefix) + 9];
+        unsigned length = sizeof(prefix) - 1;
+        for (unsigned index = 0; index < length; index++) {
+            text[index] = prefix[index];
+        }
+        unsigned pixel = destination[0];
+        for (int shift = 28; shift >= 0; shift -= 4) {
+            unsigned digit = (pixel >> shift) & 0xF;
+            text[length++] = (char)(digit < 10 ? '0' + digit
+                                               : 'a' + (digit - 10));
+        }
+        text[length++] = '\n';
+        sys3(64 /* write */, 1, (long)text, length);
+    }
+}
+#endif
 
 static int serve(long client) {
     long count = receive_message(client);
@@ -1007,12 +1167,14 @@ static int serve(long client) {
                 layer_width = take_u32();
                 layer_height = take_u32();
             } else if (object == layer_surface_id && opcode == 1) {
-                (void)take_u32(); /* anchor */
+                layer_anchor = take_u32();
             } else if (object == layer_surface_id && opcode == 2) {
                 (void)take_u32(); /* exclusive zone */
             } else if (object == layer_surface_id && opcode == 3) {
-                (void)take_u32(); (void)take_u32();
-                (void)take_u32(); (void)take_u32(); /* margins */
+                layer_margin[0] = (int)take_u32();
+                layer_margin[1] = (int)take_u32();
+                layer_margin[2] = (int)take_u32();
+                layer_margin[3] = (int)take_u32();
             } else if (object == layer_surface_id && opcode == 4) {
                 (void)take_u32(); /* keyboard interactivity */
             } else if (object == layer_surface_id && opcode == 5) {
@@ -1021,11 +1183,17 @@ static int serve(long client) {
                 (void)take_u32(); /* ack_configure */
                 layer_acked = 1;
             } else if (object == layer_surface_id && opcode == 7) {
+                for (unsigned index = 0; index < MAX_LAYERS; index++) {
+                    if (layer_entries[index].used &&
+                        layer_entries[index].surface == layer_surface_surface) {
+                        layer_entries[index].used = 0;
+                    }
+                }
                 layer_surface_id = 0;
                 layer_surface_surface = 0;
                 layer_configured = 0;
             } else if (object == layer_surface_id && opcode == 8) {
-                (void)take_u32(); /* set_layer */
+                layer_layer = take_u32();
             } else if (is_surface(object) && opcode == 0) {
                 /* wl_surface.destroy: drop focus with leave events. */
                 surface_ids[object] = 0;
@@ -1170,6 +1338,10 @@ static int serve(long client) {
                             *(volatile unsigned *)(screen + 0x18) = screen_seq * 2;
                             sys3(215 /* munmap */, mapped, length, 0);
                         }
+                    }
+                    if (object == layer_surface_surface && layer_surface_id != 0) {
+                        layer_record_commit();
+                        layer_compose();
                     }
 #else
                     long mapped = sys6(222, 0, 4096, 1, 1, pool_fd, 0);
@@ -1490,7 +1662,11 @@ void _start(void) {
         fail("gtk-serve: fork failed\n", 21);
     }
     if (child == 0) {
+#ifdef SERVE_LAYER
+        static const char *argv[] = {"/sfs/wlclient", "layer", 0};
+#else
         static const char *argv[] = {"/sfs/gtkdemo", 0};
+#endif
         static const char *envp[] = {
             "XDG_RUNTIME_DIR=/tmp",
             "HOME=/tmp",
@@ -1520,7 +1696,11 @@ void _start(void) {
     if ((status & 0x7f) != 0 || ((status >> 8) & 0xff) != 0) {
         fail("gtk-serve: client failed\n", 23);
     }
+#ifdef SERVE_LAYER
+    sys3(64, 1, (long)"layer server ok\n", 16);
+#else
     sys3(64, 1, (long)"gtk client ok\n", 14);
+#endif
     sys3(93, 0, 0, 0);
     for (;;) {
     }
