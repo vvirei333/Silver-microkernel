@@ -3858,3 +3858,36 @@ on the kernel linear alias (`KERNEL_VIRT_BASE + PA + 0x1FF8`) to catch the
 writer's PC, or a kernel PTE read-only trap to tell a user write from a
 kernel linear-map write. QEMU HMP `pmemsave` rejected the filename argument
 ("invalid char 't' in expression"), so use the gdbstub instead.
+
+### Heap corruption: no CPU writer, DMA is the remaining suspect
+
+Watchpoint run on the base image with `-smp 1` (`watchtest`: first block at
+`0x40801170`, 200 KiB, then free/alloc rounds):
+
+- Read the block's tail PA (`0x42aa8000`) through a debug syscall and set a
+  QEMU gdb hardware watchpoint on the kernel linear alias
+  `0xffff000042aa7168`. It **never fired** during the whole 70 s run, while
+  the block still corrupted (round 235, `pa_now == pa_start`).
+- A page-table walk of the task found **576 mapped pages and zero duplicate
+  VAs**; `refcount` of the corrupt frame is **1**; so no same-task alias and
+  no shared frame.
+- PTE is stable: the PA of the tail page before and after the corruption is
+  the same (`0x42aa8000`).
+
+A CPU write through the kernel linear map, another mapping of the frame, and
+a cross-task share are therefore all ruled out for this reproduction. GDB
+watchpoints only see CPU accesses, so **device DMA** is now the main
+suspect: a descriptor/buffer that still points at a frame later handed to
+the user heap. Candidates: the virtio-blk request/used ring (the block PA
+must be compared with `ring_pa`/`request_pa` from `virtio_blk::init`) and
+the net driver's RX/TX buffers (`userspace/src/bin/net_driver.rs`).
+
+The constant record is `{u32 0x218, u32 0, u64 0}`; a virtio descriptor is
+16 bytes and a used-ring element/request header is 8-16 bytes, so a stale
+DMA descriptor/buffer is a good structural fit.
+
+Next: print the virtio-blk ring/request PAs and the net-driver buffer PAs at
+boot, compare with the user block PA; or run QEMU with a DMA trace. Also note
+the `-smp 1` boot emits ~145k `MUTEX: unregister with no current task` lines
+(a boot diagnostic loop before a current task exists); production boots with
+`-smp 2` and does not show it, but it makes single-CPU debugging noisy.
