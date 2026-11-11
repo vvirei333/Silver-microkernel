@@ -1664,6 +1664,8 @@ void _start(void) {
     if (child == 0) {
 #ifdef SERVE_LAYER
         static const char *argv[] = {"/sfs/wlclient", "layer", 0};
+#elif defined(SERVE_GTK4)
+        static const char *argv[] = {"/sfs/gtk4hello", 0};
 #else
         static const char *argv[] = {"/sfs/gtkdemo", 0};
 #endif
@@ -1677,6 +1679,9 @@ void _start(void) {
             "XDG_DATA_DIRS=/sfs/share",
             "GSETTINGS_SCHEMA_DIR=/sfs",
             "FONTCONFIG_FILE=/sfs/fonts.conf",
+            "XDG_DATA_DIRS=/sfs/share:/sfs/usr/share",
+            "GSK_RENDERER=cairo",
+            "GTK_A11Y=none",
             0,
         };
         sys6(221 /* execve */, (long)argv[0], (long)argv, (long)envp, 0, 0, 0);
@@ -1696,8 +1701,10 @@ void _start(void) {
     if ((status & 0x7f) != 0 || ((status >> 8) & 0xff) != 0) {
         fail("gtk-serve: client failed\n", 23);
     }
-#ifdef SERVE_LAYER
+#if defined(SERVE_LAYER)
     sys3(64, 1, (long)"layer server ok\n", 16);
+#elif defined(SERVE_GTK4)
+    sys3(64, 1, (long)"gtk4 client ok\n", 15);
 #else
     sys3(64, 1, (long)"gtk client ok\n", 14);
 #endif

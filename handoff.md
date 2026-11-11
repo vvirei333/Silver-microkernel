@@ -3804,3 +3804,31 @@ next step is a **separate GTK4 image** built from an ALARM root (or a
 minimal set of *new* libraries: gtk4, graphene, libadwaita, gtk4-layer-shell,
 gdk-pixbuf loaders), not a merge. The layer-shell server work above does not
 depend on this.
+
+## GTK4 image staged from Arch Linux ARM
+
+`fakeroot pacman` against `mirror.archlinuxarm.org` works as a non-root
+package stager (`/tmp/alarm/pacman.conf`, `Architecture = aarch64`,
+`RootDir = ~/phosh-state/gtk4-root`, `--noscriptlet`). The full closure of
+`gtk4 libadwaita gtk4-layer-shell` is 213 packages / 198.9 MiB compressed;
+the installed root is ~1.2 GiB.
+
+`tools/gtk4_closure.py` walks DT_NEEDED from the three libraries, and
+`tools/merge_gtk4.py` merges only the files whose bytes differ from the GTK3
+image (61 of 116 libraries were already byte-identical, so only 47 MiB were
+added). The result is `~/phosh-state/disk_gtk4.img` (256 MiB image, 101 MiB
+free) with `gtk4hello` (GTK4 window, quits after 2 s) and `gtk4-serve`
+(the layer-capable compositor built with `SERVE_ONLY + SERVE_GTK4` which
+forks `/sfs/gtk4hello` and sets `GSK_RENDERER=cairo`, `GTK_A11Y=none`).
+
+One soname exceeded the SFS 27-byte name limit
+(`libcairo-script-interpreter.so.2`, only needed by libgtk-4), so it was
+renamed to `libcairo-script-interp.so.2` with `patchelf --set-soname` plus
+`--replace-needed` in libgtk-4.
+
+First boot of `linuxrun /sfs/gtk4-serve`: the compositor maps the sink and
+the GTK4 client dies immediately with `free(): invalid pointer` (SIGABRT),
+before any window appears. All GTK4 core dependencies (glib, gobject, gio,
+pango, cairo, gdk-pixbuf, harfbuzz, wayland, xkbcommon) are byte-identical
+to the GTK3 image, so this is not an ABI mix — it is the open heap
+corruption below. GTK4 is the first workload that hits it on startup.
