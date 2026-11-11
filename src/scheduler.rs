@@ -4096,26 +4096,21 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             continue;
         }
         if !region.frames.is_empty() {
-            // File-backed pages are not one contiguous run, so each frame is
-            // copied on its own. `MAP_PRIVATE` still means private here: the
-            // child must not observe the parent's writes or vice versa.
-            let mut copied: Vec<(usize, u32)> = Vec::new();
-            for &(page, _generation) in &region.frames {
-                let Some((new_page, new_generation)) = frame_allocator::alloc_user_page_tagged()
-                else {
-                    for (page, generation) in copied {
+            // File-backed pages are not one contiguous run. Share the frames
+            // copy-on-write instead of copying them: a Phosh process maps
+            // ~120 MiB of libraries, and an eager copy made `fork` (which
+            // glycin uses to spawn its image loader) exhaust DRAM and fail
+            // with EAGAIN. Both sides are write-protected below, so the first
+            // write on either side copies a single page.
+            let mut shared: Vec<(usize, u32)> = Vec::new();
+            for &(page, generation) in &region.frames {
+                if !frame_allocator::share_page_tagged(page, generation) {
+                    for (page, generation) in shared {
                         let _ = frame_allocator::free_page_tagged(page, generation);
                     }
                     return None;
-                };
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        phys_to_virt(page) as *const u8,
-                        phys_to_virt(new_page) as *mut u8,
-                        PAGE_SIZE,
-                    );
                 }
-                copied.push((new_page, new_generation));
+                shared.push((page, generation));
             }
             parts.mmap.push(MmapRegion {
                 virtual_address: region.virtual_address,
@@ -4124,7 +4119,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
                 generation: 0,
                 prot: region.prot,
                 shared: SharedMapping::default(),
-                frames: copied,
+                frames: shared,
                 lazy: false,
                 pages: BTreeMap::new(),
             });
@@ -4227,17 +4222,25 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             }
             ok
         } else if !region.frames.is_empty() {
-            // A paged file-backed region was deep-copied above; each frame is
-            // mapped separately. Mapping `physical_start` (zero for this
-            // variant) would point every page at physical 0, which is exactly
-            // how a dynamically linked child lost libc's text after fork.
+            // A paged file-backed region shares the parent's frames; each
+            // frame is mapped separately. Mapping `physical_start` (zero for
+            // this variant) would point every page at physical 0, which is
+            // exactly how a dynamically linked child lost libc's text after
+            // fork. A writable mapping starts read-only so the first write
+            // faults into the per-page COW handler instead of corrupting the
+            // frame the parent still uses.
+            let child_prot = if region.prot & mmu::PROT_WRITE != 0 {
+                mmu::PROT_READ
+            } else {
+                region.prot
+            };
             let mut ok = true;
             for (index, &(page, _generation)) in region.frames.iter().enumerate() {
                 if !mmu::map_user_page_at(
                     ttbr0,
                     region.virtual_address + index * PAGE_SIZE,
                     page,
-                    region.prot,
+                    child_prot,
                 ) {
                     ok = false;
                     break;
@@ -4298,9 +4301,19 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
                 continue;
             }
             if !region.frames.is_empty() {
-                // The child got a private deep copy, so the parent keeps its
-                // frames writable; a COW fault here would mistake the region
-                // for a contiguous run (physical_start is 0 for this form).
+                // The child shares these frames; make the parent read-only
+                // too so either side's first write copies one page.
+                if region.prot & mmu::PROT_WRITE != 0
+                    && !mmu::protect_user_pages_at(
+                        parent.ttbr0,
+                        region.virtual_address,
+                        region.page_count,
+                        mmu::PROT_READ,
+                    )
+                {
+                    kernel_stack::free(kernel_stack_start);
+                    return None;
+                }
                 continue;
             }
             if region.prot & mmu::PROT_WRITE != 0
@@ -6629,11 +6642,11 @@ impl Task {
             }
         }
 
-        if let Some(index) = self.mmap_regions.iter().position(|region| {
+        if let Some(region_index) = self.mmap_regions.iter().position(|region| {
             page >= region.virtual_address
                 && page < region.virtual_address + region.page_count * PAGE_SIZE
         }) {
-            let region = &self.mmap_regions[index];
+            let region = &self.mmap_regions[region_index];
             // A MAP_SHARED window owns no frames: a write fault means the
             // window was made read-only, and Linux kills the task instead of
             // silently breaking the sharing contract.
@@ -6641,20 +6654,23 @@ impl Task {
                 return false;
             }
             if !region.frames.is_empty() {
-                let index = (page - region.virtual_address) / PAGE_SIZE;
+                let page_index = (page - region.virtual_address) / PAGE_SIZE;
                 let prot = region.prot;
-                let (old_physical, old_generation) = region.frames[index];
+                let (old_physical, old_generation) = region.frames[page_index];
                 let Some((new_physical, new_generation)) =
                     cow_copy_run(old_physical, 1, old_generation)
                 else {
                     return false;
                 };
-                if !mmu::map_user_page_at(ttbr0, page, new_physical, prot) {
+                // The slot is already mapped (read-only); `map_user_page_at`
+                // refuses existing mappings, so re-point it instead.
+                if !mmu::remap_user_pages_at(ttbr0, page, new_physical, 1, prot) {
                     frame_allocator::free_page_tagged(new_physical, new_generation);
                     return false;
                 }
                 frame_allocator::free_page_tagged(old_physical, old_generation);
-                self.mmap_regions[index].frames[index] = (new_physical, new_generation);
+                self.mmap_regions[region_index].frames[page_index] =
+                    (new_physical, new_generation);
                 return true;
             }
             let old_physical = region.physical_start;
@@ -6686,7 +6702,7 @@ impl Task {
                 count,
                 old_generation,
             );
-            let region = &mut self.mmap_regions[index];
+            let region = &mut self.mmap_regions[region_index];
             region.physical_start = new_physical;
             region.generation = new_generation;
             return true;

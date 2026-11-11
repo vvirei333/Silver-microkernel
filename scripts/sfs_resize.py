@@ -19,6 +19,7 @@ Defaults: disk.img, 64 MiB, 2048 inodes. A smaller target than the current image
 that already has the requested geometry is a no-op.
 """
 
+import mmap
 import struct
 import sys
 
@@ -92,15 +93,27 @@ class Image:
 class Builder:
     """New image under construction; allocates blocks from the data area."""
 
-    def __init__(self, old: Image, total_blocks: int, inode_count: int):
+    def __init__(self, old: Image, total_blocks: int, inode_count: int,
+                 path: str):
         self.old = old
         self.total = total_blocks
         self.inodes = inode_count
         self.bitmap_blocks = bitmap_blocks(total_blocks)
         self.itable = 1 + self.bitmap_blocks
         self.data_start = data_start_for(total_blocks, inode_count)
-        self.data = bytearray(total_blocks * BLOCK)
+        # Sparse destination: truncate to the requested size and mmap it.
+        # The untouched tail stays holes on disk and costs no host RAM.
+        self._handle = open(path, "wb")
+        self._handle.truncate(total_blocks * BLOCK)
+        self._handle.close()
+        self._handle = open(path, "r+b")
+        self.data = mmap.mmap(self._handle.fileno(), 0)
         self.next_block = self.data_start
+
+    def close(self) -> None:
+        self.data.flush()
+        self.data.close()
+        self._handle.close()
 
     def alloc(self) -> int:
         if self.next_block >= self.total:
@@ -159,16 +172,16 @@ class Builder:
             for outer, double_block in enumerate(self.old.pointers(triple)):
                 if not double_block:
                     continue
-                new_double = self.alloc()
+                new_sub_double = self.alloc()
                 struct.pack_into(
-                    "<I", self.data, new_triple * BLOCK + outer * 4, new_double
+                    "<I", self.data, new_triple * BLOCK + outer * 4, new_sub_double
                 )
                 for middle, table in enumerate(self.old.pointers(double_block)):
                     if not table:
                         continue
                     new_table = self.alloc()
                     struct.pack_into(
-                        "<I", self.data, new_double * BLOCK + middle * 4, new_table
+                        "<I", self.data, new_sub_double * BLOCK + middle * 4, new_table
                     )
                     for entry, block in enumerate(self.old.pointers(table)):
                         if block:
@@ -210,7 +223,6 @@ class Builder:
         # below the data area belongs to metadata.
         for block in range(self.data_start):
             self.data[BLOCK + block // 8] |= 1 << (block % 8)
-        return bytes(self.data)
 
 
 def main(argv) -> int:
@@ -244,11 +256,10 @@ def main(argv) -> int:
         )
         return 0
 
-    builder = Builder(current, total_blocks, inode_count)
+    builder = Builder(current, total_blocks, inode_count, path)
     builder.copy_inodes()
-    image = builder.finish(current.root)
-    with open(path, "wb") as handle:
-        handle.write(image)
+    builder.finish(current.root)
+    builder.close()
     print(
         f"{path}: resized {current.total} -> {total_blocks} blocks "
         f"({megabytes} MiB), {current.inodes} -> {inode_count} inodes, "

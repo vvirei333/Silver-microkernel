@@ -110,7 +110,7 @@ if [ "$VIEWER" -eq 1 ]; then
 fi
 
 qemu-system-aarch64 \
-    -machine virt -cpu cortex-a72 -smp 2 -m 256M \
+    -machine virt -cpu cortex-a72 -smp 2 -m 1024M \
     -kernel "target/aarch64-unknown-none/$PROFILE/silver_microkernel" \
     -drive file=disk.img,format=raw,if=none,id=hd \
     -device virtio-blk-pci,drive=hd \

@@ -19,6 +19,7 @@ replaced, freeing the old blocks first. Files up to the VFS limit (4 direct +
 supported.
 """
 
+import mmap
 import os
 import struct
 import sys
@@ -39,8 +40,10 @@ NAME_MAX = 27
 class Image:
     def __init__(self, path: str):
         self.path = path
-        with open(path, "rb") as handle:
-            self.data = bytearray(handle.read())
+        # mmap instead of reading the whole image: the Phosh image is 2 GiB
+        # and copying it into a bytearray per injection exhausted host RAM.
+        self._handle = open(path, "r+b")
+        self.data = mmap.mmap(self._handle.fileno(), 0)
         fields = struct.unpack_from("<10I", self.data, 0)
         (
             self.magic,
@@ -323,8 +326,7 @@ class Image:
             self.add_entry(dir_index, name, index)
 
     def save(self) -> None:
-        with open(self.path, "wb") as handle:
-            handle.write(self.data)
+        self.data.flush()
 
 
 def main() -> int:

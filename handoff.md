@@ -4189,3 +4189,89 @@ Non-fatal noise seen before the abort (useful when reading logs):
    `build/window-viewer/werewolf-window --snapshot`.
 3. Then: multi-client compositing, host input injection, OSK, and the
    remaining Phosh session pieces (D-Bus, machine-id).
+
+## 2026-11-11 — Phosh renders its lockscreen
+
+The desktop is on screen. With the compositor serving Phosh's layer
+surfaces, the host viewer captures a real Phosh lockscreen (1024x768):
+big `00:01` clock, `Thursday, January 1`, and the unlock prompt. The
+snapshot is `frame=38 nonwhite-samples=48004`.
+
+Guest RAM is now **1 GiB** (`src/memory.rs` and `build_and_qemu.sh -m 1024M`);
+the Phosh image is **2 GiB** (`~/phosh-state/disk_phosh.img`, 32768 inodes,
+sparse 167 MiB on disk). `scripts/sfs_resize.py` and `scripts/sfs_inject.py`
+now mmap the image instead of loading it into a bytearray.
+
+### Why Phosh stopped before
+
+1. **gdk-pixbuf had no MIME database.** It selects the loader with
+   `g_content_type_guess`, so every PNG failed with `Unrecognized image file
+   format` even though the glycin loader worked. `share/mime/mime.cache`
+   (from `shared-mime-info`) is now in the image.
+2. **glycin's zbus reactor starved.** The loader spawned and exited, but the
+   parent never read the reply. `ASYNC_GLOBAL_EXECUTOR_THREADS=4` in the
+   launcher environment makes it deterministic (same workaround as
+   `glycintest`).
+3. **`phosh_private` was missing.** `phosh_app_tracker_init` calls
+   `phosh_private_get_startup_tracker` unconditionally and crashed on the
+   NULL proxy (`wl_proxy_get_version(NULL)`). The compositor now advertises
+   `phosh_private` v7 and parses `rotate_display`, `get_xdg_switcher`,
+   `get_thumbnail`, `get_keyboard_event`, `get_startup_tracker` and
+   `set_shell_state` (plus the tracker/keyboard-event/xdg-switcher destroy
+   requests).
+4. **Missing GSettings schemas.** Phosh aborts on
+   `org.gnome.settings-daemon.plugins.power`. The merged
+   `gschemas.compiled` now includes `gnome-settings-daemon`, `gnome-shell`,
+   `phoc` and `gsettings-desktop-schemas`.
+5. **Forking a 120 MiB process copied every library page.** glycin spawns its
+   loader with `fork`; the eager per-page copy of file-backed `MAP_PRIVATE`
+   mappings exhausted DRAM (`EAGAIN`). `fork_current` now shares those frames
+   copy-on-write and write-protects both sides. `cow_fault` re-points the
+   existing PTE (`remap_user_pages_at`, not `map_user_page_at`, which refuses
+   an existing mapping) and the region index no longer shadows the page index.
+6. **The kernel reserve was too large.** At 256 MiB a 5 MiB GDK shm pool was
+   refused. `RESERVE_DIVISOR` is now 16; with 1 GiB guest RAM there is ample
+   headroom. The stale `task_frame_limit` unit test (written for a 1/2 limit)
+   was updated for the 3/4 policy.
+
+### Compositor: per-object state, not one global id
+
+Phosh uses the display in ways the demo never did:
+
+- It binds `wl_shm` **twice** (GDK's registry and Phosh's own). A single
+  `shm_id` made the second bind shadow the first, so `create_pool` on the GDK
+  proxy was ignored. `is_shm()`/`shm_add()` now keep every shm proxy.
+- It creates several `wl_shm_pool`s and buffers on older pools. `pools[]` and
+  `buffers[]` (in `ClientState`, saved/loaded per client) record every pool fd
+  and buffer geometry. `create_buffer` is accepted on any live pool.
+- It creates six layer surfaces (lockscreen, background, top panel, panel
+  background, home, background). `layer_surfaces[]` maps each `wl_surface` to
+  its `zwlr_layer_surface_v1` and its own size/anchor/margin/layer, so each
+  one receives its own configure.
+- `wl_surface.attach` records the buffer per surface; `commit` blits and
+  releases **that** buffer, not the most recently created one. Without this
+  GDK allocated a fresh 5 MiB pool for every frame.
+
+### Verified
+
+- Host unit tests: **221 passed**.
+- Guest: `linux-fork` (`parent saw child 42`), `linux-cowfork`
+  (`cow fork ok`), `linux-memfd` (`shared memfd ok`), `linux-threadfork`
+  (`thread wait status=0`), `linux-wlreal` (`clipboard source ok`,
+  `layer-shell ok`, `libwayland 2 clients ok`), `layer-serve`
+  (`layer compose px=0xff0000ff`, `layer client ok`, `layer server ok`).
+- Phosh: `Phosh ready`, `gtk-serve: shm frame committed`, host snapshot of
+  the lockscreen.
+
+### Next
+
+1. Input injection from the host (pointer/keyboard into the compositor) so the
+   lockscreen can be swiped away and the shell becomes usable.
+2. A real background/icon theme in the 2 GiB image (the current background is
+   white because `/usr/share/backgrounds/gnome/blobs-d.svg` is absent and the
+   hicolor theme is incomplete).
+3. D-Bus session + machine-id for OSK/polkit/logind; `phosh_private` keyboard
+   grabs.
+4. Memory/process management in the iOS direction: a memory-pressure signal
+   (jetsam-like), per-process priority/QoS, and killing/suspending background
+   tasks before the kernel reserve is reached.

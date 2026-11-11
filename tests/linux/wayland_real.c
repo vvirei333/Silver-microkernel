@@ -241,6 +241,45 @@ static long connect_path(long socket) {
 static unsigned registry_id;
 static unsigned compositor_id;
 static unsigned shm_id;
+/* The client binds wl_shm more than once (GDK's registry and Phosh's own
+ * registry share the display but allocate different proxy ids). Every proxy
+ * must accept create_pool, not only the most recently bound one. */
+#define MAX_SHM 8
+static unsigned shm_ids[MAX_SHM];
+
+static int is_shm(unsigned id) {
+    if (id == 0) {
+        return 0;
+    }
+    if (id == shm_id) {
+        return 1;
+    }
+    for (unsigned index = 0; index < MAX_SHM; index++) {
+        if (shm_ids[index] == id) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void shm_add(unsigned id) {
+    if (id == 0) {
+        return;
+    }
+    /* Check only the array: `is_shm` also matches the *current* `shm_id`,
+       which would make this return before recording the id. */
+    for (unsigned index = 0; index < MAX_SHM; index++) {
+        if (shm_ids[index] == id) {
+            return;
+        }
+    }
+    for (unsigned index = 0; index < MAX_SHM; index++) {
+        if (shm_ids[index] == 0) {
+            shm_ids[index] = id;
+            return;
+        }
+    }
+}
 static unsigned shell_id;
 static unsigned xdg_surface_id;
 static unsigned toplevel_id;
@@ -275,7 +314,7 @@ static unsigned layer_width;
 static unsigned layer_height;
 static int layer_configured;
 static int layer_acked;
-#define MAX_LAYERS 4
+#define MAX_LAYERS 16
 typedef struct {
     int used;
     unsigned surface;
@@ -290,6 +329,76 @@ typedef struct {
     int fd;
 } LayerEntry;
 static LayerEntry layer_entries[MAX_LAYERS];
+
+/* Protocol state of each zwlr_layer_surface_v1. Phosh creates several (top
+ * panel, background, home, ...), so a single "current layer surface" pair let
+ * only the last one receive its configure. */
+#define MAX_LAYER_SURFACES 16
+typedef struct {
+    int used;
+    unsigned layer_surface;
+    unsigned surface;
+    unsigned layer;
+    unsigned anchor;
+    unsigned width;
+    unsigned height;
+    int margin[4];
+    int configured;
+    int acked;
+} LayerSurface;
+static LayerSurface layer_surfaces[MAX_LAYER_SURFACES];
+
+static LayerSurface *layer_surface_by_id(unsigned id) {
+    if (id == 0) {
+        return 0;
+    }
+    for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
+        if (layer_surfaces[index].used && layer_surfaces[index].layer_surface == id) {
+            return &layer_surfaces[index];
+        }
+    }
+    return 0;
+}
+
+static LayerSurface *layer_surface_by_surface(unsigned surface) {
+    if (surface == 0) {
+        return 0;
+    }
+    for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
+        if (layer_surfaces[index].used && layer_surfaces[index].surface == surface) {
+            return &layer_surfaces[index];
+        }
+    }
+    return 0;
+}
+
+static LayerSurface *layer_surface_add(unsigned id, unsigned surface) {
+    LayerSurface *slot = layer_surface_by_id(id);
+    if (slot == 0) {
+        for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
+            if (!layer_surfaces[index].used) {
+                slot = &layer_surfaces[index];
+                break;
+            }
+        }
+    }
+    if (slot == 0) {
+        slot = &layer_surfaces[0];
+    }
+    slot->used = 1;
+    slot->layer_surface = id;
+    slot->surface = surface;
+    slot->layer = 0;
+    slot->anchor = 0;
+    slot->width = 0;
+    slot->height = 0;
+    for (unsigned index = 0; index < 4; index++) {
+        slot->margin[index] = 0;
+    }
+    slot->configured = 0;
+    slot->acked = 0;
+    return slot;
+}
 static unsigned layer_anchor;
 static unsigned layer_layer;
 static int layer_margin[4];
@@ -317,6 +426,114 @@ static unsigned popup_surface_id;
 #define SURFACE_IDS 256
 static unsigned char surface_ids[SURFACE_IDS];
 
+/* wl_shm pools and buffers. A toolkit creates several pools (one per window
+ * or layer surface) and buffers on older pools, so a single `pool_id` /
+ * `buffer_id` pair lost both the create_buffer arguments and the release
+ * target. The tables are part of ClientState; the globals below are the
+ * currently loaded client's copy. */
+#define MAX_POOLS 32
+#define MAX_BUFFERS 128
+typedef struct {
+    unsigned id;
+    int fd;
+} PoolSlot;
+typedef struct {
+    unsigned id;
+    int pool_fd;
+    unsigned offset;
+    unsigned width;
+    unsigned height;
+    unsigned stride;
+    unsigned format;
+} BufferSlot;
+static PoolSlot pools[MAX_POOLS];
+static BufferSlot buffers[MAX_BUFFERS];
+static unsigned attached_buffers[SURFACE_IDS];
+
+static PoolSlot *pool_find(unsigned id) {
+    if (id == 0) {
+        return 0;
+    }
+    for (unsigned index = 0; index < MAX_POOLS; index++) {
+        if (pools[index].id == id) {
+            return &pools[index];
+        }
+    }
+    return 0;
+}
+
+static PoolSlot *pool_add(unsigned id, int fd) {
+    PoolSlot *free_slot = 0;
+    for (unsigned index = 0; index < MAX_POOLS; index++) {
+        if (pools[index].id == id) {
+            free_slot = &pools[index];
+            break;
+        }
+        if (pools[index].id == 0 && free_slot == 0) {
+            free_slot = &pools[index];
+        }
+    }
+    if (free_slot == 0) {
+        free_slot = &pools[0];
+    }
+    if (free_slot->fd >= 0 && free_slot->fd != fd) {
+        sys3(57, free_slot->fd, 0, 0);
+    }
+    free_slot->id = id;
+    free_slot->fd = fd;
+    return free_slot;
+}
+
+static BufferSlot *buffer_find(unsigned id) {
+    if (id == 0) {
+        return 0;
+    }
+    for (unsigned index = 0; index < MAX_BUFFERS; index++) {
+        if (buffers[index].id == id) {
+            return &buffers[index];
+        }
+    }
+    return 0;
+}
+
+static BufferSlot *buffer_add(unsigned id) {
+    BufferSlot *slot = buffer_find(id);
+    if (slot != 0) {
+        return slot;
+    }
+    for (unsigned index = 0; index < MAX_BUFFERS; index++) {
+        if (buffers[index].id == 0) {
+            buffers[index].id = id;
+            return &buffers[index];
+        }
+    }
+    /* Full: recycle the oldest slot. */
+    buffers[0].id = id;
+    return &buffers[0];
+}
+
+static void pools_reset(void) {
+    for (unsigned index = 0; index < MAX_POOLS; index++) {
+        if (pools[index].fd >= 0) {
+            sys3(57, pools[index].fd, 0, 0);
+        }
+        pools[index].id = 0;
+        pools[index].fd = -1;
+    }
+    for (unsigned index = 0; index < MAX_BUFFERS; index++) {
+        buffers[index].id = 0;
+        buffers[index].pool_fd = -1;
+        buffers[index].offset = 0;
+        buffers[index].width = 0;
+        buffers[index].height = 0;
+        buffers[index].stride = 0;
+        buffers[index].format = 0;
+    }
+    for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        attached_buffers[index] = 0;
+    }
+}
+
 static int is_surface(unsigned id) {
     return id < SURFACE_IDS && surface_ids[id] != 0;
 }
@@ -337,6 +554,13 @@ static unsigned stacked_id;
 static unsigned foreign_toplevel_manager_id;
 static unsigned gamma_manager_id;
 static unsigned gamma_control_id;
+/* phosh_private: the phosh<->compositor extension. Phosh calls
+ * get_startup_tracker unconditionally and crashes on a NULL proxy, so the
+ * request must at least be answered with a real object. */
+static unsigned phosh_private_id;
+static unsigned startup_tracker_id;
+static unsigned keyboard_event_id;
+static unsigned xdg_switcher_id;
 static unsigned output_manager_id;
 static unsigned output_config_id;
 static int popup_grab;
@@ -430,6 +654,10 @@ typedef struct {
     unsigned foreign_toplevel_manager_id;
     unsigned gamma_manager_id;
     unsigned gamma_control_id;
+    unsigned phosh_private_id;
+    unsigned startup_tracker_id;
+    unsigned keyboard_event_id;
+    unsigned xdg_switcher_id;
     unsigned output_manager_id;
     unsigned output_config_id;
     int popup_grab;
@@ -449,6 +677,9 @@ typedef struct {
     int connected;
     int selection_changed;
     int wants_offer;
+    PoolSlot pools[MAX_POOLS];
+    BufferSlot buffers[MAX_BUFFERS];
+    unsigned attached_buffers[SURFACE_IDS];
 } ClientState;
 
 #define CLIENT_SCALARS(X) \
@@ -474,6 +705,7 @@ typedef struct {
     X(output_power_manager_id) X(output_power_id) \
     X(layer_effects_id) X(draggable_id) X(alpha_id) X(stacked_id) \
     X(foreign_toplevel_manager_id) X(gamma_manager_id) X(gamma_control_id) \
+    X(phosh_private_id) X(startup_tracker_id) X(keyboard_event_id) X(xdg_switcher_id) \
     X(output_manager_id) X(output_config_id) \
     X(popup_grab) X(popup_committed) X(pool_id) X(buffer_id) X(frame_id) \
     X(pool_fd) X(verified) X(commits) X(focused) X(surface_entered) \
@@ -499,6 +731,15 @@ static void load_client(ClientState *client) {
     CLIENT_SCALARS(LOAD)
 #undef LOAD
     copy_mimes(data_mimes, client->data_mimes);
+    for (unsigned index = 0; index < MAX_POOLS; index++) {
+        pools[index] = client->pools[index];
+    }
+    for (unsigned index = 0; index < MAX_BUFFERS; index++) {
+        buffers[index] = client->buffers[index];
+    }
+    for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        attached_buffers[index] = client->attached_buffers[index];
+    }
 }
 
 static void save_client(ClientState *client) {
@@ -506,6 +747,15 @@ static void save_client(ClientState *client) {
     CLIENT_SCALARS(SAVE)
 #undef SAVE
     copy_mimes(client->data_mimes, data_mimes);
+    for (unsigned index = 0; index < MAX_POOLS; index++) {
+        client->pools[index] = pools[index];
+    }
+    for (unsigned index = 0; index < MAX_BUFFERS; index++) {
+        client->buffers[index] = buffers[index];
+    }
+    for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        client->attached_buffers[index] = attached_buffers[index];
+    }
 }
 
 static void send_global_version(long client, unsigned registry, unsigned name,
@@ -798,6 +1048,8 @@ static int serve(long client) {
                             "zwlr_gamma_control_manager_v1");
                 send_global_version(client, registry_id, 23,
                                     "zwlr_output_manager_v1", 2);
+                send_global_version(client, registry_id, 24,
+                                    "phosh_private", 7);
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -808,6 +1060,7 @@ static int serve(long client) {
                     compositor_id = new_id;
                 } else if (text_equal(interface, "wl_shm")) {
                     shm_id = new_id;
+                    shm_add(new_id);
                     begin(shm_id, 0 /* wl_shm.format */);
                     put_u32(0); /* ARGB8888 */
                     finish();
@@ -906,6 +1159,8 @@ static int serve(long client) {
                     gamma_manager_id = new_id;
                 } else if (text_equal(interface, "zwlr_output_manager_v1")) {
                     output_manager_id = new_id;
+                } else if (text_equal(interface, "phosh_private")) {
+                    phosh_private_id = new_id;
                 }
             } else if (object == text_input_manager_id && opcode == 1) {
                 text_input_id = take_u32(); /* get_text_input */
@@ -1211,61 +1466,144 @@ static int serve(long client) {
             } else if (object == seat_id && opcode == 0) {
                 /* wl_seat.get_pointer(new_id): enter + motion. */
                 pointer_id = take_u32();
-            } else if (object == shm_id && opcode == 0) {
-                pool_id = take_u32(); /* create_pool */
+            } else if (is_shm(object) && opcode == 0) {
+                unsigned id = take_u32(); /* create_pool */
                 (void)take_i32();
+                pool_id = id;
                 if (incoming_fd >= 0) {
-                    if (pool_fd >= 0) {
-                        sys3(57, pool_fd, 0, 0);
-                    }
-                    pool_fd = incoming_fd;
+                    PoolSlot *slot = pool_add(id, incoming_fd);
+                    pool_fd = slot->fd;
+                    incoming_fd = -1;
                 }
-            } else if (object == pool_id && opcode == 0) {
-                buffer_id = take_u32(); /* create_buffer */
-                buffer_offset = take_u32();
-                buffer_width = (int)take_u32();
-                buffer_height = (int)take_u32();
-                buffer_stride = take_u32();
-                buffer_format = take_u32();
+            } else if (pool_find(object) != 0 && opcode == 0) {
+                /* wl_shm_pool.create_buffer(new_id, offset, w, h, stride,
+                   format). Any live pool may create a buffer, not just the
+                   most recently created one. */
+                unsigned id = take_u32();
+                unsigned offset = take_u32();
+                unsigned width = take_u32();
+                unsigned height = take_u32();
+                unsigned stride = take_u32();
+                unsigned format = take_u32();
+                PoolSlot *pool = pool_find(object);
+                BufferSlot *slot = buffer_add(id);
+                slot->pool_fd = pool->fd;
+                slot->offset = offset;
+                slot->width = width;
+                slot->height = height;
+                slot->stride = stride;
+                slot->format = format;
+                buffer_id = id;
+                buffer_offset = offset;
+                buffer_width = (int)width;
+                buffer_height = (int)height;
+                buffer_stride = stride;
+                buffer_format = format;
+                pool_fd = pool->fd;
+            } else if (pool_find(object) != 0 && opcode == 1) {
+                /* wl_shm_pool.destroy: keep the descriptor open, buffers
+                   created from this pool may still be committed. */
+                PoolSlot *pool = pool_find(object);
+                pool->id = 0;
             } else if (object == layer_shell_id && opcode == 0) {
                 /* get_layer_surface(new_id, surface, output, layer, ns) */
-                layer_surface_id = take_u32();
-                layer_surface_surface = take_u32();
+                unsigned new_layer_surface = take_u32();
+                unsigned layer_surface_for = take_u32();
+                layer_surface_id = new_layer_surface;
+                layer_surface_surface = layer_surface_for;
+                LayerSurface *slot = layer_surface_add(new_layer_surface, layer_surface_for);
                 (void)take_u32(); /* output, may be null */
-                (void)take_u32(); /* layer */
+                slot->layer = take_u32();
                 char space[64];
                 take_string(space, sizeof(space));
-            } else if (object == layer_surface_id && opcode == 0) {
-                layer_width = take_u32();
-                layer_height = take_u32();
-            } else if (object == layer_surface_id && opcode == 1) {
-                layer_anchor = take_u32();
-            } else if (object == layer_surface_id && opcode == 2) {
+            } else if (layer_surface_by_id(object) != 0 && opcode == 0) {
+                LayerSurface *slot = layer_surface_by_id(object);
+                slot->width = take_u32();
+                slot->height = take_u32();
+                layer_width = slot->width;
+                layer_height = slot->height;
+            } else if (layer_surface_by_id(object) != 0 && opcode == 1) {
+                LayerSurface *slot = layer_surface_by_id(object);
+                slot->anchor = take_u32();
+                layer_anchor = slot->anchor;
+            } else if (layer_surface_by_id(object) != 0 && opcode == 2) {
                 (void)take_u32(); /* exclusive zone */
-            } else if (object == layer_surface_id && opcode == 3) {
-                layer_margin[0] = (int)take_u32();
-                layer_margin[1] = (int)take_u32();
-                layer_margin[2] = (int)take_u32();
-                layer_margin[3] = (int)take_u32();
-            } else if (object == layer_surface_id && opcode == 4) {
+            } else if (layer_surface_by_id(object) != 0 && opcode == 3) {
+                LayerSurface *slot = layer_surface_by_id(object);
+                slot->margin[0] = (int)take_u32();
+                slot->margin[1] = (int)take_u32();
+                slot->margin[2] = (int)take_u32();
+                slot->margin[3] = (int)take_u32();
+                for (unsigned index = 0; index < 4; index++) {
+                    layer_margin[index] = slot->margin[index];
+                }
+            } else if (layer_surface_by_id(object) != 0 && opcode == 4) {
                 (void)take_u32(); /* keyboard interactivity */
-            } else if (object == layer_surface_id && opcode == 5) {
+            } else if (layer_surface_by_id(object) != 0 && opcode == 5) {
                 (void)take_u32(); /* get_popup */
-            } else if (object == layer_surface_id && opcode == 6) {
-                (void)take_u32(); /* ack_configure */
+            } else if (layer_surface_by_id(object) != 0 && opcode == 6) {
+                LayerSurface *slot = layer_surface_by_id(object);
+                (void)take_u32(); /* ack_configure serial */
+                slot->acked = 1;
                 layer_acked = 1;
-            } else if (object == layer_surface_id && opcode == 7) {
-                for (unsigned index = 0; index < MAX_LAYERS; index++) {
-                    if (layer_entries[index].used &&
-                        layer_entries[index].surface == layer_surface_surface) {
-                        layer_entries[index].used = 0;
+            } else if (layer_surface_by_id(object) != 0 && opcode == 7) {
+                LayerSurface *slot = layer_surface_by_id(object);
+                if (slot != 0) {
+                    for (unsigned index = 0; index < MAX_LAYERS; index++) {
+                        if (layer_entries[index].used &&
+                            layer_entries[index].surface == slot->surface) {
+                            layer_entries[index].used = 0;
+                        }
                     }
+                    slot->used = 0;
                 }
                 layer_surface_id = 0;
                 layer_surface_surface = 0;
                 layer_configured = 0;
-            } else if (object == layer_surface_id && opcode == 8) {
-                layer_layer = take_u32();
+            } else if (layer_surface_by_id(object) != 0 && opcode == 8) {
+                LayerSurface *slot = layer_surface_by_id(object);
+                slot->layer = take_u32();
+                layer_layer = slot->layer;
+            } else if (object == phosh_private_id && opcode == 0) {
+                /* rotate_display(wl_surface, degree): unused */
+                (void)take_u32();
+                (void)take_u32();
+            } else if (object == phosh_private_id && opcode == 1) {
+                /* get_xdg_switcher(new_id) */
+                xdg_switcher_id = take_u32();
+            } else if (object == phosh_private_id && opcode == 2) {
+                /* get_thumbnail(new_id, toplevel, max_w, max_h) */
+                (void)take_u32();
+                (void)take_u32();
+                (void)take_u32();
+                (void)take_u32();
+            } else if (object == phosh_private_id && opcode == 3) {
+                /* get_keyboard_event(new_id) */
+                keyboard_event_id = take_u32();
+            } else if (object == phosh_private_id && opcode == 4) {
+                /* get_startup_tracker(new_id) */
+                startup_tracker_id = take_u32();
+            } else if (object == phosh_private_id && opcode == 5) {
+                (void)take_u32(); /* set_shell_state(state) */
+            } else if (object == startup_tracker_id && opcode == 0) {
+                startup_tracker_id = 0;
+            } else if (object == keyboard_event_id && opcode == 0) {
+                /* grab_accelerator_request(accelerator) */
+                char accelerator[128];
+                take_string(accelerator, sizeof(accelerator));
+            } else if (object == keyboard_event_id && opcode == 1) {
+                (void)take_u32(); /* ungrab_accelerator_request(action_id) */
+            } else if (object == keyboard_event_id && opcode == 2) {
+                keyboard_event_id = 0;
+            } else if (object == xdg_switcher_id && opcode == 0) {
+                /* list_xdg_surfaces: nothing to report */
+            } else if (object == xdg_switcher_id && opcode == 1) {
+                xdg_switcher_id = 0;
+            } else if (object == xdg_switcher_id && (opcode == 2 || opcode == 3)) {
+                char app_id[128];
+                char title[128];
+                take_string(app_id, sizeof(app_id));
+                take_string(title, sizeof(title));
             } else if (object == idle_notifier_id && opcode == 1) {
                 /* ext_idle_notifier_v1.get_idle_notification */
                 idle_notification_id = take_u32();
@@ -1330,10 +1668,6 @@ static int serve(long client) {
                 stacked_id = 0;
             } else if (object == foreign_toplevel_manager_id && opcode == 0) {
                 foreign_toplevel_manager_id = 0;
-    gamma_manager_id = 0;
-    gamma_control_id = 0;
-    output_manager_id = 0;
-    output_config_id = 0;
             } else if (object == gamma_manager_id && opcode == 0) {
                 /* get_gamma_control(new_id, output) */
                 gamma_control_id = take_u32();
@@ -1410,8 +1744,12 @@ static int serve(long client) {
                 popup_id = 0;
             } else if (is_surface(object) && opcode == 1) {
                 /* wl_surface.attach(buffer, x, y) */
-                attached_buffer = take_u32();
+                unsigned buffer = take_u32();
                 (void)take_i32();
+                attached_buffer = buffer;
+                if (object < SURFACE_IDS) {
+                    attached_buffers[object] = buffer;
+                }
             } else if (is_surface(object) && opcode == 3) {
                 frame_id = take_u32(); /* wl_surface.frame */
                 /* Complete the callback immediately: GTK's frame clock waits
@@ -1435,16 +1773,25 @@ static int serve(long client) {
                         popup_grab = 0;
                     }
                 }
-                if (object == layer_surface_surface && layer_surface_id != 0 &&
-                    !layer_configured) {
-                    begin(layer_surface_id, 0 /* configure */);
+                LayerSurface *layer_slot = layer_surface_by_surface(object);
+                if (layer_slot != 0 && !layer_slot->configured) {
+                    /* A layer surface asking for size 0 (or -1) leaves the
+                       axis to the compositor; answer with the logical output
+                       size instead of 0, which GTK rejects. */
+                    unsigned configure_width =
+                        (layer_slot->width == 0 || layer_slot->width == 0xFFFFFFFFu)
+                            ? 512u : layer_slot->width;
+                    unsigned configure_height =
+                        (layer_slot->height == 0 || layer_slot->height == 0xFFFFFFFFu)
+                            ? 384u : layer_slot->height;
+                    begin(layer_slot->layer_surface, 0 /* configure */);
                     put_u32(configure_serial);
                     configure_serial += 1;
-                    put_u32(layer_width);
-                    put_u32(layer_height);
+                    put_u32(configure_width);
+                    put_u32(configure_height);
                     finish();
                     send_message(client, -1);
-                    layer_configured = 1;
+                    layer_slot->configured = 1;
                 }
                 if (!surface_entered && output_id != 0) {
                     surface_entered = 1;
@@ -1452,6 +1799,24 @@ static int serve(long client) {
                     put_u32(output_id);
                     finish();
                     send_message(client, -1);
+                }
+                /* A commit uses the buffer attached to *this* surface. The
+                   globals used by the blit are refreshed from the buffer
+                   table so interleaved surfaces cannot steal each other's
+                   pool or release. */
+                unsigned committed_buffer = 0;
+                if (object < SURFACE_IDS) {
+                    committed_buffer = attached_buffers[object];
+                }
+                BufferSlot *committed_slot = buffer_find(committed_buffer);
+                if (committed_slot != 0) {
+                    buffer_id = committed_slot->id;
+                    pool_fd = committed_slot->pool_fd;
+                    buffer_offset = committed_slot->offset;
+                    buffer_width = (int)committed_slot->width;
+                    buffer_height = (int)committed_slot->height;
+                    buffer_stride = committed_slot->stride;
+                    buffer_format = committed_slot->format;
                 }
                 if (pool_fd >= 0 && buffer_id != 0) {
                     commits += 1;
@@ -1515,7 +1880,13 @@ static int serve(long client) {
                             sys3(215 /* munmap */, mapped, length, 0);
                         }
                     }
-                    if (object == layer_surface_surface && layer_surface_id != 0) {
+                    if (layer_slot != 0) {
+                        layer_surface_surface = layer_slot->surface;
+                        layer_layer = layer_slot->layer;
+                        layer_anchor = layer_slot->anchor;
+                        for (unsigned index = 0; index < 4; index++) {
+                            layer_margin[index] = layer_slot->margin[index];
+                        }
                         layer_record_commit();
                         layer_compose();
                     }
@@ -1560,10 +1931,13 @@ static int serve(long client) {
                         send_message(client, -1);
                     }
                 }
-                if (buffer_id != 0) {
-                    begin(buffer_id, 0 /* wl_buffer.release */);
+                if (committed_buffer != 0) {
+                    begin(committed_buffer, 0 /* wl_buffer.release */);
                     finish();
                     send_message(client, -1);
+                    if (object < SURFACE_IDS) {
+                        attached_buffers[object] = 0;
+                    }
                 }
                 if (frame_id != 0) {
                     send_done(client, frame_id, 0);
@@ -1731,14 +2105,16 @@ static int run_client(void) {
 /// Each accepted connection is a separate client namespace; reset the
 /// per-surface state before serving the next one.
 static void reset_client(void) {
-    if (pool_fd >= 0) {
-        sys3(57, pool_fd, 0, 0);
-        pool_fd = -1;
-    }
+    /* pools_reset() closes every descriptor owned by the pool table. */
+    pool_fd = -1;
+    pools_reset();
     attached_buffer = 0;
     registry_id = 0;
     compositor_id = 0;
     shm_id = 0;
+    for (unsigned index = 0; index < MAX_SHM; index++) {
+        shm_ids[index] = 0;
+    }
     shell_id = 0;
     xdg_surface_id = 0;
     toplevel_id = 0;
@@ -1769,6 +2145,9 @@ static void reset_client(void) {
     layer_shell_id = 0;
     layer_surface_id = 0;
     layer_surface_surface = 0;
+    for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
+        layer_surfaces[index].used = 0;
+    }
     layer_width = 0;
     layer_height = 0;
     layer_configured = 0;
@@ -1797,6 +2176,14 @@ static void reset_client(void) {
     alpha_id = 0;
     stacked_id = 0;
     foreign_toplevel_manager_id = 0;
+    gamma_manager_id = 0;
+    gamma_control_id = 0;
+    output_manager_id = 0;
+    output_config_id = 0;
+    phosh_private_id = 0;
+    startup_tracker_id = 0;
+    keyboard_event_id = 0;
+    xdg_switcher_id = 0;
     popup_id = 0;
     positioner_id = 0;
     popup_grab = 0;
@@ -1873,6 +2260,13 @@ void _start(void) {
             "XDG_CURRENT_DESKTOP=Phosh",
             "XDG_SESSION_TYPE=wayland",
             "XDG_SESSION_DESKTOP=phosh",
+            /* glycin cannot create namespaces here; the loader itself is
+             * still spawned directly and decodes normally. */
+            "GLYCIN_DISABLE_SANDBOX=i-know-the-risks",
+            /* glycin's zbus reactor and the executor tick loop starve each
+             * other with the default worker count; four workers make the
+             * loader reply deterministic (same workaround as glycintest). */
+            "ASYNC_GLOBAL_EXECUTOR_THREADS=4",
             0,
         };
         sys6(221 /* execve */, (long)argv[0], (long)argv, (long)envp, 0, 0, 0);

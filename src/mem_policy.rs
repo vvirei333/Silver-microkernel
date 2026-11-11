@@ -12,8 +12,12 @@
 //! requests. A concurrent *kernel* allocation only makes the check stricter,
 //! never looser.
 
-/// Fraction of the usable frames kept for the kernel: one eighth.
-pub const RESERVE_DIVISOR: usize = 8;
+/// Fraction of the usable frames kept for the kernel: one sixteenth.
+///
+/// One eighth (31 MiB on a 256 MiB machine) left too little headroom for a
+/// full Phosh session: a 5 MiB GDK shm pool was refused while the kernel
+/// itself only needs a few MiB beyond its pre-reserved heap.
+pub const RESERVE_DIVISOR: usize = 16;
 
 /// Frames kept out of user-visible allocations on a machine with
 /// `total_frames` usable frames.
@@ -69,9 +73,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reserve_is_an_eighth_of_the_window() {
-        assert_eq!(reserve_frames(32_768), 4_096);
-        assert_eq!(reserve_frames(8_192), 1_024);
+    fn reserve_is_a_sixteenth_of_the_window() {
+        assert_eq!(reserve_frames(32_768), 2_048);
+        assert_eq!(reserve_frames(8_192), 512);
     }
 
     #[test]
@@ -85,25 +89,25 @@ mod tests {
 
     #[test]
     fn request_must_fit_above_the_reserve() {
-        // 8 192 total -> 1 024 reserved, leaving 7 168 grantable.
-        assert!(user_alloc_ok(8_192, 7_168, 8_192));
-        assert!(!user_alloc_ok(8_192, 7_169, 8_192));
+        // 8 192 total -> 512 reserved, leaving 7 680 grantable.
+        assert!(user_alloc_ok(8_192, 7_680, 8_192));
+        assert!(!user_alloc_ok(8_192, 7_681, 8_192));
     }
 
     #[test]
     fn free_at_or_below_the_reserve_refuses_everything() {
         // free == reserve leaves zero grantable frames.
-        assert!(!user_alloc_ok(1_024, 1, 8_192));
+        assert!(!user_alloc_ok(512, 1, 8_192));
         // free below the reserve: `checked_sub` fails and nothing is granted.
-        assert!(!user_alloc_ok(1_023, 1, 8_192));
+        assert!(!user_alloc_ok(511, 1, 8_192));
         // One frame above the reserve grants exactly one.
-        assert!(user_alloc_ok(1_025, 1, 8_192));
+        assert!(user_alloc_ok(513, 1, 8_192));
     }
 
     #[test]
-    fn task_limit_is_half_with_a_floor() {
-        assert_eq!(task_frame_limit(32_768), 16_384);
-        assert_eq!(task_frame_limit(64), 32);
+    fn task_limit_is_three_quarters_with_a_floor() {
+        assert_eq!(task_frame_limit(32_768), 24_576);
+        assert_eq!(task_frame_limit(64), 48);
         // A window smaller than the floor may use all of itself, never more.
         assert_eq!(task_frame_limit(8), 8);
         assert_eq!(task_frame_limit(0), 0);

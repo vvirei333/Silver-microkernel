@@ -27,14 +27,15 @@ pub const PAGE_SIZE: usize = 4096;
 #[cfg(all(feature = "tablet", feature = "fog"))]
 compile_error!("Features 'tablet' and 'fog' are mutually exclusive");
 
-/// QEMU `virt`: one 256 MiB DRAM bank at 0x4000_0000. The extra memory is
-/// what makes a GTK-sized shared-library set fit: the whole toolkit (with its
-/// mapped data segments) is ~80 MiB and must coexist with the kernel, page
-/// tables, stacks and the application heap.
+/// QEMU `virt`: one 1 GiB DRAM bank at 0x4000_0000. A GTK3 Phosh session
+/// maps ~120 MiB of libraries, then needs several 5 MiB GDK shm pools; at
+/// 256 MiB the kernel reserve left no room for them. The kernel linear map
+/// already covers a full gigabyte, so this is the largest window the current
+/// page tables can address without a second L2 table.
 #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
 pub const DRAM_BASE: usize = 0x4000_0000;
 #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
-pub const DRAM_SIZE: usize = 256 * 1024 * 1024;
+pub const DRAM_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Redmi 10C (SM6225 "khaje"): DRAM starts at 0x4000_0000. The boot-page
 /// tables map exactly one gigabyte there, which covers the complete first DDR
