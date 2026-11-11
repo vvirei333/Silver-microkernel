@@ -4018,3 +4018,62 @@ Why the earlier evidence pointed elsewhere:
 - `gdk-pixbuf` PNG loader recognition (`Couldn't recognize image file
   format`) remains.
 - Host NVMe medium errors are unrelated but remain a hardware risk.
+
+## 2026-11-11 — GTK4 window renders (xdg-shell role classification)
+
+With the FP/SIMD fix and the memory-policy changes in place, `gtk4-serve`
+still stopped after `gtk-serve: screen mapped`: the GTK4 client connected,
+created its toplevel and committed a bufferless surface, but never received
+`xdg_surface.configure`, so it never attached a buffer.
+
+`WAYLAND_DEBUG=1` on the client showed the request order: GTK4 creates an
+auxiliary `wl_surface` (fractional-scale/viewporter target) **before** the
+toplevel. The compositor guessed roles from surface creation order — the
+first surface became `surface_id`, the second `popup_surface_id` — so the
+toplevel's `xdg_wm_base.get_xdg_surface` was classified as a popup and its
+`get_toplevel` never matched `xdg_surface_id`; no configure was sent.
+
+### Fix (`tests/linux/wayland_real.c`)
+
+- `get_xdg_surface` records the xdg_surface/surface pair but **does not**
+  guess the role.
+- The role is decided by the next request on that xdg_surface:
+  `get_toplevel` (opcode 1) makes it the toplevel and sends the configure;
+  `get_popup` (opcode 2) moves it to the popup slot and restores the
+  toplevel surface for enter/focus.
+- `toplevel_surface_id` is part of the per-client `ClientState` and the
+  `CLIENT_SCALARS` save/load list. Missing that made the second client
+  inherit the first client's toplevel surface id; the source client then
+  received `wl_keyboard.enter` naming its `wl_data_source` object
+  (`invalid object (25), type (wl_data_source), message enter(uoa)`).
+
+### Verification
+
+- Client protocol log: `xdg_surface.configure` → `ack_configure` →
+  `wl_shm.create_pool`/`create_buffer` (1080x826, stride 4320) →
+  `attach` → `commit`; the compositor prints
+  `gtk-serve: shm frame committed`.
+- Host viewer: `snapshot: 1080x826 frame=2 nonwhite-samples=12007`; the PNG
+  shows the real GTK4 window (title "Werewolf GTK4", buttons, label
+  "GTK4 on WerewolfOS").
+- `linux-wlreal`: `clipboard source ok`, `layer-shell ok`,
+  `libwayland 2 clients ok`.
+- `layer-serve`: `layer compose px=0xff0000ff`, `layer client ok`,
+  `layer server ok`.
+
+Rebuild the compositor into the GTK4 image with:
+
+```
+aarch64-linux-gnu-gcc -static -nostdlib -ffreestanding -O2 \
+  -DSERVE_ONLY -DSERVE_GTK4 -Wl,-T,tests/linux/wayland_real.ld \
+  -Wl,-z,max-page-size=4096 -o /tmp/opencode/gtk4-serve tests/linux/wayland_real.c
+python3 scripts/sfs_inject.py ~/phosh-state/disk_gtk4.img /tmp/opencode/gtk4-serve gtk4-serve
+```
+
+### Next
+
+Phosh: it needs GTK4 + libadwaita + gtk4-layer-shell in a dedicated image
+(the staged closure was 213 packages / 198.9 MiB compressed; the current
+GTK4 image has ~101 MiB free). The compositor now supports the layer-shell
+handshake and xdg toplevels; the remaining work is the image, then the
+Phosh process tree.

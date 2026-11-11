@@ -307,6 +307,9 @@ static unsigned keyboard_id;
 static unsigned pointer_id;
 static unsigned configure_serial = 1;
 static unsigned surface_id;
+/// The toplevel's wl_surface, kept separately from `surface_id` so a popup
+/// (whose xdg_surface temporarily becomes the "current" one) cannot steal it.
+static unsigned toplevel_surface_id;
 static unsigned popup_surface_id;
 /// Every wl_surface the client created, indexed by object id. GTK creates
 /// several (toplevel, cursor, ...), so a single `surface_id` tracked only the
@@ -395,6 +398,7 @@ typedef struct {
     unsigned pointer_id;
     unsigned configure_serial;
     unsigned surface_id;
+    unsigned toplevel_surface_id;
     unsigned popup_surface_id;
     unsigned popup_xdg_surface_id;
     unsigned popup_id;
@@ -435,7 +439,7 @@ typedef struct {
     X(layer_width) X(layer_height) X(layer_configured) X(layer_acked) \
     X(text_input_enabled) X(text_input_serial) \
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
-    X(configure_serial) X(surface_id) X(popup_surface_id) \
+    X(configure_serial) X(surface_id) X(toplevel_surface_id) X(popup_surface_id) \
     X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
     X(popup_grab) X(popup_committed) X(pool_id) X(buffer_id) X(frame_id) \
     X(pool_fd) X(verified) X(commits) X(focused) X(surface_entered) \
@@ -1050,27 +1054,27 @@ static int serve(long client) {
             } else if (object == shell_id && opcode == 1) {
                 positioner_id = take_u32(); /* create_positioner */
             } else if (object == shell_id && opcode == 2) {
-                /* xdg_wm_base.get_xdg_surface(new_id, surface) */
+                /* xdg_wm_base.get_xdg_surface(new_id, surface).
+                   The role is not known yet: the next request on this
+                   xdg_surface is either get_toplevel or get_popup. Surface
+                   creation order is NOT a role hint — GTK4 creates cursor and
+                   auxiliary surfaces before the toplevel, which used to put
+                   the real toplevel in the popup slot and suppress its
+                   configure. */
                 unsigned new_xdg_surface = take_u32();
                 unsigned surface = take_u32();
-                if (popup_surface_id != 0 && surface == popup_surface_id) {
-                    popup_xdg_surface_id = new_xdg_surface;
-                } else {
-                    xdg_surface_id = new_xdg_surface;
-                    /* Surface ids are not assigned by creation order: GTK
-                       creates cursor/auxiliary surfaces before the toplevel.
-                       The xdg_surface binding names the real toplevel. */
-                    if (subsurface_surface_id == surface) {
-                        subsurface_surface_id = 0;
-                    }
-                    if (popup_surface_id == surface) {
-                        popup_surface_id = 0;
-                    }
-                    surface_id = surface;
+                xdg_surface_id = new_xdg_surface;
+                surface_id = surface;
+                if (subsurface_surface_id == surface) {
+                    subsurface_surface_id = 0;
+                }
+                if (popup_surface_id == surface) {
+                    popup_surface_id = 0;
                 }
             } else if (object == xdg_surface_id && opcode == 1) {
                 /* xdg_surface.get_toplevel(new_id): send configure. */
                 toplevel_id = take_u32();
+                toplevel_surface_id = surface_id;
                 begin(toplevel_id, 0 /* xdg_toplevel.configure */);
                 put_i32(512); /* width: logical; scale 2 -> 1024 px */
                 put_i32(384);  /* height: scale 2 -> 768 px */
@@ -1082,8 +1086,15 @@ static int serve(long client) {
                 configure_serial += 1;
                 finish();
                 send_message(client, -1);
-            } else if (object == popup_xdg_surface_id && opcode == 2) {
-                /* xdg_surface.get_popup(new_id, parent, positioner) */
+            } else if (object == xdg_surface_id && opcode == 2) {
+                /* xdg_surface.get_popup(new_id, parent, positioner): the
+                   surface bound to this xdg_surface is a popup, not the
+                   toplevel. Move it to the popup slot and restore the
+                   toplevel surface for enter/focus events. */
+                popup_xdg_surface_id = xdg_surface_id;
+                popup_surface_id = surface_id;
+                xdg_surface_id = 0;
+                surface_id = toplevel_surface_id;
                 popup_id = take_u32();
                 (void)take_u32();
                 (void)take_u32();
@@ -1609,6 +1620,7 @@ static void reset_client(void) {
     keyboard_id = 0;
     pointer_id = 0;
     surface_id = 0;
+    toplevel_surface_id = 0;
     popup_surface_id = 0;
     popup_xdg_surface_id = 0;
     popup_id = 0;
