@@ -60,6 +60,30 @@ pub fn task_frame_limit(total_frames: usize) -> usize {
         .max(MIN_TASK_FRAMES.min(total_frames))
 }
 
+/// Coarse memory-pressure level, in the spirit of iOS' memorystatus: a
+/// consumer can shed caches at `Warning` before the kernel has to refuse an
+/// allocation at `Critical`.
+///
+/// `Critical` is exactly the point where user allocations start failing (free
+/// frames at or below the kernel reserve); `Warning` is twice that reserve.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum MemoryPressure {
+    Normal = 0,
+    Warning = 1,
+    Critical = 2,
+}
+
+pub fn pressure_level(free: usize, total: usize) -> MemoryPressure {
+    let reserve = reserve_frames(total);
+    if free <= reserve {
+        MemoryPressure::Critical
+    } else if free <= reserve.saturating_mul(2) {
+        MemoryPressure::Warning
+    } else {
+        MemoryPressure::Normal
+    }
+}
+
 /// Whether a task that already charged `used` frames may charge `requested`
 /// more without exceeding `limit`. All-or-nothing: the caller charges nothing
 /// on `false`.
@@ -111,6 +135,17 @@ mod tests {
         // A window smaller than the floor may use all of itself, never more.
         assert_eq!(task_frame_limit(8), 8);
         assert_eq!(task_frame_limit(0), 0);
+    }
+
+    #[test]
+    fn pressure_levels_track_the_reserve() {
+        // 32 768 total -> 2 048 reserve; warning up to 4 096 free.
+        assert_eq!(pressure_level(32_768, 32_768), MemoryPressure::Normal);
+        assert_eq!(pressure_level(4_097, 32_768), MemoryPressure::Normal);
+        assert_eq!(pressure_level(4_096, 32_768), MemoryPressure::Warning);
+        assert_eq!(pressure_level(2_049, 32_768), MemoryPressure::Warning);
+        assert_eq!(pressure_level(2_048, 32_768), MemoryPressure::Critical);
+        assert_eq!(pressure_level(0, 32_768), MemoryPressure::Critical);
     }
 
     #[test]

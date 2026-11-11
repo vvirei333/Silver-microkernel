@@ -4304,3 +4304,18 @@ so hit-testing by layer/position is the next refinement.
 
 Tests stay green: `linux-wlreal` (clipboard, layer-shell, two clients) and
 `layer-serve` (compose, client, server).
+
+## 2026-11-11 — First iOS-style memory primitive: pressure levels
+
+`mem_policy::pressure_level(free, total)` classifies the machine as `Normal`,
+`Warning` (free at or below twice the kernel reserve) or `Critical` (free at or
+below the reserve, i.e. user allocations are about to fail). The native ABI
+exposes it as `SYS_MEMORY_PRESSURE` (91), returning 0/1/2.
+
+This is the hook a future jetsam/notification path needs: a consumer can shed
+caches at `Warning` before the allocator starts refusing at `Critical`. The
+next steps are (a) a per-process priority/QoS so background loaders are the
+first jetsam candidates, and (b) killing/suspending those tasks at `Critical`
+instead of letting a foreground process fail an allocation.
+
+Host tests: 222 passed. Guest boot and `linux-hello` (exit 42) still work.

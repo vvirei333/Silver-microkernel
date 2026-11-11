@@ -89,6 +89,12 @@ pub fn free_pages() -> usize {
     STATE.lock().free_pages
 }
 
+/// Current pressure level, computed from the live free-frame count.
+pub fn pressure_level() -> silver_microkernel::mem_policy::MemoryPressure {
+    let state = STATE.lock();
+    silver_microkernel::mem_policy::pressure_level(state.free_pages, state.total_pages)
+}
+
 pub fn used_pages() -> usize {
     let state = STATE.lock();
     state.total_pages - state.free_pages
