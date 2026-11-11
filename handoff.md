@@ -4714,3 +4714,36 @@ flip's `user_data` and is reported by `poll`/`read`.
 creates and maps a dumb buffer, adds an fb, fills four quadrants and flips.
 The log ends with `drm test ok`, `event bytes 32`, `event type 1`, and a host
 screendump shows red/green/blue/white in the expected corners.
+
+### virgl: 3D context and a virtgpu render node
+
+`src/virtio_gpu.rs` now negotiates `VIRTIO_GPU_F_VIRGL` when the device offers
+it and speaks the 3D command set: `CTX_CREATE`, `CTX_ATTACH_RESOURCE`,
+`RESOURCE_CREATE_3D`, `TRANSFER_TO/FROM_HOST_3D`, `SUBMIT_3D`, plus
+`GET_CAPSET_INFO`/`GET_CAPSET`. `SUBMIT_3D` stages the command buffer in a
+128 KiB area and chains three descriptors (header, commands, response).
+
+`GET_CAPSET_INFO` takes a **capset index** into the device's capset list
+(QEMU's list is `[VIRGL, VIRGL2]`), while `GET_CAPSET` takes a capset **id**;
+passing an id to the info query returns an all-zero response and cost a round
+trip. The whole response page must be invalidated after a command: only
+invalidating the 24-byte header left `GET_DISPLAY_INFO`/`GET_CAPSET` payloads
+stale in the cache.
+
+`/dev/dri/renderD128` exposes the virtgpu DRM API: `GETPARAM` (3D features,
+supported capset ids), `GET_CAPS` (the device's 1408-byte virgl2 capset),
+`CONTEXT_INIT`, `RESOURCE_CREATE`, `RESOURCE_INFO`, `MAP`, `EXECBUFFER`
+(forwarded to `SUBMIT_3D`, with an eventfd fence when
+`VIRTGPU_EXECBUF_FENCE_FD_OUT` is set), `TRANSFER_TO/FROM_HOST`, `WAIT` and
+`GEM_CLOSE`. Resources are contiguous frame runs mapped Non-Cacheable.
+
+`tests/linux/rendertest.c` walks that API. On a `virtio-gpu-gl-pci` boot it
+prints `3d features 1`, `capset ids 6`, `caps bytes 1408`, creates a 64x64
+texture (res handle 2), maps it, submits a virgl `NOP` and receives fence
+fd 4.
+
+What is still missing for `GSK_RENDERER=gl`: shipping the aarch64 Mesa
+(`libEGL`, `libGLESv2`, `libgbm`, `libgallium`, `libdril_dri.so` as
+`virtio_gpu_dri.so`) into the image, and a Wayland buffer-sharing protocol
+(`zwp_linux_dmabuf_v1` or `wl_drm`) so a compositor can import GL-rendered
+buffers. An offscreen EGL/GLES test only needs the Mesa files.

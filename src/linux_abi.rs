@@ -1515,6 +1515,9 @@ fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
         if let Some(result) = crate::drm::ioctl(request, argument) {
             return result;
         }
+        if let Some(result) = crate::drm::render_ioctl(request, argument) {
+            return result;
+        }
     }
     if request == GPU_IOCTL_FLUSH && linux_fd::is_gpufb(task, fd) {
         return if crate::virtio_gpu::flush() {

@@ -388,14 +388,17 @@ pub fn event_pending() -> bool {
     unsafe { EVENT_PENDING }
 }
 
-/// Maps a dumb buffer by the offset `MAP_DUMB` returned.
+/// Maps a dumb buffer by the offset `MAP_DUMB` returned, or a render-node BO
+/// by the offset `VIRTGPU_MAP` returned.
 pub fn map_dumb(length: usize, offset: usize) -> Option<usize> {
     unsafe {
-        let entry = buffer_for_offset(offset)?;
-        if length == 0 || length > entry.pages * 4096 {
-            return None;
+        if let Some(entry) = buffer_for_offset(offset) {
+            if length == 0 || length > entry.pages * 4096 {
+                return None;
+            }
+            return crate::scheduler::map_drm_dumb(entry.pa, length);
         }
-        crate::scheduler::map_drm_dumb(entry.pa, length)
+        map_bo(length, offset)
     }
 }
 
@@ -755,5 +758,456 @@ pub fn report() {
     console::write_dec_u64(width as u64);
     console::write_str("x");
     console::write_dec_u64(height as u64);
-    console::write_str(" crtc 1 connector 1\r\n");
+    console::write_str(" crtc 1 connector 1");
+    if crate::virtio_gpu::virgl_available() {
+        console::write_str(", renderD128 (virgl)");
+    }
+    console::write_str("\r\n");
+}
+
+// ---------------------------------------------------------------------------
+// virtgpu render node (`/dev/dri/renderD128`)
+// ---------------------------------------------------------------------------
+
+const DRM_IOCTL_GEM_CLOSE: u64 = 0xC008_6409;
+const DRM_IOCTL_VIRTGPU_MAP: u64 = 0xC010_6441;
+const DRM_IOCTL_VIRTGPU_EXECBUFFER: u64 = 0xC040_6442;
+const DRM_IOCTL_VIRTGPU_GETPARAM: u64 = 0xC010_6443;
+const DRM_IOCTL_VIRTGPU_RESOURCE_CREATE: u64 = 0xC038_6444;
+const DRM_IOCTL_VIRTGPU_RESOURCE_INFO: u64 = 0xC010_6445;
+const DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST: u64 = 0xC02C_6446;
+const DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST: u64 = 0xC02C_6447;
+const DRM_IOCTL_VIRTGPU_WAIT: u64 = 0xC008_6448;
+const DRM_IOCTL_VIRTGPU_GET_CAPS: u64 = 0xC018_6449;
+const DRM_IOCTL_VIRTGPU_CONTEXT_INIT: u64 = 0xC010_644B;
+
+const VIRTGPU_PARAM_3D_FEATURES: u64 = 1;
+const VIRTGPU_PARAM_CAPSET_QUERY_FIX: u64 = 2;
+const VIRTGPU_PARAM_RESOURCE_BLOB: u64 = 3;
+const VIRTGPU_PARAM_HOST_VISIBLE: u64 = 4;
+const VIRTGPU_PARAM_CROSS_DEVICE: u64 = 5;
+const VIRTGPU_PARAM_CONTEXT_INIT: u64 = 6;
+const VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS: u64 = 7;
+const VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME: u64 = 8;
+
+const VIRTGPU_EXECBUF_FENCE_FD_OUT: u32 = 0x2;
+
+const MAX_BOS: usize = 32;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuMap {
+    offset: u64,
+    handle: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuExecbuffer {
+    flags: u32,
+    size: u32,
+    command: u64,
+    bo_handles: u64,
+    num_bo_handles: u32,
+    fence_fd: i32,
+    ring_idx: u32,
+    syncobj_stride: u32,
+    num_in_syncobjs: u32,
+    num_out_syncobjs: u32,
+    in_syncobjs: u64,
+    out_syncobjs: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuGetparam {
+    param: u64,
+    value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuResourceCreate {
+    target: u32,
+    format: u32,
+    bind: u32,
+    width: u32,
+    height: u32,
+    depth: u32,
+    array_size: u32,
+    last_level: u32,
+    nr_samples: u32,
+    flags: u32,
+    bo_handle: u32,
+    res_handle: u32,
+    size: u32,
+    stride: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuResourceInfo {
+    bo_handle: u32,
+    res_handle: u32,
+    size: u32,
+    blob_mem: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuBox {
+    x: u32,
+    y: u32,
+    z: u32,
+    w: u32,
+    h: u32,
+    d: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuTransfer {
+    bo_handle: u32,
+    box_: VirtgpuBox,
+    level: u32,
+    offset: u32,
+    stride: u32,
+    layer_stride: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuWait {
+    handle: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuGetCaps {
+    cap_set_id: u32,
+    cap_set_ver: u32,
+    addr: u64,
+    size: u32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct VirtgpuContextInit {
+    num_params: u32,
+    pad: u32,
+    ctx_set_params: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GemClose {
+    handle: u32,
+    pad: u32,
+}
+
+#[derive(Clone, Copy)]
+struct Bo {
+    handle: u32,
+    resource: u32,
+    pa: usize,
+    pages: usize,
+    generation: u32,
+    size: u32,
+    stride: u32,
+    width: u32,
+    height: u32,
+    in_use: bool,
+}
+
+const EMPTY_BO: Bo = Bo {
+    handle: 0,
+    resource: 0,
+    pa: 0,
+    pages: 0,
+    generation: 0,
+    size: 0,
+    stride: 0,
+    width: 0,
+    height: 0,
+    in_use: false,
+};
+
+static mut BOS: [Bo; MAX_BOS] = [EMPTY_BO; MAX_BOS];
+static mut NEXT_BO: u32 = 1;
+static mut CONTEXT_READY: bool = false;
+
+unsafe fn bo(handle: u32) -> Option<&'static mut Bo> {
+    let table = &mut *core::ptr::addr_of_mut!(BOS);
+    table.iter_mut().find(|entry| entry.in_use && entry.handle == handle)
+}
+
+unsafe fn ensure_context() -> bool {
+    if CONTEXT_READY {
+        return true;
+    }
+    if !crate::virtio_gpu::create_context() {
+        return false;
+    }
+    CONTEXT_READY = true;
+    true
+}
+
+/// Maps a BO by the offset `VIRTGPU_MAP` returned.
+pub fn map_bo(length: usize, offset: usize) -> Option<usize> {
+    unsafe {
+        let table = &*core::ptr::addr_of!(BOS);
+        let entry = table
+            .iter()
+            .find(|entry| entry.in_use && entry.pa == offset)?;
+        if length == 0 || length > entry.pages * 4096 {
+            return None;
+        }
+        crate::scheduler::map_drm_dumb(entry.pa, length)
+    }
+}
+
+/// Handles one virtgpu ioctl on a render node.
+pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
+    unsafe {
+        Some(match request {
+            DRM_IOCTL_VIRTGPU_GETPARAM => {
+                let Some(mut getparam) = load::<VirtgpuGetparam>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let virgl = crate::virtio_gpu::virgl_available();
+                getparam.value = match getparam.param {
+                    VIRTGPU_PARAM_3D_FEATURES => virgl as u64,
+                    VIRTGPU_PARAM_CAPSET_QUERY_FIX => 1,
+                    VIRTGPU_PARAM_RESOURCE_BLOB => 0,
+                    VIRTGPU_PARAM_HOST_VISIBLE => 0,
+                    VIRTGPU_PARAM_CROSS_DEVICE => 0,
+                    VIRTGPU_PARAM_CONTEXT_INIT => virgl as u64,
+                    // Capsets 1 (virgl) and 2 (virgl2).
+                    VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS => {
+                        if virgl {
+                            0b110
+                        } else {
+                            0
+                        }
+                    }
+                    VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME => 0,
+                    _ => return Some(u64::MAX),
+                };
+                if !store(argument, &getparam) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_VIRTGPU_CONTEXT_INIT => {
+                // The context is created lazily with capset 2; the parameters
+                // (capset id, ring count) describe the same thing.
+                if !ensure_context() {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_VIRTGPU_GET_CAPS => {
+                let Some(mut getcaps) = load::<VirtgpuGetCaps>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some((caps, version)) = crate::virtio_gpu::virgl_caps() else {
+                    return Some(u64::MAX);
+                };
+                if getcaps.cap_set_id != 2 || getcaps.cap_set_ver > version {
+                    return Some(u64::MAX);
+                }
+                let take = (getcaps.size as usize).min(caps.len());
+                if take == 0 || getcaps.addr == 0 {
+                    return Some(u64::MAX);
+                }
+                if user_memory::copy_to_user(&caps[..take], getcaps.addr).is_err() {
+                    return Some(u64::MAX);
+                }
+                getcaps.size = take as u32;
+                if !store(argument, &getcaps) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_VIRTGPU_RESOURCE_CREATE => {
+                let Some(mut create) = load::<VirtgpuResourceCreate>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if !ensure_context() {
+                    return Some(u64::MAX);
+                }
+                let stride = if create.stride != 0 {
+                    create.stride
+                } else {
+                    create.width * 4
+                };
+                let depth = create.depth.max(1);
+                let layers = create.array_size.max(1);
+                let size = if create.size != 0 {
+                    create.size
+                } else {
+                    stride * create.height * depth * layers
+                };
+                if size == 0 {
+                    return Some(u64::MAX);
+                }
+                let pages = (size as usize).div_ceil(4096);
+                let Some((pa, generation)) = frame_allocator::alloc_contiguous_pages_tagged(pages)
+                else {
+                    return Some(u64::MAX);
+                };
+                core::ptr::write_bytes(phys_to_virt(pa) as *mut u8, 0, pages * 4096);
+                let Some(resource) = crate::virtio_gpu::create_resource_3d(
+                    create.width,
+                    create.height,
+                    create.target,
+                    create.format,
+                    create.bind,
+                ) else {
+                    frame_allocator::free_contiguous_pages_tagged(pa, pages, generation);
+                    return Some(u64::MAX);
+                };
+                if !crate::virtio_gpu::context_attach(resource) {
+                    frame_allocator::free_contiguous_pages_tagged(pa, pages, generation);
+                    return Some(u64::MAX);
+                }
+                let table = &mut *core::ptr::addr_of_mut!(BOS);
+                let Some(slot) = table.iter_mut().find(|entry| !entry.in_use) else {
+                    frame_allocator::free_contiguous_pages_tagged(pa, pages, generation);
+                    return Some(u64::MAX);
+                };
+                let handle = NEXT_BO;
+                NEXT_BO = NEXT_BO.wrapping_add(1);
+                *slot = Bo {
+                    handle,
+                    resource,
+                    pa,
+                    pages,
+                    generation,
+                    size,
+                    stride,
+                    width: create.width,
+                    height: create.height,
+                    in_use: true,
+                };
+                create.bo_handle = handle;
+                create.res_handle = resource;
+                create.size = size;
+                create.stride = stride;
+                if !store(argument, &create) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_VIRTGPU_RESOURCE_INFO => {
+                let Some(mut info) = load::<VirtgpuResourceInfo>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(entry) = bo(info.bo_handle) else {
+                    return Some(u64::MAX);
+                };
+                info.res_handle = entry.resource;
+                info.size = entry.size;
+                info.blob_mem = 0;
+                if !store(argument, &info) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_VIRTGPU_MAP => {
+                let Some(mut map) = load::<VirtgpuMap>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(entry) = bo(map.handle) else {
+                    return Some(u64::MAX);
+                };
+                map.offset = entry.pa as u64;
+                if !store(argument, &map) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_VIRTGPU_EXECBUFFER => {
+                let Some(mut exec) = load::<VirtgpuExecbuffer>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if exec.size == 0 || exec.size as usize > 64 * 1024 || exec.command == 0 {
+                    return Some(u64::MAX);
+                }
+                if !ensure_context() {
+                    return Some(u64::MAX);
+                }
+                let mut command = alloc::vec![0_u8; exec.size as usize];
+                if user_memory::copy_from_user(exec.command, &mut command).is_err() {
+                    return Some(u64::MAX);
+                }
+                if !crate::virtio_gpu::submit_3d(&command) {
+                    return Some(u64::MAX);
+                }
+                if exec.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT != 0 {
+                    // Submission is synchronous, so the fence is signalled the
+                    // moment the ioctl returns.
+                    let task = crate::scheduler::current_task_id();
+                    match crate::linux_fd::eventfd(task, 1, true) {
+                        Ok(fd) => exec.fence_fd = fd as i32,
+                        Err(_) => return Some(u64::MAX),
+                    }
+                }
+                if !store(argument, &exec) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST | DRM_IOCTL_VIRTGPU_TRANSFER_FROM_HOST => {
+                let Some(transfer) = load::<VirtgpuTransfer>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(entry) = bo(transfer.bo_handle) else {
+                    return Some(u64::MAX);
+                };
+                let width = if transfer.box_.w != 0 {
+                    transfer.box_.w
+                } else {
+                    entry.width
+                };
+                let height = if transfer.box_.h != 0 {
+                    transfer.box_.h
+                } else {
+                    entry.height
+                };
+                let length = entry.size as usize;
+                if !crate::virtio_gpu::transfer_3d(
+                    entry.resource,
+                    entry.pa,
+                    length,
+                    width,
+                    height,
+                    request == DRM_IOCTL_VIRTGPU_TRANSFER_TO_HOST,
+                ) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_VIRTGPU_WAIT => 0,
+            DRM_IOCTL_GEM_CLOSE => {
+                let Some(close) = load::<GemClose>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(entry) = bo(close.handle) else {
+                    return Some(u64::MAX);
+                };
+                frame_allocator::free_contiguous_pages_tagged(
+                    entry.pa,
+                    entry.pages,
+                    entry.generation,
+                );
+                entry.in_use = false;
+                0
+            }
+            _ => return None,
+        })
+    }
 }

@@ -162,6 +162,10 @@ python3 scripts/sfs_inject.py "$IMAGE" build/layer_hit.elf layer-hit
     -Wl,-T,tests/linux/wayland_real.ld -Wl,-z,max-page-size=4096 \
     -o build/drmtest.elf tests/linux/drmtest.c
 python3 scripts/sfs_inject.py "$IMAGE" build/drmtest.elf drmtest
+"$CC" -static -nostdlib -ffreestanding -O2 \
+    -Wl,-T,tests/linux/wayland_real.ld -Wl,-z,max-page-size=4096 \
+    -o build/rendertest.elf tests/linux/rendertest.c
+python3 scripts/sfs_inject.py "$IMAGE" build/rendertest.elf rendertest
 python3 scripts/sfs_inject.py "$IMAGE" build/wayland_info.elf linux-wlinfo
 python3 scripts/sfs_inject.py "$IMAGE" build/dbus.elf linux-dbus
 if [ -f build/glibtest ]; then
@@ -258,7 +262,7 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
             --set-rpath '$ORIGIN' build/wayland-info
         python3 scripts/sfs_inject.py "$IMAGE" build/wayland-info wayland-info
         python3 scripts/sfs_inject.py "$IMAGE" build/wlclient wlclient
-        WLREAL=" linuxrun /sfs/linux-wlreal linuxrun /sfs/linux-wlinfo linuxrun /sfs/layer-hit linuxrun /sfs/drmtest"
+        WLREAL=" linuxrun /sfs/linux-wlreal linuxrun /sfs/linux-wlinfo linuxrun /sfs/layer-hit linuxrun /sfs/drmtest linuxrun /sfs/rendertest"
     else
         WLREAL=""
         echo "note: third_party/wayland-aarch64 is missing; skipped the real libwayland test" >&2

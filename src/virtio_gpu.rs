@@ -10,6 +10,8 @@
 //! The 3D (virgl) context and a DRM device build on the same control queue and
 //! the same framebuffer allocation.
 
+use core::sync::atomic::{AtomicBool, Ordering};
+
 use crate::console;
 use crate::frame_allocator;
 use crate::memory::phys_to_virt;
@@ -22,6 +24,11 @@ const PCI_DEVICE_GPU_TRANSITIONAL: u16 = 0x0010;
 const GPU_BAR4_PA: usize = 0x1020_0000;
 const NOTIFY_OFF: usize = 0x3000;
 const QUEUE_SIZE: usize = 64;
+/// Staging area for `SUBMIT_3D` command buffers.
+const SUBMIT_PAGES: usize = 32;
+const SUBMIT_BYTES: usize = SUBMIT_PAGES * 4096;
+/// The virtio-gpu 3D commands all belong to one virgl context.
+const VIRGL_CONTEXT_ID: u32 = 1;
 
 const VIRTQ_DESC_F_NEXT: u16 = 1;
 const VIRTQ_DESC_F_WRITE: u16 = 2;
@@ -32,9 +39,20 @@ const VIRTIO_GPU_CMD_SET_SCANOUT: u32 = 0x0103;
 const VIRTIO_GPU_CMD_RESOURCE_FLUSH: u32 = 0x0104;
 const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_2D: u32 = 0x0105;
 const VIRTIO_GPU_CMD_ATTACH_BACKING: u32 = 0x0106;
+const VIRTIO_GPU_CMD_GET_CAPSET_INFO: u32 = 0x0108;
+const VIRTIO_GPU_CMD_GET_CAPSET: u32 = 0x0109;
+const VIRTIO_GPU_CMD_CTX_CREATE: u32 = 0x0200;
+const VIRTIO_GPU_CMD_CTX_DESTROY: u32 = 0x0201;
+const VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE: u32 = 0x0202;
+const VIRTIO_GPU_CMD_RESOURCE_CREATE_3D: u32 = 0x0204;
+const VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D: u32 = 0x0205;
+const VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D: u32 = 0x0206;
+const VIRTIO_GPU_CMD_SUBMIT_3D: u32 = 0x0207;
 
 const VIRTIO_GPU_RESP_OK_NODATA: u32 = 0x1100;
 const VIRTIO_GPU_RESP_OK_DISPLAY_INFO: u32 = 0x1101;
+const VIRTIO_GPU_RESP_OK_CAPSET_INFO: u32 = 0x1102;
+const VIRTIO_GPU_RESP_OK_CAPSET: u32 = 0x1103;
 
 /// `VIRTIO_GPU_FORMAT_R8G8B8A8_UNORM`: the byte order the compositor writes
 /// (red first), so its frames go out unchanged.
@@ -56,6 +74,9 @@ struct Queue {
     /// response at offset 4096.
     command_pa: usize,
     command: usize,
+    /// 128 KiB staging area for SUBMIT_3D command buffers.
+    submit_pa: usize,
+    submit: usize,
 }
 
 /// The scanout the driver owns once `init` has run.
@@ -72,6 +93,11 @@ struct Display {
 static mut DISPLAY: Option<Display> = None;
 /// Resource 1 belongs to the scanout framebuffer; DRM buffers start at 2.
 static mut NEXT_RESOURCE: u32 = 2;
+/// True when the device negotiated `VIRTIO_GPU_F_VIRGL`.
+static VIRGL: AtomicBool = AtomicBool::new(false);
+/// Cached virgl capability set, filled by `virgl_caps`.
+static mut CAPS: [u8; 4096] = [0; 4096];
+static mut CAPS_LEN: usize = 0;
 
 fn pci_address(bus: u8, device: u8, function: u8, offset: usize) -> Option<usize> {
     if offset % 4 != 0 || offset >= 0x1000 {
@@ -157,6 +183,10 @@ unsafe fn read16(offset: usize) -> u16 {
     core::ptr::read_volatile(common(offset) as *const u16)
 }
 
+unsafe fn read32(offset: usize) -> u32 {
+    core::ptr::read_volatile(common(offset) as *const u32)
+}
+
 unsafe fn write8(offset: usize, value: u8) {
     core::ptr::write_volatile(common(offset) as *mut u8, value);
 }
@@ -200,9 +230,17 @@ unsafe fn init_device() -> Option<Queue> {
     write8(0x14, 1); // ACKNOWLEDGE
     write8(0x14, 3); // ACKNOWLEDGE | DRIVER
 
-    // Driver features: VIRTIO_F_VERSION_1 (word 1, bit 0).
-    write32(0x08, 1);
-    write32(0x0C, 1);
+    // Device features. Word 0 bit 0 is VIRTIO_GPU_F_VIRGL; word 1 bit 0 is
+    // VIRTIO_F_VERSION_1.
+    write32(0x00, 0);
+    let device_features0 = read32(0x04);
+    write32(0x00, 1);
+    let device_features1 = read32(0x04);
+    let virgl = device_features0 & 1 != 0;
+    VIRGL.store(virgl, core::sync::atomic::Ordering::Release);
+
+    write32(0x08, if virgl { 1 } else { 0 });
+    write32(0x0C, device_features1 & 1);
 
     write8(0x14, 3 | 8); // FEATURES_OK
     if read8(0x14) & 8 == 0 {
@@ -248,6 +286,7 @@ unsafe fn init_device() -> Option<Queue> {
     write8(0x14, 3 | 8 | 4); // DRIVER_OK
 
     let (command_pa, _tag) = frame_allocator::alloc_contiguous_pages_tagged(2)?;
+    let (submit_pa, _tag) = frame_allocator::alloc_contiguous_pages_tagged(SUBMIT_PAGES)?;
 
     Some(Queue {
         descriptors: ring_va,
@@ -257,6 +296,8 @@ unsafe fn init_device() -> Option<Queue> {
         last_used: 0,
         command_pa,
         command: phys_to_virt(command_pa),
+        submit_pa,
+        submit: phys_to_virt(submit_pa),
     })
 }
 
@@ -317,7 +358,10 @@ unsafe fn control(queue: &mut Queue, command: &[u8]) -> Option<u32> {
     }
     queue.last_used = queue.last_used.wrapping_add(1);
 
-    invalidate(response_va, CTRL_HDR_LEN);
+    // The whole response page: commands such as GET_DISPLAY_INFO and
+    // GET_CAPSET return payloads past the header, and the device wrote them
+    // by DMA, so the cacheable alias must be invalidated before reading.
+    invalidate(response_va, page);
     let kind = u32::from_le_bytes([
         core::ptr::read_volatile(response_va as *const u8),
         core::ptr::read_volatile((response_va + 1) as *const u8),
@@ -690,6 +734,295 @@ pub fn present_resource(
             return false;
         }
         set_scanout(&mut display.queue, resource_id, width, height)
+    }
+}
+
+/// True when 3D (virgl) commands are available.
+pub fn virgl_available() -> bool {
+    VIRGL.load(Ordering::Acquire)
+}
+
+/// Submits a virgl command buffer on the shared 3D context.
+pub fn submit_3d(data: &[u8]) -> bool {
+    unsafe {
+        let Some(display) = (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut() else {
+            return false;
+        };
+        submit_3d_queue(&mut display.queue, data)
+    }
+}
+
+unsafe fn submit_3d_queue(queue: &mut Queue, data: &[u8]) -> bool {
+    if data.is_empty() || data.len() > SUBMIT_BYTES - 64 {
+        return false;
+    }
+    let buffer = queue.submit;
+    core::ptr::write_bytes(buffer as *mut u8, 0, data.len() + 64);
+    // struct virtio_gpu_cmd_submit { u32 size; u32 padding; }
+    put32_bytes(buffer, 0, VIRTIO_GPU_CMD_SUBMIT_3D);
+    put32_bytes(buffer, 24, data.len() as u32);
+    core::ptr::copy_nonoverlapping(
+        data.as_ptr(),
+        (buffer + 32) as *mut u8,
+        data.len(),
+    );
+
+    let descriptor = queue.descriptors;
+    // [header][command buffer][response]
+    core::ptr::write_volatile(descriptor as *mut u64, queue.submit_pa as u64);
+    core::ptr::write_volatile((descriptor + 8) as *mut u32, 32);
+    core::ptr::write_volatile((descriptor + 12) as *mut u16, VIRTQ_DESC_F_NEXT);
+    core::ptr::write_volatile((descriptor + 14) as *mut u16, 1);
+
+    core::ptr::write_volatile((descriptor + 16) as *mut u64, (queue.submit_pa + 32) as u64);
+    core::ptr::write_volatile((descriptor + 24) as *mut u32, data.len() as u32);
+    core::ptr::write_volatile((descriptor + 28) as *mut u16, VIRTQ_DESC_F_NEXT);
+    core::ptr::write_volatile((descriptor + 30) as *mut u16, 2);
+
+    core::ptr::write_volatile((descriptor + 32) as *mut u64, (queue.command_pa + 4096) as u64);
+    core::ptr::write_volatile((descriptor + 40) as *mut u32, 4096);
+    core::ptr::write_volatile((descriptor + 44) as *mut u16, VIRTQ_DESC_F_WRITE);
+    core::ptr::write_volatile((descriptor + 46) as *mut u16, 0);
+
+    let available_slot = core::ptr::read_volatile((queue.available + 2) as *const u16);
+    core::ptr::write_volatile(
+        (queue.available + 4 + (available_slot as usize % QUEUE_SIZE) * 2) as *mut u16,
+        0,
+    );
+    core::arch::asm!("dmb sy", options(nostack));
+    core::ptr::write_volatile(
+        (queue.available + 2) as *mut u16,
+        available_slot.wrapping_add(1),
+    );
+
+    clean(buffer, 32 + data.len());
+    clean(queue.descriptors, 48);
+    clean(queue.available, 6 + QUEUE_SIZE * 2);
+    core::arch::asm!("dsb sy", options(nostack));
+    core::ptr::write_volatile(queue.notify as *mut u16, 0);
+    core::arch::asm!("dsb sy", options(nostack));
+
+    let mut spins = 0u64;
+    loop {
+        invalidate(queue.used, 8);
+        let used = core::ptr::read_volatile((queue.used + 2) as *const u16);
+        if used != queue.last_used {
+            break;
+        }
+        spins += 1;
+        if spins > 50_000_000 {
+            console::write_str("VIRTIO-GPU: 3D submit timed out\r\n");
+            return false;
+        }
+        core::hint::spin_loop();
+    }
+    queue.last_used = queue.last_used.wrapping_add(1);
+
+    let response = queue.command + 4096;
+    invalidate(response, CTRL_HDR_LEN);
+    let kind = u32::from_le_bytes([
+        core::ptr::read_volatile(response as *const u8),
+        core::ptr::read_volatile((response + 1) as *const u8),
+        core::ptr::read_volatile((response + 2) as *const u8),
+        core::ptr::read_volatile((response + 3) as *const u8),
+    ]);
+    kind == VIRTIO_GPU_RESP_OK_NODATA
+}
+
+fn put32_bytes(buffer: usize, offset: usize, value: u32) {
+    unsafe { core::ptr::write_unaligned((buffer + offset) as *mut u32, value) }
+}
+
+/// Creates a 3D resource and returns its id.
+pub fn create_resource_3d(
+    width: u32,
+    height: u32,
+    target: u32,
+    format: u32,
+    bind: u32,
+) -> Option<u32> {
+    unsafe {
+        let display = (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut()?;
+        if !virgl_available() {
+            return None;
+        }
+        let id = NEXT_RESOURCE;
+        // struct virtio_gpu_resource_create_3d
+        let mut command = [0u8; CTRL_HDR_LEN + 48];
+        header(&mut command, VIRTIO_GPU_CMD_RESOURCE_CREATE_3D);
+        put32(&mut command, CTRL_HDR_LEN, id);
+        put32(&mut command, CTRL_HDR_LEN + 4, target);
+        put32(&mut command, CTRL_HDR_LEN + 8, format);
+        put32(&mut command, CTRL_HDR_LEN + 12, bind);
+        put32(&mut command, CTRL_HDR_LEN + 16, width);
+        put32(&mut command, CTRL_HDR_LEN + 20, height);
+        put32(&mut command, CTRL_HDR_LEN + 24, 1); // depth
+        put32(&mut command, CTRL_HDR_LEN + 28, 1); // array_size
+        put32(&mut command, CTRL_HDR_LEN + 32, 0); // last_level
+        put32(&mut command, CTRL_HDR_LEN + 36, 0); // nr_samples
+        put32(&mut command, CTRL_HDR_LEN + 40, 0); // flags
+        match control(&mut display.queue, &command) {
+            Some(VIRTIO_GPU_RESP_OK_NODATA) => {}
+            Some(kind) => {
+                failed("resource create 3d", kind);
+                return None;
+            }
+            None => return None,
+        }
+        NEXT_RESOURCE = NEXT_RESOURCE.wrapping_add(1);
+        Some(id)
+    }
+}
+
+/// Attaches `resource_id` to the virgl context so its command buffers can
+/// reference it.
+pub fn context_attach(resource_id: u32) -> bool {
+    unsafe {
+        let Some(display) = (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut() else {
+            return false;
+        };
+        let mut command = [0u8; CTRL_HDR_LEN + 8];
+        header(&mut command, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE);
+        put32(&mut command, 4, VIRGL_CONTEXT_ID);
+        put32(&mut command, CTRL_HDR_LEN, resource_id);
+        matches!(
+            control(&mut display.queue, &command),
+            Some(VIRTIO_GPU_RESP_OK_NODATA)
+        )
+    }
+}
+
+/// Creates the virgl context. Idempotent.
+pub fn create_context() -> bool {
+    unsafe {
+        let Some(display) = (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut() else {
+            return false;
+        };
+        if !virgl_available() {
+            return false;
+        }
+        // struct virtio_gpu_ctx_create { u32 context_init; u32 padding;
+        // char debug_name[64]; } with context_init = VIRTIO_GPU_CONTEXT_INIT_
+        // VIRGL (1).
+        let mut command = [0u8; CTRL_HDR_LEN + 72];
+        header(&mut command, VIRTIO_GPU_CMD_CTX_CREATE);
+        put32(&mut command, 4, VIRGL_CONTEXT_ID);
+        put32(&mut command, CTRL_HDR_LEN, 1);
+        let name = b"werewolf";
+        command[CTRL_HDR_LEN + 8..CTRL_HDR_LEN + 8 + name.len()].copy_from_slice(name);
+        matches!(
+            control(&mut display.queue, &command),
+            Some(VIRTIO_GPU_RESP_OK_NODATA)
+        )
+    }
+}
+
+/// Transfers a box of a 3D resource to the host.
+pub fn transfer_3d(
+    resource_id: u32,
+    pa: usize,
+    length: usize,
+    width: u32,
+    height: u32,
+    to_host: bool,
+) -> bool {
+    unsafe {
+        let Some(display) = (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut() else {
+            return false;
+        };
+        // struct virtio_gpu_transfer_host_3d { box b; u64 offset; u32
+        // resource_id; u32 level; u32 stride; u32 layer_stride; }
+        let mut command = [0u8; CTRL_HDR_LEN + 48];
+        header(
+            &mut command,
+            if to_host {
+                VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D
+            } else {
+                VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D
+            },
+        );
+        put32(&mut command, 4, VIRGL_CONTEXT_ID);
+        put32(&mut command, CTRL_HDR_LEN + 12, width);
+        put32(&mut command, CTRL_HDR_LEN + 16, height);
+        put32(&mut command, CTRL_HDR_LEN + 20, 1);
+        put64(&mut command, CTRL_HDR_LEN + 24, 0);
+        put32(&mut command, CTRL_HDR_LEN + 32, resource_id);
+        put32(&mut command, CTRL_HDR_LEN + 36, 0); // level
+        put32(&mut command, CTRL_HDR_LEN + 40, width * 4); // stride
+        put32(&mut command, CTRL_HDR_LEN + 44, 0); // layer_stride
+        if to_host {
+            clean(phys_to_virt(pa), length);
+        }
+        let ok = matches!(
+            control(&mut display.queue, &command),
+            Some(VIRTIO_GPU_RESP_OK_NODATA)
+        );
+        if ok && !to_host {
+            invalidate(phys_to_virt(pa), length);
+        }
+        ok
+    }
+}
+
+/// Reads the device's virgl capability set once and caches it.
+pub fn virgl_caps() -> Option<(&'static [u8], u32)> {
+    unsafe {
+        if CAPS_LEN != 0 {
+            let caps = &*core::ptr::addr_of!(CAPS);
+            return Some((&caps[..CAPS_LEN], 2));
+        }
+        let display = (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut()?;
+        if !virgl_available() {
+            return None;
+        }
+        // `GET_CAPSET_INFO` takes a *capset index* into the device's list of
+        // capsets (QEMU's list is [VIRGL, VIRGL2]), not a capset id. Index 1
+        // is VIRGL2; `GET_CAPSET` below takes the id the device reports.
+        let mut command = [0u8; CTRL_HDR_LEN + 8];
+        header(&mut command, VIRTIO_GPU_CMD_GET_CAPSET_INFO);
+        put32(&mut command, CTRL_HDR_LEN, 1);
+        let kind = control(&mut display.queue, &command)?;
+        if kind != VIRTIO_GPU_RESP_OK_CAPSET_INFO {
+            failed("capset info", kind);
+            return None;
+        }
+        let response = display.queue.command + 4096;
+        let mut word = |offset: usize| -> u32 {
+            u32::from_le_bytes([
+                core::ptr::read_volatile((response + offset) as *const u8),
+                core::ptr::read_volatile((response + offset + 1) as *const u8),
+                core::ptr::read_volatile((response + offset + 2) as *const u8),
+                core::ptr::read_volatile((response + offset + 3) as *const u8),
+            ])
+        };
+        let capset_id = word(CTRL_HDR_LEN);
+        let max_version = word(CTRL_HDR_LEN + 4);
+        let max_size = word(CTRL_HDR_LEN + 8) as usize;
+        if max_size == 0 || max_size > CAPS.len() {
+            console::write_str("VIRTIO-GPU: capset too large\r\n");
+            return None;
+        }
+        // struct virtio_gpu_get_capset { u32 capset_id; u32 capset_version; }
+        let mut command = [0u8; CTRL_HDR_LEN + 8];
+        header(&mut command, VIRTIO_GPU_CMD_GET_CAPSET);
+        put32(&mut command, CTRL_HDR_LEN, capset_id);
+        put32(&mut command, CTRL_HDR_LEN + 4, max_version.min(2));
+        let kind = control(&mut display.queue, &command)?;
+        if kind != VIRTIO_GPU_RESP_OK_CAPSET {
+            failed("capset", kind);
+            return None;
+        }
+        let source = response + CTRL_HDR_LEN + 8;
+        invalidate(source, max_size);
+        let caps = &mut *core::ptr::addr_of_mut!(CAPS);
+        core::ptr::copy_nonoverlapping(source as *const u8, caps.as_mut_ptr(), max_size);
+        CAPS_LEN = max_size;
+        console::write_str("VIRTIO-GPU: virgl caps ");
+        console::write_dec_u64(max_size as u64);
+        console::write_str(" bytes, capset ");
+        console::write_dec_u64(capset_id as u64);
+        console::write_str("\r\n");
+        Some((&caps[..max_size], max_version))
     }
 }
 

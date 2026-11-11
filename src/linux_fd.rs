@@ -472,6 +472,7 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         // up; the compositor then presents through the GPU as well.
         "/dev/gpufb" if crate::virtio_gpu::size().is_some() => Some(Target::GpuFb),
         "/dev/dri/card0" if crate::virtio_gpu::size().is_some() => Some(Target::Drm),
+        "/dev/dri/renderD128" if crate::virtio_gpu::virgl_available() => Some(Target::Drm),
         _ => None,
     };
     if let Some(device) = device {
