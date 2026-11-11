@@ -730,6 +730,11 @@ static unsigned buffer_stride;
 static unsigned buffer_format;
 static unsigned char *screen;
 static unsigned screen_seq;
+/* virtio-gpu scanout (`/dev/gpufb`). When present, every composed frame is
+   also pushed through the GPU, so the device's own display head shows the
+   desktop and a host screendump can prove the path. */
+static unsigned char *gpufb;
+static long gpufb_fd = -1;
 
 /* Host input ring in the WIN1 header (tools/window-viewer/main.cpp). */
 #define INPUT_RING 0x100
@@ -1268,6 +1273,23 @@ static unsigned keyboard_hit_test(void) {
     return best != 0 ? best->surface : 0;
 }
 
+/* Pushes the composed pixels to the virtio-gpu and asks it to scan them out.
+   The GPU buffer has no WIN1 header, so the frame is copied from the ivshmem
+   pixel area, which stays the viewer's sink. */
+static void gpu_present(unsigned width, unsigned height) {
+    if (gpufb == 0 || gpufb_fd < 0 || screen == 0) {
+        return;
+    }
+    const unsigned *source = (const unsigned *)(screen + 0x1000);
+    unsigned *destination = (unsigned *)gpufb;
+    unsigned count = width * height;
+    for (unsigned index = 0; index < count; index++) {
+        destination[index] = source[index];
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    sys3(29 /* ioctl */, gpufb_fd, 0x5701 /* GPU_IOCTL_FLUSH */, 0);
+}
+
 #ifdef SERVE_ONLY
 static void layer_compose(void) {
     if (screen == 0) {
@@ -1353,6 +1375,7 @@ static void layer_compose(void) {
     *(volatile unsigned *)(screen + 0x18) = screen_seq * 2 + 1;
     *(volatile unsigned *)(screen + 0x2C) = 1;
     __asm__ volatile("dsb sy" ::: "memory");
+    gpu_present(out_width, out_height);
     if (drawn != 0) {
         static const char prefix[] = "layer compose px=0x";
         char text[sizeof(prefix) + 9];
@@ -2594,6 +2617,7 @@ static int serve(long client) {
                             __asm__ volatile("dsb sy" ::: "memory");
                             screen_seq += 1;
                             *(volatile unsigned *)(screen + 0x18) = screen_seq * 2;
+                            gpu_present(1024u, 768u);
                             sys3(215 /* munmap */, mapped, length, 0);
                         }
                     }
@@ -3068,6 +3092,23 @@ void _start(void) {
                 sys3(64, 1, (long)no, sizeof(no) - 1);
             }
             sys3(57 /* close */, shm, 0, 0);
+        }
+    }
+    {
+        /* The GPU scanout, when the machine has one. It is a plain pixel
+           buffer (no WIN1 header); `ioctl` flushes it to the device. */
+        long fd = sys3(56 /* openat */, -100, (long)"/dev/gpufb", 2 /* O_RDWR */);
+        if (fd >= 0) {
+            long mapped = sys6(222 /* mmap */, 0, 1024 * 768 * 4,
+                               3 /* RW */, 1 /* MAP_SHARED */, fd, 0);
+            if (mapped > 0) {
+                gpufb = (unsigned char *)mapped;
+                gpufb_fd = fd;
+                static const char ready[] = "gtk-serve: gpu scanout mapped\n";
+                sys3(64, 1, (long)ready, sizeof(ready) - 1);
+            } else {
+                sys3(57 /* close */, fd, 0, 0);
+            }
         }
     }
 

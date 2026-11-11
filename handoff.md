@@ -4664,3 +4664,29 @@ flags; }` — 24 bytes with `enabled` *after* the rectangle.
 Next: `RESOURCE_CREATE_2D` + `ATTACH_BACKING` + `SET_SCANOUT` +
 `TRANSFER_TO_HOST_2D`/`RESOURCE_FLUSH` so the compositor can present through
 the GPU instead of the ivshmem blit, then a DRM device and the virgl context.
+
+### virtio-gpu: 2D scanout, and the desktop presented through the GPU
+
+The driver now creates a 2D resource (`RESOURCE_CREATE_2D`, format
+`R8G8B8A8_UNORM`), attaches a contiguous framebuffer with `ATTACH_BACKING`,
+points scanout 0 at it with `SET_SCANOUT`, and presents with
+`TRANSFER_TO_HOST_2D` + `RESOURCE_FLUSH`. `init` draws colour bars so a host
+`screendump` proves the whole path before any client exists:
+
+```text
+VIRTIO-GPU: device 4.0
+VIRTIO-GPU: scanout 1024x768 resource 1
+```
+
+`/dev/gpufb` exposes that framebuffer to userspace: `mmap` maps the frames
+Normal Non-Cacheable (the same DMA protocol as every other surface) and
+`ioctl(fd, 0x5701 /* _IO('W',1) */)` transfers and flushes the frame. The
+compositor maps it at startup and, after each composed frame, copies the
+ivshmem pixels into it and flushes, so both sinks stay correct: the host
+viewer keeps reading the WIN1 BAR, and QEMU's own display head (or a
+screendump) shows the GPU output. `--gpu` now asks for `xres=1024,yres=768`
+so the scanout is exactly the compositor's output size.
+
+Verified with a screendump of the Phosh lockscreen through the GPU path:
+wallpaper, moon, clock and date all arrive with the right colours (a
+byte-order mistake would show as red/blue swapped).

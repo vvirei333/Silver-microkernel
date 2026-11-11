@@ -4831,6 +4831,18 @@ pub fn map_ivshmem(length: usize) -> Option<usize> {
     with_group_owner(|task| mmu::map_phys_nc_to_user(task, base, length))?
 }
 
+/// Maps the virtio-gpu scanout framebuffer into the calling process. The
+/// compositor writes frames straight into it and asks the kernel to flush.
+/// The mapping is Normal Non-Cacheable, the same protocol as every other DMA
+/// surface, so the device sees each write without a cache clean.
+pub fn map_gpufb(length: usize) -> Option<usize> {
+    let (base, size) = crate::virtio_gpu::framebuffer_phys()?;
+    if length == 0 || length > size {
+        return None;
+    }
+    with_group_owner(|task| mmu::map_shared_dma_to_user(task, base, length))?
+}
+
 pub fn map_phys_to_current(phys_addr: usize, size: usize) -> Option<usize> {
     map_phys_to_current_mode(phys_addr, size, false)
 }

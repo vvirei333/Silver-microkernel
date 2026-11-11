@@ -141,12 +141,14 @@ if [ "$GPU" -eq 1 ]; then
     GPU_DEVICES="$(qemu-system-aarch64 -device help 2>&1)"
     if printf '%s\n' "$GPU_DEVICES" | grep -q 'name "virtio-gpu-gl-pci"' &&
        qemu-system-aarch64 -display help 2>&1 | grep -qx "egl-headless"; then
-        GPU_ARGS+=(-device virtio-gpu-gl-pci)
+        # The compositor renders 1024x768 (512x384 logical at scale 2); the
+        # scanout is created at exactly that size so it fills the display.
+        GPU_ARGS+=(-device virtio-gpu-gl-pci,xres=1024,yres=768)
         GPU_DISPLAY=(-display egl-headless)
-        echo "GPU: virtio-gpu-gl-pci (virgl, egl-headless)"
+        echo "GPU: virtio-gpu-gl-pci (virgl, egl-headless) 1024x768"
     elif printf '%s\n' "$GPU_DEVICES" | grep -q 'name "virtio-gpu-pci"'; then
-        GPU_ARGS+=(-device virtio-gpu-pci)
-        echo "GPU: virtio-gpu-pci (2D)"
+        GPU_ARGS+=(-device virtio-gpu-pci,xres=1024,yres=768)
+        echo "GPU: virtio-gpu-pci (2D) 1024x768"
     else
         echo "GPU: no virtio-gpu device in this QEMU build; install" >&2
         echo "     qemu-hw-display-virtio-gpu qemu-hw-display-virtio-gpu-pci" >&2

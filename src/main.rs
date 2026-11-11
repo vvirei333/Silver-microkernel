@@ -1687,9 +1687,9 @@ pub extern "C" fn kernel_main() -> ! {
             ram_log::log("KSFS mounted");
             // Install the app bundles on first boot (or after a size change).
             seed::seed_apps();
-            // `--gpu` attaches a virtio-gpu; report it so the driver work can
-            // be checked against a real device.
-            let _ = virtio_gpu::probe();
+            // `--gpu` attaches a virtio-gpu; the driver sets up a 2D scanout
+            // and draws a test pattern when the device is present.
+            let _ = virtio_gpu::init();
         }
     }
     #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]

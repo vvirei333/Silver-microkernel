@@ -123,6 +123,7 @@ const SYS_ACCEPT4: u64 = 242;
 
 const EPERM: u64 = 1;
 const ENOENT: u64 = 2;
+const EIO: u64 = 5;
 const ENOEXEC: u64 = 8;
 const EBADF: u64 = 9;
 const ECHILD: u64 = 10;
@@ -1507,7 +1508,16 @@ fn linux_writev(fd: u64, iovec: u64, count: u64) -> u64 {
 fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
     const TIOCGWINSZ: u64 = 0x5413;
     const FIONBIO: u64 = 0x5421;
+    /// `_IO('W', 0x01)`: present the current `/dev/gpufb` contents.
+    const GPU_IOCTL_FLUSH: u64 = 0x5701;
     let task = scheduler::current_task_id();
+    if request == GPU_IOCTL_FLUSH && linux_fd::is_gpufb(task, fd) {
+        return if crate::virtio_gpu::flush() {
+            0
+        } else {
+            errno(EIO)
+        };
+    }
     // Rust's runtime (and socket2) set non-blocking through `ioctl(FIONBIO)`
     // on sockets and pipes. The fd is not a terminal, so the tty branch below
     // must not answer EBADF for it.
@@ -2176,6 +2186,16 @@ fn linux_mmap(
     // what Wayland's `wl_shm` buffers use. Other files still copy into
     // private frames, and a writable shared mapping of a read-only SFS file
     // is refused rather than silently losing its write-back.
+    if flags & MAP_SHARED != 0 && linux_fd::is_gpufb(scheduler::current_task_id(), fd) {
+        // The virtio-gpu scanout. The kernel owns the contiguous frames; the
+        // mapping is Non-Cacheable so the device sees the compositor's writes.
+        if offset != 0 {
+            return errno(EINVAL);
+        }
+        return scheduler::map_gpufb(length as usize)
+            .map(|placed| placed as u64)
+            .unwrap_or(errno(ENOMEM));
+    }
     if flags & MAP_SHARED != 0
         && linux_fd::is_ivshmem(scheduler::current_task_id(), fd)
     {
