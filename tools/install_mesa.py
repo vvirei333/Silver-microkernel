@@ -32,10 +32,14 @@ SEEDS = [
     'dri/virtio_gpu_dri.so',
     'gbm/dri_gbm.so',
 ]
+# Mesa 25 (Debian) keeps the real drivers in `mesa-libgallium`; Mesa 26
+# (Arch) ships the same file under a versioned name.
+EXTRA_SEEDS = ['libgallium-25.0.7-2+deb13u1.so']
 # Renames for names that cannot fit. Keep the new name short but still
 # recognisable; the soname and every DT_NEEDED entry are patched to match.
 SHORTEN = {
     'libgallium-26.2.6-arch1.1.so': 'libgallium-26.2.6.so',
+    'libgallium-25.0.7-2+deb13u1.so': 'libgallium-25.0.7.so',
 }
 
 
@@ -81,10 +85,22 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--root', default=os.path.expanduser('~/phosh-state/gtk4-root'))
     parser.add_argument('--image', default=os.path.expanduser('~/phosh-state/disk_phosh.img'))
+    parser.add_argument('--force', action='store_true',
+                        help='overwrite files that are already in the image')
     args = parser.parse_args()
 
-    lib = os.path.join(args.root, 'usr', 'lib')
-    queue = [os.path.realpath(os.path.join(lib, seed)) for seed in SEEDS]
+    candidates = [
+        os.path.join(args.root, 'usr', 'lib', 'aarch64-linux-gnu'),
+        os.path.join(args.root, 'usr', 'lib'),
+        os.path.join(args.root, 'usr', 'lib64'),
+    ]
+    lib = next((path for path in candidates
+                if os.path.isdir(os.path.join(path, 'dri'))), candidates[1])
+    queue = []
+    for seed in SEEDS + EXTRA_SEEDS:
+        path = os.path.realpath(os.path.join(lib, seed))
+        if os.path.exists(path):
+            queue.append(path)
     closure = {}
     while queue:
         path = queue.pop()
@@ -110,7 +126,7 @@ def main():
     try:
         for name, path in sorted(closure.items()):
             target = renames.get(name, name)
-            if target in have:
+            if target in have and not args.force:
                 print('skip (present)', target)
                 continue
             if len(target) > NAME_LIMIT:
@@ -144,7 +160,7 @@ def main():
         # LIBGL_DRIVERS_PATH looks up the driver by the *driver* name, and
         # the staged tree only has the libdril symlink, so ship a copy.
         driver = find(lib, 'virtio_gpu_dri.so')
-        if driver is not None and 'virtio_gpu_dri.so' not in have:
+        if driver is not None and ('virtio_gpu_dri.so' not in have or args.force):
             data = open(driver, 'rb').read()
             img.write_file_at('virtio_gpu_dri.so', data)
             written += 1

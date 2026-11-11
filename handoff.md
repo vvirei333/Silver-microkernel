@@ -4863,3 +4863,40 @@ So hardware GL is blocked in userspace, not in the kernel: either ship a Mesa
 that still has the virgl driver (25.x), or use Venus/zink (`venus=on`,
 `libvulkan_virtio.so`), or accept llvmpipe. The render node, the 3D context
 and the capset plumbing are all in place and exercised by `rendertest`.
+
+### Mesa 25 (Debian) with virgl: installed, still llvmpipe
+
+Key finding: Mesa 26.2 (Arch) no longer exposes a virgl GL driver. Its
+`virtio_gpu_dri.so` is the DRM *native context* driver (vdrm): libgallium
+26.2 contains `could not get caps`, `libdril_dri.so` exports only
+`__driDriverGetExtensions_virtio_gpu`, and there is no `virgl_dri.so`. The
+native path needs QEMU `drm_native_context=on` (+`blob=on`), which makes
+virglrenderer fail here (`failed to initialize drm renderer`, ENODEV).
+
+Mesa **25.0.7** from Debian is the opposite: libgallium 25.0.7 contains the
+virgl winsys strings (`DRM_IOCTL_VIRTGPU_CONTEXT_INIT failed`,
+`No virgl contexts available`) and no vdrm, so `virtio_gpu_dri.so` there is
+the virgl driver. Installed into the image from
+`https://deb.debian.org/debian/pool/main/m/mesa/`:
+
+- `mesa-libgallium_25.0.7-2+deb13u1_arm64.deb` (35 MiB, renamed to
+  `libgallium-25.0.7.so`, soname + DT_NEEDED patched),
+- `libegl-mesa0`, `libgbm1`, `libgl1-mesa-dri` (the `libdril_dri.so` stub and
+  `dri/virtio_gpu_dri.so`),
+- `libllvm19` (122 MiB `libLLVM.so.19.1`; it is a DT_NEEDED of libgallium),
+- `libz3-4`, `libedit2`, `libbsd0`, `libmd0`, plus Arch's
+  `libwayland-server.so.0` and `libtinfo.so.6` (copy of `libncursesw.so.6`).
+
+`tools/install_mesa.py` now takes `--force` (overwrite image files), detects
+`usr/lib/aarch64-linux-gnu`, seeds `mesa-libgallium`'s versioned soname and
+shortens `libgallium-<ver>-<pkg>.so` to `libgallium-<ver>.so`.
+
+`egltest` now loads Debian Mesa 25.0.7 (EGL 1.5, `OpenGL ES 3.2 Mesa
+25.0.7-2+deb13u1`, LLVM 19.1.7) and renders/reads back correctly, but the
+renderer is still **llvmpipe**.
+
+Next step: re-enable the render-node ioctl trace (the `IOCTL <request> -> <rc>`
+line in `linux_abi`) and run `egltest` once. With Mesa 25 the expected
+sequence is `GETPARAM 1..7` then `VIRTGPU_CONTEXT_INIT` (0xC010644B) and
+`RESOURCE_CREATE`; if it stops earlier, the failing request is visible
+directly. Nothing else in the image needs to change.
