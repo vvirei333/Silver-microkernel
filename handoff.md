@@ -4595,3 +4595,26 @@ unfolding, so quick settings stayed off-screen. Pending callbacks are now also
 flushed on the 20 ms idle timeout, which acts as a ~50 Hz vblank.
 
 Verified: 222 host tests, `linux-wlreal`, `layer-serve`, `layer-hit`.
+
+## 2026-11-11 — 3D acceleration: what it needs
+
+`./build_and_qemu.sh --gpu` now attaches a virtio-gpu: `virtio-gpu-gl-pci`
+when the QEMU build has OpenGL, otherwise the 2D `virtio-gpu-pci` (the current
+QEMU 11.1.3 has only the 2D device installed).
+
+Real 3D is a separate track, because three layers are missing:
+
+1. **Host QEMU**: `qemu-hw-display-virtio-gpu-pci-gl` and `virglrenderer` are
+   not installed (installing needs root). Without them QEMU has no
+   `virtio-gpu-gl-pci` and no `egl-headless`, so virgl/venus cannot run.
+2. **Kernel**: there is no virtio-gpu driver and no DRM device
+   (`/dev/dri/card0`). This is the largest piece: virtio PCI probe + queues,
+   resource create/attach/flush, a DRM ioctl surface (dumb buffers, addfb,
+   page flip) and a virtio 3D context for virgl.
+3. **Guest userspace**: the image has `libdrm.so.2` but no `libEGL`,
+   `libGLESv2`, `libgbm` or `virtio_gpu_dri.so`. Mesa's virgl driver and an
+   EGL/GBM path in the compositor are needed, plus `GSK_RENDERER=gl` for GTK4
+   apps.
+
+Phosh 0.57 itself is GTK3/cairo, so it would not use the GPU; the win is for
+GTK4 apps and for compositing via dmabuf.

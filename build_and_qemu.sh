@@ -5,7 +5,7 @@
 # card (Wolfser's network) and an ivshmem surface (Wolfser's window).
 #
 # Usage: ./build_and_qemu.sh [debug|release] [--no-run] [--viewer|--no-viewer]
-#                            [--no-linux] [--linux-tests] [--phosh]
+#                            [--no-linux] [--linux-tests] [--phosh] [--gpu]
 #   profile defaults to release.
 #   --no-run  stop after the build.
 #   --viewer  start the Qt host viewer (the default); it opens immediately and
@@ -21,6 +21,11 @@
 #   --phosh      boot the Phosh image ($PHOSH_IMAGE or
 #                ~/phosh-state/disk_phosh.img) instead of disk.img. At the
 #                prompt run `linuxstart phosh`.
+#   --gpu        attach a virtio-gpu. Uses virtio-gpu-gl-pci + egl-headless
+#                when this QEMU build has OpenGL support (install
+#                qemu-hw-display-virtio-gpu-pci-gl and virglrenderer), else the
+#                2D virtio-gpu-pci. The guest driver is not implemented yet, so
+#                the device is only probed.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -42,6 +47,7 @@ VIEWER=1
 LINUX=1
 TESTS=0
 PHOSH=0
+GPU=0
 for argument in "$@"; do
     case "$argument" in
         debug | release) PROFILE="$argument" ;;
@@ -52,7 +58,8 @@ for argument in "$@"; do
         --no-linux) LINUX=0 ;;
         --linux-tests) TESTS=1 ;;
         --phosh) PHOSH=1 ;;
-        *) echo "usage: $0 [debug|release] [--no-run] [--viewer|--no-viewer] [--no-linux] [--linux-tests] [--phosh]" >&2; exit 1 ;;
+        --gpu) GPU=1 ;;
+        *) echo "usage: $0 [debug|release] [--no-run] [--viewer|--no-viewer] [--no-linux] [--linux-tests] [--phosh] [--gpu]" >&2; exit 1 ;;
     esac
 done
 
@@ -126,8 +133,24 @@ if [ "$VIEWER" -eq 1 ]; then
     fi
 fi
 
+GPU_ARGS=()
+if [ "$GPU" -eq 1 ]; then
+    if qemu-system-aarch64 -device virtio-gpu-gl-pci,help >/dev/null 2>&1; then
+        GPU_ARGS+=(-device virtio-gpu-gl-pci)
+        echo "GPU: virtio-gpu-gl-pci (virgl)"
+    elif qemu-system-aarch64 -device virtio-gpu-pci,help >/dev/null 2>&1; then
+        GPU_ARGS+=(-device virtio-gpu-pci)
+        echo "GPU: virtio-gpu-pci (2D)"
+    else
+        echo "GPU: no virtio-gpu device in this QEMU build; install" >&2
+        echo "     qemu-hw-display-virtio-gpu-pci and qemu-hw-display-virtio-gpu-pci-gl" >&2
+        echo "     (plus virglrenderer) and run again. Booting without a GPU." >&2
+    fi
+fi
+
 qemu-system-aarch64 \
     -machine virt -cpu cortex-a72 -smp 2 -m 1024M \
+    "${GPU_ARGS[@]}" \
     -kernel "target/aarch64-unknown-none/$PROFILE/silver_microkernel" \
     -drive file="$IMAGE",format=raw,if=none,id=hd \
     -device virtio-blk-pci,drive=hd \
