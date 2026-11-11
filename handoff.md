@@ -4747,3 +4747,17 @@ What is still missing for `GSK_RENDERER=gl`: shipping the aarch64 Mesa
 `virtio_gpu_dri.so`) into the image, and a Wayland buffer-sharing protocol
 (`zwp_linux_dmabuf_v1` or `wl_drm`) so a compositor can import GL-rendered
 buffers. An offscreen EGL/GLES test only needs the Mesa files.
+
+### Lockscreen flicker: one frame per commit
+
+A layer surface was published twice per `wl_surface.commit`: the commit
+handler blitted the client's buffer straight into the sink (the raw lockscreen
+surface, no background), and then `layer_compose()` drew the full stack
+(wallpaper + lockscreen) and published that. The sink therefore alternated
+between two different images every commit, which showed up as the lockscreen
+flickering with the wallpaper visible underneath.
+
+The direct blit is the single-window fast path and now runs only when the
+surface is not a layer surface (`layer_slot == 0`); layer surfaces are
+published exclusively by `layer_compose()`. Eight screendumps of the running
+Phosh lockscreen, ~20 s apart, are now byte-identical.

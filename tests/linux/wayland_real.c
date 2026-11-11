@@ -2567,7 +2567,15 @@ static int serve(long client) {
                             "gtk-serve: shm frame committed\n";
                         sys3(64, 1, (long)frame_msg, sizeof(frame_msg) - 1);
                     }
-                    if (screen != 0 && buffer_width > 0 && buffer_height > 0 &&
+                    /* A layer surface is composed by layer_compose(), which
+                       draws the background and every layer in order. Blitting
+                       its buffer straight to the sink as well published two
+                       different frames per commit (the raw surface first, the
+                       full composite second), which showed up as the
+                       lockscreen flickering over the wallpaper. Only the
+                       single-window path needs the direct blit. */
+                    if (layer_slot == 0 && screen != 0 && buffer_width > 0 &&
+                        buffer_height > 0 &&
                         buffer_stride >= (unsigned)buffer_width * 4) {
                         unsigned length = buffer_offset +
                                           buffer_stride * (unsigned)buffer_height;
