@@ -349,6 +349,11 @@ typedef struct {
        last is on top; commit frequency must not reorder the stack. */
     unsigned seq;
     unsigned keyboard_interactivity;
+    /* zphoc_layer_shell_effects stacking: this surface must be below/above
+       the given zwlr_layer_surface_v1 id. */
+    unsigned layer_surface;
+    unsigned below;
+    unsigned above;
 } LayerEntry;
 static LayerEntry layer_entries[MAX_LAYERS];
 
@@ -367,11 +372,56 @@ typedef struct {
     int margin[4];
     int configured;
     int acked;
+    /* Set by set_size: the client changed the surface size and must receive a
+       fresh configure on the next commit. Phosh expands the top panel to the
+       full height when quick settings opens. */
+    int pending;
     unsigned seq;
     unsigned keyboard_interactivity;
+    unsigned below;
+    unsigned above;
 } LayerSurface;
 static LayerSurface layer_surfaces[MAX_LAYER_SURFACES];
 static unsigned layer_surface_seq;
+
+/* zphoc_layer_shell_effects_v1.get_stacked_layer_surface creates a helper
+ * object per layer surface; Phosh then calls stack_below() on it. Keeping only
+ * the newest helper id lost every relation but the last one. */
+#define MAX_STACKED 16
+typedef struct {
+    unsigned id;
+    unsigned layer_surface;
+} StackedSlot;
+static StackedSlot stacked_slots[MAX_STACKED];
+
+static StackedSlot *stacked_add(unsigned id, unsigned layer_surface) {
+    for (unsigned index = 0; index < MAX_STACKED; index++) {
+        if (stacked_slots[index].id == id) {
+            stacked_slots[index].layer_surface = layer_surface;
+            return &stacked_slots[index];
+        }
+    }
+    for (unsigned index = 0; index < MAX_STACKED; index++) {
+        if (stacked_slots[index].id == 0) {
+            stacked_slots[index].id = id;
+            stacked_slots[index].layer_surface = layer_surface;
+            return &stacked_slots[index];
+        }
+    }
+    return 0;
+}
+
+static StackedSlot *stacked_find(unsigned id) {
+    if (id == 0) {
+        return 0;
+    }
+    for (unsigned index = 0; index < MAX_STACKED; index++) {
+        if (stacked_slots[index].id == id) {
+            return &stacked_slots[index];
+        }
+    }
+    return 0;
+}
 
 static LayerSurface *layer_surface_by_id(unsigned id) {
     if (id == 0) {
@@ -424,7 +474,10 @@ static LayerSurface *layer_surface_add(unsigned id, unsigned surface) {
     }
     slot->configured = 0;
     slot->acked = 0;
+    slot->pending = 1;
     slot->keyboard_interactivity = 0;
+    slot->below = 0;
+    slot->above = 0;
     slot->seq = ++layer_surface_seq;
     return slot;
 }
@@ -663,6 +716,10 @@ static int popup_committed;
 static unsigned pool_id;
 static unsigned buffer_id;
 static unsigned frame_id;
+/* wl_surface.frame callbacks are completed on the surface's next commit, not
+   on the request: completing them immediately made GTK render in a tight loop
+   and burned the guest CPU. */
+static unsigned frame_ids[SURFACE_IDS];
 static int pool_fd = -1;
 static int verified;
 static unsigned commits;
@@ -778,6 +835,7 @@ typedef struct {
     unsigned pool_id;
     unsigned buffer_id;
     unsigned frame_id;
+    unsigned frame_ids[SURFACE_IDS];
     int pool_fd;
     int verified;
     unsigned commits;
@@ -804,6 +862,7 @@ typedef struct {
     RegionSlot regions[MAX_REGIONS];
     LayerEntry layer_entries[MAX_LAYERS];
     LayerSurface layer_surfaces[MAX_LAYER_SURFACES];
+    StackedSlot stacked_slots[MAX_STACKED];
     unsigned shm_ids[MAX_SHM];
 } ClientState;
 
@@ -868,6 +927,7 @@ static void load_client(ClientState *client) {
         attached_buffers[index] = client->attached_buffers[index];
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        frame_ids[index] = client->frame_ids[index];
         surface_input_set[index] = client->surface_input_set[index];
         surface_input_empty[index] = client->surface_input_empty[index];
         for (unsigned corner = 0; corner < 4; corner++) {
@@ -880,6 +940,9 @@ static void load_client(ClientState *client) {
     }
     for (unsigned index = 0; index < MAX_LAYERS; index++) {
         layer_entries[index] = client->layer_entries[index];
+    }
+    for (unsigned index = 0; index < MAX_STACKED; index++) {
+        stacked_slots[index] = client->stacked_slots[index];
     }
     for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
         layer_surfaces[index] = client->layer_surfaces[index];
@@ -904,6 +967,7 @@ static void save_client(ClientState *client) {
         client->attached_buffers[index] = attached_buffers[index];
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        client->frame_ids[index] = frame_ids[index];
         client->surface_input_set[index] = surface_input_set[index];
         client->surface_input_empty[index] = surface_input_empty[index];
         for (unsigned corner = 0; corner < 4; corner++) {
@@ -916,6 +980,9 @@ static void save_client(ClientState *client) {
     }
     for (unsigned index = 0; index < MAX_LAYERS; index++) {
         client->layer_entries[index] = layer_entries[index];
+    }
+    for (unsigned index = 0; index < MAX_STACKED; index++) {
+        client->stacked_slots[index] = stacked_slots[index];
     }
     for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
         client->layer_surfaces[index] = layer_surfaces[index];
@@ -938,6 +1005,22 @@ static void send_global_version(long client, unsigned registry, unsigned name,
 static void send_global(long client, unsigned registry, unsigned name,
                         const char *interface) {
     send_global_version(client, registry, name, interface, 1);
+}
+
+/* Monotonic milliseconds. GTK drives animations and gesture recognition from
+ * these timestamps; sending 0 made every animation crawl. */
+static unsigned now_ms(void) {
+    struct {
+        long seconds;
+        long nanoseconds;
+    } time;
+    time.seconds = 0;
+    time.nanoseconds = 0;
+    if (sys3(113 /* clock_gettime */, 1 /* CLOCK_MONOTONIC */, (long)&time, 0) < 0) {
+        return 0;
+    }
+    return (unsigned)((unsigned long)time.seconds * 1000u +
+                      (unsigned long)(time.nanoseconds / 1000000));
 }
 
 static void send_done(long client, unsigned callback, unsigned data) {
@@ -1062,6 +1145,9 @@ static void layer_record_commit(LayerSurface *slot) {
     entry->fd = pool_fd;
     entry->seq = slot->seq;
     entry->keyboard_interactivity = slot->keyboard_interactivity;
+    entry->layer_surface = slot->layer_surface;
+    entry->below = slot->below;
+    entry->above = slot->above;
 }
 
 /// Top-left corner of a layer surface in physical output coordinates. This is
@@ -1088,8 +1174,32 @@ static void layer_rect(const LayerEntry *entry, int *x, int *y) {
     }
 }
 
+/// Whether `a` is stacked above `b`. Higher layers always win; inside a layer
+/// the explicit zphoc stack_below()/stack_above() relation wins over creation
+/// order. Phosh puts panel/lockscreen backgrounds below their content that
+/// way, and without it those backgrounds take the pointer events.
+static int layer_entry_above(const LayerEntry *a, const LayerEntry *b) {
+    if (a->layer != b->layer) {
+        return a->layer > b->layer;
+    }
+    if (a->below != 0 && a->below == b->layer_surface) {
+        return 0;
+    }
+    if (b->below != 0 && b->below == a->layer_surface) {
+        return 1;
+    }
+    if (a->above != 0 && a->above == b->layer_surface) {
+        return 1;
+    }
+    if (b->above != 0 && b->above == a->layer_surface) {
+        return 0;
+    }
+    return a->seq > b->seq;
+}
+
 /// Topmost layer surface under a physical output coordinate, or 0. Higher
-/// layer wins; within a layer the surface created last wins.
+/// layer wins; within a layer the explicit stacking relation wins, then the
+/// surface created last.
 static unsigned layer_hit_test(unsigned px, unsigned py) {
     LayerEntry *best = 0;
     for (unsigned index = 0; index < MAX_LAYERS; index++) {
@@ -1116,8 +1226,7 @@ static unsigned layer_hit_test(unsigned px, unsigned py) {
                 continue;
             }
         }
-        if (best == 0 || entry->layer > best->layer ||
-            (entry->layer == best->layer && entry->seq > best->seq)) {
+        if (best == 0 || layer_entry_above(entry, best)) {
             best = entry;
         }
     }
@@ -1146,8 +1255,7 @@ static unsigned keyboard_hit_test(void) {
                 continue;
             }
         }
-        if (best == 0 || entry->layer > best->layer ||
-            (entry->layer == best->layer && entry->seq > best->seq)) {
+        if (best == 0 || layer_entry_above(entry, best)) {
             best = entry;
         }
     }
@@ -1167,12 +1275,30 @@ static void layer_compose(void) {
     }
     unsigned drawn = 0;
     for (unsigned wanted = 0; wanted <= 3; wanted++) {
+        unsigned order[MAX_LAYERS];
+        unsigned count = 0;
         for (unsigned index = 0; index < MAX_LAYERS; index++) {
             LayerEntry *entry = &layer_entries[index];
             if (!entry->used || entry->layer != wanted || entry->width == 0 ||
                 entry->height == 0 || entry->fd < 0) {
                 continue;
             }
+            order[count++] = index;
+        }
+        /* Insertion sort: order[0] is the bottom-most surface of the layer. */
+        for (unsigned position = 1; position < count; position++) {
+            unsigned key = order[position];
+            unsigned slot = position;
+            while (slot > 0 &&
+                   layer_entry_above(&layer_entries[order[slot - 1]],
+                                     &layer_entries[key])) {
+                order[slot] = order[slot - 1];
+                slot -= 1;
+            }
+            order[slot] = key;
+        }
+        for (unsigned position = 0; position < count; position++) {
+            LayerEntry *entry = &layer_entries[order[position]];
             unsigned length = entry->offset + entry->stride * entry->height;
             long mapped = sys6(222 /* mmap */, 0, length, 1 /* read */,
                                1 /* MAP_SHARED */, entry->fd, 0);
@@ -1260,7 +1386,7 @@ static void pointer_send_leave(long client, unsigned surface) {
 
 static void pointer_send_motion(long client, int x, int y) {
     begin(pointer_id, 2 /* motion */);
-    put_u32(0); /* time */
+    put_u32(now_ms()); /* time */
     put_i32(x << 8);
     put_i32(y << 8);
     finish();
@@ -1384,7 +1510,7 @@ static void poll_input(long client) {
                 unsigned button = (value & 3) == 2 ? 0x112u : 0x110u;
                 begin(pointer_id, 3 /* button */);
                 put_u32(configure_serial);
-                put_u32(0); /* time */
+                put_u32(now_ms()); /* time */
                 put_u32(button);
                 put_u32(kind == INPUT_CLICK ? 1u : 0u);
                 finish();
@@ -1395,7 +1521,7 @@ static void poll_input(long client) {
                 keyboard_route(client);
                 begin(keyboard_id, 3 /* key */);
                 put_u32(configure_serial);
-                put_u32(0); /* time */
+                put_u32(now_ms()); /* time */
                 put_u32(key);
                 put_u32(1); /* pressed */
                 finish();
@@ -1404,7 +1530,7 @@ static void poll_input(long client) {
         } else if (kind == INPUT_SCROLL) {
             if (pointer_id != 0) {
                 begin(pointer_id, 4 /* axis */);
-                put_u32(0); /* time */
+                put_u32(now_ms()); /* time */
                 put_u32(0); /* vertical */
                 put_i32((int)value * 10 * 256);
                 finish();
@@ -2003,6 +2129,7 @@ static int serve(long client) {
                 LayerSurface *slot = layer_surface_by_id(object);
                 slot->width = take_u32();
                 slot->height = take_u32();
+                slot->pending = 1;
                 layer_width = slot->width;
                 layer_height = slot->height;
             } else if (layer_surface_by_id(object) != 0 && opcode == 1) {
@@ -2137,9 +2264,11 @@ static int serve(long client) {
                 alpha_id = take_u32();
                 (void)take_u32();
             } else if (object == layer_effects_id && opcode == 3) {
-                /* get_stacked_layer_surface */
-                stacked_id = take_u32();
-                (void)take_u32();
+                /* get_stacked_layer_surface(new_id, layer_surface) */
+                unsigned new_stacked = take_u32();
+                unsigned for_surface = take_u32();
+                stacked_id = new_stacked;
+                stacked_add(new_stacked, for_surface);
             } else if (object == draggable_id && opcode <= 5) {
                 /* set_margins(2) / threshold / exclusive / mode / handle / state */
                 unsigned count = opcode == 0 ? 2u : 1u;
@@ -2150,9 +2279,29 @@ static int serve(long client) {
                 (void)take_u32(); /* alpha */
             } else if (object == alpha_id && opcode == 1) {
                 alpha_id = 0;
-            } else if (object == stacked_id && opcode <= 1) {
-                (void)take_u32(); /* layer surface */
-            } else if (object == stacked_id && opcode == 2) {
+            } else if (stacked_find(object) != 0 && opcode <= 1) {
+                /* zphoc_stacked_layer_surface_v1.stack_below / stack_above */
+                StackedSlot *stacked = stacked_find(object);
+                unsigned sibling = take_u32();
+                LayerSurface *target = layer_surface_by_id(stacked->layer_surface);
+                if (target != 0) {
+                    if (opcode == 0) {
+                        target->below = sibling;
+                    } else {
+                        target->above = sibling;
+                    }
+                    LayerEntry *entry = layer_entry_by_surface(target->surface);
+                    if (entry != 0) {
+                        if (opcode == 0) {
+                            entry->below = sibling;
+                        } else {
+                            entry->above = sibling;
+                        }
+                    }
+                }
+            } else if (stacked_find(object) != 0 && opcode == 2) {
+                StackedSlot *stacked = stacked_find(object);
+                stacked->id = 0;
                 stacked_id = 0;
             } else if (object == foreign_toplevel_manager_id && opcode == 0) {
                 foreign_toplevel_manager_id = 0;
@@ -2270,15 +2419,17 @@ static int serve(long client) {
                     }
                 }
             } else if (is_surface(object) && opcode == 3) {
-                frame_id = take_u32(); /* wl_surface.frame */
-                /* Complete the callback immediately: GTK's frame clock waits
-                   for it before painting, and a missing done event kept the
-                   first buffer from ever being committed during the demo. */
-                begin(frame_id, 0 /* wl_callback.done */);
-                put_u32(0); /* timestamp */
-                finish();
-                send_message(client, -1);
-                frame_id = 0;
+                /* wl_surface.frame: remember the callback and complete it
+                   when this surface is next committed. */
+                unsigned callback = take_u32();
+                if (object < SURFACE_IDS) {
+                    if (frame_ids[object] != 0) {
+                        send_done(client, frame_ids[object], now_ms());
+                    }
+                    frame_ids[object] = callback;
+                } else {
+                    send_done(client, callback, now_ms());
+                }
             } else if (is_surface(object) && opcode == 6) {
                 /* wl_surface.commit: report the output, then verify pixels. */
                 if (object == subsurface_surface_id) {
@@ -2293,7 +2444,7 @@ static int serve(long client) {
                     }
                 }
                 LayerSurface *layer_slot = layer_surface_by_surface(object);
-                if (layer_slot != 0 && !layer_slot->configured) {
+                if (layer_slot != 0 && layer_slot->pending) {
                     /* A layer surface asking for size 0 (or -1) leaves the
                        axis to the compositor; answer with the logical output
                        size instead of 0, which GTK rejects. */
@@ -2311,6 +2462,7 @@ static int serve(long client) {
                     finish();
                     send_message(client, -1);
                     layer_slot->configured = 1;
+                    layer_slot->pending = 0;
                 }
                 if (!surface_entered && output_id != 0) {
                     surface_entered = 1;
@@ -2454,8 +2606,9 @@ static int serve(long client) {
                        next commit look like attach(NULL), so GTK's repeated
                        present-without-attach dropped the whole layer. */
                 }
-                if (frame_id != 0) {
-                    send_done(client, frame_id, 0);
+                if (object < SURFACE_IDS && frame_ids[object] != 0) {
+                    send_done(client, frame_ids[object], now_ms());
+                    frame_ids[object] = 0;
                 }
             }
             message_start += size;
@@ -2671,6 +2824,10 @@ static void reset_client(void) {
     for (unsigned index = 0; index < MAX_LAYERS; index++) {
         layer_entries[index].used = 0;
     }
+    for (unsigned index = 0; index < MAX_STACKED; index++) {
+        stacked_slots[index].id = 0;
+        stacked_slots[index].layer_surface = 0;
+    }
     for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
         layer_surfaces[index].used = 0;
     }
@@ -2717,6 +2874,9 @@ static void reset_client(void) {
     pool_id = 0;
     buffer_id = 0;
     frame_id = 0;
+    for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        frame_ids[index] = 0;
+    }
     configure_serial = 1;
     verified = 0;
     commits = 0;

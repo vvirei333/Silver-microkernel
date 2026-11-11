@@ -4484,3 +4484,48 @@ wallpaper and `theme.pack` automatically, so rebuilding the image keeps them.
   `configure` after `set_size`/`set_anchor` (and honouring `stack_below`).
 - The Cellular and Wi-Fi tiles fall back to `image-missing`; the exact icon
   names Phosh requests for them are not covered yet.
+
+## 2026-11-11 — Resize configures, real timestamps, layer stacking (WIP)
+
+### Fresh `configure` when the size changes
+
+The compositor sent exactly one configure per layer surface. Phosh calls
+`set_size(0, 384)` when quick settings opens, and without a new configure GTK
+kept rendering a buffer for the old 32-logical height (504 physical rows).
+`LayerSurface.pending` is set by `set_size` and a configure goes out on the
+next commit. Margins/anchors deliberately do not trigger one: Phosh animates
+margins and re-configuring on every frame caused a slow resize feedback loop.
+
+### Monotonic event and frame timestamps
+
+`frame.done`, pointer motion/button/axis and keyboard key events all carried
+`time = 0`. GTK drives animations and gesture recognition from those values,
+so every animation crawled and every swipe looked instantaneous. `now_ms()`
+uses `clock_gettime(CLOCK_MONOTONIC)`. With real timestamps the Phosh startup
+animation settles in a second and the home screen (wallpaper + clock) is
+stable.
+
+### Frame callbacks on commit
+
+`wl_surface.frame` callbacks were completed immediately, so GTK rendered in a
+tight loop and the guest spent its time recompositing. They are now stored per
+surface and completed on that surface's next commit, with the presentation
+timestamp.
+
+### zphoc layer stacking
+
+`zphoc_layer_shell_effects_v1.get_stacked_layer_surface` and
+`stack_below`/`stack_above` are implemented. Phosh puts the panel and
+lockscreen *backgrounds* below their content that way; without it those
+full-screen backgrounds were on top (creation order) and took every pointer
+event meant for the panel. Composition and hit-testing now share
+`layer_entry_above()` (layer, explicit relation, then creation order).
+
+### State
+
+Builds clean; the wallpaper/timestamp run was verified in the guest (stable
+home screen). The stacking change and deferred frame callbacks still need the
+`linux-wlreal` / `layer-serve` / `layer-hit` regression run. One open issue:
+a downward drag on the top panel does not open quick settings yet — the
+instrumented build showed the initial pointer enter but the drag never reached
+the panel, so hit-testing on that surface is still being checked.
