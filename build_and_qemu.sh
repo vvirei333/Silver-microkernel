@@ -5,7 +5,7 @@
 # card (Wolfser's network) and an ivshmem surface (Wolfser's window).
 #
 # Usage: ./build_and_qemu.sh [debug|release] [--no-run] [--viewer|--no-viewer]
-#                            [--no-linux] [--linux-tests]
+#                            [--no-linux] [--linux-tests] [--phosh]
 #   profile defaults to release.
 #   --no-run  stop after the build.
 #   --viewer  start the Qt host viewer (the default); it opens immediately and
@@ -18,6 +18,9 @@
 #                (runs tools/linux-test.sh; needs the AArch64 cross compiler).
 #                The base image only has the OS files, so `linuxrun` targets
 #                such as /sfs/linux-wayland exist only after this step.
+#   --phosh      boot the Phosh image ($PHOSH_IMAGE or
+#                ~/phosh-state/disk_phosh.img) instead of disk.img. At the
+#                prompt run `linuxstart phosh`.
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -38,6 +41,7 @@ RUN=1
 VIEWER=1
 LINUX=1
 TESTS=0
+PHOSH=0
 for argument in "$@"; do
     case "$argument" in
         debug | release) PROFILE="$argument" ;;
@@ -47,7 +51,8 @@ for argument in "$@"; do
         --linux) LINUX=1 ;;
         --no-linux) LINUX=0 ;;
         --linux-tests) TESTS=1 ;;
-        *) echo "usage: $0 [debug|release] [--no-run] [--viewer|--no-viewer] [--no-linux] [--linux-tests]" >&2; exit 1 ;;
+        --phosh) PHOSH=1 ;;
+        *) echo "usage: $0 [debug|release] [--no-run] [--viewer|--no-viewer] [--no-linux] [--linux-tests] [--phosh]" >&2; exit 1 ;;
     esac
 done
 
@@ -72,6 +77,14 @@ if [ "$RUN" -ne 1 ]; then
 fi
 
 SHM="${WOLFSER_SHM:-/dev/shm/werewolf-window}"
+IMAGE="disk.img"
+if [ "$PHOSH" -eq 1 ]; then
+    IMAGE="${PHOSH_IMAGE:-$HOME/phosh-state/disk_phosh.img}"
+    if [ ! -f "$IMAGE" ]; then
+        echo "phosh image not found: $IMAGE (set PHOSH_IMAGE)" >&2
+        exit 1
+    fi
+fi
 VIEWER_BIN="build/window-viewer/werewolf-window"
 VIEWER_PID=""
 cleanup() {
@@ -102,7 +115,11 @@ if [ "$VIEWER" -eq 1 ]; then
         # QEMU's serial console.
         "$VIEWER_BIN" --watch --shm "$SHM" </dev/null >build/wolfser-viewer.log 2>&1 &
         VIEWER_PID=$!
-        echo "Wolfser: the window opens when you type \`wolfser\` (log: build/wolfser-viewer.log)"
+        if [ "$PHOSH" -eq 1 ]; then
+            echo "Phosh: at the prompt type \`linuxstart phosh\` (log: build/wolfser-viewer.log)"
+        else
+            echo "Wolfser: the window opens when you type \`wolfser\` (log: build/wolfser-viewer.log)"
+        fi
     else
         echo "warning: $VIEWER_BIN was not built (install Qt6 + cmake);" >&2
         echo "         start it later with tools/wolfser-host.sh" >&2
@@ -112,7 +129,7 @@ fi
 qemu-system-aarch64 \
     -machine virt -cpu cortex-a72 -smp 2 -m 1024M \
     -kernel "target/aarch64-unknown-none/$PROFILE/silver_microkernel" \
-    -drive file=disk.img,format=raw,if=none,id=hd \
+    -drive file="$IMAGE",format=raw,if=none,id=hd \
     -device virtio-blk-pci,drive=hd \
     -device virtio-net-pci,disable-legacy=on \
     -object memory-backend-file,id=ivshmem0,share=on,mem-path="$SHM",size=4M \

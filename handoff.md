@@ -4319,3 +4319,17 @@ first jetsam candidates, and (b) killing/suspending those tasks at `Critical`
 instead of letting a foreground process fail an allocation.
 
 Host tests: 222 passed. Guest boot and `linux-hello` (exit 42) still work.
+
+## 2026-11-11 — One-command Phosh launch
+
+`linuxstart <app>` resolves `<app>-serve` first, then `<app>`, under `/sfs`
+and `/sfs/apps`, so `linuxstart phosh` runs `/sfs/phosh-serve` without the user
+remembering the compositor suffix. `phosh` is a shortcut for the same.
+
+`./build_and_qemu.sh --phosh` boots `$PHOSH_IMAGE` (default
+`~/phosh-state/disk_phosh.img`) directly instead of `disk.img`, so the tracked
+64 MiB test image is never overwritten. At the prompt:
+
+```text
+linuxstart phosh
+```

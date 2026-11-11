@@ -222,6 +222,8 @@ fn execute(command: &str) {
             #[cfg(feature = "linux-abi")]
             syscall::print("  linuxrun <path>  Run a Linux ABI ELF (x8 = Linux syscall)\r\n");
             syscall::print("  linuxrun-<app>   Run /sfs/apps/<app> or /sfs/<app>\r\n");
+            syscall::print("  linuxstart <app> Run /sfs/<app>-serve, then /sfs/<app>\r\n");
+            syscall::print("  phosh            Shortcut for `linuxstart phosh`\r\n");
             syscall::print("  echo <text> [> file | >> file]\r\n");
             syscall::print("             Print, truncate/write, or append to a file\r\n");
             syscall::print("  touch <file>\r\n");
@@ -272,6 +274,10 @@ fn execute(command: &str) {
         Some("run") => run_elf(words.next().unwrap_or("")),
         #[cfg(feature = "linux-abi")]
         Some("linuxrun") => run_linux_elf(words.next().unwrap_or("")),
+        #[cfg(feature = "linux-abi")]
+        Some("linuxstart") => run_linux_start(words.next().unwrap_or("")),
+        #[cfg(feature = "linux-abi")]
+        Some("phosh") => run_linux_start("phosh"),
         Some("sl") => run_utility(syscall::PROGRAM_SL, ""),
         Some("mkdir") => make_directory(words.next()),
         Some("rm") => remove_file(words.next()),
@@ -802,6 +808,37 @@ fn run_elf(path: &str) {
 /// personality. The kernel assigns the console inside the spawn, before the
 /// child can run on any CPU, so no `console_set` round trip is needed.
 #[cfg(feature = "linux-abi")]
+/// `linuxstart <app>`: resolves `<app>-serve` first, then `<app>`, under
+/// `/sfs` and `/sfs/apps`. `linuxstart phosh` therefore finds
+/// `/sfs/phosh-serve` without the user remembering the suffix.
+fn run_linux_start(name: &str) {
+    if name.is_empty() {
+        syscall::print("Usage: linuxstart <app>  (e.g. linuxstart phosh)\r\n");
+        return;
+    }
+    let mut path = [0_u8; 160];
+    for suffix in [b"-serve".as_slice(), b"".as_slice()] {
+        for prefix in [b"/sfs/".as_slice(), b"/sfs/apps/".as_slice()] {
+            let total = prefix.len() + name.len() + suffix.len();
+            if total >= path.len() {
+                continue;
+            }
+            path[..prefix.len()].copy_from_slice(prefix);
+            path[prefix.len()..prefix.len() + name.len()].copy_from_slice(name.as_bytes());
+            path[prefix.len() + name.len()..total].copy_from_slice(suffix);
+            if let Ok(text) = core::str::from_utf8(&path[..total]) {
+                if let Some(cap_id) = syscall::spawn_linux_path(text) {
+                    run_spawned(cap_id, false);
+                    return;
+                }
+            }
+        }
+    }
+    syscall::print("linuxstart: no such app '");
+    syscall::print(name);
+    syscall::print("'\r\n");
+}
+
 fn run_linux_elf(path: &str) {
     run_elf_with(path, syscall::spawn_linux_path, false);
 }
@@ -844,6 +881,10 @@ fn run_elf_with(path: &str, spawn: fn(&str) -> Option<u64>, assign_console: bool
         syscall::print("'\r\n");
         return;
     };
+    run_spawned(cap_id, assign_console);
+}
+
+fn run_spawned(cap_id: u64, assign_console: bool) {
     if assign_console && !syscall::console_set(cap_id) {
         syscall::print("run: could not assign the foreground console.\r\n");
         let _ = syscall::kill(cap_id);
