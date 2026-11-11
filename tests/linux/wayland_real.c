@@ -323,6 +323,22 @@ static int is_surface(unsigned id) {
 static unsigned popup_xdg_surface_id;
 static unsigned popup_id;
 static unsigned positioner_id;
+/* Phosh-required globals: idle notifications, output power and phoc's
+ * layer-shell effects. The effects are cosmetic here, but the requests must
+ * be parsed so the client stream stays in sync. */
+static unsigned idle_notifier_id;
+static unsigned idle_notification_id;
+static unsigned output_power_manager_id;
+static unsigned output_power_id;
+static unsigned layer_effects_id;
+static unsigned draggable_id;
+static unsigned alpha_id;
+static unsigned stacked_id;
+static unsigned foreign_toplevel_manager_id;
+static unsigned gamma_manager_id;
+static unsigned gamma_control_id;
+static unsigned output_manager_id;
+static unsigned output_config_id;
 static int popup_grab;
 static int popup_committed;
 static unsigned pool_id;
@@ -403,6 +419,19 @@ typedef struct {
     unsigned popup_xdg_surface_id;
     unsigned popup_id;
     unsigned positioner_id;
+    unsigned idle_notifier_id;
+    unsigned idle_notification_id;
+    unsigned output_power_manager_id;
+    unsigned output_power_id;
+    unsigned layer_effects_id;
+    unsigned draggable_id;
+    unsigned alpha_id;
+    unsigned stacked_id;
+    unsigned foreign_toplevel_manager_id;
+    unsigned gamma_manager_id;
+    unsigned gamma_control_id;
+    unsigned output_manager_id;
+    unsigned output_config_id;
     int popup_grab;
     int popup_committed;
     unsigned pool_id;
@@ -441,6 +470,11 @@ typedef struct {
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
     X(configure_serial) X(surface_id) X(toplevel_surface_id) X(popup_surface_id) \
     X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
+    X(idle_notifier_id) X(idle_notification_id) \
+    X(output_power_manager_id) X(output_power_id) \
+    X(layer_effects_id) X(draggable_id) X(alpha_id) X(stacked_id) \
+    X(foreign_toplevel_manager_id) X(gamma_manager_id) X(gamma_control_id) \
+    X(output_manager_id) X(output_config_id) \
     X(popup_grab) X(popup_committed) X(pool_id) X(buffer_id) X(frame_id) \
     X(pool_fd) X(verified) X(commits) X(focused) X(surface_entered) \
     X(data_mime_count) X(selection_changed) X(wants_offer)
@@ -753,6 +787,17 @@ static int serve(long client) {
                             "zwp_text_input_manager_v3");
                 send_global_version(client, registry_id, 17,
                                     "zwlr_layer_shell_v1", 4);
+                send_global(client, registry_id, 18, "ext_idle_notifier_v1");
+                send_global(client, registry_id, 19,
+                            "zwlr_output_power_manager_v1");
+                send_global_version(client, registry_id, 20,
+                                    "zphoc_layer_shell_effects_v1", 3);
+                send_global_version(client, registry_id, 21,
+                                    "zwlr_foreign_toplevel_manager_v1", 3);
+                send_global(client, registry_id, 22,
+                            "zwlr_gamma_control_manager_v1");
+                send_global_version(client, registry_id, 23,
+                                    "zwlr_output_manager_v1", 2);
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -845,6 +890,22 @@ static int serve(long client) {
                     begin(presentation_id, 0 /* clock_id */);
                     put_u32(1); /* CLOCK_MONOTONIC */
                     finish(); send_message(client, -1);
+                } else if (text_equal(interface, "ext_idle_notifier_v1")) {
+                    idle_notifier_id = new_id;
+                } else if (text_equal(interface,
+                                      "zwlr_output_power_manager_v1")) {
+                    output_power_manager_id = new_id;
+                } else if (text_equal(interface,
+                                      "zphoc_layer_shell_effects_v1")) {
+                    layer_effects_id = new_id;
+                } else if (text_equal(interface,
+                                      "zwlr_foreign_toplevel_manager_v1")) {
+                    foreign_toplevel_manager_id = new_id;
+                } else if (text_equal(interface,
+                                      "zwlr_gamma_control_manager_v1")) {
+                    gamma_manager_id = new_id;
+                } else if (text_equal(interface, "zwlr_output_manager_v1")) {
+                    output_manager_id = new_id;
                 }
             } else if (object == text_input_manager_id && opcode == 1) {
                 text_input_id = take_u32(); /* get_text_input */
@@ -1205,6 +1266,110 @@ static int serve(long client) {
                 layer_configured = 0;
             } else if (object == layer_surface_id && opcode == 8) {
                 layer_layer = take_u32();
+            } else if (object == idle_notifier_id && opcode == 1) {
+                /* ext_idle_notifier_v1.get_idle_notification */
+                idle_notification_id = take_u32();
+                (void)take_u32(); /* seat */
+                (void)take_u32(); /* timeout ms */
+                begin(idle_notification_id, 1 /* resumed */);
+                finish(); send_message(client, -1);
+            } else if (object == idle_notifier_id && opcode == 2) {
+                /* get_input_idle_notification */
+                idle_notification_id = take_u32();
+                (void)take_u32();
+                (void)take_u32();
+                begin(idle_notification_id, 1 /* resumed */);
+                finish(); send_message(client, -1);
+            } else if (object == idle_notifier_id && opcode == 0) {
+                idle_notifier_id = 0;
+            } else if (object == idle_notification_id && opcode == 0) {
+                idle_notification_id = 0;
+            } else if (object == output_power_manager_id && opcode == 0) {
+                /* zwlr_output_power_manager_v1.get_output_power */
+                output_power_id = take_u32();
+                (void)take_u32(); /* output */
+                begin(output_power_id, 0 /* mode */);
+                put_u32(1); /* on */
+                finish(); send_message(client, -1);
+            } else if (object == output_power_manager_id && opcode == 1) {
+                output_power_manager_id = 0;
+            } else if (object == output_power_id && opcode == 0) {
+                unsigned mode = take_u32();
+                begin(output_power_id, 0 /* mode */);
+                put_u32(mode);
+                finish(); send_message(client, -1);
+            } else if (object == output_power_id && opcode == 1) {
+                output_power_id = 0;
+            } else if (object == layer_effects_id && opcode == 0) {
+                /* zphoc_layer_shell_effects_v1.get_draggable_layer_surface */
+                draggable_id = take_u32();
+                (void)take_u32();
+            } else if (object == layer_effects_id && opcode == 1) {
+                layer_effects_id = 0;
+            } else if (object == layer_effects_id && opcode == 2) {
+                /* get_alpha_layer_surface */
+                alpha_id = take_u32();
+                (void)take_u32();
+            } else if (object == layer_effects_id && opcode == 3) {
+                /* get_stacked_layer_surface */
+                stacked_id = take_u32();
+                (void)take_u32();
+            } else if (object == draggable_id && opcode <= 5) {
+                /* set_margins(2) / threshold / exclusive / mode / handle / state */
+                unsigned count = opcode == 0 ? 2u : 1u;
+                for (unsigned i = 0; i < count; i++) (void)take_u32();
+            } else if (object == draggable_id && opcode == 6) {
+                draggable_id = 0;
+            } else if (object == alpha_id && opcode == 0) {
+                (void)take_u32(); /* alpha */
+            } else if (object == alpha_id && opcode == 1) {
+                alpha_id = 0;
+            } else if (object == stacked_id && opcode <= 1) {
+                (void)take_u32(); /* layer surface */
+            } else if (object == stacked_id && opcode == 2) {
+                stacked_id = 0;
+            } else if (object == foreign_toplevel_manager_id && opcode == 0) {
+                foreign_toplevel_manager_id = 0;
+    gamma_manager_id = 0;
+    gamma_control_id = 0;
+    output_manager_id = 0;
+    output_config_id = 0;
+            } else if (object == gamma_manager_id && opcode == 0) {
+                /* get_gamma_control(new_id, output) */
+                gamma_control_id = take_u32();
+                (void)take_u32();
+                begin(gamma_control_id, 0 /* gamma_size */);
+                put_u32(256);
+                finish(); send_message(client, -1);
+            } else if (object == gamma_manager_id && opcode == 1) {
+                gamma_manager_id = 0;
+            } else if (object == gamma_control_id && opcode == 0) {
+                /* set_gamma(fd): consume and close the passed descriptor */
+                if (incoming_fd >= 0) {
+                    sys3(57, incoming_fd, 0, 0);
+                    incoming_fd = -1;
+                }
+            } else if (object == gamma_control_id && opcode == 1) {
+                gamma_control_id = 0;
+            } else if (object == output_manager_id && opcode == 0) {
+                /* create_configuration(new_id, serial) */
+                output_config_id = take_u32();
+                (void)take_u32();
+            } else if (object == output_manager_id && opcode == 1) {
+                output_manager_id = 0;
+            } else if (object == output_config_id && opcode == 0) {
+                /* enable_head(new_id, head) */
+                (void)take_u32();
+                (void)take_u32();
+            } else if (object == output_config_id && opcode == 1) {
+                (void)take_u32(); /* disable_head */
+            } else if (object == output_config_id && (opcode == 2 || opcode == 3)) {
+                /* apply / test: report success and finish the config */
+                begin(output_config_id, 0 /* succeeded */);
+                finish(); send_message(client, -1);
+                if (opcode == 2) output_config_id = 0;
+            } else if (object == output_config_id && opcode == 4) {
+                output_config_id = 0;
             } else if (is_surface(object) && opcode == 0) {
                 /* wl_surface.destroy: drop focus with leave events. */
                 surface_ids[object] = 0;
@@ -1623,6 +1788,15 @@ static void reset_client(void) {
     toplevel_surface_id = 0;
     popup_surface_id = 0;
     popup_xdg_surface_id = 0;
+    idle_notifier_id = 0;
+    idle_notification_id = 0;
+    output_power_manager_id = 0;
+    output_power_id = 0;
+    layer_effects_id = 0;
+    draggable_id = 0;
+    alpha_id = 0;
+    stacked_id = 0;
+    foreign_toplevel_manager_id = 0;
     popup_id = 0;
     positioner_id = 0;
     popup_grab = 0;
@@ -1678,6 +1852,8 @@ void _start(void) {
         static const char *argv[] = {"/sfs/wlclient", "layer", 0};
 #elif defined(SERVE_GTK4)
         static const char *argv[] = {"/sfs/gtk4hello", 0};
+#elif defined(SERVE_PHOSH)
+        static const char *argv[] = {"/sfs/phosh", 0};
 #else
         static const char *argv[] = {"/sfs/gtkdemo", 0};
 #endif
@@ -1694,6 +1870,9 @@ void _start(void) {
             "XDG_DATA_DIRS=/sfs/share:/sfs/usr/share",
             "GSK_RENDERER=cairo",
             "GTK_A11Y=none",
+            "XDG_CURRENT_DESKTOP=Phosh",
+            "XDG_SESSION_TYPE=wayland",
+            "XDG_SESSION_DESKTOP=phosh",
             0,
         };
         sys6(221 /* execve */, (long)argv[0], (long)argv, (long)envp, 0, 0, 0);

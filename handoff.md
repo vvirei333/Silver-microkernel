@@ -4077,3 +4077,115 @@ Phosh: it needs GTK4 + libadwaita + gtk4-layer-shell in a dedicated image
 GTK4 image has ~101 MiB free). The compositor now supports the layer-shell
 handshake and xdg toplevels; the remaining work is the image, then the
 Phosh process tree.
+
+## 2026-11-11 — Phosh: from "lacks globals" to the gdk-pixbuf icon loader
+
+State after the FP/SIMD fix (`d26d01e`) and the xdg role fix (`0896c41`).
+
+### Phosh image
+
+`~/phosh-state/disk_phosh.img` (256 MiB) is a copy of `disk_gtk3.img` plus:
+
+- `/sfs/phosh` (from the Arch ARM `phosh` 0.57.0 package; interpreter rewritten
+  to `/sfs/ld-linux-aarch64.so.1`, rpath `/sfs`),
+- the DT_NEEDED closure of `phosh`: 41 packages, ~42 MiB of new libraries
+  (`libhandy`, `libgnome-desktop-3`, `libgnome-bluetooth-3`, `libgcr`,
+  `libappstream`, `libpulse`, `libnm`, `libmm-glib`, `libsecret`,
+  `libupower-glib`, `libpolkit`, `libfeedback`, `libcallaudio`, …),
+- phosh's `share/` data (schemas, icons, applications; locale and >27-byte
+  names skipped — the SFS name limit is 27 bytes) and a merged
+  `gschemas.compiled`,
+- `glycin-image-rs` copied to `share/glycin-loaders/2+/` (see below),
+- `/sfs/phosh-serve`, the compositor built from `wayland_real.c` with
+  `-DSERVE_ONLY -DSERVE_PHOSH` (it execs `/sfs/phosh`).
+
+Reproduce with `tools/build_phosh_image.py` after staging the packages into
+`/tmp/alarm` (aarch64 pacman: `RootDir=~/phosh-state/gtk4-root`,
+`DBPath=/tmp/alarm/db`, `mirror.archlinuxarm.org`; the GTK4 closure is
+`~/phosh-state/gtk4-root`). `/tmp` does not survive a reboot, so the staging
+root must be recreated.
+
+### Compositor globals Phosh requires
+
+`phosh-wayland.c` hard-requires `wl_output`, `zwlr_layer_shell_v1`,
+`ext_idle_notifier_v1`, `xdg_wm_base`, `zxdg_output_manager_v1`,
+`zwlr_output_power_manager_v1` and `zphoc_layer_shell_effects_v1`; the
+monitor manager additionally calls `zwlr_output_manager_v1_add_listener`
+unconditionally. `wayland_real.c` now advertises and parses all of them:
+
+- `ext_idle_notifier_v1` (get_idle/get_input_idle_notification, replies
+  `resumed`), `zwlr_output_power_manager_v1` (replies `mode(on)`),
+  `zphoc_layer_shell_effects_v1` v3 (draggable/alpha/stacked requests are
+  parsed and ignored), `zwlr_foreign_toplevel_manager_v1` (stop),
+  `zwlr_gamma_control_manager_v1` (get_gamma_control replies `gamma_size(256)`,
+  `set_gamma` closes the passed fd), `zwlr_output_manager_v1` (configuration
+  requests are parsed, apply/test reply `succeeded`).
+- New per-client state: `foreign_toplevel_manager_id`, `gamma_manager_id`,
+  `gamma_control_id`, `output_manager_id`, `output_config_id`,
+  `idle_notifier_id`, `idle_notification_id`, `output_power_manager_id`,
+  `output_power_id`, `layer_effects_id`, `draggable_id`, `alpha_id`,
+  `stacked_id`. Keep new fields in `CLIENT_SCALARS`, otherwise a second
+  client inherits the first client's object ids (this already bit us once).
+
+Debugging technique that found each NULL: run with `WAYLAND_DEBUG=1`, take the
+faulting ELR from the kernel log, subtract the library base from the
+`LINUX: fmap` lines, and inspect the GOT relocation of the interface pointer
+(`readelf -r`); the interface name tells which proxy was NULL.
+
+### Kernel: memfd shadow removed
+
+A 64 MiB `ftruncate` (pulseaudio's mempool) used to allocate a full shadow
+copy in the 32 MiB kernel heap and panic (`ALLOCATION ERROR`). `MemFdState`
+now has an explicit `len`; memfds above `MEMFD_SHADOW_LIMIT` (1 MiB) are
+frame-backed and `data` is dropped. Small memfds keep the heap shadow.
+`read`/`write`/`pread`/`pwrite`/`truncate`/`seek`/`stat` use `len`. The
+64 MiB memfd now fails with ENOMEM from the contiguous frame allocator
+(non-fatal: pulse is not present anyway).
+
+### Where Phosh stops now
+
+Phosh starts, creates its shell, top panel, monitor and heads, then aborts in
+GTK icon loading:
+
+```
+Gtk:ERROR: gtkiconhelper.c:495: ensure_surface_for_gicon: assertion failed
+(error == NULL): Failed to load /org/gtk/libgtk/icons/32x32/status/image-missing.png:
+Unrecognized image file format
+```
+
+`pixbuftest` fails the same way (`Couldn't recognize the image file format`),
+while `glycintest` decodes the same PNG (`glycin ok 64x64`). gdk-pixbuf is
+built with glycin (Arch 2.44.8: `libgdk_pixbuf` NEEDS `libglycin-2.so.0`), and
+the glycin *loader binaries* were at `usr/lib/glycin-loaders/2+` but the
+library searches `$XDG_DATA_DIRS/glycin-loaders/2+` (`/sfs/share/...`), which
+only had `conf.d/`. The last change copies `glycin-image-rs[.real]` into
+`share/glycin-loaders/2+/` and adds
+`GLYCIN_DISABLE_SANDBOX=i-know-the-risks` to the Phosh environment (the
+sandbox needs namespaces bwrap cannot create here; `glycintest` used the same
+switch). **That run was interrupted before its result was captured** — the
+next step is to re-run `linuxrun /sfs/phosh-serve` and check whether the icon
+assertion is gone.
+
+Non-fatal noise seen before the abort (useful when reading logs):
+
+- `Failed to read /etc/glib-2.0/settings/*` — no native `/etc`; GSettings
+  falls back to defaults.
+- `ftruncate() failed: Cannot allocate memory`, `/tmp/pulse: Function not
+  implemented`, `Gvc-WARNING: Failed to connect context` — no pulseaudio.
+- `Missing phosh_private protocol extension` — keyboard grab/OSK features
+  disabled; add a `phosh_private` stub later if needed.
+- `phosh_osk_manager ... assertion 'self->proxy' failed` — no D-Bus/machine-id.
+- `PolKit ... No session for pid` — no logind.
+- `Gtk-WARNING ... pixbuf loaders or mime database could not be found` — the
+  same gdk-pixbuf issue.
+
+### Next steps
+
+1. Re-run `linuxrun /sfs/phosh-serve`; if the icon assertion persists, verify
+   the glycin loader search path (try `XDG_DATA_DIRS=/sfs/share:/sfs/usr/share`
+   with the loaders also in `share/glycin-loaders/2+`), or provide a
+   `loaders.cache` for gdk-pixbuf.
+2. Once the shell renders, capture the WIN1 frame with
+   `build/window-viewer/werewolf-window --snapshot`.
+3. Then: multi-client compositing, host input injection, OSK, and the
+   remaining Phosh session pieces (D-Bus, machine-id).

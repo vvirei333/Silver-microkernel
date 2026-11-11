@@ -46,7 +46,12 @@ struct MemFdFrames {
 /// Shared state of one `memfd_create` file. The offset lives in the shared
 /// object, so `dup` shares it exactly like a real file description.
 pub struct MemFdState {
+    /// Kernel-heap shadow for small memfds. Large memfds are backed by
+    /// `frames` and this is empty: keeping a full second copy of a 64 MiB
+    /// Wayland shm pool exhausted the 32 MiB kernel heap and panicked.
     data: Vec<u8>,
+    /// File size, independent of whether `data` still holds a copy.
+    len: usize,
     offset: usize,
     /// Populated by the first writable `MAP_SHARED` mapping. While present,
     /// file I/O goes through these frames so mappings and `read`/`write` see
@@ -60,30 +65,29 @@ pub struct MemFdState {
     seals: u32,
 }
 
+/// Memfds up to this size keep a heap shadow; larger ones are frame-backed
+/// from the first write/truncate so the kernel heap stays bounded.
+const MEMFD_SHADOW_LIMIT: usize = 1 << 20;
+
 impl MemFdState {
     fn len(&self) -> usize {
-        self.data.len()
+        self.len
     }
 
     /// Ensures a physical run covers `needed` bytes. Grows only when no
     /// mapping exists, because a resize would move frames out from under an
     /// existing PTE.
     fn ensure_frames(&mut self, needed: usize) -> Result<(), u64> {
-        let needed = needed.max(self.data.len());
+        let needed = needed.max(self.len);
         let page_count = needed.div_ceil(crate::memory::PAGE_SIZE).max(1);
-        let capacity = self
-            .frames
-            .as_ref()
-            .map(|frames| frames.page_count * crate::memory::PAGE_SIZE)
-            .unwrap_or(0);
-        if self.frames.is_some() && capacity >= needed {
-            if self.data.len() < needed {
-                self.data.resize(needed, 0);
+        if let Some(frames) = &self.frames {
+            if frames.page_count * crate::memory::PAGE_SIZE >= needed {
+                self.len = needed;
+                return Ok(());
             }
-            return Ok(());
-        }
-        if self.frames.is_some() && self.maps != 0 {
-            return Err(ENOMEM);
+            if self.maps != 0 {
+                return Err(ENOMEM);
+            }
         }
         let Some((physical_start, generation)) =
             crate::frame_allocator::alloc_user_contiguous_pages_tagged(page_count)
@@ -108,9 +112,9 @@ impl MemFdState {
             page_count,
             generation,
         });
-        if self.data.len() < needed {
-            self.data.resize(needed, 0);
-        }
+        // The frames are now the single copy of the content.
+        self.data = Vec::new();
+        self.len = needed;
         Ok(())
     }
 }
@@ -722,6 +726,7 @@ pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize
                 let bytes = unsafe { core::slice::from_raw_parts(source as *const u8, count) };
                 buffer[..count].copy_from_slice(bytes);
             } else {
+                let count = count.min(file.data.len().saturating_sub(start));
                 buffer[..count].copy_from_slice(&file.data[start..start + count]);
             }
             Ok(count)
@@ -793,7 +798,7 @@ pub fn lseek(task: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, u64> {
             let base = match whence {
                 0 => 0,
                 1 => file.offset as i64,
-                2 => file.data.len() as i64,
+                2 => file.len() as i64,
                 _ => return Err(EINVAL),
             };
             let position = base.checked_add(offset).ok_or(EINVAL)?;
@@ -817,7 +822,10 @@ pub fn pwrite(task: u64, fd: u64, offset: u64, bytes: &[u8]) -> Result<usize, u6
     let mut file = state.lock();
     let start = offset as usize;
     let end = start.checked_add(bytes.len()).ok_or(EINVAL)?;
-    if file.frames.is_some() {
+    if file.frames.is_some() || end > MEMFD_SHADOW_LIMIT {
+        if file.frames.is_none() {
+            file.ensure_frames(end)?;
+        }
         let capacity = file
             .frames
             .as_ref()
@@ -843,8 +851,8 @@ pub fn pwrite(task: u64, fd: u64, offset: u64, bytes: &[u8]) -> Result<usize, u6
         }
         file.data[start..end].copy_from_slice(bytes);
     }
-    if end > file.data.len() {
-        file.data.resize(end, 0);
+    if end > file.len {
+        file.len = end;
     }
     Ok(bytes.len())
 }
@@ -887,7 +895,7 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
         Target::Pipe { .. } => write_stat(buffer, S_IFIFO | 0o600, 0, fd.max(1)),
         Target::EventFd { .. } => write_stat(buffer, S_IFREG | 0o600, 0, fd.max(1)),
         Target::MemFd(state) => {
-            let size = state.lock().data.len() as u64;
+            let size = state.lock().len() as u64;
             write_stat(buffer, S_IFREG | 0o600, size, fd.max(1))
         }
         Target::Socket { .. } | Target::Unbound { .. } | Target::Listener { .. } => {
@@ -997,6 +1005,7 @@ pub fn memfd(task: u64) -> Result<u64, u64> {
         task,
         Target::MemFd(Arc::new(Mutex::new(MemFdState {
             data: Vec::new(),
+            len: 0,
             offset: 0,
             frames: None,
             maps: 0,
@@ -1289,6 +1298,7 @@ fn memfd_read(
         let source = crate::memory::phys_to_virt(frames.physical_start + file.offset);
         unsafe { core::slice::from_raw_parts(source as *const u8, take) }.to_vec()
     } else {
+        let take = take.min(file.data.len().saturating_sub(file.offset));
         file.data[file.offset..file.offset + take].to_vec()
     };
     file.offset += take;
@@ -1308,9 +1318,12 @@ fn memfd_write(
     let mut file = state.lock();
     let start = file.offset;
     let end = start.checked_add(total).ok_or(EINVAL)?;
-    if file.frames.is_some() {
+    if file.frames.is_some() || end > MEMFD_SHADOW_LIMIT {
         // A live mapping fixes the run in place; growing it would move the
         // frames. Fail instead of silently writing into unmapped memory.
+        if file.frames.is_none() {
+            file.ensure_frames(end)?;
+        }
         let capacity = file
             .frames
             .as_ref()
@@ -1330,14 +1343,14 @@ fn memfd_write(
                 total,
             );
         }
-        if end > file.data.len() {
-            file.data.resize(end, 0);
-        }
     } else {
         if end > file.data.len() {
             file.data.resize(end, 0);
         }
         file.data[start..end].copy_from_slice(&bytes);
+    }
+    if end > file.len {
+        file.len = end;
     }
     file.offset = end;
     Ok(total as u64)
@@ -1351,22 +1364,25 @@ pub fn memfd_truncate(task: u64, fd: u64, length: usize) -> Result<(), u64> {
         return Err(EINVAL);
     };
     let mut file = state.lock();
-    if length > file.data.len() {
-        if file.frames.is_some() {
-            let capacity = file
-                .frames
-                .as_ref()
-                .map(|frames| frames.page_count * crate::memory::PAGE_SIZE)
-                .unwrap_or(0);
-            if length > capacity {
-                if file.maps != 0 {
-                    return Err(ENOMEM);
-                }
-                file.ensure_frames(length)?;
-            }
+    if file.frames.is_some() || length > MEMFD_SHADOW_LIMIT {
+        if file.frames.is_none() {
+            file.ensure_frames(length)?;
         }
+        let capacity = file
+            .frames
+            .as_ref()
+            .map(|frames| frames.page_count * crate::memory::PAGE_SIZE)
+            .unwrap_or(0);
+        if length > capacity {
+            if file.maps != 0 {
+                return Err(ENOMEM);
+            }
+            file.ensure_frames(length)?;
+        }
+    } else {
+        file.data.resize(length, 0);
     }
-    file.data.resize(length, 0);
+    file.len = length;
     Ok(())
 }
 
@@ -1402,7 +1418,7 @@ pub fn memfd_fallocate(task: u64, fd: u64, offset: usize, length: usize) -> Resu
     let Target::MemFd(state) = target else {
         return Err(EINVAL);
     };
-    let current = state.lock().data.len();
+    let current = state.lock().len();
     if needed > current {
         memfd_truncate(task, fd, needed)?;
     }
