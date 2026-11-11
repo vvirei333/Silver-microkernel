@@ -748,6 +748,11 @@ static unsigned pointer_y;
 /* Surface currently holding pointer/keyboard focus (0 = none). */
 static unsigned pointer_target;
 static unsigned keyboard_target;
+/* Implicit grab: after a button press every event goes to that surface until
+   the release, even when the pointer leaves its rectangle. Without it a drag
+   that starts on the top panel is cancelled as soon as it moves below the
+   panel's buffer. */
+static unsigned pointer_grab;
 #ifdef SERVE_ONLY
 static int frame_reported;
 #endif
@@ -846,6 +851,7 @@ typedef struct {
     unsigned pointer_y;
     unsigned pointer_target;
     unsigned keyboard_target;
+    unsigned pointer_grab;
     unsigned data_mime_count;
     char data_mimes[4][64];
     long fd;
@@ -894,7 +900,7 @@ typedef struct {
     X(popup_grab) X(popup_committed) X(pool_id) X(buffer_id) X(frame_id) \
     X(pool_fd) X(verified) X(commits) X(focused) X(surface_entered) \
     X(focus_surface) X(pointer_x) X(pointer_y) X(pointer_target) \
-    X(keyboard_target) \
+    X(keyboard_target) X(pointer_grab) \
     X(data_mime_count) X(selection_changed) X(wants_offer)
 
 #define MAX_CLIENTS 2
@@ -1366,6 +1372,18 @@ static void layer_compose(void) {
 }
 #endif
 
+/* wl_pointer version 5 groups events into frames: a client that binds v5
+ * waits for wl_pointer.frame before it applies motion/button/axis. Without it
+ * GTK buffered every gesture forever. */
+static void pointer_frame(long client) {
+    if (seat_version < 5 || pointer_id == 0) {
+        return;
+    }
+    begin(pointer_id, 5 /* frame */);
+    finish();
+    send_message(client, -1);
+}
+
 static void pointer_send_enter(long client, unsigned surface, int x, int y) {
     begin(pointer_id, 0 /* enter */);
     put_u32(configure_serial);
@@ -1374,6 +1392,7 @@ static void pointer_send_enter(long client, unsigned surface, int x, int y) {
     put_i32(y << 8);
     finish();
     send_message(client, -1);
+    pointer_frame(client);
 }
 
 static void pointer_send_leave(long client, unsigned surface) {
@@ -1382,6 +1401,7 @@ static void pointer_send_leave(long client, unsigned surface) {
     put_u32(surface);
     finish();
     send_message(client, -1);
+    pointer_frame(client);
 }
 
 static void pointer_send_motion(long client, int x, int y) {
@@ -1391,6 +1411,7 @@ static void pointer_send_motion(long client, int x, int y) {
     put_i32(y << 8);
     finish();
     send_message(client, -1);
+    pointer_frame(client);
 }
 
 /// Route the pointer at physical output (px, py) to the topmost layer surface
@@ -1400,9 +1421,12 @@ static void pointer_route(long client, unsigned px, unsigned py, int motion) {
     if (pointer_id == 0) {
         return;
     }
-    unsigned target = layer_hit_test(px, py);
+    unsigned target = pointer_grab;
     int local_x;
     int local_y;
+    if (target == 0) {
+        target = layer_hit_test(px, py);
+    }
     if (target != 0) {
         LayerEntry *entry = layer_entry_by_surface(target);
         int x = 0;
@@ -1507,6 +1531,9 @@ static void poll_input(long client) {
                    only sends moves while hovering). Route it first so the
                    button goes to the surface under the cursor. */
                 pointer_route(client, x, y, 0);
+                if (kind == INPUT_CLICK) {
+                    pointer_grab = pointer_target;
+                }
                 unsigned button = (value & 3) == 2 ? 0x112u : 0x110u;
                 begin(pointer_id, 3 /* button */);
                 put_u32(configure_serial);
@@ -1515,6 +1542,10 @@ static void poll_input(long client) {
                 put_u32(kind == INPUT_CLICK ? 1u : 0u);
                 finish();
                 send_message(client, -1);
+                pointer_frame(client);
+                if (kind == INPUT_RELEASE) {
+                    pointer_grab = 0;
+                }
             }
         } else if (kind == INPUT_KEY) {
             if (keyboard_id != 0) {
@@ -1535,6 +1566,7 @@ static void poll_input(long client) {
                 put_i32((int)value * 10 * 256);
                 finish();
                 send_message(client, -1);
+                pointer_frame(client);
             }
         }
         tail = (tail + 1) % INPUT_SLOTS;
@@ -1943,7 +1975,12 @@ static int serve(long client) {
                 unsigned id = take_u32();
                 region_add(id);
             } else if (region_find(object) != 0 && opcode == 0) {
-                /* wl_region.add(x, y, width, height) */
+                /* wl_region.destroy */
+                region_forget(object);
+            } else if (region_find(object) != 0 && opcode == 1) {
+                /* wl_region.add(x, y, width, height). wl_region has destroy=0,
+                   add=1, subtract=2; mixing them up dropped every rectangle
+                   and marked interactive surfaces as input-transparent. */
                 RegionSlot *region = region_find(object);
                 int x = (int)take_u32();
                 int y = (int)take_u32();
@@ -1961,14 +1998,12 @@ static int serve(long client) {
                     if (y + height > region->y1) region->y1 = y + height;
                 }
                 region->rects += 1;
-            } else if (region_find(object) != 0 && opcode == 1) {
+            } else if (region_find(object) != 0 && opcode == 2) {
                 /* wl_region.subtract: keep the outer box (conservative). */
                 (void)take_u32();
                 (void)take_u32();
                 (void)take_u32();
                 (void)take_u32();
-            } else if (region_find(object) != 0 && opcode == 2) {
-                region_forget(object);
             } else if (object == shell_id && opcode == 1) {
                 positioner_id = take_u32(); /* create_positioner */
             } else if (object == shell_id && opcode == 2) {
@@ -2888,6 +2923,7 @@ static void reset_client(void) {
     pointer_y = 100;
     pointer_target = 0;
     keyboard_target = 0;
+    pointer_grab = 0;
     selection_changed = 0;
     wants_offer = 0;
 }

@@ -694,12 +694,18 @@ static const struct wl_buffer_listener buffer_listener = {
     .release = buffer_release,
 };
 
+static void pointer_frame(void *data, struct wl_pointer *pointer) {
+    (void)data;
+    (void)pointer;
+}
+
 static const struct wl_pointer_listener pointer_listener = {
     .enter = pointer_enter,
     .leave = pointer_leave,
     .motion = pointer_motion,
     .button = pointer_button,
     .axis = pointer_axis,
+    .frame = pointer_frame,
 };
 
 static void seat_capabilities(void *data, struct wl_seat *s, uint32_t caps) {
@@ -935,12 +941,18 @@ static void hit_pointer_axis(void *data, struct wl_pointer *pointer,
     (void)data; (void)pointer; (void)time; (void)axis; (void)value;
 }
 
+static void hit_pointer_frame(void *data, struct wl_pointer *pointer) {
+    (void)data;
+    (void)pointer;
+}
+
 static const struct wl_pointer_listener hit_pointer_listener = {
     .enter = hit_pointer_enter,
     .leave = hit_pointer_leave,
     .motion = hit_pointer_motion,
     .button = hit_pointer_button,
     .axis = hit_pointer_axis,
+    .frame = hit_pointer_frame,
 };
 
 typedef struct {
@@ -1066,8 +1078,9 @@ static int run_hit(struct wl_display *display) {
         return 8;
     }
 
-    /* Keep dispatching while the host injects moves (~6 s). */
-    for (int tick = 0; tick < 600; tick++) {
+    /* Keep dispatching while the host injects moves. The guest is slow, so
+       the window is generous (~20 s). */
+    for (int tick = 0; tick < 2000; tick++) {
         if (wl_display_roundtrip(display) < 0) {
             return 8;
         }

@@ -4529,3 +4529,30 @@ home screen). The stacking change and deferred frame callbacks still need the
 a downward drag on the top panel does not open quick settings yet — the
 instrumented build showed the initial pointer enter but the drag never reached
 the panel, so hit-testing on that surface is still being checked.
+
+## 2026-11-11 — Input actually works: wl_region opcodes, frames, implicit grab
+
+Three bugs together kept every gesture from reaching Phosh:
+
+1. **`wl_region` opcodes were shifted.** The interface is `destroy=0`, `add=1`,
+   `subtract=2`; the compositor treated `add` as `subtract`, so every region
+   stayed empty and `set_input_region` marked interactive surfaces (the top
+   panel!) as input-transparent. With the correct opcodes the panel is hit
+   (`HIT 512 4 -> 62`) and the lockscreen swipe-up unlocks to the home screen.
+2. **No `wl_pointer.frame`.** The seat is advertised at version 5, where
+   pointer events are grouped into frames; GTK buffered gestures waiting for
+   the frame event.
+3. **No implicit grab.** While a button is held, events now stay on the surface
+   that received the press, even after the pointer leaves its rectangle.
+
+`wlclient` gained no-op `.frame` listeners (libwayland aborts on a received
+event whose listener is NULL) and the `layer-hit` window grew to ~20 s for the
+slow guest.
+
+Verified: `linux-wlreal`, `layer-serve`, `layer-hit` (`hit sequence=bcb`),
+222 host tests. Phosh: swipe up unlocks to the wallpaper home screen.
+
+Still open: pulling down the top panel does not open quick settings with a
+pointer drag, at any start position. Phosh is a phone shell and its QS reveal
+looks touch-only, so the next step is a `wl_touch` device (mouse drag -> touch
+down/motion/up/frame).
