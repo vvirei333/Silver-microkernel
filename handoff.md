@@ -4556,3 +4556,32 @@ Still open: pulling down the top panel does not open quick settings with a
 pointer drag, at any start position. Phosh is a phone shell and its QS reveal
 looks touch-only, so the next step is a `wl_touch` device (mouse drag -> touch
 down/motion/up/frame).
+
+## 2026-11-11 — A session bus for Phosh
+
+`SO_PEERCRED` was already implemented, so the missing pieces for D-Bus were:
+
+1. **No `/etc` in the root VFS.** `vfs::resolve` only normalizes, so the Linux
+   read allowlist rejected `/etc/passwd` with EACCES, and `getpwuid(0)` then
+   failed with ENOENT. `seed()` now creates `/etc` and seeds `passwd`, `group`,
+   `nsswitch.conf` and `hostname`; the Linux read allowlist also accepts `/etc`.
+2. **No `dbus-daemon` in the image.** It ships as `/sfs/dbus-daemon` (patched
+   interpreter, `libgcc_s` NEEDED removed) with a permissive
+   `/sfs/share/dbus-1/session.conf` listening on `unix:path=/tmp/dbus-session`.
+3. **The daemon could not find `libgcc_s.so.1`.** Its `libsystemd` has no
+   RUNPATH, so the loader fell back to `/lib`; the child now gets
+   `LD_LIBRARY_PATH=/sfs`.
+
+`phosh-serve` forks the daemon before Phosh and exports
+`DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session`.
+
+Phosh now connects: the errors changed from "Could not connect: Connection
+refused" to `org.freedesktop.DBus.Error.ServiceUnknown` for services that
+simply do not exist yet (logind, NetworkManager, the OSK service). polkit still
+reports "No session for pid 9" because there is no logind.
+
+`layer-hit` is now event driven (it stops after the three expected enters)
+because the guest clock runs fast and a tick budget is not a reliable timeout.
+
+Verified: 222 host tests, `linux-wlreal`, `layer-serve`, `layer-hit`; Phosh
+still paints the wallpaper and unlocks with a swipe up.

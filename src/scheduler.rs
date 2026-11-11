@@ -3016,8 +3016,11 @@ pub fn read_path_allowed(task: u64, path: &str) -> bool {
             // their runtime sockets and lock files there.
             #[cfg(feature = "linux-abi")]
             {
+                // `/etc` is seeded read-only at boot (passwd, group,
+                // nsswitch.conf); dbus-daemon needs it for its uid lookup.
                 task.personality == Personality::Linux
-                    && silver_microkernel::path_is_under(path, LINUX_SCRATCH_PREFIX)
+                    && (silver_microkernel::path_is_under(path, LINUX_SCRATCH_PREFIX)
+                        || silver_microkernel::path_is_under(path, "/etc"))
             }
             #[cfg(not(feature = "linux-abi"))]
             {

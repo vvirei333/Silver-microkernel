@@ -59,6 +59,22 @@ pub fn seed_apps() {
 
 /// Seeds the bootstrap files into the already-initialized VFS.
 pub fn seed() {
+    /* Linux programs resolve uids through /etc/passwd; dbus-daemon refuses to
+       serve a session bus without it. The image ships the same content under
+       /sfs/etc, but the Linux read allowlist only sees the root VFS. */
+    let _ = crate::vfs::mkdir("/", "/etc");
+    for (path, contents) in [
+        ("/etc/passwd", b"root:x:0:0:root:/tmp:/bin/sh\nuser:x:1000:1000:user:/tmp:/bin/sh\n".as_slice()),
+        ("/etc/group", b"root:x:0:\nuser:x:1000:\n".as_slice()),
+        ("/etc/nsswitch.conf", b"passwd: files\ngroup: files\nhosts: files\n".as_slice()),
+        ("/etc/hostname", b"werewolf\n".as_slice()),
+    ] {
+        if crate::vfs::seed_file("/", path, contents).is_err() {
+            crate::console::write_str("SEED: failed to seed ");
+            crate::console::write_str(path);
+            crate::console::write_str("\r\n");
+        }
+    }
     if crate::vfs::seed_file("/", "/bin/hello", HELLO_ELF).is_err() {
         crate::console::write_str("SEED: failed to seed /bin/hello\r\n");
     }

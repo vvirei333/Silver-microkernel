@@ -3090,6 +3090,28 @@ void _start(void) {
         }
     }
 
+    /* Session bus for Phosh: libfeedback, polkit, the OSK manager and logind
+       clients connect to it. /sfs/dbus-daemon ships with a permissive config;
+       LD_LIBRARY_PATH is needed because its libsystemd has no RUNPATH. */
+    long bus = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
+    if (bus == 0) {
+        static const char *bus_argv[] = {
+            "/sfs/dbus-daemon",
+            "--config-file=/sfs/share/dbus-1/session.conf",
+            "--nofork",
+            "--nopidfile",
+            0,
+        };
+        static const char *bus_envp[] = {
+            "PATH=/sfs",
+            "LD_LIBRARY_PATH=/sfs",
+            0,
+        };
+        sys6(221 /* execve */, (long)bus_argv[0], (long)bus_argv,
+             (long)bus_envp, 0, 0, 0);
+        sys3(93 /* exit */, 0, 0, 0);
+    }
+
     /* fontconfig only writes a cache into a directory that already exists */
     sys3(34 /* mkdirat */, -100, (long)"/tmp/fontcache", 0777);
     long child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
@@ -3121,6 +3143,7 @@ void _start(void) {
             "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share:/sfs/usr/share",
             "GSK_RENDERER=cairo",
             "GTK_A11Y=none",
+            "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session",
             "XDG_CURRENT_DESKTOP=Phosh",
             "XDG_SESSION_TYPE=wayland",
             "XDG_SESSION_DESKTOP=phosh",

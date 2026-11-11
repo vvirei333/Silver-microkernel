@@ -1078,9 +1078,10 @@ static int run_hit(struct wl_display *display) {
         return 8;
     }
 
-    /* Keep dispatching while the host injects moves. The guest is slow, so
-       the window is generous (~20 s). */
-    for (int tick = 0; tick < 2000; tick++) {
+    /* Keep dispatching until the three expected enters arrived. The guest
+       clock runs fast, so a tick count is not a reliable time budget; stop as
+       soon as the sequence is complete. */
+    for (int tick = 0; tick < 200000 && hit_count < 3; tick++) {
         if (wl_display_roundtrip(display) < 0) {
             return 8;
         }
