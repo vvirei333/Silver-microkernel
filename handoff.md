@@ -4644,3 +4644,23 @@ VIRTIO-GPU: BAR4 0x000000000000000C
 BAR4 is unassigned (`0x0C` = 64-bit memory BAR, address 0), so the driver must
 program a BAR address the way virtio-blk does. `--gpu` prefers the GL device
 with `-display egl-headless` and falls back to the 2D device.
+
+### virtio-gpu: control queue works
+
+`src/virtio_gpu.rs` now claims the device (relocating the 64-bit BAR4 into
+0x1020_0000), negotiates VIRTIO_F_VERSION_1, brings up the control queue
+(queue 0, 64 entries) and issues `GET_DISPLAY_INFO`. A `--gpu` boot prints:
+
+```text
+VIRTIO-GPU: device 4.0
+VIRTIO-GPU: display 0 1280x800
+```
+
+Two protocol details that cost a round trip each: the success code is
+`VIRTIO_GPU_RESP_OK_DISPLAY_INFO = 0x1101` (the response enum starts at
+0x1100), and `virtio_gpu_display_one` is `{ rect x,y,w,h; u32 enabled; u32
+flags; }` — 24 bytes with `enabled` *after* the rectangle.
+
+Next: `RESOURCE_CREATE_2D` + `ATTACH_BACKING` + `SET_SCANOUT` +
+`TRANSFER_TO_HOST_2D`/`RESOURCE_FLUSH` so the compositor can present through
+the GPU instead of the ivshmem blit, then a DRM device and the virgl context.
