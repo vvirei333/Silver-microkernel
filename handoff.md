@@ -4585,3 +4585,13 @@ because the guest clock runs fast and a tick budget is not a reliable timeout.
 
 Verified: 222 host tests, `linux-wlreal`, `layer-serve`, `layer-hit`; Phosh
 still paints the wallpaper and unlocks with a swipe up.
+
+## 2026-11-11 — Frame clock ticks without a commit
+
+GTK requests `wl_surface.frame` and waits for `done` before running its tick
+callbacks. Completing the callback only on the surface's next commit stalled
+every animation that had nothing new to draw — the top panel never finished
+unfolding, so quick settings stayed off-screen. Pending callbacks are now also
+flushed on the 20 ms idle timeout, which acts as a ~50 Hz vblank.
+
+Verified: 222 host tests, `linux-wlreal`, `layer-serve`, `layer-hit`.

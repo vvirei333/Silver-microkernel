@@ -1585,6 +1585,17 @@ static int serve(long client) {
     } while (count == -2 && incoming_pending != 0);
     if (count == -2) {
         poll_input(client);
+        /* Frame clock tick. GTK requests wl_surface.frame and waits for the
+           done event before running its tick callbacks; completing it only on
+           commit stalled every animation that had nothing new to draw (the
+           top panel never finished unfolding). Flushing on the idle timeout
+           acts as a ~50 Hz vblank. */
+        for (unsigned index = 0; index < SURFACE_IDS; index++) {
+            if (frame_ids[index] != 0) {
+                send_done(client, frame_ids[index], now_ms());
+                frame_ids[index] = 0;
+            }
+        }
         return 0; /* input serviced, no client message */
     }
     if (count == 0) {
