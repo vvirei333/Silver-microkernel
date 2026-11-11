@@ -261,7 +261,7 @@ static void xdg_output_position(void *data, struct zxdg_output_v1 *output,
 static void xdg_output_size(void *data, struct zxdg_output_v1 *output,
                             int32_t width, int32_t height) {
     (void)data; (void)output;
-    if (width == 1024 && height == 768) {
+    if (width == 512 && height == 384) {
         xdg_output_ok = 1;
     }
 }
@@ -880,6 +880,210 @@ static int run_layer_only(struct wl_display *display) {
     return 0;
 }
 
+/* ---------------------------------------------------------------- hit test */
+/* Three stacked layer surfaces check that pointer routing follows layer
+ * order, position and wl_surface input regions:
+ *
+ *   a  TOP     400x300 at the top-left, with an EMPTY input region
+ *   c  OVERLAY 200x200 at the bottom-right
+ *   b  BOTTOM  1024x768 (full screen)
+ *
+ * The compositor sends the first enter at output (200,100) physical, which is
+ * inside `a`; because `a` has an empty input region the enter must land on
+ * `b`. A host move to (900,700) must then hit `c`, and (500,400) must return
+ * to `b`, so the expected enter sequence is "bcb".
+ */
+static struct wl_surface *hit_surfaces[3];
+static char hit_log[32];
+static unsigned hit_count;
+
+static void hit_pointer_enter(void *data, struct wl_pointer *pointer,
+                              uint32_t serial, struct wl_surface *surface,
+                              wl_fixed_t sx, wl_fixed_t sy) {
+    (void)data; (void)pointer; (void)serial; (void)sx; (void)sy;
+    char letter = '?';
+    if (surface == hit_surfaces[0]) letter = 'a';
+    else if (surface == hit_surfaces[1]) letter = 'b';
+    else if (surface == hit_surfaces[2]) letter = 'c';
+    if (hit_count + 2 < sizeof(hit_log)) {
+        hit_log[hit_count++] = letter;
+        hit_log[hit_count] = 0;
+    }
+    printf("hit enter %c\n", letter);
+    fflush(stdout);
+}
+
+static void hit_pointer_leave(void *data, struct wl_pointer *pointer,
+                              uint32_t serial, struct wl_surface *surface) {
+    (void)data; (void)pointer; (void)serial; (void)surface;
+}
+
+static void hit_pointer_motion(void *data, struct wl_pointer *pointer,
+                               uint32_t time, wl_fixed_t sx, wl_fixed_t sy) {
+    (void)data; (void)pointer; (void)time; (void)sx; (void)sy;
+}
+
+static void hit_pointer_button(void *data, struct wl_pointer *pointer,
+                               uint32_t serial, uint32_t time, uint32_t button,
+                               uint32_t state) {
+    (void)data; (void)pointer; (void)serial; (void)time; (void)button;
+    (void)state;
+}
+
+static void hit_pointer_axis(void *data, struct wl_pointer *pointer,
+                             uint32_t time, uint32_t axis, wl_fixed_t value) {
+    (void)data; (void)pointer; (void)time; (void)axis; (void)value;
+}
+
+static const struct wl_pointer_listener hit_pointer_listener = {
+    .enter = hit_pointer_enter,
+    .leave = hit_pointer_leave,
+    .motion = hit_pointer_motion,
+    .button = hit_pointer_button,
+    .axis = hit_pointer_axis,
+};
+
+typedef struct {
+    int configured;
+} HitLayer;
+
+static void hit_layer_configure(void *data,
+                                struct zwlr_layer_surface_v1 *surface,
+                                uint32_t serial, uint32_t width,
+                                uint32_t height) {
+    HitLayer *layer = data;
+    (void)width; (void)height;
+    layer->configured = 1;
+    zwlr_layer_surface_v1_ack_configure(surface, serial);
+}
+
+static void hit_layer_closed(void *data,
+                             struct zwlr_layer_surface_v1 *surface) {
+    (void)data; (void)surface;
+}
+
+static const struct zwlr_layer_surface_v1_listener hit_layer_listener = {
+    .configure = hit_layer_configure,
+    .closed = hit_layer_closed,
+};
+
+static struct wl_surface *hit_make_surface(struct wl_display *display,
+                                           int slot, uint32_t layer,
+                                           uint32_t anchor, uint32_t width,
+                                           uint32_t height,
+                                           uint32_t buffer_width,
+                                           uint32_t buffer_height,
+                                           uint32_t pixel, int empty_input) {
+    static HitLayer states[3];
+    struct wl_surface *surface = wl_compositor_create_surface(compositor);
+    if (surface == NULL) {
+        return NULL;
+    }
+    /* Record the surface before its first commit: the compositor may send the
+       pointer enter while this function is still round-tripping. */
+    hit_surfaces[slot] = surface;
+
+    struct zwlr_layer_surface_v1 *layer_surface =
+        zwlr_layer_shell_v1_get_layer_surface(layer_shell, surface, NULL, layer,
+                                              "hit");
+    if (layer_surface == NULL) {
+        return NULL;
+    }
+    HitLayer *state = &states[slot];
+    state->configured = 0;
+    zwlr_layer_surface_v1_add_listener(layer_surface, &hit_layer_listener,
+                                       state);
+    zwlr_layer_surface_v1_set_size(layer_surface, width, height);
+    zwlr_layer_surface_v1_set_anchor(layer_surface, anchor);
+    zwlr_layer_surface_v1_set_margin(layer_surface, 0, 0, 0, 0);
+    if (empty_input) {
+        struct wl_region *region = wl_compositor_create_region(compositor);
+        wl_surface_set_input_region(surface, region);
+        wl_region_destroy(region);
+    }
+    wl_surface_commit(surface);
+    for (int attempt = 0; attempt < 16 && !state->configured; attempt++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return NULL;
+        }
+    }
+    if (!state->configured) {
+        fprintf(stderr, "hit: layer configure missing\n");
+        return NULL;
+    }
+
+    size_t bytes = (size_t)buffer_width * buffer_height * 4;
+    int fd = memfd_create("hit", 0);
+    if (fd < 0 || ftruncate(fd, (off_t)bytes) < 0) {
+        return NULL;
+    }
+    unsigned *pixels = mmap(NULL, bytes, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    if (pixels == MAP_FAILED) {
+        return NULL;
+    }
+    for (size_t index = 0; index < (size_t)buffer_width * buffer_height; index++) {
+        pixels[index] = pixel;
+    }
+    struct wl_shm_pool *pool =
+        wl_shm_create_pool(shared_memory, fd, (int)bytes);
+    struct wl_buffer *buffer = wl_shm_pool_create_buffer(
+        pool, 0, buffer_width, buffer_height, buffer_width * 4,
+        WL_SHM_FORMAT_ARGB8888);
+    wl_surface_attach(surface, buffer, 0, 0);
+    wl_surface_damage(surface, 0, 0, buffer_width, buffer_height);
+    wl_surface_commit(surface);
+    return surface;
+}
+
+static int run_hit(struct wl_display *display) {
+    if (compositor == NULL || shared_memory == NULL || layer_shell == NULL ||
+        seat == NULL) {
+        fprintf(stderr, "hit: globals missing\n");
+        return 8;
+    }
+    struct wl_pointer *pointer = wl_seat_get_pointer(seat);
+    if (pointer == NULL) {
+        fprintf(stderr, "hit: pointer missing\n");
+        return 8;
+    }
+    wl_pointer_add_listener(pointer, &hit_pointer_listener, NULL);
+
+    if (hit_make_surface(display, 0, ZWLR_LAYER_SHELL_V1_LAYER_TOP,
+                         ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                             ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT,
+                         400, 300, 400, 300, 0xFFFF0000u, 1) == NULL ||
+        hit_make_surface(display, 2, ZWLR_LAYER_SHELL_V1_LAYER_OVERLAY,
+                         ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+                             ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
+                         200, 200, 200, 200, 0xFF00FF00u, 0) == NULL ||
+        hit_make_surface(display, 1, ZWLR_LAYER_SHELL_V1_LAYER_BOTTOM,
+                         ZWLR_LAYER_SURFACE_V1_ANCHOR_TOP |
+                             ZWLR_LAYER_SURFACE_V1_ANCHOR_BOTTOM |
+                             ZWLR_LAYER_SURFACE_V1_ANCHOR_LEFT |
+                             ZWLR_LAYER_SURFACE_V1_ANCHOR_RIGHT,
+                         512, 384, 1024, 768, 0xFF0000FFu, 0) == NULL) {
+        fprintf(stderr, "hit: surface setup failed\n");
+        return 8;
+    }
+
+    /* Keep dispatching while the host injects moves (~6 s). */
+    for (int tick = 0; tick < 600; tick++) {
+        if (wl_display_roundtrip(display) < 0) {
+            return 8;
+        }
+        usleep(10000);
+    }
+    printf("hit sequence=%s\n", hit_log);
+    fflush(stdout);
+    if (strstr(hit_log, "bcb") != NULL) {
+        printf("hit test ok\n");
+        fflush(stdout);
+        return 0;
+    }
+    fprintf(stderr, "hit: unexpected enter sequence '%s'\n", hit_log);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     int is_source = argc > 1 && strcmp(argv[1], "source") == 0;
     int is_receiver = argc > 1 && strcmp(argv[1], "receiver") == 0;
@@ -900,6 +1104,11 @@ int main(int argc, char **argv) {
     wl_registry_add_listener(registry, &registry_listener, NULL);
     if (wl_display_roundtrip(display) < 0) {
         return 4;
+    }
+    if (argc > 1 && strcmp(argv[1], "hit") == 0) {
+        int result = run_hit(display);
+        wl_display_disconnect(display);
+        return result;
     }
     if (compositor == NULL || shared_memory == NULL || shell == NULL) {
         fprintf(stderr, "wlclient: missing globals\n");

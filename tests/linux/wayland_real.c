@@ -329,6 +329,10 @@ static unsigned layer_height;
 static int layer_configured;
 static int layer_acked;
 #define MAX_LAYERS 16
+/* Logical output is 512x384 at wl_output.scale=2; every layer buffer is in
+ * physical pixels, so composition and hit-testing share one 1024x768 space. */
+#define OUT_WIDTH 1024u
+#define OUT_HEIGHT 768u
 typedef struct {
     int used;
     unsigned surface;
@@ -341,6 +345,10 @@ typedef struct {
     unsigned format;
     unsigned offset;
     int fd;
+    /* Creation order within the client. Within one layer the surface created
+       last is on top; commit frequency must not reorder the stack. */
+    unsigned seq;
+    unsigned keyboard_interactivity;
 } LayerEntry;
 static LayerEntry layer_entries[MAX_LAYERS];
 
@@ -359,8 +367,11 @@ typedef struct {
     int margin[4];
     int configured;
     int acked;
+    unsigned seq;
+    unsigned keyboard_interactivity;
 } LayerSurface;
 static LayerSurface layer_surfaces[MAX_LAYER_SURFACES];
+static unsigned layer_surface_seq;
 
 static LayerSurface *layer_surface_by_id(unsigned id) {
     if (id == 0) {
@@ -388,12 +399,14 @@ static LayerSurface *layer_surface_by_surface(unsigned surface) {
 
 static LayerSurface *layer_surface_add(unsigned id, unsigned surface) {
     LayerSurface *slot = layer_surface_by_id(id);
-    if (slot == 0) {
-        for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
-            if (!layer_surfaces[index].used) {
-                slot = &layer_surfaces[index];
-                break;
-            }
+    if (slot != 0) {
+        slot->surface = surface;
+        return slot;
+    }
+    for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
+        if (!layer_surfaces[index].used) {
+            slot = &layer_surfaces[index];
+            break;
         }
     }
     if (slot == 0) {
@@ -411,6 +424,8 @@ static LayerSurface *layer_surface_add(unsigned id, unsigned surface) {
     }
     slot->configured = 0;
     slot->acked = 0;
+    slot->keyboard_interactivity = 0;
+    slot->seq = ++layer_surface_seq;
     return slot;
 }
 static unsigned layer_anchor;
@@ -440,13 +455,66 @@ static unsigned popup_surface_id;
 #define SURFACE_IDS 256
 static unsigned char surface_ids[SURFACE_IDS];
 
+/* wl_region objects and the per-surface input region. A client marks
+ * decorative surfaces (panel shadows, backgrounds) with an empty input region;
+ * ignoring that made those surfaces swallow pointer events meant for the
+ * surface below them. Coordinates are surface-local logical units. */
+#define MAX_REGIONS 64
+typedef struct {
+    unsigned id;
+    unsigned rects;
+    int x0;
+    int y0;
+    int x1;
+    int y1;
+} RegionSlot;
+static RegionSlot regions[MAX_REGIONS];
+
+static RegionSlot *region_find(unsigned id) {
+    if (id == 0) {
+        return 0;
+    }
+    for (unsigned index = 0; index < MAX_REGIONS; index++) {
+        if (regions[index].id == id) {
+            return &regions[index];
+        }
+    }
+    return 0;
+}
+
+static RegionSlot *region_add(unsigned id) {
+    RegionSlot *slot = region_find(id);
+    if (slot != 0) {
+        slot->rects = 0;
+        slot->x0 = slot->y0 = slot->x1 = slot->y1 = 0;
+        return slot;
+    }
+    for (unsigned index = 0; index < MAX_REGIONS; index++) {
+        if (regions[index].id == 0) {
+            regions[index].id = id;
+            regions[index].rects = 0;
+            regions[index].x0 = regions[index].y0 = 0;
+            regions[index].x1 = regions[index].y1 = 0;
+            return &regions[index];
+        }
+    }
+    return 0;
+}
+
+static void region_forget(unsigned id) {
+    RegionSlot *slot = region_find(id);
+    if (slot != 0) {
+        slot->id = 0;
+    }
+}
+
 /* wl_shm pools and buffers. A toolkit creates several pools (one per window
  * or layer surface) and buffers on older pools, so a single `pool_id` /
  * `buffer_id` pair lost both the create_buffer arguments and the release
  * target. The tables are part of ClientState; the globals below are the
  * currently loaded client's copy. */
-#define MAX_POOLS 32
-#define MAX_BUFFERS 128
+#define MAX_POOLS 128
+#define MAX_BUFFERS 512
 typedef struct {
     unsigned id;
     int fd;
@@ -463,6 +531,10 @@ typedef struct {
 static PoolSlot pools[MAX_POOLS];
 static BufferSlot buffers[MAX_BUFFERS];
 static unsigned attached_buffers[SURFACE_IDS];
+/* 0 = no set_input_region (whole surface), 1 = region set (possibly empty). */
+static unsigned char surface_input_set[SURFACE_IDS];
+static unsigned char surface_input_empty[SURFACE_IDS];
+static int surface_input_box[SURFACE_IDS][4];
 
 static PoolSlot *pool_find(unsigned id) {
     if (id == 0) {
@@ -521,9 +593,18 @@ static BufferSlot *buffer_add(unsigned id) {
             return &buffers[index];
         }
     }
-    /* Full: recycle the oldest slot. */
-    buffers[0].id = id;
-    return &buffers[0];
+    /* A full table used to recycle slot 0, which silently handed a live
+       buffer another buffer's fd/geometry. Refuse the buffer instead: the
+       commit path then skips it rather than drawing the wrong pixels. */
+    return 0;
+}
+
+static void buffer_forget(unsigned id) {
+    BufferSlot *slot = buffer_find(id);
+    if (slot != 0) {
+        slot->id = 0;
+        slot->pool_fd = -1;
+    }
 }
 
 static void pools_reset(void) {
@@ -607,8 +688,9 @@ static unsigned screen_seq;
 static unsigned focus_surface;
 static unsigned pointer_x;
 static unsigned pointer_y;
-static int pointer_entered;
-static int keyboard_entered;
+/* Surface currently holding pointer/keyboard focus (0 = none). */
+static unsigned pointer_target;
+static unsigned keyboard_target;
 #ifdef SERVE_ONLY
 static int frame_reported;
 #endif
@@ -704,8 +786,8 @@ typedef struct {
     unsigned focus_surface;
     unsigned pointer_x;
     unsigned pointer_y;
-    int pointer_entered;
-    int keyboard_entered;
+    unsigned pointer_target;
+    unsigned keyboard_target;
     unsigned data_mime_count;
     char data_mimes[4][64];
     long fd;
@@ -716,6 +798,11 @@ typedef struct {
     PoolSlot pools[MAX_POOLS];
     BufferSlot buffers[MAX_BUFFERS];
     unsigned attached_buffers[SURFACE_IDS];
+    unsigned char surface_input_set[SURFACE_IDS];
+    unsigned char surface_input_empty[SURFACE_IDS];
+    int surface_input_box[SURFACE_IDS][4];
+    RegionSlot regions[MAX_REGIONS];
+    LayerEntry layer_entries[MAX_LAYERS];
     LayerSurface layer_surfaces[MAX_LAYER_SURFACES];
     unsigned shm_ids[MAX_SHM];
 } ClientState;
@@ -747,8 +834,8 @@ typedef struct {
     X(output_manager_id) X(output_config_id) \
     X(popup_grab) X(popup_committed) X(pool_id) X(buffer_id) X(frame_id) \
     X(pool_fd) X(verified) X(commits) X(focused) X(surface_entered) \
-    X(focus_surface) X(pointer_x) X(pointer_y) X(pointer_entered) \
-    X(keyboard_entered) \
+    X(focus_surface) X(pointer_x) X(pointer_y) X(pointer_target) \
+    X(keyboard_target) \
     X(data_mime_count) X(selection_changed) X(wants_offer)
 
 #define MAX_CLIENTS 2
@@ -780,6 +867,20 @@ static void load_client(ClientState *client) {
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         attached_buffers[index] = client->attached_buffers[index];
     }
+    for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        surface_input_set[index] = client->surface_input_set[index];
+        surface_input_empty[index] = client->surface_input_empty[index];
+        for (unsigned corner = 0; corner < 4; corner++) {
+            surface_input_box[index][corner] =
+                client->surface_input_box[index][corner];
+        }
+    }
+    for (unsigned index = 0; index < MAX_REGIONS; index++) {
+        regions[index] = client->regions[index];
+    }
+    for (unsigned index = 0; index < MAX_LAYERS; index++) {
+        layer_entries[index] = client->layer_entries[index];
+    }
     for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
         layer_surfaces[index] = client->layer_surfaces[index];
     }
@@ -801,6 +902,20 @@ static void save_client(ClientState *client) {
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         client->attached_buffers[index] = attached_buffers[index];
+    }
+    for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        client->surface_input_set[index] = surface_input_set[index];
+        client->surface_input_empty[index] = surface_input_empty[index];
+        for (unsigned corner = 0; corner < 4; corner++) {
+            client->surface_input_box[index][corner] =
+                surface_input_box[index][corner];
+        }
+    }
+    for (unsigned index = 0; index < MAX_REGIONS; index++) {
+        client->regions[index] = regions[index];
+    }
+    for (unsigned index = 0; index < MAX_LAYERS; index++) {
+        client->layer_entries[index] = layer_entries[index];
     }
     for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
         client->layer_surfaces[index] = layer_surfaces[index];
@@ -896,18 +1011,31 @@ static void send_decoration_mode(long client, unsigned mode) {
 
 
 
-static void layer_record_commit(void) {
-    if (layer_surface_surface == 0) {
-        return;
+static LayerEntry *layer_entry_by_surface(unsigned surface) {
+    if (surface == 0) {
+        return 0;
     }
-    LayerEntry *entry = 0;
     for (unsigned index = 0; index < MAX_LAYERS; index++) {
         if (layer_entries[index].used &&
-            layer_entries[index].surface == layer_surface_surface) {
-            entry = &layer_entries[index];
-            break;
+            layer_entries[index].surface == surface) {
+            return &layer_entries[index];
         }
     }
+    return 0;
+}
+
+static void layer_forget_surface(unsigned surface) {
+    LayerEntry *entry = layer_entry_by_surface(surface);
+    if (entry != 0) {
+        entry->used = 0;
+    }
+}
+
+static void layer_record_commit(LayerSurface *slot) {
+    if (slot == 0 || slot->surface == 0) {
+        return;
+    }
+    LayerEntry *entry = layer_entry_by_surface(slot->surface);
     if (entry == 0) {
         for (unsigned index = 0; index < MAX_LAYERS; index++) {
             if (!layer_entries[index].used) {
@@ -920,11 +1048,11 @@ static void layer_record_commit(void) {
         return;
     }
     entry->used = 1;
-    entry->surface = layer_surface_surface;
-    entry->layer = layer_layer;
-    entry->anchor = layer_anchor;
+    entry->surface = slot->surface;
+    entry->layer = slot->layer;
+    entry->anchor = slot->anchor;
     for (unsigned index = 0; index < 4; index++) {
-        entry->margin[index] = layer_margin[index];
+        entry->margin[index] = slot->margin[index];
     }
     entry->width = (unsigned)buffer_width;
     entry->height = (unsigned)buffer_height;
@@ -932,6 +1060,98 @@ static void layer_record_commit(void) {
     entry->format = buffer_format;
     entry->offset = buffer_offset;
     entry->fd = pool_fd;
+    entry->seq = slot->seq;
+    entry->keyboard_interactivity = slot->keyboard_interactivity;
+}
+
+/// Top-left corner of a layer surface in physical output coordinates. This is
+/// the same anchor arithmetic `layer_compose` uses, so input and pixels agree.
+static void layer_rect(const LayerEntry *entry, int *x, int *y) {
+    /* anchor bits: 1 top, 2 bottom, 4 left, 8 right */
+    if ((entry->anchor & 4) != 0 && (entry->anchor & 8) != 0) {
+        *x = entry->margin[3];
+    } else if ((entry->anchor & 8) != 0) {
+        *x = (int)OUT_WIDTH - (int)entry->width - entry->margin[1];
+    } else if ((entry->anchor & 4) != 0) {
+        *x = entry->margin[3];
+    } else {
+        *x = ((int)OUT_WIDTH - (int)entry->width) / 2;
+    }
+    if ((entry->anchor & 1) != 0 && (entry->anchor & 2) != 0) {
+        *y = entry->margin[0];
+    } else if ((entry->anchor & 2) != 0) {
+        *y = (int)OUT_HEIGHT - (int)entry->height - entry->margin[2];
+    } else if ((entry->anchor & 1) != 0) {
+        *y = entry->margin[0];
+    } else {
+        *y = ((int)OUT_HEIGHT - (int)entry->height) / 2;
+    }
+}
+
+/// Topmost layer surface under a physical output coordinate, or 0. Higher
+/// layer wins; within a layer the surface created last wins.
+static unsigned layer_hit_test(unsigned px, unsigned py) {
+    LayerEntry *best = 0;
+    for (unsigned index = 0; index < MAX_LAYERS; index++) {
+        LayerEntry *entry = &layer_entries[index];
+        if (!entry->used || entry->width == 0 || entry->height == 0 ||
+            entry->fd < 0) {
+            continue;
+        }
+        int x;
+        int y;
+        layer_rect(entry, &x, &y);
+        if ((int)px < x || (int)px >= x + (int)entry->width ||
+            (int)py < y || (int)py >= y + (int)entry->height) {
+            continue;
+        }
+        if (entry->surface < SURFACE_IDS && surface_input_set[entry->surface]) {
+            if (surface_input_empty[entry->surface]) {
+                continue;
+            }
+            /* The box is surface-local logical; the point is physical. */
+            const int *box = surface_input_box[entry->surface];
+            if ((int)px - x < box[0] * 2 || (int)px - x >= box[2] * 2 ||
+                (int)py - y < box[1] * 2 || (int)py - y >= box[3] * 2) {
+                continue;
+            }
+        }
+        if (best == 0 || entry->layer > best->layer ||
+            (entry->layer == best->layer && entry->seq > best->seq)) {
+            best = entry;
+        }
+    }
+    return best != 0 ? best->surface : 0;
+}
+
+/// Topmost layer surface that asked for keyboard focus. An exclusive
+/// (`keyboard_interactivity == 1`) surface wins regardless of the pointer;
+/// `2` (on-demand) counts only while the pointer is inside it.
+static unsigned keyboard_hit_test(void) {
+    LayerEntry *best = 0;
+    for (unsigned index = 0; index < MAX_LAYERS; index++) {
+        LayerEntry *entry = &layer_entries[index];
+        if (!entry->used || entry->width == 0 || entry->height == 0 ||
+            entry->keyboard_interactivity == 0) {
+            continue;
+        }
+        if (entry->keyboard_interactivity == 2) {
+            int x;
+            int y;
+            layer_rect(entry, &x, &y);
+            if ((int)pointer_x < x ||
+                (int)pointer_x >= x + (int)entry->width ||
+                (int)pointer_y < y ||
+                (int)pointer_y >= y + (int)entry->height) {
+                continue;
+            }
+        }
+        if (best == 0 || entry->layer > best->layer ||
+            (entry->layer == best->layer && entry->seq > best->seq)) {
+            best = entry;
+        }
+    }
+    return best != 0 ? best->surface : 0;
 }
 
 #ifdef SERVE_ONLY
@@ -939,8 +1159,8 @@ static void layer_compose(void) {
     if (screen == 0) {
         return;
     }
-    const unsigned out_width = 1024;
-    const unsigned out_height = 768;
+    const unsigned out_width = OUT_WIDTH;
+    const unsigned out_height = OUT_HEIGHT;
     unsigned *destination = (unsigned *)(screen + 0x1000);
     for (unsigned index = 0; index < out_width * out_height; index++) {
         destination[index] = 0xFF101014u;
@@ -961,25 +1181,7 @@ static void layer_compose(void) {
             }
             int x;
             int y;
-            /* anchor bits: 1 top, 2 bottom, 4 left, 8 right */
-            if ((entry->anchor & 4) != 0 && (entry->anchor & 8) != 0) {
-                x = entry->margin[3];
-            } else if ((entry->anchor & 8) != 0) {
-                x = (int)out_width - (int)entry->width - entry->margin[1];
-            } else if ((entry->anchor & 4) != 0) {
-                x = entry->margin[3];
-            } else {
-                x = ((int)out_width - (int)entry->width) / 2;
-            }
-            if ((entry->anchor & 1) != 0 && (entry->anchor & 2) != 0) {
-                y = entry->margin[0];
-            } else if ((entry->anchor & 2) != 0) {
-                y = (int)out_height - (int)entry->height - entry->margin[2];
-            } else if ((entry->anchor & 1) != 0) {
-                y = entry->margin[0];
-            } else {
-                y = ((int)out_height - (int)entry->height) / 2;
-            }
+            layer_rect(entry, &x, &y);
             const unsigned char *source =
                 (const unsigned char *)(mapped + entry->offset);
             for (unsigned row = 0; row < entry->height; row++) {
@@ -1016,7 +1218,7 @@ static void layer_compose(void) {
     *(volatile unsigned *)(screen + 0x0C) = out_height;
     *(volatile unsigned *)(screen + 0x10) = out_width * 4;
     *(volatile unsigned *)(screen + 0x14) = 1;
-    *(volatile unsigned *)(screen + 0x18) = 0;
+    *(volatile unsigned *)(screen + 0x18) = screen_seq * 2 + 1;
     *(volatile unsigned *)(screen + 0x2C) = 1;
     __asm__ volatile("dsb sy" ::: "memory");
     if (drawn != 0) {
@@ -1038,6 +1240,113 @@ static void layer_compose(void) {
 }
 #endif
 
+static void pointer_send_enter(long client, unsigned surface, int x, int y) {
+    begin(pointer_id, 0 /* enter */);
+    put_u32(configure_serial);
+    put_u32(surface);
+    put_i32(x << 8);
+    put_i32(y << 8);
+    finish();
+    send_message(client, -1);
+}
+
+static void pointer_send_leave(long client, unsigned surface) {
+    begin(pointer_id, 1 /* leave */);
+    put_u32(configure_serial);
+    put_u32(surface);
+    finish();
+    send_message(client, -1);
+}
+
+static void pointer_send_motion(long client, int x, int y) {
+    begin(pointer_id, 2 /* motion */);
+    put_u32(0); /* time */
+    put_i32(x << 8);
+    put_i32(y << 8);
+    finish();
+    send_message(client, -1);
+}
+
+/// Route the pointer at physical output (px, py) to the topmost layer surface
+/// under it, falling back to the focused toplevel. `motion` sends a motion
+/// event when the surface does not change.
+static void pointer_route(long client, unsigned px, unsigned py, int motion) {
+    if (pointer_id == 0) {
+        return;
+    }
+    unsigned target = layer_hit_test(px, py);
+    int local_x;
+    int local_y;
+    if (target != 0) {
+        LayerEntry *entry = layer_entry_by_surface(target);
+        int x = 0;
+        int y = 0;
+        if (entry != 0) {
+            layer_rect(entry, &x, &y);
+        }
+        local_x = ((int)px - x) / 2;
+        local_y = ((int)py - y) / 2;
+    } else {
+        /* Fall back to the xdg toplevel only when this client has no visible
+           layer surface at all; otherwise a miss means "no surface here". */
+        int any_layer = 0;
+        for (unsigned index = 0; index < MAX_LAYERS; index++) {
+            if (layer_entries[index].used && layer_entries[index].width != 0) {
+                any_layer = 1;
+                break;
+            }
+        }
+        if (any_layer) {
+            return;
+        }
+        target = focus_surface;
+        local_x = (int)px / 2;
+        local_y = (int)py / 2;
+    }
+    if (target == 0) {
+        return;
+    }
+    if (target != pointer_target) {
+        if (pointer_target != 0) {
+            pointer_send_leave(client, pointer_target);
+        }
+        pointer_send_enter(client, target, local_x, local_y);
+        pointer_target = target;
+    } else if (motion) {
+        pointer_send_motion(client, local_x, local_y);
+    }
+}
+
+/// Give keyboard focus to the topmost surface that asked for it. Phosh's
+/// lockscreen requests exclusive keyboard interactivity, so it wins over the
+/// background and panel even though those commit later.
+static void keyboard_route(long client) {
+    if (keyboard_id == 0) {
+        return;
+    }
+    unsigned target = keyboard_hit_test();
+    if (target == 0) {
+        target = focus_surface;
+    }
+    if (target == 0 || target == keyboard_target) {
+        return;
+    }
+    if (keyboard_target != 0) {
+        begin(keyboard_id, 2 /* leave */);
+        put_u32(configure_serial);
+        put_u32(keyboard_target);
+        finish();
+        send_message(client, -1);
+    }
+    begin(keyboard_id, 1 /* enter */);
+    put_u32(configure_serial);
+    put_u32(target);
+    put_u32(0); /* keys array, empty */
+    finish();
+    send_message(client, -1);
+    keyboard_target = target;
+}
+
 static void poll_input(long client) {
     if (screen == 0) {
         return;
@@ -1056,28 +1365,22 @@ static void poll_input(long client) {
         unsigned y = entry[6] | ((unsigned)entry[7] << 8);
         if (kind == INPUT_MOVE) {
             if (value == 1) {
-                if (pointer_id != 0 && pointer_entered) {
-                    begin(pointer_id, 1 /* leave */);
-                    put_u32(configure_serial);
-                    put_u32(focus_surface);
-                    finish();
-                    send_message(client, -1);
-                    pointer_entered = 0;
+                /* The host pointer left the window. */
+                if (pointer_id != 0 && pointer_target != 0) {
+                    pointer_send_leave(client, pointer_target);
+                    pointer_target = 0;
                 }
             } else {
                 pointer_x = x;
                 pointer_y = y;
-                if (pointer_id != 0 && pointer_entered) {
-                    begin(pointer_id, 2 /* motion */);
-                    put_u32(0); /* time */
-                    put_i32((int)(x >> 1) << 8);
-                    put_i32((int)(y >> 1) << 8);
-                    finish();
-                    send_message(client, -1);
-                }
+                pointer_route(client, x, y, 1);
             }
         } else if (kind == INPUT_CLICK || kind == INPUT_RELEASE) {
             if (pointer_id != 0) {
+                /* A click can arrive without a preceding motion (the viewer
+                   only sends moves while hovering). Route it first so the
+                   button goes to the surface under the cursor. */
+                pointer_route(client, x, y, 0);
                 unsigned button = (value & 3) == 2 ? 0x112u : 0x110u;
                 begin(pointer_id, 3 /* button */);
                 put_u32(configure_serial);
@@ -1089,6 +1392,7 @@ static void poll_input(long client) {
             }
         } else if (kind == INPUT_KEY) {
             if (keyboard_id != 0) {
+                keyboard_route(client);
                 begin(keyboard_id, 3 /* key */);
                 put_u32(configure_serial);
                 put_u32(0); /* time */
@@ -1396,7 +1700,11 @@ static int serve(long client) {
                 put_i32(0); put_i32(0);
                 finish(); send_message(client, -1);
                 begin(xdg_output_id, 1 /* logical_size */);
-                put_i32(1024); put_i32(768);
+                /* Logical size is the mode divided by wl_output.scale: a
+                   1024x768 buffer at scale 2 is a 512x384 desktop. Reporting
+                   1024x768 here made Phosh size its panels against a screen
+                   twice as large as the one it was actually drawing. */
+                put_i32(512); put_i32(384);
                 finish(); send_message(client, -1);
                 begin(xdg_output_id, 3 /* name */);
                 put_string("Werewolf panel");
@@ -1504,6 +1812,37 @@ static int serve(long client) {
                 } else if (subsurface_surface_id == 0) {
                     subsurface_surface_id = new_surface;
                 }
+            } else if (object == compositor_id && opcode == 1) {
+                /* wl_compositor.create_region(new_id) */
+                unsigned id = take_u32();
+                region_add(id);
+            } else if (region_find(object) != 0 && opcode == 0) {
+                /* wl_region.add(x, y, width, height) */
+                RegionSlot *region = region_find(object);
+                int x = (int)take_u32();
+                int y = (int)take_u32();
+                int width = (int)take_u32();
+                int height = (int)take_u32();
+                if (region->rects == 0) {
+                    region->x0 = x;
+                    region->y0 = y;
+                    region->x1 = x + width;
+                    region->y1 = y + height;
+                } else {
+                    if (x < region->x0) region->x0 = x;
+                    if (y < region->y0) region->y0 = y;
+                    if (x + width > region->x1) region->x1 = x + width;
+                    if (y + height > region->y1) region->y1 = y + height;
+                }
+                region->rects += 1;
+            } else if (region_find(object) != 0 && opcode == 1) {
+                /* wl_region.subtract: keep the outer box (conservative). */
+                (void)take_u32();
+                (void)take_u32();
+                (void)take_u32();
+                (void)take_u32();
+            } else if (region_find(object) != 0 && opcode == 2) {
+                region_forget(object);
             } else if (object == shell_id && opcode == 1) {
                 positioner_id = take_u32(); /* create_positioner */
             } else if (object == shell_id && opcode == 2) {
@@ -1624,12 +1963,14 @@ static int serve(long client) {
                 unsigned format = take_u32();
                 PoolSlot *pool = pool_find(object);
                 BufferSlot *slot = buffer_add(id);
-                slot->pool_fd = pool->fd;
-                slot->offset = offset;
-                slot->width = width;
-                slot->height = height;
-                slot->stride = stride;
-                slot->format = format;
+                if (slot != 0) {
+                    slot->pool_fd = pool->fd;
+                    slot->offset = offset;
+                    slot->width = width;
+                    slot->height = height;
+                    slot->stride = stride;
+                    slot->format = format;
+                }
                 buffer_id = id;
                 buffer_offset = offset;
                 buffer_width = (int)width;
@@ -1642,6 +1983,11 @@ static int serve(long client) {
                    created from this pool may still be committed. */
                 PoolSlot *pool = pool_find(object);
                 pool->id = 0;
+            } else if (buffer_find(object) != 0 && opcode == 0) {
+                /* wl_buffer.destroy. Toolkits create one buffer per frame
+                   and destroy the previous one, so without this the table
+                   filled up and commits started resolving to stale slots. */
+                buffer_forget(object);
             } else if (object == layer_shell_id && opcode == 0) {
                 /* get_layer_surface(new_id, surface, output, layer, ns) */
                 unsigned new_layer_surface = take_u32();
@@ -1675,7 +2021,8 @@ static int serve(long client) {
                     layer_margin[index] = slot->margin[index];
                 }
             } else if (layer_surface_by_id(object) != 0 && opcode == 4) {
-                (void)take_u32(); /* keyboard interactivity */
+                LayerSurface *slot = layer_surface_by_id(object);
+                slot->keyboard_interactivity = take_u32();
             } else if (layer_surface_by_id(object) != 0 && opcode == 5) {
                 (void)take_u32(); /* get_popup */
             } else if (layer_surface_by_id(object) != 0 && opcode == 6) {
@@ -1686,11 +2033,15 @@ static int serve(long client) {
             } else if (layer_surface_by_id(object) != 0 && opcode == 7) {
                 LayerSurface *slot = layer_surface_by_id(object);
                 if (slot != 0) {
-                    for (unsigned index = 0; index < MAX_LAYERS; index++) {
-                        if (layer_entries[index].used &&
-                            layer_entries[index].surface == slot->surface) {
-                            layer_entries[index].used = 0;
-                        }
+                    layer_forget_surface(slot->surface);
+                    if (pointer_target == slot->surface) {
+                        pointer_target = 0;
+                    }
+                    if (keyboard_target == slot->surface) {
+                        keyboard_target = 0;
+                    }
+                    if (focus_surface == slot->surface) {
+                        focus_surface = 0;
                     }
                     slot->used = 0;
                 }
@@ -1858,9 +2209,19 @@ static int serve(long client) {
                     finish();
                     send_message(client, -1);
                 }
+                layer_forget_surface(object);
+                if (pointer_target == object) {
+                    pointer_target = 0;
+                }
+                if (keyboard_target == object) {
+                    keyboard_target = 0;
+                }
                 focused = 0;
                 if (surface_id == object) {
                     surface_id = 0;
+                }
+                if (focus_surface == object) {
+                    focus_surface = 0;
                 }
             } else if (object == toplevel_id &&
                        (opcode == 9 || opcode == 10 || opcode == 11 || opcode == 12)) {
@@ -1886,6 +2247,27 @@ static int serve(long client) {
                 attached_buffer = buffer;
                 if (object < SURFACE_IDS) {
                     attached_buffers[object] = buffer;
+                }
+            } else if (is_surface(object) && opcode == 5) {
+                /* wl_surface.set_input_region(region): NULL means the whole
+                   surface, an empty region means "no input here". */
+                unsigned region_id = take_u32();
+                if (object < SURFACE_IDS) {
+                    if (region_id == 0) {
+                        surface_input_set[object] = 0;
+                        surface_input_empty[object] = 0;
+                    } else {
+                        RegionSlot *region = region_find(region_id);
+                        surface_input_set[object] = 1;
+                        surface_input_empty[object] =
+                            (region == 0 || region->rects == 0) ? 1 : 0;
+                        if (region != 0 && region->rects != 0) {
+                            surface_input_box[object][0] = region->x0;
+                            surface_input_box[object][1] = region->y0;
+                            surface_input_box[object][2] = region->x1;
+                            surface_input_box[object][3] = region->y1;
+                        }
+                    }
                 }
             } else if (is_surface(object) && opcode == 3) {
                 frame_id = take_u32(); /* wl_surface.frame */
@@ -1955,7 +2337,7 @@ static int serve(long client) {
                     buffer_stride = committed_slot->stride;
                     buffer_format = committed_slot->format;
                 }
-                if (pool_fd >= 0 && buffer_id != 0) {
+                if (committed_slot != 0 && pool_fd >= 0 && buffer_id != 0) {
                     commits += 1;
 #ifdef SERVE_ONLY
                     if (!frame_reported) {
@@ -2024,7 +2406,14 @@ static int serve(long client) {
                         for (unsigned index = 0; index < 4; index++) {
                             layer_margin[index] = layer_slot->margin[index];
                         }
-                        layer_record_commit();
+                        if (committed_buffer != 0) {
+                            layer_record_commit(layer_slot);
+                        } else {
+                            /* attach(NULL) hides the surface (Phosh does this
+                               to the lockscreen after unlocking); it must
+                               stop being drawn and stop taking input. */
+                            layer_forget_surface(layer_slot->surface);
+                        }
                         layer_compose();
                     }
 #else
@@ -2042,35 +2431,19 @@ static int serve(long client) {
                     }
 #endif
                 }
-                if (buffer_id != 0) {
-                    /* Retry until the client has created the seat proxies:
-                       the first buffer may be committed before get_pointer /
-                       get_keyboard, and a one-shot flag would lose the
-                       enter forever. */
+                if (committed_buffer != 0) {
                     focus_surface = (layer_slot != 0)
                                         ? object
                                         : (surface_id != 0 ? surface_id : object);
-                    if (keyboard_id != 0 && !keyboard_entered &&
-                        focus_surface != 0) {
-                        begin(keyboard_id, 1 /* enter */);
-                        put_u32(configure_serial);
-                        put_u32(focus_surface);
-                        put_u32(0); /* keys array, empty */
-                        finish();
-                        send_message(client, -1);
-                        keyboard_entered = 1;
-                    }
-                    if (pointer_id != 0 && !pointer_entered &&
-                        focus_surface != 0) {
-                        begin(pointer_id, 0 /* enter */);
-                        put_u32(configure_serial);
-                        put_u32(focus_surface);
-                        put_i32((int)(pointer_x >> 1) << 8);
-                        put_i32((int)(pointer_y >> 1) << 8);
-                        finish();
-                        send_message(client, -1);
-                        pointer_entered = 1;
-                    }
+                }
+                if (committed_buffer != 0 || layer_slot != 0) {
+                    /* Re-evaluate after every commit: a new surface may have
+                       appeared on top, or the old top surface may have been
+                       hidden. Routing is idempotent (no event unless the
+                       target changes), so this also retries the first enter
+                       until the seat proxies exist. */
+                    pointer_route(client, pointer_x, pointer_y, 0);
+                    keyboard_route(client);
                 }
                 if (committed_buffer != 0) {
                     begin(committed_buffer, 0 /* wl_buffer.release */);
@@ -2286,6 +2659,17 @@ static void reset_client(void) {
     layer_shell_id = 0;
     layer_surface_id = 0;
     layer_surface_surface = 0;
+    layer_surface_seq = 0;
+    for (unsigned index = 0; index < MAX_REGIONS; index++) {
+        regions[index].id = 0;
+    }
+    for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        surface_input_set[index] = 0;
+        surface_input_empty[index] = 0;
+    }
+    for (unsigned index = 0; index < MAX_LAYERS; index++) {
+        layer_entries[index].used = 0;
+    }
     for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
         layer_surfaces[index].used = 0;
     }
@@ -2341,8 +2725,8 @@ static void reset_client(void) {
     focus_surface = 0;
     pointer_x = 200;
     pointer_y = 100;
-    pointer_entered = 0;
-    keyboard_entered = 0;
+    pointer_target = 0;
+    keyboard_target = 0;
     selection_changed = 0;
     wants_offer = 0;
 }
@@ -2389,6 +2773,8 @@ void _start(void) {
     if (child == 0) {
 #ifdef SERVE_LAYER
         static const char *argv[] = {"/sfs/wlclient", "layer", 0};
+#elif defined(SERVE_HIT)
+        static const char *argv[] = {"/sfs/wlclient", "hit", 0};
 #elif defined(SERVE_GTK4)
         static const char *argv[] = {"/sfs/gtk4hello", 0};
 #elif defined(SERVE_PHOSH)
@@ -2440,6 +2826,8 @@ void _start(void) {
     }
 #if defined(SERVE_LAYER)
     sys3(64, 1, (long)"layer server ok\n", 16);
+#elif defined(SERVE_HIT)
+    sys3(64, 1, (long)"hit server ok\n", 14);
 #elif defined(SERVE_GTK4)
     sys3(64, 1, (long)"gtk4 client ok\n", 15);
 #else

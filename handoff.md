@@ -4333,3 +4333,99 @@ remembering the compositor suffix. `phosh` is a shortcut for the same.
 ```text
 linuxstart phosh
 ```
+
+## 2026-11-11 — Pointer hit-testing by layer, position and input region
+
+The compositor used to give pointer and keyboard focus to "the last surface
+that committed", so a swipe could land on the wrong layer. Input now follows
+what is actually on screen.
+
+### Hit-testing
+
+`layer_rect()` is the single anchor/margin calculation shared by
+`layer_compose` and the hit test, so pixels and input agree. `layer_hit_test()`
+returns the topmost surface under a physical output point:
+
+- higher `zwlr_layer_surface_v1` layer wins (background < bottom < top <
+  overlay);
+- within one layer the surface created last wins (`seq`, not commit order —
+  otherwise the 60 Hz redraw reordered the stack every frame).
+
+`pointer_route()` sends `leave`/`enter`/`motion` to the target, with
+surface-local logical coordinates (`(px - rect.x) / 2` at scale 2).
+`keyboard_route()` gives the keyboard to the topmost surface that asked for
+it (`set_keyboard_interactivity`, exclusive wins regardless of the pointer),
+falling back to the focused toplevel. Both are re-evaluated on every commit,
+which also retries the first enter until the seat proxies exist.
+
+### wl_surface input regions
+
+`wl_compositor.create_region`, `wl_region.add/subtract/destroy` and
+`wl_surface.set_input_region` are implemented. A surface with an empty region
+takes no pointer input; a non-empty region is hit-tested against its bounding
+box. Phosh marks panel shadows and backgrounds this way, and without this they
+swallowed every click meant for the panel.
+
+### Compositor bugs found while testing
+
+- **Buffer table overflow.** `wl_buffer.destroy` was not handled and
+  `buffer_add` recycled slot 0 when full, silently handing a live buffer
+  another buffer's fd/offset/size. Phosh creates one buffer per frame, so the
+  table filled within seconds and layers drew each other's content (the
+  duplicated quick-settings panel). The table is now 512 entries,
+  `buffer_add` refuses instead of recycling, `wl_buffer.destroy` frees the
+  slot, and a commit whose buffer is unknown is skipped rather than blitted
+  from stale globals.
+- **Composed frames were invisible.** `layer_compose` wrote `frameSeq = 0`
+  after drawing, so the host viewer kept showing the last single-surface blit
+  instead of the composition. It now writes a monotonically increasing
+  sequence, which is also why the duplicated panel and the quick-settings
+  layout are only visible now.
+- **Wrong logical output size.** `zxdg_output_v1.logical_size` reported
+  1024x768 while `wl_output` mode is 1024x768 at `scale=2`, i.e. a 512x384
+  desktop. Phosh sized its panels against a screen twice as large as the one
+  it was drawing.
+- `attach(NULL)` now removes the layer entry, so a hidden surface stops being
+  drawn and stops taking input.
+
+### New regression test
+
+`layer-hit` (a `SERVE_HIT` mode of `wayland_real.c` running `wlclient hit`)
+creates three layer surfaces:
+
+| surface | layer    | geometry                  | input region |
+|---------|----------|---------------------------|--------------|
+| a       | top      | 400x300 at the top-left   | empty        |
+| c       | overlay  | 200x200 at bottom-right   | full         |
+| b       | bottom   | full screen               | full         |
+
+The compositor's first enter is at (200,100) physical, inside `a`, so it must
+skip `a` (empty region) and land on `b`. Host moves to (900,700) and (500,400)
+must produce `c` and `b`, so the expected enter sequence is `bcb`:
+
+```text
+hit sequence=bcb
+hit test ok
+hit server ok
+```
+
+### Verified
+
+- Host unit tests: **222 passed**.
+- Guest: `linux-wlreal` (clipboard, layer-shell, two clients), `layer-serve`
+  (compose/client/server), `layer-hit` (`hit test ok`).
+- Phosh still reaches `layer compose` and paints; the quick-settings panel is
+  no longer duplicated.
+
+### Still open on the Phosh side
+
+- Phosh starts unlocked and with the quick settings expanded; its top panel is
+  resized to 768 logical (the physical output height) instead of 384, so the
+  panel is laid out against the wrong screen height. It does not react to
+  swipes on the panel yet. Re-sending a `configure` when the client changes
+  `set_size`/`set_anchor` is the next protocol gap, but the first attempt made
+  the home clock clip, so it needs a careful look.
+- The home screen is black: no wallpaper and no icon theme (next task).
+- `zphoc_layer_shell_effects_v1.stack_below()` is still ignored, so Phosh's
+  "background" surfaces are ordered by creation instead of by the requested
+  stacking.
