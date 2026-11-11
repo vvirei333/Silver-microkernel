@@ -4829,3 +4829,37 @@ hardcoded window both failed the relocation check and stopped the scanout.
 
 The default (non-blob) layout is unchanged: the capability walk finds the same
 BAR4 offsets and the 2D scanout still reports `scanout 1024x768 resource 1`.
+
+### Why Mesa still uses llvmpipe
+
+`DRM_IOCTL_VERSION` now reports major 0 / minor 1 with the name `virtio_gpu`.
+Mesa's virgl winsys treats a non-zero DRM major as a protocol error
+(`virgl_drm_get_version` returns `-EINVAL`), so the old `major = 1` made it
+drop the driver silently.
+
+That was necessary but not sufficient. Tracing every ioctl on the render node
+shows what Mesa 26.2 actually does:
+
+```text
+VERSION (x2), GET_CAPS(capset 6, size 160), GETPARAM 1..7, GET_CAPS(6),
+GETPARAM 1..7, GET_CAP(DRM_CAP_PRIME) -> give up, fall back to llvmpipe
+```
+
+`GET_CAPS(6)` with a 160-byte buffer is `vdrm_virtgpu_connect` in
+`src/virtio/vdrm/vdrm_virtgpu.c`, i.e. Mesa's **DRM native context** layer,
+not virgl (`virgl_drm_winsys_create` would query capsets 1/2 with 1408 bytes
+and then issue `VIRTGPU_CONTEXT_INIT`). Arch's Mesa 26.2 ships only
+`virtio_gpu_dri.so` and its DRI stub exports only
+`__driDriverGetExtensions_virtio_gpu`; there is no `virgl_dri.so` and no
+`__driDriverGetExtensions_virgl`, so the virgl GL driver is not reachable in
+this build at all.
+
+The native path needs the DRM capset, which QEMU only exposes with
+`drm_native_context=on` + `blob=on`, and virglrenderer then fails on this host
+(`failed to initialize drm renderer`, ENODEV) because a native context
+requires a host GPU driver for the virtual device.
+
+So hardware GL is blocked in userspace, not in the kernel: either ship a Mesa
+that still has the virgl driver (25.x), or use Venus/zink (`venus=on`,
+`libvulkan_virtio.so`), or accept llvmpipe. The render node, the 3D context
+and the capset plumbing are all in place and exercised by `rendertest`.

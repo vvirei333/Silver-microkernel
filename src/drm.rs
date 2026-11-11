@@ -419,18 +419,22 @@ pub fn ioctl(request: u64, argument: u64) -> Option<u64> {
                 let Some(mut version) = load::<Version>(argument) else {
                     return Some(u64::MAX);
                 };
-                version.major = 1;
-                version.minor = 0;
+                // Mesa's virgl winsys treats the DRM *major* as the virtgpu
+                // protocol version and requires it to be 0; a non-zero major
+                // makes `virgl_drm_get_version` fail and the driver falls
+                // back to llvmpipe without a message.
+                version.major = 0;
+                version.minor = 1;
                 version.patchlevel = 0;
-                version.name_len = 13;
-                version.date_len = 10;
+                version.name_len = 11;
+                version.date_len = 9;
                 version.desc_len = 0;
                 version.desc = 0;
                 if !store(argument, &version) {
                     return Some(u64::MAX);
                 }
-                version_string(b"werewolf-drm\0", version.name, 13);
-                version_string(b"2026-11-12\0", version.date, 10);
+                version_string(b"virtio_gpu\0", version.name, 11);
+                version_string(b"20260101\0", version.date, 9);
                 0
             }
             DRM_IOCTL_GET_CAP => {
