@@ -4813,3 +4813,19 @@ Also raised `MAX_FILE_MMAP_BYTES` to 256 MiB: the loader maps libLLVM
 `/dev/gpufb` mappings are now Normal Cacheable (the DMA path cleans before
 every transfer), because `DC ZVA` on Non-Cacheable memory is not
 architecturally defined.
+
+### virtio-gpu: PCI capability parsing
+
+The driver no longer assumes the modern virtio register banks live in BAR4
+at fixed offsets. It walks the PCI capability list, collects the COMMON
+(cfg_type 1), NOTIFY (2) and DEVICE (4) capabilities with their BAR, offset,
+length and notify multiplier, programs those BARs from the 0x1020_0000
+window and derives the register addresses from the capability data.
+
+This matters as soon as the device has a shared-memory BAR: with
+`blob=on,hostmem=...,drm_native_context=on` QEMU moves the modern block from
+BAR4 to BAR2 (16 KiB) and gives BAR4 to the 256 MiB shared window, so the old
+hardcoded window both failed the relocation check and stopped the scanout.
+
+The default (non-blob) layout is unchanged: the capability walk finds the same
+BAR4 offsets and the 2D scanout still reports `scanout 1024x768 resource 1`.

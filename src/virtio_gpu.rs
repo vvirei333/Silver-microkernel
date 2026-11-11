@@ -22,7 +22,6 @@ const PCI_DEVICE_GPU_TRANSITIONAL: u16 = 0x0010;
 
 /// A different 1 GiB device window than virtio-blk's 0x1010_0000.
 const GPU_BAR4_PA: usize = 0x1020_0000;
-const NOTIFY_OFF: usize = 0x3000;
 const QUEUE_SIZE: usize = 64;
 /// Staging area for `SUBMIT_3D` command buffers.
 const SUBMIT_PAGES: usize = 32;
@@ -130,6 +129,45 @@ fn pci_read32(bus: u8, device: u8, function: u8, offset: usize) -> Option<u32> {
     Some(unsafe { core::ptr::read_volatile(address as *const u32) })
 }
 
+fn pci_read8(bus: u8, device: u8, function: u8, offset: usize) -> Option<u8> {
+    if offset >= 0x1000 {
+        return None;
+    }
+    let address = crate::memory::phys_to_virt(
+        crate::mmu::PCI_ECAM_BASE
+            + ((bus as usize) << 20)
+            + ((device as usize) << 15)
+            + ((function as usize) << 12)
+            + offset,
+    );
+    Some(unsafe { core::ptr::read_volatile(address as *const u8) })
+}
+
+fn pci_read16(bus: u8, device: u8, function: u8, offset: usize) -> Option<u16> {
+    let low = pci_read8(bus, device, function, offset)? as u16;
+    let high = pci_read8(bus, device, function, offset + 1)? as u16;
+    Some(low | (high << 8))
+}
+
+/// Byte-wise 32-bit read: capability entries are not guaranteed to start on a
+/// 4-byte boundary, and an unaligned MMIO read would fault.
+fn pci_read32_bytes(bus: u8, device: u8, function: u8, offset: usize) -> Option<u32> {
+    let mut value = 0u32;
+    for index in 0..4 {
+        value |= (pci_read8(bus, device, function, offset + index)? as u32) << (index * 8);
+    }
+    Some(value)
+}
+
+fn pci_write16(bus: u8, device: u8, function: u8, offset: usize, value: u16) -> bool {
+    let Some(address) = pci_address(bus, device, function, offset & !3) else {
+        return false;
+    };
+    let address = address + (offset & 3);
+    unsafe { core::ptr::write_volatile(address as *mut u16, value) };
+    true
+}
+
 fn pci_write32(bus: u8, device: u8, function: u8, offset: usize, value: u32) -> bool {
     match pci_address(bus, device, function, offset) {
         Some(address) => {
@@ -162,6 +200,57 @@ fn find_device() -> Option<(u8, u8, u8)> {
     None
 }
 
+/// A virtio PCI capability: which BAR and offset holds one of the modern
+/// register banks.
+#[derive(Clone, Copy)]
+struct VirtioCap {
+    bar: usize,
+    offset: usize,
+    length: usize,
+    /// Notify capability only: bytes between two queue doorbells.
+    multiplier: usize,
+}
+
+/// Programmes one BAR. Returns the assigned base address.
+fn assign_bar(bus: u8, device: u8, function: u8, bar: usize, base: usize) -> Option<usize> {
+    let offset = 0x10 + bar * 4;
+    let original = pci_read32(bus, device, function, offset)?;
+    if original & 0x1 != 0 {
+        // I/O BAR: the modern capabilities never live there.
+        return None;
+    }
+    let is_64 = original & 0x6 == 0x4;
+    if !pci_write32(bus, device, function, offset, 0xFFFF_FFFF) {
+        return None;
+    }
+    let mask = pci_read32(bus, device, function, offset)? & !0xF;
+    if !pci_write32(bus, device, function, offset, original) {
+        return None;
+    }
+    if mask == 0 {
+        return None;
+    }
+    let size = (!mask).wrapping_add(1) as usize;
+    if base % size != 0 {
+        return None;
+    }
+    if !pci_write32(bus, device, function, offset, base as u32 | (original & 0xF)) {
+        return None;
+    }
+    if is_64 && !pci_write32(bus, device, function, offset + 4, 0) {
+        return None;
+    }
+    let assigned = pci_read32(bus, device, function, offset)? & !0xF;
+    if assigned as usize != base {
+        return None;
+    }
+    Some(base)
+}
+
+/// Walks the PCI capability list and programmes the BARs that hold the modern
+/// virtio register banks. Without blob resources the banks live in BAR4; a
+/// device with a shared-memory BAR (blobs) moves them to a smaller BAR and
+/// gives BAR4 to the shared window, so the layout must be read, not assumed.
 fn claim_device(bus: u8, device: u8, function: u8) -> bool {
     let Some(command) = pci_read32(bus, device, function, 0x04) else {
         return false;
@@ -169,23 +258,94 @@ fn claim_device(bus: u8, device: u8, function: u8) -> bool {
     if !pci_write32(bus, device, function, 0x04, command | 0x6) {
         return false;
     }
-    // BAR4 is a 64-bit memory BAR on QEMU's virtio-gpu.
-    if !pci_write32(bus, device, function, 0x20, GPU_BAR4_PA as u32) {
-        return false;
-    }
-    let _ = pci_write32(bus, device, function, 0x24, 0);
-    let Some(assigned) = pci_read32(bus, device, function, 0x20) else {
+    let Some(status) = pci_read16(bus, device, function, 0x06) else {
         return false;
     };
-    if (assigned & !0xF) != GPU_BAR4_PA as u32 {
-        console::write_str("VIRTIO-GPU: BAR4 relocation failed\r\n");
+    if status & (1 << 4) == 0 {
+        console::write_str("VIRTIO-GPU: no PCI capabilities\r\n");
         return false;
+    }
+    let Some(mut pointer) = pci_read8(bus, device, function, 0x34) else {
+        return false;
+    };
+    let mut common: Option<VirtioCap> = None;
+    let mut notify: Option<VirtioCap> = None;
+    let mut device_cfg: Option<VirtioCap> = None;
+    let mut guard = 0;
+    while pointer != 0 && guard < 48 {
+        let Some(id) = pci_read8(bus, device, function, pointer as usize) else {
+            return false;
+        };
+        let Some(next) = pci_read8(bus, device, function, pointer as usize + 1) else {
+            return false;
+        };
+        if id == 0x09 {
+            let base = pointer as usize;
+            let Some(cfg_type) = pci_read8(bus, device, function, base + 3) else {
+                return false;
+            };
+            let Some(bar) = pci_read8(bus, device, function, base + 4) else {
+                return false;
+            };
+            let Some(offset) = pci_read32_bytes(bus, device, function, base + 8) else {
+                return false;
+            };
+            let Some(length) = pci_read32_bytes(bus, device, function, base + 12) else {
+                return false;
+            };
+            let multiplier = pci_read32_bytes(bus, device, function, base + 16)
+                .unwrap_or(4) as usize;
+            let cap = VirtioCap {
+                bar: bar as usize,
+                offset: offset as usize,
+                length: length as usize,
+                multiplier: if multiplier == 0 { 4 } else { multiplier },
+            };
+            match cfg_type {
+                1 => common = Some(cap),
+                2 => notify = Some(cap),
+                4 => device_cfg = Some(cap),
+                _ => {}
+            }
+        }
+        pointer = next;
+        guard += 1;
+    }
+    let (Some(common), Some(notify), Some(device_cfg)) = (common, notify, device_cfg) else {
+        console::write_str("VIRTIO-GPU: missing virtio capabilities\r\n");
+        return false;
+    };
+
+    // Give every BAR a window. The blob BAR (512 MiB with blobs enabled) is
+    // not used: resources stay in guest memory.
+    let mut bases = [0usize; 6];
+    let mut next_base = GPU_BAR4_PA;
+    for cap in [common, notify, device_cfg] {
+        if bases[cap.bar] == 0 {
+            let Some(base) = assign_bar(bus, device, function, cap.bar, next_base) else {
+                console::write_str("VIRTIO-GPU: BAR relocation failed\r\n");
+                return false;
+            };
+            bases[cap.bar] = base;
+            next_base += 0x10_0000;
+        }
+    }
+    unsafe {
+        COMMON_VA = phys_to_virt(bases[common.bar] + common.offset);
+        NOTIFY_VA = phys_to_virt(bases[notify.bar] + notify.offset);
+        NOTIFY_MULTIPLIER = notify.multiplier;
+        DEVICE_VA = phys_to_virt(bases[device_cfg.bar] + device_cfg.offset);
     }
     true
 }
 
+static mut COMMON_VA: usize = 0;
+static mut NOTIFY_MULTIPLIER: usize = 4;
+static mut NOTIFY_VA: usize = 0;
+static mut DEVICE_VA: usize = 0;
+
 fn common(offset: usize) -> usize {
-    phys_to_virt(GPU_BAR4_PA) + offset
+    unsafe { COMMON_VA + offset }
 }
 
 unsafe fn read8(offset: usize) -> u8 {
@@ -305,7 +465,7 @@ unsafe fn init_device() -> Option<Queue> {
         descriptors: ring_va,
         available: phys_to_virt(available_pa),
         used: phys_to_virt(used_pa),
-        notify: phys_to_virt(GPU_BAR4_PA) + NOTIFY_OFF + notify_off * 4,
+        notify: unsafe { NOTIFY_VA + notify_off * NOTIFY_MULTIPLIER },
         last_used: 0,
         command_pa,
         command: phys_to_virt(command_pa),
