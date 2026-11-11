@@ -2144,14 +2144,16 @@ fn linux_mmap(
     };
 
     if flags & MAP_ANONYMOUS != 0 {
-        // A pure `PROT_NONE` reservation commits nothing on Linux; glibc's
-        // 128 MiB `new_heap` probe must succeed even when the process already
-        // has many library mappings, and ld.so reserves whole library spans
-        // this way before `MAP_FIXED`-mapping the segments over them. Such a
-        // range is tracked lazily and backed only after `mprotect` makes a
-        // part of it accessible. Every other anonymous mapping stays eager,
-        // so the common path changes neither layout nor timing.
-        let lazy = prot == 0;
+        // Anonymous memory is lazily backed, like Linux: the virtual range is
+        // reserved now and each page is committed when it is first touched.
+        // Eager backing charged the whole span up front, so a single 8 MiB
+        // `pthread_create` stack cost 2048 frames of the per-task budget even
+        // though only a handful of its pages are ever used; a GTK-sized
+        // process (most of its budget already spent on library mappings) then
+        // failed the charge and thread creation returned EAGAIN. A pure
+        // `PROT_NONE` reservation was already handled this way (glibc's
+        // 128 MiB `new_heap` probe, ld.so's library spans).
+        let lazy = true;
         let placed = match fixed {
             Some(address) if lazy => {
                 scheduler::mmap_anonymous_at_lazy(length as usize, prot, address)

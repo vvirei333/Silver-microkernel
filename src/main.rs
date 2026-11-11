@@ -1133,6 +1133,11 @@ exception_user_fault:
     str x9, [sp, #248]
     mrs x9, spsr_el1
     str x9, [sp, #256]
+    // Preserve the EL0 vector register file: kernel code may use SIMD.
+    mrs x10, tpidr_el1
+    add x10, x10, {fp_offset}
+    mov x0, x10
+    bl silver_fp_save
     mov x0, sp
     mrs x1, esr_el1
     mrs x2, elr_el1
@@ -1143,6 +1148,12 @@ exception_user_fault:
     msr elr_el1, x9
     ldr x9, [sp, #256]
     msr spsr_el1, x9
+    // Restore the task's vector registers; must stay the last step before
+    // the saved register bank is reloaded and `eret` runs.
+    mrs x10, tpidr_el1
+    add x10, x10, {fp_offset}
+    mov x0, x10
+    bl silver_fp_restore
     ldr x30, [sp, #240]
     ldp x28, x29, [sp, #224]
     ldp x26, x27, [sp, #208]
@@ -1207,12 +1218,23 @@ exception_svc_dispatch:
     str x9, [sp, #248]
     mrs x9, spsr_el1
     str x9, [sp, #256]
+    // Preserve the EL0 vector register file: kernel code may use SIMD.
+    mrs x10, tpidr_el1
+    add x10, x10, {fp_offset}
+    mov x0, x10
+    bl silver_fp_save
     mov x0, sp
     bl silver_handle_syscall
     // Fall through to the epilogue: the handler may have switched this task
     // away and back (the switch resumes via `ret`, unwinding the call chain
     // to this exact point), so the frame and SP are exactly as we left them.
 exception_svc_epilogue:
+    // Restore the task's vector registers; must stay the last step before
+    // the saved register bank is reloaded and `eret` runs.
+    mrs x10, tpidr_el1
+    add x10, x10, {fp_offset}
+    mov x0, x10
+    bl silver_fp_restore
     // Restore ELR/SPSR first, while x9 is still trampoline scratch.
     ldr x9, [sp, #248]
     msr elr_el1, x9
@@ -1275,6 +1297,16 @@ exception_irq_dispatch:
     str x9, [sp, #248]
     mrs x9, spsr_el1
     str x9, [sp, #256]
+    // Only an exception taken from EL0 carries a user vector file.
+    mrs x10, spsr_el1
+    and x10, x10, #0x0f
+    cbnz x10, 8f
+    // Preserve the EL0 vector register file: kernel code may use SIMD.
+    mrs x10, tpidr_el1
+    add x10, x10, {fp_offset}
+    mov x0, x10
+    bl silver_fp_save
+8:
     bl silver_handle_irq
     adrp x9, {probe}
     mov w10, #17
@@ -1286,6 +1318,16 @@ exception_irq_dispatch:
     bl silver_irq_signal_return
     // Fall through to the epilogue (see the SVC trampoline above).
 exception_irq_epilogue:
+    ldr x10, [sp, #256]
+    and x10, x10, #0x0f
+    cbnz x10, 8f
+    // Restore the task's vector registers; must stay the last step before
+    // the saved register bank is reloaded and `eret` runs.
+    mrs x10, tpidr_el1
+    add x10, x10, {fp_offset}
+    mov x0, x10
+    bl silver_fp_restore
+8:
     ldr x9, [sp, #248]
     msr elr_el1, x9
     ldr x9, [sp, #256]
@@ -1324,7 +1366,8 @@ exception_dispatch:
     mrs x3, far_el1
     b silver_handle_exception
 "#,
-    probe = sym crate::smp::SMP_PROBE
+    probe = sym crate::smp::SMP_PROBE,
+    fp_offset = const crate::smp::FP_OFFSET
 );
 
 /// The newer MMU/ASID/DMA boot proofs run on QEMU and on any non-fog build.

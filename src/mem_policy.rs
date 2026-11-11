@@ -37,10 +37,13 @@ pub fn user_alloc_ok(free: usize, requested: usize, total: usize) -> bool {
     remaining >= requested
 }
 
-/// Fraction of the usable frames a single task may charge. A toolkit process
-/// maps ~80 MiB of libraries before it runs, so a quarter of a 256 MiB
-/// machine is not enough; half still leaves the kernel reserve intact.
-pub const TASK_LIMIT_DIVISOR: usize = 2;
+/// Fraction of the usable frames a single task may charge. A GTK4 process
+/// maps ~120 MiB of libraries (ICU data alone is 32 MiB) before it runs, so
+/// half of a 256 MiB machine is not enough. Three quarters still leaves the
+/// kernel reserve intact, and the reserve check in `user_alloc_ok` remains the
+/// hard floor for every individual allocation.
+pub const TASK_LIMIT_NUMERATOR: usize = 3;
+pub const TASK_LIMIT_DENOMINATOR: usize = 4;
 
 /// Floor for the per-task charge on a tiny window, so the flat spawn cost
 /// (page tables, stacks, private page) still fits.
@@ -49,7 +52,8 @@ const MIN_TASK_FRAMES: usize = 16;
 /// Frames a single task may have charged at once on a machine with
 /// `total_frames` usable frames.
 pub fn task_frame_limit(total_frames: usize) -> usize {
-    (total_frames / TASK_LIMIT_DIVISOR).max(MIN_TASK_FRAMES.min(total_frames))
+    (total_frames / TASK_LIMIT_DENOMINATOR * TASK_LIMIT_NUMERATOR)
+        .max(MIN_TASK_FRAMES.min(total_frames))
 }
 
 /// Whether a task that already charged `used` frames may charge `requested`

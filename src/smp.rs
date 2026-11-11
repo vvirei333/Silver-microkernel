@@ -47,12 +47,48 @@ pub const MAX_CPUS: usize = 8;
 
 const BKL_FREE: isize = -1;
 
+/// Saved FP/SIMD register file: `q0..q31`, `FPCR` and `FPSR`.
+///
+/// Every EL0 entry saves the live vector registers here and every EL0 exit
+/// restores them, so kernel code (which the compiler is free to vectorise)
+/// cannot leak its own vector state into a task. The scheduler copies this
+/// file to and from the outgoing/incoming task on a context switch.
+#[repr(C, align(16))]
+#[derive(Copy, Clone)]
+pub struct FpState {
+    pub q: [u128; 32],
+    pub fpcr: u64,
+    pub fpsr: u64,
+}
+
+impl FpState {
+    pub const fn zero() -> Self {
+        Self {
+            q: [0; 32],
+            fpcr: 0,
+            fpsr: 0,
+        }
+    }
+}
+
+impl core::fmt::Debug for FpState {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("FpState")
+    }
+}
+
 /// Per-CPU state. Address is installed in `TPIDR_EL1`; `this_cpu()` reads it.
+///
+/// `fp` is the first field so the exception trampolines can address it with a
+/// single `mrs xN, tpidr_el1` (see `FP_OFFSET`).
 ///
 /// `current_index` is the index of the task executing (or last selected) on
 /// this CPU — the former global `TaskManager.current_index`, split per CPU so
 /// two CPUs never share one "current task". `usize::MAX` means "none yet".
+#[repr(C)]
 pub struct PerCpu {
+    /// Vector register file of the task that owns this CPU right now.
+    pub fp: UnsafeCell<FpState>,
     /// Exclusive claim bit: protects field publication before `online`.
     claimed: AtomicBool,
     /// Slot claimed during CPU bring-up; `false` = offline.
@@ -80,6 +116,7 @@ unsafe impl Sync for PerCpu {}
 impl PerCpu {
     const fn empty() -> Self {
         Self {
+            fp: UnsafeCell::new(FpState::zero()),
             claimed: AtomicBool::new(false),
             online: AtomicBool::new(false),
             cpu_id: 0,
@@ -1810,3 +1847,70 @@ fn psci_cpu_on(target_mpidr: u64, entry_physical: usize, context_id: usize) -> u
     }
     ret
 }
+
+/// Byte offset of [`PerCpu::fp`] inside the per-CPU block. The exception
+/// trampolines rely on `TPIDR_EL1 + FP_OFFSET` addressing the live vector
+/// register file.
+pub const FP_OFFSET: usize = core::mem::offset_of!(PerCpu, fp);
+
+core::arch::global_asm!(
+    r#"
+    .section .text.fp, "ax"
+
+    // void silver_fp_save(FpState *state)
+    // x0 = destination; clobbers x9. q0..q31, FPCR and FPSR only.
+    .global silver_fp_save
+    .type silver_fp_save, %function
+silver_fp_save:
+    stp q0, q1, [x0, #0]
+    stp q2, q3, [x0, #32]
+    stp q4, q5, [x0, #64]
+    stp q6, q7, [x0, #96]
+    stp q8, q9, [x0, #128]
+    stp q10, q11, [x0, #160]
+    stp q12, q13, [x0, #192]
+    stp q14, q15, [x0, #224]
+    stp q16, q17, [x0, #256]
+    stp q18, q19, [x0, #288]
+    stp q20, q21, [x0, #320]
+    stp q22, q23, [x0, #352]
+    stp q24, q25, [x0, #384]
+    stp q26, q27, [x0, #416]
+    stp q28, q29, [x0, #448]
+    stp q30, q31, [x0, #480]
+    mrs x9, fpcr
+    str x9, [x0, #512]
+    mrs x9, fpsr
+    str x9, [x0, #520]
+    ret
+    .size silver_fp_save, . - silver_fp_save
+
+    // void silver_fp_restore(const FpState *state)
+    // x0 = source; clobbers x9. Must be the last thing before `eret`.
+    .global silver_fp_restore
+    .type silver_fp_restore, %function
+silver_fp_restore:
+    ldp q0, q1, [x0, #0]
+    ldp q2, q3, [x0, #32]
+    ldp q4, q5, [x0, #64]
+    ldp q6, q7, [x0, #96]
+    ldp q8, q9, [x0, #128]
+    ldp q10, q11, [x0, #160]
+    ldp q12, q13, [x0, #192]
+    ldp q14, q15, [x0, #224]
+    ldp q16, q17, [x0, #256]
+    ldp q18, q19, [x0, #288]
+    ldp q20, q21, [x0, #320]
+    ldp q22, q23, [x0, #352]
+    ldp q24, q25, [x0, #384]
+    ldp q26, q27, [x0, #416]
+    ldp q28, q29, [x0, #448]
+    ldp q30, q31, [x0, #480]
+    ldr x9, [x0, #512]
+    msr fpcr, x9
+    ldr x9, [x0, #520]
+    msr fpsr, x9
+    ret
+    .size silver_fp_restore, . - silver_fp_restore
+"#
+);

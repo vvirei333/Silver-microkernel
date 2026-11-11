@@ -320,6 +320,10 @@ pub struct Task {
     /// are always Normal, and aging lives in the ready queue, not here.
     priority: u8,
     pub context: TaskContext,
+    /// Saved vector register file (q0-q31, FPCR, FPSR). The exception
+    /// trampolines keep the live copy in `PerCpu::fp` while this task runs;
+    /// `schedule` swaps it here on a context switch.
+    pub fp: smp::FpState,
     pub stack: MemoryRegion,
     pub user_stack: MemoryRegion,
     pub ttbr0: usize,
@@ -1039,6 +1043,10 @@ silver_user_bootstrap:
     // `bkl_release_asm` preserves x19/x20 (callee-saved), and the register
     // reads below happen after the call.
     bl {bkl_release}
+    mrs x9, tpidr_el1
+    add x9, x9, {fp_offset}
+    mov x0, x9
+    bl silver_fp_restore
     mov x0, x20
     msr elr_el1, x19
     mov x9, xzr
@@ -1057,6 +1065,10 @@ silver_fork_bootstrap:
     msr elr_el1, x9
     ldr x9, [sp, #256]
     msr spsr_el1, x9
+    mrs x9, tpidr_el1
+    add x9, x9, {fp_offset}
+    mov x0, x9
+    bl silver_fp_restore
     ldp x0, x1, [sp, #0]
     ldp x2, x3, [sp, #16]
     ldp x4, x5, [sp, #32]
@@ -1076,7 +1088,8 @@ silver_fork_bootstrap:
     eret
     .size silver_fork_bootstrap, . - silver_fork_bootstrap
 "#,
-    bkl_release = sym crate::smp::bkl_release_asm
+    bkl_release = sym crate::smp::bkl_release_asm,
+    fp_offset = const crate::smp::FP_OFFSET
 );
 
 extern "C" {
@@ -3201,7 +3214,14 @@ pub fn start() -> ! {
         first_task.context.elr,
     );
     let first_context = &first_task.context as *const TaskContext;
+    let first_fp = first_task.fp;
     let boot_context = unsafe { &mut *core::ptr::addr_of_mut!(BOOT_CONTEXT) };
+
+    // Install the first task's vector register file; `silver_user_bootstrap`
+    // restores it immediately before entering EL0.
+    unsafe {
+        *smp::this_cpu().fp.get() = first_fp;
+    }
 
     mmu::switch_address_space(first_task.ttbr0);
 
@@ -3457,6 +3477,18 @@ pub fn schedule() {
         next_context_stack_pointer,
         next_context_elr,
     );
+
+    // FP/SIMD file: the outgoing task's live copy lives in `PerCpu::fp`
+    // (its last EL0 entry saved it there). Park it in the task record and
+    // install the incoming task's file on this CPU; the incoming task's
+    // exception epilogue restores the vector registers before `eret`.
+    let cpu = smp::this_cpu();
+    unsafe {
+        if has_current && !live_is_dead {
+            (*tasks.add(current_index)).fp = *cpu.fp.get();
+        }
+        *cpu.fp.get() = (*tasks.add(next_index)).fp;
+    }
 
     // The pass is complete: the new `current_index` is published, so a later
     // pass (including a preemption right after the resume) starts from a
@@ -3823,6 +3855,10 @@ pub fn exec_linux_current(
         task.resources_released = false;
         task.argv = argv;
         task.envp = envp;
+        // exec starts a fresh program: no vector state may survive from the
+        // superseded image. The next EL0 exit restores these zeroes.
+        task.fp = smp::FpState::zero();
+        unsafe { *smp::this_cpu().fp.get() = smp::FpState::zero(); }
         (old_resources, old_stack, old_stack_generation)
     };
 
@@ -3948,6 +3984,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         parent_tls,
         parent_quota,
         parent_priority,
+        parent_fp,
     ) = {
         let parent = manager.tasks.get(parent_index)?;
         if parent.personality != Personality::Linux || parent.user_image.is_some() { return None;
@@ -3976,6 +4013,10 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             current_user_tls(),
             parent.fs_quota,
             parent.priority,
+            // The caller is inside its own syscall, so the live file is the
+            // parent's state at the `clone` call, not the older copy parked
+            // in the task record.
+            unsafe { *smp::this_cpu().fp.get() },
         )
     };
     if parent_stack.is_empty() { return None;
@@ -4324,6 +4365,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         owns_console: false,
         priority: parent_priority,
         context,
+        fp: parent_fp,
         stack: MemoryRegion::new(kernel_stack_start, kernel_stack_start + TASK_STACK_SIZE),
         user_stack: MemoryRegion::new(stack_start, stack_start + TASK_USER_STACK_SIZE),
         user_stack_generation: stack_generation,
@@ -4420,6 +4462,7 @@ pub fn spawn_thread(
         read_prefix,
         quota,
         priority,
+        fp,
     ) = {
         let parent = manager.tasks.get(smp::current_index())?;
         if parent.personality != Personality::Linux {
@@ -4436,6 +4479,7 @@ pub fn spawn_thread(
             parent.read_prefix.clone(),
             parent.fs_quota,
             parent.priority,
+            unsafe { *smp::this_cpu().fp.get() },
         )
     };
     if !mem_policy::task_charge_ok(0, TASK_STACK_PAGES, task_frame_limit()) {
@@ -4485,6 +4529,7 @@ pub fn spawn_thread(
         owns_console: false,
         priority,
         context,
+        fp,
         stack: MemoryRegion::new(
             kernel_stack_start,
             kernel_stack_start + TASK_STACK_SIZE,
@@ -5940,6 +5985,7 @@ impl Task {
             cwd: String::from("/"),
             owns_console: cfg!(feature = "demo-tasks"),
             context,
+            fp: smp::FpState::zero(),
             stack,
             user_stack,
             user_stack_generation,
@@ -7056,6 +7102,7 @@ impl Task {
         self.resume_state = None;
         self.waiting_on = None;
         self.context = TaskContext::zero();
+        self.fp = smp::FpState::zero();
         self.resources_released = true;
     }
 }

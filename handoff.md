@@ -3925,3 +3925,96 @@ Next: log the block VA and PA **per round** and watch a round that is stable
 shortly before the failure, or write-protect the block page in the PTE and
 trap the first writer (a kernel linear-map write will not fault, a user or
 user-VA write will).
+
+## 2026-11-11 — ROOT CAUSE FOUND: FP/SIMD state was not context-switched
+
+The heap corruption that blocked GTK4/Phosh is fixed. The writer was **not**
+device DMA, a stale TLB, a second mapping, or a kernel linear-map store: the
+kernel never saved or restored the FP/SIMD register file (`q0..q31`, `FPCR`,
+`FPSR`) across tasks. Every task shared one physical vector register bank.
+
+### How it produced the `{0x218, 0}` suffix
+
+glibc's `__memset_generic` (and `__memset_kunpeng`) keeps the fill pattern in
+`v0` and writes it with `stp q0, q0` / `str q`. When a timer tick or a
+migration on the other CPU switched tasks in the middle of the memset, the
+incoming task's (or the kernel's) vector state replaced `v0`. The remaining
+stores then wrote that vector state — a constant 16-byte record — from the
+switch point `X` to the end of the buffer. That is exactly the observed
+shape: a 16-byte-aligned suffix of repeated `{u64 0x218, u64 0}`, ending at
+the malloc block boundary, with the prefix still holding the pattern.
+
+Proof (`simdtest.c`): set `v0` to `0x55…`, `nanosleep` (forces a context
+switch), read `v0` back. Before the fix every round returned `0x218`; after
+the fix every round returns `0x55…`.
+
+Why the earlier evidence pointed elsewhere:
+
+- a QEMU gdb watchpoint on the kernel linear alias of the frame never fired
+  (the clobbering store is a **user** store at the block's own VA);
+- write-protecting the block's PTE did not fault (the store targeted the
+  same, writable VA — the *value*, not the address, was wrong);
+- the frame's PA/PTE never changed and a full `tlbi vmalle1is` did not help;
+- a TCG plugin proved the corrupting store was never a `0x218` store on
+  vCPU0 — the `v0` clobber happened in the *other* task's context, and the
+  plugin's vCPU1 coverage was unproven (`c1=0` for every run);
+- `-smp 1` with the timer pushed 20 s out (`cntp_tval_el0`) never corrupted,
+  and `-smp 1` in general was clean: the switch has to land *inside* the
+  ~200 KiB memset.
+
+### Fix
+
+- `smp::FpState` (`q[32]`, `fpcr`, `fpsr`, 16-byte aligned) and
+  `PerCpu::fp` as the first `#[repr(C)]` field (offset 0, `FP_OFFSET`).
+- `silver_fp_save` / `silver_fp_restore` in `smp.rs` (`stp q`/`ldp q`).
+- Every EL0 entry saves the live file in `PerCpu::fp`; every EL0 exit
+  restores it immediately before `eret`. Only exceptions whose SPSR says
+  EL0t do this, so kernel-mode interrupts do not overwrite the task file.
+  Sites: SVC entry/epilogue, IRQ entry/epilogue (conditional), user-fault
+  entry/recovery, `silver_user_bootstrap`, `silver_fork_bootstrap`.
+- `Task.fp` holds the parked file. `schedule()` swaps `PerCpu::fp` with the
+  outgoing/incoming task just before `silver_context_switch`; `start()`
+  installs the first task's file.
+- `fork`/`clone` copy the **live** `PerCpu::fp` (the caller is inside its
+  own syscall); `exec` resets the file to zero.
+
+### Secondary fixes needed to reach GTK4
+
+- `linux_mmap`: anonymous mappings are now **lazily backed** (`let lazy =
+  true`). Eager backing charged an 8 MiB `pthread_create` stack as 2048
+  frames against the per-task budget even though only a few pages are used.
+  This is what made `g_thread_pool_new` return NULL and `GTask` assert in
+  `g_task_thread_pool_init` (GLib 2.90 creates a `pool-spawner` thread for
+  non-exclusive pools; if `pthread_create` fails it returns NULL).
+- `mem_policy`: per-task limit is now **3/4** of usable frames instead of
+  1/2 (`TASK_LIMIT_NUMERATOR/DENOMINATOR`). A GTK4 process maps ~120 MiB of
+  libraries on a 256 MiB machine (`libicudata` alone is 31.6 MiB). The
+  kernel reserve checked by `user_alloc_ok` is unchanged.
+
+### Results
+
+- `simdtest`: `before == after` on every round.
+- Corruption test (`transient1`, 200 KiB memset × 6000 rounds, `-smp 2`):
+  `transient mode=1 ok`, no corruption.
+- `tools/linux-test.sh` + 32 guest tests (hello, chain, rw, libc, pie,
+  mmapfile, cowfork, threads, unixsock, namedsock, signal, sighandler,
+  asyncsig, pipe, ipc, scope, dyn, dynsig, pthread, pthread-exit,
+  threadfork, memfd, futexping, eventloop, scratch, sockets, groupsig,
+  exitgroup, dbus, wlreal, glibtest, giotest): **32/32 OK**.
+- GTK4 image (`linuxrun /sfs/gtk4-serve`, which forks `/sfs/gtk4hello`):
+  no more `free(): invalid pointer`, no `GTask` assertion, no `TASKLIMIT`;
+  the client exits 0 and the compositor prints `gtk4 client ok`.
+  `gtk4hello` standalone now only reports `Failed to open display` when no
+  compositor is running (expected).
+
+### Still open
+
+- GTK4 client does not yet commit an shm frame (`gtk-serve: shm frame
+  committed` is not printed): the mini compositor's protocol surface still
+  needs what GTK4 waits for (surface configure / xdg-shell details). No
+  crash anymore, so this is protocol work, not stability.
+- Phosh itself (GTK4 + libadwaita + gtk4-layer-shell) is not started yet.
+- Multi-client compositing and host input injection remain.
+- `gdk-pixbuf` PNG loader recognition (`Couldn't recognize image file
+  format`) remains.
+- Host NVMe medium errors are unrelated but remain a hardware risk.
