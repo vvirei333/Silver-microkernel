@@ -4275,3 +4275,32 @@ Phosh uses the display in ways the demo never did:
 4. Memory/process management in the iOS direction: a memory-pressure signal
    (jetsam-like), per-process priority/QoS, and killing/suspending background
    tasks before the kernel reserve is reached.
+
+## 2026-11-11 — Host input reaches Phosh
+
+The WIN1 header already carried an input ring (`0x100`, 64 slots of 8 bytes:
+kind, value, key, x, y; head at `0x20`, tail at `0x24`). The viewer now also
+emits `kInputRelease` on mouse release, and the compositor pumps the ring:
+
+- `receive_message` waits with `ppoll` for at most 20 ms; a timeout lets
+  `serve` call `poll_input` while the client is idle. A partial message is
+  completed before returning (`incoming` is shared by all clients).
+- `poll_input` forwards move/click/release/scroll to `wl_pointer` and keys to
+  `wl_keyboard`, in surface-local logical coordinates (`x/2`, `y/2` for
+  `wl_output.scale=2`).
+- The pointer/keyboard `enter` is retried until the seat proxies exist: the
+  first buffer can be committed before `get_pointer`/`get_keyboard`, and the
+  old one-shot flag lost the enter forever. The first enter uses (100,50) as
+  the demo client expects.
+- The compositor clears the input ring when it maps `/dev/ivshmem`, so a
+  previous run's swipe does not replay into a fresh boot.
+
+Phosh's lockscreen is a layer surface, so `focus_surface` falls back to the
+committing surface (not only an xdg toplevel). A host swipe now drags the
+lockscreen up and reveals the home screen; a downward swipe from the top
+opens the quick-settings panel (Cellular/Wi-Fi/Bluetooth tiles, brightness and
+volume sliders, Landscape). Pointer focus is still "last committed surface",
+so hit-testing by layer/position is the next refinement.
+
+Tests stay green: `linux-wlreal` (clipboard, layer-shell, two clients) and
+`layer-serve` (compose, client, server).

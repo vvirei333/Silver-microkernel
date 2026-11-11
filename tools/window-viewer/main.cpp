@@ -77,7 +77,13 @@ constexpr uint64_t kInputRing = 0x0100;
 constexpr uint32_t kInputSlots = 64;
 constexpr uint64_t kInputEntry = 8;
 
-enum InputKind : uint8_t { kInputKey = 1, kInputScroll = 2, kInputClick = 3, kInputMove = 4 };
+enum InputKind : uint8_t {
+    kInputKey = 1,
+    kInputScroll = 2,
+    kInputClick = 3,
+    kInputMove = 4,
+    kInputRelease = 5,
+};
 
 constexpr uint32_t kWebErrorNone = 0;
 constexpr uint32_t kWebErrorNetwork = 1;
@@ -612,6 +618,21 @@ protected:
         }
         const QPoint point = guestPoint(event->position().toPoint());
         pushInput(m_shared.data, kInputClick, value, 0,
+                  static_cast<uint16_t>(qBound(0, point.x(), 65535)),
+                  static_cast<uint16_t>(qBound(0, point.y(), 65535)));
+    }
+
+    void mouseReleaseEvent(QMouseEvent *event) override {
+        uint8_t value = 0;
+        if (event->button() == Qt::LeftButton) {
+            value = (event->modifiers() & Qt::ControlModifier) ? 3 : 1;
+        } else if (event->button() == Qt::MiddleButton) {
+            value = 2;
+        } else {
+            return;
+        }
+        const QPoint point = guestPoint(event->position().toPoint());
+        pushInput(m_shared.data, kInputRelease, value, 0,
                   static_cast<uint16_t>(qBound(0, point.x(), 65535)),
                   static_cast<uint16_t>(qBound(0, point.y(), 65535)));
     }

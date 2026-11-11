@@ -135,6 +135,20 @@ static long send_message(long fd, int pass_fd) {
 
 /* Reads one queued message; returns 0 on EOF. */
 static long receive_message(long fd) {
+    /* Wait up to 20 ms for a client message; a timeout lets `serve` pump the
+       host input ring even when the client has nothing to say. */
+    struct { long seconds; long nanoseconds; } timeout = { 0, 20000000 };
+    struct { int fd; short events; short revents; } ready;
+    ready.fd = (int)fd;
+    ready.events = 1; /* POLLIN */
+    ready.revents = 0;
+    long polled = sys6(73 /* ppoll */, (long)&ready, 1, (long)&timeout, 0, 0, 0);
+    if (polled == 0) {
+        return -2;
+    }
+    if (polled < 0) {
+        return -1;
+    }
     struct iovec vector = {
         incoming + incoming_pending,
         sizeof(incoming) - incoming_pending,
@@ -578,6 +592,23 @@ static unsigned buffer_stride;
 static unsigned buffer_format;
 static unsigned char *screen;
 static unsigned screen_seq;
+
+/* Host input ring in the WIN1 header (tools/window-viewer/main.cpp). */
+#define INPUT_RING 0x100
+#define INPUT_SLOTS 64
+#define INPUT_ENTRY 8
+#define INPUT_HEAD 0x20
+#define INPUT_TAIL 0x24
+#define INPUT_KEY 1
+#define INPUT_SCROLL 2
+#define INPUT_CLICK 3
+#define INPUT_MOVE 4
+#define INPUT_RELEASE 5
+static unsigned focus_surface;
+static unsigned pointer_x;
+static unsigned pointer_y;
+static int pointer_entered;
+static int keyboard_entered;
 #ifdef SERVE_ONLY
 static int frame_reported;
 #endif
@@ -670,6 +701,11 @@ typedef struct {
     unsigned commits;
     int focused;
     int surface_entered;
+    unsigned focus_surface;
+    unsigned pointer_x;
+    unsigned pointer_y;
+    int pointer_entered;
+    int keyboard_entered;
     unsigned data_mime_count;
     char data_mimes[4][64];
     long fd;
@@ -680,6 +716,8 @@ typedef struct {
     PoolSlot pools[MAX_POOLS];
     BufferSlot buffers[MAX_BUFFERS];
     unsigned attached_buffers[SURFACE_IDS];
+    LayerSurface layer_surfaces[MAX_LAYER_SURFACES];
+    unsigned shm_ids[MAX_SHM];
 } ClientState;
 
 #define CLIENT_SCALARS(X) \
@@ -709,6 +747,8 @@ typedef struct {
     X(output_manager_id) X(output_config_id) \
     X(popup_grab) X(popup_committed) X(pool_id) X(buffer_id) X(frame_id) \
     X(pool_fd) X(verified) X(commits) X(focused) X(surface_entered) \
+    X(focus_surface) X(pointer_x) X(pointer_y) X(pointer_entered) \
+    X(keyboard_entered) \
     X(data_mime_count) X(selection_changed) X(wants_offer)
 
 #define MAX_CLIENTS 2
@@ -740,6 +780,12 @@ static void load_client(ClientState *client) {
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         attached_buffers[index] = client->attached_buffers[index];
     }
+    for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
+        layer_surfaces[index] = client->layer_surfaces[index];
+    }
+    for (unsigned index = 0; index < MAX_SHM; index++) {
+        shm_ids[index] = client->shm_ids[index];
+    }
 }
 
 static void save_client(ClientState *client) {
@@ -755,6 +801,12 @@ static void save_client(ClientState *client) {
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         client->attached_buffers[index] = attached_buffers[index];
+    }
+    for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
+        client->layer_surfaces[index] = layer_surfaces[index];
+    }
+    for (unsigned index = 0; index < MAX_SHM; index++) {
+        client->shm_ids[index] = shm_ids[index];
     }
 }
 
@@ -986,8 +1038,93 @@ static void layer_compose(void) {
 }
 #endif
 
+static void poll_input(long client) {
+    if (screen == 0) {
+        return;
+    }
+    unsigned head = *(volatile unsigned *)(screen + INPUT_HEAD);
+    unsigned tail = *(volatile unsigned *)(screen + INPUT_TAIL);
+    unsigned guard = 0;
+    while (tail != head && guard++ < INPUT_SLOTS) {
+        const unsigned char *entry =
+            (const unsigned char *)(screen + INPUT_RING +
+                                    (tail % INPUT_SLOTS) * INPUT_ENTRY);
+        unsigned kind = entry[0];
+        unsigned value = entry[1];
+        unsigned key = entry[2] | ((unsigned)entry[3] << 8);
+        unsigned x = entry[4] | ((unsigned)entry[5] << 8);
+        unsigned y = entry[6] | ((unsigned)entry[7] << 8);
+        if (kind == INPUT_MOVE) {
+            if (value == 1) {
+                if (pointer_id != 0 && pointer_entered) {
+                    begin(pointer_id, 1 /* leave */);
+                    put_u32(configure_serial);
+                    put_u32(focus_surface);
+                    finish();
+                    send_message(client, -1);
+                    pointer_entered = 0;
+                }
+            } else {
+                pointer_x = x;
+                pointer_y = y;
+                if (pointer_id != 0 && pointer_entered) {
+                    begin(pointer_id, 2 /* motion */);
+                    put_u32(0); /* time */
+                    put_i32((int)(x >> 1) << 8);
+                    put_i32((int)(y >> 1) << 8);
+                    finish();
+                    send_message(client, -1);
+                }
+            }
+        } else if (kind == INPUT_CLICK || kind == INPUT_RELEASE) {
+            if (pointer_id != 0) {
+                unsigned button = (value & 3) == 2 ? 0x112u : 0x110u;
+                begin(pointer_id, 3 /* button */);
+                put_u32(configure_serial);
+                put_u32(0); /* time */
+                put_u32(button);
+                put_u32(kind == INPUT_CLICK ? 1u : 0u);
+                finish();
+                send_message(client, -1);
+            }
+        } else if (kind == INPUT_KEY) {
+            if (keyboard_id != 0) {
+                begin(keyboard_id, 3 /* key */);
+                put_u32(configure_serial);
+                put_u32(0); /* time */
+                put_u32(key);
+                put_u32(1); /* pressed */
+                finish();
+                send_message(client, -1);
+            }
+        } else if (kind == INPUT_SCROLL) {
+            if (pointer_id != 0) {
+                begin(pointer_id, 4 /* axis */);
+                put_u32(0); /* time */
+                put_u32(0); /* vertical */
+                put_i32((int)value * 10 * 256);
+                finish();
+                send_message(client, -1);
+            }
+        }
+        tail = (tail + 1) % INPUT_SLOTS;
+        *(volatile unsigned *)(screen + INPUT_TAIL) = tail;
+    }
+}
+
 static int serve(long client) {
-    long count = receive_message(client);
+    poll_input(client);
+    long count;
+    do {
+        count = receive_message(client);
+        /* A partial message must be completed before the multi-client loop
+           switches away: `incoming` and `incoming_pending` are shared by all
+           clients. Only an idle client (no pending tail) yields on timeout. */
+    } while (count == -2 && incoming_pending != 0);
+    if (count == -2) {
+        poll_input(client);
+        return 0; /* input serviced, no client message */
+    }
     if (count == 0) {
         return 1; /* peer closed */
     }
@@ -1905,30 +2042,34 @@ static int serve(long client) {
                     }
 #endif
                 }
-                if (buffer_id != 0 && !focused) {
-                    focused = 1;
-                    if (keyboard_id != 0) {
+                if (buffer_id != 0) {
+                    /* Retry until the client has created the seat proxies:
+                       the first buffer may be committed before get_pointer /
+                       get_keyboard, and a one-shot flag would lose the
+                       enter forever. */
+                    focus_surface = (layer_slot != 0)
+                                        ? object
+                                        : (surface_id != 0 ? surface_id : object);
+                    if (keyboard_id != 0 && !keyboard_entered &&
+                        focus_surface != 0) {
                         begin(keyboard_id, 1 /* enter */);
                         put_u32(configure_serial);
-                        put_u32(surface_id);
+                        put_u32(focus_surface);
                         put_u32(0); /* keys array, empty */
                         finish();
                         send_message(client, -1);
+                        keyboard_entered = 1;
                     }
-                    if (pointer_id != 0) {
+                    if (pointer_id != 0 && !pointer_entered &&
+                        focus_surface != 0) {
                         begin(pointer_id, 0 /* enter */);
                         put_u32(configure_serial);
-                        put_u32(surface_id);
-                        put_i32(100 << 8);
-                        put_i32(50 << 8);
+                        put_u32(focus_surface);
+                        put_i32((int)(pointer_x >> 1) << 8);
+                        put_i32((int)(pointer_y >> 1) << 8);
                         finish();
                         send_message(client, -1);
-                        begin(pointer_id, 2 /* motion */);
-                        put_u32(1);
-                        put_i32(100 << 8);
-                        put_i32(50 << 8);
-                        finish();
-                        send_message(client, -1);
+                        pointer_entered = 1;
                     }
                 }
                 if (committed_buffer != 0) {
@@ -2196,6 +2337,12 @@ static void reset_client(void) {
     commits = 0;
     focused = 0;
     surface_entered = 0;
+    /* The demo client expects the first enter at (100,50) logical. */
+    focus_surface = 0;
+    pointer_x = 200;
+    pointer_y = 100;
+    pointer_entered = 0;
+    keyboard_entered = 0;
     selection_changed = 0;
     wants_offer = 0;
 }
@@ -2218,6 +2365,11 @@ void _start(void) {
                                3 /* RW */, 1 /* MAP_SHARED */, shm, 0);
             if (mapped > 0) {
                 screen = (unsigned char *)mapped;
+                /* Drop input events left in the shared ring by a previous
+                   run; otherwise the first frame already reflects a stale
+                   swipe. */
+                *(volatile unsigned *)(screen + INPUT_HEAD) = 0;
+                *(volatile unsigned *)(screen + INPUT_TAIL) = 0;
                 static const char ready[] = "gtk-serve: screen mapped\n";
                 sys3(64, 1, (long)ready, sizeof(ready) - 1);
             } else {
