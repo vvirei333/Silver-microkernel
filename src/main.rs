@@ -102,6 +102,7 @@ mod sfs;
 mod sfs_format;
 mod user_program;
 mod virtio_blk;
+mod virtio_gpu;
 #[cfg(all(not(feature = "std"), feature = "smp"))]
 mod watchdog;
 #[cfg(not(feature = "std"))]
@@ -1686,6 +1687,9 @@ pub extern "C" fn kernel_main() -> ! {
             ram_log::log("KSFS mounted");
             // Install the app bundles on first boot (or after a size change).
             seed::seed_apps();
+            // `--gpu` attaches a virtio-gpu; report it so the driver work can
+            // be checked against a real device.
+            let _ = virtio_gpu::probe();
         }
     }
     #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]

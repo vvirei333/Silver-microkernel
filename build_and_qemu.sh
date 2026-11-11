@@ -135,16 +135,20 @@ fi
 
 GPU_ARGS=()
 if [ "$GPU" -eq 1 ]; then
-    if qemu-system-aarch64 -device virtio-gpu-gl-pci,help >/dev/null 2>&1; then
+    # `-device NAME,help` exits 0 even when the device is unknown, so the
+    # device list is the reliable check.
+    GPU_DEVICES="$(qemu-system-aarch64 -device help 2>&1)"
+    if printf '%s\n' "$GPU_DEVICES" | grep -q 'name "virtio-gpu-gl-pci"'; then
         GPU_ARGS+=(-device virtio-gpu-gl-pci)
         echo "GPU: virtio-gpu-gl-pci (virgl)"
-    elif qemu-system-aarch64 -device virtio-gpu-pci,help >/dev/null 2>&1; then
+    elif printf '%s\n' "$GPU_DEVICES" | grep -q 'name "virtio-gpu-pci"'; then
         GPU_ARGS+=(-device virtio-gpu-pci)
         echo "GPU: virtio-gpu-pci (2D)"
     else
         echo "GPU: no virtio-gpu device in this QEMU build; install" >&2
-        echo "     qemu-hw-display-virtio-gpu-pci and qemu-hw-display-virtio-gpu-pci-gl" >&2
-        echo "     (plus virglrenderer) and run again. Booting without a GPU." >&2
+        echo "     qemu-hw-display-virtio-gpu qemu-hw-display-virtio-gpu-pci" >&2
+        echo "     qemu-hw-display-virtio-gpu-pci-gl qemu-ui-egl-headless" >&2
+        echo "     and virglrenderer, then run again. Booting without a GPU." >&2
     fi
 fi
 

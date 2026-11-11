@@ -4618,3 +4618,15 @@ Real 3D is a separate track, because three layers are missing:
 
 Phosh 0.57 itself is GTK3/cairo, so it would not use the GPU; the win is for
 GTK4 apps and for compositing via dmabuf.
+
+### virtio-gpu discovery
+
+`src/virtio_gpu.rs` scans PCI for a virtio-gpu (0x1050 modern / 0x0010
+transitional), enables the memory window and prints the device and its BARs.
+It is wired into boot after the SFS mount, so `--gpu` boots show what the
+device exposes before the control queue and DRM work start.
+
+`--gpu` now detects the device through `-device help` (QEMU exits 0 for
+`-device NAME,help` even when the device is unknown, which made the old check
+always pass). The base modules `qemu-hw-display-virtio-gpu{,-pci}` are still
+needed for any virtio-gpu device to exist.
