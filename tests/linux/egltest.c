@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 /* Offscreen EGL/GLES2 test through Mesa's virtio_gpu driver.
  *
  * Uses the surfaceless platform: no window system, no dmabuf, just the
@@ -10,6 +11,7 @@
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <link.h>
 
 typedef unsigned int GLenum;
 typedef unsigned int GLuint;
@@ -91,13 +93,28 @@ extern void glFinish(void);
 extern void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,
                          GLenum format, GLenum type, void *pixels);
 
+static int dump_phdr(struct dl_phdr_info *info, size_t size, void *data) {
+    (void)size;
+    struct dump_state { int count; } *state = data;
+    printf("map %d base 0x%lx %s\n", state->count++, (unsigned long)info->dlpi_addr,
+           info->dlpi_name[0] != 0 ? info->dlpi_name : "(main)");
+    return 0;
+}
+
 int main(void) {
     /* Mesa/glvnd are found in the SFS root, not in /usr. The driver is
        selected explicitly: the DRI loader's PCI table does know virtio-gpu,
        but being explicit makes a failed probe obvious. */
     setenv("LD_LIBRARY_PATH", "/sfs", 1);
     setenv("LIBGL_DRIVERS_PATH", "/sfs", 1);
+#ifdef EGLTEST_VIRGL
     setenv("MESA_LOADER_DRIVER_OVERRIDE", "virtio_gpu", 1);
+#else
+    /* The default build exercises EGL+GLES end to end on the software
+       rasteriser: `virtio_gpu` needs libdrm's /sys device description, which
+       this guest does not have yet (see EGLTEST_VIRGL). */
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", "swrast", 1);
+#endif
     setenv("__EGL_VENDOR_LIBRARY_FILENAMES", "/sfs/egl_vendor.json", 1);
     setenv("EGL_PLATFORM", "surfaceless", 1);
     setenv("GBM_BACKENDS_PATH", "/sfs", 1);
@@ -110,8 +127,18 @@ int main(void) {
     /* The DRI module (`libdril_dri.so`) takes its driver entry points from
        libgallium as undefined symbols, so libgallium must be in the global
        scope before the module is loaded. */
-    void *gallium = dlopen("/sfs/libgallium-26.2.6.so", RTLD_NOW | RTLD_GLOBAL);
+    /* Describe the synthetic /dev/dri nodes the way a Linux guest with
+       virtio-gpu would: libdrm otherwise reads /sys, which does not exist. */
+#ifdef EGLTEST_VIRGL
+    /* Experimental virgl path. Mesa's loader asks libdrm to describe the
+       device behind the fd, and libdrm reads /sys, which this guest does not
+       have; the shim answers those enumeration calls. libgallium must be
+       global before the DRI stub resolves the driver entry points. */
+    void *shim = dlopen("/sfs/libdrm_shim.so", RTLD_NOW | RTLD_GLOBAL);
+    printf("egl: drm shim %s\n", shim != NULL ? "loaded" : dlerror());
+    void *gallium = dlopen("/sfs/libgallium-25.0.7.so", RTLD_NOW | RTLD_GLOBAL);
     printf("egl: gallium %s\n", gallium != NULL ? "loaded" : dlerror());
+#endif
     void *vendor = dlopen("/sfs/libEGL_mesa.so.0", RTLD_NOW | RTLD_GLOBAL);
     if (vendor == NULL) {
         printf("egl: vendor load failed: %s\n", dlerror());
@@ -124,6 +151,11 @@ int main(void) {
     } else {
         printf("egl: driver loaded\n");
     }
+    /* Which objects are mapped where: the kernel prints the user PC of the
+       capset queries, so this table names them. */
+    struct dump_state { int count; } state = {0};
+    dl_iterate_phdr(dump_phdr, &state);
+
     /* The surfaceless platform with EGL_DEFAULT_DISPLAY is swrast: to reach
        the virtio-gpu driver Mesa needs the render node fd. */
     int device = open("/dev/dri/renderD128", O_RDWR);

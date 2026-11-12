@@ -982,7 +982,11 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                     return Some(u64::MAX);
                 };
                 let virgl = crate::virtio_gpu::virgl_available();
-                getparam.value = match getparam.param {
+                // `value` is a user pointer to the result, not the result
+                // itself: Mesa passes `&value` and reads its own local, so
+                // the pointer must be saved before it is overwritten.
+                let output = getparam.value;
+                let value = match getparam.param {
                     VIRTGPU_PARAM_3D_FEATURES => virgl as u64,
                     VIRTGPU_PARAM_CAPSET_QUERY_FIX => 1,
                     VIRTGPU_PARAM_RESOURCE_BLOB => 0,
@@ -1000,7 +1004,9 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                     VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME => 0,
                     _ => return Some(u64::MAX),
                 };
-                if !store(argument, &getparam) {
+                if output == 0
+                    || user_memory::copy_to_user(&value.to_le_bytes(), output).is_err()
+                {
                     return Some(u64::MAX);
                 }
                 0

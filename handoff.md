@@ -4900,3 +4900,53 @@ line in `linux_abi`) and run `egltest` once. With Mesa 25 the expected
 sequence is `GETPARAM 1..7` then `VIRTGPU_CONTEXT_INIT` (0xC010644B) and
 `RESOURCE_CREATE`; if it stops earlier, the failing request is visible
 directly. Nothing else in the image needs to change.
+
+### VIRTGPU_GETPARAM takes a pointer
+
+`drm_virtgpu_getparam { u64 param; u64 value; }` — `value` is a **user
+pointer** to the result, not the result. Mesa passes `&value` and reads its
+own local afterwards. The driver wrote the answer into the struct field
+instead, so Mesa always saw `3D features = 0` and dropped the render node
+silently (no message at all).
+
+With the pointer written correctly, Mesa 25.0.7 goes all the way through:
+
+```text
+GETPARAM 1..7 (all succeed)
+drmGetVersion (major 0)
+VIRTGPU_CONTEXT_INIT -> 0        (virgl context created)
+GET_CAPS(2) -> 1408-byte virgl2 capset
+```
+
+and then fails at the EGL device check:
+
+```text
+MESA-LOADER: failed to retrieve device information
+libEGL debug: ... DRI2: failed to get compatible render device
+```
+
+`loader_is_device_render_capable` calls `drmGetDevice2`, and libdrm answers it
+by reading `/sys/dev/char/<maj>:<min>/device` (vendor/device/uevent, plus a
+`subsystem` symlink). This guest has no sysfs, so the check fails and Mesa
+falls back.
+
+`tests/linux/drm_shim.c` is an experimental userspace answer: it provides
+`drmGetDevice2`, `drmGetDevices2`, `drmGetDeviceFromDevId`, the free/equal
+helpers and the node-name helpers, describing the device as a Linux guest
+would see virtio-gpu (1af4:1050, primary + render nodes). With it Mesa creates
+the virgl context and fetches the capset, then dies with a translation fault
+inside libgallium's screen setup (`str` into an unmapped page just past a
+lazy mapping) — the shim is not consistent enough yet.
+
+Two ways forward:
+1. Give the kernel a tiny synthetic sysfs (`/sys/dev/char/<maj>:<min>/device`
+   with vendor/device/uevent and a `subsystem` symlink, plus `readlink` and
+   `faccessat` for those paths). Then Mesa works unmodified and the shim goes
+   away.
+2. Debug the shim crash: the faulting write is at `0x40A04004`, just past a
+   2-page lazy region, with the caller inside libgallium's `virgl_create_screen`
+   vtable fill.
+
+`egltest` now defaults to `MESA_LOADER_DRIVER_OVERRIDE=swrast` so the test is
+deterministic (Mesa 25.0.7 + llvmpipe, `egl test ok`); build it with
+`-DEGLTEST_VIRGL` to exercise the experimental virtio_gpu path with the shim.
