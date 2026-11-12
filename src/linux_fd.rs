@@ -248,7 +248,14 @@ enum Target {
     /// virtio-gpu scanout framebuffer (`/dev/gpufb`).
     GpuFb,
     /// DRM/KMS card (`/dev/dri/card0`), backed by virtio-gpu.
-    Drm,
+    Drm { render: bool },
+    /// A file in the synthetic sysfs tree (DRM device description).
+    Sysfs(&'static [u8], usize),
+    /// A synthetic directory listing (`/dev/dri`), with the next entry index.
+    DirList {
+        entries: &'static [&'static str],
+        offset: usize,
+    },
     Vfs(u64),
     Pipe {
         state: Arc<Mutex<PipeState>>,
@@ -449,6 +456,9 @@ fn insert_from(task: u64, target: Target, minimum: u64) -> Option<u64> {
     })
 }
 
+/// Nodes listed by the synthetic `/dev/dri` directory.
+const DRM_NODES: &[&str] = &["card0", "renderD128"];
+
 /// `openat(2)`. Write flags are rejected for real files (the VFS view is
 /// read-only), but synthetic devices accept writes.
 pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
@@ -462,6 +472,14 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     const O_DIRECTORY: u64 = 0o200000;
 
     let resolved = vfs::resolve(cwd, path).map_err(|_| ENOENT)?;
+    // Synthetic sysfs first: it exists only in the kernel.
+    if let Some(node) = crate::sysfs::lookup(&resolved) {
+        return match node {
+            crate::sysfs::Node::File(data) => insert(task, Target::Sysfs(data, 0)).ok_or(EMFILE),
+            crate::sysfs::Node::Dir => Err(EISDIR),
+            crate::sysfs::Node::Symlink(_) => Err(EINVAL),
+        };
+    }
     let device = match resolved.as_str() {
         "/dev/null" => Some(Target::Null),
         "/dev/zero" => Some(Target::Zero),
@@ -471,8 +489,16 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         // Only present when the machine has a virtio-gpu the driver brought
         // up; the compositor then presents through the GPU as well.
         "/dev/gpufb" if crate::virtio_gpu::size().is_some() => Some(Target::GpuFb),
-        "/dev/dri/card0" if crate::virtio_gpu::size().is_some() => Some(Target::Drm),
-        "/dev/dri/renderD128" if crate::virtio_gpu::virgl_available() => Some(Target::Drm),
+        "/dev/dri" if crate::virtio_gpu::size().is_some() => Some(Target::DirList {
+            entries: DRM_NODES,
+            offset: 0,
+        }),
+        "/dev/dri/card0" if crate::virtio_gpu::size().is_some() => {
+            Some(Target::Drm { render: false })
+        }
+        "/dev/dri/renderD128" if crate::virtio_gpu::virgl_available() => {
+            Some(Target::Drm { render: true })
+        }
         _ => None,
     };
     if let Some(device) = device {
@@ -651,7 +677,25 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         // stdin is not wired to the console yet; report EOF so a reader does
         // not spin.
         Target::Console => Ok(0),
-        Target::Drm => match crate::drm::read_event() {
+        Target::DirList { .. } => Err(EISDIR),
+        Target::Sysfs(data, offset) => {
+            if offset >= data.len() {
+                return Ok(0);
+            }
+            let take = (count as usize).min(data.len() - offset);
+            user_memory::copy_to_user(&data[offset..offset + take], buffer)
+                .map_err(|_| EFAULT)?;
+            // Advance the descriptor's offset in place.
+            let _ = with_table(task, |table| {
+                if let Some(Target::Sysfs(_, position)) =
+                    table.slots.get_mut(fd as usize).and_then(|slot| slot.as_mut())
+                {
+                    *position += take;
+                }
+            });
+            Ok(take as u64)
+        }
+        Target::Drm { .. } => match crate::drm::read_event() {
             Some(event) => {
                 user_memory::copy_to_user(&event, buffer).map_err(|_| EFAULT)?;
                 Ok(event.len() as u64)
@@ -776,7 +820,9 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         | Target::Random
         | Target::Ivshmem
         | Target::GpuFb
-        | Target::Drm => Ok(count),
+        | Target::Drm { .. }
+        | Target::Sysfs(_, _)
+        | Target::DirList { .. } => Ok(count),
         Target::Full => Err(ENOSPC),
         Target::Vfs(vfs_fd) => {
             let mut bytes = alloc::vec![0_u8; (count as usize).min(1 << 20)];
@@ -815,6 +861,21 @@ pub fn lseek(task: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, u64> {
     let task = crate::scheduler::fd_table_owner(task);
     match lookup(task, fd).ok_or(EBADF)? {
         Target::Vfs(vfs_fd) => vfs::lseek(task, vfs_fd, offset, whence).map_err(|_| EINVAL),
+        Target::DirList { .. } => {
+            // `rewinddir` only needs SEEK_SET 0.
+            if whence == 0 && offset == 0 {
+                let _ = with_table(task, |table| {
+                    if let Some(Target::DirList { offset, .. }) =
+                        table.slots.get_mut(fd as usize).and_then(|slot| slot.as_mut())
+                    {
+                        *offset = 0;
+                    }
+                });
+                Ok(0)
+            } else {
+                Err(EINVAL)
+            }
+        }
         Target::MemFd(state) => {
             let mut file = state.lock();
             let base = match whence {
@@ -903,8 +964,23 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
         | Target::Full
         | Target::Random
         | Target::Ivshmem
-        | Target::GpuFb
-        | Target::Drm => write_stat(buffer, S_IFCHR | 0o666, 0, fd.max(1)),
+        | Target::GpuFb => write_stat(buffer, S_IFCHR | 0o666, 0, fd.max(1)),
+        Target::Drm { render } => write_stat_rdev(
+            buffer,
+            S_IFCHR | 0o666,
+            0,
+            fd.max(1),
+            makedev(
+                crate::sysfs::DRM_MAJOR,
+                if render {
+                    crate::sysfs::RENDER_MINOR
+                } else {
+                    crate::sysfs::CARD_MINOR
+                },
+            ),
+        ),
+        Target::Sysfs(data, _) => write_stat(buffer, S_IFREG | 0o444, data.len() as u64, fd.max(1)),
+        Target::DirList { .. } => write_stat(buffer, S_IFDIR | 0o555, 0, fd.max(1)),
         Target::Vfs(vfs_fd) => {
             let size = vfs::fd_len(task, vfs_fd).map_err(|_| EBADF)?;
             let kind = vfs::fd_kind(task, vfs_fd).unwrap_or(vfs::FD_KIND_FILE);
@@ -946,7 +1022,45 @@ pub fn directory_path(task: u64, fd: u64) -> Option<String> {
 pub fn getdents64(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
     let task = crate::scheduler::fd_table_owner(task);
     const HEADER: usize = 19; // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1)
-    let Target::Vfs(vfs_fd) = lookup(task, fd).ok_or(EBADF)? else {
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    if let Target::DirList { entries, offset } = target {
+        if count == 0 {
+            return Ok(0);
+        }
+        let limit = (count as usize).min(64 * 1024);
+        let mut output = alloc::vec![0_u8; limit];
+        let mut used = 0usize;
+        let mut serialized = 0usize;
+        for (index, name) in entries.iter().enumerate().skip(offset) {
+            let name_len = name.len();
+            let record = (HEADER + name_len + 1 + 7) & !7;
+            if used + record > limit {
+                break;
+            }
+            let ino = (index + 1) as u64;
+            output[used..used + 8].copy_from_slice(&ino.to_le_bytes());
+            output[used + 8..used + 16].copy_from_slice(&(ino as i64).to_le_bytes());
+            output[used + 16..used + 18].copy_from_slice(&(record as u16).to_le_bytes());
+            output[used + 18] = 2; // DT_CHR
+            output[used + HEADER..used + HEADER + name_len]
+                .copy_from_slice(name.as_bytes());
+            used += record;
+            serialized += 1;
+        }
+        if serialized == 0 {
+            return Ok(0);
+        }
+        user_memory::copy_to_user(&output[..used], buffer).map_err(|_| EFAULT)?;
+        let _ = with_table(task, |table| {
+            if let Some(Target::DirList { offset, .. }) =
+                table.slots.get_mut(fd as usize).and_then(|slot| slot.as_mut())
+            {
+                *offset += serialized;
+            }
+        });
+        return Ok(used as u64);
+    }
+    let Target::Vfs(vfs_fd) = target else {
         return Err(ENOTDIR);
     };
     if count == 0 {
@@ -1941,7 +2055,9 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::Random
         | Target::Ivshmem
         | Target::GpuFb
-        | Target::Drm
+        | Target::Drm { .. }
+        | Target::Sysfs(_, _)
+        | Target::DirList { .. }
         | Target::MemFd(_)
         | Target::Epoll(_) => (O_RDWR, false),
     };
@@ -1982,7 +2098,8 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
         Target::Console | Target::Null => POLLIN | POLLOUT,
         Target::Zero | Target::Random => POLLIN,
         Target::Ivshmem | Target::GpuFb => POLLIN | POLLOUT,
-        Target::Drm => {
+        Target::Sysfs(_, _) | Target::DirList { .. } => POLLIN | POLLOUT,
+        Target::Drm { .. } => {
             if crate::drm::event_pending() {
                 POLLIN | POLLOUT
             } else {
@@ -2096,10 +2213,42 @@ pub fn fork_table(parent: u64, child: u64) {
 }
 
 pub(crate) fn write_stat(buffer: u64, mode: u32, size: u64, ino: u64) -> Result<(), u64> {
+    write_stat_rdev(buffer, mode, size, ino, 0)
+}
+
+/// Linux `makedev()` for the 64-bit dev_t encoding.
+pub(crate) fn makedev(major: u32, minor: u32) -> u64 {
+    ((major as u64 & 0xfff) << 8)
+        | (minor as u64 & 0xff)
+        | ((minor as u64 & !0xff) << 12)
+        | ((major as u64 & !0xfff) << 32)
+}
+
+/// True for the synthetic device nodes this kernel exposes under `/dev`.
+pub fn device_exists(path: &str) -> bool {
+    match path {
+        "/dev/null" | "/dev/zero" | "/dev/full" | "/dev/urandom" | "/dev/random" => true,
+        "/dev/ivshmem" => true,
+        "/dev/gpufb" => crate::virtio_gpu::size().is_some(),
+        "/dev/dri" => crate::virtio_gpu::size().is_some(),
+        "/dev/dri/card0" => crate::virtio_gpu::size().is_some(),
+        "/dev/dri/renderD128" => crate::virtio_gpu::virgl_available(),
+        _ => false,
+    }
+}
+
+pub(crate) fn write_stat_rdev(
+    buffer: u64,
+    mode: u32,
+    size: u64,
+    ino: u64,
+    rdev: u64,
+) -> Result<(), u64> {
     let mut stat = [0_u8; 128];
     stat[8..16].copy_from_slice(&ino.to_le_bytes()); // st_ino
     stat[16..20].copy_from_slice(&mode.to_le_bytes()); // st_mode
     stat[20..24].copy_from_slice(&1_u32.to_le_bytes()); // st_nlink
+    stat[32..40].copy_from_slice(&rdev.to_le_bytes()); // st_rdev
     stat[48..56].copy_from_slice(&size.to_le_bytes()); // st_size
     stat[56..60].copy_from_slice(&1024_u32.to_le_bytes()); // st_blksize
     stat[64..72].copy_from_slice(&size.div_ceil(512).to_le_bytes()); // st_blocks
@@ -2145,7 +2294,7 @@ pub fn is_ivshmem(task: u64, fd: u64) -> bool {
 /// True when `fd` names the DRM/KMS card.
 pub fn is_drm(task: u64, fd: u64) -> bool {
     let task = crate::scheduler::fd_table_owner(task);
-    matches!(lookup(task, fd), Some(Target::Drm))
+    matches!(lookup(task, fd), Some(Target::Drm { .. }))
 }
 
 /// True when `fd` names the virtio-gpu scanout framebuffer.

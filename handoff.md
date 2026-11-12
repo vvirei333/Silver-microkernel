@@ -4955,3 +4955,53 @@ deterministic (Mesa 25.0.7 + llvmpipe, `egl test ok`); build it with
 the kernel wrote through the pointer; it now passes `&value` like Mesa and
 prints `3d features 1`, `capset ids 6`, `caps bytes 1408`, `render test ok`
 on a `virtio-gpu-gl-pci` boot. `drmtest` and `layer-serve` stay green.
+
+### Synthetic sysfs: libdrm accepts the render node
+
+Mesa's loader asks libdrm to describe the device behind the fd, and libdrm
+(on Linux) walks `/sys/dev/char/<maj>:<min>` and then **enumerates
+`/dev/dri`** with `opendir`. Neither exists in this guest, so
+`drmGetDevice2` failed with EACCES and Mesa reported "DRI2: failed to get
+compatible render device".
+
+`src/sysfs.rs` now answers exactly that:
+
+- `/sys/dev/char/226:{0,128}/device/{vendor,device,subsystem_vendor,
+  subsystem_device}` = 1af4 / 1050 / 1af4 / 1100,
+- `device/uevent` with `DRIVER=virtio-pci` and the PCI ids,
+- `device/subsystem` as a symlink to `/sys/bus/pci`,
+- `device/drm` (libdrm's `drmNodeIsDRM` only stats it),
+- `dev` = `226:0` / `226:128`.
+
+Supporting that needed four kernel pieces: `open`/`read`/`fstat` for the
+synthetic files, `readlinkat`, `newfstatat`/`faccessat` for them, and a
+synthetic `/dev/dri` **directory** with `getdents64` (libdrm enumerates it).
+`fstat` on `/dev/dri/*` now reports `S_IFCHR` with the right `st_rdev`, and
+`faccessat` only claims the nodes that actually exist — the old blanket
+`/dev exists` made libdrm classify `renderD128` as a primary node.
+
+Result: `drmGetDevice2` returns 0 with `available_nodes = 0x5`
+(primary|render), and Mesa gets past the device check.
+
+`tests/linux/sysfstest.c` checks the tree directly (stat/open/read/readlink).
+
+### Remaining: crash inside libgallium's screen setup
+
+With the device accepted, Mesa creates the virgl context, fetches the
+1408-byte virgl2 capset, and then dies with a translation fault:
+
+```text
+FAULT elr 0x411FD8B0 (libgallium +0x41d8b0) x1 0x44800
+Page Fault at 0x40A04000 (ESR 0x92000047, write, translation fault L3)
+```
+
+`0x40A04000` is in no mmap region. The instruction is `stp s13, s12,
+[x19, #8]` inside a loop that also does `str w1, [x20, #14712]` and
+`ldr w1, [x22, #7440]` — it looks like a loop over a table whose pointer and
+count come from a structure. Next step: print `x19`/`x20`/`x21`/`x22` and the
+mmap regions at fault time, and check whether the table pointer is derived
+from a capset value we return (e.g. a capability count or size the driver
+expects to be smaller).
+
+`egltest` (default build) and `sysfstest` pass; `drmtest`, `rendertest`
+(GL device) and `layer-serve` stay green.

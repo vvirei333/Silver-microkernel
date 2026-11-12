@@ -12,6 +12,8 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <link.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 typedef unsigned int GLenum;
 typedef unsigned int GLuint;
@@ -130,12 +132,9 @@ int main(void) {
     /* Describe the synthetic /dev/dri nodes the way a Linux guest with
        virtio-gpu would: libdrm otherwise reads /sys, which does not exist. */
 #ifdef EGLTEST_VIRGL
-    /* Experimental virgl path. Mesa's loader asks libdrm to describe the
-       device behind the fd, and libdrm reads /sys, which this guest does not
-       have; the shim answers those enumeration calls. libgallium must be
-       global before the DRI stub resolves the driver entry points. */
-    void *shim = dlopen("/sfs/libdrm_shim.so", RTLD_NOW | RTLD_GLOBAL);
-    printf("egl: drm shim %s\n", shim != NULL ? "loaded" : dlerror());
+    /* Experimental virgl path: libgallium must be global before the DRI stub
+       resolves the driver entry points. The device description libdrm needs
+       now comes from the kernel's synthetic sysfs. */
     void *gallium = dlopen("/sfs/libgallium-25.0.7.so", RTLD_NOW | RTLD_GLOBAL);
     printf("egl: gallium %s\n", gallium != NULL ? "loaded" : dlerror());
 #endif
@@ -151,6 +150,50 @@ int main(void) {
     } else {
         printf("egl: driver loaded\n");
     }
+#ifdef EGLTEST_VIRGL
+    /* Ask libdrm directly what it makes of the render node. */
+    {
+        void *drm = dlopen("/sfs/libdrm.so.2", RTLD_NOW | RTLD_GLOBAL);
+        int (*get_device)(int, unsigned int, void **) =
+            drm != NULL ? (int (*)(int, unsigned int, void **))dlsym(drm, "drmGetDevice2") : NULL;
+        int node = open("/dev/dri/renderD128", O_RDWR);
+        struct stat st;
+        int frc = node >= 0 ? fstat(node, &st) : -1;
+        printf("fstat rc %d mode 0%o rdev %llu major %u minor %u\n", frc,
+               frc == 0 ? (unsigned)st.st_mode : 0,
+               frc == 0 ? (unsigned long long)st.st_rdev : 0ull,
+               frc == 0 ? major(st.st_rdev) : 0,
+               frc == 0 ? minor(st.st_rdev) : 0);
+        void *device = NULL;
+        int rc = (get_device != NULL && node >= 0) ? get_device(node, 0, &device) : -999;
+        printf("libdrm device: rc %d ptr %p\n", rc, device);
+        if (rc == 0 && device != NULL) {
+            int available = *(int *)((char *)device + 8);
+            printf("libdrm device: available_nodes 0x%x\n", available);
+        }
+    }
+
+    /* Reproduce libdrm's sysfs reads (fopen + fscanf("%x")) exactly. */
+    {
+        static const char *attrs[] = {"vendor", "device", "subsystem_vendor",
+                                      "subsystem_device"};
+        for (unsigned i = 0; i < 4; i++) {
+            char path[128];
+            snprintf(path, sizeof(path), "/sys/dev/char/226:128/device/%s", attrs[i]);
+            FILE *fp = fopen(path, "r");
+            if (fp == NULL) {
+                printf("sysfs %s: fopen failed\n", attrs[i]);
+                continue;
+            }
+            unsigned value = 0;
+            int parsed = fscanf(fp, "%x", &value);
+            fclose(fp);
+            printf("sysfs %s: ret %d value 0x%x\n", attrs[i], parsed, value);
+        }
+    }
+
+#endif
+
     /* Which objects are mapped where: the kernel prints the user PC of the
        capset queries, so this table names them. */
     struct dump_state { int count; } state = {0};

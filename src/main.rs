@@ -102,6 +102,7 @@ mod sfs;
 mod sfs_format;
 mod user_program;
 mod drm;
+mod sysfs;
 mod virtio_blk;
 mod virtio_gpu;
 #[cfg(all(not(feature = "std"), feature = "smp"))]

@@ -167,6 +167,7 @@ const MSG_CTRUNC: i32 = 0x8;
 const AT_FDCWD: i64 = -100;
 const AT_EMPTY_PATH: u64 = 0x1000;
 /// `struct stat` mode classes.
+const S_IFLNK: u32 = 0o120000;
 const S_IFCHR: u32 = 0o020000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
@@ -262,7 +263,7 @@ fn dispatch_inner(
             args[1],
             args[2],
         )),
-        SYS_READLINKAT => errno(ENOENT),
+        SYS_READLINKAT => linux_readlinkat(args[0], args[1], args[2], args[3]),
         SYS_NANOSLEEP => linux_nanosleep(args[0], args[1]),
         SYS_CLOCK_NANOSLEEP => linux_nanosleep(args[2], args[3]),
         SYS_CLOCK_GETRES => linux_clock_getres(args[1]),
@@ -1599,6 +1600,11 @@ fn linux_faccessat(dirfd: u64, path_ptr: u64, mode: u64) -> u64 {
     let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
         return errno(ENOENT);
     };
+    if crate::sysfs::lookup(&resolved).is_some() || linux_fd::device_exists(&resolved) {
+        // Synthetic nodes are read-only; a write probe reports EROFS like the
+        // rest of the image.
+        return if mode & W_OK != 0 { errno(EROFS) } else { 0 };
+    }
     if !scheduler::current_read_path_allowed(&resolved) {
         return errno(EACCES);
     }
@@ -1610,7 +1616,10 @@ fn linux_faccessat(dirfd: u64, path_ptr: u64, mode: u64) -> u64 {
         // declare every cache directory unwritable.
         return errno(EROFS);
     }
-    if resolved.starts_with("/dev/")
+    // Only the nodes the kernel actually exposes: a blanket "/dev exists"
+    // made libdrm's `drmGetMinorType` see card128 and classify the render
+    // node as a primary one.
+    if linux_fd::device_exists(&resolved)
         || crate::vfs::file_len(&cwd, &resolved).is_ok()
         || crate::vfs::resolve_directory(&cwd, &resolved).is_ok()
     {
@@ -1639,6 +1648,29 @@ fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
     let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
         return errno(ENOENT);
     };
+    if let Some(node) = crate::sysfs::lookup(&resolved) {
+        let (mode, size) = match node {
+            crate::sysfs::Node::File(data) => (S_IFREG | 0o444, data.len() as u64),
+            crate::sysfs::Node::Dir => (S_IFDIR | 0o755, 0),
+            crate::sysfs::Node::Symlink(target) => (S_IFLNK | 0o777, target.len() as u64),
+        };
+        return match linux_fd::write_stat(buffer, mode, size, linux_fd::path_ino(&resolved)) {
+            Ok(()) => 0,
+            Err(code) => errno(code),
+        };
+    }
+    if let Some((mode, rdev)) = synthetic_device_stat(&resolved) {
+        return match linux_fd::write_stat_rdev(
+            buffer,
+            mode,
+            0,
+            linux_fd::path_ino(&resolved),
+            rdev,
+        ) {
+            Ok(()) => 0,
+            Err(code) => errno(code),
+        };
+    }
     if !scheduler::current_read_path_allowed(&resolved) {
         return errno(EACCES);
     }
@@ -1669,6 +1701,46 @@ fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
         };
     }
     errno(ENOENT)
+}
+
+/// Mode and `st_rdev` for a synthetic `/dev` node.
+fn synthetic_device_stat(path: &str) -> Option<(u32, u64)> {
+    const S_IFCHR: u32 = 0o020000;
+    match path {
+        "/dev/dri/card0" if crate::virtio_gpu::size().is_some() => Some((
+            S_IFCHR | 0o666,
+            linux_fd::makedev(crate::sysfs::DRM_MAJOR, crate::sysfs::CARD_MINOR),
+        )),
+        "/dev/dri/renderD128" if crate::virtio_gpu::virgl_available() => Some((
+            S_IFCHR | 0o666,
+            linux_fd::makedev(crate::sysfs::DRM_MAJOR, crate::sysfs::RENDER_MINOR),
+        )),
+        _ if linux_fd::device_exists(path) => Some((S_IFCHR | 0o666, 0)),
+        _ => None,
+    }
+}
+
+/// `readlinkat(2)`: the synthetic sysfs symlinks (`device/subsystem`).
+fn linux_readlinkat(dirfd: u64, path_ptr: u64, buffer: u64, size: u64) -> u64 {
+    let Some(path) = user_string(path_ptr) else {
+        return errno(EFAULT);
+    };
+    let cwd = match dirfd_cwd(dirfd) {
+        Ok(cwd) => cwd,
+        Err(code) => return code,
+    };
+    let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
+        return errno(ENOENT);
+    };
+    let Some(target) = crate::sysfs::symlink(&resolved) else {
+        return errno(ENOENT);
+    };
+    let bytes = target.as_bytes();
+    let take = bytes.len().min(size as usize);
+    if user_memory::copy_to_user(&bytes[..take], buffer).is_err() {
+        return errno(EFAULT);
+    }
+    take as u64
 }
 
 /// `fcntl(2)`: descriptor duplication plus the flags queries every libc probes.
