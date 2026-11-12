@@ -4950,3 +4950,8 @@ Two ways forward:
 `egltest` now defaults to `MESA_LOADER_DRIVER_OVERRIDE=swrast` so the test is
 deterministic (Mesa 25.0.7 + llvmpipe, `egl test ok`); build it with
 `-DEGLTEST_VIRGL` to exercise the experimental virtio_gpu path with the shim.
+
+`rendertest` used the old (wrong) GETPARAM semantics and started failing once
+the kernel wrote through the pointer; it now passes `&value` like Mesa and
+prints `3d features 1`, `capset ids 6`, `caps bytes 1408`, `render test ok`
+on a `virtio-gpu-gl-pci` boot. `drmtest` and `layer-serve` stay green.

@@ -108,22 +108,25 @@ void _start(void) {
     }
     print("render: renderD128 open\n", 23);
 
+    /* `value` is a user pointer to the result, as in the real ioctl. */
     struct getparam param;
+    unsigned long param_value = 0;
     param.param = 1; /* VIRTGPU_PARAM_3D_FEATURES */
-    param.value = 0;
+    param.value = (unsigned long)&param_value;
     if (sys3(29, fd, DRM_IOCTL_VIRTGPU_GETPARAM, (long)&param) < 0) {
         print("render: GETPARAM failed\n", 23);
         sys3(93, 1, 0, 0);
     }
-    print_number("render: 3d features ", param.value);
+    print_number("render: 3d features ", (long)param_value);
 
+    param_value = 0;
     param.param = 7; /* VIRTGPU_PARAM_SUPPORTED_CAPSET_IDS */
-    param.value = 0;
+    param.value = (unsigned long)&param_value;
     if (sys3(29, fd, DRM_IOCTL_VIRTGPU_GETPARAM, (long)&param) < 0) {
         print("render: capset ids failed\n", 26);
         sys3(93, 1, 0, 0);
     }
-    print_number("render: capset ids ", param.value);
+    print_number("render: capset ids ", (long)param_value);
 
     static unsigned char caps[4096];
     struct get_caps getcaps;
