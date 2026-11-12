@@ -23,9 +23,18 @@ const PCI_DEVICE_GPU_TRANSITIONAL: u16 = 0x0010;
 /// A different 1 GiB device window than virtio-blk's 0x1010_0000.
 const GPU_BAR4_PA: usize = 0x1020_0000;
 const QUEUE_SIZE: usize = 64;
-/// Staging area for `SUBMIT_3D` command buffers.
-const SUBMIT_PAGES: usize = 32;
+/// Staging area for `SUBMIT_3D` command buffers. Mesa's virgl winsys grows
+/// its command buffer to `VIRGL_MAX_CMDBUF_DWORDS` (64K dwords = 256 KiB), so
+/// anything smaller silently rejects valid submissions and desynchronises the
+/// host's decoder.
+const SUBMIT_PAGES: usize = 72;
 const SUBMIT_BYTES: usize = SUBMIT_PAGES * 4096;
+
+/// The control queue is shared by every task that touches the GPU (2D
+/// scanout, transfers and virgl submissions), so each command runs under a
+/// lock; concurrent use of the single command page and descriptor corrupted
+/// the stream.
+static QUEUE_LOCK: crate::smp::SpinLock<()> = crate::smp::SpinLock::new(());
 /// The virtio-gpu 3D commands all belong to one virgl context.
 const VIRGL_CONTEXT_ID: u32 = 1;
 
@@ -477,6 +486,7 @@ unsafe fn init_device() -> Option<Queue> {
 /// Submits one control command and waits for its response. Returns the
 /// response type, or `None` when the command timed out.
 unsafe fn control(queue: &mut Queue, command: &[u8]) -> Option<u32> {
+    let _guard = QUEUE_LOCK.lock();
     let page = 4096usize;
     let buffer_pa = queue.command_pa;
     let buffer = queue.command;
@@ -926,6 +936,7 @@ pub fn submit_3d(data: &[u8]) -> bool {
 }
 
 unsafe fn submit_3d_queue(queue: &mut Queue, data: &[u8]) -> bool {
+    let _guard = QUEUE_LOCK.lock();
     if data.is_empty() || data.len() > SUBMIT_BYTES - 64 {
         return false;
     }

@@ -5145,3 +5145,59 @@ renderer. Next step is to find why: GTK4 4.x asks for dmabuf *feedback*
 (`zwp_linux_dmabuf_v1` v4 / `zwp_linux_dmabuf_feedback_v1`) and may refuse the
 v3 path; either implement feedback or check `GDK_DEBUG=gl` output with
 `G_MESSAGES_DEBUG=all` while the client still runs.
+
+
+### GPU buffers end-to-end: GTK4 renders through GL
+
+The dma-buf path is now complete enough that GTK4's GSK GL renderer works.
+
+**Kernel: PRIME buffers carry pixels.** `PRIME_HANDLE_TO_FD` exports a BO as a
+`Target::Prime { pa, size }` fd, and the compositor maps the same frames. Two
+kernel bugs surfaced on the way:
+
+- A BO's guest backing must be at least the level-0 layout. Mesa's GBM
+  window-buffer path sends `size = 1` (the field is an input, not the kernel's
+  output); taking it literally gave a 4 KiB backing for a 1024x1024 texture.
+  `size = max(input, stride * height * depth * layers)`.
+- virgl renders into a host GL texture, so the guest frames are stale until a
+  `TRANSFER_FROM_HOST_3D`. Every BO referenced by a successful `EXECBUFFER` is
+  marked dirty; `map_prime()` (a compositor mapping a PRIME fd) copies the
+  resource back into the frames first. `primetest` still passes because a BO
+  that was never submitted is not dirty and its CPU-written pattern survives.
+
+`SUBMIT_3D` now accepts 256 KiB (Mesa's `VIRGL_MAX_CMDBUF_DWORDS` is 64K
+dwords) and the whole control queue runs under a spin lock; before, a large
+shader buffer was rejected and the host's long-shader decoder lost its state
+("Got continuation without original long shader").
+
+**Compositor: `zwp_linux_dmabuf_v1` v4 + feedback.** The format table advertises
+ARGB8888/XRGB8888 with both LINEAR and `DRM_FORMAT_MOD_INVALID`. The INVALID
+entry is essential: Mesa 25's `create_dri_image()` returns without allocating
+when the driver lacks `resource_create_with_modifiers` (virgl) and the
+compositor does not list INVALID as an implicit-modifier option. Without it
+`eglMakeCurrent` reports `EGL_BAD_ALLOC: failed to allocate color buffer` and
+`eglSwapBuffers` crashes in `dri2_query_image(NULL)`. With it GSK binds a real
+dmabuf-backed framebuffer (`SET_FRAMEBUFFER_STATE` now appears in the virgl
+stream) instead of drawing to the incomplete default framebuffer of QEMU's
+`egl-headless` context.
+
+`tests/linux/wlgltest.c` isolates this path: a real `wl_egl_window`, two
+`glClear` colours and two `eglSwapBuffers` calls, run with `linuxstart wlgl`
+(SERVE_WLGL). It prints `wlgl: renderer virgl (...)` and `wlgl test ok`; the
+compositor logs `gtk-serve: dmabuf 256 256 1024 ...` and the sink shows the
+second frame's green, so the per-frame host->guest copy works too.
+
+**DRM version 0.0, not 0.1.** The second swap initially hung in Mesa with no
+syscalls and no protocol traffic. `DRM_IOCTL_VERSION` reported minor 1, which
+Mesa's virgl winsys reads as "the kernel implements
+`VIRTGPU_EXECBUF_FENCE_FD_OUT`". This kernel submits synchronously and returns
+no fence fd, so Mesa polled fd -1 forever in `sync_wait()`. Reporting 0.0 makes
+Mesa use the legacy `VIRTGPU_WAIT` path (which completes immediately here).
+Only `supports_fences` depends on that version.
+
+With that, `linuxstart gtk4` (SERVE_GTK4, `GSK_RENDERER=gl`) renders the whole
+window through virgl: title bar, buttons, antialiased label, presented as a
+1080x826 dmabuf. `egltest` (offscreen FBO + readback) and `primetest` stay
+green. Phosh's cairo/shm path still shows the pre-existing red-block/black
+frame; it reproduces with the HEAD kernel and the previous compositor, so it is
+not caused by these changes.

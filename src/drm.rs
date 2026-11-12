@@ -388,8 +388,36 @@ pub fn event_pending() -> bool {
     unsafe { EVENT_PENDING }
 }
 
+/// Copies a rendered 3D resource back into its guest backing.
+///
+/// virgl renders into a host GL texture; the frames attached to the resource
+/// only hold pixels after an explicit `TRANSFER_FROM_HOST_3D`. The compositor
+/// reads those frames directly (PRIME mapping), so the copy has to happen
+/// before it looks at them.
+pub fn flush_to_guest(pa: usize) {
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(BOS) };
+    let Some(entry) = table.iter_mut().find(|entry| {
+        entry.in_use
+            && entry.dirty
+            && entry.texture
+            && entry.pa <= pa
+            && pa < entry.pa + entry.size as usize
+    }) else {
+        return;
+    };
+    let (resource, base, size, width, height) =
+        (entry.resource, entry.pa, entry.size as usize, entry.width, entry.height);
+    if width == 0 || height == 0 {
+        return;
+    }
+    if crate::virtio_gpu::transfer_3d(resource, base, size, width, height, false) {
+        entry.dirty = false;
+    }
+}
+
 /// Maps an exported BO range (PRIME fd) into the caller.
 pub fn map_prime(pa: usize, length: usize) -> Option<usize> {
+    flush_to_guest(pa);
     crate::scheduler::map_drm_dumb(pa, length)
 }
 
@@ -429,7 +457,12 @@ pub fn ioctl(request: u64, argument: u64) -> Option<u64> {
                 // makes `virgl_drm_get_version` fail and the driver falls
                 // back to llvmpipe without a message.
                 version.major = 0;
-                version.minor = 1;
+                // Mesa's virgl winsys reads minor >= 1 as "the kernel
+                // implements VIRTGPU_EXECBUF_FENCE_FD_OUT" and then polls the
+                // returned fence fd. This driver completes submissions
+                // synchronously and has no fence fds, so advertise 0.0 and
+                // let Mesa use its legacy resource-wait path.
+                version.minor = 0;
                 version.patchlevel = 0;
                 version.name_len = 11;
                 version.date_len = 9;
@@ -955,6 +988,10 @@ struct Bo {
     stride: u32,
     width: u32,
     height: u32,
+    /// True for a texture (3D resource); false for a plain `PIPE_BUFFER`.
+    texture: bool,
+    /// The GPU rendered into this resource since the last host->guest copy.
+    dirty: bool,
     /// GEM name assigned by `GEM_FLINK` (0 until then).
     name: u32,
     in_use: bool,
@@ -970,6 +1007,8 @@ const EMPTY_BO: Bo = Bo {
     stride: 0,
     width: 0,
     height: 0,
+    texture: false,
+    dirty: false,
     name: 0,
     in_use: false,
 };
@@ -1093,11 +1132,15 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                 };
                 let depth = create.depth.max(1);
                 let layers = create.array_size.max(1);
-                let size = if create.size != 0 {
-                    create.size
-                } else {
-                    stride * create.height * depth * layers
-                };
+                // `size` is an input from Mesa and is occasionally a bogus
+                // placeholder (the GBM window-buffer path sends 1). Keep the
+                // guest backing at least as large as the level-0 layout so a
+                // host->guest readback can never run past the frames.
+                let computed = stride
+                    .saturating_mul(create.height)
+                    .saturating_mul(depth)
+                    .saturating_mul(layers);
+                let size = create.size.max(computed);
                 if size == 0 {
                     return Some(u64::MAX);
                 }
@@ -1143,6 +1186,8 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                     stride,
                     width: create.width,
                     height: create.height,
+                    texture: create.target != 0,
+                    dirty: false,
                     in_use: true,
                 };
                 create.bo_handle = handle;
@@ -1186,7 +1231,10 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                 let Some(mut exec) = load::<VirtgpuExecbuffer>(argument) else {
                     return Some(u64::MAX);
                 };
-                if exec.size == 0 || exec.size as usize > 64 * 1024 || exec.command == 0 {
+                // Mesa's virgl winsys submits up to 64K dwords (256 KiB) in
+                // one command buffer; a smaller cap rejected large shader
+                // packets and left the host's long-shader state dangling.
+                if exec.size == 0 || exec.size as usize > 256 * 1024 || exec.command == 0 {
                     return Some(u64::MAX);
                 }
                 if !ensure_context() {
@@ -1228,6 +1276,17 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                 }
                 if !submitted {
                     return Some(u64::MAX);
+                }
+                if count != 0 {
+                    let table = &mut *core::ptr::addr_of_mut!(BOS);
+                    for handle in &referenced[..count] {
+                        if let Some(entry) = table
+                            .iter_mut()
+                            .find(|entry| entry.in_use && entry.handle == *handle)
+                        {
+                            entry.dirty = true;
+                        }
+                    }
                 }
                 0
             }

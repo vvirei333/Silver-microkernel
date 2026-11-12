@@ -98,6 +98,17 @@ static void put_string(const char *text) {
         message[message_length++] = 0;
     }
 }
+
+static void put_array(const void *bytes, unsigned length) {
+    put_u32(length);
+    const unsigned char *data = (const unsigned char *)bytes;
+    for (unsigned index = 0; index < length; index++) {
+        message[message_length++] = data[index];
+    }
+    while (message_length % 4 != 0) {
+        message[message_length++] = 0;
+    }
+}
 static void begin(unsigned object, unsigned opcode) {
     message_length = 0;
     put_u32(object);
@@ -598,7 +609,116 @@ typedef struct {
     unsigned char has_plane;
 } DmabufParams;
 static DmabufParams dmabuf_params[MAX_DMABUF_PARAMS];
+static unsigned dmabuf_ids[8];
 static unsigned dmabuf_id;
+
+/* zwp_linux_dmabuf_feedback_v1 objects created through
+   get_default_feedback / get_surface_feedback. */
+static unsigned dmabuf_feedbacks[16];
+
+static int dmabuf_is_binding(unsigned object) {
+    for (unsigned index = 0; index < 8; index++) {
+        if (object != 0 && dmabuf_ids[index] == object) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int dmabuf_is_feedback(unsigned object) {
+    for (unsigned index = 0; index < 16; index++) {
+        if (object != 0 && dmabuf_feedbacks[index] == object) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* dev_t of /dev/dri/renderD128 (major 226, minor 128), the device every
+   exported buffer belongs to. */
+#define DRM_RENDER_RDEV 0xE280ull
+
+#define DRM_FORMAT_ARGB8888 0x34325241u
+#define DRM_FORMAT_XRGB8888 0x34325258u
+
+/* Sends one complete dma-buf feedback batch: a format table with the window
+   formats, the main device, one tranche for the render node and the final
+   done event. GTK/Mesa use this both to choose buffer formats and to decide
+   whether the compositor can import the buffers EGL allocates. */
+static void send_dmabuf_feedback(long client, unsigned id) {
+    /* Two formats, each with LINEAR and DRM_FORMAT_MOD_INVALID ((1 << 56)
+       - 1). A driver without explicit-modifier allocation (virgl) needs to
+       see INVALID in the list, otherwise Mesa refuses to allocate a window
+       buffer at all. */
+    unsigned char table[4][16];
+    for (unsigned index = 0; index < 4; index++) {
+        for (unsigned byte = 0; byte < 16; byte++) {
+            table[index][byte] = 0;
+        }
+        unsigned format = (index / 2) == 0 ? DRM_FORMAT_ARGB8888
+                                           : DRM_FORMAT_XRGB8888;
+        table[index][0] = format & 0xff;
+        table[index][1] = (format >> 8) & 0xff;
+        table[index][2] = (format >> 16) & 0xff;
+        table[index][3] = (format >> 24) & 0xff;
+        if ((index % 2) == 1) {
+            for (unsigned byte = 8; byte < 15; byte++) {
+                table[index][byte] = 0xff;
+            }
+        }
+    }
+    long file = sys3(279 /* memfd_create */, (long)"werewolf-dmabuf", 0, 0);
+    unsigned table_size = sizeof(table);
+    long mapped = -1;
+    if (file >= 0 && sys3(46 /* ftruncate */, file, (long)table_size, 0) == 0) {
+        mapped = sys6(222 /* mmap */, 0, table_size, 3 /* RW */, 1 /* SHARED */,
+                      file, 0);
+    }
+    if (mapped > 0) {
+        unsigned char *target = (unsigned char *)mapped;
+        for (unsigned index = 0; index < table_size; index++) {
+            target[index] = ((const unsigned char *)table)[index];
+        }
+        begin(id, 1 /* zwp_linux_dmabuf_feedback_v1.format_table */);
+        put_u32(table_size);
+        finish();
+        send_message(client, (int)file);
+        sys3(215 /* munmap */, mapped, table_size, 0);
+    }
+    if (file >= 0) {
+        sys3(57 /* close */, file, 0, 0);
+    }
+
+    begin(id, 2 /* main_device */);
+    put_array(&(unsigned long){DRM_RENDER_RDEV}, sizeof(unsigned long));
+    finish();
+    send_message(client, -1);
+
+    /* One tranche: everything can be scanned out on the render device. */
+    begin(id, 4 /* tranche_target_device */);
+    put_array(&(unsigned long){DRM_RENDER_RDEV}, sizeof(unsigned long));
+    finish();
+    send_message(client, -1);
+
+    begin(id, 5 /* tranche_formats */);
+    unsigned short indices[4] = {0, 1, 2, 3};
+    put_array(indices, sizeof(indices));
+    finish();
+    send_message(client, -1);
+
+    begin(id, 6 /* tranche_flags */);
+    put_u32(0);
+    finish();
+    send_message(client, -1);
+
+    begin(id, 3 /* tranche_done */);
+    finish();
+    send_message(client, -1);
+
+    begin(id, 0 /* done */);
+    finish();
+    send_message(client, -1);
+}
 
 static DmabufParams *dmabuf_params_find(unsigned id) {
     if (id == 0) {
@@ -1771,7 +1891,7 @@ static int serve(long client) {
                 send_global_version(client, registry_id, 24,
                                     "phosh_private", 7);
                 send_global_version(client, registry_id, 25,
-                                    "zwp_linux_dmabuf_v1", 3);
+                                    "zwp_linux_dmabuf_v1", 4);
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -1782,25 +1902,36 @@ static int serve(long client) {
                     compositor_id = new_id;
                 } else if (text_equal(interface, "zwp_linux_dmabuf_v1")) {
                     dmabuf_id = new_id;
+                    for (unsigned index = 0; index < 8; index++) {
+                        if (dmabuf_ids[index] == 0) {
+                            dmabuf_ids[index] = new_id;
+                            break;
+                        }
+                    }
                     {
                         static const char bound[] = "gtk-serve: dmabuf bound\n";
                         sys3(64, 1, (long)bound, sizeof(bound) - 1);
                     }
-                    /* Linear buffers only: the render node backs them with
-                       guest frames, and the compositor maps them directly. */
-                    static const unsigned formats[] = {0 /* ARGB8888 */,
-                                                       1 /* XRGB8888 */};
-                    for (unsigned index = 0; index < 2; index++) {
-                        begin(dmabuf_id, 0 /* format */);
-                        put_u32(formats[index]);
-                        finish();
-                        send_message(client, -1);
-                        begin(dmabuf_id, 1 /* modifier */);
-                        put_u32(formats[index]);
-                        put_u32(0); /* modifier_hi */
-                        put_u32(0); /* modifier_lo: LINEAR */
-                        finish();
-                        send_message(client, -1);
+                    /* Version 4 replaces the format/modifier events with
+                       dma-buf feedback; older bindings still get the plain
+                       linear format list. */
+                    if (version < 4) {
+                        static const unsigned formats[] = {0 /* ARGB8888 */,
+                                                           1 /* XRGB8888 */};
+                        for (unsigned index = 0; index < 2; index++) {
+                            begin(new_id, 0 /* format */);
+                            put_u32(formats[index]);
+                            finish();
+                            send_message(client, -1);
+                            if (version >= 3) {
+                                begin(new_id, 1 /* modifier */);
+                                put_u32(formats[index]);
+                                put_u32(0); /* modifier_hi */
+                                put_u32(0); /* modifier_lo: LINEAR */
+                                finish();
+                                send_message(client, -1);
+                            }
+                        }
                     }
                 } else if (text_equal(interface, "wl_shm")) {
                     shm_id = new_id;
@@ -2289,9 +2420,38 @@ static int serve(long client) {
                    created from this pool may still be committed. */
                 PoolSlot *pool = pool_find(object);
                 pool->id = 0;
-            } else if (object == dmabuf_id && opcode == 0) {
+            } else if (dmabuf_is_feedback(object)) {
+                /* zwp_linux_dmabuf_feedback_v1.destroy */
+                for (unsigned index = 0; index < 16; index++) {
+                    if (dmabuf_feedbacks[index] == object) {
+                        dmabuf_feedbacks[index] = 0;
+                    }
+                }
+            } else if (dmabuf_is_binding(object) && opcode == 1) {
                 /* zwp_linux_dmabuf_v1.create_params(new_id) */
                 dmabuf_params_add(take_u32());
+            } else if (dmabuf_is_binding(object) &&
+                       (opcode == 2 || opcode == 3)) {
+                /* get_default_feedback(new_id) or
+                   get_surface_feedback(new_id, surface) */
+                unsigned id = take_u32();
+                if (opcode == 3) {
+                    (void)take_u32(); /* wl_surface */
+                }
+                for (unsigned index = 0; index < 16; index++) {
+                    if (dmabuf_feedbacks[index] == 0) {
+                        dmabuf_feedbacks[index] = id;
+                        break;
+                    }
+                }
+                send_dmabuf_feedback(client, id);
+            } else if (dmabuf_is_binding(object) && opcode == 0) {
+                /* zwp_linux_dmabuf_v1.destroy */
+                for (unsigned index = 0; index < 8; index++) {
+                    if (dmabuf_ids[index] == object) {
+                        dmabuf_ids[index] = 0;
+                    }
+                }
             } else if (dmabuf_params_find(object) != 0) {
                 DmabufParams *params = dmabuf_params_find(object);
                 if (opcode == 0) { /* destroy */
@@ -3050,6 +3210,12 @@ static void reset_client(void) {
         dmabuf_params[index].fd = -1;
         dmabuf_params[index].has_plane = 0;
     }
+    for (unsigned index = 0; index < 8; index++) {
+        dmabuf_ids[index] = 0;
+    }
+    for (unsigned index = 0; index < 16; index++) {
+        dmabuf_feedbacks[index] = 0;
+    }
     dmabuf_id = 0;
     shell_id = 0;
     xdg_surface_id = 0;
@@ -3375,6 +3541,8 @@ void _start(void) {
         static const char *argv[] = {"/sfs/wlclient", "hit", 0};
 #elif defined(SERVE_GTK4)
         static const char *argv[] = {"/sfs/gtk4hello", 0};
+#elif defined(SERVE_WLGL)
+        static const char *argv[] = {"/sfs/wlgltest", 0};
 #elif defined(SERVE_PHOSH)
         static const char *argv[] = {"/sfs/phosh", 0};
 #else
@@ -3391,7 +3559,7 @@ void _start(void) {
             "GSETTINGS_SCHEMA_DIR=/sfs",
             "FONTCONFIG_FILE=/sfs/fonts.conf",
             "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share:/sfs/usr/share",
-#if defined(SERVE_GTK4)
+#if defined(SERVE_GTK4) || defined(SERVE_WLGL)
             /* GTK4 renders through GSK; "gl" goes EGL -> virgl. The Mesa
                files live in the SFS root, and libgallium must be global so
                the DRI stub can resolve the driver entry points. */
@@ -3440,6 +3608,8 @@ void _start(void) {
     sys3(64, 1, (long)"hit server ok\n", 14);
 #elif defined(SERVE_GTK4)
     sys3(64, 1, (long)"gtk4 client ok\n", 15);
+#elif defined(SERVE_WLGL)
+    sys3(64, 1, (long)"wlgl client ok\n", 15);
 #else
     sys3(64, 1, (long)"gtk client ok\n", 14);
 #endif
