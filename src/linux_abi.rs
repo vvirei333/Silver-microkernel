@@ -2266,6 +2266,18 @@ fn linux_mmap(
     // what Wayland's `wl_shm` buffers use. Other files still copy into
     // private frames, and a writable shared mapping of a read-only SFS file
     // is refused rather than silently losing its write-back.
+    if flags & MAP_SHARED != 0 && linux_fd::is_prime(scheduler::current_task_id(), fd) {
+        let task = scheduler::current_task_id();
+        let Some((pa, size)) = linux_fd::prime_info(task, fd) else {
+            return errno(EINVAL);
+        };
+        if length as usize > size {
+            return errno(EINVAL);
+        }
+        return crate::drm::map_prime(pa + offset as usize, length as usize)
+            .map(|placed| placed as u64)
+            .unwrap_or(errno(EINVAL));
+    }
     if flags & MAP_SHARED != 0 && linux_fd::is_drm(scheduler::current_task_id(), fd) {
         // DRM dumb buffers: the offset is the buffer's guest-physical address,
         // handed out by DRM_IOCTL_MODE_MAP_DUMB.

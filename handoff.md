@@ -5104,3 +5104,44 @@ DRI stub can resolve `__driDriverGetExtensions_virtio_gpu`.
 Next: run a GTK4 app with `GSK_RENDERER=gl`. That needs the compositor to
 share buffers with the client (`zwp_linux_dmabuf_v1` or `wl_drm`), since GBM
 surfaces belong to the render node, not to Wayland shm.
+
+### Buffer sharing: PRIME/GEM and zwp_linux_dmabuf_v1
+
+The kernel now exports render-node buffers:
+
+- `GEM_FLINK` / `GEM_OPEN` give a buffer a global name and reopen it,
+- `PRIME_HANDLE_TO_FD` turns a BO into an fd (`Target::Prime { pa, size }`)
+  that any task can receive and `mmap` (the same frames),
+- `PRIME_FD_TO_HANDLE` maps the fd back to the BO in the importer.
+
+`tests/linux/primetest.c` covers the whole path: create a BO, write a
+pattern, flink/open it, export the fd, map it twice, then fork and let the
+child map the inherited fd and verify the pattern. It prints `prime test ok`.
+
+The compositor advertises `zwp_linux_dmabuf_v1` v3 with ARGB8888/XRGB8888 on
+the LINEAR modifier, handles `create_params`/`add`/`create`/`create_immed`,
+and stores a dmabuf-backed `wl_buffer` in the same `BufferSlot` table the shm
+path uses (the descriptor is owned by the buffer and closed on destroy).
+GTK4 binds the global twice and the window composes.
+
+Two compositor fixes came with it:
+
+- the single-window blit wrote rows with the *client* width as the
+  destination stride, so any window narrower than the output was garbled
+  (the GTK4 window showed as diagonal stripes); it now uses the output stride
+  and clips to the output size,
+- `SERVE_GTK4` runs with `GSK_RENDERER=gl` and the Mesa environment
+  (`LIBGL_DRIVERS_PATH`, `__EGL_VENDOR_LIBRARY_FILENAMES`, `LD_PRELOAD` of
+  libgallium). It must **not** set `EGL_PLATFORM=surfaceless`: GTK4 needs the
+  Wayland EGL platform.
+
+`disk_gtk4.img` was resized to 512 MiB (`scripts/sfs_resize.py`) to hold Mesa
++ LLVM, and has Mesa 25, glvnd, `primtest`, `egltest` and the new
+`gtk4-serve`. The GTK4 window renders correctly (title bar, buttons, label).
+
+Still open: GSK currently presents through `wl_shm` — the client creates no
+dmabuf buffer even though it binds the global, so it falls back to the cairo
+renderer. Next step is to find why: GTK4 4.x asks for dmabuf *feedback*
+(`zwp_linux_dmabuf_v1` v4 / `zwp_linux_dmabuf_feedback_v1`) and may refuse the
+v3 path; either implement feedback or check `GDK_DEBUG=gl` output with
+`G_MESSAGES_DEBUG=all` while the client still runs.

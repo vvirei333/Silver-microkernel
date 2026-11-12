@@ -256,6 +256,9 @@ enum Target {
         entries: &'static [&'static str],
         offset: usize,
     },
+    /// A buffer exported through PRIME (`/dev/dri` handle -> fd). Carries the
+    /// physical range so any task that receives the fd can map the pixels.
+    Prime { pa: usize, size: usize },
     Vfs(u64),
     Pipe {
         state: Arc<Mutex<PipeState>>,
@@ -678,6 +681,7 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         // not spin.
         Target::Console => Ok(0),
         Target::DirList { .. } => Err(EISDIR),
+        Target::Prime { .. } => Err(EINVAL),
         Target::Sysfs(data, offset) => {
             if offset >= data.len() {
                 return Ok(0);
@@ -822,7 +826,8 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         | Target::GpuFb
         | Target::Drm { .. }
         | Target::Sysfs(_, _)
-        | Target::DirList { .. } => Ok(count),
+        | Target::DirList { .. }
+        | Target::Prime { .. } => Ok(count),
         Target::Full => Err(ENOSPC),
         Target::Vfs(vfs_fd) => {
             let mut bytes = alloc::vec![0_u8; (count as usize).min(1 << 20)];
@@ -981,6 +986,9 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
         ),
         Target::Sysfs(data, _) => write_stat(buffer, S_IFREG | 0o444, data.len() as u64, fd.max(1)),
         Target::DirList { .. } => write_stat(buffer, S_IFDIR | 0o555, 0, fd.max(1)),
+        Target::Prime { size, .. } => {
+            write_stat(buffer, S_IFREG | 0o600, size as u64, fd.max(1))
+        }
         Target::Vfs(vfs_fd) => {
             let size = vfs::fd_len(task, vfs_fd).map_err(|_| EBADF)?;
             let kind = vfs::fd_kind(task, vfs_fd).unwrap_or(vfs::FD_KIND_FILE);
@@ -2058,6 +2066,7 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::Drm { .. }
         | Target::Sysfs(_, _)
         | Target::DirList { .. }
+        | Target::Prime { .. }
         | Target::MemFd(_)
         | Target::Epoll(_) => (O_RDWR, false),
     };
@@ -2099,6 +2108,7 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
         Target::Zero | Target::Random => POLLIN,
         Target::Ivshmem | Target::GpuFb => POLLIN | POLLOUT,
         Target::Sysfs(_, _) | Target::DirList { .. } => POLLIN | POLLOUT,
+        Target::Prime { .. } => POLLOUT,
         Target::Drm { .. } => {
             if crate::drm::event_pending() {
                 POLLIN | POLLOUT
@@ -2222,6 +2232,26 @@ pub(crate) fn makedev(major: u32, minor: u32) -> u64 {
         | (minor as u64 & 0xff)
         | ((minor as u64 & !0xff) << 12)
         | ((major as u64 & !0xfff) << 32)
+}
+
+/// Creates an fd that refers to an exported BO range.
+pub fn prime_fd(task: u64, pa: usize, size: usize) -> Result<u64, u64> {
+    insert(task, Target::Prime { pa, size }).ok_or(EMFILE)
+}
+
+/// Physical range behind a PRIME fd, if `fd` is one.
+pub fn prime_info(task: u64, fd: u64) -> Option<(usize, usize)> {
+    let task = crate::scheduler::fd_table_owner(task);
+    match lookup(task, fd) {
+        Some(Target::Prime { pa, size }) => Some((pa, size)),
+        _ => None,
+    }
+}
+
+/// True when `fd` is a PRIME export.
+pub fn is_prime(task: u64, fd: u64) -> bool {
+    let task = crate::scheduler::fd_table_owner(task);
+    matches!(lookup(task, fd), Some(Target::Prime { .. }))
 }
 
 /// True for the synthetic device nodes this kernel exposes under `/dev`.

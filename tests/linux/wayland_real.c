@@ -580,7 +580,89 @@ typedef struct {
     unsigned height;
     unsigned stride;
     unsigned format;
+    /* 1 for a dmabuf: the descriptor belongs to this buffer and is closed
+       when it is destroyed. Shm buffers share their pool's descriptor. */
+    unsigned char owned;
 } BufferSlot;
+/* zwp_linux_dmabuf_v1 params objects: each collects one plane and then turns
+   into a wl_buffer. GTK creates one per frame. */
+#define MAX_DMABUF_PARAMS 16
+typedef struct {
+    unsigned id;
+    int fd;
+    unsigned offset;
+    unsigned stride;
+    unsigned width;
+    unsigned height;
+    unsigned format;
+    unsigned char has_plane;
+} DmabufParams;
+static DmabufParams dmabuf_params[MAX_DMABUF_PARAMS];
+static unsigned dmabuf_id;
+
+static DmabufParams *dmabuf_params_find(unsigned id) {
+    if (id == 0) {
+        return 0;
+    }
+    for (unsigned index = 0; index < MAX_DMABUF_PARAMS; index++) {
+        if (dmabuf_params[index].id == id) {
+            return &dmabuf_params[index];
+        }
+    }
+    return 0;
+}
+
+static DmabufParams *dmabuf_params_add(unsigned id) {
+    DmabufParams *slot = dmabuf_params_find(id);
+    if (slot != 0) {
+        return slot;
+    }
+    for (unsigned index = 0; index < MAX_DMABUF_PARAMS; index++) {
+        if (dmabuf_params[index].id == 0) {
+            DmabufParams *fresh = &dmabuf_params[index];
+            fresh->id = id;
+            fresh->fd = -1;
+            fresh->offset = 0;
+            fresh->stride = 0;
+            fresh->width = 0;
+            fresh->height = 0;
+            fresh->format = 0;
+            fresh->has_plane = 0;
+            return fresh;
+        }
+    }
+    return 0;
+}
+
+/// Logs a dmabuf buffer's geometry (no stdio in this binary).
+static void log_dmabuf_buffer(unsigned width, unsigned height, unsigned stride,
+                              unsigned format) {
+    static const char prefix[] = "gtk-serve: dmabuf ";
+    char text[96];
+    unsigned length = 0;
+    for (unsigned index = 0; index < sizeof(prefix) - 1; index++) {
+        text[length++] = prefix[index];
+    }
+    unsigned values[4] = {width, height, stride, format};
+    for (unsigned value_index = 0; value_index < 4; value_index++) {
+        unsigned value = values[value_index];
+        char digits[12];
+        unsigned count = 0;
+        if (value == 0) {
+            digits[count++] = '0';
+        }
+        while (value != 0) {
+            digits[count++] = (char)('0' + value % 10);
+            value /= 10;
+        }
+        while (count != 0) {
+            text[length++] = digits[--count];
+        }
+        text[length++] = value_index == 3 ? '\n' : ' ';
+    }
+    sys3(64, 1, (long)text, length);
+}
+
 static PoolSlot pools[MAX_POOLS];
 static BufferSlot buffers[MAX_BUFFERS];
 static unsigned attached_buffers[SURFACE_IDS];
@@ -655,8 +737,12 @@ static BufferSlot *buffer_add(unsigned id) {
 static void buffer_forget(unsigned id) {
     BufferSlot *slot = buffer_find(id);
     if (slot != 0) {
+        if (slot->owned && slot->pool_fd >= 0) {
+            sys3(57 /* close */, slot->pool_fd, 0, 0);
+        }
         slot->id = 0;
         slot->pool_fd = -1;
+        slot->owned = 0;
     }
 }
 
@@ -676,6 +762,7 @@ static void pools_reset(void) {
         buffers[index].height = 0;
         buffers[index].stride = 0;
         buffers[index].format = 0;
+        buffers[index].owned = 0;
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         attached_buffers[index] = 0;
@@ -1683,6 +1770,8 @@ static int serve(long client) {
                                     "zwlr_output_manager_v1", 2);
                 send_global_version(client, registry_id, 24,
                                     "phosh_private", 7);
+                send_global_version(client, registry_id, 25,
+                                    "zwp_linux_dmabuf_v1", 3);
             } else if (object == registry_id && opcode == 0) { /* bind */
                 (void)take_u32();
                 char interface[64];
@@ -1691,6 +1780,28 @@ static int serve(long client) {
                 unsigned new_id = take_u32();
                 if (text_equal(interface, "wl_compositor")) {
                     compositor_id = new_id;
+                } else if (text_equal(interface, "zwp_linux_dmabuf_v1")) {
+                    dmabuf_id = new_id;
+                    {
+                        static const char bound[] = "gtk-serve: dmabuf bound\n";
+                        sys3(64, 1, (long)bound, sizeof(bound) - 1);
+                    }
+                    /* Linear buffers only: the render node backs them with
+                       guest frames, and the compositor maps them directly. */
+                    static const unsigned formats[] = {0 /* ARGB8888 */,
+                                                       1 /* XRGB8888 */};
+                    for (unsigned index = 0; index < 2; index++) {
+                        begin(dmabuf_id, 0 /* format */);
+                        put_u32(formats[index]);
+                        finish();
+                        send_message(client, -1);
+                        begin(dmabuf_id, 1 /* modifier */);
+                        put_u32(formats[index]);
+                        put_u32(0); /* modifier_hi */
+                        put_u32(0); /* modifier_lo: LINEAR */
+                        finish();
+                        send_message(client, -1);
+                    }
                 } else if (text_equal(interface, "wl_shm")) {
                     shm_id = new_id;
                     shm_add(new_id);
@@ -2178,6 +2289,68 @@ static int serve(long client) {
                    created from this pool may still be committed. */
                 PoolSlot *pool = pool_find(object);
                 pool->id = 0;
+            } else if (object == dmabuf_id && opcode == 0) {
+                /* zwp_linux_dmabuf_v1.create_params(new_id) */
+                dmabuf_params_add(take_u32());
+            } else if (dmabuf_params_find(object) != 0) {
+                DmabufParams *params = dmabuf_params_find(object);
+                if (opcode == 0) { /* destroy */
+                    if (params->fd >= 0) {
+                        sys3(57 /* close */, params->fd, 0, 0);
+                    }
+                    params->id = 0;
+                    params->fd = -1;
+                    params->has_plane = 0;
+                } else if (opcode == 1) { /* add(fd, plane, offset, stride, mod) */
+                    (void)take_u32();     /* plane index, always 0 here */
+                    if (incoming_fd >= 0) {
+                        if (params->fd >= 0) {
+                            sys3(57 /* close */, params->fd, 0, 0);
+                        }
+                        params->fd = incoming_fd;
+                        incoming_fd = -1;
+                        params->has_plane = 1;
+                    }
+                    params->offset = take_u32();
+                    params->stride = take_u32();
+                    (void)take_u32(); /* modifier_hi */
+                    (void)take_u32(); /* modifier_lo */
+                } else if (opcode == 2 || opcode == 3) {
+                    /* create(width, height, format, flags, buffer) or
+                       create_immed(buffer, width, height, format, flags) */
+                    unsigned width, height, format, id;
+                    if (opcode == 2) {
+                        width = take_u32();
+                        height = take_u32();
+                        format = take_u32();
+                        (void)take_u32(); /* flags */
+                        id = take_u32();
+                    } else {
+                        id = take_u32();
+                        width = take_u32();
+                        height = take_u32();
+                        format = take_u32();
+                        (void)take_u32(); /* flags */
+                    }
+                    if (params->has_plane && params->fd >= 0) {
+                        BufferSlot *slot = buffer_add(id);
+                        if (slot != 0) {
+                            slot->pool_fd = params->fd;
+                            slot->offset = params->offset;
+                            slot->width = width;
+                            slot->height = height;
+                            slot->stride = params->stride != 0
+                                               ? params->stride
+                                               : width * 4;
+                            slot->format = format;
+                            slot->owned = 1;
+                            params->fd = -1; /* ownership moved */
+                            params->has_plane = 0;
+                            log_dmabuf_buffer(width, height, slot->stride, format);
+                        }
+                    }
+                    params->id = 0;
+                }
             } else if (buffer_find(object) != 0 && opcode == 0) {
                 /* wl_buffer.destroy. Toolkits create one buffer per frame
                    and destroy the previous one, so without this the table
@@ -2605,11 +2778,20 @@ static int serve(long client) {
                                 (mapped + buffer_offset);
                             unsigned *dst = (unsigned *)(screen + 0x1000);
                             int opaque = buffer_format == 1; /* XRGB8888 */
-                            for (unsigned y = 0; y < rows; y++) {
+                            /* The sink is the compositor's output, not the
+                               client buffer: a window smaller than the output
+                               still lands at 0,0 with the output stride. */
+                            unsigned out_width = 1024u;
+                            unsigned out_height = 768u;
+                            for (unsigned y = 0; y < rows && y < out_height; y++) {
                                 const unsigned *row =
                                     (const unsigned *)((const unsigned char *)src +
                                                        (unsigned)y * buffer_stride);
-                                for (int x = 0; x < buffer_width; x++) {
+                                unsigned columns = (unsigned)buffer_width;
+                                if (columns > out_width) {
+                                    columns = out_width;
+                                }
+                                for (unsigned x = 0; x < columns; x++) {
                                     unsigned pixel = row[x];
                                     unsigned swizzled =
                                         (pixel & 0xFF00FF00u) |
@@ -2618,8 +2800,7 @@ static int serve(long client) {
                                     if (opaque) {
                                         swizzled |= 0xFF000000u;
                                     }
-                                    dst[(unsigned)y * (unsigned)buffer_width +
-                                        (unsigned)x] = swizzled;
+                                    dst[y * out_width + x] = swizzled;
                                 }
                             }
                             __asm__ volatile("dsb sy" ::: "memory");
@@ -2861,6 +3042,15 @@ static void reset_client(void) {
     for (unsigned index = 0; index < MAX_SHM; index++) {
         shm_ids[index] = 0;
     }
+    for (unsigned index = 0; index < MAX_DMABUF_PARAMS; index++) {
+        if (dmabuf_params[index].fd >= 0) {
+            sys3(57 /* close */, dmabuf_params[index].fd, 0, 0);
+        }
+        dmabuf_params[index].id = 0;
+        dmabuf_params[index].fd = -1;
+        dmabuf_params[index].has_plane = 0;
+    }
+    dmabuf_id = 0;
     shell_id = 0;
     xdg_surface_id = 0;
     toplevel_id = 0;
@@ -3201,7 +3391,18 @@ void _start(void) {
             "GSETTINGS_SCHEMA_DIR=/sfs",
             "FONTCONFIG_FILE=/sfs/fonts.conf",
             "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share:/sfs/usr/share",
+#if defined(SERVE_GTK4)
+            /* GTK4 renders through GSK; "gl" goes EGL -> virgl. The Mesa
+               files live in the SFS root, and libgallium must be global so
+               the DRI stub can resolve the driver entry points. */
+            "GSK_RENDERER=gl",
+            "LIBGL_DRIVERS_PATH=/sfs",
+            "__EGL_VENDOR_LIBRARY_FILENAMES=/sfs/egl_vendor.json",
+            "GBM_BACKENDS_PATH=/sfs",
+            "LD_PRELOAD=/sfs/libgallium-25.0.7.so",
+#else
             "GSK_RENDERER=cairo",
+#endif
             "GTK_A11Y=none",
             "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session",
             "XDG_CURRENT_DESKTOP=Phosh",

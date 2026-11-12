@@ -388,6 +388,11 @@ pub fn event_pending() -> bool {
     unsafe { EVENT_PENDING }
 }
 
+/// Maps an exported BO range (PRIME fd) into the caller.
+pub fn map_prime(pa: usize, length: usize) -> Option<usize> {
+    crate::scheduler::map_drm_dumb(pa, length)
+}
+
 /// Maps a dumb buffer by the offset `MAP_DUMB` returned, or a render-node BO
 /// by the offset `VIRTGPU_MAP` returned.
 pub fn map_dumb(length: usize, offset: usize) -> Option<usize> {
@@ -774,6 +779,10 @@ pub fn report() {
 // ---------------------------------------------------------------------------
 
 const DRM_IOCTL_GEM_CLOSE: u64 = 0xC008_6409;
+const DRM_IOCTL_GEM_FLINK: u64 = 0xC008_640A;
+const DRM_IOCTL_GEM_OPEN: u64 = 0xC010_640B;
+const DRM_IOCTL_PRIME_HANDLE_TO_FD: u64 = 0xC00C_642D;
+const DRM_IOCTL_PRIME_FD_TO_HANDLE: u64 = 0xC00C_642E;
 const DRM_IOCTL_VIRTGPU_MAP: u64 = 0xC010_6441;
 const DRM_IOCTL_VIRTGPU_EXECBUFFER: u64 = 0xC040_6442;
 const DRM_IOCTL_VIRTGPU_GETPARAM: u64 = 0xC010_6443;
@@ -912,6 +921,29 @@ struct GemClose {
     pad: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GemFlink {
+    handle: u32,
+    name: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GemOpen {
+    name: u32,
+    handle: u32,
+    size: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PrimeHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+}
+
 #[derive(Clone, Copy)]
 struct Bo {
     handle: u32,
@@ -923,6 +955,8 @@ struct Bo {
     stride: u32,
     width: u32,
     height: u32,
+    /// GEM name assigned by `GEM_FLINK` (0 until then).
+    name: u32,
     in_use: bool,
 }
 
@@ -936,11 +970,13 @@ const EMPTY_BO: Bo = Bo {
     stride: 0,
     width: 0,
     height: 0,
+    name: 0,
     in_use: false,
 };
 
 static mut BOS: [Bo; MAX_BOS] = [EMPTY_BO; MAX_BOS];
 static mut NEXT_BO: u32 = 1;
+static mut NEXT_NAME: u32 = 1;
 static mut CONTEXT_READY: bool = false;
 
 unsafe fn bo(handle: u32) -> Option<&'static mut Bo> {
@@ -1097,6 +1133,7 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                 let handle = NEXT_BO;
                 NEXT_BO = NEXT_BO.wrapping_add(1);
                 *slot = Bo {
+                    name: 0,
                     handle,
                     resource,
                     pa,
@@ -1232,6 +1269,82 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                 // writes visible before the caller reads the mapping.
                 if let Some(entry) = bo(wait.handle) {
                     crate::virtio_gpu::invalidate_range(entry.pa, entry.size as usize);
+                }
+                0
+            }
+            DRM_IOCTL_GEM_FLINK => {
+                let Some(mut link) = load::<GemFlink>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(entry) = bo(link.handle) else {
+                    return Some(u64::MAX);
+                };
+                if entry.name == 0 {
+                    entry.name = NEXT_NAME;
+                    NEXT_NAME = NEXT_NAME.wrapping_add(1);
+                }
+                link.name = entry.name;
+                if !store(argument, &link) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_GEM_OPEN => {
+                let Some(mut open) = load::<GemOpen>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let table = &*core::ptr::addr_of!(BOS);
+                let Some(entry) = table
+                    .iter()
+                    .find(|entry| entry.in_use && entry.name != 0 && entry.name == open.name)
+                else {
+                    return Some(u64::MAX);
+                };
+                open.handle = entry.handle;
+                open.size = entry.size as u64;
+                if !store(argument, &open) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_PRIME_HANDLE_TO_FD => {
+                let Some(mut prime) = load::<PrimeHandle>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(entry) = bo(prime.handle) else {
+                    return Some(u64::MAX);
+                };
+                let task = crate::scheduler::current_task_id();
+                let size = entry.size as usize;
+                match crate::linux_fd::prime_fd(task, entry.pa, size) {
+                    Ok(fd) => prime.fd = fd as i32,
+                    Err(_) => return Some(u64::MAX),
+                }
+                if !store(argument, &prime) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_PRIME_FD_TO_HANDLE => {
+                let Some(mut prime) = load::<PrimeHandle>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if prime.fd < 0 {
+                    return Some(u64::MAX);
+                }
+                let task = crate::scheduler::current_task_id();
+                let Some((pa, _size)) = crate::linux_fd::prime_info(task, prime.fd as u64) else {
+                    return Some(u64::MAX);
+                };
+                // Handles are global in this kernel, so the importer can reuse
+                // the original one.
+                let table = &*core::ptr::addr_of!(BOS);
+                let Some(entry) = table.iter().find(|entry| entry.in_use && entry.pa == pa) else {
+                    return Some(u64::MAX);
+                };
+                prime.handle = entry.handle;
+                if !store(argument, &prime) {
+                    return Some(u64::MAX);
                 }
                 0
             }
