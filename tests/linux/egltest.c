@@ -104,6 +104,7 @@ static int dump_phdr(struct dl_phdr_info *info, size_t size, void *data) {
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IONBF, 0);
     /* Mesa/glvnd are found in the SFS root, not in /usr. The driver is
        selected explicitly: the DRI loader's PCI table does know virtio-gpu,
        but being explicit makes a failed probe obvious. */

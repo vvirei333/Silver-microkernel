@@ -5005,3 +5005,63 @@ expects to be smaller).
 
 `egltest` (default build) and `sysfstest` pass; `drmtest`, `rendertest`
 (GL device) and `layer-serve` stay green.
+
+### virgl renders: `gl: renderer virgl (eForce GTX 1650/PCIe/SSE2)`
+
+With the synthetic sysfs in place, `egltest` built with `-DEGLTEST_VIRGL`
+brings the whole stack up:
+
+```text
+egl: version 1.4
+gl: vendor   Mesa
+gl: renderer virgl (eForce GTX 1650/PCIe/SSE2)
+gl: version  OpenGL ES 2.0 Mesa 25.0.7-2+deb13u1
+gl: framebuffer complete
+```
+
+So the render node, the virgl context, the 1408-byte capset, the host GL
+translation and the FBO all work. `stdout` must be unbuffered in the test
+(`setvbuf`), otherwise the earlier lines are lost when the process dies.
+
+The remaining crash is the first `glClear`, after the FBO is complete and
+after one `VIRTGPU_RESOURCE_CREATE`:
+
+```text
+FAULT elr 0x411FD8C8 (libgallium +0x41d8c8, ldr s2, [x19])
+      x19 0x40A04004  x20 0x4099E700  x21 0x8148  x22 0x408F6700
+Page Fault at 0x40A04004 (write/read, translation fault L3, no region)
+```
+
+`0x40A04004` is just past the 2 MiB heap window (`USER_HEAP_MAX_SIZE`);
+raising `USER_HEAP_MAX_PAGES` to 4096 did not move the fault. The crashing
+function starts at libgallium+0x41d6c0:
+
+```asm
+41d6c0  paciasp
+41d6c4  stp  x29, x30, [sp, #-112]!
+41d6d0  mov  x25, x0
+41d6d4  cmp  w2, #0
+41d6e8  add  x22, x3, w2, uxtw #4      ; end of an array of 16-byte entries
+41d6f8  add  x23, x0, #0x18, lsl #12   ; x0 + 0x18000
+...
+41d8ac  stp  s15, s14, [x19]
+41d8b0  stp  s13, s12, [x19, #8]
+41d8bc  add  x19, x19, #0x20           ; 32-byte stride
+41d8b4  ldr  w1, [x22, #7440]          ; loop bound, looks uninitialised
+```
+
+It copies float4s from a 16-byte-stride array into `x0 + 0x3b004` with a
+32-byte stride, and the loop bound (`[x22, #7440]`) reads as ~33000 and
+changes between runs, i.e. it is not the value the code expects. The
+destination is inside a large heap object (likely `struct gl_context`), so
+the loop runs past the end of the object.
+
+Next step: find the caller of libgallium+0x41d6c0 (frame pointers are
+unreliable through libEGL; a kernel-side stack walk of the user stack or a
+`backtrace()` in the test would do it) and check which state field supplies
+the bound. Prime suspects are the values we return from
+`VIRTGPU_RESOURCE_CREATE` (`size`, `stride`, `res_handle`) and the caps
+blob, since the crash follows the first resource creation.
+
+`egltest` default build (swrast) still passes; `sysfstest`, `drmtest`,
+`rendertest` (GL) and `layer-serve` stay green.
