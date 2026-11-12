@@ -5065,3 +5065,42 @@ blob, since the crash follows the first resource creation.
 
 `egltest` default build (swrast) still passes; `sysfstest`, `drmtest`,
 `rendertest` (GL) and `layer-serve` stay green.
+
+### virgl works: real GLES2 rendering through the GPU
+
+`egltest` now renders and reads back the cleared colour on the host GPU:
+
+```text
+gl: renderer virgl (NVIDIA GeForce GTX 1650/PCIe/SSE2)
+gl: version  OpenGL ES 3.2 Mesa 25.0.7-2+deb13u1
+gl: framebuffer complete
+gl: readback 64 127 191 255
+egl test ok
+```
+
+Four kernel bugs stood between "context created" and pixels:
+
+1. **`GET_CAPSET` data offset.** The response is
+   `{ struct virtio_gpu_ctrl_hdr hdr; u8 capset_data[]; }` — the blob starts
+   at offset 24, not 32. Reading at +32 shifted every capability by 8 bytes,
+   so Mesa saw a garbage `MaxViewports` and a viewport loop ran off the end
+   of `gl_context` (the "page fault just past the heap").
+2. **`ctrl_hdr.ctx_id` is at offset 16**, not 4. It was written into `flags`,
+   so `CTX_CREATE` made context 0 while `SUBMIT_3D` (fixed later) targeted
+   context 1 and every command was silently ignored.
+3. **3D resources need `ATTACH_BACKING`.** Without it the host has no guest
+   memory to render into.
+4. **Cache coherency.** BOs are mapped Normal Cacheable (so glibc's `DC ZVA`
+   works), so `EXECBUFFER` cleans the BOs it references before submission and
+   invalidates them after; `VIRTGPU_WAIT` invalidates the waited BO.
+
+`SUBMIT_3D` also sets `VIRTIO_GPU_FLAG_FENCE`, which makes QEMU defer the
+control response until the host finished executing the command buffer.
+
+`egltest` now defaults to the virgl path (build with `-DEGLTEST_SWRAST` for
+the software rasteriser); it needs `libgallium-25.0.7.so` preloaded so the
+DRI stub can resolve `__driDriverGetExtensions_virtio_gpu`.
+
+Next: run a GTK4 app with `GSK_RENDERER=gl`. That needs the compositor to
+share buffers with the client (`zwp_linux_dmabuf_v1` or `wl_drm`), since GBM
+surfaces belong to the render node, not to Wayland shm.

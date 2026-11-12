@@ -1081,7 +1081,11 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                     frame_allocator::free_contiguous_pages_tagged(pa, pages, generation);
                     return Some(u64::MAX);
                 };
-                if !crate::virtio_gpu::context_attach(resource) {
+                // The host renders into guest memory, so the resource needs
+                // the frames attached before any transfer can carry pixels.
+                if !crate::virtio_gpu::attach_backing(resource, pa, size as usize)
+                    || !crate::virtio_gpu::context_attach(resource)
+                {
                     frame_allocator::free_contiguous_pages_tagged(pa, pages, generation);
                     return Some(u64::MAX);
                 }
@@ -1155,19 +1159,37 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                 if user_memory::copy_from_user(exec.command, &mut command).is_err() {
                     return Some(u64::MAX);
                 }
-                if !crate::virtio_gpu::submit_3d(&command) {
-                    return Some(u64::MAX);
-                }
-                if exec.flags & VIRTGPU_EXECBUF_FENCE_FD_OUT != 0 {
-                    // Submission is synchronous, so the fence is signalled the
-                    // moment the ioctl returns.
-                    let task = crate::scheduler::current_task_id();
-                    match crate::linux_fd::eventfd(task, 1, true) {
-                        Ok(fd) => exec.fence_fd = fd as i32,
-                        Err(_) => return Some(u64::MAX),
+                // The command buffer and every referenced BO live in guest
+                // memory that the guest writes through a cacheable mapping;
+                // push them out before the device reads, and drop them after
+                // the device wrote back.
+                let mut referenced = alloc::vec![0_u32; 64];
+                let count = (exec.num_bo_handles as usize).min(64);
+                if count != 0 && exec.bo_handles != 0 {
+                    let mut raw = alloc::vec![0_u8; count * 4];
+                    if user_memory::copy_from_user(exec.bo_handles, &mut raw).is_ok() {
+                        for index in 0..count {
+                            referenced[index] = u32::from_le_bytes([
+                                raw[index * 4],
+                                raw[index * 4 + 1],
+                                raw[index * 4 + 2],
+                                raw[index * 4 + 3],
+                            ]);
+                        }
                     }
                 }
-                if !store(argument, &exec) {
+                for handle in &referenced[..count] {
+                    if let Some(entry) = bo(*handle) {
+                        crate::virtio_gpu::clean_range(entry.pa, entry.size as usize);
+                    }
+                }
+                let submitted = crate::virtio_gpu::submit_3d(&command);
+                for handle in &referenced[..count] {
+                    if let Some(entry) = bo(*handle) {
+                        crate::virtio_gpu::invalidate_range(entry.pa, entry.size as usize);
+                    }
+                }
+                if !submitted {
                     return Some(u64::MAX);
                 }
                 0
@@ -1202,7 +1224,17 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                 }
                 0
             }
-            DRM_IOCTL_VIRTGPU_WAIT => 0,
+            DRM_IOCTL_VIRTGPU_WAIT => {
+                let Some(wait) = load::<VirtgpuWait>(argument) else {
+                    return Some(u64::MAX);
+                };
+                // Completion is synchronous in this driver; make the host's
+                // writes visible before the caller reads the mapping.
+                if let Some(entry) = bo(wait.handle) {
+                    crate::virtio_gpu::invalidate_range(entry.pa, entry.size as usize);
+                }
+                0
+            }
             DRM_IOCTL_GEM_CLOSE => {
                 let Some(close) = load::<GemClose>(argument) else {
                     return Some(u64::MAX);

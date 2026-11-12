@@ -932,7 +932,20 @@ unsafe fn submit_3d_queue(queue: &mut Queue, data: &[u8]) -> bool {
     let buffer = queue.submit;
     core::ptr::write_bytes(buffer as *mut u8, 0, data.len() + 64);
     // struct virtio_gpu_cmd_submit { u32 size; u32 padding; }
+    // The fence flag makes the device hold the response until the host has
+    // actually executed the command buffer. Without it the response arrives
+    // immediately (QEMU renders on a worker thread) and a following readback
+    // sees the old contents.
+    static FENCE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(1);
+    let fence = FENCE.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     put32_bytes(buffer, 0, VIRTIO_GPU_CMD_SUBMIT_3D);
+    put32_bytes(buffer, 4, 1); // VIRTIO_GPU_FLAG_FENCE
+    put32_bytes(buffer, 8, fence as u32);
+    put32_bytes(buffer, 12, (fence >> 32) as u32);
+    // ctx_id: the virgl context created by CTX_CREATE. Without it the host
+    // executes the command buffer in the default (non-virgl) context and the
+    // commands are silently ignored.
+    put32_bytes(buffer, 16, VIRGL_CONTEXT_ID);
     put32_bytes(buffer, 24, data.len() as u32);
     core::ptr::copy_nonoverlapping(
         data.as_ptr(),
@@ -1047,6 +1060,38 @@ pub fn create_resource_3d(
     }
 }
 
+/// Pushes a guest range to the point of coherency (before the device reads).
+pub fn clean_range(pa: usize, length: usize) {
+    unsafe { clean(phys_to_virt(pa), length) }
+}
+
+/// Drops stale cache lines so host writes become visible (after the device
+/// wrote guest memory).
+pub fn invalidate_range(pa: usize, length: usize) {
+    unsafe { invalidate(phys_to_virt(pa), length) }
+}
+
+/// Attaches a contiguous run of guest frames to a 3D resource. Without this
+/// the host has no memory to render into, and `TRANSFER_FROM_HOST` returns
+/// whatever the resource was created with (zeros).
+pub fn attach_backing(resource_id: u32, pa: usize, length: usize) -> bool {
+    unsafe {
+        let Some(display) = (&mut *core::ptr::addr_of_mut!(DISPLAY)).as_mut() else {
+            return false;
+        };
+        let mut command = [0u8; CTRL_HDR_LEN + 8 + 16];
+        header(&mut command, VIRTIO_GPU_CMD_ATTACH_BACKING);
+        put32(&mut command, CTRL_HDR_LEN, resource_id);
+        put32(&mut command, CTRL_HDR_LEN + 4, 1);
+        put64(&mut command, CTRL_HDR_LEN + 8, pa as u64);
+        put32(&mut command, CTRL_HDR_LEN + 16, length as u32);
+        matches!(
+            control(&mut display.queue, &command),
+            Some(VIRTIO_GPU_RESP_OK_NODATA)
+        )
+    }
+}
+
 /// Attaches `resource_id` to the virgl context so its command buffers can
 /// reference it.
 pub fn context_attach(resource_id: u32) -> bool {
@@ -1056,7 +1101,7 @@ pub fn context_attach(resource_id: u32) -> bool {
         };
         let mut command = [0u8; CTRL_HDR_LEN + 8];
         header(&mut command, VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE);
-        put32(&mut command, 4, VIRGL_CONTEXT_ID);
+        put32(&mut command, 16, VIRGL_CONTEXT_ID); // ctrl_hdr.ctx_id
         put32(&mut command, CTRL_HDR_LEN, resource_id);
         matches!(
             control(&mut display.queue, &command),
@@ -1079,7 +1124,7 @@ pub fn create_context() -> bool {
         // VIRGL (1).
         let mut command = [0u8; CTRL_HDR_LEN + 72];
         header(&mut command, VIRTIO_GPU_CMD_CTX_CREATE);
-        put32(&mut command, 4, VIRGL_CONTEXT_ID);
+        put32(&mut command, 16, VIRGL_CONTEXT_ID); // ctrl_hdr.ctx_id
         put32(&mut command, CTRL_HDR_LEN, 1);
         let name = b"werewolf";
         command[CTRL_HDR_LEN + 8..CTRL_HDR_LEN + 8 + name.len()].copy_from_slice(name);
@@ -1114,7 +1159,7 @@ pub fn transfer_3d(
                 VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D
             },
         );
-        put32(&mut command, 4, VIRGL_CONTEXT_ID);
+        put32(&mut command, 16, VIRGL_CONTEXT_ID); // ctrl_hdr.ctx_id
         put32(&mut command, CTRL_HDR_LEN + 12, width);
         put32(&mut command, CTRL_HDR_LEN + 16, height);
         put32(&mut command, CTRL_HDR_LEN + 20, 1);
@@ -1242,7 +1287,9 @@ pub fn capset_caps(id: u32) -> Option<(&'static [u8], u32)> {
             failed("capset", kind);
             return None;
         }
-        let source = display.queue.command + 4096 + CTRL_HDR_LEN + 8;
+        // struct virtio_gpu_resp_capset { struct virtio_gpu_ctrl_hdr hdr;
+        // __u8 capset_data[]; } — the blob starts right after the header.
+        let source = display.queue.command + 4096 + CTRL_HDR_LEN;
         invalidate(source, found_size);
         let slot = table.iter_mut().position(|entry| entry.len == 0)?;
         table[slot].id = found_id;

@@ -95,49 +95,31 @@ extern void glFinish(void);
 extern void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height,
                          GLenum format, GLenum type, void *pixels);
 
-static int dump_phdr(struct dl_phdr_info *info, size_t size, void *data) {
-    (void)size;
-    struct dump_state { int count; } *state = data;
-    printf("map %d base 0x%lx %s\n", state->count++, (unsigned long)info->dlpi_addr,
-           info->dlpi_name[0] != 0 ? info->dlpi_name : "(main)");
-    return 0;
-}
-
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
-    /* Mesa/glvnd are found in the SFS root, not in /usr. The driver is
-       selected explicitly: the DRI loader's PCI table does know virtio-gpu,
-       but being explicit makes a failed probe obvious. */
+    /* Mesa/glvnd live in the SFS root, not /usr. The driver is chosen
+       explicitly so a failed probe is visible instead of a silent llvmpipe
+       fallback. */
     setenv("LD_LIBRARY_PATH", "/sfs", 1);
     setenv("LIBGL_DRIVERS_PATH", "/sfs", 1);
-#ifdef EGLTEST_VIRGL
-    setenv("MESA_LOADER_DRIVER_OVERRIDE", "virtio_gpu", 1);
-#else
-    /* The default build exercises EGL+GLES end to end on the software
-       rasteriser: `virtio_gpu` needs libdrm's /sys device description, which
-       this guest does not have yet (see EGLTEST_VIRGL). */
-    setenv("MESA_LOADER_DRIVER_OVERRIDE", "swrast", 1);
-#endif
     setenv("__EGL_VENDOR_LIBRARY_FILENAMES", "/sfs/egl_vendor.json", 1);
     setenv("EGL_PLATFORM", "surfaceless", 1);
     setenv("GBM_BACKENDS_PATH", "/sfs", 1);
-    setenv("EGL_LOG_LEVEL", "debug", 1);
-    setenv("MESA_DEBUG", "1", 1);
-    setenv("LIBGL_DEBUG", "verbose", 1);
+#ifdef EGLTEST_SWRAST
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", "swrast", 1);
+#else
+    setenv("MESA_LOADER_DRIVER_OVERRIDE", "virtio_gpu", 1);
+#endif
+    setenv("EGL_LOG_LEVEL", "warning", 1);
 
-    /* `EGL_PLATFORM=surfaceless` makes eglGetDisplay pick the surfaceless
-       platform; the EXT entry point is the explicit fallback. */
-    /* The DRI module (`libdril_dri.so`) takes its driver entry points from
-       libgallium as undefined symbols, so libgallium must be in the global
-       scope before the module is loaded. */
-    /* Describe the synthetic /dev/dri nodes the way a Linux guest with
-       virtio-gpu would: libdrm otherwise reads /sys, which does not exist. */
-#ifdef EGLTEST_VIRGL
-    /* Experimental virgl path: libgallium must be global before the DRI stub
-       resolves the driver entry points. The device description libdrm needs
-       now comes from the kernel's synthetic sysfs. */
+#ifndef EGLTEST_SWRAST
+    /* The DRI stub (`libdril_dri.so`) resolves its driver entry points from
+       libgallium, so libgallium must be in the global scope first. */
     void *gallium = dlopen("/sfs/libgallium-25.0.7.so", RTLD_NOW | RTLD_GLOBAL);
-    printf("egl: gallium %s\n", gallium != NULL ? "loaded" : dlerror());
+    if (gallium == NULL) {
+        printf("egl: gallium load failed: %s\n", dlerror());
+        return 1;
+    }
 #endif
     void *vendor = dlopen("/sfs/libEGL_mesa.so.0", RTLD_NOW | RTLD_GLOBAL);
     if (vendor == NULL) {
@@ -145,60 +127,6 @@ int main(void) {
     } else {
         printf("egl: vendor loaded\n");
     }
-    void *driver = dlopen("/sfs/virtio_gpu_dri.so", RTLD_NOW | RTLD_GLOBAL);
-    if (driver == NULL) {
-        printf("egl: driver load failed: %s\n", dlerror());
-    } else {
-        printf("egl: driver loaded\n");
-    }
-#ifdef EGLTEST_VIRGL
-    /* Ask libdrm directly what it makes of the render node. */
-    {
-        void *drm = dlopen("/sfs/libdrm.so.2", RTLD_NOW | RTLD_GLOBAL);
-        int (*get_device)(int, unsigned int, void **) =
-            drm != NULL ? (int (*)(int, unsigned int, void **))dlsym(drm, "drmGetDevice2") : NULL;
-        int node = open("/dev/dri/renderD128", O_RDWR);
-        struct stat st;
-        int frc = node >= 0 ? fstat(node, &st) : -1;
-        printf("fstat rc %d mode 0%o rdev %llu major %u minor %u\n", frc,
-               frc == 0 ? (unsigned)st.st_mode : 0,
-               frc == 0 ? (unsigned long long)st.st_rdev : 0ull,
-               frc == 0 ? major(st.st_rdev) : 0,
-               frc == 0 ? minor(st.st_rdev) : 0);
-        void *device = NULL;
-        int rc = (get_device != NULL && node >= 0) ? get_device(node, 0, &device) : -999;
-        printf("libdrm device: rc %d ptr %p\n", rc, device);
-        if (rc == 0 && device != NULL) {
-            int available = *(int *)((char *)device + 8);
-            printf("libdrm device: available_nodes 0x%x\n", available);
-        }
-    }
-
-    /* Reproduce libdrm's sysfs reads (fopen + fscanf("%x")) exactly. */
-    {
-        static const char *attrs[] = {"vendor", "device", "subsystem_vendor",
-                                      "subsystem_device"};
-        for (unsigned i = 0; i < 4; i++) {
-            char path[128];
-            snprintf(path, sizeof(path), "/sys/dev/char/226:128/device/%s", attrs[i]);
-            FILE *fp = fopen(path, "r");
-            if (fp == NULL) {
-                printf("sysfs %s: fopen failed\n", attrs[i]);
-                continue;
-            }
-            unsigned value = 0;
-            int parsed = fscanf(fp, "%x", &value);
-            fclose(fp);
-            printf("sysfs %s: ret %d value 0x%x\n", attrs[i], parsed, value);
-        }
-    }
-
-#endif
-
-    /* Which objects are mapped where: the kernel prints the user PC of the
-       capset queries, so this table names them. */
-    struct dump_state { int count; } state = {0};
-    dl_iterate_phdr(dump_phdr, &state);
 
     /* The surfaceless platform with EGL_DEFAULT_DISPLAY is swrast: to reach
        the virtio-gpu driver Mesa needs the render node fd. */
