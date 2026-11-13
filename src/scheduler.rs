@@ -6331,38 +6331,54 @@ impl Task {
             self.release_frames(page_count);
             return None;
         }
-        let mut page = alloc::vec![0_u8; PAGE_SIZE];
-        for index in 0..page_count {
-            let Some((physical, generation)) = frame_allocator::alloc_user_page_tagged() else {
-                self.abort_paged_mapping(virtual_address, index, &mut frames, page_count);
-                return None;
-            };
-            for byte in page.iter_mut() {
+        // Read the file in runs instead of page by page: every `fill` call
+        // turns into an SFS read, and a library segment like libLLVM (163 MiB)
+        // is 40k pages. Page-sized reads made the mapping take fifteen
+        // seconds because the block cache (256 KiB) never had a chance to
+        // help; 64 KiB runs cut the number of file reads by sixteen.
+        const BATCH_PAGES: usize = 16;
+        let mut buffer = alloc::vec![0_u8; PAGE_SIZE * BATCH_PAGES];
+        let mut index = 0usize;
+        while index < page_count {
+            let batch = (page_count - index).min(BATCH_PAGES);
+            let bytes = batch * PAGE_SIZE;
+            for byte in buffer[..bytes].iter_mut() {
                 *byte = 0;
             }
-            if !fill(index * PAGE_SIZE, &mut page) {
-                let _ = frame_allocator::free_page_tagged(physical, generation);
+            if !fill(index * PAGE_SIZE, &mut buffer[..bytes]) {
                 self.abort_paged_mapping(virtual_address, index, &mut frames, page_count);
                 return None;
             }
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    page.as_ptr(),
-                    phys_to_virt(physical) as *mut u8,
-                    PAGE_SIZE,
-                );
+            for slot in 0..batch {
+                let Some((physical, generation)) = frame_allocator::alloc_user_page_tagged() else {
+                    self.abort_paged_mapping(virtual_address, index + slot, &mut frames, page_count);
+                    return None;
+                };
+                unsafe {
+                    core::ptr::copy_nonoverlapping(
+                        buffer[slot * PAGE_SIZE..].as_ptr(),
+                        phys_to_virt(physical) as *mut u8,
+                        PAGE_SIZE,
+                    );
+                }
+                if !mmu::map_user_page_at(
+                    self.ttbr0,
+                    virtual_address + (index + slot) * PAGE_SIZE,
+                    physical,
+                    prot,
+                ) {
+                    let _ = frame_allocator::free_page_tagged(physical, generation);
+                    self.abort_paged_mapping(
+                        virtual_address,
+                        index + slot,
+                        &mut frames,
+                        page_count,
+                    );
+                    return None;
+                }
+                frames.push((physical, generation));
             }
-            if !mmu::map_user_page_at(
-                self.ttbr0,
-                virtual_address + index * PAGE_SIZE,
-                physical,
-                prot,
-            ) {
-                let _ = frame_allocator::free_page_tagged(physical, generation);
-                self.abort_paged_mapping(virtual_address, index, &mut frames, page_count);
-                return None;
-            }
-            frames.push((physical, generation));
+            index += batch;
         }
         let region = MmapRegion {
             virtual_address,

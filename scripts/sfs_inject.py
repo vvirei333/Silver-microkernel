@@ -286,6 +286,36 @@ class Image:
             index = child
         return index
 
+    def remove_file_at(self, path: str) -> bool:
+        """Removes a file at a slash-separated path and frees its blocks.
+
+        Directories are refused: their entries would be left dangling.
+        """
+        parts = [piece for piece in path.split("/") if piece]
+        if not parts:
+            return False
+        parent = self.root
+        for part in parts[:-1]:
+            entry = self.find_entry(parent, part)
+            if entry is None:
+                return False
+            parent = entry
+        target = self.find_entry(parent, parts[-1])
+        if target is None:
+            return False
+        if self.inode(target)[0] == INODE_KIND_DIR:
+            return False
+        # Drop the directory entry first: a partially freed file is
+        # invisible, an entry pointing at freed blocks is corruption.
+        for block in self.dir_blocks(parent):
+            start = block * BLOCK
+            for slot in range(BLOCK // 32):
+                offset = start + slot * 32
+                if struct.unpack_from("<I", self.data, offset)[0] == target:
+                    struct.pack_into("<I", self.data, offset, 0)
+        self.free_file(target)
+        return True
+
     def write_file(self, name: str, payload: bytes) -> None:
         self.write_file_in(self.root, name, payload)
 

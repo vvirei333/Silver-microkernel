@@ -1669,6 +1669,14 @@ static void layer_compose(void) {
     const unsigned out_width = OUT_WIDTH;
     const unsigned out_height = OUT_HEIGHT;
     unsigned *destination = (unsigned *)(screen + 0x1000);
+    /* WIN1 seqlock, as in userspace/src/window_proto.rs: the frame counter is
+       odd while the pixels are being painted and even once they are complete.
+       A host viewer copies a frame only when it observes an even, changed
+       counter and the counter is unchanged after the copy. Writing a constant
+       odd value meant the window never updated at all. */
+    screen_seq += 1;
+    *(volatile unsigned *)(screen + 0x18) = screen_seq;
+    __asm__ volatile("dsb sy" ::: "memory");
     for (unsigned index = 0; index < out_width * out_height; index++) {
         destination[index] = 0xFF101014u;
     }
@@ -1816,8 +1824,12 @@ static void layer_compose(void) {
     *(volatile unsigned *)(screen + 0x0C) = out_height;
     *(volatile unsigned *)(screen + 0x10) = out_width * 4;
     *(volatile unsigned *)(screen + 0x14) = 1;
-    *(volatile unsigned *)(screen + 0x18) = screen_seq * 2 + 1;
+    /* STATE_READY, then the even sequence number that publishes the frame. */
+    *(volatile unsigned *)(screen + 0x1C) = 1;
     *(volatile unsigned *)(screen + 0x2C) = 1;
+    __asm__ volatile("dsb sy" ::: "memory");
+    screen_seq += 1;
+    *(volatile unsigned *)(screen + 0x18) = screen_seq;
     __asm__ volatile("dsb sy" ::: "memory");
     gpu_present(out_width, out_height);
     if (drawn != 0) {
@@ -2325,9 +2337,18 @@ static void launch_terminal(void) {
         "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share:/sfs/usr/share",
         "GSETTINGS_SCHEMA_DIR=/sfs", "FONTCONFIG_FILE=/sfs/fonts.conf",
         "GSK_RENDERER=cairo", "GTK_A11Y=none",
-        "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session",
         "XDG_CURRENT_DESKTOP=Phosh", "XDG_SESSION_TYPE=wayland",
-        "XDG_SESSION_DESKTOP=phosh", 0,
+        "XDG_SESSION_DESKTOP=phosh",
+        /* wl_cursor_theme_load() only looks at XCURSOR_PATH (not
+           XDG_DATA_DIRS); without a theme every cursor lookup failed and
+           GDK rescanned every icon directory on each pointer enter. */
+        "XCURSOR_THEME=default", "XCURSOR_PATH=/sfs/share/icons",
+        /* No accessibility bus is running; loading atk-bridge makes GTK block
+           for tens of seconds on the D-Bus activation timeout. */
+        "NO_AT_BRIDGE=1",
+        /* Terminal frames are wl_shm; without this GDK gives the window a GL
+           context, which makes Mesa map llvmpipe and both libLLVM copies. */
+        "GDK_GL=disable", "GDK_DEBUG=gl-disable", 0,
     };
     sys6(221 /* execve */, (long)argv[0], (long)argv, (long)envp, 0, 0, 0);
     sys3(93 /* exit */, 0, 0, 0);
@@ -2340,10 +2361,19 @@ static void layer_compose(void);
 /// Shows/hides the newest toplevel; launches the terminal when there is none.
 static void toggle_app_window(void) {
     if (!app_window.used) {
+        static const char msg[] = "gtk-serve: app launch\n";
+        sys3(64, 1, (long)msg, sizeof(msg) - 1);
         launch_terminal();
         return;
     }
     app_window.hidden = !app_window.hidden;
+    {
+        static const char hide[] = "gtk-serve: app hide\n";
+        static const char show[] = "gtk-serve: app show\n";
+        const char *msg = app_window.hidden ? hide : show;
+        unsigned length = app_window.hidden ? sizeof(hide) - 1 : sizeof(show) - 1;
+        sys3(64, 1, (long)msg, length);
+    }
 #ifdef SERVE_ONLY
     layer_compose();
 #endif
@@ -3698,6 +3728,11 @@ static int serve(long client) {
                             }
                             __asm__ volatile("dsb sy" ::: "memory");
                             sys3(215, mapped, buffer_offset + bytes, 0);
+                            if (!app_window.used) {
+                                static const char frame[] =
+                                    "gtk-serve: app frame\n";
+                                sys3(64, 1, (long)frame, sizeof(frame) - 1);
+                            }
                             app_window.used = 1;
                             app_window.owner = current_client;
                             app_window.surface = object;
@@ -4063,6 +4098,8 @@ static void reset_client(void) {
         layer_entries[index].used = 0;
     }
     if (app_window.used && app_window.owner == current_client) {
+        static const char reset[] = "gtk-serve: app reset\n";
+        sys3(64, 1, (long)reset, sizeof(reset) - 1);
         app_window.used = 0;
         app_window.copy_ready = 0;
     }
@@ -4387,6 +4424,14 @@ void _start(void) {
             "GSETTINGS_SCHEMA_DIR=/sfs",
             "FONTCONFIG_FILE=/sfs/fonts.conf",
             "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share:/sfs/usr/share",
+            "XCURSOR_THEME=default",
+            "XCURSOR_PATH=/sfs/share/icons",
+            "NO_AT_BRIDGE=1",
+            /* The terminal and the shell paint through wl_shm; asking GDK for
+               a GL context makes Mesa map llvmpipe and libLLVM (117-163 MB of
+               libraries) before the first frame. */
+            "GDK_GL=disable",
+            "GDK_DEBUG=gl-disable",
 #if defined(SERVE_GTK4) || defined(SERVE_WLGL)
             /* GTK4 renders through GSK; "gl" goes EGL -> virgl. The Mesa
                files live in the SFS root, and libgallium must be global so
@@ -4494,6 +4539,8 @@ void _start(void) {
                     clients[index].connected = 0;
                     remaining -= 1;
                     if (app_window.used && app_window.owner == index) {
+                        static const char cleared[] = "gtk-serve: app cleared\n";
+                        sys3(64, 1, (long)cleared, sizeof(cleared) - 1);
                         app_window.used = 0;
                         app_window.copy_ready = 0;
                     }

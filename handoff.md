@@ -5489,3 +5489,68 @@ Verified: `cargo test --lib` (222), `layer-serve`, `linux-wlreal`, the Phosh
 flow (lockscreen, unlock, quick settings) and, as the second client, the GTK3
 terminal — it stays alive, composes over the desktop and runs commands
 (`ls /sfs` printed the SFS listing in the text view).
+
+
+### Publishing frames to the host viewer (WIN1 seqlock)
+
+The compositor wrote a constant frame counter (`screen_seq * 2 + 1`, and
+`screen_seq` was never incremented) and never set `STATE_READY`. The host
+viewer implements the seqlock from `userspace/src/window_proto.rs`: it copies
+a frame only when the counter is even and unchanged across the copy. A
+constant odd value therefore meant **the window never updated at all**, and a
+harness could not tell a fresh frame from a stale one.
+
+`layer_compose()` now publishes the way Wolfser does: bump the counter (odd)
+before painting, write geometry and `STATE_READY`, then bump it again (even)
+after the pixels are visible. The Phosh E2E grabs now report increasing even
+sequences (2, 276, 288, ...) instead of a constant 1.
+
+### Cursors: no theme at all
+
+GDK loads cursor images from an Xcursor theme and `wl_cursor_theme_load()`
+only searches `XCURSOR_PATH` — not `XDG_DATA_DIRS`. The image had no cursor
+theme, so every pointer enter logged `Unable to load <name> from the cursor
+theme` (49 lines in one run, and the same flood from Phosh filled the serial
+console, which is what the user saw on the host).
+
+`tools/install_cursor_theme.py` generates a minimal theme (arrow, I-beam,
+crosshair, ring at 24x24, drawn from ASCII masks with a white outline) and
+installs `/share/icons/default/cursors/*` plus `index.theme`; the shell and
+the terminal get `XCURSOR_THEME=default` and `XCURSOR_PATH=/sfs/share/icons`.
+The flood is gone (0 lines).
+
+`NO_AT_BRIDGE=1` stops GTK from loading atk-bridge: with no accessibility bus
+the D-Bus activation sat on its timeout for ~30 s before `activate` fired.
+
+### Application startup: 50 s -> 16 s
+
+Measured with a throwaway probe (`gdk_display_open`, then `gtk_init`, then
+`gtk_window_new`, then `show_all`) and a temporary slow-syscall log in the
+kernel (`dispatch()` timing, since removed):
+
+* `gdk_display_open` 0.4 s, `gtk_init` 0.1 s — connecting is cheap.
+* `gtk_window_new` took **30 s**: the first window makes GDK touch GL, whose
+  `libEGL_mesa` pulls `libgallium` -> `libLLVM` -> `libz3`. Both LLVM copies
+  (117 MiB and 163 MiB) were mapped a page at a time.
+* The mapping itself is the cost: `mmap` of a file segment copies every page
+  through `virtio-blk`, and the driver issues **one 512-byte request per
+  sector** (~15 MB/s). 122 MiB took 7.7 s inside `pread`, 0.6 s elsewhere.
+
+Two fixes:
+
+1. `mmap_file_paged()` reads the file in 64 KiB runs instead of 4 KiB pages
+   (16x fewer requests, ~25% faster on its own).
+2. `tools/prune_software_gl.py` removes `libLLVM*` and `libgallium*` from the
+   desktop image. Phosh and the terminal paint through `wl_shm`; the software
+   GL stack (llvmpipe) is only used by GL clients, which live in
+   `disk_gtk4.img`. This frees ~400 MiB and removes ~25 s of copying.
+
+Terminal: `client connected` -> first frame is now ~16 s (was ~50 s), with no
+cursor messages and the window staying alive. The remaining cost is the
+remaining library mappings (libicudata 33 MiB, libgtk 8.5 MiB) and font/CSS
+work at `show_all`; the real fix there is lazy file-backed mappings, which
+the kernel does not have yet (`lazy` regions are anonymous-only).
+
+Verified: `cargo test --lib` (222), `layer-serve`, `linux-wlreal`, the Phosh
+flow (lockscreen, unlock, quick settings) and the terminal as the second
+client.
