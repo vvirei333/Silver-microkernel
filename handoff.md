@@ -5605,40 +5605,34 @@ the second client.
 
 ### App grid / overview: what Phosh 0.57 needs
 
-Super does nothing today, so the terminal is still launched with F1. The trace
-below is what the investigation established, in case the next session picks it
-up.
+Super does not open the app grid yet, so the terminal is still launched with
+F1. What the investigation established:
 
 * Phosh's home (overview + app grid) is a `PhoshHome` `GtkWindow` built on
-  `PhoshDragSurface`, driven by `zphoc_draggable_layer_surface_v1`. Its
-  visibility is bound to `PhoshShell::overview-visible` (TRUE from startup),
-  and the app grid is a child of it.
-* The home window never drew because **a layer surface must be configured
-  before GTK commits a buffer**. Phosh only calls `set_size` for surfaces it
-  resizes, so the "fill the output" home surface was never configured.
-  `get_layer_surface` now sends an initial `configure(serial, w, h)` (this
-  commit); Phosh answers with `home: 1024x768, margin: -753`.
-* The Super accelerator does arrive: Phosh registers `Super_L`/`Super_R` via
+  `PhoshDragSurface`, driven by `zphoc_draggable_layer_surface_v1`; its
+  visibility is bound to `PhoshShell::overview-visible` (TRUE from startup).
+* A layer surface must be configured before GTK commits a buffer. Phosh only
+  calls `set_size` for surfaces it resizes, so the "fill the output" home
+  surface was never configured; `get_layer_surface` now sends an initial
+  `configure(serial, w, h)` and Phosh reports
+  `Mapped 'phosh home'` / `Configured 'phosh home' (1024x768)`.
+* Super reaches Phosh: Phosh registers `Super_L`/`Super_R` through
   `phosh_private_keyboard_event.grab_accelerator_request`, our `grab_activate`
-  fires action 9, and Phosh logs
-  `phosh-keyboard-events-DEBUG: Accelerator 9 activated: Super_L`, which runs
-  `toggle_overview_action` -> `phosh_drag_surface_set_drag_state(UNFOLDED)` ->
-  `zphoc_draggable_layer_surface_v1.set_state(UNFOLDED)`.
-* `set_state` must be answered with **both** `dragged(margin)` and
-  `drag_end(state)`. Phosh's drag state only leaves FOLDED on those events, so
-  moving the margin alone (the current `set_state` handler) leaves the overview
-  hidden. With the reply added, Phosh logs `DragSurface state 2` then `0` and
-  the home surface starts drawing.
-* That last step is not committed: as soon as the home draws, the
-  `phosh top-panel background` surface draws too, and our scene kept it opaque
-  (the screen went black after unlock). Phosh fades it with
-  `zphoc_alpha_layer_surface_v1.set_alpha`, but a `LayerEntry` keeps the alpha
-  it was copied with, so a later `set_alpha` has no effect; and the drawn
-  background entry's surface id no longer matched the registered layer surface
-  after Phosh destroyed/recreated it (stale entry). Fix the alpha/entry
-  lifecycle (`set_alpha` updates the stored entry and recomposes;
-  `layer_forget_surface` on destroy must drop the entry), then re-add the
-  `set_state` reply and the app grid appears.
+  fires action 9, and Phosh runs `toggle_overview_action`.
+* `zphoc_draggable_layer_surface_v1.set_state` must be answered with **both**
+  `dragged(margin)` and `drag_end(state)`; the client only leaves its folded
+  state on those events. Implemented: Phosh now logs
+  `DragSurface ... state, 2` then `1` (dragged -> unfolded).
+* `zphoc_alpha_layer_surface_v1.set_alpha` has to update the *stored* layer
+  entry and recompose. Phosh fades the quick-settings backdrop and the home
+  background after the surface committed, so a late alpha 0 was ignored and
+  an opaque backdrop covered the whole screen.
 
-Until then F1 remains the launcher: it shows/hides the newest toplevel and
-starts the terminal when nothing is mapped.
+**Still open:** with the home unfolded, mapped and configured, its surface
+commits `attach(NULL)` (empty frames) and nothing is drawn. Phosh's own log
+shows the same `Configured 'phosh home' (1024x768)` twice and no visual. The
+next question is why GTK does not paint that window: the overview widget tree
+may be empty (no launcher entries), or the window needs an enter/frame clock
+push our compositor does not provide for that surface. Until then F1 remains
+the launcher: it shows/hides the newest toplevel and starts the terminal when
+nothing is mapped.

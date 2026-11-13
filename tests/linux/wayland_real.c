@@ -3442,12 +3442,21 @@ static int serve(long client) {
                 } else if (opcode == 4) {
                     slot->drag_handle = take_u32();
                 } else {
-                    /* set_state(folded|unfolded) is immediate. */
+                    /* set_state(folded|unfolded): Phosh asks the compositor to
+                       move the surface itself (the Super overview action, the
+                       home bar, the quick-settings sheet). The client learns
+                       the outcome only from `dragged` + `drag_end`, which
+                       update its drag-surface state; moving the margin without
+                       answering left Phosh stuck in the folded state. */
                     unsigned state = take_u32();
                     slot->state = state ? 1 : 0;
                     slot->current = slot->state ? slot->unfolded : slot->folded;
                     drag_apply(slot->layer_surface);
                     drag_recompose();
+                    drag_notify(client, slot, 0 /* dragged */,
+                                (unsigned)slot->current);
+                    drag_notify(client, slot, 1 /* drag_end */,
+                                (unsigned)slot->state);
                 }
             } else if (drag_slot_by_id(object) != 0 && opcode == 6) {
                 DragSlot *slot = drag_slot_by_id(object);
@@ -3465,6 +3474,19 @@ static int serve(long client) {
                 LayerSurface *surface = layer_surface_by_id(slot->layer_surface);
                 if (surface != 0) {
                     surface->alpha = slot->alpha;
+                    /* Phosh animates the quick-settings backdrop and the home
+                       background by changing the alpha *after* the surface
+                       committed. The stored pixels keep the alpha they were
+                       copied with, so the entry has to be updated and the
+                       scene recomposed; otherwise a transparent (alpha 0)
+                       backdrop stayed opaque and covered the screen. */
+                    LayerEntry *entry = layer_entry_by_surface(surface->surface);
+                    if (entry != 0 && entry->alpha != slot->alpha) {
+                        entry->alpha = slot->alpha;
+#ifdef SERVE_ONLY
+                        layer_compose();
+#endif
+                    }
                 }
             } else if (alpha_slot_by_id(object) != 0 && opcode == 1) {
                 AlphaSlot *slot = alpha_slot_by_id(object);
