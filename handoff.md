@@ -5449,3 +5449,43 @@ protocol trace shows it binding and creating surfaces, so the next question is
 whether its `wl_surface.commit` reaches the `app_window` capture path at all
 (trace `object, opcode == 6` for client 1) — the capture requires
 `layer_slot == 0`, so a stale layer-surface match is the first suspect.
+
+
+### Surface identifiers are per client
+
+The launched terminal drew its first frame and then closed the connection
+120 ms later with `Gdk-Message: Error reading events from display: Invalid
+argument` and exit status 1. `WAYLAND_DEBUG=1` showed the last exchange was
+`wl_surface.commit()`, and GDK3's event source `_exit(1)`s as soon as
+`wl_display_read_events()` fails.
+
+The failure was a protocol error on the *client* side, not a broken socket:
+the compositor had just handed the application a `wl_pointer.enter` /
+`wl_keyboard.enter` whose surface argument was the *shell's* layer-surface id.
+Surface ids live in the owning client's namespace, so that id either names an
+unrelated object or nothing at all; libwayland-client logs
+`unknown object (N), message wl_pointer_enter(...)`, sets `errno = EINVAL`
+and remembers it in `display->last_error`. GDK only notices on the next read,
+which is why the message points at "reading events" and why the kernel's
+`recvmsg`/`ppoll` never failed.
+
+`pointer_route()`, `keyboard_route()` and `drag_begin()` now check
+`LayerEntry::owner` before targeting a surface, and `pointer_route()` also
+hit-tests the newest toplevel for its own client, so an application window is
+clickable instead of falling through to "no surface here".
+
+Two follow-ups ride along:
+
+* `xdg_surface.set_window_geometry()` is recorded and used when compositing
+  and hit-testing the toplevel. A GTK window with client-side decorations
+  arrives as a 1076x820 buffer whose content starts at (26, 23); anchoring the
+  *content* at the output origin makes a 1024x768 terminal fit exactly instead
+  of spilling 52 px off the bottom edge.
+* F1 toggles the newest toplevel (and launches the terminal when none is
+  mapped). Without a window manager this is the way back to the shell: the
+  compositor still routes input to the application while its window is up.
+
+Verified: `cargo test --lib` (222), `layer-serve`, `linux-wlreal`, the Phosh
+flow (lockscreen, unlock, quick settings) and, as the second client, the GTK3
+terminal — it stays alive, composes over the desktop and runs commands
+(`ls /sfs` printed the SFS listing in the text view).

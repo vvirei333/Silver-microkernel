@@ -1021,6 +1021,11 @@ static int buffer_height;
 static unsigned buffer_offset;
 static unsigned buffer_stride;
 static unsigned buffer_format;
+/* Last xdg_surface.set_window_geometry() origin. A GTK toplevel buffer
+   includes its client-side decoration margins, so the window content starts
+   at this offset inside the buffer. */
+static unsigned window_geometry_x;
+static unsigned window_geometry_y;
 static unsigned char *screen;
 static unsigned screen_seq;
 /* virtio-gpu scanout (`/dev/gpufb`). When present, every composed frame is
@@ -1115,6 +1120,8 @@ typedef struct {
     unsigned popup_xdg_surface_id;
     unsigned popup_id;
     unsigned positioner_id;
+    unsigned window_geometry_x;
+    unsigned window_geometry_y;
     unsigned idle_notifier_id;
     unsigned idle_notification_id;
     unsigned output_power_manager_id;
@@ -1191,6 +1198,7 @@ typedef struct {
     X(text_input_enabled) X(text_input_serial) \
     X(seat_id) X(seat_version) X(keyboard_id) X(pointer_id) \
     X(configure_serial) X(surface_id) X(toplevel_surface_id) X(popup_surface_id) \
+    X(window_geometry_x) X(window_geometry_y) \
     X(popup_xdg_surface_id) X(popup_id) X(positioner_id) \
     X(idle_notifier_id) X(idle_notification_id) \
     X(output_power_manager_id) X(output_power_id) \
@@ -1217,6 +1225,11 @@ typedef struct {
     unsigned height;
     unsigned stride;
     unsigned format;
+    /* Top-left corner of the window content inside its buffer. */
+    unsigned geometry_x;
+    unsigned geometry_y;
+    /* F1 moved the window out of the way (there is no window manager yet). */
+    int hidden;
     unsigned char *copy;
     unsigned copy_bytes;
     int copy_ready;
@@ -1747,19 +1760,24 @@ static void layer_compose(void) {
     }
     /* The newest toplevel (an application window) goes on top of the shell
        layers. Full-output only: there is no window manager yet. */
-    if (app_window.used && app_window.copy_ready && app_window.width != 0) {
-        unsigned rows = app_window.height;
-        if (rows > out_height) {
-            rows = out_height;
-        }
-        for (unsigned row = 0; row < rows; row++) {
+    if (app_window.used && !app_window.hidden && app_window.copy_ready &&
+        app_window.width != 0) {
+        /* Anchor the window content, not the decoration margins, at the
+           output origin: a 1024x768 toplevel arrives as a 1076x820 buffer. */
+        int origin_x = -(int)app_window.geometry_x;
+        int origin_y = -(int)app_window.geometry_y;
+        for (unsigned row = 0; row < app_window.height; row++) {
+            int out_y = origin_y + (int)row;
+            if (out_y < 0 || out_y >= (int)out_height) {
+                continue;
+            }
             const unsigned *source_row = (const unsigned *)
                 (app_window.copy + row * app_window.stride);
-            unsigned columns = app_window.width;
-            if (columns > out_width) {
-                columns = out_width;
-            }
-            for (unsigned column = 0; column < columns; column++) {
+            for (unsigned column = 0; column < app_window.width; column++) {
+                int out_x = origin_x + (int)column;
+                if (out_x < 0 || out_x >= (int)out_width) {
+                    continue;
+                }
                 unsigned pixel = source_row[column];
                 unsigned swizzled = (pixel & 0xFF00FF00u) |
                                     ((pixel & 0x00FF0000u) >> 16) |
@@ -1768,7 +1786,8 @@ static void layer_compose(void) {
                     swizzled |= 0xFF000000u;
                 }
                 unsigned alpha = swizzled >> 24;
-                unsigned *target = &destination[row * out_width + column];
+                unsigned *target = &destination[(unsigned)out_y * out_width +
+                                                (unsigned)out_x];
                 if (alpha == 0) {
                     continue;
                 }
@@ -1792,7 +1811,6 @@ static void layer_compose(void) {
         }
         drawn += 1;
     }
-
     *(volatile unsigned *)(screen + 0x00) = 0x57494E31u;
     *(volatile unsigned *)(screen + 0x08) = out_width;
     *(volatile unsigned *)(screen + 0x0C) = out_height;
@@ -2006,6 +2024,9 @@ static int drag_begin(long client, unsigned px, unsigned py) {
         if (entry == 0 || !entry->used || entry->width == 0) {
             continue;
         }
+        if (entry->owner != current_client) {
+            continue;
+        }
         int axis = drag_axis(entry->anchor);
         if (axis < 0) {
             continue;
@@ -2089,12 +2110,35 @@ static void pointer_route(long client, unsigned px, unsigned py, int motion) {
     int local_y;
     if (target == 0) {
         target = layer_hit_test(px, py);
+        if (target != 0) {
+            /* Surface identifiers live in the owning client's namespace. An
+               id that happens to be the shell's layer is a random object (or
+               nothing at all) for an application, and libwayland rejects such
+               an event with "unknown object" and kills the connection. */
+            LayerEntry *hit = layer_entry_by_surface(target);
+            if (hit == 0 || hit->owner != current_client) {
+                target = 0;
+            }
+        }
+    }
+    int from_app = 0;
+    if (target == 0 && app_window.used && !app_window.hidden &&
+        app_window.copy_ready && app_window.owner == current_client &&
+        (int)px + (int)app_window.geometry_x < (int)app_window.width &&
+        (int)py + (int)app_window.geometry_y < (int)app_window.height) {
+        /* The application window is drawn over the whole scene, so it is the
+           topmost surface under the pointer for its own client. */
+        target = app_window.surface;
+        from_app = 1;
     }
     if (target != 0) {
         LayerEntry *entry = layer_entry_by_surface(target);
         int x = 0;
         int y = 0;
-        if (entry != 0) {
+        if (from_app) {
+            x = -(int)app_window.geometry_x;
+            y = -(int)app_window.geometry_y;
+        } else if (entry != 0) {
             layer_rect(entry, &x, &y);
         }
         local_x = ((int)px - x) / (int)OUTPUT_SCALE;
@@ -2138,6 +2182,14 @@ static void keyboard_route(long client) {
         return;
     }
     unsigned target = keyboard_hit_test();
+    if (target != 0) {
+        /* Same namespace rule as the pointer: never hand a client a focus
+           target that belongs to the shell or another application. */
+        LayerEntry *hit = layer_entry_by_surface(target);
+        if (hit == 0 || hit->owner != current_client) {
+            target = 0;
+        }
+    }
     if (target == 0) {
         target = focus_surface;
     }
@@ -2257,13 +2309,54 @@ static void grab_activate(long client, unsigned keycode) {
     }
 }
 
+static void launch_terminal(void) {
+    if (app_window.used) {
+        return;
+    }
+    long child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
+    if (child != 0) {
+        return;
+    }
+    static const char *argv[] = {"/sfs/term", 0};
+    static const char *envp[] = {
+        "XDG_RUNTIME_DIR=/tmp", "HOME=/tmp", "XKB_CONFIG_ROOT=/sfs/xkb",
+        "WAYLAND_DISPLAY=wayland-test", "GDK_BACKEND=wayland",
+        "LD_LIBRARY_PATH=/sfs",
+        "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share:/sfs/usr/share",
+        "GSETTINGS_SCHEMA_DIR=/sfs", "FONTCONFIG_FILE=/sfs/fonts.conf",
+        "GSK_RENDERER=cairo", "GTK_A11Y=none",
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session",
+        "XDG_CURRENT_DESKTOP=Phosh", "XDG_SESSION_TYPE=wayland",
+        "XDG_SESSION_DESKTOP=phosh", 0,
+    };
+    sys6(221 /* execve */, (long)argv[0], (long)argv, (long)envp, 0, 0, 0);
+    sys3(93 /* exit */, 0, 0, 0);
+}
+
+#ifdef SERVE_ONLY
+static void layer_compose(void);
+#endif
+
+/// Shows/hides the newest toplevel; launches the terminal when there is none.
+static void toggle_app_window(void) {
+    if (!app_window.used) {
+        launch_terminal();
+        return;
+    }
+    app_window.hidden = !app_window.hidden;
+#ifdef SERVE_ONLY
+    layer_compose();
+#endif
+}
+
 static void poll_input(void) {
     if (screen == 0) {
         return;
     }
     /* Events go to the application window when one is mapped, otherwise to
        the shell (the client that owns the layer scene). */
-    int index = app_window.used ? app_window.owner : ui_client;
+    int index = (app_window.used && !app_window.hidden) ? app_window.owner
+                                                       : ui_client;
     if (index < 0 || index >= MAX_CLIENTS || !clients[index].connected) {
         return;
     }
@@ -2282,7 +2375,12 @@ static void poll_input(void) {
         unsigned key = entry[2] | ((unsigned)entry[3] << 8);
         unsigned x = entry[4] | ((unsigned)entry[5] << 8);
         unsigned y = entry[6] | ((unsigned)entry[7] << 8);
-        if (kind == INPUT_MOVE) {
+        if (kind == INPUT_KEY && key == 59 /* F1 */) {
+            /* There is no window manager yet, so F1 is the way between the
+               shell and the application window: it shows or hides the newest
+               toplevel and launches the terminal when none is mapped. */
+            toggle_app_window();
+        } else if (kind == INPUT_MOVE) {
             if (value == 1) {
                 /* The host pointer left the window. */
                 if (pointer_id != 0 && pointer_target != 0) {
@@ -2896,6 +2994,13 @@ static int serve(long client) {
                 put_u32(configure_serial);
                 configure_serial += 1;
                 finish(); send_message(client, -1);
+            } else if (object == xdg_surface_id && opcode == 3) {
+                /* set_window_geometry(x, y, width, height): where the window
+                   content (without its decoration margins) starts. */
+                window_geometry_x = take_u32();
+                window_geometry_y = take_u32();
+                (void)take_u32();
+                (void)take_u32();
             } else if (object == xdg_surface_id && opcode == 4) {
                 (void)take_u32(); /* ack_configure(serial) */
             } else if (object == popup_xdg_surface_id && opcode == 4) {
@@ -3596,6 +3701,8 @@ static int serve(long client) {
                             app_window.used = 1;
                             app_window.owner = current_client;
                             app_window.surface = object;
+                            app_window.geometry_x = window_geometry_x;
+                            app_window.geometry_y = window_geometry_y;
                             app_window.width = (unsigned)buffer_width;
                             app_window.height = (unsigned)buffer_height;
                             app_window.stride = buffer_stride;
