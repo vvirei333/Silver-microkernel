@@ -5665,3 +5665,43 @@ Verified with viewer-style events (ring positions, Unicode keys): 90 hover
 moves, then a swipe unlocks; Ctrl+T starts the terminal; typing `ls /sfs`
 prints the SFS listing in it. `layer-serve`, `linux-wlreal` and the Phosh
 quick-settings flow stay green.
+
+
+### Frame cost: what was actually slow
+
+The desktop ran, but slowly, and the serial console was flooded with
+`layer compose px=...`. Measured with a temporary per-frame timer (100-frame
+averages, QEMU TCG):
+
+| | before | now |
+|---|---|---|
+| compose | 30-64 ms | **27 ms** |
+| of which blit | 24-61 ms | 24 ms |
+| of which GPU head | 5 ms | 1 ms |
+| composes for 10 s of lockscreen | ~250 | ~260 (Phosh's own rate) |
+
+What changed:
+
+* The per-frame console line is gone. It cost a UART write per composed frame
+  and was the "spam" in the terminal; nothing else prints per frame.
+* `layer_compose()` is no longer called from every commit. Phosh commits its
+  background, the lockscreen and the panel in the same frame, so composing
+  after each of them meant three full-frame blits per visible frame. A
+  `scene_dirty` flag now composes once per main-loop iteration.
+* Layer pixels are stored **pre-swizzled** (BGRA -> RGBA, XRGB forced opaque)
+  in `layer_store_pixels`/the app-window capture, so the compose pass only
+  copies or blends words. A static layer (the wallpaper) is no longer
+  swizzled again on every composed frame.
+* The blit hoists the per-layer alpha: an opaque layer takes a word-copy path
+  with no per-pixel multiply/divide.
+* The virtio-gpu head is refreshed every fourth frame (the ivshmem sink is
+  what the window viewer reads) and its copy is 64-bit word-wise.
+
+Frame latency end to end from viewer-style input: swipe -> unlocked in 0.53 s
+(including the injected event delays), Ctrl+T -> terminal in ~5 s, typing
+`ls` runs it.
+
+**Still open:** the compose is a full-screen redraw every frame (~24 ms of
+pixel work under TCG). Per-layer damage tracking (compose only the rects that
+changed, caching the rest) is the next big win; the shell's own GTK redraw
+cost is on top of that.

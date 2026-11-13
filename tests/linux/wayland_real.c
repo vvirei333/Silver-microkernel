@@ -1028,6 +1028,11 @@ static unsigned window_geometry_x;
 static unsigned window_geometry_y;
 static unsigned char *screen;
 static unsigned screen_seq;
+/* A layer commit only marks the scene dirty: the main loop composes once per
+   iteration. Phosh commits its background, the lockscreen and the panel in
+   the same frame, and composing after each of them cost three full-frame
+   blits per visible frame (~30 ms each under emulation). */
+static int scene_dirty;
 /* virtio-gpu scanout (`/dev/gpufb`). When present, every composed frame is
    also pushed through the GPU, so the device's own display head shows the
    desktop and a host screendump can prove the path. */
@@ -1483,8 +1488,23 @@ static void layer_store_pixels(LayerEntry *entry) {
     }
     const unsigned char *source =
         (const unsigned char *)(mapped + buffer_offset);
-    for (unsigned index = 0; index < bytes; index++) {
-        entry->copy[index] = source[index];
+    /* Store the frame in the sink's channel order (and opaque for XRGB
+       formats) once per commit. The compose pass then only blends or copies
+       words: a layer that does not change is no longer swizzled again on
+       every composed frame, which is most of the cost of the wallpaper. */
+    const unsigned *source_words = (const unsigned *)source;
+    unsigned *destination_words = (unsigned *)entry->copy;
+    unsigned words = bytes / 4;
+    const int opaque = buffer_format == 1;
+    for (unsigned index = 0; index < words; index++) {
+        unsigned pixel = source_words[index];
+        unsigned swizzled = (pixel & 0xFF00FF00u) |
+                            ((pixel & 0x00FF0000u) >> 16) |
+                            ((pixel & 0x000000FFu) << 16);
+        if (opaque) {
+            swizzled |= 0xFF000000u;
+        }
+        destination_words[index] = swizzled;
     }
     __asm__ volatile("dsb sy" ::: "memory");
     sys3(215 /* munmap */, mapped, buffer_offset + bytes, 0);
@@ -1651,9 +1671,10 @@ static void gpu_present(unsigned width, unsigned height) {
     if (gpufb == 0 || gpufb_fd < 0 || screen == 0) {
         return;
     }
-    const unsigned *source = (const unsigned *)(screen + 0x1000);
-    unsigned *destination = (unsigned *)gpufb;
-    unsigned count = width * height;
+    const unsigned long long *source =
+        (const unsigned long long *)(screen + 0x1000);
+    unsigned long long *destination = (unsigned long long *)gpufb;
+    unsigned count = (width * height) / 2;
     for (unsigned index = 0; index < count; index++) {
         destination[index] = source[index];
     }
@@ -1680,7 +1701,6 @@ static void layer_compose(void) {
     for (unsigned index = 0; index < out_width * out_height; index++) {
         destination[index] = 0xFF101014u;
     }
-    unsigned drawn = 0;
     for (unsigned wanted = 0; wanted <= 3; wanted++) {
         unsigned order[MAX_LAYERS];
         unsigned count = 0;
@@ -1715,6 +1735,7 @@ static void layer_compose(void) {
             } else {
                 continue;
             }
+            const int full_alpha = entry->alpha >= 255;
             for (unsigned row = 0; row < entry->height; row++) {
                 int out_y = y + (int)row;
                 if (out_y < 0 || out_y >= (int)out_height) {
@@ -1722,23 +1743,34 @@ static void layer_compose(void) {
                 }
                 const unsigned *source_row =
                     (const unsigned *)(source + row * entry->stride);
+                if (full_alpha) {
+                    /* Opaque layer: a straight word copy, no per-pixel
+                       multiply or divide. */
+                    unsigned *target_row =
+                        destination + (unsigned)out_y * out_width;
+                    for (unsigned column = 0; column < entry->width; column++) {
+                        int out_x = x + (int)column;
+                        if (out_x < 0 || out_x >= (int)out_width) {
+                            continue;
+                        }
+                        unsigned pixel = source_row[column];
+                        if ((pixel >> 24) != 0) {
+                            target_row[out_x] = pixel | 0xFF000000u;
+                        }
+                    }
+                    continue;
+                }
                 for (unsigned column = 0; column < entry->width; column++) {
                     int out_x = x + (int)column;
                     if (out_x < 0 || out_x >= (int)out_width) {
                         continue;
-                    }
-                    unsigned pixel = source_row[column];
-                    unsigned swizzled = (pixel & 0xFF00FF00u) |
-                                        ((pixel & 0x00FF0000u) >> 16) |
-                                        ((pixel & 0x000000FFu) << 16);
-                    if (entry->format == 1) {
-                        swizzled |= 0xFF000000u;
                     }
                     /* wl_shm ARGB8888 is premultiplied. Apply the surface
                        alpha from zphoc_alpha_layer_surface_v1 and blend over
                        the layers below; Phosh draws its home screen, panel
                        backdrop and sheets translucent, and writing them
                        straight to the sink turned every overlay black. */
+                    unsigned swizzled = source_row[column];
                     unsigned alpha = (swizzled >> 24) * entry->alpha / 255u;
                     if (alpha == 0) {
                         continue;
@@ -1763,7 +1795,6 @@ static void layer_compose(void) {
                     *target = 0xFF000000u | (blue << 16) | (green << 8) | red;
                 }
             }
-            drawn += 1;
         }
     }
     /* The newest toplevel (an application window) goes on top of the shell
@@ -1786,13 +1817,7 @@ static void layer_compose(void) {
                 if (out_x < 0 || out_x >= (int)out_width) {
                     continue;
                 }
-                unsigned pixel = source_row[column];
-                unsigned swizzled = (pixel & 0xFF00FF00u) |
-                                    ((pixel & 0x00FF0000u) >> 16) |
-                                    ((pixel & 0x000000FFu) << 16);
-                if (app_window.format == 1) {
-                    swizzled |= 0xFF000000u;
-                }
+                unsigned swizzled = source_row[column];
                 unsigned alpha = swizzled >> 24;
                 unsigned *target = &destination[(unsigned)out_y * out_width +
                                                 (unsigned)out_x];
@@ -1817,7 +1842,6 @@ static void layer_compose(void) {
                 *target = 0xFF000000u | (blue << 16) | (green << 8) | red;
             }
         }
-        drawn += 1;
     }
     *(volatile unsigned *)(screen + 0x00) = 0x57494E31u;
     *(volatile unsigned *)(screen + 0x08) = out_width;
@@ -1831,23 +1855,16 @@ static void layer_compose(void) {
     screen_seq += 1;
     *(volatile unsigned *)(screen + 0x18) = screen_seq;
     __asm__ volatile("dsb sy" ::: "memory");
-    gpu_present(out_width, out_height);
-    if (drawn != 0) {
-        static const char prefix[] = "layer compose px=0x";
-        char text[sizeof(prefix) + 9];
-        unsigned length = sizeof(prefix) - 1;
-        for (unsigned index = 0; index < length; index++) {
-            text[index] = prefix[index];
-        }
-        unsigned pixel = destination[0];
-        for (int shift = 28; shift >= 0; shift -= 4) {
-            unsigned digit = (pixel >> shift) & 0xF;
-            text[length++] = (char)(digit < 10 ? '0' + digit
-                                               : 'a' + (digit - 10));
-        }
-        text[length++] = '\n';
-        sys3(64 /* write */, 1, (long)text, length);
+    /* The ivshmem sink above is what the window viewer reads. Pushing the
+       same frame through virtio-gpu costs another full-frame copy plus a
+       device transfer (~5 ms per frame here), so refresh the device's own
+       display head only occasionally. */
+    static unsigned gpu_frames;
+    gpu_frames += 1;
+    if ((gpu_frames & 3u) == 0) {
+        gpu_present(out_width, out_height);
     }
+
 }
 #endif
 
@@ -2003,7 +2020,7 @@ static void drag_apply(unsigned layer_surface) {
 /// libwayland test build has no scanout, so this is a no-op there.
 static void drag_recompose(void) {
 #ifdef SERVE_ONLY
-    layer_compose();
+    scene_dirty = 1;
 #endif
 }
 
@@ -2375,7 +2392,7 @@ static void toggle_app_window(void) {
         sys3(64, 1, (long)msg, length);
     }
 #ifdef SERVE_ONLY
-    layer_compose();
+    scene_dirty = 1;
 #endif
 }
 
@@ -3592,7 +3609,7 @@ static int serve(long client) {
                     if (entry != 0 && entry->alpha != slot->alpha) {
                         entry->alpha = slot->alpha;
 #ifdef SERVE_ONLY
-                        layer_compose();
+                        scene_dirty = 1;
 #endif
                     }
                 }
@@ -3871,8 +3888,25 @@ static int serve(long client) {
                         if (mapped > 0) {
                             const unsigned char *source =
                                 (const unsigned char *)(mapped + buffer_offset);
-                            for (unsigned index = 0; index < bytes; index++) {
-                                app_window.copy[index] = source[index];
+                            /* Same trick as a layer: store in sink order so
+                               the compose pass copies words instead of
+                               swizzling 1024x768 pixels every frame. */
+                            const unsigned *source_words =
+                                (const unsigned *)source;
+                            unsigned *destination_words =
+                                (unsigned *)app_window.copy;
+                            unsigned words = bytes / 4;
+                            const int opaque = buffer_format == 1;
+                            for (unsigned index = 0; index < words; index++) {
+                                unsigned pixel = source_words[index];
+                                unsigned swizzled =
+                                    (pixel & 0xFF00FF00u) |
+                                    ((pixel & 0x00FF0000u) >> 16) |
+                                    ((pixel & 0x000000FFu) << 16);
+                                if (opaque) {
+                                    swizzled |= 0xFF000000u;
+                                }
+                                destination_words[index] = swizzled;
                             }
                             __asm__ volatile("dsb sy" ::: "memory");
                             sys3(215, mapped, buffer_offset + bytes, 0);
@@ -3892,7 +3926,7 @@ static int serve(long client) {
                             app_window.format = buffer_format;
                             app_window.copy_ready = 1;
                         }
-                        layer_compose();
+                        scene_dirty = 1;
                     }
                     if (layer_slot != 0) {
                         layer_surface_surface = layer_slot->surface;
@@ -3917,7 +3951,7 @@ static int serve(long client) {
                                stop being drawn and stop taking input. */
                             layer_forget_surface(layer_slot->surface);
                         }
-                        layer_compose();
+                        scene_dirty = 1;
                     }
 #else
                     long mapped = sys6(222, 0, 4096, 1, 1, pool_fd, 0);
@@ -4705,6 +4739,12 @@ void _start(void) {
                 poll_input();
             }
         }
+#ifdef SERVE_ONLY
+        if (scene_dirty) {
+            scene_dirty = 0;
+            layer_compose();
+        }
+#endif
         /* Vblank tick: complete pending frame callbacks for every client. */
         for (int index = 0; index < MAX_CLIENTS; index++) {
             if (!clients[index].connected) {
