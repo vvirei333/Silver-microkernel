@@ -340,10 +340,16 @@ static unsigned layer_height;
 static int layer_configured;
 static int layer_acked;
 #define MAX_LAYERS 16
-/* Logical output is 512x384 at wl_output.scale=2; every layer buffer is in
- * physical pixels, so composition and hit-testing share one 1024x768 space. */
+/* The scanout is a 1024x768 surface. `OUTPUT_SCALE` is what the compositor
+ * advertises through wl_output: at 1 the desktop is the full 1024x768, at 2
+ * it is a 512x384 phone-sized desktop rendered with double-density buffers.
+ * Every layer buffer is in physical pixels, so composition and hit-testing
+ * share one 1024x768 space regardless of the advertised scale. */
+#define OUTPUT_SCALE 1u
 #define OUT_WIDTH 1024u
 #define OUT_HEIGHT 768u
+#define LOGICAL_WIDTH (OUT_WIDTH / OUTPUT_SCALE)
+#define LOGICAL_HEIGHT (OUT_HEIGHT / OUTPUT_SCALE)
 typedef struct {
     int used;
     unsigned surface;
@@ -365,6 +371,16 @@ typedef struct {
     unsigned layer_surface;
     unsigned below;
     unsigned above;
+    /* zphoc_alpha_layer_surface_v1, 0..255. Phosh fades the panel backdrop
+       between folded and unfolded states. */
+    unsigned alpha;
+    /* Own copy of the last committed pixels. GTK destroys the wl_shm pool as
+       soon as the compositor releases the buffer, so re-reading the client
+       fd on every composite made static layers (wallpaper, home) vanish as
+       soon as another surface committed. */
+    unsigned char *copy;
+    unsigned copy_bytes;
+    int copy_ready;
 } LayerEntry;
 static LayerEntry layer_entries[MAX_LAYERS];
 
@@ -391,6 +407,7 @@ typedef struct {
     unsigned keyboard_interactivity;
     unsigned below;
     unsigned above;
+    unsigned alpha;
 } LayerSurface;
 static LayerSurface layer_surfaces[MAX_LAYER_SURFACES];
 static unsigned layer_surface_seq;
@@ -432,6 +449,54 @@ static StackedSlot *stacked_find(unsigned id) {
         }
     }
     return 0;
+}
+
+/* zphoc_alpha_layer_surface_v1 helpers: one object per layer surface. */
+#define MAX_ALPHA_SURFACES 8
+typedef struct {
+    int used;
+    unsigned id;
+    unsigned layer_surface;
+    unsigned alpha; /* 0..255 */
+} AlphaSlot;
+static AlphaSlot alpha_slots[MAX_ALPHA_SURFACES];
+
+static AlphaSlot *alpha_slot_add(unsigned id, unsigned layer_surface) {
+    for (unsigned index = 0; index < MAX_ALPHA_SURFACES; index++) {
+        if (alpha_slots[index].used && alpha_slots[index].layer_surface == layer_surface) {
+            alpha_slots[index].id = id;
+            return &alpha_slots[index];
+        }
+    }
+    for (unsigned index = 0; index < MAX_ALPHA_SURFACES; index++) {
+        if (!alpha_slots[index].used) {
+            alpha_slots[index].used = 1;
+            alpha_slots[index].id = id;
+            alpha_slots[index].layer_surface = layer_surface;
+            alpha_slots[index].alpha = 255;
+            return &alpha_slots[index];
+        }
+    }
+    return 0;
+}
+
+static AlphaSlot *alpha_slot_by_id(unsigned id) {
+    for (unsigned index = 0; index < MAX_ALPHA_SURFACES; index++) {
+        if (alpha_slots[index].used && alpha_slots[index].id == id) {
+            return &alpha_slots[index];
+        }
+    }
+    return 0;
+}
+
+static unsigned alpha_for_layer_surface(unsigned layer_surface) {
+    for (unsigned index = 0; index < MAX_ALPHA_SURFACES; index++) {
+        if (alpha_slots[index].used &&
+            alpha_slots[index].layer_surface == layer_surface) {
+            return alpha_slots[index].alpha;
+        }
+    }
+    return 255;
 }
 
 static LayerSurface *layer_surface_by_id(unsigned id) {
@@ -477,6 +542,7 @@ static LayerSurface *layer_surface_add(unsigned id, unsigned surface) {
     slot->layer_surface = id;
     slot->surface = surface;
     slot->layer = 0;
+    slot->alpha = 255;
     slot->anchor = 0;
     slot->width = 0;
     slot->height = 0;
@@ -786,6 +852,11 @@ static void log_dmabuf_buffer(unsigned width, unsigned height, unsigned stride,
 static PoolSlot pools[MAX_POOLS];
 static BufferSlot buffers[MAX_BUFFERS];
 static unsigned attached_buffers[SURFACE_IDS];
+/* Set when the commit's attach supplied a buffer. A commit without attach
+   keeps the previous buffer (the protocol), and must not re-release it:
+   GDK's cairo renderer destroys the buffer's cairo surface on the first
+   release, so a second one corrupts its refcount. */
+static int attached_fresh[SURFACE_IDS];
 /* 0 = no set_input_region (whole surface), 1 = region set (possibly empty). */
 static unsigned char surface_input_set[SURFACE_IDS];
 static unsigned char surface_input_empty[SURFACE_IDS];
@@ -855,6 +926,14 @@ static BufferSlot *buffer_add(unsigned id) {
 }
 
 static void buffer_forget(unsigned id) {
+    for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        if (attached_buffers[index] == id) {
+            attached_buffers[index] = 0;
+        }
+        if (attached_fresh[index] && attached_buffers[index] == 0) {
+            attached_fresh[index] = 0;
+        }
+    }
     BufferSlot *slot = buffer_find(id);
     if (slot != 0) {
         if (slot->owned && slot->pool_fd >= 0) {
@@ -1332,6 +1411,47 @@ static void layer_forget_surface(unsigned surface) {
     }
 }
 
+/// Snapshot the committed buffer into the layer's own memory. Called while
+/// the client's pool fd is still alive (before wl_buffer.release).
+static void layer_store_pixels(LayerEntry *entry) {
+    if (entry == 0 || buffer_width == 0 || buffer_height == 0) {
+        return;
+    }
+    unsigned bytes = buffer_stride * (unsigned)buffer_height;
+    if (bytes == 0) {
+        return;
+    }
+    if (entry->copy_bytes < bytes) {
+        if (entry->copy != 0) {
+            sys3(215 /* munmap */, (long)entry->copy, entry->copy_bytes, 0);
+            entry->copy = 0;
+            entry->copy_bytes = 0;
+        }
+        long memory = sys6(222 /* mmap */, 0, bytes, 3 /* RW */,
+                           0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, -1, 0);
+        if (memory <= 0) {
+            entry->copy_ready = 0;
+            return;
+        }
+        entry->copy = (unsigned char *)memory;
+        entry->copy_bytes = bytes;
+    }
+    long mapped = sys6(222 /* mmap */, 0, buffer_offset + bytes,
+                       1 /* read */, 1 /* MAP_SHARED */, pool_fd, 0);
+    if (mapped <= 0) {
+        entry->copy_ready = 0;
+        return;
+    }
+    const unsigned char *source =
+        (const unsigned char *)(mapped + buffer_offset);
+    for (unsigned index = 0; index < bytes; index++) {
+        entry->copy[index] = source[index];
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    sys3(215 /* munmap */, mapped, buffer_offset + bytes, 0);
+    entry->copy_ready = 1;
+}
+
 static void layer_record_commit(LayerSurface *slot) {
     if (slot == 0 || slot->surface == 0) {
         return;
@@ -1366,6 +1486,7 @@ static void layer_record_commit(LayerSurface *slot) {
     entry->layer_surface = slot->layer_surface;
     entry->below = slot->below;
     entry->above = slot->above;
+    entry->alpha = slot->alpha;
 }
 
 /// Top-left corner of a layer surface in physical output coordinates. This is
@@ -1439,8 +1560,10 @@ static unsigned layer_hit_test(unsigned px, unsigned py) {
             }
             /* The box is surface-local logical; the point is physical. */
             const int *box = surface_input_box[entry->surface];
-            if ((int)px - x < box[0] * 2 || (int)px - x >= box[2] * 2 ||
-                (int)py - y < box[1] * 2 || (int)py - y >= box[3] * 2) {
+            if ((int)px - x < box[0] * (int)OUTPUT_SCALE ||
+                (int)px - x >= box[2] * (int)OUTPUT_SCALE ||
+                (int)py - y < box[1] * (int)OUTPUT_SCALE ||
+                (int)py - y >= box[3] * (int)OUTPUT_SCALE) {
                 continue;
             }
         }
@@ -1534,17 +1657,15 @@ static void layer_compose(void) {
         }
         for (unsigned position = 0; position < count; position++) {
             LayerEntry *entry = &layer_entries[order[position]];
-            unsigned length = entry->offset + entry->stride * entry->height;
-            long mapped = sys6(222 /* mmap */, 0, length, 1 /* read */,
-                               1 /* MAP_SHARED */, entry->fd, 0);
-            if (mapped <= 0) {
-                continue;
-            }
             int x;
             int y;
             layer_rect(entry, &x, &y);
-            const unsigned char *source =
-                (const unsigned char *)(mapped + entry->offset);
+            const unsigned char *source;
+            if (entry->copy_ready) {
+                source = entry->copy;
+            } else {
+                continue;
+            }
             for (unsigned row = 0; row < entry->height; row++) {
                 int out_y = y + (int)row;
                 if (out_y < 0 || out_y >= (int)out_height) {
@@ -1564,13 +1685,35 @@ static void layer_compose(void) {
                     if (entry->format == 1) {
                         swizzled |= 0xFF000000u;
                     }
-                    if ((swizzled >> 24) != 0) {
-                        destination[(unsigned)out_y * out_width +
-                                    (unsigned)out_x] = swizzled;
+                    /* wl_shm ARGB8888 is premultiplied. Apply the surface
+                       alpha from zphoc_alpha_layer_surface_v1 and blend over
+                       the layers below; Phosh draws its home screen, panel
+                       backdrop and sheets translucent, and writing them
+                       straight to the sink turned every overlay black. */
+                    unsigned alpha = (swizzled >> 24) * entry->alpha / 255u;
+                    if (alpha == 0) {
+                        continue;
                     }
+                    unsigned *target = &destination[(unsigned)out_y * out_width +
+                                                    (unsigned)out_x];
+                    if (alpha == 255) {
+                        *target = swizzled | 0xFF000000u;
+                        continue;
+                    }
+                    unsigned inverse = 255u - alpha;
+                    unsigned below = *target;
+                    unsigned red = (swizzled & 0xFFu) +
+                                   ((below & 0xFFu) * inverse + 127u) / 255u;
+                    unsigned green = ((swizzled >> 8) & 0xFFu) +
+                                     (((below >> 8) & 0xFFu) * inverse + 127u) / 255u;
+                    unsigned blue = ((swizzled >> 16) & 0xFFu) +
+                                    (((below >> 16) & 0xFFu) * inverse + 127u) / 255u;
+                    if (red > 255u) red = 255u;
+                    if (green > 255u) green = 255u;
+                    if (blue > 255u) blue = 255u;
+                    *target = 0xFF000000u | (blue << 16) | (green << 8) | red;
                 }
             }
-            sys3(215 /* munmap */, mapped, length, 0);
             drawn += 1;
         }
     }
@@ -1644,6 +1787,220 @@ static void pointer_send_motion(long client, int x, int y) {
     pointer_frame(client);
 }
 
+/* ---- zphoc_draggable_layer_surface_v1 -------------------------------- */
+/* Phosh's top panel is a draggable layer surface: the compositor owns the
+ * gesture, moves the surface with a margin and tells the client which end
+ * position it settled on. Without this the panel starts (and stays) fully
+ * unfolded, covering the lock screen with quick settings. */
+#define MAX_DRAG_SURFACES 4
+typedef struct {
+    int used;
+    unsigned id;            /* zphoc_draggable_layer_surface_v1 object */
+    unsigned layer_surface; /* zwlr_layer_surface_v1 object */
+    int folded;
+    int unfolded;
+    int current;
+    unsigned threshold;     /* 8.8 fixed, 0.0 .. 1.0 */
+    unsigned drag_mode;     /* 0 full, 1 handle, 2 none */
+    unsigned drag_handle;
+    unsigned exclusive;
+    int state; /* 0 folded, 1 unfolded */
+    int dragging;
+    int start_margin;
+    int start_pointer;
+    int reported;
+} DragSlot;
+static DragSlot drag_slots[MAX_DRAG_SURFACES];
+static DragSlot *drag_active;
+
+static DragSlot *drag_slot_by_id(unsigned id) {
+    for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
+        if (drag_slots[index].used && drag_slots[index].id == id) {
+            return &drag_slots[index];
+        }
+    }
+    return 0;
+}
+
+static DragSlot *drag_slot_by_layer_surface(unsigned layer_surface) {
+    if (layer_surface == 0) {
+        return 0;
+    }
+    for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
+        if (drag_slots[index].used &&
+            drag_slots[index].layer_surface == layer_surface) {
+            return &drag_slots[index];
+        }
+    }
+    return 0;
+}
+
+static DragSlot *drag_slot_add(unsigned id, unsigned layer_surface) {
+    DragSlot *slot = drag_slot_by_layer_surface(layer_surface);
+    if (slot == 0) {
+        for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
+            if (!drag_slots[index].used) {
+                slot = &drag_slots[index];
+                break;
+            }
+        }
+    }
+    if (slot == 0) {
+        return 0;
+    }
+    slot->used = 1;
+    slot->id = id;
+    slot->layer_surface = layer_surface;
+    slot->folded = 0;
+    slot->unfolded = 0;
+    slot->current = 0;
+    slot->state = 0;
+    slot->threshold = 256;
+    slot->drag_mode = 0;
+    slot->drag_handle = 0;
+    slot->exclusive = 0;
+    slot->dragging = 0;
+    slot->reported = 0;
+    return slot;
+}
+
+/// Which layer-surface margin the drag moves: 0 top, 1 right, 2 bottom,
+/// 3 left. Matches the four three-edge anchors the protocol accepts.
+static int drag_axis(unsigned anchor) {
+    switch (anchor & 15u) {
+    case 13: return 0; /* top|left|right */
+    case 7:  return 1; /* top|bottom|right */
+    case 14: return 2; /* bottom|left|right */
+    case 11: return 3; /* top|bottom|left */
+    default: return -1;
+    }
+}
+
+static void drag_apply(unsigned layer_surface) {
+    DragSlot *slot = drag_slot_by_layer_surface(layer_surface);
+    LayerSurface *ls = layer_surface_by_id(layer_surface);
+    if (slot == 0 || ls == 0) {
+        return;
+    }
+    int axis = drag_axis(ls->anchor);
+    if (axis < 0) {
+        return;
+    }
+    LayerEntry *entry = layer_entry_by_surface(ls->surface);
+    if (entry == 0 || !entry->used) {
+        return;
+    }
+    entry->margin[axis] = slot->current * (int)OUTPUT_SCALE;
+}
+
+/// Recompose after the compositor moved a draggable surface. The plain
+/// libwayland test build has no scanout, so this is a no-op there.
+static void drag_recompose(void) {
+#ifdef SERVE_ONLY
+    layer_compose();
+#endif
+}
+
+static void drag_notify(long client, DragSlot *slot, unsigned opcode,
+                        unsigned value) {
+    begin(slot->id, opcode);
+    put_u32(value);
+    finish();
+    send_message(client, -1);
+}
+
+/// Starts a drag when the press is inside a draggable surface (or its drag
+/// handle) and returns 1, so the press is consumed by the gesture instead of
+/// being forwarded to the client.
+static int drag_begin(long client, unsigned px, unsigned py) {
+    (void)client;
+    for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
+        DragSlot *slot = &drag_slots[index];
+        if (!slot->used) {
+            continue;
+        }
+        if (slot->drag_mode == 2) {
+            continue;
+        }
+        LayerSurface *ls = layer_surface_by_id(slot->layer_surface);
+        if (ls == 0) {
+            continue;
+        }
+        LayerEntry *entry = layer_entry_by_surface(ls->surface);
+        if (entry == 0 || !entry->used || entry->width == 0) {
+            continue;
+        }
+        int axis = drag_axis(entry->anchor);
+        if (axis < 0) {
+            continue;
+        }
+        int x;
+        int y;
+        layer_rect(entry, &x, &y);
+        if ((int)px < x || (int)px >= x + (int)entry->width ||
+            (int)py < y || (int)py >= y + (int)entry->height) {
+            continue;
+        }
+        slot->dragging = 1;
+        slot->start_margin = slot->current;
+        slot->start_pointer = (axis == 0 || axis == 2) ? (int)py : (int)px;
+        slot->reported = 0;
+        drag_active = slot;
+        return 1;
+    }
+    return 0;
+}
+
+static void drag_motion(long client, unsigned px, unsigned py) {
+    DragSlot *slot = drag_active;
+    if (slot == 0) {
+        return;
+    }
+    LayerSurface *ls = layer_surface_by_id(slot->layer_surface);
+    if (ls == 0) {
+        drag_active = 0;
+        return;
+    }
+    int axis = drag_axis(ls->anchor);
+    /* Top- and bottom-anchored surfaces move vertically, left/right ones
+       horizontally. Using x for the top panel made every drag a no-op. */
+    int pointer = (axis == 0 || axis == 2) ? (int)py : (int)px;
+    int delta = (pointer - slot->start_pointer) / (int)OUTPUT_SCALE;
+    int margin = slot->start_margin + delta;
+    int low = slot->folded < slot->unfolded ? slot->folded : slot->unfolded;
+    int high = slot->folded < slot->unfolded ? slot->unfolded : slot->folded;
+    if (margin < low) margin = low;
+    if (margin > high) margin = high;
+    if (margin == slot->current && slot->reported) {
+        return;
+    }
+    slot->current = margin;
+    drag_apply(slot->layer_surface);
+    drag_recompose();
+    drag_notify(client, slot, 0 /* dragged */, (unsigned)margin);
+    slot->reported = 1;
+}
+
+static void drag_finish(long client) {
+    DragSlot *slot = drag_active;
+    if (slot == 0) {
+        return;
+    }
+    drag_active = 0;
+    slot->dragging = 0;
+    int span = slot->unfolded - slot->folded;
+    int progress = slot->current - slot->folded;
+    int unfolded = 1;
+    if (span != 0 && progress * 256 < span * (int)slot->threshold) {
+        unfolded = 0;
+    }
+    slot->state = unfolded;
+    slot->current = unfolded ? slot->unfolded : slot->folded;
+    drag_apply(slot->layer_surface);
+    drag_recompose();
+    drag_notify(client, slot, 1 /* drag_end */, (unsigned)unfolded);
+}
+
 /// Route the pointer at physical output (px, py) to the topmost layer surface
 /// under it, falling back to the focused toplevel. `motion` sends a motion
 /// event when the surface does not change.
@@ -1664,8 +2021,8 @@ static void pointer_route(long client, unsigned px, unsigned py, int motion) {
         if (entry != 0) {
             layer_rect(entry, &x, &y);
         }
-        local_x = ((int)px - x) / 2;
-        local_y = ((int)py - y) / 2;
+        local_x = ((int)px - x) / (int)OUTPUT_SCALE;
+        local_y = ((int)py - y) / (int)OUTPUT_SCALE;
     } else {
         /* Fall back to the xdg toplevel only when this client has no visible
            layer surface at all; otherwise a miss means "no surface here". */
@@ -1680,8 +2037,8 @@ static void pointer_route(long client, unsigned px, unsigned py, int motion) {
             return;
         }
         target = focus_surface;
-        local_x = (int)px / 2;
-        local_y = (int)py / 2;
+        local_x = (int)px / (int)OUTPUT_SCALE;
+        local_y = (int)py / (int)OUTPUT_SCALE;
     }
     if (target == 0) {
         return;
@@ -1750,13 +2107,21 @@ static void poll_input(long client) {
                     pointer_send_leave(client, pointer_target);
                     pointer_target = 0;
                 }
+            } else if (drag_active != 0) {
+                pointer_x = x;
+                pointer_y = y;
+                drag_motion(client, x, y);
             } else {
                 pointer_x = x;
                 pointer_y = y;
                 pointer_route(client, x, y, 1);
             }
         } else if (kind == INPUT_CLICK || kind == INPUT_RELEASE) {
-            if (pointer_id != 0) {
+            if (kind == INPUT_CLICK && drag_begin(client, x, y)) {
+                /* A layer-surface drag claims the press. */
+            } else if (kind == INPUT_RELEASE && drag_active != 0) {
+                drag_finish(client);
+            } else if (pointer_id != 0) {
                 /* A click can arrive without a preceding motion (the viewer
                    only sends moves while hovering). Route it first so the
                    button goes to the surface under the cursor. */
@@ -1799,7 +2164,11 @@ static void poll_input(long client) {
                 pointer_frame(client);
             }
         }
-        tail = (tail + 1) % INPUT_SLOTS;
+        /* The host keeps a monotonically increasing head; the consumer must
+           use the same, unbounded counter. Wrapping the tail made
+           `tail != head` true forever once head passed INPUT_SLOTS, so the
+           compositor replayed the whole ring instead of consuming it. */
+        tail = tail + 1;
         *(volatile unsigned *)(screen + INPUT_TAIL) = tail;
     }
 }
@@ -1961,7 +2330,7 @@ static int serve(long client) {
                     finish(); send_message(client, -1);
                     if (output_version >= 2) {
                         begin(output_id, 3 /* scale */);
-                        put_i32(2);
+                        put_i32((int)OUTPUT_SCALE);
                         finish(); send_message(client, -1);
                     }
                     if (output_version >= 4) {
@@ -2110,7 +2479,7 @@ static int serve(long client) {
                 fractional_id = take_u32(); /* get_fractional_scale */
                 (void)take_u32(); /* surface */
                 begin(fractional_id, 0 /* preferred_scale */);
-                put_u32(240); /* 2.0: logical 512x384 -> 1024x768 buffer */
+                put_u32(120u * OUTPUT_SCALE);
                 finish(); send_message(client, -1);
             } else if (object == fractional_id && opcode == 0) {
                 fractional_id = 0;
@@ -2138,7 +2507,7 @@ static int serve(long client) {
                    1024x768 buffer at scale 2 is a 512x384 desktop. Reporting
                    1024x768 here made Phosh size its panels against a screen
                    twice as large as the one it was actually drawing. */
-                put_i32(512); put_i32(384);
+                put_i32((int)LOGICAL_WIDTH); put_i32((int)LOGICAL_HEIGHT);
                 finish(); send_message(client, -1);
                 begin(xdg_output_id, 3 /* name */);
                 put_string("Werewolf panel");
@@ -2305,8 +2674,8 @@ static int serve(long client) {
                 toplevel_id = take_u32();
                 toplevel_surface_id = surface_id;
                 begin(toplevel_id, 0 /* xdg_toplevel.configure */);
-                put_i32(512); /* width: logical; scale 2 -> 1024 px */
-                put_i32(384);  /* height: scale 2 -> 768 px */
+                put_i32((int)LOGICAL_WIDTH);
+                put_i32((int)LOGICAL_HEIGHT);
                 put_u32(0);    /* states array: empty */
                 finish();
                 send_message(client, -1);
@@ -2657,29 +3026,97 @@ static int serve(long client) {
                 output_power_id = 0;
             } else if (object == layer_effects_id && opcode == 0) {
                 /* zphoc_layer_shell_effects_v1.get_draggable_layer_surface */
-                draggable_id = take_u32();
-                (void)take_u32();
+                unsigned new_drag = take_u32();
+                unsigned drag_for = take_u32();
+                draggable_id = new_drag;
+                drag_slot_add(new_drag, drag_for);
             } else if (object == layer_effects_id && opcode == 1) {
                 layer_effects_id = 0;
             } else if (object == layer_effects_id && opcode == 2) {
-                /* get_alpha_layer_surface */
+                /* get_alpha_layer_surface(new_id, layer_surface) */
                 alpha_id = take_u32();
-                (void)take_u32();
+                (void)alpha_slot_add(alpha_id, take_u32());
             } else if (object == layer_effects_id && opcode == 3) {
                 /* get_stacked_layer_surface(new_id, layer_surface) */
                 unsigned new_stacked = take_u32();
                 unsigned for_surface = take_u32();
                 stacked_id = new_stacked;
                 stacked_add(new_stacked, for_surface);
-            } else if (object == draggable_id && opcode <= 5) {
-                /* set_margins(2) / threshold / exclusive / mode / handle / state */
-                unsigned count = opcode == 0 ? 2u : 1u;
-                for (unsigned i = 0; i < count; i++) (void)take_u32();
-            } else if (object == draggable_id && opcode == 6) {
+            } else if (drag_slot_by_id(object) != 0 && opcode <= 5) {
+                DragSlot *slot = drag_slot_by_id(object);
+                if (opcode == 0) {
+                    /* set_margins(folded, unfolded): the surface starts
+                       folded, so apply that margin and tell the client. */
+                    slot->folded = (int)take_u32();
+                    slot->unfolded = (int)take_u32();
+                    /* Phosh computes the folded margin from the size it
+                       configured, but GTK sizes the layer surface to its
+                       content. Never push the surface further up than
+                       "only the 32px top bar visible". */
+                    LayerSurface *own =
+                        layer_surface_by_id(slot->layer_surface);
+                    LayerEntry *own_entry =
+                        own != 0 ? layer_entry_by_surface(own->surface) : 0;
+                    if (own_entry != 0 && own_entry->height != 0) {
+                        int floor = -((int)own_entry->height) +
+                                    32 * (int)OUTPUT_SCALE;
+                        if (slot->folded < floor) {
+                            slot->folded = floor;
+                        }
+                    }
+                    /* The margins are updated whenever the surface size
+                       changes; while unfolded a new folded margin must not
+                       move the surface. */
+                    if (!slot->dragging) {
+                        slot->current =
+                            slot->state ? slot->unfolded : slot->folded;
+                    }
+                    slot->reported = 0;
+                    drag_apply(slot->layer_surface);
+                    drag_recompose();
+                    drag_notify(client, slot, 1 /* drag_end */,
+                                (unsigned)slot->state);
+                } else if (opcode == 1) {
+                    slot->threshold = take_u32();
+                    if (slot->threshold > 256) {
+                        slot->threshold = 256;
+                    }
+                } else if (opcode == 2) {
+                    slot->exclusive = take_u32();
+                } else if (opcode == 3) {
+                    slot->drag_mode = take_u32();
+                } else if (opcode == 4) {
+                    slot->drag_handle = take_u32();
+                } else {
+                    /* set_state(folded|unfolded) is immediate. */
+                    unsigned state = take_u32();
+                    slot->state = state ? 1 : 0;
+                    slot->current = slot->state ? slot->unfolded : slot->folded;
+                    drag_apply(slot->layer_surface);
+                    drag_recompose();
+                }
+            } else if (drag_slot_by_id(object) != 0 && opcode == 6) {
+                DragSlot *slot = drag_slot_by_id(object);
+                slot->used = 0;
+                slot->id = 0;
                 draggable_id = 0;
-            } else if (object == alpha_id && opcode == 0) {
-                (void)take_u32(); /* alpha */
-            } else if (object == alpha_id && opcode == 1) {
+            } else if (alpha_slot_by_id(object) != 0 && opcode == 0) {
+                /* set_alpha(wl_fixed): 1.0 is opaque. */
+                AlphaSlot *slot = alpha_slot_by_id(object);
+                unsigned fixed = take_u32();
+                slot->alpha = (fixed * 255u + 127u) / 256u;
+                if (slot->alpha > 255) {
+                    slot->alpha = 255;
+                }
+                LayerSurface *surface = layer_surface_by_id(slot->layer_surface);
+                if (surface != 0) {
+                    surface->alpha = slot->alpha;
+                }
+            } else if (alpha_slot_by_id(object) != 0 && opcode == 1) {
+                AlphaSlot *slot = alpha_slot_by_id(object);
+                slot->alpha = 255;
+                slot->used = 0;
+                slot->layer_surface = 0;
                 alpha_id = 0;
             } else if (stacked_find(object) != 0 && opcode <= 1) {
                 /* zphoc_stacked_layer_surface_v1.stack_below / stack_above */
@@ -2798,6 +3235,9 @@ static int serve(long client) {
                 attached_buffer = buffer;
                 if (object < SURFACE_IDS) {
                     attached_buffers[object] = buffer;
+                    if (buffer != 0) {
+                        attached_fresh[object] = 1;
+                    }
                 }
             } else if (is_surface(object) && opcode == 5) {
                 /* wl_surface.set_input_region(region): NULL means the whole
@@ -2852,10 +3292,10 @@ static int serve(long client) {
                        size instead of 0, which GTK rejects. */
                     unsigned configure_width =
                         (layer_slot->width == 0 || layer_slot->width == 0xFFFFFFFFu)
-                            ? 512u : layer_slot->width;
+                            ? LOGICAL_WIDTH : layer_slot->width;
                     unsigned configure_height =
                         (layer_slot->height == 0 || layer_slot->height == 0xFFFFFFFFu)
-                            ? 384u : layer_slot->height;
+                            ? LOGICAL_HEIGHT : layer_slot->height;
                     begin(layer_slot->layer_surface, 0 /* configure */);
                     put_u32(configure_serial);
                     configure_serial += 1;
@@ -2878,8 +3318,11 @@ static int serve(long client) {
                    table so interleaved surfaces cannot steal each other's
                    pool or release. */
                 unsigned committed_buffer = 0;
+                int committed_fresh = 0;
                 if (object < SURFACE_IDS) {
                     committed_buffer = attached_buffers[object];
+                    committed_fresh = attached_fresh[object];
+                    attached_fresh[object] = 0;
                 }
                 BufferSlot *committed_slot = buffer_find(committed_buffer);
                 if (committed_slot != 0) {
@@ -2979,6 +3422,14 @@ static int serve(long client) {
                         }
                         if (committed_buffer != 0) {
                             layer_record_commit(layer_slot);
+                            LayerEntry *stored =
+                                layer_entry_by_surface(layer_slot->surface);
+                            if (stored != 0) {
+                                layer_store_pixels(stored);
+                            }
+                            /* A draggable surface is positioned by the
+                               compositor, not by its zwlr margin. */
+                            drag_apply(layer_slot->layer_surface);
                         } else {
                             /* attach(NULL) hides the surface (Phosh does this
                                to the lockscreen after unlocking); it must
@@ -3016,7 +3467,7 @@ static int serve(long client) {
                     pointer_route(client, pointer_x, pointer_y, 0);
                     keyboard_route(client);
                 }
-                if (committed_buffer != 0) {
+                if (committed_buffer != 0 && committed_fresh) {
                     begin(committed_buffer, 0 /* wl_buffer.release */);
                     finish();
                     send_message(client, -1);
@@ -3254,8 +3705,17 @@ static void reset_client(void) {
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         surface_input_set[index] = 0;
         surface_input_empty[index] = 0;
+        attached_buffers[index] = 0;
+        attached_fresh[index] = 0;
     }
     for (unsigned index = 0; index < MAX_LAYERS; index++) {
+        if (layer_entries[index].copy != 0) {
+            sys3(215 /* munmap */, (long)layer_entries[index].copy,
+                 layer_entries[index].copy_bytes, 0);
+            layer_entries[index].copy = 0;
+            layer_entries[index].copy_bytes = 0;
+            layer_entries[index].copy_ready = 0;
+        }
         layer_entries[index].used = 0;
     }
     for (unsigned index = 0; index < MAX_STACKED; index++) {
@@ -3264,6 +3724,18 @@ static void reset_client(void) {
     }
     for (unsigned index = 0; index < MAX_LAYER_SURFACES; index++) {
         layer_surfaces[index].used = 0;
+        layer_surfaces[index].alpha = 255;
+    }
+    for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
+        drag_slots[index].used = 0;
+        drag_slots[index].id = 0;
+        drag_slots[index].layer_surface = 0;
+    }
+    drag_active = 0;
+    for (unsigned index = 0; index < MAX_ALPHA_SURFACES; index++) {
+        alpha_slots[index].used = 0;
+        alpha_slots[index].id = 0;
+        alpha_slots[index].layer_surface = 0;
     }
     layer_width = 0;
     layer_height = 0;
@@ -3499,7 +3971,13 @@ void _start(void) {
                 "[org/gnome/desktop/screensaver]\n"
                 "picture-uri='file:///sfs/share/backgrounds/werewolf.png'\n"
                 "[org/gnome/desktop/interface]\n"
-                "icon-theme='hicolor'\n";
+                "icon-theme='hicolor'\n"
+                /* The image has /etc/passwd but no /etc/shadow and no PAM
+                   stack, so Phosh's pam_unix authentication cannot succeed.
+                   This desktop has no password yet: unlock on a key press or
+                   a swipe, like a freshly provisioned device. */
+                "[sm/puri/phosh/lockscreen]\n"
+                "require-unlock=false\n";
             sys3(64 /* write */, settings_fd, (long)settings,
                  sizeof(settings) - 1);
             sys3(57 /* close */, settings_fd, 0, 0);

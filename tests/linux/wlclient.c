@@ -261,7 +261,9 @@ static void xdg_output_position(void *data, struct zxdg_output_v1 *output,
 static void xdg_output_size(void *data, struct zxdg_output_v1 *output,
                             int32_t width, int32_t height) {
     (void)data; (void)output;
-    if (width == 512 && height == 384) {
+    /* The compositor advertises the logical desktop size; it is the 1024x768
+       scanout at wl_output.scale=1. */
+    if (width == 1024 && height == 768) {
         xdg_output_ok = 1;
     }
 }
@@ -312,7 +314,8 @@ static void fractional_preferred_scale(void *data,
                                        struct wp_fractional_scale_v1 *scale,
                                        uint32_t preferred) {
     (void)data; (void)scale;
-    if (preferred == 240) {
+    /* 1.0 in 8.8 fixed point; the compositor runs at wl_output.scale=1. */
+    if (preferred == 120) {
         fractional_ok = 1;
     }
 }
@@ -648,7 +651,9 @@ static void pointer_enter(void *data, struct wl_pointer *ptr, uint32_t serial,
                           struct wl_surface *surface, wl_fixed_t sx,
                           wl_fixed_t sy) {
     (void)data; (void)ptr; (void)serial; (void)surface;
-    if (wl_fixed_to_int(sx) == 100 && wl_fixed_to_int(sy) == 50) {
+    /* The compositor enters at output (200,100); at scale 1 that is also
+       the surface-local position. */
+    if (wl_fixed_to_int(sx) == 200 && wl_fixed_to_int(sy) == 100) {
         pointer_ok = 1;
     }
 }
@@ -1633,7 +1638,7 @@ int main(int argc, char **argv) {
         fprintf(stderr, "wlclient: buffer releases missing\n");
         return 11;
     }
-    if (!surface_entered || !output_done || output_scale != 2 ||
+    if (!surface_entered || !output_done || output_scale != 1 ||
         !output_name_ok || !output_description_ok || !seat_name_ok ||
         !keyboard_repeat_ok || !keymap_ok || !pointer_ok || !key_enter) {
         fprintf(stderr,

@@ -5240,3 +5240,81 @@ so a silent compositor is easy to tell from a slow client.
 
 Remaining Phosh work: the panel/quick-settings (the QS panel still never
 appears), logind/polkit sessions, and the empty top strip.
+
+
+### Desktop: 1024x768 logical output, unlock, and a working quick-settings panel
+
+The Phosh lock screen is a GtkWindow whose content has a minimum height of 658
+logical pixels (clock, date, PIN carousel). At `wl_output.scale=2` the logical
+screen was 512x384, so GTK clamped the window to 658 and the unlock keypad and
+prompt sat below the scanout. GTK ignores a layer-surface configure smaller than
+the content minimum, so no amount of configure massaging helps: the desktop
+itself has to be big enough.
+
+`wayland_real.c` now has an `OUTPUT_SCALE` knob (currently **1**). The compositor
+advertises the 1024x768 scanout as a 1024x768 logical desktop at scale 1, and
+`LOGICAL_WIDTH`/`LOGICAL_HEIGHT`, the pointer coordinate conversion, the input
+region scaling and the fractional-scale value all derive from it. The lock
+screen, the "Slide up to unlock" hint and the quick-settings sheet fit.
+
+Unlocking needs authentication (`sm.puri.phosh.lockscreen require-unlock`
+defaults to true) but the image has `/etc/passwd` only: no `/etc/shadow`, no
+`/etc/pam.d`, so `pam_start("phosh")` can never succeed. The compositor already
+seeds a GLib keyfile backend for the desktop defaults; it now also writes
+`require-unlock=false`, so a key press or a swipe unlocks. Real PAM/logind
+support is still the prerequisite for a password-protected session.
+
+The top panel is a `zphoc_draggable_layer_surface_v1` client: the compositor
+owns the gesture and moves the surface by rewriting one layer margin.
+Implemented here:
+
+- `get_draggable_layer_surface` plus `set_margins`, `set_threshold`,
+  `set_exclusive`, `set_drag_mode`, `set_drag_handle`, `set_state`, `destroy`.
+- The folded margin is applied on commit and after every `set_margins`; a drag
+  adjusts it between folded and unfolded, emits `dragged(margin)` on every
+  change and `drag_end(state)` on release (threshold decides the state).
+- Top/bottom anchored surfaces drag vertically, left/right horizontally. The
+  first cut used `x` for the top panel, which made every drag a no-op.
+- Phosh computes its folded margin and drag handle from the height it
+  configured (768), but GTK sizes the panel surface to its content (252), so
+  the folded margin is clamped to "only the 32px bar visible". The handle is
+  not enforced: the whole visible panel drags.
+
+Quick settings now opens by swiping down from the top bar and folds on the way
+up; the same margin machinery is what Phosh uses to fold the panel after
+unlocking.
+
+Two rendering fixes came out of the same work:
+
+- **Premultiplied alpha.** `layer_compose` blended nothing: any pixel with a
+  non-zero alpha was written as-is, which turned Phosh's translucent home and
+  panel-backdrop layers black. It now blends `src + dst * (1 - a)` and honours
+  `zphoc_alpha_layer_surface_v1.set_alpha` (a per-surface table; previously one
+  global id).
+- **Per-layer pixel snapshots.** GTK destroys the `wl_shm` pool as soon as the
+  compositor releases the buffer, so re-mapping the client fd at composite time
+  made static layers (wallpaper, home) disappear after any other surface
+  committed. Each layer entry keeps its own copy in anonymous memory, taken
+  while the pool is still alive.
+
+And one protocol bug that made input erratic: `wl_buffer.release` was sent on
+*every* commit, including commits without `attach`, so the same buffer was
+released twice; GDK's cairo renderer destroys the buffer's cairo surface on the
+first release and aborted with a `cairo_surface_reference` assertion at unlock.
+Release now happens once per fresh attach.
+
+The input ring consumer wrapped its tail modulo the slot count while the host's
+head is monotonic. Once `head` passed 64, `tail != head` stayed true forever and
+the compositor replayed the whole ring instead of consuming it (duplicated
+clicks, stuck gestures). The tail is monotonic now, like the head.
+
+Tests: `cargo test --lib` 222/222; `layer-serve` and `linux-wlreal` green (the
+test image needed a current `wlclient`); `sysfstest`, `primetest` and `egltest`
+green (`readback 64 127 191 255`). `wlclient` now expects the scale-1 output:
+logical size 1024x768, `wl_output.scale=1`, fractional 1.0 and the pointer
+entering at output (200,100).
+
+Remaining Phosh polish: the folded top bar is an empty 32px strip (no clock or
+status icons there), the quick-settings sheet is black because the blurred
+backdrop layer does not render, and the first tile row (Cellular/Wi-Fi/
+Bluetooth) loses its labels.
