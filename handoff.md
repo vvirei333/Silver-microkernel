@@ -5409,3 +5409,22 @@ multi-client plumbing itself is exercised (the second client is served and its
 state is preserved), but GTK's startup blocks somewhere after the second
 `wl_display.sync`. Debugging this needs a `WAYLAND_DEBUG` log from the client
 side (Phosh runs with it off nowadays) to see which request it is missing.
+
+
+### Per-client receive buffers
+
+Switching sockets between clients could splice one client's partially received
+message onto another client's bytes: the receive buffer was global and only a
+4 KiB tail was carried in `ClientState`. Each client now owns the full 64 KiB
+buffer and `load_client()` simply points the receive path at it.
+
+Verified: `layer-serve`, `linux-wlreal` and the Phosh flow (lockscreen,
+unlock, quick settings open/fold/open) are green with the new buffer.
+
+**Still open:** a GTK application launched as the second client stalls after
+the first `wl_display_roundtrip` — it receives all globals and the sync `done`
+(confirmed with an in-shmem protocol trace) but sends no further requests,
+while a plain libwayland client as the second client completes the whole
+sequence. The behaviour is nondeterministic between runs, which points at the
+multi-client state switching rather than a missing protocol event; the buffer
+fix above did not change it.

@@ -66,7 +66,11 @@ static unsigned long message_length;
 /* GTK batches registry, shm, configure and surface traffic well past
   1 KiB. A short buffer used to drop the tail of a recvmsg, desynchronising
   the stream so later requests (notably wl_surface.commit) were never seen. */
-static unsigned char incoming[65536];
+#define INCOMING_SIZE 65536
+/* The receive buffer belongs to the client being served: switching sockets
+   must never splice one client's partial message onto another's bytes. */
+static unsigned char incoming_fallback[INCOMING_SIZE];
+static unsigned char *incoming = incoming_fallback;
 static unsigned long incoming_pending;
 static unsigned message_start;
 static unsigned long incoming_length;
@@ -162,7 +166,7 @@ static long receive_message(long fd) {
     }
     struct iovec vector = {
         incoming + incoming_pending,
-        sizeof(incoming) - incoming_pending,
+        INCOMING_SIZE - incoming_pending,
     };
     struct msghdr header;
     union control control;
@@ -1018,6 +1022,7 @@ static unsigned buffer_offset;
 static unsigned buffer_stride;
 static unsigned buffer_format;
 static unsigned char *screen;
+
 static unsigned screen_seq;
 /* virtio-gpu scanout (`/dev/gpufb`). When present, every composed frame is
    also pushed through the GPU, so the device's own display head shows the
@@ -1165,8 +1170,8 @@ typedef struct {
     unsigned shm_ids[MAX_SHM];
     /* A partially received message must not be mixed with another client's
        bytes when the loop switches sockets. */
+    unsigned char incoming_buffer[INCOMING_SIZE];
     unsigned long incoming_pending;
-    unsigned char incoming_tail[4096];
 } ClientState;
 
 #define CLIENT_SCALARS(X) \
@@ -1237,14 +1242,8 @@ static void load_client(ClientState *client) {
 #define LOAD(field) field = client->field;
     CLIENT_SCALARS(LOAD)
 #undef LOAD
+    incoming = client->incoming_buffer;
     incoming_pending = client->incoming_pending;
-    if (incoming_pending <= sizeof(client->incoming_tail)) {
-        for (unsigned long index = 0; index < incoming_pending; index++) {
-            incoming[index] = client->incoming_tail[index];
-        }
-    } else {
-        incoming_pending = 0;
-    }
     copy_mimes(data_mimes, client->data_mimes);
     for (unsigned index = 0; index < MAX_POOLS; index++) {
         pools[index] = client->pools[index];
@@ -1282,14 +1281,7 @@ static void save_client(ClientState *client) {
 #define SAVE(field) client->field = field;
     CLIENT_SCALARS(SAVE)
 #undef SAVE
-    if (incoming_pending <= sizeof(client->incoming_tail)) {
-        client->incoming_pending = incoming_pending;
-        for (unsigned long index = 0; index < incoming_pending; index++) {
-            client->incoming_tail[index] = incoming[index];
-        }
-    } else {
-        client->incoming_pending = 0;
-    }
+    client->incoming_pending = incoming_pending;
     copy_mimes(client->data_mimes, data_mimes);
     for (unsigned index = 0; index < MAX_POOLS; index++) {
         client->pools[index] = pools[index];
