@@ -2379,6 +2379,93 @@ static void toggle_app_window(void) {
 #endif
 }
 
+/* The host viewer sends printable keys as Unicode code points (case kept) and
+   the rest as the small values from userspace/src/window_proto.rs, while the
+   compositor speaks Linux evdev keycodes. `shift` reports whether a US-layout
+   shift is needed for the character. */
+static unsigned keycode_for(unsigned key, unsigned *shift) {
+    static const unsigned char letters[26] = {
+        30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50,
+        49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44};
+    *shift = 0;
+    if (key >= 'a' && key <= 'z') return letters[key - 'a'];
+    if (key >= 'A' && key <= 'Z') {
+        *shift = 1;
+        return letters[key - 'A'];
+    }
+    if (key >= '1' && key <= '9') return 2 + (key - '1');
+    if (key == '0') return 11;
+    switch (key) {
+    case ' ': return 57;
+    case '\t': return 15;
+    case '\n': return 28;
+    case 8:
+    case 127: return 14;
+    case '-': return 12;
+    case '=': return 13;
+    case '[': return 26;
+    case ']': return 27;
+    case ';': return 39;
+    case '\'': return 40;
+    case '`': return 41;
+    case '\\': return 43;
+    case ',': return 51;
+    case '.': return 52;
+    case '/': return 53;
+    case '!': *shift = 1; return 2;
+    case '@': *shift = 1; return 3;
+    case '#': *shift = 1; return 4;
+    case '$': *shift = 1; return 5;
+    case '%': *shift = 1; return 6;
+    case '^': *shift = 1; return 7;
+    case '&': *shift = 1; return 8;
+    case '*': *shift = 1; return 9;
+    case '(': *shift = 1; return 10;
+    case ')': *shift = 1; return 11;
+    case '_': *shift = 1; return 12;
+    case '+': *shift = 1; return 13;
+    case '{': *shift = 1; return 26;
+    case '}': *shift = 1; return 27;
+    case ':': *shift = 1; return 39;
+    case '"': *shift = 1; return 40;
+    case '~': *shift = 1; return 41;
+    case '|': *shift = 1; return 43;
+    case '<': *shift = 1; return 51;
+    case '>': *shift = 1; return 52;
+    case '?': *shift = 1; return 53;
+    /* KEY_UP..KEY_FORM from window_proto.rs. */
+    case 1: return 103;
+    case 2: return 108;
+    case 3: return 104;
+    case 4: return 109;
+    case 5: return 102;
+    case 6: return 107;
+    case 11: return 14;
+    case 12: return 1;
+    case 13: return 38;
+    case 17: return 16;
+    case 18: return 20;
+    case 19: return 17;
+    case 21: return 33;
+    default: return 0;
+    }
+}
+
+/// `wl_keyboard.modifiers`: bit 0 is shift.
+static void keyboard_send_modifiers(long client, unsigned depressed) {
+    if (keyboard_id == 0) {
+        return;
+    }
+    begin(keyboard_id, 4 /* modifiers */);
+    put_u32(configure_serial);
+    put_u32(depressed);
+    put_u32(0); /* latched */
+    put_u32(0); /* locked */
+    put_u32(0); /* group */
+    finish();
+    send_message(client, -1);
+}
+
 static void poll_input(void) {
     if (screen == 0) {
         return;
@@ -2393,22 +2480,30 @@ static void poll_input(void) {
     long client = clients[index].fd;
     current_client = index;
     load_client(&clients[index]);
-    unsigned head = *(volatile unsigned *)(screen + INPUT_HEAD);
-    unsigned tail = *(volatile unsigned *)(screen + INPUT_TAIL);
+    /* Both fields hold ring positions (0..INPUT_SLOTS-1), as documented in
+       userspace/src/window_proto.rs and written by the host viewer. Keeping
+       an unbounded local tail made the two sides disagree from the first
+       wrap on: every new event was then read from a stale slot, which looked
+       like "the mouse stops working" after ~64 moves. */
+    unsigned head = (*(volatile unsigned *)(screen + INPUT_HEAD)) % INPUT_SLOTS;
+    unsigned tail = (*(volatile unsigned *)(screen + INPUT_TAIL)) % INPUT_SLOTS;
+    unsigned pending = (head + INPUT_SLOTS - tail) % INPUT_SLOTS;
     unsigned guard = 0;
-    while (tail != head && guard++ < INPUT_SLOTS) {
+    while (pending != 0 && guard++ < INPUT_SLOTS) {
         const unsigned char *entry =
-            (const unsigned char *)(screen + INPUT_RING +
-                                    (tail % INPUT_SLOTS) * INPUT_ENTRY);
+            (const unsigned char *)(screen + INPUT_RING + tail * INPUT_ENTRY);
         unsigned kind = entry[0];
         unsigned value = entry[1];
         unsigned key = entry[2] | ((unsigned)entry[3] << 8);
         unsigned x = entry[4] | ((unsigned)entry[5] << 8);
         unsigned y = entry[6] | ((unsigned)entry[7] << 8);
-        if (kind == INPUT_KEY && key == 59 /* F1 */) {
-            /* There is no window manager yet, so F1 is the way between the
-               shell and the application window: it shows or hides the newest
-               toplevel and launches the terminal when none is mapped. */
+        if (kind == INPUT_KEY && key == 18 /* KEY_NEW_TAB: Ctrl+T */) {
+            /* There is no window manager and no launcher yet, so Ctrl+T is
+               the way between the shell and the application window: it shows
+               or hides the newest toplevel and launches the terminal when
+               none is mapped. The host viewer only forwards printable keys
+               and the small control codes, so Ctrl+T is one of the few
+               combinations it can actually send. */
             toggle_app_window();
         } else if (kind == INPUT_MOVE) {
             if (value == 1) {
@@ -2453,27 +2548,43 @@ static void poll_input(void) {
                 }
             }
         } else if (kind == INPUT_KEY) {
-            grab_activate(client, key);
-            if (keyboard_id != 0) {
-                keyboard_route(client);
-                unsigned time = now_ms();
-                begin(keyboard_id, 3 /* key */);
-                put_u32(configure_serial);
-                put_u32(time);
-                put_u32(key);
-                put_u32(1); /* pressed */
-                finish();
-                send_message(client, -1);
-                /* A release is mandatory: GTK implements key repeat itself
-                   from wl_keyboard.repeat_info, so a key that never goes up
-                   keeps activating (the terminal ran Enter four times). */
-                begin(keyboard_id, 3 /* key */);
-                put_u32(configure_serial);
-                put_u32(time + 1);
-                put_u32(key);
-                put_u32(0); /* released */
-                finish();
-                send_message(client, -1);
+            /* The viewer speaks Unicode/control codes, the client speaks
+               evdev keycodes. An unknown value is consumed and dropped so it
+               cannot desynchronise the ring. */
+            unsigned shift = 0;
+            unsigned keycode = keycode_for(key, &shift);
+            if (keycode != 0) {
+                grab_activate(client, keycode);
+                if (keyboard_id != 0) {
+                    keyboard_route(client);
+                    unsigned time = now_ms();
+                    if (shift) {
+                        /* A shifted character needs the mask before the key
+                           event; GTK translates the keycode through xkb. */
+                        keyboard_send_modifiers(client, 1 /* shift */);
+                    }
+                    begin(keyboard_id, 3 /* key */);
+                    put_u32(configure_serial);
+                    put_u32(time);
+                    put_u32(keycode);
+                    put_u32(1); /* pressed */
+                    finish();
+                    send_message(client, -1);
+                    /* A release is mandatory: GTK implements key repeat
+                       itself from wl_keyboard.repeat_info, so a key that never
+                       goes up keeps activating (the terminal ran Enter four
+                       times). */
+                    begin(keyboard_id, 3 /* key */);
+                    put_u32(configure_serial);
+                    put_u32(time + 1);
+                    put_u32(keycode);
+                    put_u32(0); /* released */
+                    finish();
+                    send_message(client, -1);
+                    if (shift) {
+                        keyboard_send_modifiers(client, 0);
+                    }
+                }
             }
         } else if (kind == INPUT_SCROLL) {
             if (pointer_id != 0) {
@@ -2486,12 +2597,9 @@ static void poll_input(void) {
                 pointer_frame(client);
             }
         }
-        /* The host keeps a monotonically increasing head; the consumer must
-           use the same, unbounded counter. Wrapping the tail made
-           `tail != head` true forever once head passed INPUT_SLOTS, so the
-           compositor replayed the whole ring instead of consuming it. */
-        tail = tail + 1;
+        tail = (tail + 1) % INPUT_SLOTS;
         *(volatile unsigned *)(screen + INPUT_TAIL) = tail;
+        pending -= 1;
     }
     save_client(&clients[index]);
 }
@@ -3726,8 +3834,13 @@ static int serve(long client) {
                        full composite second), which showed up as the
                        lockscreen flickering over the wallpaper. Only the
                        single-window path needs the direct blit. */
-                    if (layer_slot == 0 && buffer_width > 0 &&
-                        buffer_height > 0 &&
+                    /* Only application clients own the overlay window. The
+                       shell's own toplevels (Phosh creates a few while it
+                       starts) are not part of the layer scene either, and
+                       capturing one made it cover the desktop and made
+                       Ctrl+T hide a phantom window instead of launching. */
+                    if (layer_slot == 0 && current_client != ui_client &&
+                        buffer_width > 0 && buffer_height > 0 &&
                         buffer_stride >= (unsigned)buffer_width * 4) {
                         /* Keep the newest toplevel as the app window and
                            draw it over the scene in layer_compose(). The

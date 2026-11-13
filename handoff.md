@@ -5636,3 +5636,32 @@ may be empty (no launcher entries), or the window needs an enter/frame clock
 push our compositor does not provide for that surface. Until then F1 remains
 the launcher: it shows/hides the newest toplevel and starts the terminal when
 nothing is mapped.
+
+
+### Host input: ring positions, key values, phantom window
+
+Running the desktop in `tools/window-viewer` showed the lockscreen but the
+mouse did nothing. Three separate causes:
+
+* **The input ring desynchronised.** `window_proto.rs` says both fields hold
+  ring positions (`0..63`) and the viewer writes `(head + 1) % slots`, while
+  `poll_input()` kept its own *unbounded* tail. The two agreed only until the
+  first wrap; after that every event was read from a stale slot, so the guest
+  kept replaying old entries - "the mouse stopped working" after ~64 moves.
+  Both sides are modulo now (`pending = (head + slots - tail) % slots`).
+* **The viewer speaks Unicode, the clients speak evdev keycodes.** Printable
+  keys arrive as Unicode code points (case preserved) and the rest as the
+  small `KEY_*` values; the compositor now translates them (`keycode_for`)
+  and brackets shifted characters with a `wl_keyboard.modifiers` mask so GTK
+  produces the right character. The viewer cannot send F1 at all, so the
+  launcher shortcut moved to **Ctrl+T** (`KEY_NEW_TAB`), which it can send.
+* **A phantom application window.** Phosh creates a couple of toplevels while
+  it starts; the compositor captured the first one as the overlay window, so
+  it drew over the desktop and Ctrl+T *hid* it instead of launching. Only
+  clients other than the shell (`current_client != ui_client`) own the
+  overlay window now.
+
+Verified with viewer-style events (ring positions, Unicode keys): 90 hover
+moves, then a swipe unlocks; Ctrl+T starts the terminal; typing `ls /sfs`
+prints the SFS listing in it. `layer-serve`, `linux-wlreal` and the Phosh
+quick-settings flow stay green.
