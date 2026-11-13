@@ -1092,7 +1092,11 @@ static unsigned pointer_grab;
 #endif
 static unsigned attached_buffer; /* written by attach; release is deferred */
 static int focused;
-static int surface_entered;
+/* Per surface: a window only paints once it has entered an output (GDK treats
+   a surface without `wl_surface.enter` as not on any output). One flag for
+   the whole client meant only the first surface ever got the event, and
+   Phosh's home/app-grid window kept committing empty frames. */
+static unsigned char surface_entered[SURFACE_IDS];
 static int selection_changed;
 static int wants_offer;
 static int current_client = -1;
@@ -1181,7 +1185,7 @@ typedef struct {
     int verified;
     unsigned commits;
     int focused;
-    int surface_entered;
+    unsigned char surface_entered[SURFACE_IDS];
     unsigned focus_surface;
     unsigned pointer_x;
     unsigned pointer_y;
@@ -1241,7 +1245,7 @@ typedef struct {
     X(phosh_private_id) X(startup_tracker_id) X(keyboard_event_id) X(xdg_switcher_id) \
     X(output_manager_id) X(output_config_id) \
     X(popup_grab) X(popup_committed) X(pool_id) X(buffer_id) X(frame_id) \
-    X(pool_fd) X(verified) X(commits) X(focused) X(surface_entered) \
+    X(pool_fd) X(verified) X(commits) X(focused) \
     X(focus_surface) X(pointer_x) X(pointer_y) X(pointer_target) \
     X(keyboard_target) X(pointer_grab) \
     X(data_mime_count) X(selection_changed) X(wants_offer)
@@ -1299,6 +1303,7 @@ static void load_client(ClientState *client) {
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         attached_buffers[index] = client->attached_buffers[index];
+        surface_entered[index] = client->surface_entered[index];
         damage_valid[index] = client->damage_valid[index];
         for (unsigned corner = 0; corner < 4; corner++) {
             damage_box[index][corner] = client->damage_box[index][corner];
@@ -1341,6 +1346,7 @@ static void save_client(ClientState *client) {
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         client->attached_buffers[index] = attached_buffers[index];
+        client->surface_entered[index] = surface_entered[index];
         client->damage_valid[index] = damage_valid[index];
         for (unsigned corner = 0; corner < 4; corner++) {
             client->damage_box[index][corner] = damage_box[index][corner];
@@ -4041,8 +4047,9 @@ static int serve(long client) {
                     layer_slot->configured = 1;
                     layer_slot->pending = 0;
                 }
-                if (!surface_entered && output_id != 0) {
-                    surface_entered = 1;
+                if (object < SURFACE_IDS && !surface_entered[object] &&
+                    output_id != 0) {
+                    surface_entered[object] = 1;
                     begin(object, 0 /* wl_surface.enter */);
                     put_u32(output_id);
                     finish();
@@ -4653,7 +4660,9 @@ static void reset_client(void) {
     verified = 0;
     commits = 0;
     focused = 0;
-    surface_entered = 0;
+    for (unsigned index = 0; index < SURFACE_IDS; index++) {
+        surface_entered[index] = 0;
+    }
     /* The demo client expects the first enter at (100,50) logical. */
     focus_surface = 0;
     pointer_x = 200;

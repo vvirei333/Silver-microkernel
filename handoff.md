@@ -5765,3 +5765,29 @@ full repaint (`layer_record_commit` watches those fields, and
 End to end: Phosh's first frame 9 s, click-to-unlock 0.22 s, Ctrl+T ->
 terminal ~9 s, `ls` runs. The cost left per frame is the compare scan
 (~3 MB, the price of knowing what changed) plus Phosh's own GTK redraw.
+
+
+### Where the app grid stands
+
+State after this round (all committed):
+
+* The home bar **is** drawn: a ~15 px black strip at the very bottom of the
+  unlocked desktop is `phosh home` in its folded position (margin -753).
+* A **click** on that bar never reaches Phosh: the press matches
+  `drag_begin()` because the home is a `PhoshDragSurface`, so the compositor
+  claims it as a drag of zero distance and `drag_finish()` settles it back to
+  folded. Swiping it up (762 -> 280, 20 steps) also leaves the scene
+  unchanged, even though the layer surface is now configured (which is what
+  creates the draggable object) and `set_state` is answered.
+* `wl_surface.enter` is now sent **per surface** instead of once per client.
+  GDK tracks which outputs a window is on; only the first surface used to get
+  the event. It did not change the home's behaviour by itself.
+
+Next suspects for "the home unfolds but paints nothing": whether Phosh's
+`PhoshDragSurface` drag threshold (`PHOSH_HOME_DRAG_THRESHOLD` 0.3 of the
+748 px span) is reached in the drag, whether Phosh's home window is `mapped`
+in GTK terms (`phosh-layer-surface-DEBUG` says "Mapped 'phosh home'"), and why
+its first frames are `attach(NULL)` - GDK may treat a layer-shell window that
+never got an `xdg`-style configure cycle as not drawable. Running Phosh with
+`G_MESSAGES_DEBUG=all` and reading `phosh-home`/`phosh-drag-surface` debug
+lines is the cheapest way to see whether the state change happens at all.
