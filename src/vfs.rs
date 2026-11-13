@@ -997,6 +997,14 @@ impl Vfs {
         Ok(data.len())
     }
 
+    /// Reads a file range without an open descriptor. A file-backed lazy
+    /// mapping needs this: the client may close the descriptor right after
+    /// `mmap`, while the pages are still read on demand.
+    fn read_path_at(&mut self, path: &str, offset: usize, limit: usize) -> Result<Vec<u8>, ()> {
+        let (mount, relative) = self.resolve(path);
+        self.mounts[mount].fs.read_at(&relative, offset, limit)
+    }
+
     fn write(&mut self, owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
         let index = self
             .open_files
@@ -1356,6 +1364,10 @@ where
     F: FnOnce(&[u8]) -> Result<(), ()>,
 {
     with_vfs(|vfs| vfs.pread_with(owner, fd, offset, limit, consume))
+}
+
+pub fn read_path_at(path: &str, offset: usize, limit: usize) -> Result<Vec<u8>, ()> {
+    with_vfs(|vfs| vfs.read_path_at(path, offset, limit))
 }
 
 pub fn write(owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {

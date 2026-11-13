@@ -5554,3 +5554,50 @@ the kernel does not have yet (`lazy` regions are anonymous-only).
 Verified: `cargo test --lib` (222), `layer-serve`, `linux-wlreal`, the Phosh
 flow (lockscreen, unlock, quick settings) and the terminal as the second
 client.
+
+
+### File-backed mappings are lazy
+
+`mmap` of a file copied the whole requested range into fresh frames before
+returning, so the dynamic loader's `PT_LOAD` segments were paid for up front:
+libLLVM's 122 MiB cost 7.7 s of `pread` (the block driver issues one 512-byte
+request per sector, ~15 MB/s) and several hundred MiB of DRAM that the program
+never executes.
+
+`MmapRegion` now carries `file: Option<(path, byte offset)>`. A mapping of a
+filesystem file is `lazy`: `lazy_page_fault()` allocates one frame, reads that
+page through `vfs::read_path_at()` and only then maps it. The path is a stable
+reference because the SFS image is immutable; a file removed from a writable
+mount turns the fault into a task kill rather than a stale read. `memfd` and
+other synthetic descriptors keep the eager path (they have no path).
+
+Two follow-ups were needed:
+
+* `split_region_at()` clones a region when `mprotect` cuts it in half. The
+  tail's page 0 is `offset_pages` further into the file, so its file offset is
+  advanced by `offset_pages * PAGE_SIZE`. Without that, a RELRO `mprotect` on
+  part of a library segment would make the tail read the wrong pages.
+* The kernel copy path validates the page table *before* touching user memory
+  (`PAN` is on and `copy_from_user`/`copy_to_user` use `ldtrb`/`sttrb`). An
+  untouched lazy page therefore failed validation and the syscall returned
+  `EFAULT` without the hardware ever faulting the page in — dbus-daemon died
+  with `Failed to open /dev/null: Bad address` because its path literal lives
+  in a lazily mapped `.rodata` page. `user_memory` now backs the pages of the
+  window (`back_user_pages`) with a read or write `cow_fault` before retrying
+  the validation; `copy_to_user` already did this for fork-COW pages.
+
+Measured (`linuxstart phosh` → first composed frame, and F1 → terminal window):
+
+| | before | after |
+|---|---|---|
+| Phosh first frame | ~139 s | **10 s** |
+| F1 → terminal window | ~45-60 s | **6 s** |
+| terminal connect → first frame | ~50 s | **3.4 s** |
+
+`Phosh ready after 7.08s` in its own log. The terminal still runs commands
+(`ls /sfs` prints the listing), and the shell's lockscreen/quick settings flow
+is unchanged.
+
+Verified: `cargo test --lib` (222), `layer-serve`, `linux-wlreal`, the Phosh
+flow (lockscreen, unlock, quick settings open/fold/open) and the terminal as
+the second client.

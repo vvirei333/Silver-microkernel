@@ -233,6 +233,13 @@ struct MmapRegion {
     /// Faulted pages of a lazy region, keyed by page offset. Sparse, because
     /// a 128 MiB reservation usually has only a few MiB touched.
     pages: BTreeMap<u32, (usize, u32)>,
+    /// File-backed lazy region: `(path, byte offset of the mapping inside the
+    /// file)`. Pages are read from the file on first touch, so mapping a
+    /// 160 MiB library costs only the pages the program actually executes.
+    /// The SFS image is immutable, so a path is a stable reference even after
+    /// the client closes the descriptor; a file removed from a writable mount
+    /// turns the fault into a task kill instead of a stale read.
+    file: Option<(alloc::string::String, usize)>,
 }
 
 impl MmapRegion {
@@ -3133,6 +3140,18 @@ where
     with_group_owner(|task| task.mmap_file_paged(length, prot, fixed, fill))?
 }
 
+/// Maps a file lazily: pages are read through the VFS on first touch.
+#[cfg(feature = "linux-abi")]
+pub fn mmap_file_lazy(
+    length: usize,
+    prot: u64,
+    fixed: Option<usize>,
+    path: alloc::string::String,
+    file_offset: usize,
+) -> Option<usize> {
+    with_group_owner(|task| task.mmap_file_lazy(length, prot, fixed, path, file_offset))?
+}
+
 /// Maps a memfd `MAP_SHARED` window. The frames stay owned by the memfd, so
 /// every process that maps the same file sees the same bytes.
 #[cfg(feature = "linux-abi")]
@@ -4095,6 +4114,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
                 frames: Vec::new(),
                 lazy: true,
                 pages,
+                file: region.file.clone(),
             });
             continue;
         }
@@ -4125,6 +4145,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
                 frames: shared,
                 lazy: false,
                 pages: BTreeMap::new(),
+                file: None,
             });
             continue;
         }
@@ -4144,6 +4165,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
             frames: Vec::new(),
             lazy: false,
             pages: BTreeMap::new(),
+            file: None,
         });
     }
 
@@ -6221,6 +6243,7 @@ impl Task {
                 frames: Vec::new(),
                 lazy: true,
                 pages: BTreeMap::new(),
+                file: None,
             };
             let position = self
                 .mmap_regions
@@ -6300,6 +6323,7 @@ impl Task {
             frames: Vec::new(),
             lazy: false,
             pages: BTreeMap::new(),
+            file: None,
         };
         let position = self
             .mmap_regions
@@ -6314,6 +6338,42 @@ impl Task {
     /// Maps a file-backed `MAP_PRIVATE` range one frame per page. `fill` is
     /// called with the mapping-relative offset and a zeroed page buffer; it
     /// returns `false` to abort (an I/O error must not publish a half image).
+    /// Reserves address space for a file mapping; each page is read from
+    /// `path` when it faults. A library segment is typically 100+ MiB while
+    /// only a fraction is executed, and an eager copy cost 15 MB/s through
+    /// the block device.
+    fn mmap_file_lazy(
+        &mut self,
+        length: usize,
+        prot: u64,
+        fixed: Option<usize>,
+        path: alloc::string::String,
+        file_offset: usize,
+    ) -> Option<usize> {
+        let (virtual_address, page_count, span) =
+            self.mmap_prepare(length, prot, fixed, true)?;
+        let region = MmapRegion {
+            virtual_address,
+            page_count,
+            physical_start: 0,
+            generation: 0,
+            prot,
+            shared: SharedMapping::default(),
+            frames: Vec::new(),
+            lazy: true,
+            pages: BTreeMap::new(),
+            file: Some((path, file_offset)),
+        };
+        let position = self
+            .mmap_regions
+            .iter()
+            .position(|existing| existing.virtual_address > virtual_address)
+            .unwrap_or(self.mmap_regions.len());
+        self.mmap_regions.insert(position, region);
+        self.mmap_bytes += span;
+        Some(virtual_address)
+    }
+
     fn mmap_file_paged<F>(
         &mut self,
         length: usize,
@@ -6390,6 +6450,7 @@ impl Task {
             frames,
             lazy: false,
             pages: BTreeMap::new(),
+            file: None,
         };
         let position = self
             .mmap_regions
@@ -6493,6 +6554,7 @@ impl Task {
         if self.mmap_regions[index].pages.contains_key(&offset) {
             return false;
         }
+        let source = self.mmap_regions[index].file.clone();
         if !self.charge_frames(1) {
             return false;
         }
@@ -6502,6 +6564,32 @@ impl Task {
         };
         unsafe {
             core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, PAGE_SIZE);
+        }
+        if let Some((path, file_offset)) = source {
+            // The faulting thread waits for one page of disk I/O; that is the
+            // price of not copying an unused library into frames. VFS reads
+            // are polled and take the VFS lock, which no path holds while
+            // waiting for the scheduler lock.
+            let start = file_offset + offset as usize * PAGE_SIZE;
+            match crate::vfs::read_path_at(&path, start, PAGE_SIZE) {
+                Ok(bytes) => {
+                    let count = bytes.len().min(PAGE_SIZE);
+                    unsafe {
+                        core::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            phys_to_virt(physical) as *mut u8,
+                            count,
+                        );
+                    }
+                }
+                Err(()) => {
+                    // Mapping zeros would silently turn an I/O error into an
+                    // empty page; fail the access instead.
+                    let _ = frame_allocator::free_page_tagged(physical, generation);
+                    self.release_frames(1);
+                    return false;
+                }
+            }
         }
         if !mmu::map_user_page_at(self.ttbr0, page, physical, prot) {
             frame_allocator::free_page_tagged(physical, generation);
@@ -7046,6 +7134,11 @@ impl Task {
         tail.page_count = self.mmap_regions[index].page_count - offset_pages;
         if tail.lazy {
             tail.pages = self.mmap_regions[index].take_pages_from(offset_pages as u32);
+            // A file-backed region reads page `n` at `file_offset + n * PAGE`.
+            // The tail's page 0 is `offset_pages` further into the file.
+            if let Some((_, file_offset)) = tail.file.as_mut() {
+                *file_offset += offset_pages * PAGE_SIZE;
+            }
         } else if tail.frames.is_empty() {
             tail.physical_start =
                 self.mmap_regions[index].physical_start + offset_pages * PAGE_SIZE;

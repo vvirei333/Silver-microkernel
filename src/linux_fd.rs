@@ -1991,6 +1991,16 @@ fn socket_recv_message(
     }
 }
 
+/// Path of an open filesystem file, used to map it lazily. Synthetic
+/// descriptors (memfd, pipes, devices) have no path and return `None`.
+pub fn vfs_path(task: u64, fd: u64) -> Option<alloc::string::String> {
+    let task = crate::scheduler::fd_table_owner(task);
+    match lookup(task, fd)? {
+        Target::Vfs(vfs_fd) => crate::vfs::fd_path(task, vfs_fd),
+        _ => None,
+    }
+}
+
 /// `recvmsg(2)` core: returns the payload length and installs received
 /// descriptors into `task`'s table under fresh numbers.
 pub fn socket_recv(

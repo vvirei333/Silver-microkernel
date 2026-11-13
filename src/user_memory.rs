@@ -24,7 +24,11 @@ pub fn copy_from_user(source: u64, destination: &mut [u8]) -> Result<(), UserFau
         let take = (destination.len() - done).min(COPY_CHUNK);
         let window = &mut destination[done..done + take];
         if !mmu::valid_user_slice(source + done as u64, take as u64) {
-            return Err(UserFault);
+            #[cfg(feature = "linux-abi")]
+            back_user_pages(source + done as u64, take, false);
+            if !mmu::valid_user_slice(source + done as u64, take as u64) {
+                return Err(UserFault);
+            }
         }
         for (index, byte) in window.iter_mut().enumerate() {
             let value: u8;
@@ -43,18 +47,31 @@ pub fn copy_from_user(source: u64, destination: &mut [u8]) -> Result<(), UserFau
     Ok(())
 }
 
-/// A fork-shared stack/region is mapped read-only until a write fault copies
-/// it. A syscall that copies a result out (wait status, read buffer, signal
-/// frame) must trigger the same COW path the EL0 fault handler would.
+/// Backs the user pages of `[pointer, pointer + length)`.
+///
+/// Two things make a page unreadable until the fault handler runs: a region
+/// shared with `fork` is write-protected until `cow_fault` copies it, and a
+/// lazily mapped region (an anonymous reservation, or a file-backed mapping
+/// since libraries are read on demand) has no frame at all. The kernel copy
+/// path checks the page table *before* touching memory — `PAN` is on and the
+/// accessors use `ldtrb`/`sttrb` — so a syscall whose buffer or path string
+/// lives on an untouched page would otherwise fail with `EFAULT` without the
+/// hardware ever faulting the page in.
 #[cfg(feature = "linux-abi")]
-fn cow_prepare(pointer: u64, length: usize) {
+fn back_user_pages(pointer: u64, length: usize, write: bool) {
     let mut page = pointer & !(COPY_CHUNK as u64 - 1);
     let Some(end) = pointer.checked_add(length as u64) else {
         return;
     };
     while page < end {
-        if !mmu::valid_user_slice_mut(page, 1) {
-            let _ = crate::scheduler::cow_fault(page as usize, 1 << 6);
+        let valid = if write {
+            mmu::valid_user_slice_mut(page, 1)
+        } else {
+            mmu::valid_user_slice(page, 1)
+        };
+        if !valid {
+            let esr = if write { 1u64 << 6 } else { 0 };
+            let _ = crate::scheduler::cow_fault(page as usize, esr);
         }
         page = page.saturating_add(COPY_CHUNK as u64);
     }
@@ -67,7 +84,7 @@ pub fn copy_to_user(source: &[u8], destination: u64) -> Result<(), UserFault> {
         let window = &source[done..done + take];
         if !mmu::valid_user_slice_mut(destination + done as u64, take as u64) {
             #[cfg(feature = "linux-abi")]
-            cow_prepare(destination + done as u64, take);
+            back_user_pages(destination + done as u64, take, true);
             if !mmu::valid_user_slice_mut(destination + done as u64, take as u64) {
                 return Err(UserFault);
             }

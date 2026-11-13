@@ -2350,6 +2350,20 @@ fn linux_mmap(
         return errno(ENOMEM);
     }
     let task = scheduler::current_task_id();
+    // A file from the (immutable) filesystem is mapped lazily: the loader maps
+    // whole PT_LOAD segments, and an eager copy of libLLVM alone cost 7.7 s of
+    // block-device reads for pages the program never executes. memfd and other
+    // synthetic descriptors keep the eager path below.
+    if let Some(path) = linux_fd::vfs_path(task, fd) {
+        let placed = scheduler::mmap_file_lazy(
+            length as usize,
+            prot,
+            fixed,
+            path,
+            offset as usize,
+        );
+        return placed.map(|placed| placed as u64).unwrap_or(errno(ENOMEM));
+    }
     let placed = scheduler::mmap_file_paged(length as usize, prot, fixed, |page_offset, buffer| {
         // The buffer arrives zeroed; a short read leaves the rest as the
         // zero-fill Linux expects past EOF.
