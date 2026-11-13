@@ -1022,7 +1022,6 @@ static unsigned buffer_offset;
 static unsigned buffer_stride;
 static unsigned buffer_format;
 static unsigned char *screen;
-
 static unsigned screen_seq;
 /* virtio-gpu scanout (`/dev/gpufb`). When present, every composed frame is
    also pushed through the GPU, so the device's own display head shows the
@@ -4396,7 +4395,14 @@ void _start(void) {
                 }
             }
         }
-        poll_input();
+        /* Only switch client state when the host actually queued input. */
+        if (screen != 0) {
+            unsigned input_head = *(volatile unsigned *)(screen + INPUT_HEAD);
+            unsigned input_tail = *(volatile unsigned *)(screen + INPUT_TAIL);
+            if (input_head != input_tail) {
+                poll_input();
+            }
+        }
         /* Vblank tick: complete pending frame callbacks for every client. */
         for (int index = 0; index < MAX_CLIENTS; index++) {
             if (!clients[index].connected) {

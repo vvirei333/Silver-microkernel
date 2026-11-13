@@ -5428,3 +5428,24 @@ while a plain libwayland client as the second client completes the whole
 sequence. The behaviour is nondeterministic between runs, which points at the
 multi-client state switching rather than a missing protocol event; the buffer
 fix above did not change it.
+
+
+### Input servicing only when the host queued something
+
+`poll_input()` was called on every loop iteration, loading and saving a
+client's protocol state each time. That runs the whole `load_client` /
+`save_client` copy (pools, buffers, regions, seat proxies, the 64 KiB receive
+buffer pointer) 50 times a second with nothing to do, and a second client
+(GTK, in this case) never got past its first roundtrip. Gating the call on the
+input ring's head/tail fixes the symptom: with no host input the state is no
+longer churned, and the terminal now binds globals, creates surfaces and
+requests frames (confirmed with the in-shmem protocol trace).
+
+The Phosh flow still works with the gate (lockscreen, Space unlock, quick
+settings open/fold/open).
+
+**Still open:** the terminal's window is not visible after it launches. The
+protocol trace shows it binding and creating surfaces, so the next question is
+whether its `wl_surface.commit` reaches the `app_window` capture path at all
+(trace `object, opcode == 6` for client 1) — the capture requires
+`layer_slot == 0`, so a stale layer-surface match is the first suspect.
