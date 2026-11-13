@@ -864,6 +864,11 @@ static unsigned attached_buffers[SURFACE_IDS];
    GDK's cairo renderer destroys the buffer's cairo surface on the first
    release, so a second one corrupts its refcount. */
 static int attached_fresh[SURFACE_IDS];
+/* Damage accumulated between commits: only that rectangle is re-read from the
+   client's pool. GTK damages a few hundred pixels for a clock tick or a
+   sheet edge, while the surface itself is a full-screen buffer. */
+static int damage_box[SURFACE_IDS][4];
+static unsigned char damage_valid[SURFACE_IDS];
 /* 0 = no set_input_region (whole surface), 1 = region set (possibly empty). */
 static unsigned char surface_input_set[SURFACE_IDS];
 static unsigned char surface_input_empty[SURFACE_IDS];
@@ -1033,6 +1038,28 @@ static unsigned screen_seq;
    the same frame, and composing after each of them cost three full-frame
    blits per visible frame (~30 ms each under emulation). */
 static int scene_dirty;
+/* Union of the rectangles that changed since the last compose. A clock tick
+   or a typed character only repaints its own box instead of the whole
+   output, which is the difference between 27 ms and ~1 ms per frame. */
+static int compose_box[4];
+static int compose_full = 1;
+
+static void compose_damage(int x0, int y0, int x1, int y1) {
+    if (compose_full) {
+        return;
+    }
+    if (compose_box[0] >= compose_box[2] || compose_box[1] >= compose_box[3]) {
+        compose_box[0] = x0;
+        compose_box[1] = y0;
+        compose_box[2] = x1;
+        compose_box[3] = y1;
+        return;
+    }
+    if (x0 < compose_box[0]) compose_box[0] = x0;
+    if (y0 < compose_box[1]) compose_box[1] = y0;
+    if (x1 > compose_box[2]) compose_box[2] = x1;
+    if (y1 > compose_box[3]) compose_box[3] = y1;
+}
 /* virtio-gpu scanout (`/dev/gpufb`). When present, every composed frame is
    also pushed through the GPU, so the device's own display head shows the
    desktop and a host screendump can prove the path. */
@@ -1171,6 +1198,8 @@ typedef struct {
     PoolSlot pools[MAX_POOLS];
     BufferSlot buffers[MAX_BUFFERS];
     unsigned attached_buffers[SURFACE_IDS];
+    int damage_box[SURFACE_IDS][4];
+    unsigned char damage_valid[SURFACE_IDS];
     unsigned char surface_input_set[SURFACE_IDS];
     unsigned char surface_input_empty[SURFACE_IDS];
     int surface_input_box[SURFACE_IDS][4];
@@ -1270,6 +1299,10 @@ static void load_client(ClientState *client) {
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         attached_buffers[index] = client->attached_buffers[index];
+        damage_valid[index] = client->damage_valid[index];
+        for (unsigned corner = 0; corner < 4; corner++) {
+            damage_box[index][corner] = client->damage_box[index][corner];
+        }
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         frame_ids[index] = client->frame_ids[index];
@@ -1308,6 +1341,10 @@ static void save_client(ClientState *client) {
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         client->attached_buffers[index] = attached_buffers[index];
+        client->damage_valid[index] = damage_valid[index];
+        for (unsigned corner = 0; corner < 4; corner++) {
+            client->damage_box[index][corner] = damage_box[index][corner];
+        }
     }
     for (unsigned index = 0; index < SURFACE_IDS; index++) {
         client->frame_ids[index] = frame_ids[index];
@@ -1452,12 +1489,35 @@ static void layer_forget_surface(unsigned surface) {
     LayerEntry *entry = layer_entry_by_surface(surface);
     if (entry != 0) {
         entry->used = 0;
+        /* The area it covered has to be repainted from the layers below. */
+        compose_full = 1;
+        scene_dirty = 1;
     }
 }
 
+/// Damage rectangle reported for the commit being processed (the whole
+/// buffer when the client sent none), and clears it.
+static void take_damage(int surface, int width, int height, int *x0, int *y0,
+                        int *x1, int *y1) {
+    if (surface >= 0 && surface < SURFACE_IDS && damage_valid[surface]) {
+        *x0 = damage_box[surface][0];
+        *y0 = damage_box[surface][1];
+        *x1 = *x0 + damage_box[surface][2];
+        *y1 = *y0 + damage_box[surface][3];
+        damage_valid[surface] = 0;
+        return;
+    }
+    *x0 = 0;
+    *y0 = 0;
+    *x1 = width;
+    *y1 = height;
+}
+
 /// Snapshot the committed buffer into the layer's own memory. Called while
-/// the client's pool fd is still alive (before wl_buffer.release).
-static void layer_store_pixels(LayerEntry *entry) {
+/// the client's pool fd is still alive (before wl_buffer.release). Only the
+/// damaged rows/columns are re-read; the rest of the copy is already current.
+static void layer_store_pixels(LayerEntry *entry, int x0, int y0, int x1,
+                               int y1) {
     if (entry == 0 || buffer_width == 0 || buffer_height == 0) {
         return;
     }
@@ -1492,19 +1552,31 @@ static void layer_store_pixels(LayerEntry *entry) {
        formats) once per commit. The compose pass then only blends or copies
        words: a layer that does not change is no longer swizzled again on
        every composed frame, which is most of the cost of the wallpaper. */
-    const unsigned *source_words = (const unsigned *)source;
-    unsigned *destination_words = (unsigned *)entry->copy;
-    unsigned words = bytes / 4;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int)buffer_width) x1 = (int)buffer_width;
+    if (y1 > (int)buffer_height) y1 = (int)buffer_height;
+    if (x0 >= x1 || y0 >= y1) {
+        sys3(215 /* munmap */, mapped, buffer_offset + bytes, 0);
+        entry->copy_ready = 1;
+        return;
+    }
     const int opaque = buffer_format == 1;
-    for (unsigned index = 0; index < words; index++) {
-        unsigned pixel = source_words[index];
-        unsigned swizzled = (pixel & 0xFF00FF00u) |
-                            ((pixel & 0x00FF0000u) >> 16) |
-                            ((pixel & 0x000000FFu) << 16);
-        if (opaque) {
-            swizzled |= 0xFF000000u;
+    for (int row = y0; row < y1; row++) {
+        const unsigned *source_row =
+            (const unsigned *)(source + (unsigned)row * buffer_stride);
+        unsigned *destination_row =
+            (unsigned *)(entry->copy + (unsigned)row * buffer_stride);
+        for (int column = x0; column < x1; column++) {
+            unsigned pixel = source_row[column];
+            unsigned swizzled = (pixel & 0xFF00FF00u) |
+                                ((pixel & 0x00FF0000u) >> 16) |
+                                ((pixel & 0x000000FFu) << 16);
+            if (opaque) {
+                swizzled |= 0xFF000000u;
+            }
+            destination_row[column] = swizzled;
         }
-        destination_words[index] = swizzled;
     }
     __asm__ volatile("dsb sy" ::: "memory");
     sys3(215 /* munmap */, mapped, buffer_offset + bytes, 0);
@@ -1605,7 +1677,15 @@ static unsigned layer_hit_test(unsigned px, unsigned py) {
     for (unsigned index = 0; index < MAX_LAYERS; index++) {
         LayerEntry *entry = &layer_entries[index];
         if (!entry->used || entry->width == 0 || entry->height == 0 ||
-            entry->fd < 0) {
+            entry->fd < 0 || !entry->copy_ready) {
+            continue;
+        }
+        /* A surface faded out with zphoc_alpha_layer_surface_v1 is invisible
+           but still covers the screen. Phosh's "top-panel background" is a
+           full-output surface at an overlay layer (the quick-settings
+           backdrop); while it is transparent it must not swallow the pointer,
+           otherwise the lockscreen never sees the unlock swipe. */
+        if (entry->alpha == 0) {
             continue;
         }
         int x;
@@ -1690,6 +1770,19 @@ static void layer_compose(void) {
     const unsigned out_width = OUT_WIDTH;
     const unsigned out_height = OUT_HEIGHT;
     unsigned *destination = (unsigned *)(screen + 0x1000);
+    int clip_x0 = compose_full ? 0 : compose_box[0];
+    int clip_y0 = compose_full ? 0 : compose_box[1];
+    int clip_x1 = compose_full ? (int)out_width : compose_box[2];
+    int clip_y1 = compose_full ? (int)out_height : compose_box[3];
+    if (clip_x0 < 0) clip_x0 = 0;
+    if (clip_y0 < 0) clip_y0 = 0;
+    if (clip_x1 > (int)out_width) clip_x1 = (int)out_width;
+    if (clip_y1 > (int)out_height) clip_y1 = (int)out_height;
+    compose_full = 0;
+    compose_box[0] = 0;
+    compose_box[1] = 0;
+    compose_box[2] = 0;
+    compose_box[3] = 0;
     /* WIN1 seqlock, as in userspace/src/window_proto.rs: the frame counter is
        odd while the pixels are being painted and even once they are complete.
        A host viewer copies a frame only when it observes an even, changed
@@ -1698,8 +1791,11 @@ static void layer_compose(void) {
     screen_seq += 1;
     *(volatile unsigned *)(screen + 0x18) = screen_seq;
     __asm__ volatile("dsb sy" ::: "memory");
-    for (unsigned index = 0; index < out_width * out_height; index++) {
-        destination[index] = 0xFF101014u;
+    for (int row = clip_y0; row < clip_y1; row++) {
+        unsigned *line = destination + (unsigned)row * out_width;
+        for (int column = clip_x0; column < clip_x1; column++) {
+            line[column] = 0xFF101014u;
+        }
     }
     for (unsigned wanted = 0; wanted <= 3; wanted++) {
         unsigned order[MAX_LAYERS];
@@ -1738,7 +1834,7 @@ static void layer_compose(void) {
             const int full_alpha = entry->alpha >= 255;
             for (unsigned row = 0; row < entry->height; row++) {
                 int out_y = y + (int)row;
-                if (out_y < 0 || out_y >= (int)out_height) {
+                if (out_y < clip_y0 || out_y >= clip_y1) {
                     continue;
                 }
                 const unsigned *source_row =
@@ -1750,7 +1846,7 @@ static void layer_compose(void) {
                         destination + (unsigned)out_y * out_width;
                     for (unsigned column = 0; column < entry->width; column++) {
                         int out_x = x + (int)column;
-                        if (out_x < 0 || out_x >= (int)out_width) {
+                        if (out_x < clip_x0 || out_x >= clip_x1) {
                             continue;
                         }
                         unsigned pixel = source_row[column];
@@ -1762,7 +1858,7 @@ static void layer_compose(void) {
                 }
                 for (unsigned column = 0; column < entry->width; column++) {
                     int out_x = x + (int)column;
-                    if (out_x < 0 || out_x >= (int)out_width) {
+                    if (out_x < clip_x0 || out_x >= clip_x1) {
                         continue;
                     }
                     /* wl_shm ARGB8888 is premultiplied. Apply the surface
@@ -1807,14 +1903,14 @@ static void layer_compose(void) {
         int origin_y = -(int)app_window.geometry_y;
         for (unsigned row = 0; row < app_window.height; row++) {
             int out_y = origin_y + (int)row;
-            if (out_y < 0 || out_y >= (int)out_height) {
+            if (out_y < clip_y0 || out_y >= clip_y1) {
                 continue;
             }
             const unsigned *source_row = (const unsigned *)
                 (app_window.copy + row * app_window.stride);
             for (unsigned column = 0; column < app_window.width; column++) {
                 int out_x = origin_x + (int)column;
-                if (out_x < 0 || out_x >= (int)out_width) {
+                if (out_x < clip_x0 || out_x >= clip_x1) {
                     continue;
                 }
                 unsigned swizzled = source_row[column];
@@ -2021,6 +2117,7 @@ static void drag_apply(unsigned layer_surface) {
 static void drag_recompose(void) {
 #ifdef SERVE_ONLY
     scene_dirty = 1;
+    compose_full = 1;
 #endif
 }
 
@@ -2393,6 +2490,7 @@ static void toggle_app_window(void) {
     }
 #ifdef SERVE_ONLY
     scene_dirty = 1;
+    compose_full = 1;
 #endif
 }
 
@@ -3610,6 +3708,7 @@ static int serve(long client) {
                         entry->alpha = slot->alpha;
 #ifdef SERVE_ONLY
                         scene_dirty = 1;
+                        compose_full = 1;
 #endif
                     }
                 }
@@ -3738,6 +3837,34 @@ static int serve(long client) {
                     attached_buffers[object] = buffer;
                     if (buffer != 0) {
                         attached_fresh[object] = 1;
+                    }
+                }
+            } else if (is_surface(object) && (opcode == 2 || opcode == 9)) {
+                /* wl_surface.damage / damage_buffer: accumulate the union of
+                   the rectangles this commit changed. */
+                int dx = (int)take_u32();
+                int dy = (int)take_u32();
+                int dw = (int)take_u32();
+                int dh = (int)take_u32();
+                if (object < SURFACE_IDS && dw > 0 && dh > 0) {
+                    if (damage_valid[object]) {
+                        int *box = damage_box[object];
+                        int x0 = dx < box[0] ? dx : box[0];
+                        int y0 = dy < box[1] ? dy : box[1];
+                        int x1 = dx + dw > box[0] + box[2] ? dx + dw
+                                                          : box[0] + box[2];
+                        int y1 = dy + dh > box[1] + box[3] ? dy + dh
+                                                          : box[1] + box[3];
+                        box[0] = x0;
+                        box[1] = y0;
+                        box[2] = x1 - x0;
+                        box[3] = y1 - y0;
+                    } else {
+                        damage_box[object][0] = dx;
+                        damage_box[object][1] = dy;
+                        damage_box[object][2] = dw;
+                        damage_box[object][3] = dh;
+                        damage_valid[object] = 1;
                     }
                 }
             } else if (is_surface(object) && opcode == 5) {
@@ -3888,25 +4015,36 @@ static int serve(long client) {
                         if (mapped > 0) {
                             const unsigned char *source =
                                 (const unsigned char *)(mapped + buffer_offset);
-                            /* Same trick as a layer: store in sink order so
-                               the compose pass copies words instead of
-                               swizzling 1024x768 pixels every frame. */
-                            const unsigned *source_words =
-                                (const unsigned *)source;
-                            unsigned *destination_words =
-                                (unsigned *)app_window.copy;
-                            unsigned words = bytes / 4;
+                            /* Same as a layer: store in sink order and only
+                               the damaged part, so a keystroke does not
+                               re-swizzle a megapixel window. */
+                            int dx0, dy0, dx1, dy1;
+                            take_damage((int)object, (int)buffer_width,
+                                        (int)buffer_height,
+                                        &dx0, &dy0, &dx1, &dy1);
+                            if (dx0 < 0) dx0 = 0;
+                            if (dy0 < 0) dy0 = 0;
+                            if (dx1 > (int)buffer_width) dx1 = (int)buffer_width;
+                            if (dy1 > (int)buffer_height) dy1 = (int)buffer_height;
                             const int opaque = buffer_format == 1;
-                            for (unsigned index = 0; index < words; index++) {
-                                unsigned pixel = source_words[index];
-                                unsigned swizzled =
-                                    (pixel & 0xFF00FF00u) |
-                                    ((pixel & 0x00FF0000u) >> 16) |
-                                    ((pixel & 0x000000FFu) << 16);
-                                if (opaque) {
-                                    swizzled |= 0xFF000000u;
+                            for (int row = dy0; row < dy1; row++) {
+                                const unsigned *source_row =
+                                    (const unsigned *)(source +
+                                                       (unsigned)row * buffer_stride);
+                                unsigned *destination_row =
+                                    (unsigned *)(app_window.copy +
+                                                 (unsigned)row * buffer_stride);
+                                for (int column = dx0; column < dx1; column++) {
+                                    unsigned pixel = source_row[column];
+                                    unsigned swizzled =
+                                        (pixel & 0xFF00FF00u) |
+                                        ((pixel & 0x00FF0000u) >> 16) |
+                                        ((pixel & 0x000000FFu) << 16);
+                                    if (opaque) {
+                                        swizzled |= 0xFF000000u;
+                                    }
+                                    destination_row[column] = swizzled;
                                 }
-                                destination_words[index] = swizzled;
                             }
                             __asm__ volatile("dsb sy" ::: "memory");
                             sys3(215, mapped, buffer_offset + bytes, 0);
@@ -3925,6 +4063,10 @@ static int serve(long client) {
                             app_window.stride = buffer_stride;
                             app_window.format = buffer_format;
                             app_window.copy_ready = 1;
+                            compose_damage(-(int)app_window.geometry_x + dx0,
+                                           -(int)app_window.geometry_y + dy0,
+                                           -(int)app_window.geometry_x + dx1,
+                                           -(int)app_window.geometry_y + dy1);
                         }
                         scene_dirty = 1;
                     }
@@ -3940,7 +4082,16 @@ static int serve(long client) {
                             LayerEntry *stored =
                                 layer_entry_by_surface(layer_slot->surface);
                             if (stored != 0) {
-                                layer_store_pixels(stored);
+                                int dx0, dy0, dx1, dy1;
+                                take_damage((int)object, (int)buffer_width,
+                                            (int)buffer_height,
+                                            &dx0, &dy0, &dx1, &dy1);
+                                layer_store_pixels(stored, dx0, dy0, dx1, dy1);
+                                int lx = 0;
+                                int ly = 0;
+                                layer_rect(stored, &lx, &ly);
+                                compose_damage(lx + dx0, ly + dy0,
+                                               lx + dx1, ly + dy1);
                             }
                             /* A draggable surface is positioned by the
                                compositor, not by its zwlr margin. */

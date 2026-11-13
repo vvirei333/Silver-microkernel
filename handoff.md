@@ -5705,3 +5705,36 @@ Frame latency end to end from viewer-style input: swipe -> unlocked in 0.53 s
 pixel work under TCG). Per-layer damage tracking (compose only the rects that
 changed, caching the rest) is the next big win; the shell's own GTK redraw
 cost is on top of that.
+
+
+### Unlock, invisible blockers, and damage tracking
+
+Two things surfaced when the desktop was driven from the window viewer:
+
+* **A transparent surface swallowed the pointer.** Phosh's
+  `top-panel background` (the quick-settings backdrop) is a full-output layer
+  surface at an overlay layer. While the sheet is folded Phosh fades it to
+  alpha 0, so it is invisible - but the hit test still picked it, and the
+  lockscreen never saw the mouse. `layer_hit_test()` now skips entries with
+  `alpha == 0` (and entries with no stored pixels). A click or any key on the
+  lockscreen then unlocks it (Phosh's `require-unlock=false` path); measured
+  0.25 s from click to the unlocked frame.
+* **The sheet itself is opaque black.** We cannot blur, so the quick-settings
+  backdrop renders as black over most of the screen. That is a cosmetic
+  limitation, not a blocker: dragging it back up folds it.
+
+Frame cost work (QEMU TCG, 1024x768):
+
+* `wl_surface.damage` / `damage_buffer` are tracked per surface, and
+  `layer_store_pixels()` re-reads only the damaged rows/columns. A clock tick
+  or a keystroke no longer re-swizzles a full-screen buffer; a typed line in
+  the terminal now costs a few hundred pixels.
+* `layer_compose()` honours a damage box: it clears and repaints only the
+  union of the changed rectangles (the whole frame when a surface moves,
+  appears, disappears, or changes alpha). A small update costs ~1 ms instead
+  of 27 ms; the full-frame path is unchanged.
+
+The static-lockscreen case still composes a full frame per Phosh redraw
+(~24 ms), so the next step for 30-60 fps is to find out why Phosh redraws at
+all when nothing changed (its frame clock gets a `wl_callback.done` at our
+50 Hz idle tick).
