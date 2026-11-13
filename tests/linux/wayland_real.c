@@ -3224,6 +3224,19 @@ static int serve(long client) {
                 slot->layer = take_u32();
                 char space[64];
                 take_string(space, sizeof(space));
+                /* Configure the surface as soon as it exists. GTK sizes its
+                   window from this event and does not commit a buffer before
+                   it arrives; Phosh only calls `set_size` for surfaces it
+                   resizes, so a window that fills the output (the home /
+                   overview surface) was never configured and never drew. */
+                begin(new_layer_surface, 0 /* configure */);
+                put_u32(configure_serial);
+                configure_serial += 1;
+                put_u32(LOGICAL_WIDTH);
+                put_u32(LOGICAL_HEIGHT);
+                finish();
+                send_message(client, -1);
+                slot->configured = 1;
             } else if (layer_surface_by_id(object) != 0 && opcode == 0) {
                 LayerSurface *slot = layer_surface_by_id(object);
                 slot->width = take_u32();
