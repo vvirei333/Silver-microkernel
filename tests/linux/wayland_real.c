@@ -381,6 +381,9 @@ typedef struct {
     unsigned char *copy;
     unsigned copy_bytes;
     int copy_ready;
+    /* Which Wayland client owns this surface. The layer scene is global, the
+       protocol state stays per client. */
+    int owner;
 } LayerEntry;
 static LayerEntry layer_entries[MAX_LAYERS];
 
@@ -1045,7 +1048,6 @@ static unsigned keyboard_target;
    panel's buffer. */
 static unsigned pointer_grab;
 #ifdef SERVE_ONLY
-static int frame_reported;
 #endif
 static unsigned attached_buffer; /* written by attach; release is deferred */
 static int focused;
@@ -1161,6 +1163,10 @@ typedef struct {
     LayerSurface layer_surfaces[MAX_LAYER_SURFACES];
     StackedSlot stacked_slots[MAX_STACKED];
     unsigned shm_ids[MAX_SHM];
+    /* A partially received message must not be mixed with another client's
+       bytes when the loop switches sockets. */
+    unsigned long incoming_pending;
+    unsigned char incoming_tail[4096];
 } ClientState;
 
 #define CLIENT_SCALARS(X) \
@@ -1194,8 +1200,26 @@ typedef struct {
     X(keyboard_target) X(pointer_grab) \
     X(data_mime_count) X(selection_changed) X(wants_offer)
 
-#define MAX_CLIENTS 2
+#define MAX_CLIENTS 4
 static ClientState clients[MAX_CLIENTS];
+
+/* The newest xdg_toplevel, drawn over the layer scene. One window is enough
+ * until the compositor grows a real window manager. */
+typedef struct {
+    int used;
+    int owner;
+    unsigned surface;
+    unsigned width;
+    unsigned height;
+    unsigned stride;
+    unsigned format;
+    unsigned char *copy;
+    unsigned copy_bytes;
+    int copy_ready;
+} AppWindow;
+static AppWindow app_window;
+static int ui_client = -1; /* owns the layer scene (Phosh) */
+static int frame_reported;
 static int clipboard_owner = -1;
 static unsigned clipboard_source_id;
 static char clipboard_mimes[4][64];
@@ -1213,6 +1237,14 @@ static void load_client(ClientState *client) {
 #define LOAD(field) field = client->field;
     CLIENT_SCALARS(LOAD)
 #undef LOAD
+    incoming_pending = client->incoming_pending;
+    if (incoming_pending <= sizeof(client->incoming_tail)) {
+        for (unsigned long index = 0; index < incoming_pending; index++) {
+            incoming[index] = client->incoming_tail[index];
+        }
+    } else {
+        incoming_pending = 0;
+    }
     copy_mimes(data_mimes, client->data_mimes);
     for (unsigned index = 0; index < MAX_POOLS; index++) {
         pools[index] = client->pools[index];
@@ -1235,9 +1267,6 @@ static void load_client(ClientState *client) {
     for (unsigned index = 0; index < MAX_REGIONS; index++) {
         regions[index] = client->regions[index];
     }
-    for (unsigned index = 0; index < MAX_LAYERS; index++) {
-        layer_entries[index] = client->layer_entries[index];
-    }
     for (unsigned index = 0; index < MAX_STACKED; index++) {
         stacked_slots[index] = client->stacked_slots[index];
     }
@@ -1253,6 +1282,14 @@ static void save_client(ClientState *client) {
 #define SAVE(field) client->field = field;
     CLIENT_SCALARS(SAVE)
 #undef SAVE
+    if (incoming_pending <= sizeof(client->incoming_tail)) {
+        client->incoming_pending = incoming_pending;
+        for (unsigned long index = 0; index < incoming_pending; index++) {
+            client->incoming_tail[index] = incoming[index];
+        }
+    } else {
+        client->incoming_pending = 0;
+    }
     copy_mimes(client->data_mimes, data_mimes);
     for (unsigned index = 0; index < MAX_POOLS; index++) {
         client->pools[index] = pools[index];
@@ -1274,9 +1311,6 @@ static void save_client(ClientState *client) {
     }
     for (unsigned index = 0; index < MAX_REGIONS; index++) {
         client->regions[index] = regions[index];
-    }
-    for (unsigned index = 0; index < MAX_LAYERS; index++) {
-        client->layer_entries[index] = layer_entries[index];
     }
     for (unsigned index = 0; index < MAX_STACKED; index++) {
         client->stacked_slots[index] = stacked_slots[index];
@@ -1397,7 +1431,8 @@ static LayerEntry *layer_entry_by_surface(unsigned surface) {
     }
     for (unsigned index = 0; index < MAX_LAYERS; index++) {
         if (layer_entries[index].used &&
-            layer_entries[index].surface == surface) {
+            layer_entries[index].surface == surface &&
+            layer_entries[index].owner == current_client) {
             return &layer_entries[index];
         }
     }
@@ -1470,6 +1505,8 @@ static void layer_record_commit(LayerSurface *slot) {
     }
     entry->used = 1;
     entry->surface = slot->surface;
+    entry->owner = current_client;
+    ui_client = current_client;
     entry->layer = slot->layer;
     entry->anchor = slot->anchor;
     for (unsigned index = 0; index < 4; index++) {
@@ -1717,6 +1754,54 @@ static void layer_compose(void) {
             drawn += 1;
         }
     }
+    /* The newest toplevel (an application window) goes on top of the shell
+       layers. Full-output only: there is no window manager yet. */
+    if (app_window.used && app_window.copy_ready && app_window.width != 0) {
+        unsigned rows = app_window.height;
+        if (rows > out_height) {
+            rows = out_height;
+        }
+        for (unsigned row = 0; row < rows; row++) {
+            const unsigned *source_row = (const unsigned *)
+                (app_window.copy + row * app_window.stride);
+            unsigned columns = app_window.width;
+            if (columns > out_width) {
+                columns = out_width;
+            }
+            for (unsigned column = 0; column < columns; column++) {
+                unsigned pixel = source_row[column];
+                unsigned swizzled = (pixel & 0xFF00FF00u) |
+                                    ((pixel & 0x00FF0000u) >> 16) |
+                                    ((pixel & 0x000000FFu) << 16);
+                if (app_window.format == 1) {
+                    swizzled |= 0xFF000000u;
+                }
+                unsigned alpha = swizzled >> 24;
+                unsigned *target = &destination[row * out_width + column];
+                if (alpha == 0) {
+                    continue;
+                }
+                if (alpha == 255) {
+                    *target = swizzled | 0xFF000000u;
+                    continue;
+                }
+                unsigned inverse = 255u - alpha;
+                unsigned below = *target;
+                unsigned red = (swizzled & 0xFFu) +
+                               ((below & 0xFFu) * inverse + 127u) / 255u;
+                unsigned green = ((swizzled >> 8) & 0xFFu) +
+                                 (((below >> 8) & 0xFFu) * inverse + 127u) / 255u;
+                unsigned blue = ((swizzled >> 16) & 0xFFu) +
+                                (((below >> 16) & 0xFFu) * inverse + 127u) / 255u;
+                if (red > 255u) red = 255u;
+                if (green > 255u) green = 255u;
+                if (blue > 255u) blue = 255u;
+                *target = 0xFF000000u | (blue << 16) | (green << 8) | red;
+            }
+        }
+        drawn += 1;
+    }
+
     *(volatile unsigned *)(screen + 0x00) = 0x57494E31u;
     *(volatile unsigned *)(screen + 0x08) = out_width;
     *(volatile unsigned *)(screen + 0x0C) = out_height;
@@ -2181,10 +2266,19 @@ static void grab_activate(long client, unsigned keycode) {
     }
 }
 
-static void poll_input(long client) {
+static void poll_input(void) {
     if (screen == 0) {
         return;
     }
+    /* Events go to the application window when one is mapped, otherwise to
+       the shell (the client that owns the layer scene). */
+    int index = app_window.used ? app_window.owner : ui_client;
+    if (index < 0 || index >= MAX_CLIENTS || !clients[index].connected) {
+        return;
+    }
+    long client = clients[index].fd;
+    current_client = index;
+    load_client(&clients[index]);
     unsigned head = *(volatile unsigned *)(screen + INPUT_HEAD);
     unsigned tail = *(volatile unsigned *)(screen + INPUT_TAIL);
     unsigned guard = 0;
@@ -2280,10 +2374,10 @@ static void poll_input(long client) {
         tail = tail + 1;
         *(volatile unsigned *)(screen + INPUT_TAIL) = tail;
     }
+    save_client(&clients[index]);
 }
 
 static int serve(long client) {
-    poll_input(client);
     long count;
     do {
         count = receive_message(client);
@@ -2292,7 +2386,6 @@ static int serve(long client) {
            clients. Only an idle client (no pending tail) yields on timeout. */
     } while (count == -2 && incoming_pending != 0);
     if (count == -2) {
-        poll_input(client);
         /* Frame clock tick. GTK requests wl_surface.frame and waits for the
            done event before running its tick callbacks; completing it only on
            commit stalled every animation that had nothing new to draw (the
@@ -3472,68 +3565,53 @@ static int serve(long client) {
                        full composite second), which showed up as the
                        lockscreen flickering over the wallpaper. Only the
                        single-window path needs the direct blit. */
-                    if (layer_slot == 0 && screen != 0 && buffer_width > 0 &&
+                    if (layer_slot == 0 && buffer_width > 0 &&
                         buffer_height > 0 &&
                         buffer_stride >= (unsigned)buffer_width * 4) {
-                        unsigned length = buffer_offset +
-                                          buffer_stride * (unsigned)buffer_height;
-                        long mapped = sys6(222 /* mmap */, 0, length,
-                                           1 /* read */, 1 /* MAP_SHARED */,
-                                           pool_fd, 0);
+                        /* Keep the newest toplevel as the app window and
+                           draw it over the scene in layer_compose(). The
+                           buffer is copied while the pool is alive, for the
+                           same reason layers are copied. */
+                        unsigned bytes = buffer_stride *
+                                         (unsigned)buffer_height;
+                        if (app_window.copy_bytes < bytes) {
+                            if (app_window.copy != 0) {
+                                sys3(215, (long)app_window.copy,
+                                     app_window.copy_bytes, 0);
+                            }
+                            long memory = sys6(222, 0, bytes, 3,
+                                               0x22 /* PRIVATE|ANON */, -1, 0);
+                            if (memory > 0) {
+                                app_window.copy = (unsigned char *)memory;
+                                app_window.copy_bytes = bytes;
+                            } else {
+                                app_window.copy = 0;
+                                app_window.copy_bytes = 0;
+                            }
+                        }
+                        long mapped = 0;
+                        if (app_window.copy != 0) {
+                            mapped = sys6(222, 0, buffer_offset + bytes,
+                                          1, 1, pool_fd, 0);
+                        }
                         if (mapped > 0) {
-                            /* The WIN1 header owns the first 4 KiB, so a
-                               4 MiB BAR holds 4 MiB - 4 KiB of pixels. A
-                               1024x1024 GTK frame is exactly the whole BAR
-                               and used to run off the mapping by one page. */
-                            unsigned max_pixels = (4u * 1024u * 1024u - 0x1000u) / 4u;
-                            unsigned rows = (unsigned)buffer_height;
-                            if ((unsigned)buffer_width * rows > max_pixels) {
-                                rows = max_pixels / (unsigned)buffer_width;
-                            }
-                            if (screen_seq == 0) {
-                                *(volatile unsigned *)(screen + 0x00) = 0x57494E31u;
-                                *(volatile unsigned *)(screen + 0x08) = (unsigned)buffer_width;
-                                *(volatile unsigned *)(screen + 0x0C) = rows;
-                                *(volatile unsigned *)(screen + 0x10) = (unsigned)buffer_width * 4;
-                                *(volatile unsigned *)(screen + 0x14) = 1; /* RGBA8888 */
-                                *(volatile unsigned *)(screen + 0x18) = 0;
-                                *(volatile unsigned *)(screen + 0x2C) = 1; /* show window */
-                            }
-                            const unsigned *src = (const unsigned *)
-                                (mapped + buffer_offset);
-                            unsigned *dst = (unsigned *)(screen + 0x1000);
-                            int opaque = buffer_format == 1; /* XRGB8888 */
-                            /* The sink is the compositor's output, not the
-                               client buffer: a window smaller than the output
-                               still lands at 0,0 with the output stride. */
-                            unsigned out_width = 1024u;
-                            unsigned out_height = 768u;
-                            for (unsigned y = 0; y < rows && y < out_height; y++) {
-                                const unsigned *row =
-                                    (const unsigned *)((const unsigned char *)src +
-                                                       (unsigned)y * buffer_stride);
-                                unsigned columns = (unsigned)buffer_width;
-                                if (columns > out_width) {
-                                    columns = out_width;
-                                }
-                                for (unsigned x = 0; x < columns; x++) {
-                                    unsigned pixel = row[x];
-                                    unsigned swizzled =
-                                        (pixel & 0xFF00FF00u) |
-                                        ((pixel & 0x00FF0000u) >> 16) |
-                                        ((pixel & 0x000000FFu) << 16);
-                                    if (opaque) {
-                                        swizzled |= 0xFF000000u;
-                                    }
-                                    dst[y * out_width + x] = swizzled;
-                                }
+                            const unsigned char *source =
+                                (const unsigned char *)(mapped + buffer_offset);
+                            for (unsigned index = 0; index < bytes; index++) {
+                                app_window.copy[index] = source[index];
                             }
                             __asm__ volatile("dsb sy" ::: "memory");
-                            screen_seq += 1;
-                            *(volatile unsigned *)(screen + 0x18) = screen_seq * 2;
-                            gpu_present(1024u, 768u);
-                            sys3(215 /* munmap */, mapped, length, 0);
+                            sys3(215, mapped, buffer_offset + bytes, 0);
+                            app_window.used = 1;
+                            app_window.owner = current_client;
+                            app_window.surface = object;
+                            app_window.width = (unsigned)buffer_width;
+                            app_window.height = (unsigned)buffer_height;
+                            app_window.stride = buffer_stride;
+                            app_window.format = buffer_format;
+                            app_window.copy_ready = 1;
                         }
+                        layer_compose();
                     }
                     if (layer_slot != 0) {
                         layer_surface_surface = layer_slot->surface;
@@ -3764,6 +3842,46 @@ static int run_client(void) {
 
 /// Each accepted connection is a separate client namespace; reset the
 /// per-surface state before serving the next one.
+static void reset_client(void);
+
+/// Prepares a fresh protocol state for a new client without touching the
+/// descriptors other clients still own.
+static void init_client_state(int slot, long fd) {
+    unsigned char *raw = (unsigned char *)&clients[slot];
+    for (unsigned index = 0; index < sizeof(ClientState); index++) {
+        raw[index] = 0;
+    }
+    for (unsigned index = 0; index < MAX_POOLS; index++) {
+        clients[slot].pools[index].fd = -1;
+    }
+    for (unsigned index = 0; index < MAX_BUFFERS; index++) {
+        clients[slot].buffers[index].pool_fd = -1;
+    }
+    clients[slot].pool_fd = -1;
+    clients[slot].fd = fd;
+    clients[slot].connected = 1;
+    clients[slot].next_server_id = 0xFF000000u;
+
+    current_client = slot;
+    load_client(&clients[slot]);
+    /* Clear the globals that are not part of ClientState. reset_client() also
+       closes descriptors, and those are all -1 here. */
+    int saved_dmabuf_fd[MAX_DMABUF_PARAMS];
+    for (unsigned index = 0; index < MAX_DMABUF_PARAMS; index++) {
+        saved_dmabuf_fd[index] = dmabuf_params[index].fd;
+    }
+    reset_client();
+    for (unsigned index = 0; index < MAX_DMABUF_PARAMS; index++) {
+        if (dmabuf_params[index].fd < 0) {
+            dmabuf_params[index].fd = saved_dmabuf_fd[index];
+        }
+    }
+    clients[slot].fd = fd;
+    clients[slot].connected = 1;
+    clients[slot].next_server_id = 0xFF000000u;
+    save_client(&clients[slot]);
+}
+
 static void reset_client(void) {
     /* pools_reset() closes every descriptor owned by the pool table. */
     pool_fd = -1;
@@ -3831,6 +3949,12 @@ static void reset_client(void) {
         attached_fresh[index] = 0;
     }
     for (unsigned index = 0; index < MAX_LAYERS; index++) {
+        /* The layer scene is global: a new client must not wipe the shell's
+           layers. Only its own entries go away. */
+        if (layer_entries[index].used &&
+            layer_entries[index].owner != current_client) {
+            continue;
+        }
         if (layer_entries[index].copy != 0) {
             sys3(215 /* munmap */, (long)layer_entries[index].copy,
                  layer_entries[index].copy_bytes, 0);
@@ -3839,6 +3963,10 @@ static void reset_client(void) {
             layer_entries[index].copy_ready = 0;
         }
         layer_entries[index].used = 0;
+    }
+    if (app_window.used && app_window.owner == current_client) {
+        app_window.used = 0;
+        app_window.copy_ready = 0;
     }
     for (unsigned index = 0; index < MAX_STACKED; index++) {
         stacked_slots[index].id = 0;
@@ -4196,10 +4324,109 @@ void _start(void) {
         fail("gtk-serve: accept failed\n", 23);
     }
     sys3(64, 1, (long)"gtk-serve: client connected\n", 28);
-    reset_client();
-    while (serve(client) == 0) {
+    init_client_state(0, client);
+    int remaining = 1;
+
+    /* Several clients: the shell (layer surfaces) plus applications it
+       launches. Each keeps its own protocol state; the layer scene and the
+       newest toplevel are global. */
+    while (remaining > 0) {
+        struct pollfd {
+            int fd;
+            short events;
+            short revents;
+        };
+        struct pollfd ready[MAX_CLIENTS + 1];
+        int slot_of[MAX_CLIENTS + 1];
+        int count = 0;
+        ready[count].fd = (int)server;
+        ready[count].events = 1; /* POLLIN */
+        ready[count].revents = 0;
+        slot_of[count] = -1;
+        count += 1;
+        for (int index = 0; index < MAX_CLIENTS; index++) {
+            if (!clients[index].connected) {
+                continue;
+            }
+            ready[count].fd = (int)clients[index].fd;
+            ready[count].events = 1;
+            ready[count].revents = 0;
+            slot_of[count] = index;
+            count += 1;
+        }
+        struct { long seconds; long nanoseconds; } timeout = { 0, 20000000 };
+        long ready_count = sys6(73 /* ppoll */, (long)ready, count,
+                                (long)&timeout, 0, 0, 0);
+        if (ready_count > 0) {
+            if ((ready[0].revents & 1) != 0 && remaining < MAX_CLIENTS) {
+                long accepted = sys3(202 /* accept */, server, 0, 0);
+                if (accepted >= 0) {
+                    int slot = -1;
+                    for (int index = 0; index < MAX_CLIENTS; index++) {
+                        if (!clients[index].connected) {
+                            slot = index;
+                            break;
+                        }
+                    }
+                    if (slot < 0) {
+                        sys3(57, accepted, 0, 0);
+                    } else {
+                        init_client_state(slot, accepted);
+                        remaining += 1;
+                        static const char joined[] =
+                            "gtk-serve: client connected\n";
+                        sys3(64, 1, (long)joined, sizeof(joined) - 1);
+                    }
+                }
+            }
+            for (int probe = 1; probe < count; probe++) {
+                int index = slot_of[probe];
+                if (index < 0 || !clients[index].connected) {
+                    continue;
+                }
+                if ((ready[probe].revents & 1) == 0) {
+                    continue;
+                }
+                current_client = index;
+                load_client(&clients[index]);
+                int result = serve(clients[index].fd);
+                save_client(&clients[index]);
+                if (result != 0) {
+                    sys3(57, clients[index].fd, 0, 0);
+                    clients[index].connected = 0;
+                    remaining -= 1;
+                    if (app_window.used && app_window.owner == index) {
+                        app_window.used = 0;
+                        app_window.copy_ready = 0;
+                    }
+                    static const char left[] = "gtk-serve: client gone\n";
+                    sys3(64, 1, (long)left, sizeof(left) - 1);
+                }
+            }
+        }
+        poll_input();
+        /* Vblank tick: complete pending frame callbacks for every client. */
+        for (int index = 0; index < MAX_CLIENTS; index++) {
+            if (!clients[index].connected) {
+                continue;
+            }
+            current_client = index;
+            load_client(&clients[index]);
+            for (unsigned surface = 0; surface < SURFACE_IDS; surface++) {
+                if (frame_ids[surface] != 0) {
+                    send_done(clients[index].fd, frame_ids[surface], now_ms());
+                    frame_ids[surface] = 0;
+                }
+            }
+            save_client(&clients[index]);
+        }
     }
-    sys3(57, client, 0, 0);
+    for (int index = 0; index < MAX_CLIENTS; index++) {
+        if (clients[index].connected) {
+            sys3(57, clients[index].fd, 0, 0);
+            clients[index].connected = 0;
+        }
+    }
     sys3(57, server, 0, 0);
     int status = 0;
     sys6(260 /* wait4 */, child, (long)&status, 0, 0, 0, 0);
@@ -4254,7 +4481,8 @@ void _start(void) {
     }
 
     int okay = 1;
-    for (int index = 0; index < MAX_CLIENTS; index++) {
+    /* The two wlclient roles above are the only clients this test starts. */
+    for (int index = 0; index < 2; index++) {
         long client = sys3(202 /* accept */, server, 0, 0);
         if (client < 0) {
             fail("wayland: accept failed\n", 23);
@@ -4272,7 +4500,7 @@ void _start(void) {
         short events;
         short revents;
     };
-    int remaining = MAX_CLIENTS;
+    int remaining = 2;
     while (remaining > 0) {
         struct pollfd ready[MAX_CLIENTS];
         int count = 0;
@@ -4335,7 +4563,8 @@ void _start(void) {
             }
         }
     }
-    for (int index = 0; index < MAX_CLIENTS; index++) {
+    /* Only the two clients this test starts were served. */
+    for (int index = 0; index < 2; index++) {
         if (clients[index].connected) {
             sys3(57, clients[index].fd, 0, 0);
             clients[index].connected = 0;

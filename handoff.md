@@ -5366,3 +5366,46 @@ happens. Making the server multi-client is the prerequisite for the app grid
 and for any real session; the per-client state save/restore used by the
 multi-client test is the starting point, but surface/buffer/pool tables have to
 become per-client because object ids collide across clients.
+
+
+### Multi-client compositor (first cut)
+
+The compositor served exactly one Wayland client, so the shell could not start
+anything: a second `accept()` never happened. It now accepts up to four
+clients and round-robins them with a single `ppoll()` over the listening
+socket and every client fd.
+
+Each client keeps its own protocol state in `ClientState` (objects, pools,
+buffers, regions, seat proxies, focus, clipboard). Two things are global
+instead:
+
+- **The layer scene.** `layer_entries` is no longer swapped with the client
+  state: Phosh's panel/background/home have to stay composed while an
+  application is being served. Entries remember their `owner` so a new client
+  only clears its own.
+- **The application window.** The newest `xdg_toplevel` is copied into
+  `app_window` (same reason as the layers: GTK destroys the shm pool when the
+  buffer is released) and drawn over the layer scene with the alpha blend. One
+  window is enough until there is a window manager.
+
+A partially received message must not be spliced onto another client's bytes,
+so the pending tail (up to 4 KiB) is part of `ClientState` and restored on the
+next serve of that client. New clients are initialised with
+`init_client_state()`, which zeroes their state *without* closing descriptors
+the other clients still own — the old `reset_client()` at accept closed the
+previous client's shm pools and dmabuf fds.
+
+Input goes to the application window when one exists (the terminal is
+full-screen there), otherwise to the client that owns the layer scene.
+
+Verified: `cargo test --lib` 222/222, `layer-serve` and `linux-wlreal` green,
+and the Phosh flow still works (lockscreen, Space to unlock, swipe opens and
+folds quick settings).
+
+**Not finished.** A launched application connects, binds globals (compositor,
+shm, seat, xdg_wm_base, ...) and completes two roundtrips, then stalls before
+creating its surface; no commit ever arrives, so nothing is drawn. The
+multi-client plumbing itself is exercised (the second client is served and its
+state is preserved), but GTK's startup blocks somewhere after the second
+`wl_display.sync`. Debugging this needs a `WAYLAND_DEBUG` log from the client
+side (Phosh runs with it off nowadays) to see which request it is missing.
