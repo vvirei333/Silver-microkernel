@@ -1516,16 +1516,22 @@ static void take_damage(int surface, int width, int height, int *x0, int *y0,
 /// Snapshot the committed buffer into the layer's own memory. Called while
 /// the client's pool fd is still alive (before wl_buffer.release). Only the
 /// damaged rows/columns are re-read; the rest of the copy is already current.
-static void layer_store_pixels(LayerEntry *entry, int x0, int y0, int x1,
-                               int y1) {
+/// Returns 1 when the region actually changed, 0 when the new frame is
+/// identical to the stored one (a redraw that produced the same pixels: Phosh
+/// redraws its lockscreen ~25 times a second, and skipping the compose for
+/// those is most of the remaining win).
+static int layer_store_pixels(LayerEntry *entry, int x0, int y0, int x1,
+                              int y1, int *changed_x0, int *changed_y0,
+                              int *changed_x1, int *changed_y1) {
     if (entry == 0 || buffer_width == 0 || buffer_height == 0) {
-        return;
+        return 0;
     }
     unsigned bytes = buffer_stride * (unsigned)buffer_height;
     if (bytes == 0) {
-        return;
+        return 0;
     }
-    if (entry->copy_bytes < bytes) {
+    int fresh = 0;
+    if (entry->copy == 0 || entry->copy_bytes < bytes) {
         if (entry->copy != 0) {
             sys3(215 /* munmap */, (long)entry->copy, entry->copy_bytes, 0);
             entry->copy = 0;
@@ -1535,23 +1541,20 @@ static void layer_store_pixels(LayerEntry *entry, int x0, int y0, int x1,
                            0x22 /* MAP_PRIVATE|MAP_ANONYMOUS */, -1, 0);
         if (memory <= 0) {
             entry->copy_ready = 0;
-            return;
+            return 0;
         }
         entry->copy = (unsigned char *)memory;
         entry->copy_bytes = bytes;
+        fresh = 1;
     }
     long mapped = sys6(222 /* mmap */, 0, buffer_offset + bytes,
                        1 /* read */, 1 /* MAP_SHARED */, pool_fd, 0);
     if (mapped <= 0) {
         entry->copy_ready = 0;
-        return;
+        return 0;
     }
     const unsigned char *source =
         (const unsigned char *)(mapped + buffer_offset);
-    /* Store the frame in the sink's channel order (and opaque for XRGB
-       formats) once per commit. The compose pass then only blends or copies
-       words: a layer that does not change is no longer swizzled again on
-       every composed frame, which is most of the cost of the wallpaper. */
     if (x0 < 0) x0 = 0;
     if (y0 < 0) y0 = 0;
     if (x1 > (int)buffer_width) x1 = (int)buffer_width;
@@ -1559,36 +1562,97 @@ static void layer_store_pixels(LayerEntry *entry, int x0, int y0, int x1,
     if (x0 >= x1 || y0 >= y1) {
         sys3(215 /* munmap */, mapped, buffer_offset + bytes, 0);
         entry->copy_ready = 1;
-        return;
+        return 0;
     }
-    const int opaque = buffer_format == 1;
+    /* Find the rectangle that actually changed by comparing with the stored
+       copy, 64 bits at a time. GTK damages its whole window on every redraw
+       (a full-screen buffer) but usually changes only the clock or a hint,
+       and repainting a megapixel frame for that is what kept the desktop at
+       ~25 fps. */
+    int cx0 = x1;
+    int cy0 = y1;
+    int cx1 = x0;
+    int cy1 = y0;
     for (int row = y0; row < y1; row++) {
-        const unsigned *source_row =
-            (const unsigned *)(source + (unsigned)row * buffer_stride);
-        unsigned *destination_row =
-            (unsigned *)(entry->copy + (unsigned)row * buffer_stride);
-        for (int column = x0; column < x1; column++) {
-            unsigned pixel = source_row[column];
-            unsigned swizzled = (pixel & 0xFF00FF00u) |
-                                ((pixel & 0x00FF0000u) >> 16) |
-                                ((pixel & 0x000000FFu) << 16);
-            if (opaque) {
-                swizzled |= 0xFF000000u;
+        const unsigned char *source_row =
+            source + (unsigned)row * buffer_stride;
+        const unsigned char *stored_row =
+            entry->copy + (unsigned)row * buffer_stride;
+        int column = x0;
+        while (column + 2 <= x1) {
+            unsigned long long a;
+            unsigned long long b;
+            __builtin_memcpy(&a, source_row + (unsigned)column * 4, 8);
+            __builtin_memcpy(&b, stored_row + (unsigned)column * 4, 8);
+            if (a != b) {
+                if (column < cx0) cx0 = column;
+                if (column + 2 > cx1) cx1 = column + 2;
+                if (row < cy0) cy0 = row;
+                if (row + 1 > cy1) cy1 = row + 1;
             }
-            destination_row[column] = swizzled;
+            column += 2;
+        }
+        if (column < x1) {
+            unsigned a;
+            unsigned b;
+            __builtin_memcpy(&a, source_row + (unsigned)column * 4, 4);
+            __builtin_memcpy(&b, stored_row + (unsigned)column * 4, 4);
+            if (a != b) {
+                if (column < cx0) cx0 = column;
+                if (column + 1 > cx1) cx1 = column + 1;
+                if (row < cy0) cy0 = row;
+                if (row + 1 > cy1) cy1 = row + 1;
+            }
+        }
+    }
+    if (fresh) {
+        cx0 = x0;
+        cy0 = y0;
+        cx1 = x1;
+        cy1 = y1;
+    }
+    if (cx0 >= cx1 || cy0 >= cy1) {
+        sys3(215 /* munmap */, mapped, buffer_offset + bytes, 0);
+        entry->copy_ready = 1;
+        return 0;
+    }
+    for (int row = cy0; row < cy1; row++) {
+        const unsigned char *source_row =
+            source + (unsigned)row * buffer_stride;
+        unsigned char *destination_row =
+            entry->copy + (unsigned)row * buffer_stride;
+        int column = cx0;
+        while (column + 2 <= cx1) {
+            unsigned long long value;
+            __builtin_memcpy(&value, source_row + (unsigned)column * 4, 8);
+            __builtin_memcpy(destination_row + (unsigned)column * 4,
+                             &value, 8);
+            column += 2;
+        }
+        if (column < cx1) {
+            unsigned value;
+            __builtin_memcpy(&value, source_row + (unsigned)column * 4, 4);
+            __builtin_memcpy(destination_row + (unsigned)column * 4,
+                             &value, 4);
         }
     }
     __asm__ volatile("dsb sy" ::: "memory");
     sys3(215 /* munmap */, mapped, buffer_offset + bytes, 0);
     entry->copy_ready = 1;
+    *changed_x0 = cx0;
+    *changed_y0 = cy0;
+    *changed_x1 = cx1;
+    *changed_y1 = cy1;
+    return 1;
 }
-
 static void layer_record_commit(LayerSurface *slot) {
     if (slot == 0 || slot->surface == 0) {
         return;
     }
     LayerEntry *entry = layer_entry_by_surface(slot->surface);
+    int appeared = 0;
     if (entry == 0) {
+        appeared = 1;
         for (unsigned index = 0; index < MAX_LAYERS; index++) {
             if (!layer_entries[index].used) {
                 entry = &layer_entries[index];
@@ -1598,6 +1662,23 @@ static void layer_record_commit(LayerSurface *slot) {
     }
     if (entry == 0) {
         return;
+    }
+    /* A surface that (re)appears, moves or changes layer order has to be
+       repainted as a whole; the content diff only covers its own rectangle. */
+    int geometry_changed = appeared ||
+                           entry->width != (unsigned)buffer_width ||
+                           entry->height != (unsigned)buffer_height ||
+                           entry->layer != slot->layer ||
+                           entry->anchor != slot->anchor;
+    for (unsigned index = 0; index < 4 && !geometry_changed; index++) {
+        if (entry->margin[index] != slot->margin[index] ||
+            entry->below != slot->below || entry->above != slot->above) {
+            geometry_changed = 1;
+        }
+    }
+    if (geometry_changed) {
+        compose_full = 1;
+        scene_dirty = 1;
     }
     entry->used = 1;
     entry->surface = slot->surface;
@@ -1832,41 +1913,58 @@ static void layer_compose(void) {
                 continue;
             }
             const int full_alpha = entry->alpha >= 255;
-            for (unsigned row = 0; row < entry->height; row++) {
-                int out_y = y + (int)row;
-                if (out_y < clip_y0 || out_y >= clip_y1) {
-                    continue;
-                }
+            const int force_opaque = entry->format == 1;
+            /* Walk only the intersection of the layer and the damage box:
+               iterating the whole layer and skipping out-of-clip pixels made
+               a "partial" compose more expensive than a full one. */
+            int start_x = x < clip_x0 ? clip_x0 - x : 0;
+            int start_y = y < clip_y0 ? clip_y0 - y : 0;
+            int end_x = (int)entry->width;
+            int end_y = (int)entry->height;
+            if (x + end_x > clip_x1) end_x = clip_x1 - x;
+            if (y + end_y > clip_y1) end_y = clip_y1 - y;
+            if (start_x < 0) start_x = 0;
+            if (start_y < 0) start_y = 0;
+            if (end_x <= start_x || end_y <= start_y) {
+                continue;
+            }
+            for (int row = start_y; row < end_y; row++) {
+                int out_y = y + row;
                 const unsigned *source_row =
-                    (const unsigned *)(source + row * entry->stride);
+                    (const unsigned *)(source + (unsigned)row * entry->stride);
                 if (full_alpha) {
                     /* Opaque layer: a straight word copy, no per-pixel
                        multiply or divide. */
                     unsigned *target_row =
                         destination + (unsigned)out_y * out_width;
-                    for (unsigned column = 0; column < entry->width; column++) {
-                        int out_x = x + (int)column;
-                        if (out_x < clip_x0 || out_x >= clip_x1) {
-                            continue;
-                        }
+                    for (int column = start_x; column < end_x; column++) {
                         unsigned pixel = source_row[column];
-                        if ((pixel >> 24) != 0) {
-                            target_row[out_x] = pixel | 0xFF000000u;
+                        unsigned swizzled = (pixel & 0xFF00FF00u) |
+                                            ((pixel & 0x00FF0000u) >> 16) |
+                                            ((pixel & 0x000000FFu) << 16);
+                        if (force_opaque) {
+                            swizzled |= 0xFF000000u;
+                        }
+                        if ((swizzled >> 24) != 0) {
+                            target_row[x + column] = swizzled | 0xFF000000u;
                         }
                     }
                     continue;
                 }
-                for (unsigned column = 0; column < entry->width; column++) {
-                    int out_x = x + (int)column;
-                    if (out_x < clip_x0 || out_x >= clip_x1) {
-                        continue;
-                    }
+                for (int column = start_x; column < end_x; column++) {
+                    int out_x = x + column;
                     /* wl_shm ARGB8888 is premultiplied. Apply the surface
                        alpha from zphoc_alpha_layer_surface_v1 and blend over
                        the layers below; Phosh draws its home screen, panel
                        backdrop and sheets translucent, and writing them
                        straight to the sink turned every overlay black. */
-                    unsigned swizzled = source_row[column];
+                    unsigned pixel = source_row[column];
+                    unsigned swizzled = (pixel & 0xFF00FF00u) |
+                                        ((pixel & 0x00FF0000u) >> 16) |
+                                        ((pixel & 0x000000FFu) << 16);
+                    if (force_opaque) {
+                        swizzled |= 0xFF000000u;
+                    }
                     unsigned alpha = (swizzled >> 24) * entry->alpha / 255u;
                     if (alpha == 0) {
                         continue;
@@ -1901,19 +1999,28 @@ static void layer_compose(void) {
            output origin: a 1024x768 toplevel arrives as a 1076x820 buffer. */
         int origin_x = -(int)app_window.geometry_x;
         int origin_y = -(int)app_window.geometry_y;
-        for (unsigned row = 0; row < app_window.height; row++) {
-            int out_y = origin_y + (int)row;
-            if (out_y < clip_y0 || out_y >= clip_y1) {
-                continue;
-            }
+        const int app_force_opaque = app_window.format == 1;
+        int app_start_x = origin_x < clip_x0 ? clip_x0 - origin_x : 0;
+        int app_start_y = origin_y < clip_y0 ? clip_y0 - origin_y : 0;
+        int app_end_x = (int)app_window.width;
+        int app_end_y = (int)app_window.height;
+        if (origin_x + app_end_x > clip_x1) app_end_x = clip_x1 - origin_x;
+        if (origin_y + app_end_y > clip_y1) app_end_y = clip_y1 - origin_y;
+        if (app_start_x < 0) app_start_x = 0;
+        if (app_start_y < 0) app_start_y = 0;
+        for (int row = app_start_y; row < app_end_y; row++) {
+            int out_y = origin_y + row;
             const unsigned *source_row = (const unsigned *)
-                (app_window.copy + row * app_window.stride);
-            for (unsigned column = 0; column < app_window.width; column++) {
-                int out_x = origin_x + (int)column;
-                if (out_x < clip_x0 || out_x >= clip_x1) {
-                    continue;
+                (app_window.copy + (unsigned)row * app_window.stride);
+            for (int column = app_start_x; column < app_end_x; column++) {
+                int out_x = origin_x + column;
+                unsigned pixel = source_row[column];
+                unsigned swizzled = (pixel & 0xFF00FF00u) |
+                                    ((pixel & 0x00FF0000u) >> 16) |
+                                    ((pixel & 0x000000FFu) << 16);
+                if (app_force_opaque) {
+                    swizzled |= 0xFF000000u;
                 }
-                unsigned swizzled = source_row[column];
                 unsigned alpha = swizzled >> 24;
                 unsigned *target = &destination[(unsigned)out_y * out_width +
                                                 (unsigned)out_x];
@@ -4026,27 +4133,61 @@ static int serve(long client) {
                             if (dy0 < 0) dy0 = 0;
                             if (dx1 > (int)buffer_width) dx1 = (int)buffer_width;
                             if (dy1 > (int)buffer_height) dy1 = (int)buffer_height;
-                            const int opaque = buffer_format == 1;
-                            for (int row = dy0; row < dy1; row++) {
-                                const unsigned *source_row =
-                                    (const unsigned *)(source +
-                                                       (unsigned)row * buffer_stride);
-                                unsigned *destination_row =
-                                    (unsigned *)(app_window.copy +
-                                                 (unsigned)row * buffer_stride);
-                                for (int column = dx0; column < dx1; column++) {
-                                    unsigned pixel = source_row[column];
-                                    unsigned swizzled =
-                                        (pixel & 0xFF00FF00u) |
-                                        ((pixel & 0x00FF0000u) >> 16) |
-                                        ((pixel & 0x000000FFu) << 16);
-                                    if (opaque) {
-                                        swizzled |= 0xFF000000u;
+                            /* Raw copy, and only when the pixels differ: a
+                               window redraw that changed nothing must not
+                               cost a compose. */
+                            int app_changed = 0;
+                            for (int row = dy0; row < dy1 && !app_changed;
+                                 row++) {
+                                const unsigned char *source_row =
+                                    source + (unsigned)row * buffer_stride;
+                                const unsigned char *stored_row =
+                                    app_window.copy + (unsigned)row * buffer_stride;
+                                int column = dx0;
+                                while (column + 2 <= dx1) {
+                                    unsigned long long a;
+                                    unsigned long long b;
+                                    __builtin_memcpy(&a, source_row + (unsigned)column * 4, 8);
+                                    __builtin_memcpy(&b, stored_row + (unsigned)column * 4, 8);
+                                    if (a != b) {
+                                        app_changed = 1;
+                                        break;
                                     }
-                                    destination_row[column] = swizzled;
+                                    column += 2;
+                                }
+                                if (!app_changed && column < dx1) {
+                                    unsigned a;
+                                    unsigned b;
+                                    __builtin_memcpy(&a, source_row + (unsigned)column * 4, 4);
+                                    __builtin_memcpy(&b, stored_row + (unsigned)column * 4, 4);
+                                    if (a != b) {
+                                        app_changed = 1;
+                                    }
                                 }
                             }
-                            __asm__ volatile("dsb sy" ::: "memory");
+                            if (app_changed) {
+                                for (int row = dy0; row < dy1; row++) {
+                                    const unsigned char *source_row =
+                                        source + (unsigned)row * buffer_stride;
+                                    unsigned char *destination_row =
+                                        app_window.copy + (unsigned)row * buffer_stride;
+                                    int column = dx0;
+                                    while (column + 2 <= dx1) {
+                                        unsigned long long value;
+                                        __builtin_memcpy(&value, source_row + (unsigned)column * 4, 8);
+                                        __builtin_memcpy(destination_row + (unsigned)column * 4,
+                                                         &value, 8);
+                                        column += 2;
+                                    }
+                                    if (column < dx1) {
+                                        unsigned value;
+                                        __builtin_memcpy(&value, source_row + (unsigned)column * 4, 4);
+                                        __builtin_memcpy(destination_row + (unsigned)column * 4,
+                                                         &value, 4);
+                                    }
+                                }
+                                __asm__ volatile("dsb sy" ::: "memory");
+                            }
                             sys3(215, mapped, buffer_offset + bytes, 0);
                             if (!app_window.used) {
                                 static const char frame[] =
@@ -4063,10 +4204,13 @@ static int serve(long client) {
                             app_window.stride = buffer_stride;
                             app_window.format = buffer_format;
                             app_window.copy_ready = 1;
-                            compose_damage(-(int)app_window.geometry_x + dx0,
-                                           -(int)app_window.geometry_y + dy0,
-                                           -(int)app_window.geometry_x + dx1,
-                                           -(int)app_window.geometry_y + dy1);
+                            if (app_changed) {
+                                compose_damage(
+                                    -(int)app_window.geometry_x + dx0,
+                                    -(int)app_window.geometry_y + dy0,
+                                    -(int)app_window.geometry_x + dx1,
+                                    -(int)app_window.geometry_y + dy1);
+                            }
                         }
                         scene_dirty = 1;
                     }
@@ -4086,12 +4230,16 @@ static int serve(long client) {
                                 take_damage((int)object, (int)buffer_width,
                                             (int)buffer_height,
                                             &dx0, &dy0, &dx1, &dy1);
-                                layer_store_pixels(stored, dx0, dy0, dx1, dy1);
-                                int lx = 0;
-                                int ly = 0;
-                                layer_rect(stored, &lx, &ly);
-                                compose_damage(lx + dx0, ly + dy0,
-                                               lx + dx1, ly + dy1);
+                                int cx0, cy0, cx1, cy1;
+                                if (layer_store_pixels(stored, dx0, dy0,
+                                                       dx1, dy1, &cx0, &cy0,
+                                                       &cx1, &cy1)) {
+                                    int lx = 0;
+                                    int ly = 0;
+                                    layer_rect(stored, &lx, &ly);
+                                    compose_damage(lx + cx0, ly + cy0,
+                                                   lx + cx1, ly + cy1);
+                                }
                             }
                             /* A draggable surface is positioned by the
                                compositor, not by its zwlr margin. */

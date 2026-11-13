@@ -5738,3 +5738,30 @@ The static-lockscreen case still composes a full frame per Phosh redraw
 (~24 ms), so the next step for 30-60 fps is to find out why Phosh redraws at
 all when nothing changed (its frame clock gets a `wl_callback.done` at our
 50 Hz idle tick).
+
+
+### Damage by content, not by what the client claims
+
+Measuring the frame cost showed the partial composes were still full-frame:
+`wl_surface.damage` is useless here because GTK damages its **whole window**
+on every redraw, and Phosh redraws its lockscreen ~25 times a second. Every
+one of those frames therefore re-read and re-painted 1024x768 pixels.
+
+`layer_store_pixels()` now compares the new buffer with the stored copy 64
+bits at a time and returns the **bounding box of the pixels that actually
+differ**. Only that box is copied and only that box is composed. A clock tick
+or a pulsing hint becomes a ~200 pixel repaint:
+
+| | before | now |
+|---|---|---|
+| compose (changed frame) | 24 ms | < 1 ms |
+| compose area | 786432 px | ~200 px |
+| composes per second (lockscreen) | ~26 | ~40 |
+
+A surface that appears, moves, changes layer order or alpha still forces a
+full repaint (`layer_record_commit` watches those fields, and
+`layer_forget_surface`/drag/alpha set `compose_full`).
+
+End to end: Phosh's first frame 9 s, click-to-unlock 0.22 s, Ctrl+T ->
+terminal ~9 s, `ls` runs. The cost left per frame is the compare scan
+(~3 MB, the price of knowing what changed) plus Phosh's own GTK redraw.
