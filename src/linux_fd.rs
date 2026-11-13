@@ -992,14 +992,23 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
         Target::Vfs(vfs_fd) => {
             let size = vfs::fd_len(task, vfs_fd).map_err(|_| EBADF)?;
             let kind = vfs::fd_kind(task, vfs_fd).unwrap_or(vfs::FD_KIND_FILE);
+            let path = vfs::fd_path(task, vfs_fd);
             let mode = if kind == vfs::FD_KIND_DIR {
                 S_IFDIR | 0o755
-            } else {
+            } else if path.as_deref().is_some_and(|path| {
+                silver_microkernel::path_is_under(
+                    path,
+                    crate::scheduler::LINUX_SCRATCH_PREFIX,
+                )
+            }) {
                 S_IFREG | 0o644
+            } else {
+                // The SFS image carries no permission bits and is read-only;
+                // report its files executable so access(X_OK) and gio's
+                // g_find_program_in_path() accept the programs in /sfs.
+                S_IFREG | 0o555
             };
-            let ino = vfs::fd_path(task, vfs_fd)
-                .map(|path| path_ino(&path))
-                .unwrap_or(fd.max(1));
+            let ino = path.map(|path| path_ino(&path)).unwrap_or(fd.max(1));
             write_stat(buffer, mode, size as u64, ino)
         }
         Target::Pipe { .. } => write_stat(buffer, S_IFIFO | 0o600, 0, fd.max(1)),

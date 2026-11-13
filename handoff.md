@@ -5318,3 +5318,51 @@ Remaining Phosh polish: the folded top bar is an empty 32px strip (no clock or
 status icons there), the quick-settings sheet is black because the blurred
 backdrop layer does not render, and the first tile row (Cellular/Wi-Fi/
 Bluetooth) loses its labels.
+
+
+### A terminal application, and executable bits for SFS
+
+Phosh's image is GTK3 + libhandy (the GTK4 stack lives only in the GTK4 test
+image), so the first real application is a GTK3 terminal:
+`tests/linux/term.c`. It keeps a text view, runs each command through
+`/sfs/busybox sh -c <line>` with `g_spawn_sync`, appends stdout/stderr and the
+exit status, and supports `cd` (tracked in the prompt) and `clear`. The
+compositor gained a `SERVE_TERM` mode that forks `/sfs/term`, so
+`linuxstart term` runs it end to end. Verified: `uname -a` prints
+`Linux werewolf 0.1.1 #1 SMP aarch64 GNU/Linux`, `ls /sfs` lists the image.
+
+`tools/install_terminal.py` installs the pieces reproducibly: the static
+Debian busybox (`/busybox`), the terminal (`/term`), a launcher entry
+(`/share/applications/werewolf-terminal.desktop`) and the hicolor icon.
+
+**Keyboard release.** The input ring only carried a key press, so the
+compositor sent `wl_keyboard.key` with pressed=1 and never a release. GTK
+implements key repeat itself from `wl_keyboard.repeat_info`, so a key that
+never goes up kept activating: pressing Enter in the terminal ran the command
+four times. The compositor now follows every press with a release.
+
+**Executable bits (kernel).** `g_app_info_get_all()` returned no applications
+even though the `.desktop` file parsed and `stat` worked: glib's
+`g_desktop_app_info_load_from_keyfile()` validates `Exec` through
+`g_find_program_for_path()`, which needs an executable file, and SFS inodes
+carry no permission bits (everything was reported as `0644`). Linux `stat` and
+`fstat` now report SFS regular files as `0555` (read-only image, everything
+runnable) while the writable `/tmp` tree stays `0644`. With that,
+`g_app_info_get_all()` returns `werewolf-terminal.desktop | Terminal` and the
+file/executable checks used by shells and toolkits behave.
+
+**Global shortcuts.** Phosh grabs its shell accelerators (Super for the
+overview, Print, Alt+F2, ...) through `phosh_private_keyboard_event`: the
+compositor must acknowledge `grab_accelerator_request` and deliver
+`accelerator_activated_event`. `wayland_real.c` now keeps a grab table, maps
+the accelerator name to an evdev keycode (Super, F1-F12, Print, letters) and
+forwards activations, with ungrab support. Phosh does not currently create the
+keyboard-event object in this session (no `get_keyboard_event` request is
+seen), which is why the overview cannot be opened yet.
+
+**Next: multi-client compositing.** The compositor still serves exactly one
+Wayland client, so Phosh cannot launch applications: a second `accept()` never
+happens. Making the server multi-client is the prerequisite for the app grid
+and for any real session; the per-client state save/restore used by the
+multi-client test is the starting point, but surface/buffer/pool tables have to
+become per-client because object ids collide across clients.

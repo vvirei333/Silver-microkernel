@@ -2084,6 +2084,103 @@ static void keyboard_route(long client) {
     keyboard_target = target;
 }
 
+/* ---- phosh_private_keyboard_event: global accelerators ----------------- */
+/* Phosh asks the compositor to grab global shortcuts (Super for the overview,
+ * Print for screenshots, ...). The compositor owns the keyboard, so without
+ * these grabs the shell never sees them. */
+#define MAX_GRABS 16
+typedef struct {
+    int used;
+    unsigned action;
+    char accelerator[64];
+} GrabSlot;
+static GrabSlot grabs[MAX_GRABS];
+static unsigned next_action_id = 1;
+
+static unsigned grab_keycode(const char *accelerator) {
+    const char *name = accelerator;
+    while (*name == '<') {
+        const char *end = name;
+        while (*end != '\0' && *end != '>') end++;
+        if (*end != '>') break;
+        name = end + 1;
+    }
+    if (text_equal(name, "Super_L") || text_equal(name, "Super")) return 125;
+    if (text_equal(name, "Super_R")) return 126;
+    if (text_equal(name, "Print")) return 210;
+    if (name[0] == 'F' && name[1] >= '1' && name[1] <= '9' && name[2] == '\0')
+        return 58 + (unsigned)(name[1] - '0');
+    if (name[0] == 'F' && name[1] == '1' && name[2] >= '0' && name[2] <= '2')
+        return 87 + (unsigned)(name[2] - '0');
+    if (name[1] == '\0' && name[0] >= 'a' && name[0] <= 'z') {
+        static const unsigned letters[26] = {
+            30, 48, 46, 32, 18, 33, 34, 35, 23, 36, 37, 38, 50,
+            49, 24, 25, 16, 19, 31, 20, 22, 47, 17, 45, 21, 44};
+        return letters[(unsigned)(name[0] - 'a')];
+    }
+    return 0;
+}
+
+static GrabSlot *grab_find_by_accelerator(const char *accelerator) {
+    for (unsigned index = 0; index < MAX_GRABS; index++) {
+        if (grabs[index].used &&
+            text_equal(grabs[index].accelerator, accelerator)) {
+            return &grabs[index];
+        }
+    }
+    return 0;
+}
+
+static GrabSlot *grab_add(const char *accelerator) {
+    GrabSlot *slot = grab_find_by_accelerator(accelerator);
+    if (slot != 0) {
+        return 0;
+    }
+    for (unsigned index = 0; index < MAX_GRABS; index++) {
+        if (!grabs[index].used) {
+            grabs[index].used = 1;
+            grabs[index].action = next_action_id++;
+            unsigned length = 0;
+            while (accelerator[length] != '\0' &&
+                   length + 1 < sizeof(grabs[index].accelerator)) {
+                grabs[index].accelerator[length] = accelerator[length];
+                length++;
+            }
+            grabs[index].accelerator[length] = '\0';
+            return &grabs[index];
+        }
+    }
+    return 0;
+}
+
+static void grab_success(long client, const GrabSlot *slot) {
+    begin(keyboard_event_id, 2 /* grab_success_event */);
+    put_string(slot->accelerator);
+    put_u32(slot->action);
+    finish();
+    send_message(client, -1);
+}
+
+/// Forward a pressed key to the client if it matches a grabbed accelerator.
+static void grab_activate(long client, unsigned keycode) {
+    if (keyboard_event_id == 0) {
+        return;
+    }
+    for (unsigned index = 0; index < MAX_GRABS; index++) {
+        if (!grabs[index].used) {
+            continue;
+        }
+        unsigned wanted = grab_keycode(grabs[index].accelerator);
+        if (wanted != 0 && wanted == keycode) {
+            begin(keyboard_event_id, 0 /* accelerator_activated_event */);
+            put_u32(grabs[index].action);
+            put_u32(now_ms());
+            finish();
+            send_message(client, -1);
+        }
+    }
+}
+
 static void poll_input(long client) {
     if (screen == 0) {
         return;
@@ -2143,13 +2240,25 @@ static void poll_input(long client) {
                 }
             }
         } else if (kind == INPUT_KEY) {
+            grab_activate(client, key);
             if (keyboard_id != 0) {
                 keyboard_route(client);
+                unsigned time = now_ms();
                 begin(keyboard_id, 3 /* key */);
                 put_u32(configure_serial);
-                put_u32(now_ms()); /* time */
+                put_u32(time);
                 put_u32(key);
                 put_u32(1); /* pressed */
+                finish();
+                send_message(client, -1);
+                /* A release is mandatory: GTK implements key repeat itself
+                   from wl_keyboard.repeat_info, so a key that never goes up
+                   keeps activating (the terminal ran Enter four times). */
+                begin(keyboard_id, 3 /* key */);
+                put_u32(configure_serial);
+                put_u32(time + 1);
+                put_u32(key);
+                put_u32(0); /* released */
                 finish();
                 send_message(client, -1);
             }
@@ -2977,8 +3086,21 @@ static int serve(long client) {
                 /* grab_accelerator_request(accelerator) */
                 char accelerator[128];
                 take_string(accelerator, sizeof(accelerator));
+                GrabSlot *slot = grab_add(accelerator);
+                if (slot != 0) {
+                    grab_success(client, slot);
+                }
             } else if (object == keyboard_event_id && opcode == 1) {
-                (void)take_u32(); /* ungrab_accelerator_request(action_id) */
+                unsigned action = take_u32();
+                for (unsigned index = 0; index < MAX_GRABS; index++) {
+                    if (grabs[index].used && grabs[index].action == action) {
+                        grabs[index].used = 0;
+                    }
+                }
+                begin(keyboard_event_id, 4 /* ungrab_success_event */);
+                put_u32(action);
+                finish();
+                send_message(client, -1);
             } else if (object == keyboard_event_id && opcode == 2) {
                 keyboard_event_id = 0;
             } else if (object == xdg_switcher_id && opcode == 0) {
@@ -4021,6 +4143,8 @@ void _start(void) {
         static const char *argv[] = {"/sfs/gtk4hello", 0};
 #elif defined(SERVE_WLGL)
         static const char *argv[] = {"/sfs/wlgltest", 0};
+#elif defined(SERVE_TERM)
+        static const char *argv[] = {"/sfs/term", 0};
 #elif defined(SERVE_PHOSH)
         static const char *argv[] = {"/sfs/phosh", 0};
 #else

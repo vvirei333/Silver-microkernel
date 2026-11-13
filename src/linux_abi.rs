@@ -1690,9 +1690,19 @@ fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
         };
     }
     if let Ok(size) = crate::vfs::file_len(&cwd, &path) {
+        let file_mode = if silver_microkernel::path_is_under(
+            &resolved,
+            crate::scheduler::LINUX_SCRATCH_PREFIX,
+        ) {
+            S_IFREG | 0o644
+        } else {
+            // SFS stores no permission bits and is read-only; report files
+            // executable so gio's g_find_program_in_path() accepts /sfs.
+            S_IFREG | 0o555
+        };
         return match linux_fd::write_stat(
             buffer,
-            S_IFREG | 0o644,
+            file_mode,
             size as u64,
             linux_fd::path_ino(&resolved),
         ) {
