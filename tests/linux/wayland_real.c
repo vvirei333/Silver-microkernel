@@ -3588,10 +3588,12 @@ void _start(void) {
         sys6(221 /* execve */, (long)argv[0], (long)argv, (long)envp, 0, 0, 0);
         fail("gtk-serve: exec failed\n", 20);
     }
+    sys3(64, 1, (long)"gtk-serve: waiting for client\n", 29);
     long client = sys3(202 /* accept */, server, 0, 0);
     if (client < 0) {
         fail("gtk-serve: accept failed\n", 23);
     }
+    sys3(64, 1, (long)"gtk-serve: client connected\n", 28);
     reset_client();
     while (serve(client) == 0) {
     }

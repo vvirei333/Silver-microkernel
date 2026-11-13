@@ -5201,3 +5201,42 @@ window through virgl: title bar, buttons, antialiased label, presented as a
 green. Phosh's cairo/shm path still shows the pre-existing red-block/black
 frame; it reproduces with the HEAD kernel and the previous compositor, so it is
 not caused by these changes.
+
+
+### Phosh renders again: gdk-pixbuf without glycin
+
+After the GPU work the Phosh image stopped at GTK icon loading: the lock
+screen never appeared and Phosh aborted after 2.5 minutes with
+
+```
+Gtk:ERROR: gtkiconhelper.c:495: ensure_surface_for_gicon: assertion failed
+(error == NULL): Failed to load /org/gtk/libgtk/icons/48x48/status/image-missing.png:
+Operation did not complete in supplied limit of 60s
+```
+
+The 60 s limit is glycin's. The Arch aarch64 gdk-pixbuf (2.44) has no
+built-in loaders; every decode goes through glycin, and its gdk-pixbuf
+integration either reports `Failed to get the filename` or hangs waiting for
+the loader reply. `glycintest` itself still decodes a PNG, so the loader binary
+is fine; the failure is in the gdk-pixbuf integration, which also blocks the
+wallpaper.
+
+Fix: install Debian 13's gdk-pixbuf 2.42.12, whose PNG/JPEG loaders are
+compiled into `libgdk_pixbuf-2.0.so.0`. It keeps the same soname and every
+`gdk_pixbuf_*` symbol imported by the guest's GTK4/phosh is exported by it.
+The Debian build needs `libjpeg.so.62` (Arch ships `libjpeg.so.8`), so the
+matching `libjpeg62-turbo` goes into `/sfs` too. No loader modules or
+`loaders.cache` are involved. `tools/install_gdk_pixbuf.py` downloads both
+`.debs`, extracts the libraries and injects them (idempotent; `--cache` keeps
+the downloads).
+
+With that, `pixbuftest` prints `pixbuf 64x64` (it used to fail with
+`Failed to get the filename`) and `linuxstart phosh` shows the lockscreen:
+night-sky wallpaper, the big clock (updating), "Thursday, January 1". The top
+~60 px strip stays black (Phosh's panel layer is empty on the lockscreen) and
+the unlock prompt below the date is clipped by the 1024x768 output. The
+compositor now also logs `gtk-serve: waiting for client` / `client connected`
+so a silent compositor is easy to tell from a slow client.
+
+Remaining Phosh work: the panel/quick-settings (the QS panel still never
+appears), logind/polkit sessions, and the empty top strip.
