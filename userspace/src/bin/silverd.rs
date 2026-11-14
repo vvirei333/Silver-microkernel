@@ -62,6 +62,12 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         if !syscall::cap_grant(net_server_cap, net_server_id, syscall::CAP_MMIO) {
             fail("SILVERD: NET SERVER CAP GRANT FAILED\r\n");
         }
+        // The server owns the shared window; the driver writes received
+        // frames into it, so the driver needs a target-scoped share right over
+        // the server (not a blanket CAP_MMIO allowance).
+        if !syscall::cap_grant(net_server_cap, net_id, syscall::CAP_DMA_SHARE) {
+            fail("SILVERD: NET DRIVER DMA SHARE GRANT FAILED\r\n");
+        }
 
     // 4. Howl (shell)
     let howl_cap = syscall::spawn(syscall::PROGRAM_HOWL, syscall::task_id())
@@ -70,6 +76,11 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         .unwrap_or_else(|| fail("SILVERD: HOWL CAP LOOKUP FAILED\r\n"));
     if !syscall::cap_grant(howl_cap, howl_id, syscall::CAP_MMIO) {
         fail("SILVERD: HOWL CAP GRANT FAILED\r\n");
+    }
+    // The shell's wget/ping map the server's per-client window; it also
+    // delegates the right to Wolfser when it spawns it.
+    if !syscall::cap_grant(net_server_cap, howl_id, syscall::CAP_DMA_SHARE) {
+        fail("SILVERD: HOWL DMA SHARE GRANT FAILED\r\n");
     }
     // CAP_POWER is granted by the kernel's console policy (it cannot be
     // delegated through a spawn handle, which only carries CAP_ALL).

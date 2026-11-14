@@ -668,6 +668,16 @@ fn wolfser_command(url: Option<&str>) {
         syscall::print("wolfser: cannot start the program\r\n");
         return;
     };
+    // Wolfser maps the network window for its fetches. Hand it the
+    // target-scoped share right over the network driver (we hold it since
+    // silverd started us); authority only flows down to a child.
+    if let Some(wolfser) = syscall::cap_get_task_id(cap_id) {
+        if let Some(server) = find_task_id(syscall::PROGRAM_NET_SERVER) {
+            if let Some(share) = syscall::cap_find(server, syscall::CAP_DMA_SHARE) {
+                let _ = syscall::cap_grant(share, wolfser, syscall::CAP_DMA_SHARE);
+            }
+        }
+    }
     syscall::print("wolfser: started (host viewer shows the window)\r\n");
     let _ = cap_id;
 }
@@ -1347,6 +1357,14 @@ fn grant_device_rights(cap_id: u64, task_id: u64, program: u64) {
     // for that task, and the kernel resolves recipients by task ID.
     if !syscall::cap_grant(cap_id, task_id, rights) {
         syscall::print("Spawned, but CAP_MMIO grant failed: the task has no device access.\r\n");
+    }
+    if program == syscall::PROGRAM_NET_SERVER {
+        // The driver writes frames into this server's window: grant the
+        // driver a share right over the freshly spawned server. `cap_id` is
+        // the shell's handle on the server, so its target is the server.
+        if let Some(driver) = find_task_id(syscall::PROGRAM_NET_DRIVER) {
+            let _ = syscall::cap_grant(cap_id, driver, syscall::CAP_DMA_SHARE);
+        }
     }
 }
 

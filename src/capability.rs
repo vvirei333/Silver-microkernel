@@ -21,11 +21,17 @@ pub const CAP_POWER: u32 = 1 << 8;
 /// rename). Apps spawned from `/sfs/apps` do not hold it: an installed ELF can
 /// read the tree but cannot modify the disk until a bundle manifest grants it.
 pub const CAP_FS_WRITE: u32 = 1 << 9;
+/// Authority to map another task's DMA window (the net server and its
+/// clients attach to the driver's rings). Target-scoped: the capability names
+/// the DMA-owning task. Unlike `CAP_MMIO` it is not carried by every device
+/// task, and a holder can map only windows of that one owner.
+pub const CAP_DMA_SHARE: u32 = 1 << 10;
 
 /// Rights that describe authority over a specific `target_task`. They are
 /// only meaningful together with a target and are checked with
 /// [`CapTable::has_target_rights`] / [`CapTable::grant`].
-pub const CAP_TARGET_BITS: u32 = CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME;
+pub const CAP_TARGET_BITS: u32 =
+    CAP_KILL | CAP_WAIT | CAP_CONSOLE_GRANT | CAP_RESUME | CAP_DMA_SHARE;
 
 /// Rights that describe a process-wide/system privilege of the holder. Such a
 /// right is held only by a self-capability (`target_task == own id`), never by
@@ -40,7 +46,8 @@ pub const CAP_ALL: u32 = CAP_KILL
     | CAP_MMIO
     | CAP_IRQ
     | CAP_PCI
-    | CAP_FS_WRITE;
+    | CAP_FS_WRITE
+    | CAP_DMA_SHARE;
 
 /// Upper bound on capability records in one task. Spawn handles alone need up
 /// to `MAX_TASKS` entries in a parent; repeated `SYS_CAP_GRANT` must not grow
@@ -122,6 +129,15 @@ impl CapTable {
         self.caps.iter().any(|cap| {
             cap.target_task == target_task && cap.rights & rights_mask == rights_mask
         })
+    }
+
+    /// First capability for `target_task` covering `rights_mask`. Used by
+    /// `SYS_CAP_FIND` so a task can delegate a scoped right it received.
+    pub fn find_for_target(&self, target_task: u64, rights_mask: u32) -> Option<CapId> {
+        self.caps
+            .iter()
+            .find(|cap| cap.target_task == target_task && cap.rights & rights_mask == rights_mask)
+            .map(|cap| cap.id)
     }
 
     pub fn get_mut(&mut self, id: CapId) -> Option<&mut Cap> {

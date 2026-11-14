@@ -12,6 +12,10 @@ use crate::{condvar::Condvar, mutex::Mutex, scheduler, timer};
 
 pub const PAYLOAD_SIZE: usize = 32;
 pub const MAILBOX_CAPACITY: usize = 256;
+/// One sender may leave at most this many unread messages in one mailbox.
+/// Beyond it `send` returns [`SendError::QueueFull`] instead of blocking, so
+/// a single task cannot pin every legitimate sender by filling a mailbox.
+pub const MAX_MESSAGES_PER_SENDER: usize = 64;
 pub const INFINITE_TIMEOUT: u64 = u64::MAX;
 
 #[derive(Copy, Clone)]
@@ -86,6 +90,9 @@ pub fn send(target: u64, message: Message) -> Result<(), SendError> {
         }
         let index = mailbox_index(&mut guard, target);
         let mailbox = &mut guard.mailboxes[index];
+        if queued_from(&mailbox.queue, message.sender) >= MAX_MESSAGES_PER_SENDER {
+            return Err(SendError::QueueFull);
+        }
         if mailbox.queue.len() < MAILBOX_CAPACITY {
             mailbox.queue.push_back(message);
             mailbox.not_empty.notify_one();
@@ -106,7 +113,9 @@ pub fn try_send(target: u64, message: Message) -> Result<(), SendError> {
     }
     let index = mailbox_index(&mut guard, target);
     let mailbox = &mut guard.mailboxes[index];
-    if mailbox.queue.len() >= MAILBOX_CAPACITY {
+    if mailbox.queue.len() >= MAILBOX_CAPACITY
+        || queued_from(&mailbox.queue, message.sender) >= MAX_MESSAGES_PER_SENDER
+    {
         return Err(SendError::QueueFull);
     }
     mailbox.queue.push_back(message);
@@ -197,6 +206,10 @@ pub fn remove_task(owner: u64) {
         mailbox.not_full.notify_all();
     }
     state.mailboxes.retain(|mailbox| mailbox.owner != owner);
+}
+
+fn queued_from(queue: &VecDeque<Message>, sender: u64) -> usize {
+    queue.iter().filter(|message| message.sender == sender).count()
 }
 
 fn mailbox_index(state: &mut IpcState, owner: u64) -> usize {

@@ -48,6 +48,7 @@ const SYS_TASK_RESUME: u64 = 40;
 const SYS_WAIT_EVENT: u64 = 41;
 const SYS_CAP_GET_TASK_ID: u64 = 60;
 const SYS_CAP_GRANT: u64 = 61;
+const SYS_CAP_FIND: u64 = 99;
 const SYS_MAP_PHYS: u64 = 62;
 const SYS_MAP_PHYS_NC: u64 = 96;
 const SYS_BIND_IRQ: u64 = 63;
@@ -106,6 +107,8 @@ pub const CAP_MOUNT: u32 = 1 << 7;
 pub const CAP_POWER: u32 = 1 << 8;
 pub const CAP_KILL: u32 = 1 << 0;
 pub const CAP_WAIT: u32 = 1 << 1;
+/// Map another task's DMA window; target-scoped to the window's owner.
+pub const CAP_DMA_SHARE: u32 = 1 << 10;
 pub const OPEN_READ: u64 = 0;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_APPEND: u64 = 2;
@@ -380,6 +383,11 @@ pub fn cap_get_task_id(cap_id: u64) -> Option<u64> {
 
 pub fn cap_grant(cap_id: u64, recipient_task_id: u64, rights: u32) -> bool {
     unsafe { syscall3(SYS_CAP_GRANT, cap_id, recipient_task_id, rights as u64) == 0 }
+}
+
+/// Id of the caller's first capability for `target` covering `rights`.
+pub fn cap_find(target: u64, rights: u32) -> Option<u64> {
+    optional_id(unsafe { syscall2(SYS_CAP_FIND, target, rights as u64) })
 }
 
 pub fn map_phys(phys_addr: u64, size: u64) -> Option<u64> {

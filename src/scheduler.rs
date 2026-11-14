@@ -4722,6 +4722,13 @@ pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, right
                     task.id == recipient_task_id
                         && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
                 }) {
+                    // Authority may only be handed down: to yourself or to a
+                    // task you spawned. Otherwise a holder of any handle could
+                    // spread its rights to arbitrary pids.
+                    if recipient_task_id != caller_id && recipient.ppid != Some(caller_id) {
+                        interrupts::restore_irq(saved_daif);
+                        return false;
+                    }
                     // A repeated grant must not grow one task's table without
                     // limit; the whole request fails if there is no room.
                     let needed = usize::from(global != 0) + usize::from(scoped != 0);
@@ -4743,6 +4750,15 @@ pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, right
     }
     interrupts::restore_irq(saved_daif);
     granted
+}
+
+/// `SYS_CAP_FIND(target, rights)`: id of the caller's first capability for
+/// `target` covering `rights`, or 0. Lets a task delegate a scoped right it
+/// received without having to remember the CapId.
+pub fn cap_find_for_target(target: u64, rights: u32) -> u64 {
+    current_task_mut()
+        .and_then(|task| task.cap_table.find_for_target(target, rights))
+        .unwrap_or(0)
 }
 
 pub fn current_task_has_rights(rights: u32) -> bool {
@@ -4884,19 +4900,40 @@ pub fn map_phys_nc_to_current(phys_addr: usize, size: usize) -> Option<usize> {
 fn map_phys_to_current_mode(phys_addr: usize, size: usize, non_cacheable: bool) -> Option<usize> {
     let saved_daif = interrupts::save_and_disable_irq();
     let result = scheduler_manager().and_then(|manager| {
-        let shared_dma = manager.tasks.iter().any(|owner| {
-            owner.dma_pages.iter().any(|&(base, page_count, _)| {
-                base.checked_add(page_count * PAGE_SIZE)
-                    .is_some_and(|dma_end| {
-                        phys_addr >= base
-                            && phys_addr
-                                .checked_add(size)
-                                .is_some_and(|requested_end| requested_end <= dma_end)
-                    })
-            })
+        let task_id = manager.tasks.get(smp::current_index())?.id;
+        // Which task owns the DMA window this range falls into, if any?
+        let region_owner = manager.tasks.iter().find_map(|owner| {
+            owner
+                .dma_pages
+                .iter()
+                .any(|&(base, page_count, _)| {
+                    base.checked_add(page_count * PAGE_SIZE)
+                        .is_some_and(|dma_end| {
+                            phys_addr >= base
+                                && phys_addr
+                                    .checked_add(size)
+                                    .is_some_and(|requested_end| requested_end <= dma_end)
+                        })
+                })
+                .then_some(owner.id)
         });
         let task = manager.tasks.get_mut(smp::current_index())?;
-        let task_id = task.id;
+        // Own DMA keeps the shared-DMA mapping. A foreign window requires the
+        // target-scoped CAP_DMA_SHARE for its owner: CAP_MMIO alone (held by
+        // several device tasks) must not become a cross-task memory read.
+        let shared_dma = match region_owner {
+            Some(owner) if owner == task_id => true,
+            Some(owner) => {
+                if !task
+                    .cap_table
+                    .has_target_rights(owner, capability::CAP_DMA_SHARE)
+                {
+                    return None;
+                }
+                true
+            }
+            None => false,
+        };
         if !task
             .cap_table
             .has_self_rights(task_id, capability::CAP_MMIO)
