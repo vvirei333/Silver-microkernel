@@ -3050,21 +3050,52 @@ static void unlock_now(void) {
     send_message(clients[current_client].fd, -1);
 }
 
+/* Snap-back / completion animation for the lock drag: the surface eases from
+   where the pointer left it to either 0 (stay locked) or -768 (unlocked). */
+static int lock_anim;
+static int lock_anim_from;
+static int lock_anim_to;
+static unsigned lock_anim_start;
+static int lock_anim_unlock;
+
 static void lock_drag_end(void) {
     if (!lock_drag) {
         return;
     }
     lock_drag = 0;
-    int unlock = lock_drag_offset < -120;
+    lock_anim_from = lock_drag_offset;
+    lock_anim_to = lock_drag_offset < -120 ? -(int)OUT_HEIGHT : 0;
+    lock_anim_unlock = lock_drag_offset < -120;
+    lock_anim_start = now_ms();
+    lock_anim = 1;
+}
+
+static void lock_anim_step(void) {
+    if (!lock_anim) {
+        return;
+    }
+    unsigned elapsed = now_ms() - lock_anim_start;
+    const unsigned duration = 200;
+    int offset;
+    if (elapsed >= duration) {
+        offset = lock_anim_to;
+        lock_anim = 0;
+    } else {
+        unsigned t = elapsed * 1024u / duration;
+        unsigned eased = (t * t * (3u * 1024u - 2u * t)) / (1024u * 1024u);
+        offset = lock_anim_from +
+                 (lock_anim_to - lock_anim_from) * (int)eased / 1024;
+    }
     LayerEntry *entry = layer_entry_by_surface(lock_drag_surface);
     if (entry != 0) {
-        entry->margin[0] = 0;
+        entry->margin[0] = offset;
     }
 #ifdef SERVE_ONLY
     scene_dirty = 1;
     compose_full = 1;
 #endif
-    if (unlock) {
+    if (!lock_anim && lock_anim_unlock) {
+        lock_anim_unlock = 0;
         unlock_now();
     }
 }
@@ -5540,6 +5571,7 @@ void _start(void) {
                 poll_input();
             }
         }
+        lock_anim_step();
 #ifdef SERVE_ONLY
         if (scene_dirty) {
             scene_dirty = 0;

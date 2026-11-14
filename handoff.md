@@ -6064,3 +6064,12 @@ helper without `WAYLAND_DISPLAY`, GDK fell back to X11 and the child died with
 tapping the launcher tile. Host has one compositor, so the default is always
 safe. Needs a guest check: tap the Terminal tile a few times and confirm there
 is no "cannot open display:" any more.
+
+
+### Lock drag animation
+
+Releasing the lock drag no longer snaps: `lock_anim_step()` (called once per
+main-loop iteration, alongside input) eases the surface margin from where the
+pointer left it to 0 (stay locked) or -OUT_HEIGHT (unlocked, then the Space
+key press) over 200 ms with a smoothstep curve. Damage-only composes keep the
+cost at one full repaint per animation frame.
