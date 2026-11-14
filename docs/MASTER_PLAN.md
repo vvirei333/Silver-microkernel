@@ -38,6 +38,23 @@ background and target phosh top-panel surface not in same layer` при рабо
 
 **M0.2 — чёрный экран при фокусе в text-entry**
 
+**Статус 2026-11-14 (z-order-лог):** гипотеза «поверх всего лежит локскрин-фон»
+и «застрявший output shield» **опровергнуты**. Все layer-surface (включая
+`phosh background` layer 0) в чёрном кадре mapped; CSS-пробы и ярко-розовые
+обои доказывают, что сцена не перекрыта. phoc сам коммитит **пустой кадр** с
+damage на весь выход (source = прозрачный/непрозрачный чёрный), после чего
+рисует только курсор. В тот же момент layout-транзакция таймаутится (2
+configure pending), затем acks приходят при `pending_layer_configures == 0` —
+это и есть CRITICAL. `PHOC_DEBUG=damage-whole` и preload-шим на
+`wlr_damage_ring_rotate_buffer` (полный damage каждый кадр) не помогают.
+Ввод при этом доходит до Phosh (`wl_pointer.enter/button` на home,
+`wl_keyboard.key`) — подвисает отрисовка, не доставка событий.
+
+Вывод: фикс = патч phoc в `phoc_layer_surface_send_configure` (начинать/
+продлевать транзакцию при уже висящем `pending_serial`) + защитное опускание
+шилда при `pending == 0`. Нужна пересборка phoc 0.57.0 из исходников
+(gitlab.gnome.org доступен). До этого — known issue в 0.1.2.
+
 - Первичное подозрение: реализация `zphoc_layer_shell_effects_v1` (alpha=0 на
   home background при fold; state не восстанавливается / применяется к output
   вместо surface).

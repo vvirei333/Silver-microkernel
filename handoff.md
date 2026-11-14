@@ -6499,3 +6499,51 @@ Findings from this round (see `docs/MASTER_PLAN.md` for the plan):
 * Screen blanking/locking is disabled in the seeded keyfile
   (`org.gnome.desktop.session idle-delay=uint32 0`,
   `org.gnome.desktop.screensaver lock-delay=0`).
+
+### M0.2 z-order log: not the shield, not the wallpaper — phoc presents blank frames
+
+With the exact phoc 0.57.0 from the image (`self->pending_layer_configures`,
+plural; the earlier singular name in this log was a mis-transcription) and its
+sources from `gitlab.gnome.org/World/Phosh/phoc` v0.57.0, the black frame was
+instrumented from the outside:
+
+* **Output shield: not raised.** An `LD_PRELOAD` shim counted full-output
+  black rects in `wlr_render_pass_add_rect` per frame. A normal frame has one
+  (the clear), session init has two (shield + clear). The black frame stays at
+  one: no change, no shield.
+* **Shell state: still unlocked.** Phosh logs
+  `Removing PHOSH_STATE_LOCKED ... PHOSH_STATE_OVERVIEW` before the tap and no
+  further state change after it. The tap does not re-lock the shell.
+* **No Phosh surface paints it.** Unique per-surface CSS colours
+  (`phosh-background`, `phosh-home`, `phosh-overview`, `phosh-top-panel`,
+  `phosh-top-panel-bg`, `phosh-lockscreen`, `phosh-lockscreen-bg`) all vanish
+  in the black frame. A solid magenta wallpaper proves the wallpaper does
+  paint before the tap, so the black is not the wallpaper or a surface above
+  it.
+* **phoc commits a blank frame.** A per-commit probe of the nested toplevel
+  logs the blackening commit: damage `0x0 1024x768`, source pixels
+  `0x00000000` (premultiplied transparent black), previous copy magenta. After
+  that commit phoc only sends cursor-sized damage and never repaints the
+  scene.
+* **The layout transaction is the only phoc-side anomaly at that moment.**
+  Phosh reconfigures home/panel on the tap, the transaction times out after
+  3 s with two pending configures, and the later acks call
+  `phoc_layout_transaction_notify_layer_configured` with
+  `pending_layer_configures == 0` (the CRITICAL). The layer dump at the black
+  frame still lists every layer as mapped.
+* **Input is not lost.** With `WAYLAND_DEBUG=1` Phosh receives
+  `wl_pointer.enter/motion/button` on the `phosh home` surface (local
+  `512,38`) and `wl_keyboard.enter` plus `key` (keycode 20 = `t`). The UI
+  looks frozen because phoc presents no new frames, not because the events
+  never arrive.
+* `PHOC_DEBUG=damage-whole` and an `wlr_damage_ring_rotate_buffer` shim that
+  forces full output damage do **not** fix it: the renderer still produces an
+  empty frame.
+
+Verdict: M0.2 is a phoc layout-transaction/configure-handshake bug, not the
+stacked-surface CRITICAL and not the shield. Fixing it needs a rebuilt phoc
+(now possible: sources are available) with
+`phoc_layer_surface_send_configure` starting/extending the transaction even
+when `pending_serial` is outstanding, and a defensive shield lower when
+`pending_layer_configures` is 0. Until then, 0.1.2 ships with this as a known
+issue (tap on the app-grid search field freezes the output).
