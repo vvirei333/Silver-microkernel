@@ -605,7 +605,11 @@ static void keyboard_keymap(void *data, struct wl_keyboard *kb,
     lseek(fd, 0, SEEK_SET);
     ssize_t got = read(fd, buffer, want);
     close(fd);
-    if (got > 0 && strstr(buffer, "WEREWOLF_KEYMAP") != NULL) {
+    /* The mini compositor now ships the same real XKB keymap it gives
+       wlroots/phoc (a client that builds its own xkb state cannot use the
+       old marker); the historical test marker is still accepted. */
+    if (got > 0 && (strstr(buffer, "xkb_keymap") != NULL ||
+                    strstr(buffer, "WEREWOLF_KEYMAP") != NULL)) {
         keymap_ok = 1;
     }
 }
