@@ -4941,8 +4941,17 @@ static int serve(long client) {
                             app_window.used = 1;
                             app_window.owner = current_client;
                             app_window.surface = object;
+#ifdef SERVE_PHOC
+                            /* phoc's nested toplevel is the whole output and
+                               carries no client-side decorations. Its
+                               set_window_geometry must not shift/crop the
+                               buffer we blit to the host window. */
+                            app_window.geometry_x = 0;
+                            app_window.geometry_y = 0;
+#else
                             app_window.geometry_x = window_geometry_x;
                             app_window.geometry_y = window_geometry_y;
+#endif
                             if (app_window.toplevel == 0) {
                                 app_window.toplevel = toplevel_id;
                             }
@@ -5926,6 +5935,31 @@ void _start(void) {
         }
         lock_anim_step();
 #ifdef SERVE_ONLY
+        /* Rate-limited vblank: a client that animates needs frame callbacks
+           even when it has no new damage to commit. Uncapped, this used to
+           let one blinking cursor drive a full-speed render loop. */
+        {
+            static unsigned last_frame_tick;
+            unsigned frame_now = now_ms();
+            if (frame_now - last_frame_tick >= 16) {
+                last_frame_tick = frame_now;
+                for (int index = 0; index < MAX_CLIENTS; index++) {
+                    if (!clients[index].connected) {
+                        continue;
+                    }
+                    current_client = index;
+                    load_client(&clients[index]);
+                    for (unsigned surface = 0; surface < SURFACE_IDS; surface++) {
+                        if (frame_ids[surface] != 0) {
+                            send_done(clients[index].fd, frame_ids[surface],
+                                      frame_now);
+                            frame_ids[surface] = 0;
+                        }
+                    }
+                    save_client(&clients[index]);
+                }
+            }
+        }
         if (scene_dirty) {
             scene_dirty = 0;
             layer_compose();

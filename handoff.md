@@ -6348,3 +6348,24 @@ black window after a command, this points at phoc's pixman compositing of
 Phosh's layer surfaces rather than at the app data. Next: compare the scene
 with the mini compositor's direct Phosh path, or try a phoc build with a
 different renderer/damage setting.
+
+### Frame clock and nested-window geometry
+
+Two more experiments under phoc:
+
+* a **rate-limited (16 ms) vblank** in the main loop completes pending frame
+  callbacks for clients that animate without new damage. Uncapped this caused
+  a full-speed render loop; capped it is protocol-correct and cheap.
+* `SERVE_PHOC` forces the nested window's client-side geometry to `(0, 0)`
+  instead of trusting `xdg_surface.set_window_geometry`. phoc's toplevel is
+  the whole output and has no CSD, so a non-zero geometry cropped the blitted
+  buffer (the terminal text was missing its first ~90 px).
+
+Neither made the app-grid favourite tile appear. The UI template shows the
+tile inside `favs_revealer` above a separator; the revealer and separator are
+allocated (visible line under the search bar), so the favourite model has an
+item, but its `PhoshAppGridButton` (a 64 px `GtkImage` plus label) is
+invisible. Next step: check whether the icon lookup (`utilities-terminal` from
+the unpacked theme) returns a texture under this GTK/gdk-pixbuf setup, or
+whether the button is drawn with transparent colours; a GTK inspector or a
+debug build of Phosh would answer it.
