@@ -6101,3 +6101,46 @@ the `foreign_handle` created for the app).
 
 Where to hook: the phosh_private branch already ignores opcode 2
 (`get_thumbnail`): it takes four u32s. Store `(frame_id, max_w, max_h)` there.
+
+
+### Thumbnails: the handshake is implemented
+
+`phosh_private.get_thumbnail` is now a real screencopy frame. The offer
+computes the thumbnail size from the application window's *content* rectangle
+(the CSD margins are skipped), preserving the aspect ratio with integer maths,
+and sends `buffer(ARGB8888, width, height, stride)`. On `copy(buffer)` the
+compositor resolves the client's shm buffer, scales the stored app frame with
+nearest neighbour, then sends `flags(0)`, `ready(timestamp)` and a
+`wl_buffer.release`. `failed` is sent for an unknown toplevel, a hidden/absent
+window or a buffer whose geometry does not match the offer; `destroy` and
+`copy_with_damage` are accepted (`copy_with_damage` answers immediately, a
+thumbnail is one still frame).
+
+**Do not send `buffer_done`.** Phosh bundles wlr-screencopy **v2**
+(`phosh-v0.57.0/protocol/wlr-screencopy-unstable-v1.xml`,
+`zwlr_screencopy_frame_v1 version="2"`), so opcode 6 is an unknown event.
+Sending it made libwayland abort Phosh's connection: the shell exited with
+`Gdk-Message: Error reading events from display: Resource temporarily
+unavailable`. Phoc sends only `buffer` for a thumbnail for the same reason;
+the earlier note in this file that asked for `buffer_done` was wrong.
+
+Verified in the guest: launching the Terminal tile creates the activity card,
+the compositor logs `phosh: thumb ready 430 290` once, and the overview card
+shows the scaled terminal (white body, title bar cropped away by the content
+rectangle). Phosh asks again whenever an activity is resized; the card is a
+snapshot, not a live mirror, which matches phoc.
+
+### The launcher needs an empty `WAYLAND_DISPLAY` treated as unset
+
+The tile-launch check found `cannot open display:` still. GIO handed
+`gio-launch-desktop` a present-but-empty `WAYLAND_DISPLAY`; the helper only
+filled the variable in when `getenv()` returned NULL, so GDK fell back to X11
+and the child died. Empty is now treated like missing, for `GDK_BACKEND` too.
+
+One caveat remains, unrelated to the environment: a second application started
+while the first one is still initialising can lose the race and print the same
+message, while one launch always survives. The compositor still keeps
+`surface_ids[]` as one global table even though Wayland surface ids are per
+client, so the id namespaces are not separated; that is the first suspect and
+the next thing to verify. Fixing it means moving the surface table into
+`ClientState`, like the buffer table already is.

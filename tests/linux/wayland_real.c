@@ -1479,6 +1479,254 @@ static void send_done(long client, unsigned callback, unsigned data) {
     send_message(client, -1);
 }
 
+/* ---- phosh_private.get_thumbnail ---------------------------------------- */
+/* Phosh asks for a window thumbnail with
+ *   get_thumbnail(new_id, toplevel, max_width, max_height)
+ * and expects the id to be a zwlr_screencopy_frame_v1: the compositor sends
+ * `buffer` with the size it wants, the client answers with `copy(buffer)`,
+ * and one `flags` + `ready` completes the frame. Phosh uses these for the
+ * activity switcher; without the handshake the grid stays empty.
+ *
+ * There is one application window, so the only valid toplevel is the
+ * foreign-toplevel handle announced for it. The source is the window's
+ * content rectangle (the buffer's client-side decoration margins are not
+ * part of it), scaled with nearest neighbour into the client's shm buffer. */
+#define MAX_THUMBNAILS 8
+typedef struct {
+    int used;
+    unsigned id;
+    unsigned width;
+    unsigned height;
+    unsigned stride;
+    int copied;
+} ThumbnailFrame;
+static ThumbnailFrame thumbnails[MAX_THUMBNAILS];
+
+/// Diagnostics for the thumbnail handshake (no stdio in this binary).
+#ifdef SERVE_ONLY
+static void thumbnail_log(const char *label, unsigned first, unsigned second) {
+    char text[160];
+    unsigned length = 0;
+    static const char prefix[] = "phosh: thumb ";
+    for (unsigned index = 0; index < sizeof(prefix) - 1; index++) {
+        text[length++] = prefix[index];
+    }
+    for (unsigned index = 0; label[index] != 0 && length < sizeof(text) - 24;
+         index++) {
+        text[length++] = label[index];
+    }
+    unsigned values[2] = {first, second};
+    for (unsigned value_index = 0; value_index < 2; value_index++) {
+        unsigned value = values[value_index];
+        char digits[12];
+        unsigned count = 0;
+        text[length++] = ' ';
+        if (value == 0) {
+            digits[count++] = '0';
+        }
+        while (value != 0) {
+            digits[count++] = (char)('0' + value % 10);
+            value /= 10;
+        }
+        while (count != 0) {
+            text[length++] = digits[--count];
+        }
+    }
+    text[length++] = '\n';
+    sys3(64, 1, (long)text, length);
+}
+#endif
+
+static ThumbnailFrame *thumbnail_by_id(unsigned id) {
+    if (id == 0) {
+        return 0;
+    }
+    for (unsigned index = 0; index < MAX_THUMBNAILS; index++) {
+        if (thumbnails[index].used && thumbnails[index].id == id) {
+            return &thumbnails[index];
+        }
+    }
+    return 0;
+}
+
+static ThumbnailFrame *thumbnail_add(unsigned id) {
+    ThumbnailFrame *slot = thumbnail_by_id(id);
+    if (slot == 0) {
+        for (unsigned index = 0; index < MAX_THUMBNAILS; index++) {
+            if (!thumbnails[index].used) {
+                slot = &thumbnails[index];
+                break;
+            }
+        }
+    }
+    if (slot == 0) {
+        return 0;
+    }
+    slot->used = 1;
+    slot->id = id;
+    slot->width = 0;
+    slot->height = 0;
+    slot->stride = 0;
+    slot->copied = 0;
+    return slot;
+}
+
+static void thumbnail_send_failed(long client, unsigned id) {
+    begin(id, 3 /* zwlr_screencopy_frame_v1.failed */);
+    finish();
+    send_message(client, -1);
+}
+
+/// Content rectangle of the application window inside its buffer, or 0 when
+/// there is no live window to capture.
+static int thumbnail_source_rect(unsigned *x, unsigned *y, unsigned *width,
+                                 unsigned *height) {
+    /* A window hidden by the compositor (F1/Ctrl+T) still has a toplevel and
+       the overview shows its card, so capture its last committed pixels. */
+    if (!app_window.used || !app_window.copy_ready ||
+        app_window.width == 0 || app_window.height == 0) {
+        return 0;
+    }
+    unsigned left = app_window.geometry_x;
+    unsigned top = app_window.geometry_y;
+    if (app_window.width <= 2 * left || app_window.height <= 2 * top) {
+        left = 0;
+        top = 0;
+    }
+    *x = left;
+    *y = top;
+    *width = app_window.width - 2 * left;
+    *height = app_window.height - 2 * top;
+    if (*width == 0 || *height == 0) {
+        return 0;
+    }
+    return 1;
+}
+
+static void thumbnail_offer(long client, unsigned id, unsigned toplevel,
+                            unsigned max_width, unsigned max_height) {
+    ThumbnailFrame *frame = thumbnail_add(id);
+    if (frame == 0) {
+        thumbnail_send_failed(client, id);
+        return;
+    }
+    unsigned source_x, source_y, source_width, source_height;
+    if (foreign_handle == 0 || toplevel != foreign_handle ||
+        !thumbnail_source_rect(&source_x, &source_y, &source_width,
+                               &source_height)) {
+        /* Phoc sends `failed` straight after creating a frame whose toplevel
+           has no view; the client then destroys it without a copy. */
+        thumbnail_send_failed(client, id);
+        return;
+    }
+    /* Preserve the aspect ratio: one limit picks the size, the other axis is
+       derived from the source's ratio. Integer rounds, no floating point
+       (this program links no libgcc). */
+    unsigned width = source_width;
+    unsigned height = source_height;
+    if (max_width != 0 && width > max_width) {
+        width = max_width;
+        height = (unsigned)(((unsigned long long)source_height * max_width +
+                             source_width / 2) / source_width);
+    }
+    if (max_height != 0 && height > max_height) {
+        height = max_height;
+        width = (unsigned)(((unsigned long long)source_width * max_height +
+                            source_height / 2) / source_height);
+    }
+    if (width == 0) width = 1;
+    if (height == 0) height = 1;
+    frame->width = width;
+    frame->height = height;
+    frame->stride = width * 4;
+    begin(id, 0 /* zwlr_screencopy_frame_v1.buffer */);
+    put_u32(0 /* WL_SHM_FORMAT_ARGB8888 */);
+    put_u32(frame->width);
+    put_u32(frame->height);
+    put_u32(frame->stride);
+    finish();
+    send_message(client, -1);
+    /* No `buffer_done`: Phosh bundles screencopy v2 (its XML has no v3
+       events), so an opcode-6 event is an unknown event and libwayland
+       aborts the shell's connection. Phoc only sends `buffer` here too. */
+}
+
+/// Scales the window's content rectangle into the client's shm buffer and
+/// completes the frame. Returns 0 after sending `failed`.
+static int thumbnail_copy(long client, ThumbnailFrame *frame,
+                          unsigned buffer_object) {
+    unsigned source_x, source_y, source_width, source_height;
+    if (frame == 0 || frame->copied || frame->width == 0 ||
+        !thumbnail_source_rect(&source_x, &source_y, &source_width,
+                               &source_height)) {
+        thumbnail_send_failed(client, frame != 0 ? frame->id : buffer_object);
+        return 0;
+    }
+    BufferSlot *slot = buffer_find(buffer_object);
+    if (slot == 0 || slot->pool_fd < 0 || slot->width != frame->width ||
+        slot->height != frame->height ||
+        slot->stride < frame->width * 4 ||
+        (slot->format != 0 && slot->format != 1)) {
+        thumbnail_send_failed(client, frame->id);
+        return 0;
+    }
+    unsigned bytes = slot->offset + slot->stride * slot->height;
+    long mapped = sys6(222 /* mmap */, 0, bytes, 3 /* RW */,
+                       1 /* MAP_SHARED */, slot->pool_fd, 0);
+    if (mapped <= 0) {
+        thumbnail_send_failed(client, frame->id);
+        return 0;
+    }
+    unsigned char *destination = (unsigned char *)(mapped + slot->offset);
+    const int force_opaque = app_window.format == 1; /* XRGB8888 */
+    for (unsigned row = 0; row < frame->height; row++) {
+        unsigned source_row = (unsigned)(((unsigned long long)row *
+                                          source_height) / frame->height);
+        const unsigned *source = (const unsigned *)
+            (app_window.copy +
+             (unsigned long long)(source_y + source_row) * app_window.stride +
+             (unsigned long long)source_x * 4);
+        unsigned *target = (unsigned *)(destination + row * slot->stride);
+        for (unsigned column = 0; column < frame->width; column++) {
+            unsigned source_column = (unsigned)
+                (((unsigned long long)column * source_width) / frame->width);
+            unsigned pixel = source[source_column];
+            if (force_opaque) {
+                pixel |= 0xFF000000u;
+            }
+            target[column] = pixel;
+        }
+    }
+    __asm__ volatile("dsb sy" ::: "memory");
+    sys3(215 /* munmap */, mapped, bytes, 0);
+    frame->copied = 1;
+    begin(frame->id, 1 /* zwlr_screencopy_frame_v1.flags */);
+    put_u32(0);
+    finish();
+    send_message(client, -1);
+    unsigned milliseconds = now_ms();
+    begin(frame->id, 2 /* zwlr_screencopy_frame_v1.ready */);
+    put_u32(0);
+    put_u32(milliseconds / 1000u);
+    put_u32((milliseconds % 1000u) * 1000000u);
+    finish();
+    send_message(client, -1);
+    /* The client may reuse the buffer for the next thumbnail. */
+    begin(buffer_object, 0 /* wl_buffer.release */);
+    finish();
+    send_message(client, -1);
+#ifdef SERVE_ONLY
+    /* One line as proof the handshake completed; Phosh asks again on every
+       activity resize, which does not need a log line each. */
+    static int thumbnail_reported;
+    if (!thumbnail_reported) {
+        thumbnail_reported = 1;
+        thumbnail_log("ready", frame->width, frame->height);
+    }
+#endif
+    return 1;
+}
+
 /// Sends the current shared selection to one client, allocating the next
 /// server-range object id for its data offer.
 static void send_clipboard_offer(ClientState *client) {
@@ -4088,11 +4336,27 @@ static int serve(long client) {
                 /* get_xdg_switcher(new_id) */
                 xdg_switcher_id = take_u32();
             } else if (object == phosh_private_id && opcode == 2) {
-                /* get_thumbnail(new_id, toplevel, max_w, max_h) */
-                (void)take_u32();
-                (void)take_u32();
-                (void)take_u32();
-                (void)take_u32();
+                /* get_thumbnail(new_id, toplevel, max_w, max_h): the new
+                   object is a zwlr_screencopy_frame_v1 (phoc does the same
+                   cast), so the frame requests are answered below. */
+                unsigned thumbnail_frame = take_u32();
+                unsigned thumbnail_toplevel = take_u32();
+                unsigned thumbnail_max_width = take_u32();
+                unsigned thumbnail_max_height = take_u32();
+                thumbnail_offer(client, thumbnail_frame, thumbnail_toplevel,
+                                thumbnail_max_width, thumbnail_max_height);
+            } else if (thumbnail_by_id(object) != 0 && opcode == 0) {
+                /* zwlr_screencopy_frame_v1.copy(buffer) */
+                ThumbnailFrame *thumbnail = thumbnail_by_id(object);
+                thumbnail_copy(client, thumbnail, take_u32());
+            } else if (thumbnail_by_id(object) != 0 && opcode == 1) {
+                /* zwlr_screencopy_frame_v1.destroy */
+                thumbnail_by_id(object)->used = 0;
+            } else if (thumbnail_by_id(object) != 0 && opcode == 2) {
+                /* copy_with_damage: a thumbnail is one still frame, so it is
+                   answered immediately instead of waiting for damage. */
+                ThumbnailFrame *thumbnail = thumbnail_by_id(object);
+                thumbnail_copy(client, thumbnail, take_u32());
             } else if (object == phosh_private_id && opcode == 3) {
                 /* get_keyboard_event(new_id) */
                 keyboard_event_id = take_u32();
