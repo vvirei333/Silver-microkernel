@@ -6769,3 +6769,59 @@ The parser moved out of `userspace/src/bin/net_server.rs` into
 `userspace/src/http_parse.rs` (core-only) so the guest server and the host
 fuzzer share one implementation. `tools/security_test.py --fuzz` is the CI
 entry point; 200000 deterministic cases run in ~30 ms.
+
+### M2.1 report applied; M2.2 packet; critical sigreturn finding
+
+**M2.1 triage.** The auditor confirmed S1-S8 / I1-I10 (no kernel-memory
+takeover in the audited set) and filed F1-F9. Applied now:
+
+* **F4** — the kernel-side nameserver RPC is bounded: `receive_from_timeout`
+  with `NAME_RPC_TIMEOUT_TICKS = 3000` (30 s); a live but hung Scout yields
+  `SYSCALL_TIMEOUT` instead of pinning every register/lookup forever.
+* **F6** — one shared-console write is capped at 256 KiB per call, so a Linux
+  task cannot bury the diagnostic log by writing megabytes in one call.
+* **F5** — confirmed: allocation failure calls `allocation_error` →
+  `silver_handle_exception(7)` → kernel halt. Deliberate (state may be
+  inconsistent) but reachable under heap pressure; documented as an accepted
+  DoS, bounded by the per-call caps and fixed tables.
+* **F8** — the BKL is reentrant by design (depth counter); the notify path
+  depends on it. Written into `docs/SECURITY.md` so a future refactor cannot
+  "fix" the nested acquire and reintroduce the lost-wakeup window.
+* **F9** — the PID-existence oracle is accepted for the single-user M2 and
+  documented.
+* **F1/F2/F3** — send-by-pid, shared-DMA mapping for any `CAP_MMIO` holder,
+  and grant-to-arbitrary-pid are authority-model decisions left to the owner;
+  all three are in the known-gaps list with the options.
+
+**Critical finding while preparing M2.2 (L1).** The Linux signal return path
+trusted the user's `uc_mcontext.pstate`: `restore_frame` copied it into
+`frame[32]`, the trampoline wrote it to `SPSR_EL1` and `eret`ed. A handler
+that set `PSTATE.M = EL1h` returned to **EL1** at the PC and with the x0-x30
+from the same user-controlled ucontext. Proved on the unfixed kernel with
+`tests/security/sigreturn_pstate.c`:
+
+```
+EL1 EXCEPTION kind=0
+ESR_EL1=000000008600000F
+ELR_EL1=0000000000400114
+KERNEL PANIC: halting
+```
+
+The instruction abort happened only because EL1 cannot fetch the user half;
+pointing PC at a kernel gadget (no KASLR) makes it an arbitrary EL1 call —
+local privilege escalation from any Linux task. Fixed by rejecting
+`pstate & 0xF != 0` (the `valid_user_regs` rule) and killing the task with
+SIGSEGV; the regression test now sees the child die with 139. **L2**, found in
+the same pass: `SIGKILL`/`SIGSTOP` could be blocked, making a task unkillable;
+`set_blocked` now strips both bits.
+
+**M2.2 packet.** `docs/audit/M2.2/` — snapshot of `linux_abi.rs`,
+`linux_signal.rs`, `linux_fd.rs`, `irq_policy.rs` plus line-numbered IRQ
+excerpts (`main-irq.rs`, `gic-irq.rs`, `gicv3-irq.rs`, `scheduler-irq.rs`),
+with `linux-dispatch.md` (L1 proof and fix, leads L3-L9) and `irq-entry.md`
+(bind/wait/wake/teardown, leads R1-R7).
+
+Verification on the fixed tree: Linux ABI matrix 26/26 (signals, pthreads,
+exit_group, Wayland, D-Bus, health 0/0/0), `cargo test --lib` 222,
+`tools/security_test.py --fuzz` 2/2 + 200000 fuzz cases, and the full Phosh
+demo script (`tools/demo.py --no-record`) unchanged.

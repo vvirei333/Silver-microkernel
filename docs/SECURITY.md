@@ -56,6 +56,15 @@ without releasing the BKL cannot be unmapped underneath the copy. The
 reference implementation and its rationale are `sys_waitpid` in
 `src/syscall.rs`; `tests/security/` is where violations become regressions.
 
+**The kernel lock.** The BKL is reentrant on its owning CPU (depth counter,
+`smp::bkl_acquire`). Notification paths (`Condvar::notify_*` →
+`scheduler::wake_task`) take it while the caller already holds it; that nesting
+is part of the contract, not an accident. The same contract is what makes
+`Condvar::wait` safe: it drops the object mutex *before* enqueueing, and no
+other CPU can run a notifier until `schedule_released()` gives the BKL away.
+Any change that releases the BKL between the unlock and the enqueue
+reintroduces a lost wakeup.
+
 ### 3. Identity
 
 Task id, message sender, mailbox owner, fd owner and console owner are facts
@@ -98,21 +107,49 @@ surface as an error code, never as a kernel abort driven by user input.
 ## Known gaps and accepted risks (tracked for M2)
 
 1. **Send-by-pid is ambient authority.** Any task can fill another task's
-   mailbox; there is no per-sender quota or capability on `SYS_SEND`.
-2. **Nameserver policy is user-space.** `R`/`L` reach Scout unauthenticated;
+   mailbox; there is no per-sender quota or capability on `SYS_SEND`. A task
+   can also spread a handle it owns to an arbitrary recipient pid
+   (`SYS_CAP_GRANT` takes a raw id): not an escalation, but uncontrolled
+   delegation. Decision pending (owner): per-pair quota vs. send capability.
+2. **Shared DMA is ambient for `CAP_MMIO` holders.** `SYS_MAP_PHYS[_NC]`
+   maps a range that overlaps *any* task's DMA window as shared memory. The
+   net server needs exactly this to see the driver's ring, but any other
+   `CAP_MMIO` holder can attach to it. Decision pending (owner): own-region
+   only, an explicit share grant, or a fixed broker list.
+3. **Nameserver policy is user-space.** `R`/`L` reach Scout unauthenticated;
    name squatting/replacement depends on Scout's policy, not the kernel's.
-3. **No syscall filtering.** There is no seccomp-like profile; a task may call
+4. **No syscall filtering.** There is no seccomp-like profile; a task may call
    every syscall it has rights for. The capability table, not the ABI, is the
    authority boundary.
-4. **No KASLR.** Kernel text/data addresses are fixed. Combined with an
+5. **No KASLR.** Kernel text/data addresses are fixed. Combined with an
    arbitrary-read bug this matters; alone it is not an escape.
-5. **Blocking RPC without a deadline.** `receive_from(SCOUT_ID)` waits for a
-   live Scout forever; a hung Scout wedges name lookups.
-6. **Queue memory is not charged.** Mailbox queues live on the kernel heap
+6. **Blocking RPC deadlines are generous.** The nameserver RPC is bounded
+   (30 s), but a hung Scout still stalls each register/lookup for that long.
+7. **Queue memory is not charged.** Mailbox queues live on the kernel heap
    outside the per-task ledger (bounded globally, not per sender).
+8. **PID existence oracle.** `SYS_TASK_ALIVE` (and send errors) reveal whether
+   an arbitrary task id is alive. Accepted for the single-user console M2.
+9. **Allocation failure halts the kernel.** The global allocator's OOM path
+   is a deliberate `KERNEL PANIC` (state may be inconsistent). Per-call caps
+   (console write, fd/name limits) and the bounded tables keep user-driven
+   allocations small, but an OOM is still a DoS, not a recoverable error.
 
 These are findings in their own right for the auditor; nothing in this list
 is an excuse for a memory-safety bug.
+
+## Findings fixed during M2 (so far)
+
+| ID | Finding | Class | Status |
+|---|---|---|---|
+| F-http | HTTP chunk size `0xFFF…F` spun `dechunk` forever | integer overflow → remote DoS | fixed (`5b01348`), fuzz regression |
+| L1 | `rt_sigreturn` restored a user `PSTATE`, returning to EL1 with a user PC and registers | missing validation → local privilege escalation | fixed, `tests/security/sigreturn_pstate.c` |
+| L2 | `SIGKILL`/`SIGSTOP` could be blocked | missing clamp → unkillable task | fixed |
+| F4 | nameserver RPC waited forever on a live-but-hung Scout | missing timeout → wedge | fixed (30 s bound) |
+| F6 | one console write could flood megabytes | unbounded input → log suppression | fixed (256 KiB/call) |
+| F5 | allocation failure halts the kernel | accepted, documented (#9) | per-call caps bound reachable sizes |
+| F8 | BKL reentrancy is assumed by notify paths | contract now documented | documented above |
+| F9 | PID existence oracle | accepted for M2 | documented (#8) |
+| F1/F2/F3 | send-by-pid, shared DMA, grant-to-foreign-pid | ambient authority | open — owner decision |
 
 ## Disclosure and fix protocol
 

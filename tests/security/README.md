@@ -32,8 +32,9 @@ command mirrors `build_and_qemu.sh` (no display, serial on a Unix socket).
 | Case | Proves |
 |---|---|
 | `fd_lifetime` | An fd passed over `SCM_RIGHTS` is **duplicated/refcounted**, not remembered by number: the sender closes its copy, the freed number is recycled by unrelated memfds, and the receiver still reads the original file. Regression for the M0.2 class (fd lifetime / ownership across IPC) moved from user space into the kernel boundary. |
+| `sigreturn_pstate` | `rt_sigreturn` must reject a ucontext whose `pstate` is not EL0t. The child sets `PSTATE.M = EL1h` in its handler and traps with `udf` right after the interrupted syscall: on the unfixed kernel this is an `EL1 EXCEPTION` panic (and, with a kernel PC, an arbitrary EL1 call); with the fix the child dies with SIGSEGV and the parent prints the marker. |
 
-Planned (from the M2 audit checklist, `docs/audit/M2/`):
+Planned (from the M2 audit reports in `docs/audit/M2/` and `docs/audit/M2.2/`):
 
 - `send_spam` — a task filling another task's mailbox (ambient send-by-pid).
 - `munmap_toctou` — a sibling thread unmapping a receive buffer after the
@@ -41,6 +42,11 @@ Planned (from the M2 audit checklist, `docs/audit/M2/`):
 - `name_squat` — duplicate/owner-replacement policy for `R`/`L` names.
 - `linux_fd_lifetime` — the Linux personality's fd table under
   `close_range`/`dup`/`fork` (the M0.2 class on the ABI side).
+- `sigreturn_pc` — the follow-up to `sigreturn_pstate`: an EL0t frame with a
+  kernel PC must die on an EL0 instruction abort, never execute at EL1.
+- `blocked_kill` — a task that blocks SIGKILL must still die.
+- `irq_orphan` — bind an SPI and exit before draining; the next interrupt
+  must be masked as unknown, not halt the machine (R1).
 
 ## Host fuzz targets
 
