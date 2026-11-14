@@ -6282,3 +6282,31 @@ Known gaps from this first run:
   painted), and typed text is not visible in the search entry. Check GIO's
   app enumeration / favourites under Phosh, and the entry's theme.
 - pixman performance and a visible host cursor are still open.
+
+### Nested phoc: windows and input, and the next blockers
+
+After the lock screen milestone the wrapper (temporarily) started `/sfs/term`
+as a client of phoc. The terminal window renders through phoc at 1024x768 and
+receives keycodes (title bar, text view, entry). That confirms the path
+`our compositor -> phoc -> application` for pointer and keyboard input.
+
+New blockers found in the same run:
+
+* **The guest froze after pressing Enter in the terminal.** QEMU stayed at
+  100% of one core, the shm frame counter stopped and the host input ring was
+  no longer consumed (head != tail). Nothing was printed to the serial. The
+  terminal's `ls` may have triggered a render/commit flood or a kernel-side
+  spin; the next step is a watchdog around the compositor's main loop (log the
+  last client/syscall) or a kernel-side per-task PC dump.
+* **Phosh's app grid still shows no tiles.** GIO and GSettings were verified
+  from inside the running session with a probe: `apps=1`,
+  `id=werewolf-terminal.desktop`, `favourite-apps=['werewolf-terminal.desktop']`,
+  and the runtime keyfile is intact. So the data is right and the grid's
+  favourites/overview page is not rendering its tile (or places it outside the
+  visible area). The search entry also shows no typed text.
+* The terminal content is **clipped on the left** by roughly 90 px under phoc,
+  although its title bar is centered. Looks like a window/sizing issue inside
+  phoc rather than in our compositor.
+* Phosh logs `Could not find application for app-id 'term'` for the terminal
+  toplevel; `tests/linux/term.c` should use an app-id matching
+  `werewolf-terminal.desktop`.
