@@ -6825,3 +6825,36 @@ Verification on the fixed tree: Linux ABI matrix 26/26 (signals, pthreads,
 exit_group, Wayland, D-Bus, health 0/0/0), `cargo test --lib` 222,
 `tools/security_test.py --fuzz` 2/2 + 200000 fuzz cases, and the full Phosh
 demo script (`tools/demo.py --no-record`) unchanged.
+
+### M2.2 verdict applied: PSTATE sanitizer, F1/F2/F3, L10; M2.3 packet
+
+**L1 hardening.** `restore_frame` now rejects any `pstate & 0x1F != 0` and
+keeps only NZCV|DAIF (`0xF000_0000 | 0x3C0`); SS/IL/BTYPE/reserved bits are
+stripped. Review-table correction: SPSR_EL1 bit 30 is NZCV.**Z**, not the
+AArch32 selector — AA32 is M[4] (bit 4), already inside the 0x1F check.
+Terminating on bit 30 would kill every handler that returns with Z set.
+Two regressions pin the behaviour down: `sigreturn_flags` (Z survives,
+SS/IL stripped, task resumes) and `sigreturn_aa32` (M[4]=1 → SIGSEGV).
+
+**F1** — per-(sender,target) quota: `MAX_MESSAGES_PER_SENDER = 64`; a
+blocking `send` now returns `QueueFull` instead of letting one task pin a
+mailbox. **F3** — `grant_capability` only accepts the caller itself or a task
+it spawned (`ppid` check); the demos' concurrent-wait grant is parent→child
+and stays valid. **F2** — `CAP_DMA_SHARE` is a target-scoped right naming the
+DMA owner; silverd grants it over the net server to the driver and the shell,
+the shell delegates it to Wolfser through the new `SYS_CAP_FIND` (syscall 99).
+`CAP_MMIO` alone no longer maps another task's DMA. Per-region scoping stays
+for M3. Verified live: `ping 10.0.2.2` maps the server window and replies; no
+map failures. A full boot capture (`-serial …,wait=on`) shows the driver
+initialising and the kernel's DMA boot tests passing.
+
+**L10** — EL0 can mask IRQs (`msr daifset` is untrapped without FEAT_FGT on
+Cortex-A72): a single-CPU freeze. Accepted as a documented DoS (SMP product,
+timer PPI per PE); FGT platforms can trap it in M4.
+
+**M2.3 packet** — `docs/audit/M2.3/`: whole-file snapshots of `exceptions.rs`,
+`vfs.rs`, `sfs.rs`, `sfs_format.rs`, `elf.rs` plus line-numbered fault/COW
+excerpts; `fault-path.md` (leads C1-C8) and `vfs-sfs.md` (leads V1-V8).
+
+Verification: matrix 26/26, security suite 4/4 + 200000 fuzz cases,
+`cargo test --lib` 222, Phosh demo unchanged.

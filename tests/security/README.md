@@ -33,6 +33,8 @@ command mirrors `build_and_qemu.sh` (no display, serial on a Unix socket).
 |---|---|
 | `fd_lifetime` | An fd passed over `SCM_RIGHTS` is **duplicated/refcounted**, not remembered by number: the sender closes its copy, the freed number is recycled by unrelated memfds, and the receiver still reads the original file. Regression for the M0.2 class (fd lifetime / ownership across IPC) moved from user space into the kernel boundary. |
 | `sigreturn_pstate` | `rt_sigreturn` must reject a ucontext whose `pstate` is not EL0t. The child sets `PSTATE.M = EL1h` in its handler and traps with `udf` right after the interrupted syscall: on the unfixed kernel this is an `EL1 EXCEPTION` panic (and, with a kernel PC, an arbitrary EL1 call); with the fix the child dies with SIGSEGV and the parent prints the marker. |
+| `sigreturn_aa32` | `PSTATE.M[4] = 1` (AArch32) is a different execution state; the frame must be rejected (SIGSEGV), not `eret`ed into an unsupported mode. |
+| `sigreturn_flags` | The sanitizer keeps NZCV (bit 30 is `Z`, not the AArch32 selector) and strips SS/IL/reserved: the handler sets `Z|SS|IL|bit23`, the task must resume at EL0 and print the marker. |
 
 Planned (from the M2 audit reports in `docs/audit/M2/` and `docs/audit/M2.2/`):
 
@@ -45,6 +47,11 @@ Planned (from the M2 audit reports in `docs/audit/M2/` and `docs/audit/M2.2/`):
 - `sigreturn_pc` — the follow-up to `sigreturn_pstate`: an EL0t frame with a
   kernel PC must die on an EL0 instruction abort, never execute at EL1.
 - `blocked_kill` — a task that blocks SIGKILL must still die.
+- `mailbox_quota` — a native sender cannot exceed 64 unread messages per
+  target (needs a native probe; the Linux ABI has no `SYS_SEND`).
+- `dma_cross_read` — a `CAP_MMIO` holder without `CAP_DMA_SHARE` must fail to
+  map another task's window; with the right it must succeed (native probe).
+- `grant_foreign` — `SYS_CAP_GRANT` to a non-child pid must be refused.
 - `irq_orphan` — bind an SPI and exit before draining; the next interrupt
   must be masked as unknown, not halt the machine (R1).
 

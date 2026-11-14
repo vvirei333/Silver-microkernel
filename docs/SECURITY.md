@@ -83,7 +83,13 @@ Authority is a capability, not an id (`src/capability.rs`):
   handle over a child carries `CAP_ALL` but is not an own privilege, so it
   cannot pass device, mount or power rights on.
 - Delegation is all-or-nothing and bounded (`MAX_CAPS_PER_TASK = 96`); a
-  mixed global|scoped request through a handle grants neither.
+  mixed global|scoped request through a handle grants neither. Authority only
+  flows down: the recipient must be the caller itself or a task the caller
+  spawned (`SYS_CAP_GRANT` checks `ppid`).
+- `CAP_DMA_SHARE` is target-scoped to the task that owns a DMA window. The
+  net driver and the network clients receive it from silverd; the shell
+  delegates it to Wolfser via `SYS_CAP_FIND`. Holding `CAP_MMIO` alone does
+  not map another task's window.
 - Task ids and mailbox targets are **not** capabilities. `SYS_SEND` is
   ambient authority by pid today; see "Known gaps".
 
@@ -106,16 +112,14 @@ surface as an error code, never as a kernel abort driven by user input.
 
 ## Known gaps and accepted risks (tracked for M2)
 
-1. **Send-by-pid is ambient authority.** Any task can fill another task's
-   mailbox; there is no per-sender quota or capability on `SYS_SEND`. A task
-   can also spread a handle it owns to an arbitrary recipient pid
-   (`SYS_CAP_GRANT` takes a raw id): not an escalation, but uncontrolled
-   delegation. Decision pending (owner): per-pair quota vs. send capability.
-2. **Shared DMA is ambient for `CAP_MMIO` holders.** `SYS_MAP_PHYS[_NC]`
-   maps a range that overlaps *any* task's DMA window as shared memory. The
-   net server needs exactly this to see the driver's ring, but any other
-   `CAP_MMIO` holder can attach to it. Decision pending (owner): own-region
-   only, an explicit share grant, or a fixed broker list.
+1. **Send-by-pid is ambient authority.** Any task can send to any live pid;
+   there is no send capability. A single sender is now bounded to 64 unread
+   messages per target (`QueueFull` instead of blocking), so it can no longer
+   pin every legitimate client; the address remains ambient by design until a
+   capability-handle IPC model lands in M3.
+2. **DMA sharing is per owner, not per region.** `CAP_DMA_SHARE` names the
+   task whose window may be mapped; the holder can map any of that task's DMA
+   regions. Region-scoped grants (and revocation) are the M3 refinement.
 3. **Nameserver policy is user-space.** `R`/`L` reach Scout unauthenticated;
    name squatting/replacement depends on Scout's policy, not the kernel's.
 4. **No syscall filtering.** There is no seccomp-like profile; a task may call
@@ -133,6 +137,14 @@ surface as an error code, never as a kernel abort driven by user input.
    is a deliberate `KERNEL PANIC` (state may be inconsistent). Per-call caps
    (console write, fd/name limits) and the bounded tables keep user-driven
    allocations small, but an OOM is still a DoS, not a recoverable error.
+10. **EL0 can mask IRQs (L10).** Cortex-A72 has no FEAT_FGT, so `msr
+    daifset, #2` from EL0 is not trapped; a task that masks IRQs and spins
+    can starve the timer on a uniprocessor. The product runs SMP (two or more
+    cores in QEMU, eight on the phone target), where the other CPUs keep
+    scheduling; the timer PPI is per-PE, so a second CPU still preempts and
+    the task is killable. Upstream Linux has the same "don't do that" on UP;
+    platforms with FGT can trap the write in M4. This is a known DoS, not a
+    boundary break.
 
 These are findings in their own right for the auditor; nothing in this list
 is an excuse for a memory-safety bug.
@@ -149,7 +161,10 @@ is an excuse for a memory-safety bug.
 | F5 | allocation failure halts the kernel | accepted, documented (#9) | per-call caps bound reachable sizes |
 | F8 | BKL reentrancy is assumed by notify paths | contract now documented | documented above |
 | F9 | PID existence oracle | accepted for M2 | documented (#8) |
-| F1/F2/F3 | send-by-pid, shared DMA, grant-to-foreign-pid | ambient authority | open — owner decision |
+| F1 | send-by-pid could pin a mailbox with 256 messages | ambient authority → DoS | fixed: 64 unread per (sender,target) |
+| F2 | any `CAP_MMIO` holder mapped any task's DMA | ambient authority → cross-task read | fixed: target-scoped `CAP_DMA_SHARE` (per owner; per region in M3) |
+| F3 | a handle could delegate rights to an arbitrary pid | uncontrolled delegation | fixed: recipient must be self or own child |
+| L10 | EL0 can `msr daifset` and starve a uniprocessor | missing trap (no FGT) | accepted: SMP product, documented (#10) |
 
 ## Disclosure and fix protocol
 
