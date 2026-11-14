@@ -6310,3 +6310,24 @@ New blockers found in the same run:
 * Phosh logs `Could not find application for app-id 'term'` for the terminal
   toplevel; `tests/linux/term.c` should use an app-id matching
   `werewolf-terminal.desktop`.
+
+### The freeze was `close_range` walking to 4 billion
+
+GLib's spawned child closes inherited descriptors with
+`close_range(3, ~0U, 0)`. Our handler looped `while fd <= last` over the raw
+bound, so the first terminal command (which spawns busybox through
+`g_spawn_sync`) spent forever in `linux_fd::close`: QEMU at 100% of one core,
+the shm frame counter stopped, the input ring was not consumed and the
+terminal window stayed black. Clamp `last` to the descriptor table limit
+(256). `tests/linux/closerangeprobe.c` reproduces the call; `linux-test.sh`
+installs it as `linux-closerange` and it now returns immediately.
+
+Also removed the "vblank tick" in the compositor main loop that completed
+**every** pending frame callback on every iteration. Frame callbacks belong to
+a surface's commit (that path already sends `done`); the tick let a client
+with a blinking cursor drive a full-speed render loop.
+
+Still open after this fix: Phosh's app grid paints no tile even though GIO and
+GSettings see `werewolf-terminal.desktop` from inside the running session, and
+the terminal window content is clipped on the left under phoc. The terminal
+command output itself was not yet re-checked after the close_range fix.

@@ -5927,21 +5927,6 @@ void _start(void) {
             layer_compose();
         }
 #endif
-        /* Vblank tick: complete pending frame callbacks for every client. */
-        for (int index = 0; index < MAX_CLIENTS; index++) {
-            if (!clients[index].connected) {
-                continue;
-            }
-            current_client = index;
-            load_client(&clients[index]);
-            for (unsigned surface = 0; surface < SURFACE_IDS; surface++) {
-                if (frame_ids[surface] != 0) {
-                    send_done(clients[index].fd, frame_ids[surface], now_ms());
-                    frame_ids[surface] = 0;
-                }
-            }
-            save_client(&clients[index]);
-        }
     }
     for (int index = 0; index < MAX_CLIENTS; index++) {
         if (clients[index].connected) {

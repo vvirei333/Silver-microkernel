@@ -181,6 +181,15 @@ else
     GLIBTEST=""
 fi
 
+# `close_range(3, ~0U, 0)` is what GLib does in a spawned child. Walking
+# every descriptor to u32::MAX froze the nested-compositor session.
+if "$CC" -static -O2 -o build/closerangeprobe tests/linux/closerangeprobe.c; then
+    python3 scripts/sfs_inject.py "$IMAGE" build/closerangeprobe linux-closerange
+    CLOSE_RANGE=" linuxrun /sfs/linux-closerange"
+else
+    CLOSE_RANGE=""
+fi
+
 # A real static libc binary (the SFS image is 64 MiB; all of these fit).
 if "$CC" -static -O2 -o build/libc.elf tests/linux/libc.c 2>/dev/null; then
     printf 'readme!!' > build/readme.txt
@@ -286,4 +295,4 @@ else
 fi
 
 python3 scripts/sfs_fsck.py "$IMAGE"
-echo "installed: linuxrun /sfs/linux-hello  linuxrun /sfs/linux-rw$LIBC$DYN"
+echo "installed: linuxrun /sfs/linux-hello  linuxrun /sfs/linux-rw$CLOSE_RANGE$LIBC$DYN"

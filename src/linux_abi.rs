@@ -1197,9 +1197,18 @@ fn linux_fchmodat(dirfd: u64, path_pointer: u64) -> u64 {
 }
 
 /// `close_range(2)`: glib's spawn path uses it to drop inherited descriptors.
+/// It calls `close_range(3, ~0U, 0)`; walking to `u32::MAX` one descriptor at
+/// a time burned a core forever before the child could exec (the terminal
+/// "froze" on its first command). Only descriptor numbers the fd table can
+/// hold exist, so clamp to its limit.
 fn linux_close_range(first: u64, last: u64, flags: u64) -> u64 {
-    if flags & !1 != 0 || first > last {
+    if flags & !1 != 0 {
         return errno(EINVAL);
+    }
+    const MAX_DESCRIPTORS: u64 = 256;
+    let last = last.min(MAX_DESCRIPTORS - 1);
+    if first > last {
+        return 0;
     }
     let task = scheduler::current_task_id();
     let mut fd = first;
