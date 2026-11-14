@@ -6144,3 +6144,41 @@ message, while one launch always survives. The compositor still keeps
 client, so the id namespaces are not separated; that is the first suspect and
 the next thing to verify. Fixing it means moving the surface table into
 `ClientState`, like the buffer table already is.
+
+
+### New clients no longer wipe Phosh's layer effects
+
+Every accepted connection calls `reset_client()`, and it cleared the
+**global** `drag_slots[]` and `alpha_slots[]` tables unconditionally. The
+application connecting (the terminal) therefore destroyed Phosh's draggable
+home and panel objects. The symptom was confusing: the home folded when the
+toplevel appeared, and then a later commit of the home (still animating)
+called `layer_record_commit()`, which copies the client's margin (0) into the
+layer entry, while `drag_apply()` could no longer find the slot and returned
+silently. The overview slid back in behind the application window. The alpha
+slots were lost the same way, so later `set_alpha` requests were dropped.
+
+Fix: `DragSlot` and `AlphaSlot` carry the owning client (`current_client` is
+now declared before them, because the layer-effect helpers precede
+`ClientState`). Lookups match owner **and** id, `layer_effective_alpha()`
+matches the entry's owner, and `reset_client()` clears only the slots of the
+client being reset. `layer_surface_seq` is no longer zeroed per connection:
+it is global stacking order, and resetting it made a new layer surface look
+older than Phosh's existing ones.
+
+Verified: launching the Terminal from the tile folds the home and the
+desktop stays wallpaper + top bar + floating window (no app grid behind it);
+the top panel still unfolds by dragging down *after* the application has
+connected. The activity thumbnail still completes.
+
+Known follow-ups, both visible in this flow:
+
+* while an application window is mapped, `poll_input()` sends every event to
+  that client, so the shell (home bar, panel) cannot be dragged until the
+  window is hidden (Ctrl+T). A real window manager has to hit-test the shell
+  layers first and only give the remainder to the app.
+* the tile still starts one application per click (the first click focuses,
+  the second launches), and a second GTK client starting while the first is
+  still initialising can print `cannot open display:`. One window survives.
+  `surface_ids[]` is still one global table although surface ids are per
+  client; moving it into `ClientState` is the next isolation step.

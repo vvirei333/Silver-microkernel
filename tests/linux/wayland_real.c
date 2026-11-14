@@ -514,10 +514,18 @@ static StackedSlot *stacked_find(unsigned id) {
     return 0;
 }
 
+/* Client whose message is being served. Object ids are per client, so every
+   lookup in the tables below must also match the owner. Declared here because
+   the layer-effect helpers are used before ClientState is defined. */
+static int current_client = -1;
+
 /* zphoc_alpha_layer_surface_v1 helpers: one object per layer surface. */
 #define MAX_ALPHA_SURFACES 8
 typedef struct {
     int used;
+    /* The layer-surface object ids live in the owning client's namespace;
+       Phosh and an application both start their ids at 3. */
+    int owner;
     unsigned id;
     unsigned layer_surface;
     unsigned alpha; /* 0..255 */
@@ -526,7 +534,9 @@ static AlphaSlot alpha_slots[MAX_ALPHA_SURFACES];
 
 static AlphaSlot *alpha_slot_add(unsigned id, unsigned layer_surface) {
     for (unsigned index = 0; index < MAX_ALPHA_SURFACES; index++) {
-        if (alpha_slots[index].used && alpha_slots[index].layer_surface == layer_surface) {
+        if (alpha_slots[index].used &&
+            alpha_slots[index].owner == current_client &&
+            alpha_slots[index].layer_surface == layer_surface) {
             alpha_slots[index].id = id;
             return &alpha_slots[index];
         }
@@ -534,6 +544,7 @@ static AlphaSlot *alpha_slot_add(unsigned id, unsigned layer_surface) {
     for (unsigned index = 0; index < MAX_ALPHA_SURFACES; index++) {
         if (!alpha_slots[index].used) {
             alpha_slots[index].used = 1;
+            alpha_slots[index].owner = current_client;
             alpha_slots[index].id = id;
             alpha_slots[index].layer_surface = layer_surface;
             alpha_slots[index].alpha = 255;
@@ -545,7 +556,9 @@ static AlphaSlot *alpha_slot_add(unsigned id, unsigned layer_surface) {
 
 static AlphaSlot *alpha_slot_by_id(unsigned id) {
     for (unsigned index = 0; index < MAX_ALPHA_SURFACES; index++) {
-        if (alpha_slots[index].used && alpha_slots[index].id == id) {
+        if (alpha_slots[index].used &&
+            alpha_slots[index].owner == current_client &&
+            alpha_slots[index].id == id) {
             return &alpha_slots[index];
         }
     }
@@ -555,6 +568,7 @@ static AlphaSlot *alpha_slot_by_id(unsigned id) {
 static unsigned alpha_for_layer_surface(unsigned layer_surface) {
     for (unsigned index = 0; index < MAX_ALPHA_SURFACES; index++) {
         if (alpha_slots[index].used &&
+            alpha_slots[index].owner == current_client &&
             alpha_slots[index].layer_surface == layer_surface) {
             return alpha_slots[index].alpha;
         }
@@ -1154,7 +1168,6 @@ static int focused;
 static unsigned char surface_entered[SURFACE_IDS];
 static int selection_changed;
 static int wants_offer;
-static int current_client = -1;
 
 typedef struct {
     unsigned registry_id;
@@ -1502,41 +1515,6 @@ typedef struct {
 } ThumbnailFrame;
 static ThumbnailFrame thumbnails[MAX_THUMBNAILS];
 
-/// Diagnostics for the thumbnail handshake (no stdio in this binary).
-#ifdef SERVE_ONLY
-static void thumbnail_log(const char *label, unsigned first, unsigned second) {
-    char text[160];
-    unsigned length = 0;
-    static const char prefix[] = "phosh: thumb ";
-    for (unsigned index = 0; index < sizeof(prefix) - 1; index++) {
-        text[length++] = prefix[index];
-    }
-    for (unsigned index = 0; label[index] != 0 && length < sizeof(text) - 24;
-         index++) {
-        text[length++] = label[index];
-    }
-    unsigned values[2] = {first, second};
-    for (unsigned value_index = 0; value_index < 2; value_index++) {
-        unsigned value = values[value_index];
-        char digits[12];
-        unsigned count = 0;
-        text[length++] = ' ';
-        if (value == 0) {
-            digits[count++] = '0';
-        }
-        while (value != 0) {
-            digits[count++] = (char)('0' + value % 10);
-            value /= 10;
-        }
-        while (count != 0) {
-            text[length++] = digits[--count];
-        }
-    }
-    text[length++] = '\n';
-    sys3(64, 1, (long)text, length);
-}
-#endif
-
 static ThumbnailFrame *thumbnail_by_id(unsigned id) {
     if (id == 0) {
         return 0;
@@ -1715,15 +1693,6 @@ static int thumbnail_copy(long client, ThumbnailFrame *frame,
     begin(buffer_object, 0 /* wl_buffer.release */);
     finish();
     send_message(client, -1);
-#ifdef SERVE_ONLY
-    /* One line as proof the handshake completed; Phosh asks again on every
-       activity resize, which does not need a log line each. */
-    static int thumbnail_reported;
-    if (!thumbnail_reported) {
-        thumbnail_reported = 1;
-        thumbnail_log("ready", frame->width, frame->height);
-    }
-#endif
     return 1;
 }
 
@@ -2085,6 +2054,10 @@ static int layer_entry_above(const LayerEntry *a, const LayerEntry *b) {
 #define MAX_DRAG_SURFACES 4
 typedef struct {
     int used;
+    /* Object ids are per client; Phosh owns the drag surfaces, but the
+       table is global and must not be reset by a new application's
+       connection. See reset_client(). */
+    int owner;
     unsigned id;            /* zphoc_draggable_layer_surface_v1 object */
     unsigned layer_surface; /* zwlr_layer_surface_v1 object */
     int folded;
@@ -2115,7 +2088,8 @@ static unsigned layer_effective_alpha(const LayerEntry *entry) {
     if (entry->below != 0) {
         for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
             DragSlot *slot = &drag_slots[index];
-            if (slot->used && slot->layer_surface == entry->below) {
+            if (slot->used && slot->owner == entry->owner &&
+                slot->layer_surface == entry->below) {
                 if (slot->state == 0 && !slot->dragging) {
                     return 0;
                 }
@@ -2608,7 +2582,9 @@ static void pointer_send_motion(long client, int x, int y) {
 
 static DragSlot *drag_slot_by_id(unsigned id) {
     for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
-        if (drag_slots[index].used && drag_slots[index].id == id) {
+        if (drag_slots[index].used &&
+            drag_slots[index].owner == current_client &&
+            drag_slots[index].id == id) {
             return &drag_slots[index];
         }
     }
@@ -2621,6 +2597,7 @@ static DragSlot *drag_slot_by_layer_surface(unsigned layer_surface) {
     }
     for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
         if (drag_slots[index].used &&
+            drag_slots[index].owner == current_client &&
             drag_slots[index].layer_surface == layer_surface) {
             return &drag_slots[index];
         }
@@ -2642,6 +2619,7 @@ static DragSlot *drag_slot_add(unsigned id, unsigned layer_surface) {
         return 0;
     }
     slot->used = 1;
+    slot->owner = current_client;
     slot->id = id;
     slot->layer_surface = layer_surface;
     slot->folded = 0;
@@ -4989,6 +4967,7 @@ static int serve(long client) {
                                      probe < MAX_DRAG_SURFACES; probe++) {
                                     DragSlot *below = &drag_slots[probe];
                                     if (below->used &&
+                                        below->owner == stored->owner &&
                                         below->layer_surface == stored->below &&
                                         below->state == 0 &&
                                         !below->dragging) {
@@ -5326,7 +5305,6 @@ static void reset_client(void) {
     layer_shell_id = 0;
     layer_surface_id = 0;
     layer_surface_surface = 0;
-    layer_surface_seq = 0;
     for (unsigned index = 0; index < MAX_REGIONS; index++) {
         regions[index].id = 0;
     }
@@ -5373,12 +5351,18 @@ static void reset_client(void) {
         layer_surfaces[index].alpha = 255;
     }
     for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
+        if (drag_slots[index].owner != current_client) {
+            continue;
+        }
         drag_slots[index].used = 0;
         drag_slots[index].id = 0;
         drag_slots[index].layer_surface = 0;
     }
     drag_active = 0;
     for (unsigned index = 0; index < MAX_ALPHA_SURFACES; index++) {
+        if (alpha_slots[index].owner != current_client) {
+            continue;
+        }
         alpha_slots[index].used = 0;
         alpha_slots[index].id = 0;
         alpha_slots[index].layer_surface = 0;
