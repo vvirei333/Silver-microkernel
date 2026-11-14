@@ -5791,3 +5791,32 @@ its first frames are `attach(NULL)` - GDK may treat a layer-shell window that
 never got an `xdg`-style configure cycle as not drawable. Running Phosh with
 `G_MESSAGES_DEBUG=all` and reading `phosh-home`/`phosh-drag-surface` debug
 lines is the cheapest way to see whether the state change happens at all.
+
+
+### Swipes on layer surfaces, and two Phosh findings
+
+* While a button is held on a **layer** surface the compositor now keeps the
+  pointer still: Phosh's gestures are touch gestures (its lockscreen only
+  unlocks on a swipe `is_touch`), so forwarding the motion turned every mouse
+  swipe into a drag that cancelled the click. A press plus a release at the
+  same place is a click, which unlocks (require-unlock is off) and presses
+  panel buttons. The application window still gets real motion for selections
+  and scrolling. The quick-settings drag is unaffected: it is a
+  compositor-side drag (`drag_begin`), not a pointer motion stream.
+* A scene dump written into the ivshmem window (the serial console shreds
+  multi-line output when Phosh also logs) showed, the moment Phosh starts:
+  * the home/overview **is unfolded** (`state 1`, `current 0`, margin 0) with
+    `drag_mode = NONE` (Phosh disables dragging while unfolded), so a swipe on
+    the home bar cannot grab it - a click toggles it instead;
+  * the home surface (74/75) **never commits a buffer**: Phosh maps it,
+    configures it, logs `Mapped/Configured 'phosh home'`, and then only sends
+    `attach(NULL)`. Nothing paints, so the app grid stays invisible even
+    though the state machine says it is open. Only the lockscreen (43) and the
+    panel/backdrop (62/69) ever draw.
+* The panel/quick-settings layer surface sometimes ends up configured
+  **1024x768** instead of its content height (252 or 32). `set_size(0, 0)`
+  means "let me size myself", but our configure always proposes the whole
+  output and GTK adopts it, so the folded sheet covers half the screen and the
+  open one covers everything - the "шторка пол экрана" symptom. Next: propose
+  the output size only for axes that are anchored on both sides and keep the
+  client's own size on the free axis.

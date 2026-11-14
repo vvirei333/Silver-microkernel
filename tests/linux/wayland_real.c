@@ -2747,7 +2747,19 @@ static void poll_input(void) {
             } else {
                 pointer_x = x;
                 pointer_y = y;
-                pointer_route(client, x, y, 1);
+                /* While a button is held on a *layer* surface, keep the
+                   pointer still: the shell's gestures are touch gestures
+                   (Phosh's lockscreen unlocks on a swipe with touch only), so
+                   forwarding the motion turned every mouse swipe into a drag
+                   that cancelled the click. A press plus a release at the same
+                   place is a click, and a click unlocks (require-unlock is
+                   off) and presses buttons on the panel. The application
+                   window still gets real motion for selections and scrolling. */
+                int grabbed_layer = pointer_grab != 0 &&
+                                    layer_entry_by_surface(pointer_grab) != 0;
+                if (!grabbed_layer) {
+                    pointer_route(client, x, y, 1);
+                }
             }
         } else if (kind == INPUT_CLICK || kind == INPUT_RELEASE) {
             if (kind == INPUT_CLICK && drag_begin(client, x, y)) {
