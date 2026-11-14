@@ -44,6 +44,9 @@ Icon=utilities-terminal
 Terminal=false
 Categories=System;Utility;
 Keywords=shell;command;busybox;
+# Phosh's app grid only offers apps that claim a mobile form factor unless
+# "Show All Apps" is pressed; without this the launcher tile is invisible.
+X-Purism-FormFactor=Mobile;
 StartupNotify=false
 '''
 

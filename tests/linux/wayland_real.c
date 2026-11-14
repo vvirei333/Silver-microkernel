@@ -1820,7 +1820,12 @@ static int layer_entry_above(const LayerEntry *a, const LayerEntry *b) {
     if (b->above != 0 && b->above == a->layer_surface) {
         return 0;
     }
-    return a->seq > b->seq;
+    /* Without an explicit relation the surface created *first* is on top:
+       wlroots prepends new layer surfaces to the layer list and draws that
+       list in order, so the oldest surface ends up above the newer ones.
+       Phosh depends on it - the top panel is created before the home and its
+       full-screen background, and must stay above them. */
+    return a->seq < b->seq;
 }
 
 /// Topmost layer surface under a physical output coordinate, or 0. Higher
@@ -2057,10 +2062,20 @@ static void layer_compose(void) {
     screen_seq += 1;
     *(volatile unsigned *)(screen + 0x18) = screen_seq;
     __asm__ volatile("dsb sy" ::: "memory");
+    /* Desktop backdrop. Phosh's own wallpaper lives in the home's background
+       surface, which fades out when the overview folds, and its background
+       manager needs a configured picture; without one the root would be a
+       flat near-black. Paint a night-sky gradient instead: one multiply per
+       row, then a plain fill, so it costs the same as the flat colour. */
     for (int row = clip_y0; row < clip_y1; row++) {
         unsigned *line = destination + (unsigned)row * out_width;
+        unsigned t = (unsigned)row * 255u / (OUT_HEIGHT > 1 ? OUT_HEIGHT - 1 : 1);
+        unsigned red = 10u + (28u - 10u) * t / 255u;
+        unsigned green = 16u + (36u - 16u) * t / 255u;
+        unsigned blue = 36u + (66u - 36u) * t / 255u;
+        unsigned colour = 0xFF000000u | (blue << 16) | (green << 8) | red;
         for (int column = clip_x0; column < clip_x1; column++) {
-            line[column] = 0xFF101014u;
+            line[column] = colour;
         }
     }
     for (unsigned wanted = 0; wanted <= 3; wanted++) {
@@ -3033,7 +3048,11 @@ static void poll_input(void) {
                 /* A click can arrive without a preceding motion (the viewer
                    only sends moves while hovering). Route it first so the
                    button goes to the surface under the cursor. */
-                pointer_route(client, x, y, 0);
+                /* Send the position, not just the enter: GTK positions a
+                   click from the last motion/enter it saw, and a release with
+                   stale coordinates can land outside the widget that was
+                   pressed (the click then only focuses it). */
+                pointer_route(client, x, y, 1);
                 if (kind == INPUT_CLICK) {
                     pointer_grab = pointer_target;
                 }
@@ -5167,7 +5186,12 @@ void _start(void) {
                    This desktop has no password yet: unlock on a key press or
                    a swipe, like a freshly provisioned device. */
                 "[sm/puri/phosh/lockscreen]\n"
-                "require-unlock=false\n";
+                "require-unlock=false\n"
+                /* The app grid's home page lists favourites; with an empty
+                   list the launcher is a blank page with only the search
+                   entry. */
+                "[org/gnome/shell]\n"
+                "favorite-apps=['werewolf-terminal.desktop']\n";
             sys3(64 /* write */, settings_fd, (long)settings,
                  sizeof(settings) - 1);
             sys3(57 /* close */, settings_fd, 0, 0);
@@ -5250,6 +5274,9 @@ void _start(void) {
             "GSK_RENDERER=cairo",
 #endif
             "GTK_A11Y=none",
+            /* GDesktopAppInfo execs gio-launch-desktop instead of forking the
+               app itself; the desktop's libexec copy is not in this image. */
+            "GIO_LAUNCH_DESKTOP=/sfs/gio-launch-desktop",
             "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session",
             "XDG_CURRENT_DESKTOP=Phosh",
             "XDG_SESSION_TYPE=wayland",

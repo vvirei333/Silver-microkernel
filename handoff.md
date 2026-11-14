@@ -5899,3 +5899,35 @@ dragged by its title bar and closed with the compositor's button. Phosh gets
 the toplevel and draws an activity card for it. Next: fold the home reliably
 when a toplevel exists, give the top panel a visible bar, and launch from the
 app grid.
+
+
+### A usable desktop: launcher tiles, GIO launching, wallpapers
+
+* **Layer order.** Within a layer, the surface created *first* is on top, as in
+  wlroots (new layer surfaces are prepended to the layer list and the list is
+  drawn in order). The old "newest on top" fallback put the home's full-screen
+  wallpaper above the top panel, so the bar was invisible. Explicit
+  stack_below/stack_above still wins; only the fallback changed.
+* **Launcher tiles.** Phosh's grid hides apps that do not claim a mobile form
+  factor, and its home page only lists favourites. The terminal entry now has
+  `X-Purism-FormFactor=Mobile;` and the compositor seeds
+  `org.gnome.shell favorite-apps=['werewolf-terminal.desktop']` in the keyfile,
+  so a Terminal tile appears on the overview.
+* **Launching.** GDesktopAppInfo does not fork the app itself: it execs
+  `gio-launch-desktop` (to set GIO_LAUNCHED_DESKTOP_FILE_PID safely). The
+  desktop's libexec copy is not in the image - `tools/gio-launch-desktop.c`
+  builds a 20-line replacement, installed at /sfs/gio-launch-desktop, and
+  `GIO_LAUNCH_DESKTOP` points at it. Clicking the tile now starts /sfs/term.
+* **Desktop backdrop.** Phosh's wallpaper lives in the home's background
+  surface, which fades out when the overview folds; the background manager
+  draws nothing (no configured picture), so the desktop was black. The
+  compositor now paints a night-sky vertical gradient (one multiply per row)
+  as the root fill.
+* **Clicks.** The press/release now route with a motion event so GTK always has
+  the position, not just the enter. A first click right after unlocking still
+  sometimes only focuses the grid; a second click always activates.
+
+State: lock screen -> Space unlock -> overview (wallpaper, search, Terminal
+tile) -> tapping Terminal launches /sfs/term through GIO -> Phosh folds the
+overview (the foreign toplevel arrives) -> the terminal floats over the
+gradient desktop with a visible top bar, movable by its title bar and closable.
