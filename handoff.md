@@ -6001,3 +6001,23 @@ the backdrop in.
 
 Result: with a terminal open the desktop shows the wallpaper (the home's
 background surface is back), the top panel bar, and the floating window.
+
+
+### Unlocking with the mouse
+
+Two bugs together made the lock screen impossible to unlock with the mouse:
+
+* `drag_begin` matched a press against a drag surface by **rectangle only**, and
+  Phosh keeps the home (a drag surface) unfolded at full size *underneath* the
+  lock screen. Every press anywhere on the screen was claimed as a home drag
+  before it could reach the lock screen. A drag surface now only claims the
+  press when it is the surface under the pointer (`layer_hit_test`).
+* Phosh's unlock is a touch swipe on its deck; a plain mouse click never
+  produced it. With `require-unlock=false` any key press unlocks, so a click on
+  a *plain* layer surface (no drag slot, not the app window) now sends Space to
+  that client and swallows the press/release. On the desktop the topmost
+  surface is always a drag surface (panel/home) or the app window, so normal
+  clicks are unaffected.
+
+Verified: a plain click on the lock screen unlocks to the overview; the
+Terminal tile, launching and the floating window still work.

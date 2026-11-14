@@ -2458,8 +2458,29 @@ static void drag_notify(long client, DragSlot *slot, unsigned opcode,
 /// Starts a drag when the press is inside a draggable surface (or its drag
 /// handle) and returns 1, so the press is consumed by the gesture instead of
 /// being forwarded to the client.
+/// 1 when this layer surface belongs to a drag slot (panel, home).
+static int layer_has_drag_surface(unsigned surface) {
+    for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
+        DragSlot *slot = &drag_slots[index];
+        if (!slot->used) {
+            continue;
+        }
+        LayerSurface *ls = layer_surface_by_id(slot->layer_surface);
+        if (ls != 0 && ls->surface == surface) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int drag_begin(long client, unsigned px, unsigned py) {
     (void)client;
+    /* A draggable surface may only claim the press when it is the surface
+       under the pointer. Phosh keeps the home (a drag surface) unfolded at
+       full size underneath the lock screen; matching by rectangle alone made
+       every press on the lock screen a home drag, so it could never be
+       unlocked with the mouse. */
+    unsigned under_pointer = layer_hit_test(px, py);
     for (unsigned index = 0; index < MAX_DRAG_SURFACES; index++) {
         DragSlot *slot = &drag_slots[index];
         if (!slot->used) {
@@ -2477,6 +2498,9 @@ static int drag_begin(long client, unsigned px, unsigned py) {
             continue;
         }
         if (entry->owner != current_client) {
+            continue;
+        }
+        if (ls->surface != under_pointer) {
             continue;
         }
         int axis = drag_axis(entry->anchor);
@@ -2958,6 +2982,39 @@ static void keyboard_send_modifiers(long client, unsigned depressed) {
     send_message(client, -1);
 }
 
+/// Clicking a plain layer surface (the lock screen) sends Space to the client:
+/// with `require-unlock=false` that is what unlocks it. Returns 1 when it did.
+static int layer_unlock_on_click(unsigned px, unsigned py) {
+    unsigned surface = layer_hit_test(px, py);
+    if (surface == 0 || layer_has_drag_surface(surface)) {
+        return 0;
+    }
+    if (app_window.used && !app_window.hidden &&
+        surface == app_window.surface) {
+        return 0;
+    }
+    if (keyboard_id == 0) {
+        return 0;
+    }
+    keyboard_route(current_client);
+    unsigned time = now_ms();
+    begin(keyboard_id, 3 /* key */);
+    put_u32(configure_serial);
+    put_u32(time);
+    put_u32(57); /* KEY_SPACE */
+    put_u32(1);
+    finish();
+    send_message(clients[current_client].fd, -1);
+    begin(keyboard_id, 3);
+    put_u32(configure_serial);
+    put_u32(time + 1);
+    put_u32(57);
+    put_u32(0);
+    finish();
+    send_message(clients[current_client].fd, -1);
+    return 1;
+}
+
 static void poll_input(void) {
     if (screen == 0) {
         return;
@@ -3040,6 +3097,12 @@ static void poll_input(void) {
                 chrome_grab = 0;
             } else if (kind == INPUT_CLICK && drag_begin(client, x, y)) {
                 /* A layer-surface drag claims the press. */
+            } else if (kind == INPUT_CLICK &&
+                       (chrome_grab = layer_unlock_on_click(x, y))) {
+                /* The lock screen has no drag surface and Phosh's unlock is a
+                   touch swipe, which a mouse cannot produce. A click on it is
+                   the closest thing; with require-unlock off a key press
+                   unlocks, so a click sends one. */
             } else if (kind == INPUT_RELEASE && window_drag) {
                 window_drag = 0;
             } else if (kind == INPUT_RELEASE && drag_active != 0) {
