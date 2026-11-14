@@ -1323,8 +1323,15 @@ static ClientState clients[MAX_CLIENTS];
 
 /* The newest xdg_toplevel, drawn over the layer scene. One window is enough
  * until the compositor grows a real window manager. */
+#if defined(SERVE_PHOC)
+/* phoc (a nested wlroots compositor) owns the whole output: its nested output
+   is the window, so configure it at the full screen size. */
+#define APP_WIN_WIDTH ((int)OUT_WIDTH)
+#define APP_WIN_HEIGHT ((int)OUT_HEIGHT)
+#else
 #define APP_WIN_WIDTH 780
 #define APP_WIN_HEIGHT 520
+#endif
 typedef struct {
     int used;
     int owner;
@@ -2229,6 +2236,12 @@ static void close_app_window(void) {
 /// 1 when the compositor's window chrome (close button / title drag) took the
 /// press, so it must not reach the application.
 static int app_window_chrome(unsigned px, unsigned py) {
+#ifdef SERVE_PHOC
+    (void)px;
+    (void)py;
+    /* No compositor-drawn chrome around the nested compositor. */
+    return 0;
+#endif
     if (!app_window.used || app_window.hidden || !app_window.copy_ready ||
         app_window.owner != current_client) {
         return 0;
@@ -2469,6 +2482,7 @@ static void layer_compose(void) {
                 *target = 0xFF000000u | (blue << 16) | (green << 8) | red;
             }
         }
+#ifndef SERVE_PHOC
         /* Window outline and close button. The client's own title bar is at
            the top of its buffer, so the button lands in its right corner. */
         int chrome_x, chrome_y, chrome_w, chrome_h;
@@ -2506,6 +2520,7 @@ static void layer_compose(void) {
                     0xFF000000u | colour;
             }
         }
+#endif
     }
     *(volatile unsigned *)(screen + 0x00) = 0x57494E31u;
     *(volatile unsigned *)(screen + 0x08) = out_width;
@@ -5662,6 +5677,11 @@ void _start(void) {
         static const char *argv[] = {"/sfs/term", 0};
 #elif defined(SERVE_PHOSH)
         static const char *argv[] = {"/sfs/phosh", 0};
+#elif defined(SERVE_PHOC)
+        /* Real postmarketOS stack: phoc is the compositor and starts Phosh as
+           its shell. -S waits for phosh_private.set_shell_state(up). */
+        static const char *argv[] = {"/sfs/phoc", "-C", "/sfs/phoc.ini",
+                                     "-S", "-E", "/sfs/phosh", 0};
 #else
         static const char *argv[] = {"/sfs/gtkdemo", 0};
 #endif
@@ -5684,6 +5704,15 @@ void _start(void) {
                libraries) before the first frame. */
             "GDK_GL=disable",
             "GDK_DEBUG=gl-disable",
+#if defined(SERVE_PHOC)
+            /* wlroots nested inside this compositor, software renderer: one
+               nested output is the host window, and pixman keeps Mesa out of
+               the picture until the GL path is needed. */
+            "WLR_BACKENDS=wayland",
+            "WLR_RENDERER=pixman",
+            "WLR_RENDERER_ALLOW_SOFTWARE=1",
+            "WLR_WL_OUTPUTS=1",
+#endif
 #if defined(SERVE_GTK4) || defined(SERVE_WLGL)
             /* GTK4 renders through GSK; "gl" goes EGL -> virgl. The Mesa
                files live in the SFS root, and libgallium must be global so

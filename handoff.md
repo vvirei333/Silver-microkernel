@@ -6182,3 +6182,51 @@ Known follow-ups, both visible in this flow:
   still initialising can print `cannot open display:`. One window survives.
   `surface_ids[]` is still one global table although surface ids are per
   client; moving it into `ClientState` is the next isolation step.
+
+
+## 2026-11-14 — Nested phoc (WIP): the real postmarketOS stack
+
+Decision: stop growing the hand-written compositor into a window manager and
+run **phoc** (postmarketOS' wlroots compositor) as a nested client instead.
+Our compositor becomes a thin host-window shim; phoc owns windows, input,
+layer-shell, screenshots and starts Phosh as its shell.
+
+Shipped in this WIP commit:
+
+* `wayland_real.c` has a `SERVE_PHOC` target. It configures the nested output
+  at the full 1024x768, draws no compositor chrome/close button, and execs
+  `/sfs/phoc -C /sfs/phoc.ini -S -E /sfs/phosh` with
+  `WLR_BACKENDS=wayland`, `WLR_RENDERER=pixman`,
+  `WLR_RENDERER_ALLOW_SOFTWARE=1`, `WLR_WL_OUTPUTS=1`. `phoc-serve` is built
+  with `-DSERVE_ONLY -DSERVE_PHOC`.
+* `tools/build_phoc_image.py` installs phoc 0.57.0 (staged in
+  `/tmp/alarm/x-phoc`), libwlroots-0.20 and the 17 missing SONAMEs from
+  `/tmp/alarm/phocroot` (18 files, 5 MiB), plus a one-line `phoc.ini`
+  (`xwayland=false`). The image already had phoc's gschema compiled in.
+* Input sources: the `wlroots0.20`, `libinput`, `vulkan-icd-loader`,
+  `lcms2`, `seatd`, `libdisplay-info`, `libliftoff`, `xcb-util-*` packages
+  were staged with `/tmp/opencode/stage_phoc.py` (pacman closure from the
+  aarch64 mirror, cache in `/tmp/alarm/cache`).
+
+Guest result: phoc starts inside our compositor and connects, logs the
+expected `drmGetDeviceFromDevId failed` / `Linux dmabuf support unavailable`
+(pixman does not need dmabuf), then dies at:
+
+    phoc-server-WARNING: Unable to open wayland socket: Invalid argument
+
+That is `wl_display_add_socket_auto()` failing. Our kernel has no filesystem
+socket files at all: AF_UNIX `bind` registers the path in a kernel listener
+table (`src/linux_fd.rs`), and `read_sockaddr` clamps to 110 bytes. Suspects
+for the EINVAL, in order:
+
+1. libwayland-server's `bind()` sockaddr length (it passes the full
+   `sizeof(struct sockaddr_un)`; that should be accepted).
+2. a syscall around socket creation (`SOCK_CLOEXEC`, `listen`, a
+   `fchmod`/`rename` pair) returning EINVAL and libwayland reporting it.
+3. `/tmp` handling for the generated `wayland-N` name.
+
+Next step: instrument `linux_bind`/`linux_socket`/`linux_listen` to print the
+errno and the path for the phoc process, or run a tiny guest client that
+calls `wl_display_add_socket_auto` against libwayland-server directly.
+Once the socket opens, verify Phosh appears through phoc and that input
+(including a real XKB keymap, which `phoc` will need) reaches it.
