@@ -118,6 +118,16 @@ SHA256 (assets/demo-0.1.2.gif) = c10ed8820c6c180a92c8502aeaf3883f3b71aca91dbd384
 SHA256 (assets/silver-fastfetch-0.1.2.png) = 8ff91fd3bb8aeb06ddec7e59b555574cfad7827acb1ab842030ba530d84d885c
 ```
 
+## Post-release fixes on `main`
+
+These land after the tag and will be in 0.1.3:
+
+- **HTTP chunked-body DoS (fixed in `5b01348`).** A response with a chunk size
+  of `0xFFFFFFFFFFFFFFFF` made the network server spin forever (the parser's
+  `input + 1` wrapped in release builds). 0.1.2 binaries are affected. The
+  parser now clamps its cursor; the regression is the named seed of the host
+  fuzzer in `tests/security/fuzz/`.
+
 ## License and project direction
 
 MIT — see `LICENSE`. The project vector (console OS first, Linux applications
