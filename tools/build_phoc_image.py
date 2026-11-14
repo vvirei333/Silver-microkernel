@@ -23,6 +23,11 @@ from sfs_inject import Image  # noqa: E402
 PHOC = '/tmp/alarm/x-phoc/usr/bin/phoc'
 PHOC_LIBS = '/tmp/alarm/phocroot/usr/lib'
 SERVE = 'build/phoc_serve.elf'
+# wlroots 0.20's pixman renderer has no `update_from_buffer`, so a client that
+# attaches a fresh shm buffer with partial damage loses everything outside the
+# damage (black rectangles). The shim restores the undamaged pixels client
+# side; the wrapper preloads it into Phosh.
+SHIM = 'build/damage_keep.so'
 DEFAULT_IMAGE = os.path.expanduser('~/phosh-state/disk_phosh.img')
 
 PHOC_INI = b'''[core]
@@ -34,6 +39,11 @@ xwayland=false
 # for a different scale. Give it the same 300x200 mm / scale 1 the mini
 # compositor advertises.
 [output:WL-1]
+# wlroots' wayland backend defaults to a 1280x720 host surface. Our scanout
+# and window are 1024x768, so ask for a custom mode that matches; otherwise
+# phoc's buffer is 1280x720 and blitting it crops 128 px on each side (which
+# is where Phosh draws the leftmost app-grid favourites).
+mode = 1024x768
 scale = 1
 phys_width = 300
 phys_height = 200
@@ -136,6 +146,14 @@ def main():
     files.update(written)
     files['phoc.ini'] = PHOC_INI
     files['phoc-serve'] = open(SERVE, 'rb').read()
+
+    if not os.path.exists(SHIM):
+        subprocess.run(['aarch64-linux-gnu-gcc', '-shared', '-fPIC', '-O2',
+                        '-o', SHIM, 'tests/linux/damage_keep.c',
+                        '-Lthird_party/wayland-aarch64/lib',
+                        '-Wl,-rpath,/sfs', '-Wl,--no-as-needed',
+                        '-l:libwayland-client.so', '-ldl'], check=True)
+    files['damage_keep.so'] = open(SHIM, 'rb').read()
 
     for name, payload in files.items():
         if len(name.encode()) > 27:

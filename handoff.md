@@ -6418,3 +6418,50 @@ frame callbacks tick, and forcing whole-output damage does not repaint the
 tile. The next concrete probe is the home layer buffer itself: capture it under
 both hosts and compare the favourite region, or log the layer-surface
 configure (width/height/scale) Phosh acks under phoc.
+
+### The app-grid tile was a cropped nested output
+
+phoc's nested wlroots output defaults to **1280x720**, not our 1024x768
+scanout. The wrapper received 1280x720 buffers, centred them (x = -128,
+y = 40) and clipped, so 128 px on each side of phoc's output never reached
+the screen. Phosh lays the overview out for 1280 px, so the leftmost
+favourite tile sat exactly in the cropped strip — visible under the mini
+compositor, missing under phoc.
+
+Fixes, both verified by screenshot (`final_grid`): `[output:WL-1] mode =
+1024x768` in `phoc.ini` (the wayland backend has no fixed mode list, so phoc
+sets a custom mode and resizes its host surface), and `SERVE_PHOC` pins the
+nested window at (0, 0) instead of the compositor's default 40 px panel
+inset. The grid now matches the mini compositor 1:1 and the Terminal
+favourite draws.
+
+### What is left: a tap in the app grid blacks the screen under phoc
+
+Any tap that gives a text entry focus (the search field, or launching the
+terminal) turns the output black; only a 144x1 sliver in the top-left row
+stays. Findings so far:
+
+* The client side is correct. A `wl_proxy_marshal_array_flags` interposer
+  (`tests/linux/damage_keep.c`) tracks shm pools/buffers and replays the
+  previous frame into the regions the client did not damage; it logs the
+  fill for the 1024x768 home layer at the moment of the black frame.
+* phoc still renders black with `PHOC_DEBUG=damage-whole`,
+  `disable-animations` and `force-shell-reveal`, so it is not output damage
+  tracking either.
+* Phosh fades layer surfaces through phoc's private
+  `zphoc_layer_shell_effects_v1` alpha protocol (`home.c` sets the home
+  background alpha to 0 when the overview folds, `fader.c`/`splash.c` do the
+  same for blanking). Hiding the global makes phoc report
+  `zphoc_layer_shell_effects_v1: (nil)` but Phosh then never reaches
+  "Phosh ready", so the extension cannot simply be dropped.
+* phoc logs `phoc-output-CRITICAL: Stacked surface phosh top-panel background
+  and target phosh top-panel surface not in same layer` around the unlock.
+  The top-panel background is a second layer surface Phosh stacks under the
+  panel; phoc rejects it when the two are in different layers.
+
+Next: follow that stacked-surface error. Either make Phosh's top-panel
+background use the same layer (its `PhoshLayerSurface` namespace), or patch
+phoc so a rejected stack keeps the surface in place, then re-test a tap in
+the grid. `damage_keep.c` is a real workaround for wlroots' missing pixman
+`update_from_buffer` and is preloaded into Phosh; it does not by itself fix
+the black frame.

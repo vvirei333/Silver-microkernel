@@ -4955,6 +4955,14 @@ static int serve(long client) {
                             if (app_window.toplevel == 0) {
                                 app_window.toplevel = toplevel_id;
                             }
+#ifdef SERVE_PHOC
+                            /* phoc's nested output is the whole scanout, so it
+                               goes at the origin and is not inset for the
+                               compositor's own panel. Keeping the window at
+                               (0, 0) also makes the blit 1:1. */
+                            app_window.x = 0;
+                            app_window.y = 0;
+#else
                             if (app_window.x == 0 && app_window.y == 0) {
                                 int content_w = (int)buffer_width -
                                                 2 * (int)window_geometry_x;
@@ -4968,6 +4976,7 @@ static int serve(long client) {
                                     ((int)LOGICAL_HEIGHT - content_h) / 2;
                                 if (app_window.y < 40) app_window.y = 40;
                             }
+#endif
                             app_window.width = (unsigned)buffer_width;
                             app_window.height = (unsigned)buffer_height;
                             app_window.stride = buffer_stride;
@@ -5821,6 +5830,17 @@ void _start(void) {
                     entry[6] == 'D' && entry[7] == '_' && entry[8] == 'D') {
                     shell_envp[index] = "WAYLAND_DISPLAY=wayland-0";
                 }
+            }
+            /* wlroots 0.20's pixman renderer cannot update a texture in
+               place, so a client that attaches a fresh shm buffer with
+               partial damage loses everything outside that damage (black
+               rectangles). The shim copies the previous buffer's pixels into
+               the undamaged area before commit, which is what a compositor
+               with `update_from_buffer` does. Phosh and the apps it spawns
+               inherit the preload; phoc itself does not need it. */
+            if (count + 1 < 64) {
+                shell_envp[count] = "LD_PRELOAD=/sfs/damage_keep.so";
+                shell_envp[count + 1] = 0;
             }
             static const char *shell_argv[] = {"/sfs/phosh", 0};
             sys6(221 /* execve */, (long)shell_argv[0], (long)shell_argv,
