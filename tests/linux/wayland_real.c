@@ -5651,6 +5651,11 @@ void _start(void) {
                 "primary-color='#0a0e1c'\n"
                 "[org/gnome/desktop/screensaver]\n"
                 "picture-uri='file:///sfs/share/backgrounds/werewolf.png'\n"
+                /* Nothing here implements a session lock: no logind, no PAM,
+                   no OSK. Let the screen stay on so the desktop is usable. */
+                "lock-delay=0\n"
+                "[org/gnome/desktop/session]\n"
+                "idle-delay=uint32 0\n"
                 "[org/gnome/desktop/interface]\n"
                 "icon-theme='hicolor'\n"
                 /* The image has /etc/passwd but no /etc/shadow and no PAM

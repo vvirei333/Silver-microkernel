@@ -419,6 +419,28 @@ static void add_damage(struct surface *surface, int32_t x, int32_t y,
     rect->height = height * scale;
 }
 
+/* phoc treats Phosh's top panel as a draggable layer surface over its whole
+   surface (drag handle 0 == "the whole surface"), so a tap below the 32 px
+   panel bar starts a panel drag; phoc then reconfigures the panel to the full
+   output and its dark GTK window covers the screen. Keep the extension but
+   never let the surface be dragged. */
+static int disable_panel_drag(const char *class, uint32_t opcode,
+                              const intptr_t *args, intptr_t *patched) {
+    if (strcmp(class, "zphoc_draggable_layer_surface_v1") != 0) {
+        return 0;
+    }
+    /* set_drag_mode(mode): full=0, handle=1, none=2 */
+    if (opcode != 3) {
+        return 0;
+    }
+    for (int index = 0; index < 6; index++) {
+        patched[index] = args[index];
+    }
+    patched[0] = 2;
+    logmsg("damage_keep: panel drag disabled\n");
+    return 1;
+}
+
 static void handle_request(struct wl_proxy *proxy, uint32_t opcode,
                            const char *class, const intptr_t *args,
                            void *result) {
@@ -548,7 +570,13 @@ void *wl_proxy_marshal_array_flags(struct wl_proxy *proxy, uint32_t opcode,
         handle_request(proxy, opcode, class, args, NULL);
     }
 
-    void *result = real_marshal(proxy, opcode, interface, version, flags, args);
+    intptr_t patched[6];
+    const intptr_t *forward = args;
+    if (class != NULL && disable_panel_drag(class, opcode, args, patched)) {
+        forward = patched;
+    }
+
+    void *result = real_marshal(proxy, opcode, interface, version, flags, forward);
 
     if (constructor && class != NULL) {
         handle_request(proxy, opcode, class, args, result);

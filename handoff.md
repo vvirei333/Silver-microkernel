@@ -6465,3 +6465,37 @@ phoc so a rejected stack keeps the surface in place, then re-test a tap in
 the grid. `damage_keep.c` is a real workaround for wlroots' missing pixman
 `update_from_buffer` and is preloaded into Phosh; it does not by itself fix
 the black frame.
+
+### M0 status: stacked-surface is benign, the "black screen" is Phosh's fade
+
+Findings from this round (see `docs/MASTER_PLAN.md` for the plan):
+
+* **M0.1 done (negative):** `phoc-output-CRITICAL: Stacked surface phosh
+  top-panel background and target phosh top-panel surface not in same layer` is
+  present on working devices too — PureOS/Phosh on Librem 5 and PinePhone log
+  exactly this while the shell runs. It is cosmetic, not the black-screen
+  cause. The plan now records it as non-blocking.
+* **The "black screen" is Phosh's lock screen / overview fade, and the parts
+  it fades to were unpainted.** With `tests/linux/damage_keep.c` filling the
+  undamaged area of each shm buffer, the lock screen now renders completely
+  (clock, date, "Slide up to unlock").
+* **Unlock:** `Space` reaches Phosh, the lockscreen handles it
+  (`show_unlock_page` → `require-unlock=false` → unlock) and the keyboard focus
+  moves from the lockscreen surface to the home surface. The app grid is
+  interactive.
+* **Panel drag was stealing taps:** phoc treats Phosh's top panel as a
+  draggable layer surface over its whole surface (drag handle 0 == "whole
+  surface"), so a tap below the 32 px bar started a panel drag; phoc then
+  reconfigured the panel to the full output and its dark GTK window covered
+  the screen. The preload now forces `set_drag_mode(none)` on
+  `zphoc_draggable_layer_surface_v1`; the full-screen black on a tap is gone.
+* **Still open:** a tap on the search field leaves a black band where the
+  search bar was, and typing a search blacks the rest of the output. That is
+  the home-background alpha fade (Phosh sets the home background alpha to 0 in
+  search mode) revealing a desktop background that is not painted. Next: check
+  the `phosh background` layer surface (layer 0) — its configure arrives
+  (`configure(12, 1024, 768)`) but the buffer may be black; compare with the
+  home background that does show the wallpaper.
+* Screen blanking/locking is disabled in the seeded keyfile
+  (`org.gnome.desktop.session idle-delay=uint32 0`,
+  `org.gnome.desktop.screensaver lock-delay=0`).
