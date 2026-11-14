@@ -6073,3 +6073,31 @@ main-loop iteration, alongside input) eases the surface margin from where the
 pointer left it to 0 (stay locked) or -OUT_HEIGHT (unlocked, then the Space
 key press) over 200 ms with a smoothstep curve. Damage-only composes keep the
 cost at one full repaint per animation frame.
+
+
+### Activity thumbnails: the protocol, ready to implement
+
+`phosh_private.get_thumbnail(id, toplevel, max_width, max_height)` does **not**
+return a custom object: the `new_id` is a `zwlr_screencopy_frame_v1`
+(`phoc-v0.46.0/protocols/phosh-private.xml`, line 54). Phosh therefore expects
+the screencopy frame handshake for a single frame:
+
+1. compositor -> `buffer` (opcode 0): format ARGB8888 (0), width, height,
+   stride (width*4). Size = the app window's content scaled to fit
+   max_width/max_height, aspect preserved; a 0 means unconstrained.
+2. compositor -> `buffer_done` (opcode 6 at version 3+).
+3. client -> `copy(frame, buffer)` (request 0).
+4. compositor: scale `app_window.copy` (content rect only, skip the CSD
+   margins) into the client's wl_shm buffer and send `ready` (opcode 2) with a
+   timestamp, then flags if needed.
+5. Errors go through `failed` (opcode 3) with the reason enum; `failed` must be
+   sent with a valid enum value or libwayland aborts Phosh.
+
+The scaling loop is the only new piece of pixel work (nearest neighbour is
+fine at 250x150). Reuse `buffer_find`/`buffer_width` from the pool machinery to
+resolve the client's buffer on `copy`, and remember the pending frame per
+handle so `copy` knows the size and the source window (the toplevel handle is
+the `foreign_handle` created for the app).
+
+Where to hook: the phosh_private branch already ignores opcode 2
+(`get_thumbnail`): it takes four u32s. Store `(frame_id, max_w, max_h)` there.
