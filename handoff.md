@@ -5860,3 +5860,42 @@ Two follow-ups that the visible scene needed:
 Verified end to end: lock screen renders (clock, date, "Slide up to unlock"),
 Space unlocks (require-unlock is off), the overview shows the wallpaper, the
 search entry and "Show All Apps", Ctrl+T opens the terminal and `ls` runs.
+
+
+### A real window: floating, movable, closable
+
+The application toplevel is no longer a full-output blit. The compositor
+configures it to 780x520, places its content rectangle in the middle of the
+output and draws the client's CSD margins around it, so the terminal is a
+window over the desktop instead of a second full screen. The compositor owns
+two pieces of chrome on top of the client's title bar: a close button in the
+top-right corner (sends `xdg_toplevel.close`, then hides the surface) and a
+title-bar drag that moves the window. The press/release of a chrome action is
+swallowed so the client never sees half a click.
+
+`zwlr_foreign_toplevel_manager_v1` is now implemented for that window:
+`toplevel`, `title`, `app_id`, `output_enter`, `done` when the first frame
+arrives, `closed` when the client goes away, and Phosh's `close` request is
+forwarded to the app. Two details mattered:
+
+* Phosh's manager object lives in Phosh's object namespace, so the announce
+  reads `clients[ui_client].foreign_toplevel_manager_id`, not the global
+  (which holds the *app's* state while its message is processed).
+* handles created by the compositor must use ids above `WL_SERVER_ID_START`
+  (`0xFF000000`). A low id made libwayland abort Phosh's connection with
+  "Error reading events from display: Invalid argument".
+
+Also: the app window is tracked by the toplevel's `wl_surface` only. Clients
+commit cursor surfaces too, and capturing one shrank the window to 24x24.
+
+And the drag-surface bookkeeping learned not to answer `set_margins` with a
+`drag_end`: claiming a state the client never entered made Phosh believe its
+home was already folded, so it never sent `set_state` and the overview could
+not fold when an application appeared.
+
+State after this round: lock screen -> Space unlock -> overview (wallpaper,
+search, "Show All Apps") -> Ctrl+T opens a floating terminal that can be
+dragged by its title bar and closed with the compositor's button. Phosh gets
+the toplevel and draws an activity card for it. Next: fold the home reliably
+when a toplevel exists, give the top panel a visible bar, and launch from the
+app grid.

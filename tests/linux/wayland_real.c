@@ -62,6 +62,22 @@ struct sockaddr_un {
 };
 
 static unsigned char *screen;
+/* wl_surface of the application toplevel (in the app client's namespace).
+   Only commits on this surface may become the app window: a client also
+   commits cursor surfaces, and capturing one shrank the window to 24x24. */
+static unsigned app_surface_id;
+/* zwlr_foreign_toplevel_manager_v1 handle for the application window. Phosh
+   folds the overview when it learns that a toplevel exists and lists it in the
+   activity switcher; without the handle an app window floats over the app
+   grid forever. The handle lives in Phosh's object namespace. */
+static unsigned foreign_handle;
+/* The compositor creates the handle resource, and Wayland reserves the ids
+   whose high bit is set for server-created objects. A low id made libwayland
+   abort Phosh's connection with EINVAL. */
+#define WL_SERVER_ID_START 0xFF000000u
+static unsigned foreign_handle_next = WL_SERVER_ID_START;
+static char toplevel_title[96];
+static char toplevel_app_id[96];
 static unsigned char message[1024];
 static unsigned long message_length;
 /* GTK batches registry, shm, configure and surface traffic well past
@@ -1294,10 +1310,17 @@ static ClientState clients[MAX_CLIENTS];
 
 /* The newest xdg_toplevel, drawn over the layer scene. One window is enough
  * until the compositor grows a real window manager. */
+#define APP_WIN_WIDTH 780
+#define APP_WIN_HEIGHT 520
 typedef struct {
     int used;
     int owner;
     unsigned surface;
+    /* xdg_toplevel object in the app's namespace, for close requests. */
+    unsigned toplevel;
+    /* Top-left of the window content on the output. */
+    int x;
+    int y;
     unsigned width;
     unsigned height;
     unsigned stride;
@@ -1312,6 +1335,10 @@ typedef struct {
     int copy_ready;
 } AppWindow;
 static AppWindow app_window;
+static int window_drag;
+static int chrome_grab;
+static int window_drag_dx;
+static int window_drag_dy;
 static int ui_client = -1; /* owns the layer scene (Phosh) */
 static int frame_reported;
 static int clipboard_owner = -1;
@@ -1487,8 +1514,8 @@ static void broadcast_clipboard(void) {
 /// xdg_surface.configure serial.
 static void send_toplevel_state(long client, unsigned state) {
     begin(toplevel_id, 0 /* xdg_toplevel.configure */);
-    put_i32(1024);
-    put_i32(768);
+    put_i32(APP_WIN_WIDTH);
+    put_i32(APP_WIN_HEIGHT);
     put_u32(state != 0 ? 1 : 0);
     if (state != 0) {
         put_u32(state);
@@ -1936,6 +1963,71 @@ static void gpu_present(unsigned width, unsigned height) {
     sys3(29 /* ioctl */, gpufb_fd, 0x5701 /* GPU_IOCTL_FLUSH */, 0);
 }
 
+/* The client draws its own title bar (CSD); the compositor overlays a close
+   button in its top-right corner and moves the window when the title bar is
+   dragged. Both are cheap per-pixel work, no toolkit involved. */
+#define APP_CLOSE_SIZE 22
+#define APP_TITLE_HEIGHT 34
+
+static void app_window_content_rect(int *x, int *y, int *width, int *height) {
+    int content_width = (int)app_window.width -
+                        2 * (int)app_window.geometry_x;
+    int content_height = (int)app_window.height -
+                         2 * (int)app_window.geometry_y;
+    if (content_width <= 0) content_width = (int)app_window.width;
+    if (content_height <= 0) content_height = (int)app_window.height;
+    *x = app_window.x;
+    *y = app_window.y;
+    *width = content_width;
+    *height = content_height;
+}
+
+static void close_app_window(void) {
+    if (app_window.used && app_window.toplevel != 0 &&
+        app_window.owner >= 0 && app_window.owner < MAX_CLIENTS &&
+        clients[app_window.owner].connected) {
+        begin(app_window.toplevel, 8 /* xdg_toplevel.close */);
+        finish();
+        send_message(clients[app_window.owner].fd, -1);
+    }
+    app_window.hidden = 1;
+    window_drag = 0;
+    chrome_grab = 0;
+#ifdef SERVE_ONLY
+    scene_dirty = 1;
+    compose_full = 1;
+#endif
+}
+
+/// 1 when the compositor's window chrome (close button / title drag) took the
+/// press, so it must not reach the application.
+static int app_window_chrome(unsigned px, unsigned py) {
+    if (!app_window.used || app_window.hidden || !app_window.copy_ready ||
+        app_window.owner != current_client) {
+        return 0;
+    }
+    int x, y, width, height;
+    app_window_content_rect(&x, &y, &width, &height);
+    if ((int)px < x || (int)px >= x + width ||
+        (int)py < y || (int)py >= y + height) {
+        return 0;
+    }
+    int close_x = x + width - APP_CLOSE_SIZE - 8;
+    int close_y = y + 6;
+    if ((int)px >= close_x && (int)px < close_x + APP_CLOSE_SIZE &&
+        (int)py >= close_y && (int)py < close_y + APP_CLOSE_SIZE) {
+        close_app_window();
+        return 1;
+    }
+    if ((int)py < y + APP_TITLE_HEIGHT) {
+        window_drag = 1;
+        window_drag_dx = (int)px - app_window.x;
+        window_drag_dy = (int)py - app_window.y;
+        return 1;
+    }
+    return 0;
+}
+
 #ifdef SERVE_ONLY
 static void layer_compose(void) {
     if (screen == 0) {
@@ -2089,10 +2181,11 @@ static void layer_compose(void) {
        layers. Full-output only: there is no window manager yet. */
     if (app_window.used && !app_window.hidden && app_window.copy_ready &&
         app_window.width != 0) {
-        /* Anchor the window content, not the decoration margins, at the
-           output origin: a 1024x768 toplevel arrives as a 1076x820 buffer. */
-        int origin_x = -(int)app_window.geometry_x;
-        int origin_y = -(int)app_window.geometry_y;
+        /* The buffer carries the client-side decoration margins (a 780x520
+           toplevel arrives as an 832x572 buffer), so the window is placed by
+           its content rectangle and the margins land around it. */
+        int origin_x = app_window.x - (int)app_window.geometry_x;
+        int origin_y = app_window.y - (int)app_window.geometry_y;
         const int app_force_opaque = app_window.format == 1;
         int app_start_x = origin_x < clip_x0 ? clip_x0 - origin_x : 0;
         int app_start_y = origin_y < clip_y0 ? clip_y0 - origin_y : 0;
@@ -2137,6 +2230,43 @@ static void layer_compose(void) {
                 if (green > 255u) green = 255u;
                 if (blue > 255u) blue = 255u;
                 *target = 0xFF000000u | (blue << 16) | (green << 8) | red;
+            }
+        }
+        /* Window outline and close button. The client's own title bar is at
+           the top of its buffer, so the button lands in its right corner. */
+        int chrome_x, chrome_y, chrome_w, chrome_h;
+        app_window_content_rect(&chrome_x, &chrome_y, &chrome_w, &chrome_h);
+        for (int row = chrome_y - 2; row < chrome_y + chrome_h + 2; row++) {
+            if (row < clip_y0 || row >= clip_y1) continue;
+            for (int column = chrome_x - 2; column < chrome_x + chrome_w + 2;
+                 column++) {
+                if (column < clip_x0 || column >= clip_x1) continue;
+                if (row >= chrome_y && row < chrome_y + chrome_h &&
+                    column >= chrome_x && column < chrome_x + chrome_w) {
+                    continue;
+                }
+                destination[(unsigned)row * out_width + (unsigned)column] =
+                    0xFF20242Eu;
+            }
+        }
+        int button_x = chrome_x + chrome_w - APP_CLOSE_SIZE - 8;
+        int button_y = chrome_y + 6;
+        const int radius = APP_CLOSE_SIZE / 2 - 1;
+        for (int row = 0; row < APP_CLOSE_SIZE; row++) {
+            int out_y = button_y + row;
+            if (out_y < clip_y0 || out_y >= clip_y1) continue;
+            for (int column = 0; column < APP_CLOSE_SIZE; column++) {
+                int out_x = button_x + column;
+                if (out_x < clip_x0 || out_x >= clip_x1) continue;
+                int dx = column - APP_CLOSE_SIZE / 2;
+                int dy = row - APP_CLOSE_SIZE / 2;
+                int ax = dx < 0 ? -dx : dx;
+                int ay = dy < 0 ? -dy : dy;
+                if (ax > radius || ay > radius) continue;
+                unsigned colour = 0xFF3A3F4Bu;
+                if (ax == ay && ax <= 5) colour = 0xFFD8DCE6u;
+                destination[(unsigned)out_y * out_width + (unsigned)out_x] =
+                    0xFF000000u | colour;
             }
         }
     }
@@ -2429,10 +2559,12 @@ static void pointer_route(long client, unsigned px, unsigned py, int motion) {
         }
     }
     int from_app = 0;
+    int app_left = app_window.x - (int)app_window.geometry_x;
+    int app_top = app_window.y - (int)app_window.geometry_y;
     if (target == 0 && app_window.used && !app_window.hidden &&
         app_window.copy_ready && app_window.owner == current_client &&
-        (int)px + (int)app_window.geometry_x < (int)app_window.width &&
-        (int)py + (int)app_window.geometry_y < (int)app_window.height) {
+        (int)px >= app_left && (int)px < app_left + (int)app_window.width &&
+        (int)py >= app_top && (int)py < app_top + (int)app_window.height) {
         /* The application window is drawn over the whole scene, so it is the
            topmost surface under the pointer for its own client. */
         target = app_window.surface;
@@ -2443,8 +2575,8 @@ static void pointer_route(long client, unsigned px, unsigned py, int motion) {
         int x = 0;
         int y = 0;
         if (from_app) {
-            x = -(int)app_window.geometry_x;
-            y = -(int)app_window.geometry_y;
+            x = app_window.x - (int)app_window.geometry_x;
+            y = app_window.y - (int)app_window.geometry_y;
         } else if (entry != 0) {
             layer_rect(entry, &x, &y);
         }
@@ -2662,6 +2794,8 @@ static void toggle_app_window(void) {
         return;
     }
     app_window.hidden = !app_window.hidden;
+    window_drag = 0;
+    chrome_grab = 0;
     {
         static const char hide[] = "gtk-serve: app hide\n";
         static const char show[] = "gtk-serve: app show\n";
@@ -2747,6 +2881,53 @@ static unsigned keycode_for(unsigned key, unsigned *shift) {
     }
 }
 
+/// Tells Phosh about the application window (see `foreign_handle`).
+static void foreign_toplevel_announce(void) {
+    /* The manager object lives in Phosh's namespace; the globals hold the
+       state of the client whose message is being processed (the app). */
+    unsigned manager = (ui_client >= 0 && ui_client < MAX_CLIENTS)
+                           ? clients[ui_client].foreign_toplevel_manager_id
+                           : 0;
+    if (manager == 0 || ui_client < 0 || ui_client >= MAX_CLIENTS ||
+        !clients[ui_client].connected) {
+        return;
+    }
+    long phosh = clients[ui_client].fd;
+    foreign_handle = foreign_handle_next;
+    foreign_handle_next += 4;
+    begin(manager, 0 /* toplevel(new_id) */);
+    put_u32(foreign_handle);
+    finish();
+    send_message(phosh, -1);
+    begin(foreign_handle, 0 /* title */);
+    put_string(toplevel_title[0] != 0 ? toplevel_title : "Application");
+    finish();
+    send_message(phosh, -1);
+    begin(foreign_handle, 1 /* app_id */);
+    put_string(toplevel_app_id);
+    finish();
+    send_message(phosh, -1);
+    begin(foreign_handle, 2 /* output_enter */);
+    put_u32(clients[ui_client].output_id);
+    finish();
+    send_message(phosh, -1);
+    begin(foreign_handle, 5 /* done */);
+    finish();
+    send_message(phosh, -1);
+}
+
+static void foreign_toplevel_closed(void) {
+    if (foreign_handle == 0 || ui_client < 0 || ui_client >= MAX_CLIENTS ||
+        !clients[ui_client].connected) {
+        foreign_handle = 0;
+        return;
+    }
+    begin(foreign_handle, 6 /* closed */);
+    finish();
+    send_message(clients[ui_client].fd, -1);
+    foreign_handle = 0;
+}
+
 /// `wl_keyboard.modifiers`: bit 0 is shift.
 static void keyboard_send_modifiers(long client, unsigned depressed) {
     if (keyboard_id == 0) {
@@ -2802,7 +2983,25 @@ static void poll_input(void) {
                combinations it can actually send. */
             toggle_app_window();
         } else if (kind == INPUT_MOVE) {
-            if (value == 1) {
+            if (window_drag) {
+                int nx = (int)x - window_drag_dx;
+                int ny = (int)y - window_drag_dy;
+                int content_width = (int)app_window.width -
+                                    2 * (int)app_window.geometry_x;
+                if (content_width <= 0) content_width = (int)app_window.width;
+                if (nx > (int)LOGICAL_WIDTH - 80) nx = (int)LOGICAL_WIDTH - 80;
+                if (nx < -content_width + 80) nx = -content_width + 80;
+                if (ny < 0) ny = 0;
+                if (ny > (int)LOGICAL_HEIGHT - 40) ny = (int)LOGICAL_HEIGHT - 40;
+                if (nx != app_window.x || ny != app_window.y) {
+                    app_window.x = nx;
+                    app_window.y = ny;
+#ifdef SERVE_ONLY
+                    scene_dirty = 1;
+                    compose_full = 1;
+#endif
+                }
+            } else if (value == 1) {
                 /* The host pointer left the window. */
                 if (pointer_id != 0 && pointer_target != 0) {
                     pointer_send_leave(client, pointer_target);
@@ -2818,8 +3017,16 @@ static void poll_input(void) {
                 pointer_route(client, x, y, 1);
             }
         } else if (kind == INPUT_CLICK || kind == INPUT_RELEASE) {
-            if (kind == INPUT_CLICK && drag_begin(client, x, y)) {
+            if (kind == INPUT_CLICK && app_window_chrome(x, y)) {
+                /* The compositor's own window chrome claimed the press. */
+                chrome_grab = 1;
+            } else if (kind == INPUT_RELEASE && chrome_grab) {
+                /* The press never reached the client; swallow the release. */
+                chrome_grab = 0;
+            } else if (kind == INPUT_CLICK && drag_begin(client, x, y)) {
                 /* A layer-surface drag claims the press. */
+            } else if (kind == INPUT_RELEASE && window_drag) {
+                window_drag = 0;
             } else if (kind == INPUT_RELEASE && drag_active != 0) {
                 drag_finish(client);
             } else if (pointer_id != 0) {
@@ -3401,9 +3608,12 @@ static int serve(long client) {
                 /* xdg_surface.get_toplevel(new_id): send configure. */
                 toplevel_id = take_u32();
                 toplevel_surface_id = surface_id;
+                if (current_client != ui_client) {
+                    app_surface_id = surface_id;
+                }
                 begin(toplevel_id, 0 /* xdg_toplevel.configure */);
-                put_i32((int)LOGICAL_WIDTH);
-                put_i32((int)LOGICAL_HEIGHT);
+                put_i32(APP_WIN_WIDTH);
+                put_i32(APP_WIN_HEIGHT);
                 put_u32(0);    /* states array: empty */
                 finish();
                 send_message(client, -1);
@@ -3820,8 +4030,6 @@ static int serve(long client) {
                     slot->reported = 0;
                     drag_apply(slot->layer_surface);
                     drag_recompose();
-                    drag_notify(client, slot, 1 /* drag_end */,
-                                (unsigned)slot->state);
                 } else if (opcode == 1) {
                     slot->threshold = take_u32();
                     if (slot->threshold > 256) {
@@ -3913,6 +4121,13 @@ static int serve(long client) {
                 StackedSlot *stacked = stacked_find(object);
                 stacked->id = 0;
                 stacked_id = 0;
+            } else if (foreign_handle != 0 && object == foreign_handle) {
+                /* zwlr_foreign_toplevel_handle_v1 requests. */
+                if (opcode == 1) {
+                    close_app_window();
+                } else if (opcode == 7) {
+                    foreign_handle = 0;
+                }
             } else if (object == foreign_toplevel_manager_id && opcode == 0) {
                 foreign_toplevel_manager_id = 0;
             } else if (object == gamma_manager_id && opcode == 0) {
@@ -3981,6 +4196,21 @@ static int serve(long client) {
                 }
                 if (focus_surface == object) {
                     focus_surface = 0;
+                }
+            } else if (object == toplevel_id &&
+                       (opcode == 2 || opcode == 3)) {
+                /* xdg_toplevel.set_title / set_app_id */
+                char value[96];
+                take_string(value, sizeof(value));
+                if (current_client != ui_client) {
+                    char *target = opcode == 2 ? toplevel_title
+                                               : toplevel_app_id;
+                    unsigned index = 0;
+                    while (value[index] != 0 && index + 1 < 96) {
+                        target[index] = value[index];
+                        index += 1;
+                    }
+                    target[index] = 0;
                 }
             } else if (object == toplevel_id &&
                        (opcode == 9 || opcode == 10 || opcode == 11 || opcode == 12)) {
@@ -4158,6 +4388,7 @@ static int serve(long client) {
                        capturing one made it cover the desktop and made
                        Ctrl+T hide a phantom window instead of launching. */
                     if (layer_slot == 0 && current_client != ui_client &&
+                        object == app_surface_id &&
                         buffer_width > 0 && buffer_height > 0 &&
                         buffer_stride >= (unsigned)buffer_width * 4) {
                         /* Keep the newest toplevel as the app window and
@@ -4260,23 +4491,41 @@ static int serve(long client) {
                                 static const char frame[] =
                                     "gtk-serve: app frame\n";
                                 sys3(64, 1, (long)frame, sizeof(frame) - 1);
+                                foreign_toplevel_announce();
                             }
                             app_window.used = 1;
                             app_window.owner = current_client;
                             app_window.surface = object;
                             app_window.geometry_x = window_geometry_x;
                             app_window.geometry_y = window_geometry_y;
+                            if (app_window.toplevel == 0) {
+                                app_window.toplevel = toplevel_id;
+                            }
+                            if (app_window.x == 0 && app_window.y == 0) {
+                                int content_w = (int)buffer_width -
+                                                2 * (int)window_geometry_x;
+                                int content_h = (int)buffer_height -
+                                                2 * (int)window_geometry_y;
+                                if (content_w <= 0) content_w = (int)buffer_width;
+                                if (content_h <= 0) content_h = (int)buffer_height;
+                                app_window.x =
+                                    ((int)LOGICAL_WIDTH - content_w) / 2;
+                                app_window.y =
+                                    ((int)LOGICAL_HEIGHT - content_h) / 2;
+                                if (app_window.y < 40) app_window.y = 40;
+                            }
                             app_window.width = (unsigned)buffer_width;
                             app_window.height = (unsigned)buffer_height;
                             app_window.stride = buffer_stride;
                             app_window.format = buffer_format;
                             app_window.copy_ready = 1;
                             if (app_changed) {
-                                compose_damage(
-                                    -(int)app_window.geometry_x + dx0,
-                                    -(int)app_window.geometry_y + dy0,
-                                    -(int)app_window.geometry_x + dx1,
-                                    -(int)app_window.geometry_y + dy1);
+                                int origin_x = app_window.x -
+                                               (int)app_window.geometry_x;
+                                int origin_y = app_window.y -
+                                               (int)app_window.geometry_y;
+                                compose_damage(origin_x + dx0, origin_y + dy0,
+                                               origin_x + dx1, origin_y + dy1);
                             }
                         }
                         scene_dirty = 1;
@@ -4648,8 +4897,14 @@ static void reset_client(void) {
     if (app_window.used && app_window.owner == current_client) {
         static const char reset[] = "gtk-serve: app reset\n";
         sys3(64, 1, (long)reset, sizeof(reset) - 1);
+        foreign_toplevel_closed();
         app_window.used = 0;
         app_window.copy_ready = 0;
+        app_window.toplevel = 0;
+        app_surface_id = 0;
+        app_window.x = 0;
+        app_window.y = 0;
+        app_window.hidden = 0;
     }
     for (unsigned index = 0; index < MAX_STACKED; index++) {
         stacked_slots[index].id = 0;
@@ -5091,8 +5346,15 @@ void _start(void) {
                     if (app_window.used && app_window.owner == index) {
                         static const char cleared[] = "gtk-serve: app cleared\n";
                         sys3(64, 1, (long)cleared, sizeof(cleared) - 1);
+                        foreign_toplevel_closed();
                         app_window.used = 0;
                         app_window.copy_ready = 0;
+                        app_window.toplevel = 0;
+                        app_surface_id = 0;
+                        app_window.x = 0;
+                        app_window.y = 0;
+                        app_window.hidden = 0;
+                        window_drag = 0;
                     }
                     static const char left[] = "gtk-serve: client gone\n";
                     sys3(64, 1, (long)left, sizeof(left) - 1);
