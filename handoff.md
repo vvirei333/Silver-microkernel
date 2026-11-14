@@ -5981,3 +5981,23 @@ not the layer-0 `phosh background` surface either (the heuristic samples 16
 points of that entry and does not match). Next step is a scene dump of the
 folded state (the compositor's in-shmem dump code was removed; add it back
 briefly) to see which entry covers (30,300), then fix that surface.
+
+
+### The black desktop was the quick-settings backdrop (fixed)
+
+A scene dump of the folded state showed five entries; the pixel at (30,300)
+was painted by surface 69, `phosh top-panel background`: 1024x768 at layer TOP,
+`alpha 255`, `alpha_set 0`, `below 64` (stacked below the folded panel). The
+compose-time `layer_effective_alpha` check was already in place, but the
+backdrop's pixels had been painted while it was still opaque and later
+damage-only repaints never touched that area, so the stale black stayed.
+
+Fix: when a layer surface commits a buffer and it is (a) stacked below a drag
+surface, (b) that drag surface is folded and not being dragged, and (c) the
+client never set an explicit alpha, the entry is *forgotten* instead of stored
+(`layer_forget_surface` marks a full recompose). It comes back on the next
+commit, which is exactly what happens when the panel unfolds and Phosh fades
+the backdrop in.
+
+Result: with a terminal open the desktop shows the wallpaper (the home's
+background surface is back), the top panel bar, and the floating window.

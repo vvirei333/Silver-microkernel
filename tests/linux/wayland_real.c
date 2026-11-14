@@ -4560,6 +4560,28 @@ static int serve(long client) {
                             layer_record_commit(layer_slot);
                             LayerEntry *stored =
                                 layer_entry_by_surface(layer_slot->surface);
+                            /* A surface stacked below a folded drag surface
+                               (Phosh's quick-settings backdrop) that never
+                               received an explicit alpha is invisible. Drop
+                               its stored entry instead of relying on the
+                               compose-time check: damage-only repaints would
+                               otherwise keep the pixels it painted earlier. */
+                            if (stored != 0 && stored->alpha_set == 0 &&
+                                stored->below != 0) {
+                                for (unsigned probe = 0;
+                                     probe < MAX_DRAG_SURFACES; probe++) {
+                                    DragSlot *below = &drag_slots[probe];
+                                    if (below->used &&
+                                        below->layer_surface == stored->below &&
+                                        below->state == 0 &&
+                                        !below->dragging) {
+                                        layer_forget_surface(
+                                            layer_slot->surface);
+                                        stored = 0;
+                                        break;
+                                    }
+                                }
+                            }
                             if (stored != 0) {
                                 int dx0, dy0, dx1, dy1;
                                 take_damage((int)object, (int)buffer_width,
