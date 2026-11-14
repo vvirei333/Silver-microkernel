@@ -24,6 +24,8 @@ extern crate alloc;
 #[path = "../allocator.rs"]
 mod allocator;
 #[allow(dead_code)]
+#[path = "../http_parse.rs"]
+mod http_parse;
 #[path = "../ipc.rs"]
 mod ipc;
 #[allow(dead_code)]
@@ -1405,8 +1407,11 @@ fn finish_fetch(fetch: &mut Fetch, outbox: &mut Outbox) {
             net_ipc::CLIENT_BODY_MAX,
         )
     };
-    let (code, status, body_len) = parse_response(buffer, fetch.received);
-    if let Some(header_end) = find_header_end(&buffer[..fetch.received]) {
+    let (code, status, body_len) = match http_parse::parse_response(buffer, fetch.received) {
+        Some((status, body_len)) => (net_ipc::NET_OK, status, body_len),
+        None => (net_ipc::NET_ERR_RESPONSE, 0, 0),
+    };
+    if let Some(header_end) = http_parse::find_header_end(&buffer[..fetch.received]) {
         store_response_cookies(&fetch.host[..fetch.host_len], &buffer[..header_end]);
     }
     let requester = fetch.requester;
@@ -1414,8 +1419,8 @@ fn finish_fetch(fetch: &mut Fetch, outbox: &mut Outbox) {
     // Redirects are the client's decision: hand it the Location header and
     // let the browser resolve it (a target may need the host's HTTPS path).
     if code == net_ipc::NET_OK && is_redirect(status) {
-        if let Some(header_end) = find_header_end(&buffer[..fetch.received]) {
-            if let Some(location) = find_header(&buffer[..header_end], b"location") {
+        if let Some(header_end) = http_parse::find_header_end(&buffer[..fetch.received]) {
+            if let Some(location) = http_parse::find_header(&buffer[..header_end], b"location") {
                 let offset = (location.as_ptr() as usize).wrapping_sub(buffer.as_ptr() as usize);
                 let length = location.len().min(net_ipc::CLIENT_BODY_MAX);
                 unsafe {
@@ -1443,7 +1448,7 @@ fn finish_fetch(fetch: &mut Fetch, outbox: &mut Outbox) {
     // Move the body to the start of the body window: clients read it from
     // `CLIENT_BODY`, not from after the header.
     if code == net_ipc::NET_OK {
-        let header_end = find_header_end(&buffer[..fetch.received]).unwrap_or(0) + 4;
+        let header_end = http_parse::find_header_end(&buffer[..fetch.received]).unwrap_or(0) + 4;
         if header_end <= fetch.received {
             let body = &mut buffer[header_end..fetch.received];
             unsafe {
@@ -1560,103 +1565,6 @@ fn build_request(fetch: &mut Fetch) {
         push(b"Connection: close\r\n\r\n");
     }
     fetch.request_len = length;
-}
-
-fn find_header_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(4).position(|window| window == b"\r\n\r\n")
-}
-
-/// Finds a header value (case-insensitive) after the status line.
-fn find_header<'a>(headers: &'a [u8], name: &[u8]) -> Option<&'a [u8]> {
-    for line in headers.split(|&byte| byte == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        if line.len() > name.len()
-            && line[..name.len()].eq_ignore_ascii_case(name)
-            && line[name.len()] == b':'
-        {
-            let value = &line[name.len() + 1..];
-            let start = value.iter().position(|byte| !byte.is_ascii_whitespace())?;
-            return Some(&value[start..]);
-        }
-    }
-    None
-}
-
-fn parse_response(buffer: &mut [u8], received: usize) -> (u8, u16, usize) {
-    let Some(end) = find_header_end(&buffer[..received]) else {
-        return (net_ipc::NET_ERR_RESPONSE, 0, 0);
-    };
-    let headers = &buffer[..end];
-    let body_start = end + 4;
-
-    // "HTTP/1.1 200 OK"
-    let status = headers
-        .split(|&byte| byte == b' ')
-        .nth(1)
-        .and_then(|digits| core::str::from_utf8(digits).ok())
-        .and_then(|digits| digits.trim().parse::<u16>().ok())
-        .unwrap_or(0);
-
-    if let Some(value) = find_header(headers, b"transfer-encoding") {
-        if value.eq_ignore_ascii_case(b"chunked") {
-            let length = dechunk(&mut buffer[body_start..received]);
-            return (net_ipc::NET_OK, status, length);
-        }
-    }
-    if let Some(value) = find_header(headers, b"content-length") {
-        if let Ok(text) = core::str::from_utf8(value) {
-            if let Ok(length) = text.trim().parse::<usize>() {
-                let available = received - body_start;
-                return (net_ipc::NET_OK, status, length.min(available));
-            }
-        }
-    }
-    (net_ipc::NET_OK, status, received - body_start)
-}
-
-/// Decodes a chunked body in place. Returns the decoded length.
-fn dechunk(buffer: &mut [u8]) -> usize {
-    let mut input = 0usize;
-    let mut output = 0usize;
-    while input < buffer.len() {
-        // Parse the hex chunk size.
-        let mut size = 0usize;
-        let mut digits = 0usize;
-        while input < buffer.len() {
-            let byte = buffer[input];
-            let digit = match byte {
-                b'0'..=b'9' => Some(usize::from(byte - b'0')),
-                b'a'..=b'f' => Some(usize::from(byte - b'a') + 10),
-                b'A'..=b'F' => Some(usize::from(byte - b'A') + 10),
-                _ => None,
-            };
-            let Some(digit) = digit else { break };
-            size = size.saturating_mul(16).saturating_add(digit);
-            digits += 1;
-            input += 1;
-        }
-        if digits == 0 {
-            break;
-        }
-        // Skip the CRLF after the size.
-        while input < buffer.len() && buffer[input] != b'\n' {
-            input += 1;
-        }
-        input = (input + 1).min(buffer.len());
-        if size == 0 {
-            break;
-        }
-        let count = size.min(buffer.len() - input).min(buffer.len() - output);
-        buffer.copy_within(input..input + count, output);
-        input += size;
-        output += count;
-        // Skip the CRLF after the chunk data.
-        while input < buffer.len() && buffer[input] != b'\n' {
-            input += 1;
-        }
-        input = (input + 1).min(buffer.len());
-    }
-    output
 }
 
 fn parse_ipv4(text: &str) -> Option<[u8; 4]> {
