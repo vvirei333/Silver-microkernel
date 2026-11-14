@@ -1366,6 +1366,7 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                 }
                 0
             }
+            #[cfg(feature = "linux-abi")]
             DRM_IOCTL_PRIME_HANDLE_TO_FD => {
                 let Some(mut prime) = load::<PrimeHandle>(argument) else {
                     return Some(u64::MAX);
@@ -1384,6 +1385,7 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                 }
                 0
             }
+            #[cfg(feature = "linux-abi")]
             DRM_IOCTL_PRIME_FD_TO_HANDLE => {
                 let Some(mut prime) = load::<PrimeHandle>(argument) else {
                     return Some(u64::MAX);

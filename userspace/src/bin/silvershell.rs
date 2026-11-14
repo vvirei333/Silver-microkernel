@@ -195,6 +195,7 @@ fn execute(command: &str) {
         return;
     }
 
+    #[cfg(feature = "linux-abi")]
     if let Some(name) = command.strip_prefix("linuxrun-") {
         run_linux_alias(name);
         return;
@@ -220,10 +221,12 @@ fn execute(command: &str) {
             syscall::print("  cat <file> Print a file\r\n");
             syscall::print("  run <path>  Load and run an ELF file from the filesystem\r\n");
             #[cfg(feature = "linux-abi")]
-            syscall::print("  linuxrun <path>  Run a Linux ABI ELF (x8 = Linux syscall)\r\n");
-            syscall::print("  linuxrun-<app>   Run /sfs/apps/<app> or /sfs/<app>\r\n");
-            syscall::print("  linuxstart <app> Run /sfs/<app>-serve, then /sfs/<app>\r\n");
-            syscall::print("  phosh            Shortcut for `linuxstart phosh`\r\n");
+            {
+                syscall::print("  linuxrun <path>  Run a Linux ABI ELF (x8 = Linux syscall)\r\n");
+                syscall::print("  linuxrun-<app>   Run /sfs/apps/<app> or /sfs/<app>\r\n");
+                syscall::print("  linuxstart <app> Run /sfs/<app>-serve, then /sfs/<app>\r\n");
+                syscall::print("  phosh            Shortcut for `linuxstart phosh`\r\n");
+            }
             syscall::print("  echo <text> [> file | >> file]\r\n");
             syscall::print("             Print, truncate/write, or append to a file\r\n");
             syscall::print("  touch <file>\r\n");
@@ -804,13 +807,10 @@ fn run_elf(path: &str) {
     run_elf_with(path, syscall::spawn_path, true);
 }
 
-/// Loads a foreign ELF (`linuxrun <path>`) and runs it with the Linux syscall
-/// personality. The kernel assigns the console inside the spawn, before the
-/// child can run on any CPU, so no `console_set` round trip is needed.
-#[cfg(feature = "linux-abi")]
 /// `linuxstart <app>`: resolves `<app>-serve` first, then `<app>`, under
 /// `/sfs` and `/sfs/apps`. `linuxstart phosh` therefore finds
 /// `/sfs/phosh-serve` without the user remembering the suffix.
+#[cfg(feature = "linux-abi")]
 fn run_linux_start(name: &str) {
     if name.is_empty() {
         syscall::print("Usage: linuxstart <app>  (e.g. linuxstart phosh)\r\n");
@@ -839,16 +839,22 @@ fn run_linux_start(name: &str) {
     syscall::print("'\r\n");
 }
 
+/// Loads a foreign ELF (`linuxrun <path>`) and runs it with the Linux syscall
+/// personality. The kernel assigns the console inside the spawn, before the
+/// child can run on any CPU, so no `console_set` round trip is needed.
+#[cfg(feature = "linux-abi")]
 fn run_linux_elf(path: &str) {
     run_elf_with(path, syscall::spawn_linux_path, false);
 }
 
 /// `linuxrun-<app>`: resolves `/sfs/apps/<app>` then `/sfs/<app>`, so a
 /// installed bundle and a plain test binary share one short command.
+#[cfg(feature = "linux-abi")]
 fn run_linux_alias(name: &str) {
     run_elf_with(name, spawn_linux_alias, false);
 }
 
+#[cfg(feature = "linux-abi")]
 fn spawn_linux_alias(name: &str) -> Option<u64> {
     if name.is_empty() {
         return None;
