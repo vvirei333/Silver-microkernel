@@ -4144,7 +4144,17 @@ static int serve(long client) {
                 PoolSlot *pool = pool_find(object);
                 BufferSlot *slot = buffer_add(id);
                                 if (slot != 0) {
-                    slot->pool_fd = pool->fd;
+                    /* A pool may be destroyed (and its slot reused, closing
+                       the descriptor) while buffers created from it are still
+                       being committed. Give every shm buffer its own
+                       descriptor so the number cannot be recycled under it;
+                       the commit path then maps the right memory instead of
+                       whatever file later inherited the number. */
+                    if (slot->owned && slot->pool_fd >= 0) {
+                        sys3(57 /* close */, slot->pool_fd, 0, 0);
+                    }
+                    slot->pool_fd = (int)sys3(23 /* dup */, pool->fd, 0, 0);
+                    slot->owned = slot->pool_fd >= 0;
                     slot->offset = offset;
                     slot->width = width;
                     slot->height = height;

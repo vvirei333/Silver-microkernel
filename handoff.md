@@ -6655,3 +6655,42 @@ maps only uid 0), `[alarm]`/`[aur]` commented out, `--disable-sandbox`,
 
 The image was restored to the original `phoc` and the clean wrapper
 (`phoc-serve`) so the baseline is reproducible; QEMU is stopped.
+
+### M0.2 closed: the black frame was the proxy closing a live shm-pool fd
+
+**Root cause (proxy, not phoc).** `tests/linux/wayland_real.c` stored the
+`wl_shm` pool descriptor per buffer (`BufferSlot::pool_fd`) without owning it.
+`pool_add()` closes the descriptor of a slot when it is reused. phoc (via the
+wlroots wayland backend) destroys shm pools while buffers created from them are
+still being committed; the slot was reused, the old fd was closed and its
+number was recycled (`fd=0` in the log). The proxy then `mmap()`ed the wrong
+file and read zeros. That full-damage commit of black pixels overwrote
+`app_window.copy` on the host, and every later partial-damage commit
+(`dmg=0,47 745x46` for the search caret) could only update that small region —
+so the screen stayed black.
+
+**Evidence.**
+* phoc-side readback of the output buffer before commit:
+  `OUTPUT pixels nonblack=3072/3072 tl=0a0e1c q=0e1323 c=13192b q3=171e32`
+  (the wallpaper is there; phoc never committed a black frame).
+* proxy-side log while broken:
+  `APP commit ... id=26 off=0 fd=0 ... raw0=00000000 src=00000000,...`
+  — same buffer id, mapped memory all zeros.
+* the same log after the fix:
+  `APP commit ... id=26 fd=5 ... src=ff0e1323,ff13192b,ff171e32,ff0a0e1c`
+  — exactly the pixels phoc painted.
+* the earlier `OUTPUT commit damage=0,0 1280x768` was an artefact of the
+  experimental pixman patch skipping `wlr_damage_ring_rotate_buffer` (the only
+  place that resets `ring->current`). With `rotate_buffer` restored the output
+  and the buffer are both `1024x768`.
+
+**Fix.** Every shm buffer now holds its own `dup()` of the pool descriptor
+(`owned = 1`, closed in `buffer_forget()` and when a slot is reused); pools can
+close their descriptor safely again. Verified with the **original** phoc:
+unlock → tap the search field → type "term" → results; no black frame, and
+damage updates keep working.
+
+The phoc patches (per-surface `in_transaction`, warning instead of CRITICAL,
+pixman full-frame damage) remain experimental artifacts in
+`/home/ivan/alarm/artifacts`; the image keeps the distro phoc. The transaction
+hardening is still valid defence in depth but was not the fix.
