@@ -32,6 +32,8 @@ MONITOR = "/tmp/werewolf-security.monitor"
 CASES = {
     "fd_lifetime": b"fd lifetime ok",
     "sigreturn_pstate": b"sigreturn pstate blocked",
+    "sigreturn_aa32": b"sigreturn aa32 blocked",
+    "sigreturn_flags": b"sigreturn flags ok",
 }
 
 

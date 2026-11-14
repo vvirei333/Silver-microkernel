@@ -371,17 +371,23 @@ pub fn restore_frame(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) {
     let pc = u64::from_le_bytes(bytes[MC_PC..MC_PC + 8].try_into().unwrap());
     let pstate = u64::from_le_bytes(bytes[MC_PSTATE..MC_PSTATE + 8].try_into().unwrap());
 
-    // A signal frame may only resume EL0. PSTATE.M is user-controlled here:
-    // without this check a task returns from its handler with PSTATE.M =
-    // EL1h (or any other mode) and `eret` jumps to EL1 at the PC and with the
-    // x0-x30 also supplied by the same ucontext — an arbitrary EL1 call.
-    // Linux's valid_user_regs() rejects exactly this; we kill the task.
-    if pstate & 0xF != 0 {
+    // A signal frame may only resume AArch64 EL0t. M[4:0] is user-controlled
+    // here: M[3:0] = EL1h/EL0 with any mode, and M[4] = 1 selects AArch32
+    // (which this kernel has no personality for — its SVC would miss the
+    // dispatcher). Without the check `eret` jumps to EL1 at the user PC with
+    // the user x0-x30 — an arbitrary EL1 call.
+    if pstate & 0x1F != 0 {
         terminate(SIGSEGV);
     }
-
+    // Keep only the user-visible PSTATE: NZCV (bits 31-28) and DAIF (9-6).
+    // SS/IL (21/20), BTYPE, PAN/UAO and reserved bits must not be restored:
+    // SS would arm a software-step stream on EL0, IL is an illegal PSTATE
+    // state that faults immediately after eret, the rest are RES0 on return.
+    // NOTE: bit 30 is NZCV.Z, not the AArch32 selector — terminating on it
+    // would kill every handler that returns with a zero result flag set.
+    const PSTATE_USER_MASK: u64 = 0xF000_0000 | 0x3C0;
     frame[31] = pc;
-    frame[32] = pstate;
+    frame[32] = pstate & PSTATE_USER_MASK;
     write_user_sp(sp);
     let task = scheduler::current_task_id();
     set_blocked(task, mask);
