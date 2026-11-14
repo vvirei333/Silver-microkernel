@@ -31,6 +31,7 @@ MONITOR = "/tmp/werewolf-security.monitor"
 # file stem -> marker the guest must print
 CASES = {
     "fd_lifetime": b"fd lifetime ok",
+    "sigreturn_pstate": b"sigreturn pstate blocked",
 }
 
 

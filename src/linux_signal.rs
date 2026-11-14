@@ -124,7 +124,12 @@ pub fn blocked(task: u64) -> u64 {
 }
 
 pub fn set_blocked(task: u64, mask: u64) {
-    with_table(task, |table| table.blocked = mask);
+    // SIGKILL and SIGSTOP cannot be blocked. Linux silently drops those bits
+    // in sigprocmask/sigaction; without this a task could make itself
+    // unkillable by blocking SIGKILL (the pending bit is then never
+    // delivered) — a self-protection DoS.
+    const UNBLOCKABLE: u64 = (1 << (SIGKILL - 1)) | (1 << (19 - 1)); // SIGSTOP = 19
+    with_table(task, |table| table.blocked = mask & !UNBLOCKABLE);
 }
 
 /// Records a pending signal. Returns `false` for an invalid number or a
@@ -365,6 +370,15 @@ pub fn restore_frame(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) {
     let sp = u64::from_le_bytes(bytes[MC_SP..MC_SP + 8].try_into().unwrap());
     let pc = u64::from_le_bytes(bytes[MC_PC..MC_PC + 8].try_into().unwrap());
     let pstate = u64::from_le_bytes(bytes[MC_PSTATE..MC_PSTATE + 8].try_into().unwrap());
+
+    // A signal frame may only resume EL0. PSTATE.M is user-controlled here:
+    // without this check a task returns from its handler with PSTATE.M =
+    // EL1h (or any other mode) and `eret` jumps to EL1 at the PC and with the
+    // x0-x30 also supplied by the same ucontext — an arbitrary EL1 call.
+    // Linux's valid_user_regs() rejects exactly this; we kill the task.
+    if pstate & 0xF != 0 {
+        terminate(SIGSEGV);
+    }
 
     frame[31] = pc;
     frame[32] = pstate;
