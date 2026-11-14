@@ -5820,3 +5820,43 @@ lines is the cheapest way to see whether the state change happens at all.
   open one covers everything - the "шторка пол экрана" symptom. Next: propose
   the output size only for axes that are anchored on both sides and keep the
   client's own size on the free axis.
+
+
+### The app grid paints: multi-descriptor SCM_RIGHTS
+
+The home / app grid ("phosh home", surface 74/75) was mapped, configured,
+unfolded, and committing 1024x768 frames - and the compositor still drew
+nothing. The frames were real; the compositor silently dropped their buffers.
+
+`libwayland` flushes every pending message of a connection in one sendmsg, so
+several `wl_shm.create_pool` calls can arrive in a single cmsg array with
+several descriptors. The receive path kept only the first descriptor
+(`incoming_fd`), the later pools were never registered, and every buffer
+created from them (`wl_shm_pool.create_buffer`) failed the pool lookup and was
+never added to the buffer table. The commit then found no buffer and skipped
+the surface: no layer entry, no pixels, no input. This affected exactly the
+windows Phosh creates in one go - the home, its wallpaper background and the
+top-panel backdrop - while the lockscreen and panel (each with its own pool in
+its own flush) worked.
+
+`receive_message` now parses the whole cmsg array into a small descriptor FIFO
+and `take_incoming_fd()` pops one per fd-carrying request (create_pool,
+dma-buf add, data_offer.receive, gamma). After that the grid, its wallpaper
+and the backdrops all reach the buffer table.
+
+Two follow-ups that the visible scene needed:
+
+* Phosh only sends `set_alpha` to the quick-settings backdrop when the panel
+  folds or unfolds, and it never folds at startup (the shell folds the panel
+  before the panel exists). At alpha 1 the backdrop is an opaque sheet over
+  the whole desktop, which read as "everything is black". A layer surface
+  that was never given an explicit alpha is now transparent while the drag
+  surface it is stacked below is folded (`layer_effective_alpha`).
+* The folded margin of the top panel is clamped no more: Phosh computes it
+  from the surface height and its layout puts the bar at the bottom of a
+  full-height surface, so an old, smaller buffer height made the "clamp to
+  32 px visible" rule leave the sheet half-way down the screen.
+
+Verified end to end: lock screen renders (clock, date, "Slide up to unlock"),
+Space unlocks (require-unlock is off), the overview shows the wallpaper, the
+search entry and "Show All Apps", Ctrl+T opens the terminal and `ls` runs.
