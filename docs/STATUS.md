@@ -196,10 +196,15 @@ contains the current test image.
   `src/linux_elf.rs` — the optional Linux personality.
 - `userspace/` — native programs, including the Howl shell.
 - `tests/linux/` — freestanding and glibc Linux ABI tests.
+- `tests/security/` — kernel-boundary regressions (`fd_lifetime`, …) and host
+  fuzz targets; runner `tools/security_test.py --fuzz`.
 - `third_party/wayland-aarch64/` — vendored Wayland/libffi/libdrm binaries,
   headers and generated xdg-shell code (MIT).
 - `tools/` — test injector, SFS tools, host window viewer.
 - `docs/` — architecture and audit notes; this file is the status snapshot.
+- `docs/SECURITY.md` — what the kernel accepts from a task, disclosure and
+  the new-syscall PR gate. `docs/audit/M2/` — the frozen entry-point snapshot
+  and checklist handed to the M2 auditor.
 - `handoff.md` — chronological slice log with detailed rationale.
 
 ## Next

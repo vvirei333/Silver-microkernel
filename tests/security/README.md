@@ -1,0 +1,72 @@
+# Security tests
+
+Two kinds of checks live here:
+
+1. **Guest regressions** (`*.c`) — freestanding Linux ABI programs that drive
+   a kernel boundary and print a marker. They run on the real kernel in QEMU,
+   because the behaviour under test (fd tables, SCM_RIGHTS, capabilities)
+   only exists there.
+2. **Host fuzz targets** (`fuzz/*.rs`) — deterministic harnesses for parsers
+   that consume untrusted bytes. The parser module is shared with the guest
+   (`userspace/src/http_parse.rs`), so a host crash is a guest crash.
+
+## Run
+
+```bash
+# build the release kernel first
+./build_and_qemu.sh release --no-run
+
+tools/security_test.py                 # compile + inject + boot + run all cases
+tools/security_test.py --fuzz          # ... and run the host HTTP parser fuzzer
+tools/security_test.py --case fd_lifetime
+tools/security_test.py --no-boot       # compile and inject only
+```
+
+The runner never touches the tracked `disk.img`: it copies it to
+`/tmp/werewolf-security.img` and injects the compiled programs there. The
+kernel is `target/aarch64-unknown-none/release/silver_microkernel`; the QEMU
+command mirrors `build_and_qemu.sh` (no display, serial on a Unix socket).
+
+## Cases
+
+| Case | Proves |
+|---|---|
+| `fd_lifetime` | An fd passed over `SCM_RIGHTS` is **duplicated/refcounted**, not remembered by number: the sender closes its copy, the freed number is recycled by unrelated memfds, and the receiver still reads the original file. Regression for the M0.2 class (fd lifetime / ownership across IPC) moved from user space into the kernel boundary. |
+
+Planned (from the M2 audit checklist, `docs/audit/M2/`):
+
+- `send_spam` — a task filling another task's mailbox (ambient send-by-pid).
+- `munmap_toctou` — a sibling thread unmapping a receive buffer after the
+  pre-block validation; the copy-out must revalidate.
+- `name_squat` — duplicate/owner-replacement policy for `R`/`L` names.
+- `linux_fd_lifetime` — the Linux personality's fd table under
+  `close_range`/`dup`/`fork` (the M0.2 class on the ABI side).
+
+## Host fuzz targets
+
+`fuzz/http_parse_fuzz.rs` compiles `userspace/src/http_parse.rs` directly with
+`rustc` and feeds it mutated responses: content-length edge values, chunked
+bodies, missing CRLF, oversized sizes, `received` larger than the buffer.
+Panics are findings; the harness prints the input as hex.
+
+It found the first real bug on its first run: a chunk size of
+`0xFFFFFFFFFFFFFFFF` made `input = input.saturating_add(size)` reach
+`usize::MAX`, the following `input + 1` wrapped to zero in release builds and
+`dechunk` spun forever — a remote DoS on any chunked HTTP response. The fix
+clamps `input` to the buffer length; the oversized-chunk seed is now the
+harness's named regression (it runs before the random phase, so a regression
+hangs the harness instead of slipping through).
+
+Tune the iteration count with `HTTP_FUZZ_ITERS` (default 200000, ~30 ms).
+The harness is deterministic: a failing input is reproducible from the
+printed iteration/hex.
+
+## Adding a case
+
+1. Drop `name.c` here, freestanding (`-nostdlib`, raw `svc` wrappers — copy
+   the header from `fd_lifetime.c`), with a single `_start`.
+2. Print a unique marker (`"<name> ok\n"`) and exit 0 on success; print the
+   failure reason and exit 1 otherwise.
+3. Add `"name": b"<name> ok"` to `CASES` in `tools/security_test.py`.
+4. If it needs a shared module, add a host harness under `fuzz/` instead and
+   wire it into `run_fuzz()`.

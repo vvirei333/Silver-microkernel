@@ -16,8 +16,11 @@ milestone plan are in [`docs/VECTOR.md`](docs/VECTOR.md) and
   kernel go through the bounded heap, userspace uses static storage or the
   Linux ABI's `brk`/`mmap` for foreign programs.
 - **A new syscall or driver needs a test.** Host unit tests live next to the
-  module (`cargo test --lib`); guest proofs are boot tests or entries in the
-  Linux ABI matrix (`docs/STATUS.md`).
+  module (`cargo test --lib`); guest proofs are boot tests, entries in the
+  Linux ABI matrix (`docs/STATUS.md`) or a case under `tests/security/`.
+  A parser that consumes untrusted bytes gets a host fuzz target
+  (`tests/security/fuzz/`). A security fix lands with its
+  failing-then-passing test — see `docs/SECURITY.md`.
 - **Ports are platform trees.** One device is one file plus its driver tasks;
   the checklist and the agent workflow for a new board are in the master plan
   (M5).
@@ -42,6 +45,7 @@ guest still runs and publishes frames into the ivshmem surface.
 ```bash
 cargo test --lib                    # kernel/host unit tests
 ./build_and_qemu.sh --linux-tests   # then run the matrix at `howl>`
+tools/security_test.py --fuzz       # boundary regressions + HTTP fuzzer
 tools/demo.py --no-record           # smoke-test the Phosh path
 ```
 

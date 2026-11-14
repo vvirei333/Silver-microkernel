@@ -6730,3 +6730,42 @@ re-injecting. Tags: `werewolfos-0.1.2`, `silver-kernel-0.1.2`.
 
 Known gaps for 0.1.3: lock-screen wallpaper, host cursor, software-rendering
 performance, and the research-log cleanup that remains from M1.5.
+
+### M2 start: entry-point bundle, security protocol, first boundary tests
+
+The M2 track opens with the two entry points the auditor walks first:
+
+* `docs/audit/M2/` — a frozen code snapshot (`snapshot/`, manifest with
+  SHA256, commit `1b0f52d`) plus an annotated path through the SVC trampoline
+  (`syscall-entry.md`, invariants S1-S8, leads Q1-Q5) and mailbox IPC
+  (`ipc-entry.md`, invariants I1-I10). The invariants are testable claims, not
+  prose: unknown call numbers, user-pointer validation, check-then-use across
+  a BKL release, capability delegation, queue limits, death cleanup.
+* `docs/SECURITY.md` — the protocol the audit is measured against: assets and
+  trust boundaries, what a task may hand the kernel (registers, pointers,
+  time, identity, authority, resources), failure containment, the known gaps
+  (send-by-pid ambient authority, nameserver policy in user space, no syscall
+  filtering, no KASLR, unbounded Scout RPC, uncharged queue memory), the
+  disclosure/fix flow and the PR gate for a new syscall.
+
+**First boundary tests.** `tests/security/` now holds guest regressions and
+host fuzz targets, run by `tools/security_test.py` (it copies `disk.img` to
+`/tmp`, boots the release kernel and asserts a marker per case):
+
+* `fd_lifetime.c` — the M0.2 class moved into the kernel: a descriptor passed
+  with `SCM_RIGHTS` must be duplicated/refcounted, so closing the sender's
+  copy and recycling the freed number must not change what the receiver
+  reads. Passes on the current kernel.
+* `fuzz/http_parse_fuzz.rs` — compiles the guest's HTTP response parser
+  directly with `rustc` and feeds it mutated responses. **It found a remote
+  DoS on its first run**: a chunk size of `0xFFFFFFFFFFFFFFFF` made
+  `input = input.saturating_add(size)` reach `usize::MAX`, and the following
+  `input + 1` wrapped to zero in release builds — `dechunk` spun forever on
+  any chunked response. Fixed by clamping `input` to the buffer length; the
+  oversized-chunk seed is now the harness's named regression (it runs before
+  the random phase, so a regression hangs the harness).
+
+The parser moved out of `userspace/src/bin/net_server.rs` into
+`userspace/src/http_parse.rs` (core-only) so the guest server and the host
+fuzzer share one implementation. `tools/security_test.py --fuzz` is the CI
+entry point; 200000 deterministic cases run in ~30 ms.
