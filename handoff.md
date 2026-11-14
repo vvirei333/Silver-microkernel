@@ -6021,3 +6021,18 @@ Two bugs together made the lock screen impossible to unlock with the mouse:
 
 Verified: a plain click on the lock screen unlocks to the overview; the
 Terminal tile, launching and the floating window still work.
+
+
+### Synthetic swipe: tried, does not work
+
+Replaying the press as a swipe (press, eight motions upward 12 ms apart, release,
+all with synthetic timestamps) does *not* unlock: libhandy's deck swipe is
+touch-only, so the gesture is ignored even at ~5000 px/s. Adding a Space key
+after the replay did not help either - the pending pointer sequence seems to
+keep GTK from acting on the key until it finishes.
+
+What works and is shipped (`f55e8ba`): a click (or the end of a drag) on the
+lock screen sends Space, and `require-unlock=false` turns that into the unlock.
+If a real swipe feel is wanted later, the clean way is to make the *lock
+screen* respond to pointer drags in the compositor (animate the layer surface
+up and finish the unlock), rather than fighting libhandy's touch-only gesture.
