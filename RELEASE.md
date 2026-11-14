@@ -127,6 +127,13 @@ These land after the tag and will be in 0.1.3:
   `input + 1` wrapped in release builds). 0.1.2 binaries are affected. The
   parser now clamps its cursor; the regression is the named seed of the host
   fuzzer in `tests/security/fuzz/`.
+- **`rt_sigreturn` privilege escalation (fixed in `3c4e834`, critical).**
+  0.1.2 accepted the user's `pstate` from a signal frame and returned to it
+  with `eret`: `PSTATE.M = EL1h` executed the task's PC at EL1 with the
+  task's registers (proved with `tests/security/sigreturn_pstate.c`, which
+  panics the unfixed kernel with `EL1 EXCEPTION`). Non-EL0t frames are now
+  rejected with SIGSEGV. **Any 0.1.2 build that runs Linux binaries should
+  take this fix.**
 
 ## License and project direction
 
