@@ -55,6 +55,16 @@ configure pending), затем acks приходят при `pending_layer_confi
 шилда при `pending == 0`. Нужна пересборка phoc 0.57.0 из исходников
 (gitlab.gnome.org доступен). До этого — known issue в 0.1.2.
 
+**Статус 2026-11-14 (пересборка):** phoc 0.57.0 собирается в Arch ARM
+chroot (`/home/ivan/alarm`), запускается в образе. Инструментация показала:
+в чёрном кадре сцена **рисуется полностью** (5 layer-surface, layer 0
+`mapped buffer=1 texture=1`, damage 1024x768), но коммит уходит с damage
+**1280x768** при буфере 1024x768 — output/damage-ring не совпадает с
+swapchain-буфером. Патч транзакции (per-surface `in_transaction`) и
+pixman-full-damage чёрный кадр не убирают. Следующий шаг — выровнять размер
+nested output и буфера / проверить clamping damage в прокси. Детали и
+артефакты — в `handoff.md` (раздел «M0.2 rebuild»).
+
 - Первичное подозрение: реализация `zphoc_layer_shell_effects_v1` (alpha=0 на
   home background при fold; state не восстанавливается / применяется к output
   вместо surface).

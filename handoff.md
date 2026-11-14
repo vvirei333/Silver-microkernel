@@ -6577,3 +6577,81 @@ on phoc traces the two suspicious configures end to end:
 Next cheap probe: stop the primary background from committing before its
 pixbuf exists (or force a reload after the fold). If that paints the
 wallpaper, the black frame is Phosh's background cache and not phoc at all.
+
+### M0.2 rebuild: phoc 0.57.0 builds, renders the scene, still commits black
+
+**Persistent build environment (do not put in /tmp):**
+- `/home/ivan/alarm/root` — Arch Linux ARM rootfs (glibc 2.43; the image has
+  2.44, so binaries built here run there).
+- `/home/ivan/alarm/phoc-src` — phoc 0.57.0 + the patches below (the full
+  tree; the 20 KiB `phoc-0.57.0.tar.gz` in artifacts is a broken download, the
+  tree is the real source).
+- `/home/ivan/alarm/artifacts/` — `phoc-original` (the image's binary),
+  `phoc-patched-instrumented` (the current build), `m0.2-phoc.patch`.
+- `/home/ivan/alarm/logs/serial-last.log` — the instrumented run.
+
+**Build recipe (no root, bwrap + binfmt):**
+```
+R=/home/ivan/alarm/root
+bwrap --unshare-all --share-net --bind "$R" / --proc /proc --dev /dev \
+  --tmpfs /tmp --bind /home/ivan/alarm/phoc-src /src --uid 0 --gid 0 -- \
+  /bin/bash -c 'cd /src && meson setup build -Dembed-wlroots=disabled \
+  -Dxwayland=disabled -Ddtrace=disabled -Dsysprof=disabled && ninja -C build'
+```
+Rootfs gotchas already applied: `SigLevel = Never`, `LocalFileSigLevel =
+Never`, `alpm` uid/gid 0 in `/etc/passwd`+`/etc/group` (the user namespace
+maps only uid 0), `[alarm]`/`[aur]` commented out, `--disable-sandbox`,
+`expat` and `glib2-devel` installed (`glib-mkenums` lives there).
+
+**Patch set (`artifacts/m0.2-phoc.patch`):**
+1. `layer-surface`: one layout-transaction slot per surface (`in_transaction`),
+   so a configure sent while a previous serial is outstanding is still
+   counted; warn when an ack has no slot.
+2. `layout-transaction`: lost ack is a warning, not a CRITICAL assertion.
+3. `render.c`/`output.c`: `PHOC_RENDER_DEBUG` instrumentation (env cached,
+   never call `g_getenv` in the per-frame path — doing so changed the timing
+   and made the unlock go black): per-frame `RENDER frame` summary (damage,
+   rendered/missing, layer queue lengths, layer-0 buffer/texture/geo),
+   `PHOCQ rebuilt` queue dumps, `OUTPUT render/paint/commit` logs.
+4. `output.c`: on the pixman renderer always set `buffer_damage` to the whole
+   buffer (the pixman swapchain does not preserve contents).
+
+**What the rebuilt phoc proved:**
+- The vanilla rebuild boots Phosh exactly like the image binary.
+- Step 0 (old binary): configures 11/16/17 delivered to Phosh, acked with the
+  same serials, transaction finished in 1890 ms without a timeout, and the
+  screen still went black. **The transaction timeout is not the cause.**
+- Instrumented rebuilt phoc at the black frame:
+  `RENDER frame damage=0,0 1024x768 rendered=5 missing=0 queues=0:1 1:0 2:4
+  3:0 l0=phosh background[m buf=1 tex=1 1024x768]`
+  The compositor draws all five layer surfaces and layer 0 has the wallpaper
+  texture. The scene is not empty.
+- The pixman full-frame fix makes every frame paint `0,0 1024x768`, yet the
+  host is still black.
+- The commit log shows `OUTPUT commit ... damage=0,0 1280x768` while the paint
+  log shows `0,0 1024x768`: the nested output/damage ring is **1280x768** but
+  the swapchain buffer is **1024x768**. The host window is 1024x768. This
+  buffer/output size mismatch is the leading suspect: the pixman render pass
+  may be writing with the output's 1280 stride into a 1024-wide buffer, or the
+  committed buffer is not the one painted.
+- The transaction hardening does **not** fix the black screen. Keep it as
+  defence in depth.
+
+**Next (in order):**
+1. Inject `artifacts/phoc-patched-instrumented` as `/sfs/phoc`, add
+   `PHOC_RENDER_DEBUG=1` to the wrapper env, boot/unlock/tap, and read
+   `OUTPUT paint ... size=WxH output=WxH` and `OUTPUT commit ...`.
+   Confirm the 1280/1024 mismatch and whether the buffer is the painted one.
+2. If output is 1280 and buffer 1024, force the nested output to 1024x768
+   (phoc.ini `mode`, the wrapper toplevel configure, or the wlroots wayland
+   backend's output size) and retest. The wrapper's window is 1024x768.
+3. Isolate the proxy: clamp the host surface damage/compose to
+   `OUT_WIDTH`/`OUT_HEIGHT` in `wayland_real.c` SERVE_PHOC and test with the
+   **original** phoc. If the clamp changes the black frame, the bug is in the
+   proxy's handling of the 1280x768 damage/stride, not phoc.
+4. If the buffer is still black while the render reports five surfaces, hook
+   `wlr_render_pass_add_texture` or read back the pixman buffer to see where
+   the scene lands.
+
+The image was restored to the original `phoc` and the clean wrapper
+(`phoc-serve`) so the baseline is reproducible; QEMU is stopped.
