@@ -6547,3 +6547,33 @@ stacked-surface CRITICAL and not the shield. Fixing it needs a rebuilt phoc
 when `pending_serial` is outstanding, and a defensive shield lower when
 `pending_layer_configures` is 0. Until then, 0.1.2 ships with this as a known
 issue (tap on the app-grid search field freezes the output).
+
+### M0.2 step 0: configures and acks are correct; the 3 s timeout is not the cause
+
+`WAYLAND_DEBUG=1` on Phosh plus `phoc-layer-surface`/`phoc-layout-transaction`
+on phoc traces the two suspicious configures end to end:
+
+* top-panel `configure(11)`, home `configure(16)` and the new layer-0
+  `phosh background` `configure(17)` are all **delivered** to Phosh and
+  **acked with the same serial** (`ack_configure(11/16/17)`).
+* The transaction counts all three (`adding 2th/3th pending configure`) and
+  finishes after **1890 ms**, below the 3 s timeout, with no CRITICAL.
+* That run still ends in the black frame. So the timeout is not required for
+  the bug; it only adds the `pending_layer_configures == 0` CRITICAL when
+  software rendering is slower than 3 s.
+* After the configure Phosh creates **fresh shm pools** and commits buffers of
+  the right size (`1024x768` for the panel/panel-background, `1024x736` for
+  home) with **full damage**, so this is not a client resize or a lost
+  configure. GDK is already running with `GDK_GL=disable` and
+  `GDK_DEBUG=gl-disable`; the EGL-resize theory does not apply.
+* During the same transition phoc creates a **new** layer-0
+  `phosh background` surface (the primary wallpaper). Its image fetch is
+  asynchronous and the loader logs `Failed to load background image:
+  Operation was cancelled`; its first full-damage commit can therefore
+  contain only the CSS background (no pixbuf).
+* The cosmetic `Stacked surface ... not in same layer` CRITICAL still appears
+  at the fold; it is unrelated.
+
+Next cheap probe: stop the primary background from committing before its
+pixbuf exists (or force a reload after the fold). If that paints the
+wallpaper, the black frame is Phosh's background cache and not phoc at all.
