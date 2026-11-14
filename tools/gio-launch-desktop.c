@@ -30,10 +30,15 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (getenv("WAYLAND_DISPLAY") == NULL) {
+    /* An empty value means the variable is present but unusable; GDK then
+       falls back to X11 and dies with "cannot open display: ". Treat empty
+       like missing. */
+    const char *display = getenv("WAYLAND_DISPLAY");
+    if (display == NULL || display[0] == 0) {
         setenv("WAYLAND_DISPLAY", "wayland-test", 1);
     }
-    if (getenv("GDK_BACKEND") == NULL) {
+    const char *backend = getenv("GDK_BACKEND");
+    if (backend == NULL || backend[0] == 0) {
         setenv("GDK_BACKEND", "wayland", 1);
     }
 
