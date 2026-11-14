@@ -58,7 +58,7 @@ debt. Апгрейд только если ребейз патчей ≤ 2 дн�
 
 ---
 
-## M1. РЕЛИЗ 0.1.0 (цель: 2-4 недели от M0)
+## M1. РЕЛИЗ 0.1.2 (цель: 2-4 недели от M0)
 
 Состав (минимум, не перфекционизм):
 
@@ -76,7 +76,7 @@ debt. Апгрейд только если ребейз патчей ≤ 2 дн�
   манифест: *"WerewolfOS is free software. Forks, copies and closed derivatives
   are not enemies of this project — they are proof it worked."*
 - Trademark-декларация имени, ©-строки, DCO для PR.
-- Теги: `silver-kernel-0.1.0`, `werewolfos-0.1.0`.
+- Теги: `silver-kernel-0.1.2`, `werewolfos-0.1.2`.
 
 ---
 
@@ -182,7 +182,7 @@ ABI = userspace ELF-исполнитель, драйверы только сво
 ## ПОРЯДОК РАБОТ (сводка)
 
 ```
-Сейчас:  M0 (phoc-блокеры, timebox!) → M1 (релиз 0.1.0 + демо + репо)
+Сейчас:  M0 (phoc-блокеры, timebox!) → M1 (релиз 0.1.2 + демо + репо)
 Далее:   M2 (SECURITY.md → аудит точек входа → фаззер → lockdown) ‖ M3.1-M3.2
 Потом:   M3.3 (Redmi bring-up, simplefb первой!) → M3.4 (GPU/freedreno)
 Горизонт: M4 RISC-V, M5 сообщество-масштаб

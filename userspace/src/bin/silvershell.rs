@@ -287,7 +287,7 @@ fn execute(command: &str) {
         Some("cd") => change_directory(words.next()),
         Some("pwd") => print_working_directory(),
         Some("clear") => clear_screen(),
-        Some("uname") => syscall::print("Silver Kernel v0.1.1 aarch64 (WerewolfOS)\r\n"),
+        Some("uname") => syscall::print("Silver Kernel v0.1.2 aarch64 (WerewolfOS)\r\n"),
         Some("health") => show_health(),
         Some("du") => show_usage(words.next()),
         Some("ps") => show_tasks(),
@@ -1422,8 +1422,8 @@ fn fastfetch() {
     syscall::print("\r\n");
     plain("werewolf@howl");
     plain("-------------");
-    field("OS:", "WerewolfOS 0.1.1");
-    field("Kernel:", "Silver Microkernel 0.1.1");
+    field("OS:", "WerewolfOS 0.1.2");
+    field("Kernel:", "Silver Microkernel 0.1.2");
     field("Codename:", "First Howl");
     field("Arch:", "AArch64");
     field("Platform:", "QEMU / ARM64");

@@ -38,7 +38,7 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 - Console shell (`howl`) with file, process, mount, network and health
   commands; `linuxrun-<app>` resolves `/sfs/apps/<app>` then `/sfs/<app>` and
   supplies the Wayland/XDG environment.
-- Fastfetch-style boot banner, kernel/userspace version **0.1.1**.
+- Fastfetch-style boot banner, kernel/userspace version **0.1.2**.
 
 ### Linux ABI
 - Static and dynamic glibc programs; real `ld.so`, PIE/`PT_INTERP`, `$ORIGIN`.

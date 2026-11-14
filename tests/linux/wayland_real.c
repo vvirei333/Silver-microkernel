@@ -5679,6 +5679,21 @@ void _start(void) {
         }
     }
 
+    /* Debug: colour the top panel and its stacked background. */
+    sys3(34 /* mkdirat */, -100, (long)"/tmp/.config/gtk-3.0", 0777);
+    {
+        long css_fd = sys3(56 /* openat */, -100,
+                           (long)"/tmp/.config/gtk-3.0/gtk.css",
+                           0x241 /* O_WRONLY|O_CREAT|O_TRUNC */);
+        if (css_fd >= 0) {
+            static const char css[] =
+                "phosh-top-panel { background-color: #ff0000; }\n"
+                "phosh-top-panel-bg { background-color: #00ff00; }\n";
+            sys3(64 /* write */, css_fd, (long)css, sizeof(css) - 1);
+            sys3(57 /* close */, css_fd, 0, 0);
+        }
+    }
+
     /* Session bus for Phosh: libfeedback, polkit, the OSK manager and logind
        clients connect to it. /sfs/dbus-daemon ships with a permissive config;
        LD_LIBRARY_PATH is needed because its libsystemd has no RUNPATH. */

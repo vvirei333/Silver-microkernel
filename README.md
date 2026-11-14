@@ -49,9 +49,9 @@ milestone.
 
 ## Screenshot
 
-![WerewolfOS fastfetch](assets/silver-fastfetch-0.1.1.png)
+![WerewolfOS fastfetch](assets/silver-fastfetch-0.1.2.png)
 
-The `fastfetch` screen above is real output from WerewolfOS 0.1.1
+The `fastfetch` screen above is real output from WerewolfOS 0.1.2
 (Silver Microkernel) running in QEMU. The aligned summary includes processes,
 open files, SFS usage and DMA state. The interactive `howl` shell and the
 `howler` UART driver run in userspace.

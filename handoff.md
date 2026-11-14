@@ -29,10 +29,10 @@ Redmi port is parked. The reference checklist is
   `no_std,tablet` (parked), `no_std,smp-selftest`, `no_std,demo-tasks`.
 - **Console OS (QEMU serial):** boots to `howl ready` with no graphics tasks;
   `help`, `uname`, `ls /`, `health` all answer. `health` reports no DMA leaks.
-  The kernel/userspace version is **0.1.1**. `fastfetch` prints an aligned
+  The kernel/userspace version is **0.1.2**. `fastfetch` prints an aligned
   two-column summary — OS/kernel, codename, arch, platform, shell, FS, uptime,
   memory with a percentage, processes, open files, SFS usage and DMA state —
-  followed by the 16-colour bar, and `uname` reports `Silver Kernel v0.1.1`.
+  followed by the 16-colour bar, and `uname` reports `Silver Kernel v0.1.2`.
   A real dynamic glibc binary (`ld.so` + `libc.so.6`) loads and prints
   `dynamic hello` through the Linux ABI.
 - **Network:** `net_server` runs DHCP (with the static fallback), DNS, TCP and
