@@ -5931,3 +5931,33 @@ State: lock screen -> Space unlock -> overview (wallpaper, search, Terminal
 tile) -> tapping Terminal launches /sfs/term through GIO -> Phosh folds the
 overview (the foreign toplevel arrives) -> the terminal floats over the
 gradient desktop with a visible top bar, movable by its title bar and closable.
+
+
+### Where the top panel stands (next session)
+
+The bar is now visible (the layer order fix), but the *panel window itself* is
+sitting at margin 0 instead of its folded margin: its 1024x768 buffer has the
+clock bar in rows 0..32 and an opaque black quick-settings body below, so the
+"desktop" around a window is black and every click on the panel rect would be
+claimed as a panel drag (mode FULL). In the folded state the margin must be
+-736 (bar rows 736..768 shown at screen 0..32) and the black body must be
+off-screen.
+
+Check, in this order:
+
+* the panel's `DragSlot`: `state` (should be 0), `folded` (should be about
+  -736, from the client's `set_margins`), `current`;
+* `drag_finish()` - a stray press inside the panel rect (which is 0..768 as
+  long as the margin is 0) turns into an "unfolded" drag and latches the
+  state;
+* `layer_record_commit()` copies `slot->margin[]` (the zwlr margins, 0 for
+  drag surfaces) over the drag-applied margin; `drag_apply` runs right after,
+  so it should win, but the ordering is worth double checking.
+
+Two smaller things seen in the same runs:
+
+* the first click on the app grid right after unlocking sometimes only
+  focuses the tile (press and release both reach the client with the same
+  target, so it is not a routing bug); a second click always launches;
+* the compositor's night-sky gradient root is painted but never visible: the
+  panel body (above) covers it. Once the panel folds, it should show.
