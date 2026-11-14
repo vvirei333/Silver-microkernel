@@ -5643,9 +5643,13 @@ void _start(void) {
                 "require-unlock=false\n"
                 /* The app grid's home page lists favourites; with an empty
                    list the launcher is a blank page with only the search
-                   entry. */
+                   entry. Phosh 0.57 reads them from its own schema
+                   (sm.puri.phosh favorites); org.gnome.shell is kept for
+                   older shells. */
                 "[org/gnome/shell]\n"
-                "favorite-apps=['werewolf-terminal.desktop']\n";
+                "favorite-apps=['werewolf-terminal.desktop']\n"
+                "[sm/puri/phosh]\n"
+                "favorites=['werewolf-terminal.desktop']\n";
             sys3(64 /* write */, settings_fd, (long)settings,
                  sizeof(settings) - 1);
             sys3(57 /* close */, settings_fd, 0, 0);

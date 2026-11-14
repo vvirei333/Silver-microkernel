@@ -6331,3 +6331,20 @@ Still open after this fix: Phosh's app grid paints no tile even though GIO and
 GSettings see `werewolf-terminal.desktop` from inside the running session, and
 the terminal window content is clipped on the left under phoc. The terminal
 command output itself was not yet re-checked after the close_range fix.
+
+### Phosh 0.57 reads favourites from `sm.puri.phosh`
+
+The app grid stayed empty because the image seeded `org.gnome.shell
+favorite-apps`, which is what older Phosh versions used; Phosh 0.57's
+`PhoshFavoriteListModel` reads `sm.puri.phosh` → `favorites`. Both keys are
+now written into the GSettings keyfile (`[sm/puri/phosh] favorites=[...]`).
+A probe confirmed the backend returns the value for both schemas.
+
+The grid still paints no tile: the favourites revealer is present (there is a
+separator line below the search bar) but the button itself is invisible, and
+after focusing the search the top part of the screen turns into an opaque
+black rectangle. Together with the terminal's left-clipped content and its
+black window after a command, this points at phoc's pixman compositing of
+Phosh's layer surfaces rather than at the app data. Next: compare the scene
+with the mini compositor's direct Phosh path, or try a phoc build with a
+different renderer/damage setting.
