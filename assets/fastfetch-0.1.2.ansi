@@ -1,0 +1,48 @@
+[0m fastfetch
+                                       .==.       .:+:.
+                                      .-=-.       .+-:
+                                     .:-:-.      .+.-:
+                                    ..=.:-.:.   .=:.--...
+                                    .=. :=:.   .-: .-=..
+                                    .....    ...
+                                    .-==:. ..-=-..
+                                 ....
+                                .---.                 .:. ....
+                                .:::                .:=:..:=:.
+                                 ...               .::...-...
+                                 .-.       .::... .-:
+                                 .=.       ...... .:+..
+                                 .=.               .--.
+                                 .=.                :=:.
+                                 .=.....            .--..
+                                 .=..:+-.            .=:.
+                                 .:. ...             .... ..:::::::..
+                                 .+:.-=:. =-           .=:....    ...:-..
+                                 .+: ...  =-            .=..         ..-==:..
+                                 .+:      =-             ::.           -:.-*-..
+                                 .+:  .:-.==. .:=.      .+.          ..==::..
+                                 ..=++=:...-++=:..  .:::=....      ..:....
+                                    ..      ...  .::..... ...-++++-:::.
+
+werewolf@howl
+-------------
+OS:          WerewolfOS 0.1.2
+Kernel:      Silver Microkernel 0.1.2
+Codename:    First Howl
+Arch:        AArch64
+Platform:    QEMU / ARM64
+Type:        Microkernel
+Shell:       Howl
+FS:          SFS
+Status:      Experimental
+Uptime:      2.12 s
+Memory:      42.8 MiB / 1024.0 MiB (4%)
+Free RAM:    981.1 MiB
+Processes:   7 live / 0 zombie
+Open files:  0
+Disk (/sfs): 24.5 MiB used / 68 inodes
+DMA:         0 leaked / 0 quarantined
+
+[40m  [41m  [42m  [43m  [44m  [45m  [46m  [47m  [0m
+[100m  [101m  [102m  [103m  [104m  [105m  [106m  [107m  [0m
+[1;36mhowl>[0m 

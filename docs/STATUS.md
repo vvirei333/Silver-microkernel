@@ -1,6 +1,6 @@
 # WerewolfOS — current project status
 
-_Last refreshed: 2026-11-09 (after the two-client Wayland frame/animation slice)._
+_Last refreshed: 2026-11-15 (release 0.1.2: Phosh desktop, M0 closed)._
 
 WerewolfOS is a native AArch64 console microkernel with its own drivers, VFS,
 network stack and shell. Linux programs — including a real `libwayland-client`
@@ -87,6 +87,22 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   - stock `wayland-info` from `wayland-utils` enumerates the compositor.
 - Vendored aarch64 libs/headers in `third_party/wayland-aarch64` (MIT).
 
+### Phosh desktop
+
+- The real postmarketOS stack runs on the Linux ABI: **phoc 0.57** (Wayland
+  compositor) and **Phosh 0.57** (GTK3 shell), software-rendered with the
+  pixman renderer (GL disabled).
+- Nested 1024×768 scanout published into the host window through ivshmem; the
+  repo's proxy (`tests/linux/wayland_real.c`, `SERVE_PHOC`) serves the nested
+  compositor.
+- Works end to end: lock screen, unlock, app grid, type-ahead search, launching
+  a GTK Terminal, typing and running commands.
+- Demo: `assets/demo-0.1.2.gif`, reproducible with `tools/demo.py`.
+- Known cosmetic gaps: the lock-screen wallpaper is not painted (black
+  backdrop with the clock), the host cursor is not drawn, and the overview fold
+  still logs the upstream `Stacked surface … not in same layer` CRITICAL (the
+  same message appears on PureOS phones).
+
 ### D-Bus
 - EXTERNAL auth (`SO_PEERCRED`), `Hello` method call, method return, signals.
 - `NEGOTIATE_UNIX_FD` and `UNIX_FDS=1` with an `h` body: memfd passed both
@@ -147,8 +163,17 @@ Run `./build_and_qemu.sh --linux-tests` once, then at `howl>`:
 | `linuxrun /sfs/linux-dbus` | `dbus ok` |
 | `health` | 0 zombies, 0 open files, 0 DMA leaks |
 
-Host-side: `cargo test --lib` → **221 tests**. Feature builds: `no_std`,
-`no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,smp-selftest`.
+Host-side: `cargo test --lib` → **222 tests**. Feature builds: `no_std`,
+`no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,smp-selftest`; the
+`--no-linux` build is clean (the switch is also a regression test for Linux
+code leaking into the kernel).
+
+**Release 0.1.2 matrix run (2026-11-15): 26/26 green**, including
+`health` → `zombie 0 / open 0 / leaked 0`. Two stale pieces found and fixed
+while gating the release: `linux-wlreal` still expected the old
+`WEREWOLF_KEYMAP` marker (the compositor now ships a real XKB keymap for
+wlroots), and the shell/drm PRIME paths were not feature-gated, which broke
+`--no-linux`.
 
 ## Build and run
 

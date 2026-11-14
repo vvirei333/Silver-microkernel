@@ -47,14 +47,38 @@ milestone.
 
 🐺 Developer Telegram: [Сильвер не кодит](https://t.me/rustdev_rs)
 
+## Manifesto
+
+WerewolfOS is free software. Forks, copies and closed derivatives are not
+enemies of this project — they are proof it worked.
+
+Reference device: **Redmi 10C (SM6225)** — the first phone target once the OS
+layer is ready (parked for now, see `redmi10c_poc/`).
+
+## Demo — Phosh on the Silver microkernel
+
+![WerewolfOS 0.1.2 demo](assets/demo-0.1.2.gif)
+
+30 seconds of the real desktop: the Phosh lock screen, unlock, the app grid,
+type-ahead search, launching the GTK Terminal and running `ls /sfs`. The
+frames are the pixels the kernel published into the host window (software
+rendering, 1024×768); `tools/demo.py` reproduces the run and re-records it.
+A higher-quality [MP4](assets/demo-0.1.2.mp4) and a
+[still](assets/demo-0.1.2-terminal.png) are in `assets/`.
+
 ## Screenshot
 
 ![WerewolfOS fastfetch](assets/silver-fastfetch-0.1.2.png)
 
 The `fastfetch` screen above is real output from WerewolfOS 0.1.2
-(Silver Microkernel) running in QEMU. The aligned summary includes processes,
-open files, SFS usage and DMA state. The interactive `howl` shell and the
-`howler` UART driver run in userspace.
+(Silver Microkernel) running in QEMU. The text is rendered from the captured
+serial stream (`assets/fastfetch-0.1.2.ansi`, raw PL011 bytes) by
+`tools/make_fastfetch_asset.py`; only the window frame is decoration. The
+aligned summary includes processes, open files, SFS usage and DMA state. The
+interactive `howl` shell and the `howler` UART driver run in userspace.
+
+Release notes for this version: [`RELEASE.md`](RELEASE.md). Contributions:
+[`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## What already works
 

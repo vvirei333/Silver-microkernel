@@ -1,1 +1,2 @@
-* text=auto eol=lf
+# Serial captures must keep their exact bytes (CRLF, ANSI escapes).
+assets/*.ansi -text

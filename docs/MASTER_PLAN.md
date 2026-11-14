@@ -111,6 +111,15 @@ debt. Апгрейд только если ребейз патчей ≤ 2 дн�
 - Известные issues — в RELEASE.md с трекингом
 - **Демо-видео 60 сек**: boot → стол → свайп → терминал → ls → exit
 
+**Статус 2026-11-15: M1 выполнен.** Релиз 0.1.2 собран и проверен: матрица
+26/26 (включая `health` 0/0/0), `cargo test --lib` 222, `--no-linux` чистый,
+`uname`/fastfetch 0.1.2. Демо записано из реального scanout
+(`assets/demo-0.1.2.gif`, 29.5 с, сценарий — `tools/demo.py`), фастфетч-скрин
+перегенерирован из raw serial-дампа (`tools/make_fastfetch_asset.py`).
+RELEASE.md, CONTRIBUTING.md, манифест и reference device добавлены; теги —
+`werewolfos-0.1.2` и `silver-kernel-0.1.2`. Остаток M1.5 (отделение
+research-хвостов от kernel+OS) — следующий шаг.
+
 **M1.5 — чистый публичный репо:**
 
 - Отделить kernel+OS от research-хвостов; README: что работает/что нет,

@@ -6694,3 +6694,39 @@ The phoc patches (per-surface `in_transaction`, warning instead of CRITICAL,
 pixman full-frame damage) remain experimental artifacts in
 `/home/ivan/alarm/artifacts`; the image keeps the distro phoc. The transaction
 hardening is still valid defence in depth but was not the fix.
+
+### M1: release 0.1.2 shipped
+
+The M1 checklist drove three fixes and produced the release artifacts.
+
+**Quality gates.** `cargo test --lib` → 222 passed. The Linux ABI matrix ran
+26/26 green (including `health` → `zombie 0 / open 0 / leaked 0`). Two stale
+pieces surfaced while gating:
+
+* `linux-wlreal` still required the literal `WEREWOLF_KEYMAP` blob, but the
+  mini compositor now ships the real `xkb_keymap { … }` it must give
+  wlroots/phoc. `wlclient.c` accepts both; the test prints
+  `libwayland 2 clients ok` again.
+* The `--no-linux` build had grown unconditional references to Linux code:
+  the shell's `linuxrun` helpers and `drm.rs`'s PRIME ioctls. Both are now
+  cfg-gated; `./build_and_qemu.sh --no-linux --no-run` is clean, which keeps
+  the removal switch usable as a regression test.
+
+**Assets.** `assets/silver-fastfetch-0.1.2.png` is regenerated from a real
+0.1.2 boot: `assets/fastfetch-0.1.2.ansi` is the raw PL011 capture and
+`tools/make_fastfetch_asset.py` renders it with the guest's own ANSI colours
+(the old image still said 0.1.1). The demo (`tools/demo.py`) boots the release
+kernel with the Phosh image, runs `fastfetch` and `health` on the console, then
+`linuxstart phosh`, unlocks, searches for “term”, launches the GTK Terminal,
+runs `ls /sfs` and closes the window. Frames are read from the guest's ivshmem
+scanout at 10 fps; the GTK launch wait is cut out. Output:
+`assets/demo-0.1.2.gif` (29.5 s) and `.mp4`, plus the terminal still.
+
+**Docs.** `RELEASE.md` (what works, known gaps, reproduce steps, verification
+table, checksums), `CONTRIBUTING.md`, README manifesto + reference device,
+refreshed `STATUS.md` and `MASTER_PLAN.md`. `disk.img` is the tested image
+(with the wlclient fix) so the shipped image passes the matrix without
+re-injecting. Tags: `werewolfos-0.1.2`, `silver-kernel-0.1.2`.
+
+Known gaps for 0.1.3: lock-screen wallpaper, host cursor, software-rendering
+performance, and the research-log cleanup that remains from M1.5.
