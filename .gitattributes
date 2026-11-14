@@ -1,2 +1,2 @@
-# Serial captures must keep their exact bytes (CRLF, ANSI escapes).
+# The serial capture must keep its exact bytes (CRLF, ANSI escapes).
 assets/*.ansi -text

@@ -58,6 +58,20 @@ and `health` reports 0 zombies, 0 open files and 0 DMA leaks.
 - Commits: one logical change, imperative subject, body explains *why* (and
   what was ruled out). Reference the milestone (M0.2, M2, …) when relevant.
 
+## Sign-off (DCO)
+
+Every commit must be signed off:
+
+```bash
+git commit -s
+```
+
+The `Signed-off-by: Name <email>` trailer certifies the Developer Certificate
+of Origin 1.1: you wrote the change, or you have the right to submit it, and
+you license it to the project under its MIT license. Use your real name and a
+reachable email. Commits without a sign-off are asked to amend, not silently
+merged.
+
 ## Reporting
 
 - Bugs and regressions: open an issue with the boot log (`serial.log`), the

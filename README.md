@@ -1517,6 +1517,16 @@ does not use `GICR_IGROUPR0`: on Rain it reads zero for timer PPI 18 even
 though the interrupt is delivered as Group 1 NS. This is a boot/timer smoke
 test, not a DMA-reclamation or TLB/cache stress test.
 
+## Trademark
+
+“WerewolfOS”, “Silver Kernel” and the wolf mark identify this project. The
+code is MIT: fork it, ship it, change it. If you distribute a modified build,
+do not present it as the official WerewolfOS/Silver Kernel release or imply
+that the project endorses it — say what you changed. Referring to the project
+by name (compatibility, ports, reviews, benchmarks) is always fine.
+
+© 2026 silver_microkernel contributors.
+
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
