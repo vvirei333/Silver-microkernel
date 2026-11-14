@@ -6402,3 +6402,19 @@ Difference between the two hosts worth checking next:
 Fix candidates: give the nested output a sane physical size (phoc.ini
 `[output:WL-1] ...` or a wlroots wayland-backend option), or patch phoc's
 output setup to report 300x200 mm. Then re-check the tile.
+
+### Nested output size/scale: warning gone, tile still blank
+
+`phoc.ini` now gives the nested output `scale = 1` and
+`phys_width/phys_height = 300x200`. phoc no longer logs "invalid physical
+size, using default scale", but the app-grid favourite tile is still blank and
+the layout is unchanged. So the 0 mm monitor was not the cause.
+
+The remaining known difference is that the same Phosh draws the tile when it
+is a direct client of the mini compositor. Everything checked so far is
+identical or correct under phoc: GIO sees the app, GSettings has the
+favourite, the desktop file is adaptive, the output is 1024x768 at scale 1,
+frame callbacks tick, and forcing whole-output damage does not repaint the
+tile. The next concrete probe is the home layer buffer itself: capture it under
+both hosts and compare the favourite region, or log the layer-surface
+configure (width/height/scale) Phosh acks under phoc.

@@ -28,6 +28,15 @@ DEFAULT_IMAGE = os.path.expanduser('~/phosh-state/disk_phosh.img')
 PHOC_INI = b'''[core]
 # There is no XWayland server in the image; keep phoc from probing for one.
 xwayland=false
+
+# The nested wayland backend reports 0 mm by default; phoc then logs
+# "invalid physical size, using default scale" and Phosh lays the app grid out
+# for a different scale. Give it the same 300x200 mm / scale 1 the mini
+# compositor advertises.
+[output:WL-1]
+scale = 1
+phys_width = 300
+phys_height = 200
 '''
 
 
