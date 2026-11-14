@@ -5,17 +5,22 @@
  * desktop has this helper in libexec; this is our copy, pointed at by
  * GIO_LAUNCH_DESKTOP.
  *
- * The helper is deliberately tiny: record the pid, then exec the program.
+ * Besides recording the pid it also guarantees the Wayland environment. Some
+ * launches arrived without WAYLAND_DISPLAY (and GDK then fell back to X11 and
+ * printed "cannot open display:"); the guest has exactly one compositor, so
+ * filling the variable in is always right.
  */
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         return 1;
     }
+
     char buffer[64];
     int length = snprintf(buffer, sizeof(buffer),
                           "GIO_LAUNCHED_DESKTOP_FILE_PID=%ld", (long)getpid());
@@ -24,6 +29,14 @@ int main(int argc, char *argv[]) {
             return 1;
         }
     }
+
+    if (getenv("WAYLAND_DISPLAY") == NULL) {
+        setenv("WAYLAND_DISPLAY", "wayland-test", 1);
+    }
+    if (getenv("GDK_BACKEND") == NULL) {
+        setenv("GDK_BACKEND", "wayland", 1);
+    }
+
     execvp(argv[1], argv + 1);
     return 127;
 }

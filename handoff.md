@@ -6053,3 +6053,14 @@ from the lock screen to the overview). Clicking without a drag still unlocks.
 
 A real "finger" feel on top of this would be an ease-out animation of the
 margin after the release; the mechanism is in place.
+
+
+### Launch environment
+
+`tools/gio-launch-desktop.c` now also fills in `WAYLAND_DISPLAY=wayland-test`
+and `GDK_BACKEND=wayland` when they are missing. Several launches reached the
+helper without `WAYLAND_DISPLAY`, GDK fell back to X11 and the child died with
+"cannot open display:", which is the wave of failures in the console after
+tapping the launcher tile. Host has one compositor, so the default is always
+safe. Needs a guest check: tap the Terminal tile a few times and confirm there
+is no "cannot open display:" any more.
