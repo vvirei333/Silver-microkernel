@@ -6369,3 +6369,36 @@ invisible. Next step: check whether the icon lookup (`utilities-terminal` from
 the unpacked theme) returns a texture under this GTK/gdk-pixbuf setup, or
 whether the button is drawn with transparent colours; a GTK inspector or a
 debug build of Phosh would answer it.
+
+### The app-grid favourite tile is phoc-only
+
+Same image, same Phosh, two hosts:
+
+* `linuxstart phosh` (mini compositor): the Terminal favourite tile is drawn
+  (icon-only — Phosh 0.57 sets the label to NULL in FAVORITES mode).
+* `linuxstart phoc`: the favourites revealer is allocated (the separator sits
+  at the right y) but the button is blank. The whole app-grid layout also sits
+  ~47 px lower, and focusing the search turns the top ~300 px into an opaque
+  black rectangle.
+
+The app data is not the problem. A probe spawned inside the phoc session sees
+`XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share`, `apps=1`,
+`id=werewolf-terminal.desktop`; the desktop file carries
+`X-Purism-FormFactor=Mobile;`. `PHOC_DEBUG=damage-whole`, a 16 ms frame tick
+and forcing the nested window geometry to 0 all left the tile blank.
+
+Difference between the two hosts worth checking next:
+
+* phoc logs `Output 'WL-1' has invalid physical size, using default scale`.
+  The nested wlroots output reports **0 mm x 0 mm**, while the mini
+  compositor advertises a 300x200 mm output with scale 1. Phosh derives scale
+  and usable area from the monitor; a 0 mm monitor may give it a different
+  scale, which would explain the ~47 px layout shift and a GtkImage icon that
+  ends up outside its allocation.
+* compare the home layer buffer (the favourite region) under both hosts
+  byte-for-byte, and log the `wl_output.geometry/scale` and layer-surface
+  configure that Phosh receives under phoc.
+
+Fix candidates: give the nested output a sane physical size (phoc.ini
+`[output:WL-1] ...` or a wlroots wayland-backend option), or patch phoc's
+output setup to report 300x200 mm. Then re-check the tile.
