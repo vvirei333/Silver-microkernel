@@ -36,6 +36,12 @@ const SYS_FUTEX: u64 = 98;
 const SYS_MEMFD_CREATE: u64 = 279;
 const SYS_IOCTL: u64 = 29;
 const SYS_FCNTL: u64 = 25;
+const SYS_STATX: u64 = 291;
+const SYS_FCHMOD: u64 = 52;
+const SYS_FCHMODAT: u64 = 53;
+const SYS_FCHOWNAT: u64 = 54;
+const SYS_FCHOWN: u64 = 55;
+const SYS_CLOSE_RANGE: u64 = 436;
 const SYS_GETCWD: u64 = 17;
 const SYS_CHDIR: u64 = 49;
 const SYS_OPENAT: u64 = 56;
@@ -98,6 +104,7 @@ const SYS_EPOLL_PWAIT2: u64 = 441;
 const SYS_TIMERFD_CREATE: u64 = 85;
 const SYS_TIMERFD_SETTIME: u64 = 86;
 const SYS_TIMERFD_GETTIME: u64 = 87;
+const SYS_FLOCK: u64 = 32;
 const SYS_MKDIRAT: u64 = 34;
 const SYS_UNLINKAT: u64 = 35;
 const SYS_RENAMEAT: u64 = 38;
@@ -177,9 +184,7 @@ const S_IFREG: u32 = 0o100000;
 pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
     let number = frame[8];
     let args = [frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]];
-    let result = dispatch_inner(frame, number, args);
-
-    result
+    dispatch_inner(frame, number, args)
 }
 
 fn dispatch_inner(
@@ -256,6 +261,10 @@ fn dispatch_inner(
         SYS_IOCTL => linux_ioctl(args[0], args[1], args[2]),
         SYS_FSTAT => finish(linux_fd::fstat(scheduler::current_task_id(), args[0], args[1]).map(|_| 0)),
         SYS_NEWFSTATAT => linux_newfstatat(args[0], args[1], args[2], args[3]),
+        SYS_STATX => linux_statx(args[0], args[1], args[2], args[3], args[4]),
+        SYS_FCHMOD | SYS_FCHOWN => linux_fchmod(args[0]),
+        SYS_FCHMODAT | SYS_FCHOWNAT => linux_fchmodat(args[0], args[1]),
+        SYS_CLOSE_RANGE => linux_close_range(args[0], args[1], args[2]),
         SYS_FACCESSAT => linux_faccessat(args[0], args[1], args[2]),
         SYS_GETDENTS64 => finish(linux_fd::getdents64(
             scheduler::current_task_id(),
@@ -323,6 +332,7 @@ fn dispatch_inner(
         }
         SYS_SETSOCKOPT => linux_setsockopt(args[0], args[1]),
         SYS_GETSOCKOPT => linux_getsockopt(args[0], args[1], args[2], args[3], args[4]),
+        SYS_FLOCK => linux_flock(args[0], args[1]),
         SYS_SOCKET => linux_socket(args[0], args[1], args[2]),
         SYS_BIND => linux_bind(args[0], args[1], args[2]),
         SYS_LISTEN => finish(
@@ -1162,6 +1172,63 @@ fn linux_socket(domain: u64, kind: u64, protocol: u64) -> u64 {
     ))
 }
 
+/// `fchmod`/`fchown`: the VFS has no per-inode permission bits, so the call
+/// only has to prove the descriptor is alive.
+fn linux_fchmod(fd: u64) -> u64 {
+    if linux_fd::status_flags(scheduler::current_task_id(), fd).is_none() {
+        return errno(EBADF);
+    }
+    0
+}
+
+/// `fchmodat`/`fchownat`: same, by path. The path has to resolve.
+fn linux_fchmodat(dirfd: u64, path_pointer: u64) -> u64 {
+    let Some(path) = user_string(path_pointer) else {
+        return errno(EFAULT);
+    };
+    let cwd = match dirfd_cwd(dirfd) {
+        Ok(cwd) => cwd,
+        Err(code) => return code,
+    };
+    match crate::vfs::resolve(&cwd, &path) {
+        Ok(_) => 0,
+        Err(_) => errno(ENOENT),
+    }
+}
+
+/// `close_range(2)`: glib's spawn path uses it to drop inherited descriptors.
+fn linux_close_range(first: u64, last: u64, flags: u64) -> u64 {
+    if flags & !1 != 0 || first > last {
+        return errno(EINVAL);
+    }
+    let task = scheduler::current_task_id();
+    let mut fd = first;
+    while fd <= last {
+        let _ = linux_fd::close(task, fd);
+        fd += 1;
+    }
+    0
+}
+
+/// `flock(2)`. The guest compositors use an advisory lock on their Wayland
+/// lockfile to detect a live socket owner. This kernel has no per-file lock
+/// table yet, so the lock is granted: a second compositor then fails at
+/// `bind` with EADDRINUSE and tries the next `wayland-N` name, which is
+/// exactly what `wl_display_add_socket_auto` expects.
+fn linux_flock(fd: u64, operation: u64) -> u64 {
+    const LOCK_SH: u64 = 1;
+    const LOCK_EX: u64 = 2;
+    const LOCK_NB: u64 = 4;
+    const LOCK_UN: u64 = 8;
+    if linux_fd::status_flags(scheduler::current_task_id(), fd).is_none() {
+        return errno(EBADF);
+    }
+    match operation & !LOCK_NB {
+        LOCK_SH | LOCK_EX | LOCK_UN => 0,
+        _ => errno(EINVAL),
+    }
+}
+
 fn linux_bind(fd: u64, address: u64, length: u64) -> u64 {
     let path = match read_sockaddr(address, length) {
         Ok(path) => path,
@@ -1648,50 +1715,47 @@ fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
     let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
         return errno(ENOENT);
     };
-    if let Some(node) = crate::sysfs::lookup(&resolved) {
+    match stat_resolved(&cwd, &path, &resolved) {
+        Ok((mode, size, ino, Some(rdev))) => {
+            finish(linux_fd::write_stat_rdev(buffer, mode, size, ino, rdev).map(|_| 0))
+        }
+        Ok((mode, size, ino, None)) => {
+            finish(linux_fd::write_stat(buffer, mode, size, ino).map(|_| 0))
+        }
+        Err(code) => errno(code),
+    }
+}
+
+/// Shared path stat for `newfstatat` and `statx`.
+fn stat_resolved(
+    cwd: &str,
+    path: &str,
+    resolved: &str,
+) -> Result<(u32, u64, u64, Option<u64>), u64> {
+    if let Some(node) = crate::sysfs::lookup(resolved) {
         let (mode, size) = match node {
             crate::sysfs::Node::File(data) => (S_IFREG | 0o444, data.len() as u64),
             crate::sysfs::Node::Dir => (S_IFDIR | 0o755, 0),
             crate::sysfs::Node::Symlink(target) => (S_IFLNK | 0o777, target.len() as u64),
         };
-        return match linux_fd::write_stat(buffer, mode, size, linux_fd::path_ino(&resolved)) {
-            Ok(()) => 0,
-            Err(code) => errno(code),
-        };
+        return Ok((mode, size, linux_fd::path_ino(resolved), None));
     }
-    if let Some((mode, rdev)) = synthetic_device_stat(&resolved) {
-        return match linux_fd::write_stat_rdev(
-            buffer,
-            mode,
-            0,
-            linux_fd::path_ino(&resolved),
-            rdev,
-        ) {
-            Ok(()) => 0,
-            Err(code) => errno(code),
-        };
+    if let Some((mode, rdev)) = synthetic_device_stat(resolved) {
+        return Ok((mode, 0, linux_fd::path_ino(resolved), Some(rdev)));
     }
-    if !scheduler::current_read_path_allowed(&resolved) {
-        return errno(EACCES);
+    if !scheduler::current_read_path_allowed(resolved) {
+        return Err(EACCES);
     }
     // Directories first: the SFS backend reports a directory inode's size as
     // 0, so `file_len` succeeds for one and used to classify it as a regular
     // file. Toolkits stat XDG/data directories and reject a "file" where a
     // directory is required (xkbcommon refused its own config root).
-    if crate::vfs::read_dir(&cwd, &path).is_ok() {
-        return match linux_fd::write_stat(
-            buffer,
-            S_IFDIR | 0o755,
-            0,
-            linux_fd::path_ino(&resolved),
-        ) {
-            Ok(()) => 0,
-            Err(code) => errno(code),
-        };
+    if crate::vfs::read_dir(cwd, path).is_ok() {
+        return Ok((S_IFDIR | 0o755, 0, linux_fd::path_ino(resolved), None));
     }
-    if let Ok(size) = crate::vfs::file_len(&cwd, &path) {
+    if let Ok(size) = crate::vfs::file_len(cwd, path) {
         let file_mode = if silver_microkernel::path_is_under(
-            &resolved,
+            resolved,
             crate::scheduler::LINUX_SCRATCH_PREFIX,
         ) {
             S_IFREG | 0o644
@@ -1700,17 +1764,66 @@ fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
             // executable so gio's g_find_program_in_path() accepts /sfs.
             S_IFREG | 0o555
         };
-        return match linux_fd::write_stat(
-            buffer,
-            file_mode,
-            size as u64,
-            linux_fd::path_ino(&resolved),
-        ) {
-            Ok(()) => 0,
-            Err(code) => errno(code),
-        };
+        return Ok((file_mode, size as u64, linux_fd::path_ino(resolved), None));
     }
-    errno(ENOENT)
+    Err(ENOENT)
+}
+
+/// `statx(2)`: glib and wlroots probe it first; without it they fall back to
+/// repeated retry loops. Writes the fixed 256-byte `struct statx`.
+fn linux_statx(dirfd: u64, path_ptr: u64, flags: u64, _mask: u64, buffer: u64) -> u64 {
+    let Some(path) = user_string(path_ptr) else {
+        return errno(EFAULT);
+    };
+    let task = scheduler::current_task_id();
+    let fields = if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return errno(ENOENT);
+        }
+        match linux_fd::stat_fields(task, dirfd) {
+            Ok(fields) => fields,
+            Err(code) => return errno(code),
+        }
+    } else {
+        let cwd = match dirfd_cwd(dirfd) {
+            Ok(cwd) => cwd,
+            Err(code) => return code,
+        };
+        let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
+            return errno(ENOENT);
+        };
+        match stat_resolved(&cwd, &path, &resolved) {
+            Ok(fields) => fields,
+            Err(code) => return errno(code),
+        }
+    };
+    match write_statx(buffer, fields.0, fields.1, fields.2, fields.3) {
+        Ok(()) => 0,
+        Err(code) => errno(code),
+    }
+}
+
+fn write_statx(
+    buffer: u64,
+    mode: u32,
+    size: u64,
+    ino: u64,
+    rdev: Option<u64>,
+) -> Result<(), u64> {
+    const STATX_BASIC_STATS: u32 = 0x7ff;
+    let mut raw = [0_u8; 256];
+    raw[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
+    raw[4..8].copy_from_slice(&4096_u32.to_le_bytes());
+    raw[16..20].copy_from_slice(&1_u32.to_le_bytes());
+    raw[28..30].copy_from_slice(&(mode as u16).to_le_bytes());
+    raw[32..40].copy_from_slice(&ino.to_le_bytes());
+    raw[40..48].copy_from_slice(&size.to_le_bytes());
+    raw[48..56].copy_from_slice(&(size / 512).to_le_bytes());
+    if let Some(device) = rdev {
+        raw[128..132].copy_from_slice(&linux_fd::major(device).to_le_bytes());
+        raw[132..136].copy_from_slice(&linux_fd::minor(device).to_le_bytes());
+    }
+    user_memory::copy_to_user(&raw, buffer).map_err(|_| EFAULT)
 }
 
 /// Mode and `st_rdev` for a synthetic `/dev` node.
@@ -1847,6 +1960,20 @@ fn linux_mkdirat(dirfd: u64, path_pointer: u64, _mode: u64) -> u64 {
 fn linux_unlinkat(dirfd: u64, path_pointer: u64, flags: u64) -> u64 {
     if flags & !AT_REMOVEDIR != 0 {
         return errno(EINVAL);
+    }
+    // POSIX shm lives in the synthetic /dev/shm namespace, not in the
+    // scratch VFS; wlroots calls shm_unlink() on every buffer it allocates.
+    if let Some(path) = user_string(path_pointer) {
+        if let Ok(cwd) = dirfd_cwd(dirfd) {
+            if let Ok(resolved) = crate::vfs::resolve(&cwd, &path) {
+                if let Some(name) = resolved.strip_prefix("/dev/shm/") {
+                    return match linux_fd::shm_unlink(name) {
+                        Ok(()) => 0,
+                        Err(code) => errno(code),
+                    };
+                }
+            }
+        }
     }
     let (cwd, path) = match scratch_resolved(dirfd, path_pointer) {
         Ok(pair) => pair,

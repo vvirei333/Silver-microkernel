@@ -3032,6 +3032,7 @@ static void launch_terminal(void) {
     if (app_window.used) {
         return;
     }
+
     long child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
     if (child != 0) {
         return;
@@ -4081,18 +4082,33 @@ static int serve(long client) {
             } else if (object == seat_id && opcode == 1) {
                 /* wl_seat.get_keyboard(new_id): keymap fd + enter. */
                 keyboard_id = take_u32();
-                /* Send NO_KEYMAP: a protocol-valid empty keymap. The old
-                   "WEREWOLF_KEYMAP" placeholder made xkbcommon fail to parse
-                   the compositor keymap on every GTK client. */
-                unsigned length = 0;
+                /* A real XKB keymap. An empty (NO_KEYMAP) one is enough for a
+                   client that only forwards keycodes, but wlroots builds its
+                   own xkb state from the parent keymap and cannot translate a
+                   key to a keysym without it. The rules/includes are resolved
+                   on the client side from XKB_CONFIG_ROOT=/sfs/xkb. */
+                static const char keymap_text[] =
+                    "xkb_keymap {\n"
+                    "  xkb_keycodes  { include \"evdev+aliases(qwerty)\" };\n"
+                    "  xkb_types     { include \"complete\" };\n"
+                    "  xkb_compat    { include \"complete\" };\n"
+                    "  xkb_symbols   { include \"pc+us+inet(evdev)\" };\n"
+                    "  xkb_geometry  { include \"pc(pc105)\" };\n"
+                    "};\n";
+                unsigned length = sizeof(keymap_text) - 1;
                 long keymap = sys3(279 /* memfd_create */, (long)"keymap", 0, 0);
                 if (keymap >= 0 && sys3(46 /* ftruncate */, keymap, length, 0) >= 0 &&
                     sys3(62 /* lseek */, keymap, 0, 0) == 0) {
-                    begin(keyboard_id, 0 /* keymap */);
-                    put_u32(0); /* NO_KEYMAP */
-                    put_u32(length);
-                    finish();
-                    send_message(client, (int)keymap);
+                    long written = sys3(64 /* write */, keymap,
+                                        (long)keymap_text, length);
+                    if (written == (long)length) {
+                        sys3(62 /* lseek */, keymap, 0, 0);
+                        begin(keyboard_id, 0 /* keymap */);
+                        put_u32(1); /* WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 */
+                        put_u32(length);
+                        finish();
+                        send_message(client, (int)keymap);
+                    }
                 }
                 if (keymap >= 0) {
                     sys3(57, keymap, 0, 0);
@@ -5660,6 +5676,64 @@ void _start(void) {
 
     /* fontconfig only writes a cache into a directory that already exists */
     sys3(34 /* mkdirat */, -100, (long)"/tmp/fontcache", 0777);
+    static const char *envp[] = {
+        "XDG_RUNTIME_DIR=/tmp",
+        "HOME=/tmp",
+        "XKB_CONFIG_ROOT=/sfs/xkb",
+        "WAYLAND_DISPLAY=wayland-test",
+        "GDK_BACKEND=wayland",
+        "LD_LIBRARY_PATH=/sfs",
+        "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share",
+        "GSETTINGS_SCHEMA_DIR=/sfs",
+        "FONTCONFIG_FILE=/sfs/fonts.conf",
+        "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share:/sfs/usr/share",
+        "XCURSOR_THEME=default",
+        "XCURSOR_PATH=/sfs/share/icons",
+        "NO_AT_BRIDGE=1",
+        /* The terminal and the shell paint through wl_shm; asking GDK for
+           a GL context makes Mesa map llvmpipe and libLLVM (117-163 MB of
+           libraries) before the first frame. */
+        "GDK_GL=disable",
+        "GDK_DEBUG=gl-disable",
+#if defined(SERVE_PHOC)
+        /* wlroots nested inside this compositor, software renderer: one
+           nested output is the host window, and pixman keeps Mesa out of
+           the picture until the GL path is needed. */
+        "WLR_BACKENDS=wayland",
+        "WLR_RENDERER=pixman",
+        "WLR_RENDERER_ALLOW_SOFTWARE=1",
+        "WLR_WL_OUTPUTS=1",
+#endif
+#if defined(SERVE_GTK4) || defined(SERVE_WLGL)
+        /* GTK4 renders through GSK; "gl" goes EGL -> virgl. The Mesa
+           files live in the SFS root, and libgallium must be global so
+           the DRI stub can resolve the driver entry points. */
+        "GSK_RENDERER=gl",
+        "LIBGL_DRIVERS_PATH=/sfs",
+        "__EGL_VENDOR_LIBRARY_FILENAMES=/sfs/egl_vendor.json",
+        "GBM_BACKENDS_PATH=/sfs",
+        "LD_PRELOAD=/sfs/libgallium-25.0.7.so",
+#else
+        "GSK_RENDERER=cairo",
+#endif
+        "GTK_A11Y=none",
+        /* GDesktopAppInfo execs gio-launch-desktop instead of forking the
+           app itself; the desktop's libexec copy is not in this image. */
+        "GIO_LAUNCH_DESKTOP=/sfs/gio-launch-desktop",
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session",
+        "XDG_CURRENT_DESKTOP=Phosh",
+        "XDG_SESSION_TYPE=wayland",
+        "XDG_SESSION_DESKTOP=phosh",
+        /* glycin cannot create namespaces here; the loader itself is
+         * still spawned directly and decodes normally. */
+        "GLYCIN_DISABLE_SANDBOX=i-know-the-risks",
+        /* glycin's zbus reactor and the executor tick loop starve each
+         * other with the default worker count; four workers make the
+         * loader reply deterministic (same workaround as glycintest). */
+        "ASYNC_GLOBAL_EXECUTOR_THREADS=4",
+        0,
+    };
+
     long child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
     if (child < 0) {
         fail("gtk-serve: fork failed\n", 21);
@@ -5681,70 +5755,68 @@ void _start(void) {
         /* Real postmarketOS stack: phoc is the compositor and starts Phosh as
            its shell. -S waits for phosh_private.set_shell_state(up). */
         static const char *argv[] = {"/sfs/phoc", "-C", "/sfs/phoc.ini",
-                                     "-S", "-E", "/sfs/phosh", 0};
+                                     "-S", 0};
 #else
         static const char *argv[] = {"/sfs/gtkdemo", 0};
 #endif
-        static const char *envp[] = {
-            "XDG_RUNTIME_DIR=/tmp",
-            "HOME=/tmp",
-            "XKB_CONFIG_ROOT=/sfs/xkb",
-            "WAYLAND_DISPLAY=wayland-test",
-            "GDK_BACKEND=wayland",
-            "LD_LIBRARY_PATH=/sfs",
-            "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share",
-            "GSETTINGS_SCHEMA_DIR=/sfs",
-            "FONTCONFIG_FILE=/sfs/fonts.conf",
-            "XDG_DATA_DIRS=/tmp/xdg/share:/sfs/share:/sfs/usr/share",
-            "XCURSOR_THEME=default",
-            "XCURSOR_PATH=/sfs/share/icons",
-            "NO_AT_BRIDGE=1",
-            /* The terminal and the shell paint through wl_shm; asking GDK for
-               a GL context makes Mesa map llvmpipe and libLLVM (117-163 MB of
-               libraries) before the first frame. */
-            "GDK_GL=disable",
-            "GDK_DEBUG=gl-disable",
-#if defined(SERVE_PHOC)
-            /* wlroots nested inside this compositor, software renderer: one
-               nested output is the host window, and pixman keeps Mesa out of
-               the picture until the GL path is needed. */
-            "WLR_BACKENDS=wayland",
-            "WLR_RENDERER=pixman",
-            "WLR_RENDERER_ALLOW_SOFTWARE=1",
-            "WLR_WL_OUTPUTS=1",
-#endif
-#if defined(SERVE_GTK4) || defined(SERVE_WLGL)
-            /* GTK4 renders through GSK; "gl" goes EGL -> virgl. The Mesa
-               files live in the SFS root, and libgallium must be global so
-               the DRI stub can resolve the driver entry points. */
-            "GSK_RENDERER=gl",
-            "LIBGL_DRIVERS_PATH=/sfs",
-            "__EGL_VENDOR_LIBRARY_FILENAMES=/sfs/egl_vendor.json",
-            "GBM_BACKENDS_PATH=/sfs",
-            "LD_PRELOAD=/sfs/libgallium-25.0.7.so",
-#else
-            "GSK_RENDERER=cairo",
-#endif
-            "GTK_A11Y=none",
-            /* GDesktopAppInfo execs gio-launch-desktop instead of forking the
-               app itself; the desktop's libexec copy is not in this image. */
-            "GIO_LAUNCH_DESKTOP=/sfs/gio-launch-desktop",
-            "DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/dbus-session",
-            "XDG_CURRENT_DESKTOP=Phosh",
-            "XDG_SESSION_TYPE=wayland",
-            "XDG_SESSION_DESKTOP=phosh",
-            /* glycin cannot create namespaces here; the loader itself is
-             * still spawned directly and decodes normally. */
-            "GLYCIN_DISABLE_SANDBOX=i-know-the-risks",
-            /* glycin's zbus reactor and the executor tick loop starve each
-             * other with the default worker count; four workers make the
-             * loader reply deterministic (same workaround as glycintest). */
-            "ASYNC_GLOBAL_EXECUTOR_THREADS=4",
-            0,
-        };
         sys6(221 /* execve */, (long)argv[0], (long)argv, (long)envp, 0, 0, 0);
         fail("gtk-serve: exec failed\n", 20);
     }
+#ifdef SERVE_PHOC
+    /* phoc publishes its display as wayland-0. Its own `-E` spawn runs from
+       a GLib idle that the wlroots event loop never dispatches here, so the
+       wrapper starts the shell itself (which is what postmarketOS' session
+       manager does too). Wait until the socket accepts a connection, then
+       exec Phosh with WAYLAND_DISPLAY pointing at phoc. */
+    long shell_child = sys6(220 /* clone */, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
+    if (shell_child == 0) {
+        for (unsigned attempt = 0; attempt < 40; attempt++) {
+            struct { long seconds; long nanoseconds; } delay = { 0, 250000000 };
+            sys6(73 /* ppoll */, 0, 0, (long)&delay, 0, 0, 0);
+            long probe = sys3(198 /* socket */, 1, 1, 0);
+            if (probe < 0) {
+                continue;
+            }
+            struct sockaddr_un address;
+            for (unsigned long index = 0; index < sizeof(address.path); index++) {
+                address.path[index] = 0;
+            }
+            address.family = 1;
+            static const char phoc_name[] = "/tmp/wayland-0";
+            unsigned length = 0;
+            while (phoc_name[length] != 0) {
+                address.path[length] = phoc_name[length];
+                length++;
+            }
+            long connected = sys3(203 /* connect */, probe, (long)&address,
+                                  sizeof(unsigned short) + length + 1);
+            sys3(57 /* close */, probe, 0, 0);
+            if (connected != 0) {
+                continue;
+            }
+            const char *shell_envp[64];
+            unsigned count = 0;
+            while (envp[count] != 0 && count + 1 < 64) {
+                shell_envp[count] = envp[count];
+                count++;
+            }
+            shell_envp[count] = 0;
+            for (unsigned index = 0; index < count; index++) {
+                const char *entry = shell_envp[index];
+                if (entry[0] == 'W' && entry[1] == 'A' && entry[2] == 'Y' &&
+                    entry[3] == 'L' && entry[4] == 'A' && entry[5] == 'N' &&
+                    entry[6] == 'D' && entry[7] == '_' && entry[8] == 'D') {
+                    shell_envp[index] = "WAYLAND_DISPLAY=wayland-0";
+                }
+            }
+            static const char *shell_argv[] = {"/sfs/phosh", 0};
+            sys6(221 /* execve */, (long)shell_argv[0], (long)shell_argv,
+                 (long)shell_envp, 0, 0, 0);
+            sys3(93 /* exit */, 0, 0, 0);
+        }
+        sys3(93 /* exit */, 1, 0, 0);
+    }
+#endif
     sys3(64, 1, (long)"gtk-serve: waiting for client\n", 29);
     long client = sys3(202 /* accept */, server, 0, 0);
     if (client < 0) {

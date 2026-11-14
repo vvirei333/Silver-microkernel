@@ -324,6 +324,70 @@ fn with_table<R>(task: u64, action: impl FnOnce(&mut Table) -> R) -> R {
     action(&mut tables[index])
 }
 
+/// POSIX shared-memory names (`shm_open`). glibc implements `shm_open` as
+/// `open("/dev/shm/<name>")`, and wlroots 0.20 allocates its keymap and
+/// swapchain buffers this way. Names map to a shared memfd state so two
+/// opens of the same name see the same bytes until `shm_unlink`.
+static SHM_FILES: Mutex<Vec<(alloc::string::String, Arc<Mutex<MemFdState>>)>> =
+    Mutex::new(Vec::new());
+
+/// Creates or opens one POSIX shm object and installs it in the fd table.
+pub fn shm_open(
+    task: u64,
+    name: &str,
+    create: bool,
+    exclusive: bool,
+    truncate: bool,
+) -> Result<u64, u64> {
+    let state = {
+        let mut files = SHM_FILES.lock();
+        let existing = files
+            .iter()
+            .find(|(stored, _)| stored == name)
+            .map(|(_, state)| state.clone());
+        match existing {
+            Some(state) => {
+                if create && exclusive {
+                    return Err(EEXIST);
+                }
+                if truncate {
+                    let mut file = state.lock();
+                    file.data.clear();
+                    file.len = 0;
+                    file.offset = 0;
+                }
+                state
+            }
+            None => {
+                if !create {
+                    return Err(ENOENT);
+                }
+                let state = Arc::new(Mutex::new(MemFdState {
+                    data: Vec::new(),
+                    len: 0,
+                    offset: 0,
+                    frames: None,
+                    maps: 0,
+                    seals: 0,
+                }));
+                files.push((name.into(), state.clone()));
+                state
+            }
+        }
+    };
+    insert(task, Target::MemFd(state)).ok_or(EMFILE)
+}
+
+/// `shm_unlink`: forget a name. Open descriptors keep the object alive.
+pub fn shm_unlink(name: &str) -> Result<(), u64> {
+    let mut files = SHM_FILES.lock();
+    let Some(index) = files.iter().position(|(stored, _)| stored == name) else {
+        return Err(ENOENT);
+    };
+    files.remove(index);
+    Ok(())
+}
+
 fn lookup(task: u64, fd: u64) -> Option<Target> {
     with_table(task, |table| {
         table.slots.get(fd as usize).cloned().flatten()
@@ -483,6 +547,31 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
             crate::sysfs::Node::Symlink(_) => Err(EINVAL),
         };
     }
+    if let Some(name) = resolved.strip_prefix("/dev/shm/") {
+        if name.is_empty() || name.contains('/') {
+            return Err(ENOENT);
+        }
+        return shm_open(
+            task,
+            name,
+            flags & O_CREAT != 0,
+            flags & O_EXCL != 0,
+            flags & O_TRUNC != 0,
+        );
+    }
+    if resolved == "/dev/shm" {
+        if flags & O_DIRECTORY == 0 {
+            return Err(EISDIR);
+        }
+        return insert(
+            task,
+            Target::DirList {
+                entries: &[],
+                offset: 0,
+            },
+        )
+        .ok_or(EMFILE);
+    }
     let device = match resolved.as_str() {
         "/dev/null" => Some(Target::Null),
         "/dev/zero" => Some(Target::Zero),
@@ -569,9 +658,24 @@ pub fn close(task: u64, fd: u64) -> Result<(), u64> {
     .ok_or(EBADF)?;
     target.release_endpoint();
     if let Target::Vfs(vfs_fd) = target {
-        let _ = vfs::close(task, vfs_fd);
+        close_vfs_if_last(task, vfs_fd);
     }
     Ok(())
+}
+
+/// `dup`/`dup2` share one VFS descriptor (and its offset), so closing one
+/// Linux slot must not retire it while another slot still names it. libxml2
+/// dups an fd, closes the original and reads from the duplicate; without this
+/// the read returned EBADF and xkbregistry could not load its rules.
+fn close_vfs_if_last(task: u64, vfs_fd: u64) {
+    let still_open = with_table(task, |table| {
+        table.slots.iter().flatten().any(|other| {
+            matches!(other, Target::Vfs(other_fd) if *other_fd == vfs_fd)
+        })
+    });
+    if !still_open {
+        let _ = vfs::close(task, vfs_fd);
+    }
 }
 
 pub fn dup(task: u64, fd: u64) -> Result<u64, u64> {
@@ -659,7 +763,7 @@ pub fn dup2(task: u64, oldfd: u64, newfd: u64) -> Result<u64, u64> {
     if let Some(displaced) = displaced {
         displaced.release_endpoint();
         if let Target::Vfs(vfs_fd) = displaced {
-            let _ = vfs::close(task, vfs_fd);
+            close_vfs_if_last(task, vfs_fd);
         }
     }
     target.retain_endpoint();
@@ -959,36 +1063,39 @@ pub fn path_ino(path: &str) -> u64 {
 }
 
 /// Fills the aarch64 `struct stat` for a descriptor.
-pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
+/// Mode, size, inode and (for device nodes) rdev of one open descriptor.
+/// Shared by `fstat` and `statx`, which cannot reuse the `struct stat`
+/// writer without a user buffer.
+pub fn stat_fields(
+    task: u64,
+    fd: u64,
+) -> Result<(u32, u64, u64, Option<u64>), u64> {
     let task = crate::scheduler::fd_table_owner(task);
     let target = lookup(task, fd).ok_or(EBADF)?;
-    match target {
-        Target::Console => write_stat(buffer, S_IFCHR | 0o620, 0, fd.max(1)),
+    Ok(match target {
+        Target::Console => (S_IFCHR | 0o620, 0, fd.max(1), None),
         Target::Null
         | Target::Zero
         | Target::Full
         | Target::Random
         | Target::Ivshmem
-        | Target::GpuFb => write_stat(buffer, S_IFCHR | 0o666, 0, fd.max(1)),
-        Target::Drm { render } => write_stat_rdev(
-            buffer,
+        | Target::GpuFb => (S_IFCHR | 0o666, 0, fd.max(1), None),
+        Target::Drm { render } => (
             S_IFCHR | 0o666,
             0,
             fd.max(1),
-            makedev(
+            Some(makedev(
                 crate::sysfs::DRM_MAJOR,
                 if render {
                     crate::sysfs::RENDER_MINOR
                 } else {
                     crate::sysfs::CARD_MINOR
                 },
-            ),
+            )),
         ),
-        Target::Sysfs(data, _) => write_stat(buffer, S_IFREG | 0o444, data.len() as u64, fd.max(1)),
-        Target::DirList { .. } => write_stat(buffer, S_IFDIR | 0o555, 0, fd.max(1)),
-        Target::Prime { size, .. } => {
-            write_stat(buffer, S_IFREG | 0o600, size as u64, fd.max(1))
-        }
+        Target::Sysfs(data, _) => (S_IFREG | 0o444, data.len() as u64, fd.max(1), None),
+        Target::DirList { .. } => (S_IFDIR | 0o555, 0, fd.max(1), None),
+        Target::Prime { size, .. } => (S_IFREG | 0o600, size as u64, fd.max(1), None),
         Target::Vfs(vfs_fd) => {
             let size = vfs::fd_len(task, vfs_fd).map_err(|_| EBADF)?;
             let kind = vfs::fd_kind(task, vfs_fd).unwrap_or(vfs::FD_KIND_FILE);
@@ -1009,20 +1116,26 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
                 S_IFREG | 0o555
             };
             let ino = path.map(|path| path_ino(&path)).unwrap_or(fd.max(1));
-            write_stat(buffer, mode, size as u64, ino)
+            (mode, size as u64, ino, None)
         }
-        Target::Pipe { .. } => write_stat(buffer, S_IFIFO | 0o600, 0, fd.max(1)),
-        Target::EventFd { .. } => write_stat(buffer, S_IFREG | 0o600, 0, fd.max(1)),
-        Target::MemFd(state) => {
-            let size = state.lock().len() as u64;
-            write_stat(buffer, S_IFREG | 0o600, size, fd.max(1))
-        }
+        Target::Pipe { .. } => (S_IFIFO | 0o600, 0, fd.max(1), None),
+        Target::EventFd { .. } => (S_IFREG | 0o600, 0, fd.max(1), None),
+        Target::MemFd(state) => (S_IFREG | 0o600, state.lock().len() as u64, fd.max(1), None),
         Target::Socket { .. } | Target::Unbound { .. } | Target::Listener { .. } => {
-            write_stat(buffer, S_IFSOCK | 0o600, 0, fd.max(1))
+            (S_IFSOCK | 0o600, 0, fd.max(1), None)
         }
         Target::Epoll(_) | Target::TimerFd { .. } => {
-            write_stat(buffer, S_IFREG | 0o600, 0, fd.max(1))
+            (S_IFREG | 0o600, 0, fd.max(1), None)
         }
+    })
+}
+
+pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
+    let task = crate::scheduler::fd_table_owner(task);
+    let (mode, size, ino, rdev) = stat_fields(task, fd)?;
+    match rdev {
+        Some(rdev) => write_stat_rdev(buffer, mode, size, ino, rdev),
+        None => write_stat(buffer, mode, size, ino),
     }
 }
 
@@ -2246,6 +2359,14 @@ pub(crate) fn write_stat(buffer: u64, mode: u32, size: u64, ino: u64) -> Result<
 }
 
 /// Linux `makedev()` for the 64-bit dev_t encoding.
+pub(crate) fn major(dev: u64) -> u32 {
+    (((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff)) as u32
+}
+
+pub(crate) fn minor(dev: u64) -> u32 {
+    ((dev & 0xff) | ((dev >> 12) & !0xff)) as u32
+}
+
 pub(crate) fn makedev(major: u32, minor: u32) -> u64 {
     ((major as u64 & 0xfff) << 8)
         | (minor as u64 & 0xff)

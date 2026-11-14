@@ -37,6 +37,29 @@ def needed(path):
     return [line.split()[-1] for line in out.splitlines() if 'NEEDED' in line]
 
 
+# wlroots 0.20 rejects a layer surface that asks for height 0 without both
+# top and bottom anchors. Phosh's home bar asks for exactly that (0x0,
+# bottom|left|right), which is valid layer-shell, and postmarketOS carries the
+# same downstream revert (pmaports "temp/wlroots: revert 0 dimension error
+# check", MR 1702). Neutralise the two error branches:
+#   bc75c  b.ne <width error>   -> nop
+#   bc7b0  b.eq <continue>      -> b <continue>
+WLROOTS_LAYER_CHECK = {
+    0xBC75C: (b'\x41\x03\x00\x54', b'\x1f\x20\x03\xd5'),
+    0xBC7B0: (b'\xc0\xfd\xff\x54', b'\xee\xff\xff\x17'),
+}
+
+
+def patch_wlroots(data):
+    data = bytearray(data)
+    for offset, (old, new) in WLROOTS_LAYER_CHECK.items():
+        if bytes(data[offset:offset + 4]) != old:
+            print(f'WLROOTS: unexpected bytes at {offset:#x}, left unpatched')
+            continue
+        data[offset:offset + 4] = new
+    return bytes(data)
+
+
 def image_names(img):
     names = set()
     for block in img.dir_blocks(img.root):
@@ -77,13 +100,21 @@ def main():
         if soname in seen:
             continue
         seen.add(soname)
-        if soname in have or soname in written:
+        if soname in written:
+            continue
+        if soname in have:
+            # The library is already installed; only the wlroots patch has to
+            # be refreshed when the image predates it.
+            if soname == 'libwlroots-0.20.so' and soname in libs:
+                written[soname] = patch_wlroots(open(libs[soname], 'rb').read())
             continue
         path = libs.get(soname)
         if path is None:
             missing.append(soname)
             continue
         payload = open(path, 'rb').read()
+        if soname == 'libwlroots-0.20.so':
+            payload = patch_wlroots(payload)
         written[soname] = payload
         for name in needed(path):
             queue.append(name)

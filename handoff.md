@@ -6230,3 +6230,55 @@ errno and the path for the phoc process, or run a tiny guest client that
 calls `wl_display_add_socket_auto` against libwayland-server directly.
 Once the socket opens, verify Phosh appears through phoc and that input
 (including a real XKB keymap, which `phoc` will need) reaches it.
+
+
+## 2026-11-14 — Nested phoc runs Phosh (the postmarketOS stack)
+
+The real stack is up: `phoc-serve` (this compositor built with `SERVE_PHOC`)
+hosts **phoc** nested on the Wayland backend with the pixman renderer; phoc
+owns a 1024x768 output and **Phosh runs as its shell**. Verified in the guest:
+`Phosh ready`, the lockscreen is rendered through phoc, Space unlocks to the
+app grid.
+
+What it needed:
+
+1. **phoc 0.57 + wlroots 0.20 in the image.** `tools/build_phoc_image.py`
+   installs phoc, `libwlroots-0.20.so` and the 17 missing SONAMEs (libinput,
+   libseat, vulkan loader, lcms2, libdisplay-info, libliftoff, the xcb-util
+   set, ...). `phoc.ini` disables Xwayland.
+2. **wlroots layer-shell 0-dimension check reverted**, the same downstream
+   patch postmarketOS carries (pmaports "temp/wlroots: revert 0 dimension
+   error check", MR 1702). Phosh asks for a 0x0 home bar anchored
+   bottom|left|right; wlroots 0.20 treats that as a protocol error and kills
+   the shell. The builder neutralises the two branches (offsets documented in
+   `tools/build_phoc_image.py`).
+3. **Kernel gaps this exposed:**
+   - `flock(2)` is granted (libwayland's lockfile socket setup needs it);
+   - `/dev/shm` with `shm_open`/`shm_unlink` backed by shared memfd state
+     (wlroots allocates keymap and swapchain buffers through it);
+   - `fchmod`/`fchmodat`/`fchown` succeed, `close_range` works;
+   - `statx` is implemented (glib probes it; without it Phosh spun on
+     `ENOSYS 291`);
+   - `dup`/`dup2` share one VFS descriptor, so `close` now retires the VFS
+     fd only when the **last** Linux slot is gone. libxml2 dups
+     `xkb/rules/evdev.xml`, closes the original and reads the duplicate;
+     without the refcount xkbregistry died with EBADF and phoc had no layouts.
+4. **A real XKB keymap from the compositor** (`evdev+us`) instead of
+   `NO_KEYMAP`. wlroots builds its own xkb state from the parent keymap; a
+   client that only forwards keycodes cannot translate them to keysyms.
+   Space now unlocks.
+5. **phoc's `-E` session spawn never runs** here: the GLib idle that starts
+   the session is not dispatched under the wlroots event loop. The wrapper
+   starts phoc with `-S` and then execs Phosh itself on `/tmp/wayland-0` once
+   the socket accepts connections — the same split postmarketOS' session
+   manager uses.
+
+Known gaps from this first run:
+
+- one pointer click reached phoc with stale surface coordinates (motion/press
+  at the old position, release at the new one), so `Show All Apps` did
+  nothing. Check the input-ring helper and the app-window local mapping.
+- the app grid shows no application tiles (search bar and `Show All Apps` are
+  painted), and typed text is not visible in the search entry. Check GIO's
+  app enumeration / favourites under Phosh, and the entry's theme.
+- pixman performance and a visible host cursor are still open.
