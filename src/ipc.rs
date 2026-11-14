@@ -129,6 +129,12 @@ pub fn receive_from(sender: u64) -> Result<Message, ReceiveError> {
     receive_matching(Some(sender), INFINITE_TIMEOUT)
 }
 
+/// Bounded variant of [`receive_from`]: a live but wedged peer must not pin
+/// the caller forever. Used by the kernel-side nameserver RPC.
+pub fn receive_from_timeout(sender: u64, timeout_ticks: u64) -> Result<Message, ReceiveError> {
+    receive_matching(Some(sender), timeout_ticks)
+}
+
 fn receive_matching(sender: Option<u64>, timeout_ticks: u64) -> Result<Message, ReceiveError> {
     let id = scheduler::current_task_id();
     let deadline = if timeout_ticks == INFINITE_TIMEOUT {

@@ -128,6 +128,11 @@ const NAME_LIMIT: usize = ipc::PAYLOAD_SIZE - 2;
 /// Written into x0 when the call number is not in the table.
 pub const SYSCALL_ERROR: u64 = u64::MAX;
 pub const SYSCALL_TIMEOUT: u64 = u64::MAX - 1;
+
+/// Upper bound on the kernel-side nameserver RPC (`R`/`U`/`L` to SCOUT_ID).
+/// Scout is an EL0 task: if it hangs, every register/lookup must fail with
+/// `SYSCALL_TIMEOUT` instead of sleeping forever. 3000 ticks = 30 s at 100 Hz.
+const NAME_RPC_TIMEOUT_TICKS: u64 = 3000;
 pub const SYSCALL_STOPPED: u64 = u64::MAX - 2;
 /// `SYS_WAITPID`: no such child, or its zombie record was already consumed.
 pub const SYSCALL_ECHILD: u64 = u64::MAX - 3;
@@ -1189,7 +1194,10 @@ fn sys_print(ptr: u64, len: u64) -> u64 {
 /// (the foreground `linuxrun`) holds console ownership in the Silver model.
 #[cfg(feature = "linux-abi")]
 pub(crate) fn write_user_output_shared(ptr: u64, len: u64) -> u64 {
-    let mut remaining = len as usize;
+    // A single write() must not be able to flood the serial line for
+    // megabytes and bury the diagnostic log; the remainder is dropped.
+    const MAX_SHARED_WRITE: u64 = 256 * 1024;
+    let mut remaining = len.min(MAX_SHARED_WRITE) as usize;
     let mut address = ptr;
     while remaining != 0 {
         let chunk = remaining.min(4096);
@@ -1353,8 +1361,8 @@ fn sys_register_name(name_ptr: u64) -> u64 {
     if ipc::send(SCOUT_ID, request).is_err() {
         return SYSCALL_ERROR;
     }
-    let Ok(reply) = ipc::receive_from(SCOUT_ID) else {
-        return SYSCALL_ERROR;
+    let Ok(reply) = ipc::receive_from_timeout(SCOUT_ID, NAME_RPC_TIMEOUT_TICKS) else {
+        return SYSCALL_TIMEOUT;
     };
     if reply.text() == &b"OK"[..] {
         0
@@ -1374,8 +1382,8 @@ fn sys_unregister_name(name_ptr: u64) -> u64 {
     if ipc::send(SCOUT_ID, request).is_err() {
         return SYSCALL_ERROR;
     }
-    let Ok(reply) = ipc::receive_from(SCOUT_ID) else {
-        return SYSCALL_ERROR;
+    let Ok(reply) = ipc::receive_from_timeout(SCOUT_ID, NAME_RPC_TIMEOUT_TICKS) else {
+        return SYSCALL_TIMEOUT;
     };
     if reply.text() == &b"OK"[..] {
         0
@@ -1395,8 +1403,8 @@ fn sys_lookup_name(name_ptr: u64) -> u64 {
     if ipc::send(SCOUT_ID, request).is_err() {
         return SYSCALL_ERROR;
     }
-    let Ok(reply) = ipc::receive_from(SCOUT_ID) else {
-        return SYSCALL_ERROR;
+    let Ok(reply) = ipc::receive_from_timeout(SCOUT_ID, NAME_RPC_TIMEOUT_TICKS) else {
+        return SYSCALL_TIMEOUT;
     };
     match parse_id_reply(&reply) {
         Some(id) => id,
