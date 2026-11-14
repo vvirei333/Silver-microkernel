@@ -5961,3 +5961,23 @@ Two smaller things seen in the same runs:
   target, so it is not a routing bug); a second click always launches;
 * the compositor's night-sky gradient root is painted but never visible: the
   panel body (above) covers it. Once the panel folds, it should show.
+
+
+### Correction: the panel is fine, the black desktop is a background layer
+
+Instrumented the drag slots. At startup and after unlocking:
+
+    MARG ls 64 folded=-736 unfolded=0 current=-736 state=0
+    APPLY ls 64 axis=0 margin=-736 height=768
+
+so the top panel *is* folded correctly (bar rows 736..768 shown at screen
+0..32) and the earlier note blaming the panel is wrong. The home is unfolded
+(`current 0`, state 1) with no toplevel, which is what the overview should be.
+
+With an application window open the home folds and the desktop around it is
+*pure black*. The gradient root and a "skip an all-black background layer"
+heuristic were both tried; the black pixel survived byte-for-byte, so it is
+not the layer-0 `phosh background` surface either (the heuristic samples 16
+points of that entry and does not match). Next step is a scene dump of the
+folded state (the compositor's in-shmem dump code was removed; add it back
+briefly) to see which entry covers (30,300), then fix that surface.
