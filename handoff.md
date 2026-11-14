@@ -6036,3 +6036,20 @@ lock screen sends Space, and `require-unlock=false` turns that into the unlock.
 If a real swipe feel is wanted later, the clean way is to make the *lock
 screen* respond to pointer drags in the compositor (animate the layer surface
 up and finish the unlock), rather than fighting libhandy's touch-only gesture.
+
+
+### Lock screen swipe (shipped)
+
+The compositor performs the unlock gesture itself, because libhandy's deck
+swipe is touch-only. A press on a plain layer surface (no drag slot, not the
+app window - i.e. the lock screen) starts `lock_drag`: every motion moves the
+surface's `margin[0]` so it follows the pointer up (clamped), and releasing
+past 120 px sends the Space key press that unlocks (`require-unlock=false`).
+Releasing earlier snaps the surface back.
+
+Verified: dragging the lock screen up shows the overview underneath while the
+finger is down, and the release lands on the desktop (screenshot mean jumps
+from the lock screen to the overview). Clicking without a drag still unlocks.
+
+A real "finger" feel on top of this would be an ease-out animation of the
+margin after the release; the mechanism is in place.

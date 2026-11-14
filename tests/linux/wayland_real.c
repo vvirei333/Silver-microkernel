@@ -2982,9 +2982,16 @@ static void keyboard_send_modifiers(long client, unsigned depressed) {
     send_message(client, -1);
 }
 
-/// Clicking a plain layer surface (the lock screen) sends Space to the client:
-/// with `require-unlock=false` that is what unlocks it. Returns 1 when it did.
-static int layer_unlock_on_click(unsigned px, unsigned py) {
+/* Dragging the lock screen up. libhandy's unlock is a touch-only swipe and
+   ignores pointer sequences, so the compositor performs the gesture itself:
+   the layer surface follows the pointer, and releasing after a long enough
+   drag sends the key press that unlocks (require-unlock is off). */
+static int lock_drag;
+static unsigned lock_drag_surface;
+static int lock_drag_start;
+static int lock_drag_offset;
+
+static int lock_drag_begin(unsigned px, unsigned py) {
     unsigned surface = layer_hit_test(px, py);
     if (surface == 0 || layer_has_drag_surface(surface)) {
         return 0;
@@ -2993,11 +3000,40 @@ static int layer_unlock_on_click(unsigned px, unsigned py) {
         surface == app_window.surface) {
         return 0;
     }
-    if (keyboard_id == 0) {
-        return 0;
+    lock_drag = 1;
+    lock_drag_surface = surface;
+    lock_drag_start = (int)py;
+    lock_drag_offset = 0;
+    return 1;
+}
+
+static void lock_drag_move(unsigned py) {
+    if (!lock_drag) {
+        return;
     }
-    keyboard_route(current_client);
+    int offset = (int)py - lock_drag_start;
+    if (offset > 0) offset = 0;
+    if (offset < -700) offset = -700;
+    if (offset == lock_drag_offset) {
+        return;
+    }
+    lock_drag_offset = offset;
+    LayerEntry *entry = layer_entry_by_surface(lock_drag_surface);
+    if (entry != 0) {
+        entry->margin[0] = offset;
+#ifdef SERVE_ONLY
+        scene_dirty = 1;
+        compose_full = 1;
+#endif
+    }
+}
+
+static void unlock_now(void) {
+    if (keyboard_id == 0) {
+        return;
+    }
     unsigned time = now_ms();
+    keyboard_route(current_client);
     begin(keyboard_id, 3 /* key */);
     put_u32(configure_serial);
     put_u32(time);
@@ -3012,7 +3048,25 @@ static int layer_unlock_on_click(unsigned px, unsigned py) {
     put_u32(0);
     finish();
     send_message(clients[current_client].fd, -1);
-    return 1;
+}
+
+static void lock_drag_end(void) {
+    if (!lock_drag) {
+        return;
+    }
+    lock_drag = 0;
+    int unlock = lock_drag_offset < -120;
+    LayerEntry *entry = layer_entry_by_surface(lock_drag_surface);
+    if (entry != 0) {
+        entry->margin[0] = 0;
+    }
+#ifdef SERVE_ONLY
+    scene_dirty = 1;
+    compose_full = 1;
+#endif
+    if (unlock) {
+        unlock_now();
+    }
 }
 
 static void poll_input(void) {
@@ -3055,7 +3109,9 @@ static void poll_input(void) {
                combinations it can actually send. */
             toggle_app_window();
         } else if (kind == INPUT_MOVE) {
-            if (window_drag) {
+            if (lock_drag) {
+                lock_drag_move(y);
+            } else if (window_drag) {
                 int nx = (int)x - window_drag_dx;
                 int ny = (int)y - window_drag_dy;
                 int content_width = (int)app_window.width -
@@ -3092,13 +3148,16 @@ static void poll_input(void) {
             if (kind == INPUT_CLICK && app_window_chrome(x, y)) {
                 /* The compositor's own window chrome claimed the press. */
                 chrome_grab = 1;
+            } else if (kind == INPUT_RELEASE && lock_drag) {
+                lock_drag_end();
+                chrome_grab = 0;
             } else if (kind == INPUT_RELEASE && chrome_grab) {
                 /* The press never reached the client; swallow the release. */
                 chrome_grab = 0;
             } else if (kind == INPUT_CLICK && drag_begin(client, x, y)) {
                 /* A layer-surface drag claims the press. */
             } else if (kind == INPUT_CLICK &&
-                       (chrome_grab = layer_unlock_on_click(x, y))) {
+                       (chrome_grab = lock_drag_begin(x, y))) {
                 /* The lock screen has no drag surface and Phosh's unlock is a
                    touch swipe, which a mouse cannot produce. A click on it is
                    the closest thing; with require-unlock off a key press
