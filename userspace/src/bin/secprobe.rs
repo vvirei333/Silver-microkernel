@@ -233,6 +233,9 @@ fn run_dma_test() -> bool {
 
     let _ = send3(owner, MSG_RELEASE, 0, 0);
     let _ = syscall::kill(attacker_cap);
+    // A failed handshake can leave the owner waiting for MSG_START; kill both
+    // so a broken grant fails the probe instead of hanging the shell.
+    let _ = syscall::kill(owner_cap);
     let _ = syscall::waitpid(attacker);
     let _ = syscall::waitpid(owner);
 
