@@ -135,7 +135,9 @@ an unbounded buffer.
 
 ## Test matrix
 
-Run `./build_and_qemu.sh --linux-tests` once, then at `howl>`:
+Run `./build_and_qemu.sh --linux-tests` once, then `tools/linux_matrix.py`
+boots the release kernel, sends the commands below and checks every marker.
+The same list can be run manually at `howl>`:
 
 | Command | Expected |
 |---|---|
