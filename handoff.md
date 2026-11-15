@@ -6858,3 +6858,30 @@ excerpts; `fault-path.md` (leads C1-C8) and `vfs-sfs.md` (leads V1-V8).
 
 Verification: matrix 26/26, security suite 4/4 + 200000 fuzz cases,
 `cargo test --lib` 222, Phosh demo unchanged.
+
+### M2.3 verdict applied; M2.4 packet (IRQ + Linux tails)
+
+**V-dot (defense in depth).** The SFS backend had its own `split_path` that
+filtered empty components but accepted `.`/`..`: safe only because the VFS
+normaliser runs first. The backend now delegates to
+`sfs_format::split_path_name`, which validates every component (no `.`/`..`,
+no empty interior component, name <= `NAME_MAX`), plus a unit test
+(`split_path_name_rejects_dot_entries`) that pins `/a/..`, `.` and `..`.
+
+**R7 gate aligned.** `silver_irq_signal_return` now checks
+`frame[32] & 0x1F == 0` instead of `& 0xF`, so the "may receive a signal"
+gate is exactly the L1 PSTATE gate (rejects AArch32 M[4] as well as EL1).
+
+**Known gap #11.** Lazy file-backed page faults read SFS under the BKL; a
+uniprocessor stalls until the read completes. Bounded and fail-closed, but a
+latency known-issue; moving the read out of the lock is M3.
+
+**M2.4 packet** — `docs/audit/M2.4/`: whole-file snapshots of `gic.rs`,
+`gicv3.rs`, `irq_policy.rs`, `wait_queue.rs`, `timer.rs`, `linux_signal.rs`,
+`linux_fd.rs`, `linux_elf.rs` and line-numbered excerpts of the IRQ
+trampoline/hook, scheduler wait/bind/exit/kill/reap, `smp::irq_may_schedule`,
+and the dispatcher/altstack/kill head. `irq-entry.md` carries R1-R7,
+`linux-dispatch.md` carries L3-L9, both against the shipped tree.
+
+Verification: `cargo test --lib` 223, matrix 26/26, security 4/4 + 200k fuzz,
+`--no-linux` build clean.

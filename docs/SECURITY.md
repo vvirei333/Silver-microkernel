@@ -110,7 +110,10 @@ surface as an error code, never as a kernel abort driven by user input.
   (`exception_user_fault`); COW faults are repaired and the instruction is
   retried.
 
-## Known gaps and accepted risks (tracked for M2)
+## Known gaps and accepted risks
+
+These are accepted for the M2 boundary (0.1.2) and re-evaluated at every
+milestone; each has an owner decision above or in the findings table.
 
 1. **Send-by-pid is ambient authority.** Any task can send to any live pid;
    there is no send capability. A single sender is now bounded to 64 unread
@@ -145,11 +148,17 @@ surface as an error code, never as a kernel abort driven by user input.
     the task is killable. Upstream Linux has the same "don't do that" on UP;
     platforms with FGT can trap the write in M4. This is a known DoS, not a
     boundary break.
+11. **Page-fault file I/O runs under the BKL (performance).** A lazy
+    file-backed fault reads the page from SFS while the kernel lock is held,
+    so a uniprocessor stalls every task until the read completes (on SMP it
+    stalls this CPU's kernel path only). The read is bounded, checked and
+    fails closed; this is a latency known-issue, not a boundary break. Moving
+    the streaming read out of the lock is an M3 performance item.
 
 These are findings in their own right for the auditor; nothing in this list
 is an excuse for a memory-safety bug.
 
-## Findings fixed during M2 (so far)
+## Findings fixed during M2
 
 | ID | Finding | Class | Status |
 |---|---|---|---|
@@ -165,6 +174,7 @@ is an excuse for a memory-safety bug.
 | F2 | any `CAP_MMIO` holder mapped any task's DMA | ambient authority → cross-task read | fixed: target-scoped `CAP_DMA_SHARE` (per owner; per region in M3) |
 | F3 | a handle could delegate rights to an arbitrary pid | uncontrolled delegation | fixed: recipient must be self or own child |
 | L10 | EL0 can `msr daifset` and starve a uniprocessor | missing trap (no FGT) | accepted: SMP product, documented (#10) |
+| V-dot | the SFS backend splitter accepted `.`/`..` (the VFS normalised first) | defense in depth | fixed: backend uses `sfs_format::split_path_name`; unit test |
 
 ## Disclosure and fix protocol
 
