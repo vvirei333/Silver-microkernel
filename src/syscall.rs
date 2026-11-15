@@ -204,7 +204,10 @@ pub extern "C" fn silver_irq_signal_return(frame: *mut u64) {
         return;
     }
     let frame = unsafe { &mut *(frame as *mut [u64; FRAME_QUADWORDS]) };
-    if frame[32] & 0xF != 0 {
+    // Same gate as the sigreturn sanitizer: only a native AArch64 EL0t
+    // context (M[4:0] = 0) may receive a signal frame. M[4] would select
+    // AArch32, which has no signal-frame layout here.
+    if frame[32] & 0x1F != 0 {
         return;
     }
     #[cfg(feature = "linux-abi")]

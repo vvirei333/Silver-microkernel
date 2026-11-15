@@ -491,6 +491,16 @@ pub fn split_path(path: &str) -> Result<Vec<&str>, ()> {
     Ok(parts)
 }
 
+/// Splits a backend-relative path into `(parents, name)` for the mutating
+/// backend entry points. Components go through the same validation as
+/// [`split_path`], so an unnormalised path that reaches a backend directly
+/// can never create, remove or rename a `.`/`..` entry or an over-long name.
+pub fn split_path_name(path: &str) -> Result<(Vec<&str>, &str), ()> {
+    let mut parts = split_path(path)?;
+    let name = parts.pop().ok_or(())?;
+    Ok((parts, name))
+}
+
 /// Resolves a directory path to its inode, rejecting a missing component or a
 /// file where a directory is required.
 pub fn resolve_dir(image: &[u8], superblock: &Superblock, parts: &[&str]) -> Option<u32> {
@@ -1503,6 +1513,23 @@ mod tests {
         assert!(split_path("a//b").is_err());
         assert!(split_path(&"x".repeat(NAME_MAX + 1)).is_err());
         assert!(split_path(&"x".repeat(NAME_MAX)).is_ok());
+    }
+
+    #[test]
+    fn split_path_name_rejects_dot_entries() {
+        let (parents, name) = split_path_name("/a/b").unwrap();
+        assert_eq!(parents, vec!["a"]);
+        assert_eq!(name, "b");
+        // The mutators (create/remove/rename) must fail closed on a path that
+        // was not normalised by the layer above: no "." or ".." entry may be
+        // created or resolved, and the root has no name to create.
+        assert!(split_path_name("/a/..").is_err());
+        assert!(split_path_name("/a/.").is_err());
+        assert!(split_path_name("..").is_err());
+        assert!(split_path_name(".").is_err());
+        assert!(split_path_name("/").is_err());
+        assert!(split_path_name(&"x".repeat(NAME_MAX + 1)).is_err());
+        assert!(split_path_name(&"y".repeat(NAME_MAX)).is_ok());
     }
 
     #[test]

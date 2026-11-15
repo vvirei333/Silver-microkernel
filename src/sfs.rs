@@ -189,13 +189,12 @@ fn zero_block(block: u32) -> bool {
     write_block(block, &[0_u8; BLOCK_SIZE])
 }
 
+/// Backend-relative path split. Delegates to the format crate's validator so
+/// the mutation entry points reject `.`/`..`, empty interior components and
+/// over-long names even if the VFS resolver is bypassed: a backend must not
+/// depend on its caller having normalised the path.
 fn split_path(path: &str) -> Option<(Vec<&str>, &str)> {
-    let mut parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    if parts.is_empty() {
-        return None;
-    }
-    let name = parts.pop()?;
-    Some((parts, name))
+    crate::sfs_format::split_path_name(path).ok()
 }
 
 fn reader() -> Option<Reader> {
