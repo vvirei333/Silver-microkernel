@@ -72,3 +72,22 @@ Open at the time of writing (owner/auditor to close with this packet):
    outside the BKL, FGT trap for EL0 `daifset` on platforms that have it.
 
 The fuzzer and `--no-linux` build are already CI gates; M3 keeps them.
+
+## Closed
+
+Auditor verdict on this packet: R1, R2, R4, R6, R7, L5, L7 accepted clean;
+R3 accepted with the reaper-mask note (fixed: the reaper disables a dead
+task's bound INTID); R5 accepted with a bounded mutex-release window
+(recorded as gap #12). M2.3 and M2.4 are accepted, so M2 is closed.
+
+Closing changes in this slice:
+
+- `dma_cross_read` and `grant_foreign` landed as native EL0 regressions and
+  both were verified **failing on a deliberately reverted gate** and passing
+  on the shipped tree. The other four probes (`mailbox_quota`,
+  `blocked_kill`, `irq_orphan`, `linux_fd_lifetime`) move to M3.
+- Tag: `security-m2-complete`.
+
+Verification on the final tree: security 6/6 + 200k fuzz cases, matrix 26/26,
+`cargo test --lib` 223, Phosh demo clean, `--no-linux` build clean.
+

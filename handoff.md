@@ -6885,3 +6885,38 @@ and the dispatcher/altstack/kill head. `irq-entry.md` carries R1-R7,
 
 Verification: `cargo test --lib` 223, matrix 26/26, security 4/4 + 200k fuzz,
 `--no-linux` build clean.
+
+### M2 closed: native F2/F3 regressions, R3 reaper mask, tag
+
+**Native probes.** `userspace/src/bin/secprobe.rs` is an embedded EL0
+program with no initial rights; the shell (`secprobe <case>`) grants it
+`CAP_MMIO` and the foreground console. `grant_foreign` spawns an idle child
+and tries to delegate CAP_WAIT to the shell (must be refused), to itself and
+to its own child (both must succeed). `dma_cross_read` builds an
+orchestrator -> owner/attacker tree: the owner allocates 4 KiB of DMA, the
+attacker (CAP_MMIO, no cap naming the owner) must fail to map it, the
+orchestrator then delegates `CAP_DMA_SHARE` over the owner (the silverd
+spawn-handle path), the attacker maps and writes, and the owner must observe
+the byte. The probe cannot be turned into a mapping proxy: a caller that
+cannot grant CAP_MMIO makes the owner/attacker handshake fail closed.
+
+**Negative controls.** Both cases were run against a tree with the F2 and F3
+gates deliberately reverted (`shared_dma = region_owner.is_some()` and the
+`ppid` check removed): `FAIL grant_foreign`, `FAIL dma_cross_read`. Restored
+the gates (`git checkout -- src/scheduler.rs`), rebuilt, both pass. This is
+the failing-then-passing evidence for the two already-shipped fixes.
+
+**R3.** The reaper now calls `gic::disable_irq(intid)` before clearing a dead
+task's `bound_irq`, so the first post-mortem interrupt cannot walk the
+unknown-INTID streak toward the halt limit. **R5** is documented as known
+gap #12: a dead task's mutexes are released by the reaper, a bounded window.
+
+**M2 closure.** `tools/security_test.py` now runs 6 cases (4 Linux + 2
+native) and supports `--case dma_cross_read` / `--case grant_foreign`. Tag
+`security-m2-complete` marks the closure. Remaining probes
+(`mailbox_quota`, `blocked_kill`, `irq_orphan`, `linux_fd_lifetime`) move to
+M3 with per-region `CAP_DMA_SHARE`, page-fault I/O outside the BKL, and
+simplefb on the Redmi.
+
+Verification on the final tree: security 6/6 + 200000 fuzz cases, matrix
+26/26, `cargo test --lib` 223, Phosh demo clean, `--no-linux` build clean.

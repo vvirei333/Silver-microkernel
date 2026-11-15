@@ -135,9 +135,10 @@ research-хвостов от kernel+OS) — следующий шаг.
 
 **Состояние на 2026-11-15.** Аудит-срезы выполнены в порядке M2.1 (triage) →
 M2.2 (диспетчер/IRQ) → M2.3 (faults/COW + VFS/SFS) → M2.4 (IRQ и Linux-хвосты);
-пакеты лежат в `docs/audit/`. После вердикта по M2.4 фаза закрывается;
-«graduated lockdown» и kernel self-hardening переносятся в M3/M4, фаззер и
-`--no-linux` уже работают как CI-гейты.
+пакеты лежат в `docs/audit/`. Вердикты по M2.3/M2.4 приняты, нативные
+регрессии `dma_cross_read`/`grant_foreign` зелёные, **M2 закрыт тегом
+`security-m2-complete`**. «Graduated lockdown» и kernel self-hardening
+переносятся в M3/M4, фаззер и `--no-linux` уже работают как CI-гейты.
 
 **M2.1 — docs/SECURITY.md** (2 страницы): протокол «что ядро принимает от
 таска» — copy-in/out, дескрипторы, caps, лимиты (таблица из STATUS.md как база).
