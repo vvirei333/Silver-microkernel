@@ -1,12 +1,17 @@
 # Security tests
 
-Two kinds of checks live here:
+Three kinds of checks live here:
 
 1. **Guest regressions** (`*.c`) — freestanding Linux ABI programs that drive
    a kernel boundary and print a marker. They run on the real kernel in QEMU,
    because the behaviour under test (fd tables, SCM_RIGHTS, capabilities)
    only exists there.
-2. **Host fuzz targets** (`fuzz/*.rs`) — deterministic harnesses for parsers
+2. **Native guest regressions** (`userspace/src/bin/secprobe.rs`, embedded in
+   the kernel and run with `secprobe <case>`) — EL0 programs that need the
+   Silver capability model (`SYS_CAP_GRANT`, `SYS_MAP_PHYS`), which the Linux
+   ABI does not expose. The shell grants `CAP_MMIO` for the run; the probe
+   itself has no initial rights.
+3. **Host fuzz targets** (`fuzz/*.rs`) — deterministic harnesses for parsers
    that consume untrusted bytes. The parser module is shared with the guest
    (`userspace/src/http_parse.rs`), so a host crash is a guest crash.
 
@@ -35,6 +40,8 @@ command mirrors `build_and_qemu.sh` (no display, serial on a Unix socket).
 | `sigreturn_pstate` | `rt_sigreturn` must reject a ucontext whose `pstate` is not EL0t. The child sets `PSTATE.M = EL1h` in its handler and traps with `udf` right after the interrupted syscall: on the unfixed kernel this is an `EL1 EXCEPTION` panic (and, with a kernel PC, an arbitrary EL1 call); with the fix the child dies with SIGSEGV and the parent prints the marker. |
 | `sigreturn_aa32` | `PSTATE.M[4] = 1` (AArch32) is a different execution state; the frame must be rejected (SIGSEGV), not `eret`ed into an unsupported mode. |
 | `sigreturn_flags` | The sanitizer keeps NZCV (bit 30 is `Z`, not the AArch32 selector) and strips SS/IL/reserved: the handler sets `Z|SS|IL|bit23`, the task must resume at EL0 and print the marker. |
+| `dma_cross_read` | **Native.** A task with `CAP_MMIO` but no capability naming a DMA owner cannot map that owner's window; after the orchestrator delegates the target-scoped `CAP_DMA_SHARE` (the silverd path) the map succeeds and the owner observes the byte written through it. |
+| `grant_foreign` | **Native.** `SYS_CAP_GRANT` refuses a live non-child pid (the shell), while the same handle still delegates to the caller itself and to its own child. |
 
 Planned (from the M2 audit reports in `docs/audit/M2/` and `docs/audit/M2.2/`):
 
@@ -49,9 +56,6 @@ Planned (from the M2 audit reports in `docs/audit/M2/` and `docs/audit/M2.2/`):
 - `blocked_kill` — a task that blocks SIGKILL must still die.
 - `mailbox_quota` — a native sender cannot exceed 64 unread messages per
   target (needs a native probe; the Linux ABI has no `SYS_SEND`).
-- `dma_cross_read` — a `CAP_MMIO` holder without `CAP_DMA_SHARE` must fail to
-  map another task's window; with the right it must succeed (native probe).
-- `grant_foreign` — `SYS_CAP_GRANT` to a non-child pid must be refused.
 - `irq_orphan` — bind an SPI and exit before draining; the next interrupt
   must be masked as unknown, not halt the machine (R1).
 

@@ -88,6 +88,7 @@ fn main() {
         ("sl", "sl.elf"),
         ("utils", "utils.elf"),
         ("wolfser", "wolfser.elf"),
+        ("secprobe", "secprobe.elf"),
         ("uart_driver", "uart_driver.elf"),
         ("net_driver", "net_driver.elf"),
         ("net_server", "net_server.elf"),

@@ -28,12 +28,17 @@ WORK_IMAGE = Path("/tmp/werewolf-security.img")
 SERIAL = "/tmp/werewolf-security.serial"
 MONITOR = "/tmp/werewolf-security.monitor"
 
-# file stem -> marker the guest must print
+# file stem -> (expected marker, guest command). A `None` command means the
+# standard Linux-ABI runner (`linuxrun /sfs/sec-<name>`).
 CASES = {
-    "fd_lifetime": b"fd lifetime ok",
-    "sigreturn_pstate": b"sigreturn pstate blocked",
-    "sigreturn_aa32": b"sigreturn aa32 blocked",
-    "sigreturn_flags": b"sigreturn flags ok",
+    "fd_lifetime": (b"fd lifetime ok", None),
+    "sigreturn_pstate": (b"sigreturn pstate blocked", None),
+    "sigreturn_aa32": (b"sigreturn aa32 blocked", None),
+    "sigreturn_flags": (b"sigreturn flags ok", None),
+    # Native EL0 probes: the shell grants CAP_MMIO and runs the embedded
+    # secprobe program in the foreground.
+    "dma_cross_read": (b"dma cross read ok", "secprobe dma_cross_read"),
+    "grant_foreign": (b"grant foreign ok", "secprobe grant_foreign"),
 }
 
 
@@ -90,9 +95,9 @@ class Guest:
     def console(self, command):
         self.sock.sendall((command + "\n").encode())
 
-    def run(self, name, marker, timeout=90):
+    def run(self, command, marker, timeout=90):
         self.log.clear()
-        self.console("linuxrun /sfs/sec-" + name)
+        self.console(command)
         return self.wait(marker, timeout)
 
     def stop(self):
@@ -165,6 +170,12 @@ def main():
 
     selected = [(name, target) for name, target in built
                 if args.case in (None, name)]
+    # Native probes are embedded in the kernel, not injected as C files.
+    native = [name for name in CASES if name not in dict(built)]
+    if args.case in native:
+        selected = [(args.case, None)]
+    elif args.case is None:
+        selected += [(name, None) for name in sorted(native)]
     if not selected:
         raise SystemExit("no such case: " + str(args.case))
     missing = [name for name, _ in selected if name not in CASES]
@@ -187,7 +198,8 @@ def main():
         if not guest.wait(b"howl>", 120):
             raise SystemExit("no howl prompt")
         for name, _ in selected:
-            ok = guest.run(name, CASES[name])
+            marker, command = CASES[name]
+            ok = guest.run(command or ("linuxrun /sfs/sec-" + name), marker)
             print(("PASS " if ok else "FAIL ") + name, flush=True)
             if not ok:
                 failed.append(name)

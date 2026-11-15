@@ -17,6 +17,10 @@ pub const BIGFILE: u64 = 18;
 pub const UTILS: u64 = 19;
 /// Wolfser: the network browser that draws into the host-shared ivshmem surface.
 pub const WOLFSER: u64 = 20;
+/// Native security regression probe (M2 capability gates). No initial rights:
+/// the shell grants CAP_MMIO for the run, and the probe grants it down to the
+/// owner/attacker children it spawns.
+pub const SECPROBE: u64 = 21;
 
 /// Sentinel program ID for tasks spawned from a dynamically loaded ELF (the
 /// `run <path>` path). Distinct from `u64::MAX`, which marks kernel tasks.
@@ -42,6 +46,7 @@ static UTILS_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/utils.elf"))
 /// builds still carry it.
 #[cfg(not(feature = "fog"))]
 static WOLFSER_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/wolfser.elf"));
+static SECPROBE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/secprobe.elf"));
 static BIGDIR_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigdir.elf"));
 static BIGFILE_ELF: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bigfile.elf"));
 
@@ -64,6 +69,7 @@ pub fn image(program: u64) -> Option<&'static [u8]> {
         UTILS => Some(UTILS_ELF),
         #[cfg(not(feature = "fog"))]
         WOLFSER => Some(WOLFSER_ELF),
+        SECPROBE => Some(SECPROBE_ELF),
         BIGDIR => Some(BIGDIR_ELF),
         BIGFILE => Some(BIGFILE_ELF),
         _ => None,

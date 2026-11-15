@@ -98,6 +98,9 @@ pub const PROGRAM_BIGDIR: u64 = 17;
 pub const PROGRAM_BIGFILE: u64 = 18;
 pub const PROGRAM_UTILS: u64 = 19;
 pub const PROGRAM_WOLFSER: u64 = 20;
+/// Native security regression probe (M2 capability gates). It carries no
+/// initial rights: only the shell grants it `CAP_MMIO` for the run.
+pub const PROGRAM_SECPROBE: u64 = 21;
 /// Sentinel program ID for tasks spawned from a dynamically loaded ELF.
 pub const PROGRAM_DYNAMIC: u64 = u64::MAX - 1;
 pub const CAP_MMIO: u32 = 1 << 4;

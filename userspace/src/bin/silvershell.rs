@@ -251,6 +251,8 @@ fn execute(command: &str) {
             syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server> [arg]\r\n");
             syscall::print("  bg <program> [arg]\r\n");
             syscall::print("             Spawn without console ownership\r\n");
+            syscall::print("  secprobe <grant_foreign|dma_cross_read>\r\n");
+            syscall::print("             Native M2 capability regression (security suite)\r\n");
             syscall::print("  fg <cap>   Resume a task in the foreground\r\n");
             syscall::print("  Ctrl-Z     Stop the foreground task and return to shell\r\n");
             syscall::print("  kill <cap> Kill a task\r\n");
@@ -295,6 +297,7 @@ fn execute(command: &str) {
         Some("du") => show_usage(words.next()),
         Some("ps") => show_tasks(),
         Some("spawn") | Some("bg") => spawn_program(words.next(), words.next()),
+        Some("secprobe") => secprobe_command(words.next()),
         Some("fg") => foreground_task(words.next()),
         Some("kill") => kill_task(words.next()),
         Some("wait") => wait_task(words.next()),
@@ -1365,6 +1368,54 @@ fn grant_device_rights(cap_id: u64, task_id: u64, program: u64) {
         if let Some(driver) = find_task_id(syscall::PROGRAM_NET_DRIVER) {
             let _ = syscall::cap_grant(cap_id, driver, syscall::CAP_DMA_SHARE);
         }
+    }
+}
+
+/// `secprobe <grant_foreign|dma_cross_read>`: native M2 capability
+/// regressions. The probe binary has no initial rights, so a caller that
+/// cannot delegate CAP_MMIO cannot turn it into a mapping proxy. The shell
+/// is the trusted control plane and holds CAP_MMIO itself; it grants the
+/// right to its own child for the run and gives it the foreground console.
+fn secprobe_command(test: Option<&str>) {
+    let mode = match test {
+        None => 0,
+        Some("grant_foreign") => 1,
+        Some("dma_cross_read") => 2,
+        Some(_) => {
+            syscall::print("usage: secprobe <grant_foreign|dma_cross_read>\r\n");
+            return;
+        }
+    };
+    let Some(cap_id) = syscall::spawn(syscall::PROGRAM_SECPROBE, mode) else {
+        syscall::print("secprobe: cannot start the probe\r\n");
+        return;
+    };
+    let Some(task_id) = syscall::cap_get_task_id(cap_id) else {
+        let _ = syscall::kill(cap_id);
+        syscall::print("secprobe: cannot resolve the probe task\r\n");
+        return;
+    };
+    if !syscall::cap_grant(cap_id, task_id, syscall::CAP_MMIO) {
+        let _ = syscall::kill(cap_id);
+        let _ = syscall::wait(cap_id);
+        syscall::print("secprobe: CAP_MMIO grant failed\r\n");
+        return;
+    }
+    if !syscall::console_set(cap_id) {
+        let _ = syscall::kill(cap_id);
+        let _ = syscall::wait(cap_id);
+        syscall::print("secprobe: cannot assign the console\r\n");
+        return;
+    }
+    match syscall::wait_event(cap_id) {
+        Some(syscall::WaitEvent::Exited(0)) => {}
+        Some(syscall::WaitEvent::Exited(status)) => {
+            syscall::print("secprobe: exit status ");
+            syscall::print_dec_u64(status);
+            syscall::print("\r\n");
+        }
+        Some(syscall::WaitEvent::Stopped) => syscall::print("secprobe: stopped\r\n"),
+        None => syscall::print("secprobe: wait failed\r\n"),
     }
 }
 

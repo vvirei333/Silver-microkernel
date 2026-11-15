@@ -5591,6 +5591,14 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         vfs::close_task(task.id);
         wake.extend(task.release_mutexes());
         task.cap_table.remove_all();
+        // A dead task's bound line stays enabled in the GIC until here. Mask
+        // it before the binding disappears: otherwise the next interrupt
+        // arrives with no owner, takes the unknown-INTID path and charges the
+        // unmaskable streak (R3). The mask is idempotent for an already-masked
+        // line and runs once, with the task provably off-CPU.
+        if let Some(intid) = task.bound_irq {
+            crate::gic::disable_irq(intid);
+        }
         task.bound_irq = None;
         task.irq_pending = false;
         task.release_stack();

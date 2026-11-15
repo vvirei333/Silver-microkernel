@@ -154,6 +154,12 @@ milestone; each has an owner decision above or in the findings table.
     stalls this CPU's kernel path only). The read is bounded, checked and
     fails closed; this is a latency known-issue, not a boundary break. Moving
     the streaming read out of the lock is an M3 performance item.
+12. **A dead task's mutexes are released by the reaper (R5 window).** A task
+    killed while holding a mutex stays its owner until the next reap pass
+    (`release_mutexes`); a waiter on that mutex is blocked for that window.
+    The window is bounded and the reaper runs on the next scheduling pass,
+    and the alternative (taking every lock in the dying task's context) is
+    worse. Recorded as a known window, not a leak.
 
 These are findings in their own right for the auditor; nothing in this list
 is an excuse for a memory-safety bug.
@@ -175,6 +181,7 @@ is an excuse for a memory-safety bug.
 | F3 | a handle could delegate rights to an arbitrary pid | uncontrolled delegation | fixed: recipient must be self or own child |
 | L10 | EL0 can `msr daifset` and starve a uniprocessor | missing trap (no FGT) | accepted: SMP product, documented (#10) |
 | V-dot | the SFS backend splitter accepted `.`/`..` (the VFS normalised first) | defense in depth | fixed: backend uses `sfs_format::split_path_name`; unit test |
+| R3 | a killed IRQ owner left its INTID enabled, so the next interrupt charged the unmaskable streak | missing teardown mask | fixed: the reaper disables the bound INTID before clearing it |
 
 ## Disclosure and fix protocol
 
