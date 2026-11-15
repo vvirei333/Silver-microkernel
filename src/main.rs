@@ -1473,6 +1473,28 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
+    // Bind driver resources from the live tree once. QEMU without a DTB keeps
+    // the fixed PL011/PCI table; fog gets the UART base/size/INTID from its
+    // node. A missing/disabled node leaves the driver without a range.
+    {
+        let params = boot::get();
+        let dtb = params.as_ref().and_then(fog::dtb_slice);
+        crate::driver_resources::init(dtb);
+    }
+    // Evidence that the live tree, not the static fallback, supplied the
+    // console UART. Printed only when a DTB was handed over.
+    if let Some((range, irq)) = crate::driver_resources::dtb_uart() {
+        console::write_str("DRIVER UART=DT base=0x");
+        console::write_hex_u64(range.base);
+        console::write_str(" size=0x");
+        console::write_hex_u64(range.size);
+        if let Some(intid) = irq {
+            console::write_str(" irq=");
+            console::write_dec_u64(u64::from(intid));
+        }
+        console::write_str("\r\n");
+    }
+
     #[cfg(feature = "fog")]
     {
         fog::log_banner(&boot_params, &fog_info);

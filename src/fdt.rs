@@ -101,6 +101,26 @@ pub struct UartNode {
     pub irq: Option<u32>,
 }
 
+/// A driver bindable from the live tree. The kernel's driver table maps this
+/// kind to the EL0 program that owns the node; the spawn path grants exactly
+/// this MMIO range and INTID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DriverKind {
+    Pl011,
+    GeniUart,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DriverNode {
+    pub kind: DriverKind,
+    pub mmio: Region,
+    pub irq: Option<u32>,
+}
+
+/// Nodes one pass may discover. The product has one console UART today; the
+/// limit leaves room for a second UART or a simplefb node later.
+pub const MAX_DRIVER_NODES: usize = 8;
+
 /// GIC generation declared by the live tree.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum GicKind {
@@ -370,6 +390,24 @@ impl<'a> Fdt<'a> {
         let mut visitor = UartFinder::default();
         self.walk(&mut visitor)?;
         visitor.best
+    }
+
+    /// Every enabled node a known driver can bind, in tree order. The node's
+    /// first `reg` pair is the MMIO range; `interrupts` gives the INTID using
+    /// the same SPI/PPI encoding as `find_uart`. A node without a plausible
+    /// `reg` or with `status = "disabled"` is skipped (dead hardware is not a
+    /// crash).
+    pub fn driver_nodes(&self, out: &mut [DriverNode]) -> usize {
+        let mut finder = DriverFinder {
+            out,
+            count: 0,
+            current_kind: None,
+            current_range: None,
+            current_irq: None,
+            current_disabled: false,
+        };
+        let _ = self.walk(&mut finder);
+        finder.count
     }
 
     /// The interrupt controller described by the live tree, if present.
@@ -928,6 +966,76 @@ impl<'a> Visitor<'a> for GicFinder {
     }
 }
 
+struct DriverFinder<'o> {
+    out: &'o mut [DriverNode],
+    count: usize,
+    current_kind: Option<DriverKind>,
+    current_range: Option<Region>,
+    current_irq: Option<u32>,
+    current_disabled: bool,
+}
+
+impl<'a, 'o> Visitor<'a> for DriverFinder<'o> {
+    fn begin(&mut self, _path: &str, _name: &str) {
+        self.current_kind = None;
+        self.current_range = None;
+        self.current_irq = None;
+        self.current_disabled = false;
+    }
+
+    fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        match name {
+            "compatible" => {
+                let mut rest = value;
+                while let Some(text) = next_string(&mut rest) {
+                    if text == "arm,pl011" {
+                        self.current_kind = Some(DriverKind::Pl011);
+                    } else if text == "qcom,geni-uart" || text == "qcom,geni-debug-uart" {
+                        self.current_kind = Some(DriverKind::GeniUart);
+                    }
+                }
+            }
+            "reg" if self.current_range.is_none() => {
+                self.current_range = parse_reg_range(value);
+            }
+            "interrupts" if self.current_irq.is_none() && value.len() >= 12 => {
+                let kind = read_be32(value, 0);
+                let number = read_be32(value, 4);
+                self.current_irq = match (kind, number) {
+                    (Some(0), Some(number)) if number < 1024 => Some(32 + number),
+                    (Some(1), Some(number)) if number < 16 => Some(16 + number),
+                    _ => None,
+                };
+            }
+            "status" => {
+                if let Some(text) = first_string(value) {
+                    if text == "disabled" {
+                        self.current_disabled = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, _path: &str) {
+        let (Some(kind), Some(mmio)) = (self.current_kind, self.current_range) else {
+            return;
+        };
+        let irq = self.current_irq;
+        // Consume the node state: the parent's `end` must not push the same
+        // binding again with the child's range still in the finder.
+        self.current_kind = None;
+        self.current_range = None;
+        self.current_irq = None;
+        if self.current_disabled || self.count >= self.out.len() {
+            return;
+        }
+        self.out[self.count] = DriverNode { kind, mmio, irq };
+        self.count += 1;
+    }
+}
+
 #[derive(Default)]
 struct TimerFinder {
     current_timer: bool,
@@ -1113,6 +1221,26 @@ fn unit_address(name: &str) -> Option<u64> {
     let digits = address.split(',').next()?;
     let value = u64::from_str_radix(digits, 16).ok()?;
     (value != 0).then_some(value)
+}
+
+/// Splits a `reg` property's first entry into a half-open region, accepting
+/// the two common cell layouts (2/2 and 1/1) used by the platforms here.
+fn parse_reg_range(value: &[u8]) -> Option<Region> {
+    if value.len() >= 16 {
+        let start = read_be64(value, 0)?;
+        let size = read_be64(value, 8)?;
+        if plausible_reg(start, size) {
+            return Some(Region::new(start, start + size));
+        }
+    }
+    if value.len() >= 8 {
+        let start = read_be32(value, 0)? as u64;
+        let size = read_be32(value, 4)? as u64;
+        if plausible_reg(start, size) {
+            return Some(Region::new(start, start + size));
+        }
+    }
+    None
 }
 
 /// Parses the first `(address, size)` pair of a `reg` property, accepting the
@@ -1339,7 +1467,8 @@ const fn align_down_u64(value: u64, alignment: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_regions, select_allocator_window, Fdt, GicKind, Region, UartKind, FDT_MAGIC,
+        parse_regions, select_allocator_window, DriverKind, DriverNode, Fdt, GicKind, Region,
+        UartKind, FDT_MAGIC,
     };
 
     // --- a tiny DTB writer used only by the tests -------------------------
@@ -1662,6 +1791,46 @@ mod tests {
         assert_eq!(uart.base, 0x4a9000);
         assert!(uart.debug);
         assert_eq!(uart.kind, UartKind::Geni);
+    }
+
+    #[test]
+    fn driver_nodes_read_enabled_uart_ranges_and_irqs() {
+        let blob = sample_dtb().build();
+        let fdt = Fdt::new(&blob).unwrap();
+        let mut nodes = [DriverNode {
+            kind: DriverKind::Pl011,
+            mmio: Region::default(),
+            irq: None,
+        }; 4];
+        assert_eq!(fdt.driver_nodes(&mut nodes), 2);
+        assert_eq!(nodes[0].kind, DriverKind::GeniUart);
+        assert_eq!(nodes[0].mmio, Region::new(0x4a9000, 0x4a9100));
+        assert_eq!(nodes[1].mmio, Region::new(0x4a8c000, 0x4a8c100));
+
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.begin("serial@9000000");
+        dtb.prop_str("compatible", "arm,pl011");
+        dtb.prop_reg2("reg", 0x0900_0000, 0x1000);
+        dtb.prop_u32_array("interrupts", &[0, 1, 4]); // SPI 1 -> INTID 33
+        dtb.end();
+        dtb.begin("serial@a000000");
+        dtb.prop_str("compatible", "arm,pl011");
+        dtb.prop_reg2("reg", 0x0a00_0000, 0x1000);
+        dtb.prop_str("status", "disabled");
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let fdt = Fdt::new(&blob).unwrap();
+        let mut nodes = [DriverNode {
+            kind: DriverKind::Pl011,
+            mmio: Region::default(),
+            irq: None,
+        }; 2];
+        assert_eq!(fdt.driver_nodes(&mut nodes), 1);
+        assert_eq!(nodes[0].kind, DriverKind::Pl011);
+        assert_eq!(nodes[0].mmio, Region::new(0x0900_0000, 0x0900_1000));
+        assert_eq!(nodes[0].irq, Some(33));
     }
 
     #[test]

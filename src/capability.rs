@@ -144,6 +144,27 @@ impl CapTable {
         })
     }
 
+    /// True when `owner` may bind `intid`. A broad self `CAP_IRQ` (trusted
+    /// shell/test probe) authorizes any INTID; a node-scoped capability has
+    /// `region = (intid, 1)` and authorizes only that line.
+    pub fn has_irq(&self, owner: u64, intid: u32) -> bool {
+        self.caps.iter().any(|cap| {
+            if cap.target_task != owner || cap.rights & CAP_IRQ == 0 {
+                return false;
+            }
+            match cap.region {
+                None => true,
+                Some((base, size)) => {
+                    let intid = u64::from(intid);
+                    intid >= base
+                        && intid
+                            .checked_sub(base)
+                            .is_some_and(|offset| offset < size)
+                }
+            }
+        })
+    }
+
     /// True when a capability for `target_task` carries at least `rights_mask`.
     /// Used by `SYS_WAITPID` to authorize a non-child target without exposing
     /// arbitrary PID access.

@@ -5153,10 +5153,7 @@ pub fn bind_irq(intid: u32) -> bool {
             let Some(current) = manager.tasks.get(current_index) else {
                 return false;
             };
-            if !current
-                .cap_table
-                .has_self_rights(current.id, capability::CAP_IRQ)
-            {
+            if !current.cap_table.has_irq(current.id, intid) {
                 return false;
             }
             if manager.tasks.iter().enumerate().any(|(index, task)| {
@@ -5841,7 +5838,7 @@ fn initial_self_rights(program: u64) -> Option<u32> {
         // The UART driver owns the input path, including the Ctrl-Z console
         // stop request; without this right SYS_STOP_CONSOLE is denied.
         user_program::HOWLER => {
-            capability::CAP_MMIO | capability::CAP_IRQ | capability::CAP_CONSOLE_GRANT
+            capability::CAP_MMIO | capability::CAP_CONSOLE_GRANT
         }
         user_program::NET_DRIVER => capability::CAP_MMIO | capability::CAP_PCI,
         user_program::NET_SERVER => capability::CAP_MMIO,
@@ -6180,6 +6177,15 @@ impl Task {
                     id,
                     capability::CAP_MMIO,
                     Some((range.base, range.size)),
+                );
+            }
+            // The IRQ grant is node-scoped too: `(intid, 1)`. The QEMU UART
+            // gets 33; a DT-bound UART gets whatever its `interrupts` says.
+            if let Some(intid) = crate::driver_resources::irq(program) {
+                cap_table.insert_region(
+                    id,
+                    capability::CAP_IRQ,
+                    Some((u64::from(intid), 1)),
                 );
             }
         }

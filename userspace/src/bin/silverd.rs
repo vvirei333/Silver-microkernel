@@ -89,7 +89,9 @@ pub extern "C" fn _start(_argument: u64) -> ! {
         .unwrap_or_else(|| fail("SILVERD: HOWLER SPAWN FAILED\r\n"));
     let howler_id = syscall::cap_get_task_id(howler_cap)
         .unwrap_or_else(|| fail("SILVERD: HOWLER CAP LOOKUP FAILED\r\n"));
-    if !syscall::cap_grant(howler_cap, howler_id, syscall::CAP_MMIO | syscall::CAP_IRQ) {
+    // MMIO is still delegated for DMA/alloc; the UART MMIO range and its
+    // INTID are inserted by the kernel from the driver resource table.
+    if !syscall::cap_grant(howler_cap, howler_id, syscall::CAP_MMIO) {
         fail("SILVERD: HOWLER CAP GRANT FAILED\r\n");
     }
 

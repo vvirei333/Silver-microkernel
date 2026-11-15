@@ -7043,3 +7043,25 @@ the same way. Then M3.2 (basic pack) and simplefb on Redmi.
 Verification: security 12/12 + health + 200k fuzz; Linux ABI matrix 26/26
 (the /tmp harness was wiped, so a fresh runner was reconstructed from the
 STATUS table); Phosh demo clean; ping OK; 223 host tests; --no-linux clean.
+
+### M3.1b: FDT driver binding and node-scoped IRQs
+
+`fdt::driver_nodes` walks every enabled node, reads `compatible`, the first
+`reg` pair and `interrupts`, and returns bindable UART nodes (PL011 or GENI).
+`driver_resources::init` runs once at boot, prefers the node `find_uart`
+would use, and stores base/size/INTID. QEMU's `-kernel` path passes no DTB
+(x0=0), so the fixed QEMU table remains; fog consumes the live values.
+
+Spawn now inserts `CAP_IRQ` with `region = (intid, 1)` for the UART; HOWLER no
+longer receives a broad CAP_IRQ from the kernel or silverd. `SYS_BIND_IRQ`
+checks `has_irq`, so the driver can bind only its node's line. Broad CAP_IRQ
+remains only for the trusted shell/test probe (the shell still delegates the
+GIC range for `irq_orphan`/`mmio_range_confine`).
+
+Limits: only UART nodes are bound; PCI/virtio/ivshmem remain program-id
+matched with static windows; the walker assumes 2/2 or 1/1 reg cells; the
+kernel still spawns from the program table (DT controls resources, not
+spawn). Next: PCI BAR publication and DT-driven spawn.
+
+Verification: security 12/12 + health + 200k fuzz; Linux ABI matrix 26/26;
+Phosh demo clean; ping OK; cargo test --lib 224; --no-linux clean.

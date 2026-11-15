@@ -1,16 +1,19 @@
-//! Driver MMIO resources: which physical range each built-in EL0 driver may
-//! map, and (later) the DT node that owns it.
+//! Driver MMIO/IRQ resources: which physical range and INTID each built-in
+//! EL0 driver may use, bound from the live DT where one exists.
 //!
 //! `map_phys` still requires `CAP_MMIO`, but that right only opens the DMA
 //! path now. A non-DMA device range must be covered by a region-scoped
-//! `CAP_MMIO` capability. The spawn path inserts these ranges for built-in
-//! drivers, and `SYS_MMIO_GRANT` lets a holder delegate a sub-range it
-//! already owns (the shell does that for the GIC probe).
+//! `CAP_MMIO` capability. `SYS_BIND_IRQ` likewise requires a region-scoped
+//! `CAP_IRQ` (or a broad right held by the trusted shell/test probe).
 //!
-//! QEMU uses fixed platform addresses. On the phone the UART base is the one
-//! proved by the live FDT through `geni_uart::physical_base`; other nodes are
-//! intentionally absent until the driver binds a DT node.
+//! `init` runs once at boot. A live DTB binds the console UART by
+//! `compatible` (`arm,pl011` or `qcom,geni-*`); QEMU without a DTB keeps the
+//! fixed PL011 address. A missing or disabled node leaves the driver
+//! unbound (dead hardware, not a crash).
 
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+use crate::fdt::{DriverKind, DriverNode, MAX_DRIVER_NODES};
 use crate::platform::{self, Kind};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -20,6 +23,7 @@ pub struct Range {
 }
 
 const QEMU_UART: Range = Range { base: 0x0900_0000, size: 0x1000 };
+const QEMU_UART_IRQ: u32 = 33;
 const QEMU_GIC: Range = Range { base: 0x0800_0000, size: 0x1_0000 };
 /// PCI ECAM is reached through `SYS_PCI_*`, not `map_phys`; this is the
 /// memory-BAR window the virtio driver assigns and maps (0x1010_0000,
@@ -28,24 +32,54 @@ const QEMU_PCI_MMIO: Range = Range { base: 0x1000_0000, size: 0x0100_0000 };
 /// ivshmem BAR used by Wolfser and the demo window.
 const QEMU_IVSHMEM: Range = Range { base: 0x1040_0000, size: 0x0040_0000 };
 
+static UART_BASE: AtomicU64 = AtomicU64::new(0);
+static UART_SIZE: AtomicU64 = AtomicU64::new(0);
+/// Zero means the DT did not describe an interrupt for the UART.
+static UART_IRQ: AtomicU32 = AtomicU32::new(0);
+
+/// Binds the resources described by the live tree. Called once before the
+/// first user task; a second call is harmless and only fills the UART slot.
+pub fn init(dtb: Option<&[u8]>) {
+    let Some(tree) = dtb.and_then(crate::fdt::Fdt::new) else {
+        return;
+    };
+    let mut nodes = [DriverNode {
+        kind: DriverKind::Pl011,
+        mmio: crate::fdt::Region::default(),
+        irq: None,
+    }; MAX_DRIVER_NODES];
+    let count = tree.driver_nodes(&mut nodes);
+    // Prefer the node `find_uart` would use (debug GENI over plain GENI).
+    let preferred = tree.find_uart().map(|uart| uart.base);
+    let chosen = nodes[..count]
+        .iter()
+        .find(|node| preferred.map_or(true, |base| node.mmio.start == base))
+        .or_else(|| nodes[..count].first());
+    if let Some(node) = chosen {
+        UART_BASE.store(node.mmio.start, Ordering::Release);
+        UART_SIZE.store(node.mmio.size(), Ordering::Release);
+        if let Some(irq) = node.irq {
+            UART_IRQ.store(irq, Ordering::Release);
+        }
+    }
+}
+
 /// Range a program may map as device MMIO, if any. The spawn path adds it as
 /// a self `CAP_MMIO` region; it is not inheritable through a generic handle.
 pub fn mmio_range(program: u64) -> Option<Range> {
     match (platform::detect(), program) {
-        (Kind::Qemu, crate::user_program::HOWLER) => Some(QEMU_UART),
+        (Kind::Qemu, crate::user_program::HOWLER) => Some(dtb_uart_range().unwrap_or(QEMU_UART)),
         // The shell holds the GIC range only to delegate it to the IRQ probe.
         (Kind::Qemu, crate::user_program::HOWL) => Some(QEMU_GIC),
         (Kind::Qemu, crate::user_program::NET_DRIVER) => Some(QEMU_PCI_MMIO),
         (Kind::Qemu, crate::user_program::WOLFSER) => Some(QEMU_IVSHMEM),
-        // The fog console runs from the kernel GENI driver; the EL0 UART task
-        // is not spawned there yet, but the range is ready for M3.3.
-        (Kind::Fog, crate::user_program::HOWLER) => {
+        (Kind::Fog, crate::user_program::HOWLER) => dtb_uart_range().or_else(|| {
             let base = crate::geni_uart::physical_base();
             (base != 0).then_some(Range {
                 base: base as u64,
                 size: 0x1000,
             })
-        }
+        }),
         // Tablet profile is parked but must not regress if booted.
         (Kind::Sm8650, crate::user_program::HOWLER) => Some(Range {
             base: 0x0089_C000,
@@ -53,4 +87,34 @@ pub fn mmio_range(program: u64) -> Option<Range> {
         }),
         _ => None,
     }
+}
+
+/// INTID a program may bind, if the platform/DT assigned one. A missing value
+/// means no node-scoped IRQ; a broad `CAP_IRQ` (trusted shell/test probe) is
+/// still accepted by `bind_irq`.
+pub fn irq(program: u64) -> Option<u32> {
+    match (platform::detect(), program) {
+        (Kind::Qemu, crate::user_program::HOWLER) => {
+            let from_dt = UART_IRQ.load(Ordering::Acquire);
+            Some(if from_dt != 0 { from_dt } else { QEMU_UART_IRQ })
+        }
+        (Kind::Fog, crate::user_program::HOWLER) => {
+            let irq = UART_IRQ.load(Ordering::Acquire);
+            (irq != 0).then_some(irq)
+        }
+        (Kind::Sm8650, crate::user_program::HOWLER) => Some(crate::gic::uart_irq()),
+        _ => None,
+    }
+}
+
+pub fn dtb_uart() -> Option<(Range, Option<u32>)> {
+    let range = dtb_uart_range()?;
+    let irq = UART_IRQ.load(Ordering::Acquire);
+    Some((range, (irq != 0).then_some(irq)))
+}
+
+fn dtb_uart_range() -> Option<Range> {
+    let base = UART_BASE.load(Ordering::Acquire);
+    let size = UART_SIZE.load(Ordering::Acquire);
+    (base != 0 && size != 0).then_some(Range { base, size })
 }

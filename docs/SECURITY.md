@@ -84,10 +84,16 @@ Authority is a capability, not an id (`src/capability.rs`):
   cannot pass device, mount or power rights on.
 - `CAP_MMIO` opens `map_phys`/`alloc_dma`; it is **not** a license to map any
   physical address. Device MMIO needs a region-scoped self `CAP_MMIO`
-  capability. The spawn path inserts the range from
-  `src/driver_resources.rs` (UART, PCI BAR window, ivshmem, GIC for the trusted
-  shell); `map_phys` accepts a non-DMA range only when a self capability
-  covers the whole request. DMA windows are governed by ownership/share below.
+  capability. The spawn path inserts the range from the driver resource table
+  (`src/driver_resources.rs`, bound from the live DT when one exists); the
+  QEMU UART/PCI/ivshmem ranges are the static fallback. `map_phys` accepts a
+  non-DMA range only when a self capability covers the whole request. DMA
+  windows are governed by ownership/share below.
+- `CAP_IRQ` is node-scoped the same way: the spawn path inserts
+  `region = (intid, 1)` for the driver's DT interrupt (QEMU UART: 33), and
+  `SYS_BIND_IRQ` checks `has_irq`. A broad `CAP_IRQ` (region `None`) is kept
+  only for the trusted shell/test probe, which delegates nothing but the probe
+  run.
 - A range may be delegated down with `SYS_MMIO_GRANT(recipient, base, size)`:
   the caller must hold a covering range and the recipient must be itself or
   its own child. The shell uses this to give the IRQ/MMIO probe the GIC range.
@@ -196,6 +202,7 @@ is an excuse for a memory-safety bug.
 | V-dot | the SFS backend splitter accepted `.`/`..` (the VFS normalised first) | defense in depth | fixed: backend uses `sfs_format::split_path_name`; unit test |
 | R3 | a killed IRQ owner left its INTID enabled, so the next interrupt charged the unmaskable streak | missing teardown mask | fixed: every `bound_irq` clear masks the line; `irq_orphan` |
 | M3-MMIO | any `CAP_MMIO` holder mapped any device physical range | ambient device authority | fixed: region-scoped self `CAP_MMIO` from driver resources, `SYS_MMIO_GRANT`, `mmio_range_confine` |
+| M3-IRQ | `CAP_IRQ` bound any INTID | ambient interrupt authority | fixed for drivers: DT/QEMU range `(intid,1)` from `driver_resources`, `has_irq`; broad only for trusted shell/test probe |
 
 ## Disclosure and fix protocol
 
