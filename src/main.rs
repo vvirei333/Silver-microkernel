@@ -49,6 +49,7 @@ mod fog_validate;
 mod frame_allocator;
 #[cfg(not(feature = "std"))]
 mod geni_uart;
+mod driver_resources;
 #[cfg(not(feature = "std"))]
 mod gic;
 mod gicv3;

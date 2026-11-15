@@ -180,9 +180,14 @@ quarantine free, канарейки), checked-арифметика на всех
 **Состояние на 2026-11-15.** M3-soft закрыт кроме асинхронной подкачки:
 четыре пробы (`mailbox_quota`, `blocked_kill`, `linux_fd_lifetime`,
 `irq_orphan`), region-scoped `SYS_DMA_GRANT_SELF` и `dma_region_confine`
-зелёные; детали и дизайн page-fault I/O — в `docs/M3_SOFT.md`. Следующий
-срез — async page-in (block driver IRQ path + cache/device lock вне BKL),
-затем simplefb на Redmi 10C.
+зелёные; детали и дизайн page-fault I/O — в `docs/M3_SOFT.md`.
+
+M3.1a сделан: MMIO драйверов больше не ambient — range-scoped self
+`CAP_MMIO` из `driver_resources.rs`, `SYS_MMIO_GRANT`, проба
+`mmio_range_confine`; детали и ограничения — в `docs/M3_DRIVER.md`.
+Следующий срез M3.1 — generic DT walk (`compatible`/`reg`/`interrupts`) и
+node-scoped IRQ-капы. Затем async page-in, M3.2 basic pack и simplefb на
+Redmi 10C.
 
 **M3.1 — driver-task framework:**
 

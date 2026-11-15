@@ -153,6 +153,27 @@ impl CapTable {
         })
     }
 
+    /// True when a region-scoped `CAP_MMIO` for `owner` covers
+    /// `[base, base + size)`. A broad `CAP_MMIO` (no region) authorizes DMA
+    /// and `alloc_dma`, not device MMIO: device ranges must be explicit.
+    pub fn has_mmio_range(&self, owner: u64, base: u64, size: u64) -> bool {
+        let Some(end) = base.checked_add(size) else {
+            return false;
+        };
+        self.caps.iter().any(|cap| {
+            if cap.target_task != owner || cap.rights & CAP_MMIO == 0 {
+                return false;
+            }
+            let Some((range_base, range_size)) = cap.region else {
+                return false;
+            };
+            let Some(range_end) = range_base.checked_add(range_size) else {
+                return false;
+            };
+            base >= range_base && end <= range_end
+        })
+    }
+
     /// True when a region-scoped `CAP_DMA_SHARE` for `target_task` covers the
     /// whole physical range `[base, base + size)`. A capability without a
     /// region (a spawn handle, or a legacy owner-wide grant) never authorizes

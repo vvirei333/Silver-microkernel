@@ -34,6 +34,7 @@ const ROLE_DMA_ONLY: u64 = 2;
 const ROLE_MAILBOX_ONLY: u64 = 3;
 const ROLE_REGION_ONLY: u64 = 4;
 const ROLE_IRQ_ONLY: u64 = 5;
+const ROLE_MMIO_ONLY: u64 = 6;
 
 const ROLE_DMA_ATTACKER: u64 = 10;
 const ROLE_MAIL_VICTIM: u64 = 11;
@@ -59,6 +60,9 @@ const GICD_SIZE: u64 = 0x1_0000;
 const GICD_ISENABLER: u64 = 0x100;
 /// An unused, user-bindable SPI (32..=1019, not the timer, not the UART).
 const PROBE_INTID: u64 = 64;
+/// QEMU PL011: the range the shell does *not* delegate to the MMIO probe.
+const UART_PHYS: u64 = 0x0900_0000;
+const UART_SIZE: u64 = 0x1000;
 
 const DMA_BYTES: u64 = 8192;
 const REGION_BYTES: u64 = 4096;
@@ -98,6 +102,10 @@ pub extern "C" fn _start(argument: u64) -> ! {
         ROLE_IRQ_ONLY => {
             let _ = wait_for(MSG_SHELL_GO);
             finish(run_irq_test(), "irq orphan ok")
+        }
+        ROLE_MMIO_ONLY => {
+            let _ = wait_for(MSG_SHELL_GO);
+            finish(run_mmio_test(), "mmio range confine ok")
         }
         ROLE_DMA_ATTACKER => dma_attacker(),
         ROLE_MAIL_VICTIM => mail_victim(),
@@ -356,6 +364,21 @@ fn run_region_test() -> bool {
         syscall::print("dma region confine: owner did not see the write\r\n");
     }
     first_ok && second_denied && observed
+}
+
+/// M3.1 range check: the shell delegates only the GIC range. Mapping the GIC
+/// must succeed; mapping the UART (a real device range the probe does not own)
+/// must fail even though the probe holds CAP_MMIO.
+fn run_mmio_test() -> bool {
+    let gic_ok = syscall::map_phys_nc(GICD_BASE, GICD_SIZE).is_some();
+    let uart_ok = syscall::map_phys(UART_PHYS, UART_SIZE).is_some();
+    if !gic_ok {
+        syscall::print("mmio range confine: granted GIC range was refused\r\n");
+    }
+    if uart_ok {
+        syscall::print("mmio range confine: unrelated UART range was mapped\r\n");
+    }
+    gic_ok && !uart_ok
 }
 
 /// R3: the reaper must disable a dead owner's bound INTID. The probe reads

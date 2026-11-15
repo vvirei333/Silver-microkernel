@@ -24,6 +24,9 @@ use core::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 
 /// Physical base configured by `init_at`. Zero means "not proven, stay off".
 static BASE: AtomicUsize = AtomicUsize::new(0);
+/// Physical base proved at boot; the driver-resource table grants exactly
+/// this range to the EL0 UART task.
+static PHYS: AtomicUsize = AtomicUsize::new(0);
 static READY: AtomicBool = AtomicBool::new(false);
 
 /// Cached RX word and the number of valid bytes still in it. The GENI FIFO
@@ -112,9 +115,11 @@ pub fn init_at(base_phys: usize) {
     if base_phys == 0 {
         READY.store(false, Ordering::Release);
         BASE.store(0, Ordering::Release);
+        PHYS.store(0, Ordering::Release);
         return;
     }
     BASE.store(crate::memory::phys_to_virt(base_phys), Ordering::Release);
+    PHYS.store(base_phys, Ordering::Release);
     RX_WORD.store(0, Ordering::Relaxed);
     RX_COUNT.store(0, Ordering::Relaxed);
 
@@ -158,6 +163,11 @@ pub fn init_at(base_phys: usize) {
 /// Tablet default, kept for the existing SM8650 path.
 pub fn init() {
     init_at(0x0089_C000);
+}
+
+/// Physical base proved by the FDT/boot path, or zero when the UART is off.
+pub fn physical_base() -> usize {
+    PHYS.load(Ordering::Acquire)
 }
 
 /// Set when a TX poll exhausts its budget. The UART is not clocked on the

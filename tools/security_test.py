@@ -42,6 +42,7 @@ CASES = {
     "mailbox_quota": (b"mailbox quota ok", "secprobe mailbox_quota"),
     "dma_region_confine": (b"dma region confine ok", "secprobe dma_region_confine"),
     "irq_orphan": (b"irq orphan ok", "secprobe irq_orphan"),
+    "mmio_range_confine": (b"mmio range confine ok", "secprobe mmio_range_confine"),
     "blocked_kill": (b"blocked kill ok", None),
     "linux_fd_lifetime": (b"linux fd lifetime ok", None),
 }

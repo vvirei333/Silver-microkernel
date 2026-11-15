@@ -32,6 +32,10 @@ const SFS_PATH_MAX: usize = 191;
 const SFS_NAME_DATA_LIMIT: usize = 29;
 
 const TASK_LIST_CAPACITY: usize = 32;
+/// QEMU virt GIC distributor: the shell holds this range only to delegate it
+/// to the IRQ/MMIO probes.
+const GICD_BASE: u64 = 0x0800_0000;
+const GICD_SIZE: u64 = 0x1_0000;
 const EMPTY_TASK: syscall::TaskInfo = syscall::TaskInfo {
     id: 0,
     state: 0,
@@ -1369,9 +1373,10 @@ fn secprobe_command(test: Option<&str>) {
         Some("mailbox_quota") => 3,
         Some("dma_region_confine") => 4,
         Some("irq_orphan") => 5,
+        Some("mmio_range_confine") => 6,
         Some(_) => {
             syscall::print(
-                "usage: secprobe <grant_foreign|dma_cross_read|mailbox_quota|dma_region_confine|irq_orphan>\r\n",
+                "usage: secprobe <grant_foreign|dma_cross_read|mailbox_quota|dma_region_confine|irq_orphan|mmio_range_confine>\r\n",
             );
             return;
         }
@@ -1395,6 +1400,17 @@ fn secprobe_command(test: Option<&str>) {
         let _ = syscall::kill(cap_id);
         let _ = syscall::wait(cap_id);
         syscall::print("secprobe: capability grant failed\r\n");
+        return;
+    }
+    // Device MMIO is region-scoped now. The IRQ and range probes map the GIC
+    // distributor, so delegate exactly that range (the shell owns it as a
+    // trusted control-plane capability; this is not ambient CAP_MMIO).
+    if (mode == 5 || mode == 6)
+        && !syscall::mmio_grant(task_id, GICD_BASE, GICD_SIZE)
+    {
+        let _ = syscall::kill(cap_id);
+        let _ = syscall::wait(cap_id);
+        syscall::print("secprobe: GIC range grant failed\r\n");
         return;
     }
     if !syscall::console_set(cap_id) {

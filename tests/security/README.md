@@ -47,6 +47,7 @@ command mirrors `build_and_qemu.sh` (no display, serial on a Unix socket).
 | `blocked_kill` | A child sets `SIG_SETMASK=~0`, reads the mask back (SIGKILL/SIGSTOP must be stripped) and sleeps; the parent's SIGKILL reaps it with the killed status. Exiting early with 77 makes a mask regression fail deterministically. |
 | `linux_fd_lifetime` | 1000 rounds of memfd -> `SCM_RIGHTS` -> close sender -> churn the freed number -> read the receiver's duplicate. A number-based table reads a churn byte and fails. |
 | `irq_orphan` | **Native.** A task binds SPI 64; the GIC `ISENABLER` bit is read through an NC mapping before and after the kill. The reaper must clear it, and the INTID must be rebindable. |
+| `mmio_range_confine` | **Native.** The shell delegates only the GIC range. The probe maps the GIC (allowed) and the UART (refused) even though it holds broad `CAP_MMIO`: device MMIO needs a region-scoped capability. |
 
 Planned:
 

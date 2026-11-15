@@ -1171,6 +1171,13 @@ pub fn init() {
                 .and_then(|manager| manager.tasks.iter_mut().find(|task| task.id == id))
             {
                 task.cap_table.insert(id, capability::CAP_MMIO);
+                // The capacity probe maps 0x0010_0000 as a device range; give
+                // it exactly that range, like a real driver's DT node.
+                task.cap_table.insert_region(
+                    id,
+                    capability::CAP_MMIO,
+                    Some((0x0010_0000, 0x1000)),
+                );
             }
         }
         let _zombie_probe = spawn_user(user_program::DEMO, 43);
@@ -4817,6 +4824,51 @@ pub fn dma_grant_self(recipient_task_id: u64, base: usize, size: usize) -> bool 
     granted
 }
 
+/// `SYS_MMIO_GRANT(recipient, base, size)`: delegate a sub-range of a device
+/// mapping the caller already owns. Used by the trusted shell to hand the GIC
+/// distributor range to the IRQ probe; a future DT broker uses the same rule
+/// for driver children. Authority only flows down (self or own child).
+pub fn mmio_grant(recipient_task_id: u64, base: usize, size: usize) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let caller_id = current_task_id();
+    let saved_daif = interrupts::save_and_disable_irq();
+    let mut granted = false;
+    if let Some(manager) = scheduler_manager() {
+        let owns = manager
+            .tasks
+            .get(smp::current_index())
+            .is_some_and(|task| {
+                task.id == caller_id
+                    && task
+                        .cap_table
+                        .has_mmio_range(caller_id, base as u64, size as u64)
+            });
+        if owns {
+            if let Some(recipient) = manager.tasks.iter_mut().find(|task| {
+                task.id == recipient_task_id
+                    && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+            }) {
+                if recipient_task_id != caller_id && recipient.ppid != Some(caller_id) {
+                    interrupts::restore_irq(saved_daif);
+                    return false;
+                }
+                if recipient.cap_table.has_capacity() {
+                    recipient.cap_table.insert_region(
+                        recipient_task_id,
+                        capability::CAP_MMIO,
+                        Some((base as u64, size as u64)),
+                    );
+                    granted = true;
+                }
+            }
+        }
+    }
+    interrupts::restore_irq(saved_daif);
+    granted
+}
+
 /// `SYS_CAP_FIND(target, rights)`: id of the caller's first capability for
 /// `target` covering `rights`, or 0. Lets a task delegate a scoped right it
 /// received without having to remember the CapId.
@@ -5002,6 +5054,16 @@ fn map_phys_to_current_mode(phys_addr: usize, size: usize, non_cacheable: bool) 
         if !task
             .cap_table
             .has_self_rights(task_id, capability::CAP_MMIO)
+        {
+            return None;
+        }
+        // DMA windows are governed by ownership/share above. Anything else is
+        // device MMIO and needs a region-scoped self capability: a broad
+        // CAP_MMIO only opens the DMA path.
+        if !shared_dma
+            && !task
+                .cap_table
+                .has_mmio_range(task_id, phys_addr as u64, size as u64)
         {
             return None;
         }
@@ -6106,11 +6168,20 @@ impl Task {
         context.user_stack_pointer = user_stack_pointer;
 
         let mut cap_table = capability::CapTable::new();
-        if let Some(rights) = user
-            .map(|(program, _)| program)
-            .and_then(initial_self_rights)
-        {
-            cap_table.insert(id, rights);
+        if let Some((program, _)) = user {
+            if let Some(rights) = initial_self_rights(program) {
+                cap_table.insert(id, rights);
+            }
+            // Device MMIO is not ambient: each built-in driver gets exactly
+            // the range the DT/platform assigned to it, as a self capability
+            // with a region. `map_phys` requires this for non-DMA addresses.
+            if let Some(range) = crate::driver_resources::mmio_range(program) {
+                cap_table.insert_region(
+                    id,
+                    capability::CAP_MMIO,
+                    Some((range.base, range.size)),
+                );
+            }
         }
 
         #[cfg(feature = "linux-abi")]

@@ -15,9 +15,10 @@ item is designed but **not** landed (see the last section).
 | 1.3 | `irq_orphan` (R3) | **done** | GIC `ISENABLER` read before/after kill; rebind succeeds |
 | 3 | page-fault I/O outside the BKL | **designed, not landed** | design below |
 
-Security suite: **11/11** cases, a post-suite `health` with zombie 0 / open 0 /
-leaked 0, and 200k fuzz cases. Matrix 26/26, Phosh demo clean, `--no-linux`
-clean, 223 host unit tests.
+Security suite: **12/12** cases (11 M3-soft + `mmio_range_confine` from
+M3.1), a post-suite `health` with zombie 0 / open 0 / leaked 0, and 200k fuzz
+cases. Matrix 26/26, Phosh demo clean, `--no-linux` clean, 223 host unit
+tests.
 
 ## Negative controls
 

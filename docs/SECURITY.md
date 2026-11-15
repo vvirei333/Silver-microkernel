@@ -82,6 +82,16 @@ Authority is a capability, not an id (`src/capability.rs`):
   `CAP_POWER`, `CAP_FS_WRITE`) only count as **self**-capabilities. A spawn
   handle over a child carries `CAP_ALL` but is not an own privilege, so it
   cannot pass device, mount or power rights on.
+- `CAP_MMIO` opens `map_phys`/`alloc_dma`; it is **not** a license to map any
+  physical address. Device MMIO needs a region-scoped self `CAP_MMIO`
+  capability. The spawn path inserts the range from
+  `src/driver_resources.rs` (UART, PCI BAR window, ivshmem, GIC for the trusted
+  shell); `map_phys` accepts a non-DMA range only when a self capability
+  covers the whole request. DMA windows are governed by ownership/share below.
+- A range may be delegated down with `SYS_MMIO_GRANT(recipient, base, size)`:
+  the caller must hold a covering range and the recipient must be itself or
+  its own child. The shell uses this to give the IRQ/MMIO probe the GIC range.
+  Broad `CAP_MMIO` cannot be widened into a device range.
 - Delegation is all-or-nothing and bounded (`MAX_CAPS_PER_TASK = 96`); a
   mixed global|scoped request through a handle grants neither. Authority only
   flows down: the recipient must be the caller itself or a task the caller
@@ -167,7 +177,7 @@ findings table.
 These are findings in their own right for the auditor; nothing in this list
 is an excuse for a memory-safety bug.
 
-## Findings fixed during M2
+## Findings fixed during M2/M3
 
 | ID | Finding | Class | Status |
 |---|---|---|---|
@@ -185,6 +195,7 @@ is an excuse for a memory-safety bug.
 | L10 | EL0 can `msr daifset` and starve a uniprocessor | missing trap (no FGT) | accepted: SMP product, documented (#10) |
 | V-dot | the SFS backend splitter accepted `.`/`..` (the VFS normalised first) | defense in depth | fixed: backend uses `sfs_format::split_path_name`; unit test |
 | R3 | a killed IRQ owner left its INTID enabled, so the next interrupt charged the unmaskable streak | missing teardown mask | fixed: every `bound_irq` clear masks the line; `irq_orphan` |
+| M3-MMIO | any `CAP_MMIO` holder mapped any device physical range | ambient device authority | fixed: region-scoped self `CAP_MMIO` from driver resources, `SYS_MMIO_GRANT`, `mmio_range_confine` |
 
 ## Disclosure and fix protocol
 

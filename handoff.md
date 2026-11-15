@@ -7010,3 +7010,36 @@ Verified on the 2 GiB Phosh image: the lock screen now shows the night-sky
 gradient, moon, stars and pines; unlock, app grid, Terminal and `ls /sfs`
 still work. Still image: `assets/lockscreen-0.1.3.png`. The 0.1.2 demo GIF is
 left untouched; it is the historical 0.1.2 recording.
+
+### M3.1a: device MMIO is region-scoped
+
+M3 starts with the authority half of the driver-task framework. `CAP_MMIO`
+used to mean "call map_phys on any physical address": a driver with the right
+could map the UART, the GIC or another device's registers. Now it only opens
+the DMA path; device MMIO needs a region-scoped self `CAP_MMIO`.
+
+- `src/driver_resources.rs` is the per-program table. QEMU: HOWLER gets
+  PL011 `0x0900_0000..+0x1000`, HOWL (trusted shell) gets the GIC distributor
+  `0x0800_0000..+0x10000` only to delegate, NET_DRIVER gets the PCI
+  memory-BAR window `0x1000_0000..+0x100_0000`, WOLFSER gets ivshmem
+  `0x1040_0000..+0x40_0000`. Fog HOWLER will use the UART base proved by the
+  live FDT (`geni_uart::physical_base`); SM8650 keeps its fixed base.
+- Spawn inserts the range as a self `CAP_MMIO` capability next to the broad
+  right. `map_phys` checks: own DMA → allowed, foreign DMA → region-scoped
+  `CAP_DMA_SHARE`, anything else → a self `CAP_MMIO` region covering the whole
+  request. A broad `CAP_MMIO` cannot be widened into a device range.
+- `SYS_MMIO_GRANT(recipient, base, size)` delegates a sub-range the caller
+  already covers, only to itself or its own child. The shell uses it to hand
+  the GIC range to the `irq_orphan` and `mmio_range_confine` probes.
+- New native probe `mmio_range_confine`: GIC maps (delegated), UART refuses
+  (broad CAP_MMIO only). Negative control: removing the range check makes the
+  UART map and the probe fails; restoring it passes.
+
+The table is still static/platform-derived, not a generic DT walk. Next M3.1
+slice: walk every enabled node, read `compatible`/`reg`/`interrupts`, bind a
+driver table and grant from the node; IRQ grants should carry the node INTID
+the same way. Then M3.2 (basic pack) and simplefb on Redmi.
+
+Verification: security 12/12 + health + 200k fuzz; Linux ABI matrix 26/26
+(the /tmp harness was wiped, so a fresh runner was reconstructed from the
+STATUS table); Phosh demo clean; ping OK; 223 host tests; --no-linux clean.

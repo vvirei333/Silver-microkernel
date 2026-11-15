@@ -50,6 +50,7 @@ const SYS_CAP_GET_TASK_ID: u64 = 60;
 const SYS_CAP_GRANT: u64 = 61;
 const SYS_CAP_FIND: u64 = 99;
 const SYS_DMA_GRANT_SELF: u64 = 101;
+const SYS_MMIO_GRANT: u64 = 102;
 const SYS_MAP_PHYS: u64 = 62;
 const SYS_MAP_PHYS_NC: u64 = 96;
 const SYS_BIND_IRQ: u64 = 63;
@@ -398,6 +399,11 @@ pub fn cap_find(target: u64, rights: u32) -> Option<u64> {
 /// `[base, base + size)` of a DMA run the caller owns.
 pub fn dma_grant_self(recipient: u64, base: u64, size: u64) -> bool {
     unsafe { syscall3(SYS_DMA_GRANT_SELF, recipient, base, size) == 0 }
+}
+
+/// Delegate a device MMIO sub-range the caller already owns.
+pub fn mmio_grant(recipient: u64, base: u64, size: u64) -> bool {
+    unsafe { syscall3(SYS_MMIO_GRANT, recipient, base, size) == 0 }
 }
 
 pub fn map_phys(phys_addr: u64, size: u64) -> Option<u64> {
