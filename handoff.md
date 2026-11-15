@@ -6977,3 +6977,36 @@ outside the BKL first. This is the next slice.
 Verification: security 11/11 + post-suite health 0/0/0 + 200k fuzz, matrix
 26/26, Phosh demo clean, ping through the net server (owner-granted client
 window) OK, `cargo test --lib` 223, `--no-linux` clean.
+
+### Phosh lock-screen wallpaper (0.1.3)
+
+The 0.1.2 lock screen was a black backdrop with the clock. The wallpaper was
+configured in GSettings (`org.gnome.desktop.background`), and the home's
+background layer painted it after unlock, but Phosh 0.57's lock screen is a
+GTK widget whose background is CSS, not the home layer; when the overview
+folds, that layer fades out and the lock screen shows the compositor's black
+root.
+
+`phosh-serve` now seeds `/tmp/.config/gtk-3.0/gtk.css` (HOME is `/tmp`) with:
+
+```css
+phosh-lockscreen, .phosh-lockshield {
+  background-image: linear-gradient(rgba(0,0,0,0.35), rgba(0,0,0,0.35)),
+                    url('file:///sfs/share/backgrounds/werewolf.png');
+  background-size: cover;
+  background-position: center;
+}
+```
+
+The app grid keeps the existing home background; only the lock screen needed
+the extra CSS. The image is the one already installed by
+`tools/gen_theme_assets.py`. `tools/build_phosh_image.py`
+now compiles `/sfs/phosh-serve` from `tests/linux/wayland_real.c` with
+`-DSERVE_ONLY -DSERVE_PHOSH` instead of inheriting an old binary from the GTK3
+base image. `tools/demo.py` samples the lock screen before unlocking and warns
+if it is black, so the regression is visible in the demo log.
+
+Verified on the 2 GiB Phosh image: the lock screen now shows the night-sky
+gradient, moon, stars and pines; unlock, app grid, Terminal and `ls /sfs`
+still work. Still image: `assets/lockscreen-0.1.3.png`. The 0.1.2 demo GIF is
+left untouched; it is the historical 0.1.2 recording.

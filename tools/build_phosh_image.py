@@ -80,6 +80,21 @@ subprocess.run(['patchelf','--set-interpreter','/sfs/ld-linux-aarch64.so.1',
                 '--set-rpath','/sfs', phosh_tmp], check=True)
 files['phosh']=open(phosh_tmp,'rb').read()
 
+# phosh-serve is the freestanding compositor/proxy that seeds the GTK
+# settings, the lock-screen CSS and the theme pack before exec'ing Phosh.
+# Building it here keeps the image reproducible instead of inheriting an old
+# binary from the GTK3 base image.
+root=os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+serve_tmp='/tmp/alarm/phosh-serve'
+subprocess.run(['aarch64-linux-gnu-gcc','-static','-nostdlib','-ffreestanding',
+                '-O2','-DSERVE_ONLY','-DSERVE_PHOSH',
+                '-Wl,-T,'+os.path.join(root,'tests/linux/wayland_real.ld'),
+                '-Wl,-z,max-page-size=4096',
+                '-o',serve_tmp,os.path.join(root,'tests/linux/wayland_real.c')],
+               check=True)
+files['phosh-serve']=open(serve_tmp,'rb').read()
+print('phosh-serve', len(files['phosh-serve']))
+
 count=0; skipped=0
 for root,dirs,fs in os.walk(PKG+'/usr/share'):
     for f in fs:

@@ -1447,6 +1447,7 @@ driver's contract.
 | [docs/PORTING_FOG.md](docs/PORTING_FOG.md) | Redmi 10C port plan (parked): console-over-UART/storage/power path, hardware unknowns and regression matrix |
 | [docs/REFERENCE.md](docs/REFERENCE.md) | Reference console product: definition, acceptance checklist, current status, known gaps and next work |
 | [docs/VECTOR.md](docs/VECTOR.md) | Direction: console OS, host-rendered browser window, Linux ABI/Phosh assessment and staged plan |
+| [docs/MOBILE_LINUX_ARCH.md](docs/MOBILE_LINUX_ARCH.md) | How postmarketOS/Nura works as mobile Linux (boot, deviceinfo, initramfs, Alpine/systemd, Phosh/phoc services) and what to borrow for WerewolfOS |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
 
 Current verification snapshot (2026-11-08, console product): **217 host

@@ -50,6 +50,7 @@ the screenshot is the raw PL011 byte stream.
   disabled. Expect software-rendering performance and CPU cost.
 - **Lockscreen wallpaper is not painted** — the lock screen is a black backdrop
   with the clock and “Slide up to unlock”. Cosmetic; tracked for 0.1.3.
+  (Fixed on `main` for 0.1.3; see the post-release notes below.)
 - The nested window does not draw a host cursor (the guest cursor is visible
   inside the scanout).
 - `phoc-output-CRITICAL: Stacked surface … not in same layer` appears when the
@@ -134,6 +135,11 @@ These land after the tag and will be in 0.1.3:
   panics the unfixed kernel with `EL1 EXCEPTION`). Non-EL0t frames are now
   rejected with SIGSEGV. **Any 0.1.2 build that runs Linux binaries should
   take this fix.**
+- **Lock-screen wallpaper (fixed on `main`).** Phosh 0.57 draws the lock
+  screen as a GTK widget with no background of its own; the home wallpaper
+  layer fades out first, leaving black. `phosh-serve` now writes
+  `~/.config/gtk-3.0/gtk.css` with the werewolf image plus a dark overlay
+  before it execs Phosh. Verified in `assets/lockscreen-0.1.3.png`.
 
 ## Security campaign M2 — closed
 

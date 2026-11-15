@@ -5689,6 +5689,32 @@ void _start(void) {
         }
     }
 
+    /* Phosh 0.57 draws the lock screen as a GTK widget with no background of
+       its own; the desktop wallpaper lives in the home's background layer and
+       fades out before the lock screen appears, leaving a black backdrop.
+       GTK3 reads ~/.config/gtk-3.0/gtk.css (HOME is /tmp), so give the lock
+       screen the same night-sky image with a slight darkening overlay. The
+       app grid keeps the compositor/home background and is deliberately not
+       touched here. */
+    sys3(34 /* mkdirat */, -100, (long)"/tmp/.config/gtk-3.0", 0777);
+    {
+        long css_fd = sys3(56 /* openat */, -100,
+                           (long)"/tmp/.config/gtk-3.0/gtk.css",
+                           0x241 /* O_WRONLY|O_CREAT|O_TRUNC */);
+        if (css_fd >= 0) {
+            static const char css[] =
+                "phosh-lockscreen, .phosh-lockshield {\n"
+                "  background-image: linear-gradient(rgba(0,0,0,0.35),"
+                " rgba(0,0,0,0.35)),"
+                " url('file:///sfs/share/backgrounds/werewolf.png');\n"
+                "  background-size: cover;\n"
+                "  background-position: center;\n"
+                "}\n";
+            sys3(64 /* write */, css_fd, (long)css, sizeof(css) - 1);
+            sys3(57 /* close */, css_fd, 0, 0);
+        }
+    }
+
     /* Session bus for Phosh: libfeedback, polkit, the OSK manager and logind
        clients connect to it. /sfs/dbus-daemon ships with a permissive config;
        LD_LIBRARY_PATH is needed because its libsystemd has no RUNPATH. */

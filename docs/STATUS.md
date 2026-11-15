@@ -97,9 +97,11 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   compositor.
 - Works end to end: lock screen, unlock, app grid, type-ahead search, launching
   a GTK Terminal, typing and running commands.
+- Lock-screen background is painted from the same night-sky wallpaper through
+  a GTK3 CSS file seeded by `phosh-serve` (0.1.3 fix; 0.1.2 had a black lock
+  screen). Screenshot: `assets/lockscreen-0.1.3.png`.
 - Demo: `assets/demo-0.1.2.gif`, reproducible with `tools/demo.py`.
-- Known cosmetic gaps: the lock-screen wallpaper is not painted (black
-  backdrop with the clock), the host cursor is not drawn, and the overview fold
+- Known cosmetic gaps: the host cursor is not drawn, and the overview fold
   still logs the upstream `Stacked surface … not in same layer` CRITICAL (the
   same message appears on PureOS phones).
 

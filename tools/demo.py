@@ -233,6 +233,15 @@ class Session:
             sys.exit("Phosh did not become ready")
         time.sleep(6)
 
+        # The lock screen is a GTK widget with its own CSS background; without
+        # it the compositor backdrop is black. Sample away from the clock so a
+        # wallpaper regression is visible in the demo log.
+        lock = self.grab()
+        if lock is not None:
+            red, green, blue = lock.getpixel((100, 600))
+            if red + green + blue < 15:
+                print("warning: lock-screen wallpaper is missing")
+
         if self.record:
             self.start_recording()
             print("recording %d fps" % FPS)
