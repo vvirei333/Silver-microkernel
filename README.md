@@ -1450,6 +1450,7 @@ driver's contract.
 | [docs/MOBILE_LINUX_ARCH.md](docs/MOBILE_LINUX_ARCH.md) | How postmarketOS/Nura works as mobile Linux (boot, deviceinfo, initramfs, Alpine/systemd, Phosh/phoc services) and what to borrow for WerewolfOS |
 | [docs/M3_DRIVER.md](docs/M3_DRIVER.md) | M3.1a driver-task framework: region-scoped MMIO, driver resource table, `SYS_MMIO_GRANT`, limits and next DT slice |
 | [docs/M3_SIMPLEFB.md](docs/M3_SIMPLEFB.md) | M3.2a simplefb boot framebuffer: contract, Redmi panel constants, QEMU selftest, limits |
+| [docs/ALPINE_ENV.md](docs/ALPINE_ENV.md) | Alpine/musl userland on the Linux ABI: BusyBox, ash and apk-tools running from SFS; builder and limits |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
 
 Current verification snapshot (2026-11-08, console product): **217 host

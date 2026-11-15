@@ -7125,3 +7125,25 @@ has not run on hardware yet; tomorrow's Redmi boot is the first picture.
 
 Limits: descriptor is a constant, not yet parsed from DT/ABL; ARGB8888 only;
 no EL0 framebuffer API/compositor; eMMC/HID/I2C remain.
+
+### Alpine/musl base under the Linux ABI
+
+The Linux ABI layer now runs the smallest useful Alpine environment from SFS:
+Alpine 3.24.4 BusyBox v1.37 (dynamic musl), the same binary as `sh`, musl
+loader/libc, `/etc/alpine-release`, and static `apk-tools 3.0.9`. The builder
+downloads the minirootfs/apk-tools-static into /tmp, patches BusyBox's
+interpreter to /sfs/ld-musl-aarch64.so.1 and rpath /sfs, and injects into a
+copy of disk.img; the tracked image is untouched.
+
+Smoke: `tools/build_alpine_env.py` then `tools/alpine_smoke.py` prints
+`PASS alpine busybox` and `PASS alpine apk-tools`. SFS has no symlinks and a
+27-byte name limit, so the musl loader is installed twice (`ld-musl...` and
+`libc.musl...`).
+
+This is the package-manager/shell base, not a bootable pmOS rootfs yet. Next:
+apk repositories/keys and a real install into the guest, then the Alpine
+Phosh/phoc closure (the Arch-staged Phosh image remains the working desktop
+until then).
+
+Verification: alpine smoke passes; security 12/12, matrix 26/26, simplefb
+selftest, cargo test --lib 226, --no-linux clean.

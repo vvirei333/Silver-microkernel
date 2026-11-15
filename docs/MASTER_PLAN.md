@@ -208,6 +208,12 @@ HID-клавиатура, I2C-мини.
 Осталось: аппаратная проверка на Redmi, DT/ABL descriptor, EL0 API; затем
 eMMC/HID/I2C.
 
+**Alpine base — первый срез (2026-11-16):** Linux ABI запускает Alpine
+3.24 musl BusyBox, ash и `apk-tools 3.0.9` из SFS
+(`tools/build_alpine_env.py`, `tools/alpine_smoke.py`); см.
+`docs/ALPINE_ENV.md`. Следующий шаг — apk-репозитории/ключи и полный
+Alpine closure для Phosh.
+
 **M3.3 — Redmi 10C bring-up (этапность, каждая ступень = демо):**
 
 1. simplefb экран (u-boot/ABL) — **первая картинка на железе**
