@@ -86,10 +86,12 @@ Authority is a capability, not an id (`src/capability.rs`):
   mixed global|scoped request through a handle grants neither. Authority only
   flows down: the recipient must be the caller itself or a task the caller
   spawned (`SYS_CAP_GRANT` checks `ppid`).
-- `CAP_DMA_SHARE` is target-scoped to the task that owns a DMA window. The
-  net driver and the network clients receive it from silverd; the shell
-  delegates it to Wolfser via `SYS_CAP_FIND`. Holding `CAP_MMIO` alone does
-  not map another task's window.
+- `CAP_DMA_SHARE` is **region-scoped and owner-consented**. The owner of a
+  DMA run calls `SYS_DMA_GRANT_SELF(recipient, base, size)`; `map_phys`
+  accepts a foreign range only when a capability for that owner covers the
+  whole range. A generic `SYS_CAP_GRANT` cannot delegate this right, and a
+  spawn handle (which covers `CAP_ALL`) does not authorize a foreign map.
+  `CAP_MMIO` alone never maps another task's window.
 - Task ids and mailbox targets are **not** capabilities. `SYS_SEND` is
   ambient authority by pid today; see "Known gaps".
 
@@ -112,17 +114,18 @@ surface as an error code, never as a kernel abort driven by user input.
 
 ## Known gaps and accepted risks
 
-These are accepted for the M2 boundary (0.1.2) and re-evaluated at every
-milestone; each has an owner decision above or in the findings table.
+These are accepted at the current boundary (M2 closed, M3 in progress) and
+re-evaluated at every milestone; each has an owner decision above or in the
+findings table.
 
 1. **Send-by-pid is ambient authority.** Any task can send to any live pid;
    there is no send capability. A single sender is now bounded to 64 unread
    messages per target (`QueueFull` instead of blocking), so it can no longer
    pin every legitimate client; the address remains ambient by design until a
    capability-handle IPC model lands in M3.
-2. **DMA sharing is per owner, not per region.** `CAP_DMA_SHARE` names the
-   task whose window may be mapped; the holder can map any of that task's DMA
-   regions. Region-scoped grants (and revocation) are the M3 refinement.
+2. **DMA share grants have no revocation.** A region grant lives until the
+   recipient exits; the owner cannot recall it early. Region scoping bounds
+   what a holder can reach, but revocation is still an M3+ item.
 3. **Nameserver policy is user-space.** `R`/`L` reach Scout unauthenticated;
    name squatting/replacement depends on Scout's policy, not the kernel's.
 4. **No syscall filtering.** There is no seccomp-like profile; a task may call
@@ -177,11 +180,11 @@ is an excuse for a memory-safety bug.
 | F8 | BKL reentrancy is assumed by notify paths | contract now documented | documented above |
 | F9 | PID existence oracle | accepted for M2 | documented (#8) |
 | F1 | send-by-pid could pin a mailbox with 256 messages | ambient authority → DoS | fixed: 64 unread per (sender,target) |
-| F2 | any `CAP_MMIO` holder mapped any task's DMA | ambient authority → cross-task read | fixed: target-scoped `CAP_DMA_SHARE` (per owner; per region in M3) |
+| F2 | any `CAP_MMIO` holder mapped any task's DMA | ambient authority → cross-task read | fixed: region-scoped owner consent (`SYS_DMA_GRANT_SELF`), `dma_cross_read` + `dma_region_confine` |
 | F3 | a handle could delegate rights to an arbitrary pid | uncontrolled delegation | fixed: recipient must be self or own child |
 | L10 | EL0 can `msr daifset` and starve a uniprocessor | missing trap (no FGT) | accepted: SMP product, documented (#10) |
 | V-dot | the SFS backend splitter accepted `.`/`..` (the VFS normalised first) | defense in depth | fixed: backend uses `sfs_format::split_path_name`; unit test |
-| R3 | a killed IRQ owner left its INTID enabled, so the next interrupt charged the unmaskable streak | missing teardown mask | fixed: the reaper disables the bound INTID before clearing it |
+| R3 | a killed IRQ owner left its INTID enabled, so the next interrupt charged the unmaskable streak | missing teardown mask | fixed: every `bound_irq` clear masks the line; `irq_orphan` |
 
 ## Disclosure and fix protocol
 
@@ -190,7 +193,7 @@ is an excuse for a memory-safety bug.
    `README.md`) with `file:line`, the call sequence and a reproducer.
 2. A finding is reproduced as a guest test under `tests/security/` (or a host
    unit test when it is pure logic) **before** the fix. The runner is
-   `tools/security-test.sh`; a fix without a failing-then-passing test is not
+   `tools/security_test.py`; a fix without a failing-then-passing test is not
    accepted.
 3. Severity is judged on: reachability from an untrusted task, whether it
    breaks the kernel/userspace boundary, whether it persists across tasks,

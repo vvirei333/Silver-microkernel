@@ -75,6 +75,8 @@ pub const SYS_POWER_OFF: u64 = 71;
 pub const SYS_POWER_RESET: u64 = 97;
 /// Returns the caller's first capability id for a target covering `rights`.
 pub const SYS_CAP_FIND: u64 = 99;
+/// Owner-consented, region-scoped DMA share: `(recipient, base, size)`.
+pub const SYS_DMA_GRANT_SELF: u64 = 101;
 /// Spawns a dynamically loaded ELF with the AArch64 **Linux** syscall
 /// personality (`x8` = Linux syscall number) instead of the Silver table.
 pub const SYS_SPAWN_LINUX_PATH: u64 = 98;
@@ -367,6 +369,13 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
         SYS_FS_USAGE => sys_fs_usage(frame[0], frame[1]),
         SYS_CAP_GET_TASK_ID => scheduler::capability_task_id(frame[0]).unwrap_or(SYSCALL_ERROR),
         SYS_CAP_FIND => scheduler::cap_find_for_target(frame[0], frame[1] as u32),
+        SYS_DMA_GRANT_SELF => {
+            if scheduler::dma_grant_self(frame[0], frame[1] as usize, frame[2] as usize) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
         SYS_CAP_GRANT => {
             if scheduler::grant_capability(frame[0], frame[1], frame[2] as u32) {
                 0

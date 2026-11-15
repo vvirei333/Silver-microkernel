@@ -1795,6 +1795,16 @@ fn set_state_unless_dead(task: &mut Task, next: TaskState) {
     }
 }
 
+/// Drops a task's IRQ binding and masks the line in the GIC. Every path that
+/// clears `bound_irq` must go through here: leaving the line enabled lets the
+/// next hardware interrupt take the unknown-INTID path with no owner.
+fn release_bound_irq(task: &mut Task) {
+    if let Some(intid) = task.bound_irq {
+        crate::gic::disable_irq(intid);
+        task.bound_irq = None;
+    }
+}
+
 pub fn sleep(milliseconds: u64) {
     if milliseconds == 0 {
         yield_current();
@@ -2109,7 +2119,7 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
     let saved_daif = interrupts::save_and_disable_irq();
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Dead;
-        task.bound_irq = None;
+        release_bound_irq(task);
         // The status survives the Dead -> Zombie transition in `reap`; the
         // executable resources are released there, after this CPU has left
         // the context (see `reap_dead_tasks`).
@@ -2176,7 +2186,7 @@ pub fn kill_task(id: u64) -> bool {
     crate::linux_abi::futex_cleanup(id);
     vfs::close_task(id);
     manager.tasks[index].state = TaskState::Dead;
-    manager.tasks[index].bound_irq = None;
+    release_bound_irq(&mut manager.tasks[index]);
     manager.tasks[index].exit_status = Some(1);
     recover_console(manager, id);
     reparent_children(manager, id);
@@ -2792,7 +2802,7 @@ pub fn exit_group(status: u64) -> ! {
                 && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
             {
                 task.state = TaskState::Dead;
-                task.bound_irq = None;
+                release_bound_irq(task);
                 task.exit_status = Some(if task.id == tgid { status } else { 1 });
                 wake.push(task.id);
             }
@@ -4700,10 +4710,16 @@ pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, right
     if rights == 0 || rights & !known != 0 {
         return false;
     }
+    // DMA sharing is not delegated through a generic handle: the owner must
+    // name the physical region with `SYS_DMA_GRANT_SELF`. A handle covers a
+    // task, not a range, and an owner-wide grant was the F2 hole.
+    if rights & capability::CAP_DMA_SHARE != 0 {
+        return false;
+    }
     let caller_id = current_task_id();
     let saved_daif = interrupts::save_and_disable_irq();
     let mut granted = false;
-    if let Some((source_target, _)) =
+    if let Some((source_target, _, _)) =
         current_task_mut().and_then(|task| task.cap_table.grant(cap_id, rights))
     {
         let global = rights & capability::CAP_GLOBAL_BITS;
@@ -4744,6 +4760,55 @@ pub fn grant_capability(cap_id: capability::CapId, recipient_task_id: u64, right
                         }
                         granted = true;
                     }
+                }
+            }
+        }
+    }
+    interrupts::restore_irq(saved_daif);
+    granted
+}
+
+/// `SYS_DMA_GRANT_SELF(recipient, base, size)`: the owner of a DMA run hands
+/// `recipient` the right to map exactly `[base, base + size)` of it. This is
+/// the owner's consent to share its own memory, not delegation of authority
+/// over another task, so the "self or own child" rule does not apply: a
+/// server may hand a client a window it owns. The range is checked against
+/// the caller's own `dma_pages`, so no task can grant access to someone
+/// else's run.
+pub fn dma_grant_self(recipient_task_id: u64, base: usize, size: usize) -> bool {
+    if size == 0 {
+        return false;
+    }
+    let Some(end) = base.checked_add(size) else {
+        return false;
+    };
+    let caller_id = current_task_id();
+    let saved_daif = interrupts::save_and_disable_irq();
+    let mut granted = false;
+    if let Some(manager) = scheduler_manager() {
+        let owns = manager
+            .tasks
+            .get(smp::current_index())
+            .is_some_and(|task| {
+                task.id == caller_id
+                    && task.dma_pages.iter().any(|&(run_base, page_count, _)| {
+                        run_base
+                            .checked_add(page_count * PAGE_SIZE)
+                            .is_some_and(|run_end| base >= run_base && end <= run_end)
+                    })
+            });
+        if owns {
+            if let Some(recipient) = manager.tasks.iter_mut().find(|task| {
+                task.id == recipient_task_id
+                    && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+            }) {
+                if recipient.cap_table.has_capacity() {
+                    recipient.cap_table.insert_region(
+                        caller_id,
+                        capability::CAP_DMA_SHARE,
+                        Some((base as u64, size as u64)),
+                    );
+                    granted = true;
                 }
             }
         }
@@ -4926,7 +4991,7 @@ fn map_phys_to_current_mode(phys_addr: usize, size: usize, non_cacheable: bool) 
             Some(owner) => {
                 if !task
                     .cap_table
-                    .has_target_rights(owner, capability::CAP_DMA_SHARE)
+                    .has_dma_share(owner, phys_addr as u64, size as u64)
                 {
                     return None;
                 }
@@ -5592,14 +5657,11 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         wake.extend(task.release_mutexes());
         task.cap_table.remove_all();
         // A dead task's bound line stays enabled in the GIC until here. Mask
-        // it before the binding disappears: otherwise the next interrupt
-        // arrives with no owner, takes the unknown-INTID path and charges the
-        // unmaskable streak (R3). The mask is idempotent for an already-masked
-        // line and runs once, with the task provably off-CPU.
-        if let Some(intid) = task.bound_irq {
-            crate::gic::disable_irq(intid);
-        }
-        task.bound_irq = None;
+        // A dead task's line must be masked before the binding disappears:
+        // otherwise the next interrupt arrives with no owner, takes the
+        // unknown-INTID path and charges the unmaskable streak (R3). Every
+        // path that clears `bound_irq` goes through the same helper.
+        release_bound_irq(task);
         task.irq_pending = false;
         task.release_stack();
         task.release_space(&dma_revokes);
@@ -5731,7 +5793,10 @@ fn initial_self_rights(program: u64) -> Option<u32> {
         // The shell is the trusted control plane of the console OS; it owns
         // the power privilege directly (a spawn handle can never delegate it).
         user_program::HOWL => {
-            capability::CAP_MMIO | capability::CAP_FS_WRITE | capability::CAP_POWER
+            capability::CAP_MMIO
+                | capability::CAP_IRQ
+                | capability::CAP_FS_WRITE
+                | capability::CAP_POWER
         }
         // Trusted filesystem stress helper (not an installed app bundle).
         user_program::BIGDIR | user_program::BIGFILE => capability::CAP_FS_WRITE,

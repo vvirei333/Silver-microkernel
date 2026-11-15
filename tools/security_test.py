@@ -39,6 +39,11 @@ CASES = {
     # secprobe program in the foreground.
     "dma_cross_read": (b"dma cross read ok", "secprobe dma_cross_read"),
     "grant_foreign": (b"grant foreign ok", "secprobe grant_foreign"),
+    "mailbox_quota": (b"mailbox quota ok", "secprobe mailbox_quota"),
+    "dma_region_confine": (b"dma region confine ok", "secprobe dma_region_confine"),
+    "irq_orphan": (b"irq orphan ok", "secprobe irq_orphan"),
+    "blocked_kill": (b"blocked kill ok", None),
+    "linux_fd_lifetime": (b"linux fd lifetime ok", None),
 }
 
 
@@ -199,15 +204,32 @@ def main():
             raise SystemExit("no howl prompt")
         for name, _ in selected:
             marker, command = CASES[name]
-            ok = guest.run(command or ("linuxrun /sfs/sec-" + name), marker)
+            timeout = int(os.environ.get("SECURITY_TIMEOUT", "90"))
+            ok = guest.run(command or ("linuxrun /sfs/sec-" + name), marker, timeout)
             print(("PASS " if ok else "FAIL ") + name, flush=True)
             if not ok:
+                text = guest.log.decode("utf-8", "replace")
+                sys.stderr.write(text[-4000:] + "\n")
                 failed.append(name)
+        if args.case is None:
+            guest.log.clear()
+            guest.console("health")
+            guest.wait(b"uptime:", 30)
+            text = bytes(guest.log)
+            healthy = all(
+                marker in text
+                for marker in (b"zombie 0", b"open 0", b"leaked 0")
+            )
+            print(("PASS " if healthy else "FAIL ") + "post-suite health", flush=True)
+            if not healthy:
+                sys.stderr.write(text.decode("utf-8", "replace")[-2000:] + "\n")
+                failed.append("health")
     finally:
         guest.stop()
 
+    case_failures = [name for name in failed if name != "health"]
     print("\n%d/%d security cases passed" %
-          (len(selected) - len(failed), len(selected)))
+          (len(selected) - len(case_failures), len(selected)))
     if failed:
         print("failed: " + ", ".join(failed))
         sys.exit(1)

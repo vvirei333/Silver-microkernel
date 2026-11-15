@@ -6920,3 +6920,60 @@ simplefb on the Redmi.
 
 Verification on the final tree: security 6/6 + 200000 fuzz cases, matrix
 26/26, `cargo test --lib` 223, Phosh demo clean, `--no-linux` build clean.
+
+### M3-soft: four probes, per-region DMA, IRQ teardown; page-fault I/O deferred
+
+**1.1 mailbox_quota.** Native probe: one sender queues exactly 64 messages
+(`try_send`), then ten *blocking* sends must return `QueueFull` immediately.
+The victim sleeps out the fill window, drains all 64, sees the go message and
+answers. Every wait uses `receive_timeout` (400 ticks), so a regression fails
+instead of hanging the shell.
+
+**1.2 blocked_kill.** The child sets `SIG_SETMASK=~0`, reads the mask back and
+exits 77 if SIGKILL/SIGSTOP are still present, otherwise sleeps for four
+seconds. The parent sends SIGKILL and polls `wait4(WNOHANG)`; only the killed
+status (1) passes. The readback is important: `linux_kill` short-circuits
+default-terminating signals, so a pure "did it die" test does not exercise
+`set_blocked` at all (the first negative control proved that).
+
+**1.4 linux_fd_lifetime.** 1000 rounds of memfd → SCM_RIGHTS → close sender
+→ churn eight memfds through the freed number → pread the receiver's
+duplicate; a number-based table reads 0xEE. The older `fd_lifetime` remains
+as the small M0.2 case.
+
+**2 per-region DMA.** `Cap` gained an optional `(base, size)` region.
+`SYS_DMA_GRANT_SELF(recipient, base, size)` lets the **owner** share exactly
+its own run (checked against `dma_pages`); `map_phys` requires a region-scoped
+cap covering the whole request. `SYS_CAP_GRANT` rejects `CAP_DMA_SHARE` — a
+task handle is not a range. `net_server` grants its main mailbox to the driver
+at attach time and each client window when it is created; silverd/shell no
+longer pass owner-wide share rights, and ping/Wolfser still work. The new
+`dma_region_confine` probe grants 4 KiB of an 8 KiB run, maps the first half
+and requires the second half to fail. Revocation remains gap #2.
+
+**1.3 irq_orphan.** Native probe binds SPI 64, reads `GICD_ISENABLER` through
+an NC mapping (CAP_MMIO), kills the owner, waits for the reaper, reads the
+bit again (must be clear) and rebinds. This exposed a real gap: the reaper's
+mask was ineffective because `kill_task`/`exit` cleared `bound_irq` before
+the reaper ran. Every path that clears the binding now goes through
+`release_bound_irq`, which masks first. QEMU GICv2 implements 256 INTIDs, so
+the probe uses SPI 64 (400 is outside the implemented range and never
+enables).
+
+**Negative controls.** Reverted gates in one temporary build:
+`MAX_MESSAGES_PER_SENDER=1024` → FAIL mailbox; `UNBLOCKABLE=0` → FAIL
+blocked_kill; `shared_dma = region_owner.is_some()` → FAIL dma_cross_read and
+dma_region_confine; `release_bound_irq` without the GIC write → FAIL
+irq_orphan. Restored the tree and all 11 cases pass.
+
+**Page-fault I/O (item 3) is designed but not landed.** The VFS read is
+polled inside the fault path and the BKL, the kernel mutexes assume the BKL,
+and releasing it around the read while borrowing the task would allow a
+concurrent munmap to invalidate the copy. The async design (blocked page-in
+request, worker/IRQ completion, ASID-tagged mapping, retry) is written down in
+`docs/M3_SOFT.md`; it needs the block driver IRQ path and a cache/device lock
+outside the BKL first. This is the next slice.
+
+Verification: security 11/11 + post-suite health 0/0/0 + 200k fuzz, matrix
+26/26, Phosh demo clean, ping through the net server (owner-granted client
+window) OK, `cargo test --lib` 223, `--no-linux` clean.

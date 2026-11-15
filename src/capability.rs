@@ -21,10 +21,9 @@ pub const CAP_POWER: u32 = 1 << 8;
 /// rename). Apps spawned from `/sfs/apps` do not hold it: an installed ELF can
 /// read the tree but cannot modify the disk until a bundle manifest grants it.
 pub const CAP_FS_WRITE: u32 = 1 << 9;
-/// Authority to map another task's DMA window (the net server and its
-/// clients attach to the driver's rings). Target-scoped: the capability names
-/// the DMA-owning task. Unlike `CAP_MMIO` it is not carried by every device
-/// task, and a holder can map only windows of that one owner.
+/// Authority to map a specific physical range of another task's DMA window.
+/// `SYS_DMA_GRANT_SELF` inserts it with the owner's id and `(base, size)`;
+/// a generic `SYS_CAP_GRANT` cannot delegate it.
 pub const CAP_DMA_SHARE: u32 = 1 << 10;
 
 /// Rights that describe authority over a specific `target_task`. They are
@@ -58,6 +57,12 @@ pub struct Cap {
     pub id: CapId,
     pub target_task: u64,
     pub rights: u32,
+    /// Physical range this capability is confined to. Only `CAP_DMA_SHARE`
+    /// uses it today: a share grant names `[base, base + size)` of the
+    /// target's DMA window, and `map_phys` accepts only ranges inside it.
+    /// `None` means the right is not range-scoped (and, for DMA share, does
+    /// not authorize a foreign mapping at all).
+    pub region: Option<(u64, u64)>,
 }
 
 pub struct CapTable {
@@ -74,12 +79,25 @@ impl CapTable {
     }
 
     pub fn insert(&mut self, target_task: u64, rights: u32) -> CapId {
+        self.insert_region(target_task, rights, None)
+    }
+
+    /// Inserts a capability confined to a physical range. Used by
+    /// `SYS_DMA_GRANT_SELF`: the owner of a DMA run hands a recipient the
+    /// right to map exactly that run (or a sub-range).
+    pub fn insert_region(
+        &mut self,
+        target_task: u64,
+        rights: u32,
+        region: Option<(u64, u64)>,
+    ) -> CapId {
         let id = self.next_id;
         self.next_id += 1;
         self.caps.push(Cap {
             id,
             target_task,
             rights,
+            region,
         });
         id
     }
@@ -104,12 +122,16 @@ impl CapTable {
         self.caps.iter().find(|cap| cap.id == id)
     }
 
-    pub fn grant(&self, cap_id: CapId, rights_mask: u32) -> Option<(u64, u32)> {
+    pub fn grant(
+        &self,
+        cap_id: CapId,
+        rights_mask: u32,
+    ) -> Option<(u64, u32, Option<(u64, u64)>)> {
         let cap = self.get(cap_id)?;
         if cap.rights & rights_mask != rights_mask {
             return None;
         }
-        Some((cap.target_task, rights_mask))
+        Some((cap.target_task, rights_mask, cap.region))
     }
 
     /// Own privileges of `owner`: only capabilities whose target is the task
@@ -128,6 +150,28 @@ impl CapTable {
     pub fn has_target_rights(&self, target_task: u64, rights_mask: u32) -> bool {
         self.caps.iter().any(|cap| {
             cap.target_task == target_task && cap.rights & rights_mask == rights_mask
+        })
+    }
+
+    /// True when a region-scoped `CAP_DMA_SHARE` for `target_task` covers the
+    /// whole physical range `[base, base + size)`. A capability without a
+    /// region (a spawn handle, or a legacy owner-wide grant) never authorizes
+    /// a foreign mapping: DMA sharing is region-scoped by construction.
+    pub fn has_dma_share(&self, target_task: u64, base: u64, size: u64) -> bool {
+        let Some(end) = base.checked_add(size) else {
+            return false;
+        };
+        self.caps.iter().any(|cap| {
+            if cap.target_task != target_task || cap.rights & CAP_DMA_SHARE == 0 {
+                return false;
+            }
+            let Some((region_base, region_size)) = cap.region else {
+                return false;
+            };
+            let Some(region_end) = region_base.checked_add(region_size) else {
+                return false;
+            };
+            base >= region_base && end <= region_end
         })
     }
 

@@ -251,8 +251,8 @@ fn execute(command: &str) {
             syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server> [arg]\r\n");
             syscall::print("  bg <program> [arg]\r\n");
             syscall::print("             Spawn without console ownership\r\n");
-            syscall::print("  secprobe <grant_foreign|dma_cross_read>\r\n");
-            syscall::print("             Native M2 capability regression (security suite)\r\n");
+            syscall::print("  secprobe <grant_foreign|dma_cross_read|mailbox_quota|dma_region_confine|irq_orphan>\r\n");
+            syscall::print("             Native M2 capability/IPC regression (security suite)\r\n");
             syscall::print("  fg <cap>   Resume a task in the foreground\r\n");
             syscall::print("  Ctrl-Z     Stop the foreground task and return to shell\r\n");
             syscall::print("  kill <cap> Kill a task\r\n");
@@ -671,16 +671,9 @@ fn wolfser_command(url: Option<&str>) {
         syscall::print("wolfser: cannot start the program\r\n");
         return;
     };
-    // Wolfser maps the network window for its fetches. Hand it the
-    // target-scoped share right over the network driver (we hold it since
-    // silverd started us); authority only flows down to a child.
-    if let Some(wolfser) = syscall::cap_get_task_id(cap_id) {
-        if let Some(server) = find_task_id(syscall::PROGRAM_NET_SERVER) {
-            if let Some(share) = syscall::cap_find(server, syscall::CAP_DMA_SHARE) {
-                let _ = syscall::cap_grant(share, wolfser, syscall::CAP_DMA_SHARE);
-            }
-        }
-    }
+    // Wolfser maps a per-client window from net_server; the server grants
+    // exactly that range when it handles the first OP_SHARE, so no
+    // owner-wide share right is delegated here.
     syscall::print("wolfser: started (host viewer shows the window)\r\n");
     let _ = cap_id;
 }
@@ -1361,14 +1354,6 @@ fn grant_device_rights(cap_id: u64, task_id: u64, program: u64) {
     if !syscall::cap_grant(cap_id, task_id, rights) {
         syscall::print("Spawned, but CAP_MMIO grant failed: the task has no device access.\r\n");
     }
-    if program == syscall::PROGRAM_NET_SERVER {
-        // The driver writes frames into this server's window: grant the
-        // driver a share right over the freshly spawned server. `cap_id` is
-        // the shell's handle on the server, so its target is the server.
-        if let Some(driver) = find_task_id(syscall::PROGRAM_NET_DRIVER) {
-            let _ = syscall::cap_grant(cap_id, driver, syscall::CAP_DMA_SHARE);
-        }
-    }
 }
 
 /// `secprobe <grant_foreign|dma_cross_read>`: native M2 capability
@@ -1381,8 +1366,13 @@ fn secprobe_command(test: Option<&str>) {
         None => 0,
         Some("grant_foreign") => 1,
         Some("dma_cross_read") => 2,
+        Some("mailbox_quota") => 3,
+        Some("dma_region_confine") => 4,
+        Some("irq_orphan") => 5,
         Some(_) => {
-            syscall::print("usage: secprobe <grant_foreign|dma_cross_read>\r\n");
+            syscall::print(
+                "usage: secprobe <grant_foreign|dma_cross_read|mailbox_quota|dma_region_confine|irq_orphan>\r\n",
+            );
             return;
         }
     };
@@ -1395,16 +1385,34 @@ fn secprobe_command(test: Option<&str>) {
         syscall::print("secprobe: cannot resolve the probe task\r\n");
         return;
     };
-    if !syscall::cap_grant(cap_id, task_id, syscall::CAP_MMIO) {
+    // Only the IRQ probe needs CAP_IRQ; everything else gets just CAP_MMIO.
+    let rights = if mode == 5 {
+        syscall::CAP_MMIO | syscall::CAP_IRQ
+    } else {
+        syscall::CAP_MMIO
+    };
+    if !syscall::cap_grant(cap_id, task_id, rights) {
         let _ = syscall::kill(cap_id);
         let _ = syscall::wait(cap_id);
-        syscall::print("secprobe: CAP_MMIO grant failed\r\n");
+        syscall::print("secprobe: capability grant failed\r\n");
         return;
     }
     if !syscall::console_set(cap_id) {
         let _ = syscall::kill(cap_id);
         let _ = syscall::wait(cap_id);
         syscall::print("secprobe: cannot assign the console\r\n");
+        return;
+    }
+    // Release the probe only after both the capability and the console are in
+    // place: the child may have been scheduled on another CPU immediately
+    // after spawn, and allocating DMA before the grant would fail the run.
+    if !syscall::send(
+        task_id,
+        &ipc::Message::new(0, &0x5343_u64.to_le_bytes()),
+    ) {
+        let _ = syscall::kill(cap_id);
+        let _ = syscall::wait(cap_id);
+        syscall::print("secprobe: could not release the probe\r\n");
         return;
     }
     match syscall::wait_event(cap_id) {

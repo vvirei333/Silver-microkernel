@@ -177,6 +177,13 @@ quarantine free, канарейки), checked-арифметика на всех
 
 ## M3. ДРАЙВЕРНАЯ МОДЕЛЬ + REDMI 10C (после M1, длительная)
 
+**Состояние на 2026-11-15.** M3-soft закрыт кроме асинхронной подкачки:
+четыре пробы (`mailbox_quota`, `blocked_kill`, `linux_fd_lifetime`,
+`irq_orphan`), region-scoped `SYS_DMA_GRANT_SELF` и `dma_region_confine`
+зелёные; детали и дизайн page-fault I/O — в `docs/M3_SOFT.md`. Следующий
+срез — async page-in (block driver IRQ path + cache/device lock вне BKL),
+затем simplefb на Redmi 10C.
+
 **M3.1 — driver-task framework:**
 
 - Драйвер = EL0-таск; MMIO/IRQ-капы только по своей DT-ноде (ядро мапит MMIO

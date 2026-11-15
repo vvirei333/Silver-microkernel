@@ -378,6 +378,8 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
     let mut driver = resolve_driver(driver_hint);
     let mut attached = false;
     let mut next_attach = 0_u64;
+    /// Driver whose mailbox range was granted to the server's DMA window.
+    let mut driver_granted = 0_u64;
     let mut now_millis = 0_i64;
     let mut next_seq = 0_u16;
     /// The echo request awaiting its reply, if any. One at a time: the ICMP
@@ -402,11 +404,24 @@ pub extern "C" fn _start(driver_hint: u64) -> ! {
             driver = resolve_driver(driver_hint);
             attached = false;
             next_attach = 0;
+            driver_granted = 0;
         }
 
         if !attached && now_millis as u64 >= next_attach {
             if let Some(id) = driver {
-                let _ = syscall::try_send(id, &net_ipc::attach(dma_paddr, net_ipc::DMA_SIZE));
+                // The server owns the mailbox; hand the driver exactly this
+                // range, never a blanket right over the whole task.
+                if driver_granted != id
+                    && syscall::dma_grant_self(id, dma_paddr, net_ipc::DMA_SIZE)
+                {
+                    driver_granted = id;
+                }
+                if driver_granted == id {
+                    let _ = syscall::try_send(
+                        id,
+                        &net_ipc::attach(dma_paddr, net_ipc::DMA_SIZE),
+                    );
+                }
             }
             next_attach = now_millis as u64 + ATTACH_RETRY_MILLIS;
         }
@@ -767,6 +782,12 @@ impl ClientWindows {
         }
         let (vaddr, paddr) = syscall::alloc_dma(net_ipc::CLIENT_SIZE)?;
         write_u16(vaddr, net_ipc::CLIENT_REQUEST, 0);
+        // The window belongs to this server, so it can consent to sharing
+        // exactly this range with the requesting client. A client that cannot
+        // receive the grant gets no window at all (never an unmapped address).
+        if !syscall::dma_grant_self(owner, paddr, net_ipc::CLIENT_SIZE) {
+            return None;
+        }
         let slot = self.slots.iter_mut().find(|slot| slot.is_none())?;
         *slot = Some(ClientWindow {
             owner,

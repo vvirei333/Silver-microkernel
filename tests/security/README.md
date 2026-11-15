@@ -40,24 +40,22 @@ command mirrors `build_and_qemu.sh` (no display, serial on a Unix socket).
 | `sigreturn_pstate` | `rt_sigreturn` must reject a ucontext whose `pstate` is not EL0t. The child sets `PSTATE.M = EL1h` in its handler and traps with `udf` right after the interrupted syscall: on the unfixed kernel this is an `EL1 EXCEPTION` panic (and, with a kernel PC, an arbitrary EL1 call); with the fix the child dies with SIGSEGV and the parent prints the marker. |
 | `sigreturn_aa32` | `PSTATE.M[4] = 1` (AArch32) is a different execution state; the frame must be rejected (SIGSEGV), not `eret`ed into an unsupported mode. |
 | `sigreturn_flags` | The sanitizer keeps NZCV (bit 30 is `Z`, not the AArch32 selector) and strips SS/IL/reserved: the handler sets `Z|SS|IL|bit23`, the task must resume at EL0 and print the marker. |
-| `dma_cross_read` | **Native.** A task with `CAP_MMIO` but no capability naming a DMA owner cannot map that owner's window; after the orchestrator delegates the target-scoped `CAP_DMA_SHARE` (the silverd path) the map succeeds and the owner observes the byte written through it. |
+| `dma_cross_read` | **Native.** A task with `CAP_MMIO` but no share capability cannot map another task's DMA run; after the owner calls `SYS_DMA_GRANT_SELF` the map succeeds and the owner observes the byte written through it. |
+| `dma_region_confine` | **Native.** A grant for the first 4 KiB of an 8 KiB run does not authorize the second 4 KiB: the first map succeeds, the second is refused. |
 | `grant_foreign` | **Native.** `SYS_CAP_GRANT` refuses a live non-child pid (the shell), while the same handle still delegates to the caller itself and to its own child. |
+| `mailbox_quota` | **Native.** One sender queues exactly 64 unread messages; the next ten **blocking** sends return `QueueFull` immediately instead of pinning, and the victim still drains all 64 and answers. |
+| `blocked_kill` | A child sets `SIG_SETMASK=~0`, reads the mask back (SIGKILL/SIGSTOP must be stripped) and sleeps; the parent's SIGKILL reaps it with the killed status. Exiting early with 77 makes a mask regression fail deterministically. |
+| `linux_fd_lifetime` | 1000 rounds of memfd -> `SCM_RIGHTS` -> close sender -> churn the freed number -> read the receiver's duplicate. A number-based table reads a churn byte and fails. |
+| `irq_orphan` | **Native.** A task binds SPI 64; the GIC `ISENABLER` bit is read through an NC mapping before and after the kill. The reaper must clear it, and the INTID must be rebindable. |
 
-Planned (from the M2 audit reports in `docs/audit/M2/` and `docs/audit/M2.2/`):
+Planned:
 
 - `send_spam` — a task filling another task's mailbox (ambient send-by-pid).
 - `munmap_toctou` — a sibling thread unmapping a receive buffer after the
   pre-block validation; the copy-out must revalidate.
 - `name_squat` — duplicate/owner-replacement policy for `R`/`L` names.
-- `linux_fd_lifetime` — the Linux personality's fd table under
-  `close_range`/`dup`/`fork` (the M0.2 class on the ABI side).
 - `sigreturn_pc` — the follow-up to `sigreturn_pstate`: an EL0t frame with a
   kernel PC must die on an EL0 instruction abort, never execute at EL1.
-- `blocked_kill` — a task that blocks SIGKILL must still die.
-- `mailbox_quota` — a native sender cannot exceed 64 unread messages per
-  target (needs a native probe; the Linux ABI has no `SYS_SEND`).
-- `irq_orphan` — bind an SPI and exit before draining; the next interrupt
-  must be masked as unknown, not halt the machine (R1).
 
 ## Host fuzz targets
 
