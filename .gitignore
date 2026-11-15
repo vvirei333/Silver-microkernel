@@ -7,5 +7,13 @@ keys/*.key
 /build
 .vscode/
 
+# Large image artifacts are release assets, not source. `disk.img` is the
+# deliberate clean base image and stays tracked; backups, boot images and
+# repacks must not enter history again.
+*.img
+!disk.img
+tablet/backups/
+redmi10c_poc/out/
+
 # Python bytecode from the image injection helper.
 __pycache__/

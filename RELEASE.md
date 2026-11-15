@@ -135,6 +135,30 @@ These land after the tag and will be in 0.1.3:
   rejected with SIGSEGV. **Any 0.1.2 build that runs Linux binaries should
   take this fix.**
 
+## Security campaign M2 — closed
+
+Tag `security-m2-complete` (on `55f557d`, after the release tag) closes the
+first security phase, audited slice by slice:
+
+- **L1 (critical):** `rt_sigreturn` accepted a user PSTATE and `eret`ed to
+  EL1 with the user's PC and registers — a local privilege escalation. Fixed
+  and pinned by `tests/security/sigreturn_pstate.c`; the sanitizer now keeps
+  only `NZCV|DAIF` and rejects any non-AArch64-EL0t frame.
+- Four DoS classes fixed: the HTTP chunk-size spin, unbounded console writes,
+  mailbox pinning (per-sender quota) and orphaned IRQ teardown. L10 (EL0
+  `msr daifset` without FEAT_FGT) is a documented, accepted risk on the SMP
+  product (gap #10).
+- Authority model tightened: target-scoped `CAP_DMA_SHARE` (F2) and
+  delegation only to self or one's own child (F3), both with native EL0
+  regressions (`dma_cross_read`, `grant_foreign`) verified **failing with the
+  gates reverted** before passing on the fixed tree.
+- Release gate: 6 guest regressions, 200k-case parser fuzz, 223 host unit
+  tests, matrix 26/26 and a clean `--no-linux` build.
+
+The full audit trail (snapshots, leads, verdicts, manifests) is in
+[`docs/audit/`](docs/audit/); the contract and accepted gaps are in
+[`docs/SECURITY.md`](docs/SECURITY.md).
+
 ## License and project direction
 
 MIT — see `LICENSE`. The project vector (console OS first, Linux applications
