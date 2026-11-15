@@ -1810,6 +1810,8 @@ fn release_bound_irq(task: &mut Task) {
         crate::gic::disable_irq(intid);
         task.bound_irq = None;
     }
+    // A dying driver must not keep PCI BAR claims (SYS_MMIO_CLAIM) alive.
+    crate::driver_resources::release_mmio_claims(task.id);
 }
 
 pub fn sleep(milliseconds: u64) {
@@ -4867,6 +4869,32 @@ pub fn mmio_grant(recipient_task_id: u64, base: usize, size: usize) -> bool {
     }
     interrupts::restore_irq(saved_daif);
     granted
+}
+
+/// `SYS_MMIO_CLAIM(base, size)`: a PCI-capable driver reserves a BAR range
+/// within the platform window and receives a region-scoped `CAP_MMIO` for it.
+/// Overlapping claims by another live task are refused; a dying task's claims
+/// are released by the teardown helper.
+pub fn mmio_claim(base: usize, size: usize) -> bool {
+    let Some(task) = current_task_mut() else {
+        return false;
+    };
+    let task_id = task.id;
+    if !task
+        .cap_table
+        .has_self_rights(task_id, capability::CAP_PCI)
+    {
+        return false;
+    }
+    if !task.cap_table.has_capacity() {
+        return false;
+    }
+    if !crate::driver_resources::claim_mmio(task_id, base as u64, size as u64) {
+        return false;
+    }
+    task.cap_table
+        .insert_region(task_id, capability::CAP_MMIO, Some((base as u64, size as u64)));
+    true
 }
 
 /// `SYS_CAP_FIND(target, rights)`: id of the caller's first capability for

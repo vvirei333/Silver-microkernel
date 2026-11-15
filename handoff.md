@@ -7065,3 +7065,24 @@ spawn). Next: PCI BAR publication and DT-driven spawn.
 
 Verification: security 12/12 + health + 200k fuzz; Linux ABI matrix 26/26;
 Phosh demo clean; ping OK; cargo test --lib 224; --no-linux clean.
+
+### M3.1c: per-BAR PCI claims
+
+`SYS_MMIO_CLAIM(base, size)` is the per-function BAR authority. The caller
+needs `CAP_PCI`; the range must be inside the platform PCI window; the kernel
+records the claim in a bounded table and refuses overlap with another live
+task; then it inserts a region-scoped `CAP_MMIO` for exactly that range.
+Claims are released by the same teardown helper that masks a dead task's IRQ.
+The kernel still does not parse BARs itself: the driver assigns/discovers them
+through `SYS_PCI_*`, then claims the result.
+
+net_driver claims every BAR it maps; Wolfser claims its ivshmem BAR. The broad
+16 MiB PCI window is no longer inserted at spawn. Negative control:
+`mmio_claim` forced to false turns `ping 10.0.2.2` from OK into TIMEOUT, then
+restoring it brings ping back.
+
+Next: spawn drivers from the DT table (compatible -> program) instead of
+SilverD's program list, then M3.2 basic pack/simplefb.
+
+Verification: security 12/12 + health + 200k fuzz; Linux ABI matrix 26/26;
+Phosh demo clean; ping OK; cargo test --lib 224; --no-linux clean.

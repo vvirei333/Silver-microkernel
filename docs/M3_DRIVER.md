@@ -31,6 +31,14 @@ This slice lands the **authority** half: device MMIO is no longer ambient.
   - broad `CAP_MMIO` alone opens only the DMA path; it cannot map a device.
 - `SYS_BIND_IRQ` checks `has_irq`: a node-scoped capability covers only its
   INTID. A broad `CAP_IRQ` remains only for the trusted shell/test probe.
+- `SYS_MMIO_CLAIM(base, size)` reserves a PCI function BAR inside the
+  platform window (`CAP_PCI` required). The kernel records the claim
+  (`MMIO_CLAIMS`, released on task teardown) and inserts a region-scoped
+  `CAP_MMIO` for exactly that range. `net_driver` claims each mapped BAR;
+  Wolfser claims its ivshmem BAR. Overlapping claims by another live task are
+  refused, so one driver cannot map another function's registers by guessing
+  the window. The negative control (`mmio_claim` forced false) turns `ping`
+  from OK to TIMEOUT.
 - `SYS_MMIO_GRANT(recipient, base, size)` delegates a sub-range the caller
   already covers, only to itself or its own child. The shell uses it to give
   the `irq_orphan`/`mmio_range_confine` probes the GIC range.
@@ -40,9 +48,10 @@ This slice lands the **authority** half: device MMIO is no longer ambient.
 
 ## Current limits
 
-- The driver table binds **UART nodes**; PCI devices (virtio-net, ivshmem) are
-  still matched by program id and use the static PCI/ivshmem windows. Generic
-  PCI BAR publication is the next step.
+- The driver table binds **UART nodes** from DT; PCI devices are matched by
+  program id, then claim their BAR ranges individually through
+  `SYS_MMIO_CLAIM`. The kernel does not parse BARs itself; `CAP_PCI` plus the
+  first-come claim table is the authority boundary.
 - `driver_nodes` assumes 2/2 or 1/1 `reg` cells; a node with a different
   parent cell layout is skipped (fail closed) until the walker tracks parent
   `#address-cells`/`#size-cells`.

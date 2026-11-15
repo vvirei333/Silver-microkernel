@@ -5687,6 +5687,9 @@ fn open_window() -> Result<u64, u64> {
     // The proxy areas live after the pixels, so map the whole BAR. Keep the
     // mapping bounded by the device size and the rewrite limit.
     let mapping = size.min(WINDOW_MAX_SIZE);
+    if !syscall::mmio_claim(IVSHMEM_BAR, mapping) {
+        return Err(8);
+    }
     let base = syscall::map_phys_nc(IVSHMEM_BAR, mapping).ok_or(7u64)?;
     window::write_u32(base, window::FIELD_MAGIC, window::MAGIC);
     window::write_u32(base, window::FIELD_VERSION, window::VERSION);

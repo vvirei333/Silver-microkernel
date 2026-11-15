@@ -866,6 +866,11 @@ fn map_bar(bus: u8, device: u8, function: u8, bar: u8) -> Option<u64> {
         base |= u64::from(syscall::pci_read32(address + 4)?) << 32;
     }
 
+    // PCI BAR authority is per range: the platform publishes the window, this
+    // claim records the function's BAR and grants exactly that CAP_MMIO.
+    if !syscall::mmio_claim(base, BAR_MAPPING_SIZE) {
+        return None;
+    }
     syscall::map_phys(base, BAR_MAPPING_SIZE)
 }
 

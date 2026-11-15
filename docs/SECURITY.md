@@ -94,6 +94,12 @@ Authority is a capability, not an id (`src/capability.rs`):
   `SYS_BIND_IRQ` checks `has_irq`. A broad `CAP_IRQ` (region `None`) is kept
   only for the trusted shell/test probe, which delegates nothing but the probe
   run.
+- `CAP_PCI` plus `SYS_MMIO_CLAIM(base, size)` is the per-function BAR
+  authority: the caller must hold `CAP_PCI`, the range must lie in the
+  platform PCI window, no other live task may have claimed an overlapping
+  range, and the kernel records the claim and inserts a region-scoped
+  `CAP_MMIO`. Claims are released on every teardown path. `net_driver` and
+  Wolfser use this instead of a whole-window grant.
 - A range may be delegated down with `SYS_MMIO_GRANT(recipient, base, size)`:
   the caller must hold a covering range and the recipient must be itself or
   its own child. The shell uses this to give the IRQ/MMIO probe the GIC range.
@@ -203,6 +209,7 @@ is an excuse for a memory-safety bug.
 | R3 | a killed IRQ owner left its INTID enabled, so the next interrupt charged the unmaskable streak | missing teardown mask | fixed: every `bound_irq` clear masks the line; `irq_orphan` |
 | M3-MMIO | any `CAP_MMIO` holder mapped any device physical range | ambient device authority | fixed: region-scoped self `CAP_MMIO` from driver resources, `SYS_MMIO_GRANT`, `mmio_range_confine` |
 | M3-IRQ | `CAP_IRQ` bound any INTID | ambient interrupt authority | fixed for drivers: DT/QEMU range `(intid,1)` from `driver_resources`, `has_irq`; broad only for trusted shell/test probe |
+| M3-PCI | `CAP_PCI` holder could map the whole PCI window as one range | over-broad device authority | fixed: per-BAR `SYS_MMIO_CLAIM` with overlap refusal; negative control turns ping TIMEOUT |
 
 ## Disclosure and fix protocol
 

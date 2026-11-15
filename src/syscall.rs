@@ -79,6 +79,9 @@ pub const SYS_CAP_FIND: u64 = 99;
 pub const SYS_DMA_GRANT_SELF: u64 = 101;
 /// Delegate a device MMIO sub-range the caller already owns.
 pub const SYS_MMIO_GRANT: u64 = 102;
+/// Claim a PCI BAR range (requires `CAP_PCI`) and receive a region-scoped
+/// `CAP_MMIO` for exactly that range.
+pub const SYS_MMIO_CLAIM: u64 = 103;
 /// Spawns a dynamically loaded ELF with the AArch64 **Linux** syscall
 /// personality (`x8` = Linux syscall number) instead of the Silver table.
 pub const SYS_SPAWN_LINUX_PATH: u64 = 98;
@@ -380,6 +383,13 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
         }
         SYS_MMIO_GRANT => {
             if scheduler::mmio_grant(frame[0], frame[1] as usize, frame[2] as usize) {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
+        SYS_MMIO_CLAIM => {
+            if scheduler::mmio_claim(frame[0] as usize, frame[1] as usize) {
                 0
             } else {
                 SYSCALL_ERROR

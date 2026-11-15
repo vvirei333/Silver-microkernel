@@ -51,6 +51,7 @@ const SYS_CAP_GRANT: u64 = 61;
 const SYS_CAP_FIND: u64 = 99;
 const SYS_DMA_GRANT_SELF: u64 = 101;
 const SYS_MMIO_GRANT: u64 = 102;
+const SYS_MMIO_CLAIM: u64 = 103;
 const SYS_MAP_PHYS: u64 = 62;
 const SYS_MAP_PHYS_NC: u64 = 96;
 const SYS_BIND_IRQ: u64 = 63;
@@ -404,6 +405,12 @@ pub fn dma_grant_self(recipient: u64, base: u64, size: u64) -> bool {
 /// Delegate a device MMIO sub-range the caller already owns.
 pub fn mmio_grant(recipient: u64, base: u64, size: u64) -> bool {
     unsafe { syscall3(SYS_MMIO_GRANT, recipient, base, size) == 0 }
+}
+
+/// Claim a PCI BAR range (requires CAP_PCI); the kernel records the claim and
+/// grants a region-scoped CAP_MMIO for exactly that range.
+pub fn mmio_claim(base: u64, size: u64) -> bool {
+    unsafe { syscall2(SYS_MMIO_CLAIM, base, size) == 0 }
 }
 
 pub fn map_phys(phys_addr: u64, size: u64) -> Option<u64> {

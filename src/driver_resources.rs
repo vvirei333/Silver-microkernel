@@ -14,6 +14,7 @@
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::fdt::{DriverKind, DriverNode, MAX_DRIVER_NODES};
+use crate::mutex::Mutex;
 use crate::platform::{self, Kind};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -29,13 +30,27 @@ const QEMU_GIC: Range = Range { base: 0x0800_0000, size: 0x1_0000 };
 /// memory-BAR window the virtio driver assigns and maps (0x1010_0000,
 /// 0x1020_0000 + bar * 64 KiB).
 const QEMU_PCI_MMIO: Range = Range { base: 0x1000_0000, size: 0x0100_0000 };
-/// ivshmem BAR used by Wolfser and the demo window.
-const QEMU_IVSHMEM: Range = Range { base: 0x1040_0000, size: 0x0040_0000 };
 
 static UART_BASE: AtomicU64 = AtomicU64::new(0);
 static UART_SIZE: AtomicU64 = AtomicU64::new(0);
 /// Zero means the DT did not describe an interrupt for the UART.
 static UART_IRQ: AtomicU32 = AtomicU32::new(0);
+
+const MAX_MMIO_CLAIMS: usize = 16;
+
+#[derive(Copy, Clone)]
+struct MmioClaim {
+    owner: u64,
+    base: u64,
+    size: u64,
+}
+
+/// PCI function BARs claimed by live drivers. A claim is the per-function
+/// authority behind `SYS_MMIO_CLAIM`: the platform window says what is
+/// possible, the claim table says who owns which part. Entries are released
+/// on every task teardown path.
+static MMIO_CLAIMS: Mutex<[Option<MmioClaim>; MAX_MMIO_CLAIMS]> =
+    Mutex::new([None; MAX_MMIO_CLAIMS]);
 
 /// Binds the resources described by the live tree. Called once before the
 /// first user task; a second call is harmless and only fills the UART slot.
@@ -71,8 +86,9 @@ pub fn mmio_range(program: u64) -> Option<Range> {
         (Kind::Qemu, crate::user_program::HOWLER) => Some(dtb_uart_range().unwrap_or(QEMU_UART)),
         // The shell holds the GIC range only to delegate it to the IRQ probe.
         (Kind::Qemu, crate::user_program::HOWL) => Some(QEMU_GIC),
-        (Kind::Qemu, crate::user_program::NET_DRIVER) => Some(QEMU_PCI_MMIO),
-        (Kind::Qemu, crate::user_program::WOLFSER) => Some(QEMU_IVSHMEM),
+        // NET_DRIVER and WOLFSER obtain their BAR ranges through
+        // SYS_MMIO_CLAIM after PCI enumeration; the platform only publishes
+        // the window below.
         (Kind::Fog, crate::user_program::HOWLER) => dtb_uart_range().or_else(|| {
             let base = crate::geni_uart::physical_base();
             (base != 0).then_some(Range {
@@ -117,4 +133,61 @@ fn dtb_uart_range() -> Option<Range> {
     let base = UART_BASE.load(Ordering::Acquire);
     let size = UART_SIZE.load(Ordering::Acquire);
     (base != 0 && size != 0).then_some(Range { base, size })
+}
+
+/// The platform's PCI memory window, if the machine has one. A driver with
+/// `CAP_PCI` may claim a sub-range for a BAR; the claim is recorded and
+/// turned into a region-scoped `CAP_MMIO` capability by the syscall layer.
+pub fn pci_window() -> Option<Range> {
+    match platform::detect() {
+        Kind::Qemu => Some(QEMU_PCI_MMIO),
+        _ => None,
+    }
+}
+
+/// Claims `[base, base + size)` for `owner`. Ranges outside the platform
+/// window or overlapping another live owner are refused. Re-claiming the same
+/// range is idempotent (a driver may map several capabilities of one BAR).
+pub fn claim_mmio(owner: u64, base: u64, size: u64) -> bool {
+    let Some(window) = pci_window() else {
+        return false;
+    };
+    let Some(end) = base.checked_add(size) else {
+        return false;
+    };
+    let window_end = window.base.saturating_add(window.size);
+    if size == 0 || base < window.base || end > window_end {
+        return false;
+    }
+    let mut claims = MMIO_CLAIMS.lock();
+    for slot in claims.iter() {
+        if let Some(claim) = slot {
+            let claim_end = claim.base.saturating_add(claim.size);
+            let overlaps = base < claim_end && claim.base < end;
+            if overlaps && claim.owner != owner {
+                return false;
+            }
+            if overlaps && claim.owner == owner && claim.base == base && claim.size == size {
+                return true;
+            }
+        }
+    }
+    for slot in claims.iter_mut() {
+        if slot.is_none() {
+            *slot = Some(MmioClaim { owner, base, size });
+            return true;
+        }
+    }
+    false
+}
+
+/// Drops every BAR claim owned by a dying task. Called from the same teardown
+/// helper that masks its bound IRQ.
+pub fn release_mmio_claims(owner: u64) {
+    let mut claims = MMIO_CLAIMS.lock();
+    for slot in claims.iter_mut() {
+        if slot.is_some_and(|claim| claim.owner == owner) {
+            *slot = None;
+        }
+    }
 }
