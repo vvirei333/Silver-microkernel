@@ -7086,3 +7086,21 @@ SilverD's program list, then M3.2 basic pack/simplefb.
 
 Verification: security 12/12 + health + 200k fuzz; Linux ABI matrix 26/26;
 Phosh demo clean; ping OK; cargo test --lib 224; --no-linux clean.
+
+### M3.1d: DT-gated driver spawn
+
+`driver_resources::bound(program)` tells whether the platform/DT bound a
+driver; `SYS_DRIVER_BOUND(program)` exposes it to EL0. SilverD now asks before
+spawning HOWLER: with no UART node the input task is not started, with the
+QEMU fallback or a fog DT node it is. Negative control: forcing
+`bound(HOWLER)=false` makes `ps` show no `howler` task; restoring it brings
+`howler` back. The shell still gets kernel-console input in that boot, so the
+test is the task list, not the prompt.
+
+M3.1 is now closed in the resource/spawn-gating sense: UART MMIO/IRQ are
+DT-bound, PCI BARs are per-function claims, and SilverD does not start a
+driver whose node is absent. The kernel still orchestrates through SilverD
+rather than spawning drivers itself, and PCI devices are not DT nodes.
+
+Verification: security 12/12 + health + 200k fuzz; Linux ABI matrix 26/26;
+Phosh demo clean; ping OK; cargo test --lib 224; --no-linux clean.

@@ -135,6 +135,19 @@ fn dtb_uart_range() -> Option<Range> {
     (base != 0 && size != 0).then_some(Range { base, size })
 }
 
+/// Whether the platform/DT bound this driver program. SilverD uses this to
+/// spawn a driver only when its node exists; an unmatched node stays dead
+/// instead of producing a driver that cannot map anything.
+pub fn bound(program: u64) -> bool {
+    match program {
+        crate::user_program::HOWLER => mmio_range(program).is_some(),
+        crate::user_program::NET_DRIVER | crate::user_program::WOLFSER => {
+            pci_window().is_some()
+        }
+        _ => false,
+    }
+}
+
 /// The platform's PCI memory window, if the machine has one. A driver with
 /// `CAP_PCI` may claim a sub-range for a BAR; the claim is recorded and
 /// turned into a region-scoped `CAP_MMIO` capability by the syscall layer.

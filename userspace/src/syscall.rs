@@ -52,6 +52,7 @@ const SYS_CAP_FIND: u64 = 99;
 const SYS_DMA_GRANT_SELF: u64 = 101;
 const SYS_MMIO_GRANT: u64 = 102;
 const SYS_MMIO_CLAIM: u64 = 103;
+const SYS_DRIVER_BOUND: u64 = 104;
 const SYS_MAP_PHYS: u64 = 62;
 const SYS_MAP_PHYS_NC: u64 = 96;
 const SYS_BIND_IRQ: u64 = 63;
@@ -411,6 +412,12 @@ pub fn mmio_grant(recipient: u64, base: u64, size: u64) -> bool {
 /// grants a region-scoped CAP_MMIO for exactly that range.
 pub fn mmio_claim(base: u64, size: u64) -> bool {
     unsafe { syscall2(SYS_MMIO_CLAIM, base, size) == 0 }
+}
+
+/// Whether the platform/DT bound a driver program (and therefore whether the
+/// init task should spawn it).
+pub fn driver_bound(program: u64) -> bool {
+    unsafe { syscall1(SYS_DRIVER_BOUND, program) != 0 }
 }
 
 pub fn map_phys(phys_addr: u64, size: u64) -> Option<u64> {

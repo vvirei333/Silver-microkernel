@@ -31,6 +31,11 @@ This slice lands the **authority** half: device MMIO is no longer ambient.
   - broad `CAP_MMIO` alone opens only the DMA path; it cannot map a device.
 - `SYS_BIND_IRQ` checks `has_irq`: a node-scoped capability covers only its
   INTID. A broad `CAP_IRQ` remains only for the trusted shell/test probe.
+- `bound(program)` exposes whether the platform/DT bound a driver. SilverD
+  asks via `SYS_DRIVER_BOUND` before spawning HOWLER: if no UART node matched,
+  the input driver is not started (`ps` then shows no `howler`); QEMU's
+  fallback keeps it bound. Negative control: forcing `bound(HOWLER)=false`
+  removes the task from `ps`; restoring it brings `howler` back.
 - `SYS_MMIO_CLAIM(base, size)` reserves a PCI function BAR inside the
   platform window (`CAP_PCI` required). The kernel records the claim
   (`MMIO_CLAIMS`, released on task teardown) and inserts a region-scoped
@@ -55,9 +60,10 @@ This slice lands the **authority** half: device MMIO is no longer ambient.
 - `driver_nodes` assumes 2/2 or 1/1 `reg` cells; a node with a different
   parent cell layout is skipped (fail closed) until the walker tracks parent
   `#address-cells`/`#size-cells`.
-- The kernel does not spawn drivers from the DT yet: SilverD still uses the
-  program table. Binding-by-compatible currently controls *what resources a
-  spawned driver gets*, not *whether it is spawned*.
+- The kernel does not itself spawn drivers from the DT: SilverD still walks
+  the program table, but asks `SYS_DRIVER_BOUND` before spawning the UART
+  driver. DT controls resources and the UART spawn decision; PCI drivers are
+  not DT nodes.
 - Broad `CAP_IRQ` for the trusted shell/test probe is a deliberate exception,
   not a driver path.
 - The kernel still owns virtio-blk/SFS. Moving the block driver to EL0 is the

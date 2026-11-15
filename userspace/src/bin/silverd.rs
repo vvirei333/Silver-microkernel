@@ -84,15 +84,21 @@ pub extern "C" fn _start(_argument: u64) -> ! {
     }
 
     // 5. Howler (UART). The boot argument is the shell's task id: that is
-    // where input bytes are delivered.
-    let howler_cap = syscall::spawn(syscall::PROGRAM_HOWLER, howl_id)
-        .unwrap_or_else(|| fail("SILVERD: HOWLER SPAWN FAILED\r\n"));
-    let howler_id = syscall::cap_get_task_id(howler_cap)
-        .unwrap_or_else(|| fail("SILVERD: HOWLER CAP LOOKUP FAILED\r\n"));
-    // MMIO is still delegated for DMA/alloc; the UART MMIO range and its
-    // INTID are inserted by the kernel from the driver resource table.
-    if !syscall::cap_grant(howler_cap, howler_id, syscall::CAP_MMIO) {
-        fail("SILVERD: HOWLER CAP GRANT FAILED\r\n");
+    // where input bytes are delivered. The kernel binds the UART from the
+    // live DT (or the QEMU fallback); if no node matched, do not spawn a
+    // driver that could not map its registers.
+    if syscall::driver_bound(syscall::PROGRAM_HOWLER) {
+        let howler_cap = syscall::spawn(syscall::PROGRAM_HOWLER, howl_id)
+            .unwrap_or_else(|| fail("SILVERD: HOWLER SPAWN FAILED\r\n"));
+        let howler_id = syscall::cap_get_task_id(howler_cap)
+            .unwrap_or_else(|| fail("SILVERD: HOWLER CAP LOOKUP FAILED\r\n"));
+        // MMIO is still delegated for DMA/alloc; the UART MMIO range and its
+        // INTID are inserted by the kernel from the driver resource table.
+        if !syscall::cap_grant(howler_cap, howler_id, syscall::CAP_MMIO) {
+            fail("SILVERD: HOWLER CAP GRANT FAILED\r\n");
+        }
+    } else {
+        syscall::print("SILVERD: NO UART NODE, INPUT DRIVER NOT STARTED\r\n");
     }
 
     loop {

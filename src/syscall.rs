@@ -82,6 +82,8 @@ pub const SYS_MMIO_GRANT: u64 = 102;
 /// Claim a PCI BAR range (requires `CAP_PCI`) and receive a region-scoped
 /// `CAP_MMIO` for exactly that range.
 pub const SYS_MMIO_CLAIM: u64 = 103;
+/// Whether the platform/DT bound a driver program.
+pub const SYS_DRIVER_BOUND: u64 = 104;
 /// Spawns a dynamically loaded ELF with the AArch64 **Linux** syscall
 /// personality (`x8` = Linux syscall number) instead of the Silver table.
 pub const SYS_SPAWN_LINUX_PATH: u64 = 98;
@@ -395,6 +397,7 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
                 SYSCALL_ERROR
             }
         }
+        SYS_DRIVER_BOUND => u64::from(crate::driver_resources::bound(frame[0])),
         SYS_CAP_GRANT => {
             if scheduler::grant_capability(frame[0], frame[1], frame[2] as u32) {
                 0
