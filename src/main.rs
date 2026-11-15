@@ -1389,6 +1389,67 @@ const DEEP_BOOT_SELFTESTS: bool = false;
 #[cfg(any(not(feature = "fog"), feature = "fog-hw-selftests"))]
 const DEEP_BOOT_SELFTESTS: bool = true;
 
+/// Minimal boot framebuffer proof. On the phone the Redmi `cont_splash`
+/// region is painted directly; on QEMU (and any non-fog profile) a small
+/// frame-allocator surface validates the writer without a display.
+fn simplefb_boot() {
+    #[cfg(feature = "fog")]
+    {
+        let info = silver_microkernel::simplefb::FOG_PANEL;
+        let Some(bytes) = info.bytes() else {
+            return;
+        };
+        let pointer = memory::phys_to_virt(info.base as usize) as *mut u32;
+        let pixels = unsafe { core::slice::from_raw_parts_mut(pointer, bytes / 4) };
+        let Some(mut canvas) = silver_microkernel::simplefb::Canvas::new(
+            pixels, info.width, info.height, info.stride,
+        ) else {
+            return;
+        };
+        canvas.paint_boot();
+        console::write_str("SIMPLEFB: FOG base=0x");
+        console::write_hex_u64(info.base);
+        console::write_str(" 720x1650 stride=720\r\n");
+        ram_log::log("SIMPLEFB FOG PANEL");
+    }
+
+    #[cfg(not(feature = "fog"))]
+    {
+        const WIDTH: usize = 128;
+        const HEIGHT: usize = 96;
+        const STRIDE: usize = 128;
+        let pages = (WIDTH * HEIGHT * 4).div_ceil(memory::PAGE_SIZE);
+        let Some((physical, generation)) =
+            frame_allocator::alloc_contiguous_pages_tagged(pages)
+        else {
+            console::write_str("SIMPLEFB TEST: NO FRAMES\r\n");
+            return;
+        };
+        let pointer = memory::phys_to_virt(physical) as *mut u32;
+        let pixels = unsafe {
+            core::slice::from_raw_parts_mut(pointer, STRIDE * HEIGHT)
+        };
+        let mut ok = false;
+        let mut painted = false;
+        if let Some(mut canvas) = silver_microkernel::simplefb::Canvas::new(
+            pixels, WIDTH, HEIGHT, STRIDE,
+        ) {
+            canvas.paint_boot();
+            painted = true;
+        }
+        if painted {
+            ok = pixels[0] != 0
+                && pixels[STRIDE * (HEIGHT / 3) + WIDTH / 2] == 0xFF39_D2FF;
+        }
+        frame_allocator::free_contiguous_pages_tagged(physical, pages, generation);
+        if ok {
+            console::write_str("SIMPLEFB TEST PASS 128x96\r\n");
+        } else {
+            console::write_str("SIMPLEFB TEST FAIL\r\n");
+        }
+    }
+}
+
 #[cfg(not(feature = "std"))]
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
@@ -1520,6 +1581,7 @@ pub extern "C" fn kernel_main() -> ! {
         exceptions::silver_handle_exception(6, 0, 0, 0);
     }
     ram_log::log("FRAME ALLOC OK");
+    simplefb_boot();
 
     // The heap comes before the filesystem: mounting validates the image with
     // `sfs_format::fsck`, which now tracks one bit per data block (a 16 MiB

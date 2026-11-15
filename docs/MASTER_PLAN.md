@@ -187,8 +187,9 @@ self `CAP_MMIO`/`CAP_IRQ` из `driver_resources.rs`, FDT-обход
 (`compatible`/`reg`/`interrupts`), `SYS_MMIO_GRANT`, per-BAR
 `SYS_MMIO_CLAIM`, `SYS_DRIVER_BOUND` (SilverD не спавнит UART-драйвер без
 узла), проба `mmio_range_confine`; детали и ограничения — в
-`docs/M3_DRIVER.md`. Следующий срез — async page-in, M3.2 basic pack и
-simplefb на Redmi 10C.
+`docs/M3_DRIVER.md`. M3.2a simplefb готов (QEMU selftest; Redmi — завтра).
+Следующий срез — аппаратная картинка на Redmi, затем eMMC/HID/I2C и async
+page-in.
 
 **M3.1 — driver-task framework:**
 
@@ -200,6 +201,12 @@ simplefb на Redmi 10C.
 **M3.2 — basic pack** (QEMU → плата): virtio уже есть; добавить 8250-стиль UART,
 framebuffer (simplefb: base+stride+формат от бутлоадера), eMMC-блок,
 HID-клавиатура, I2C-мини.
+
+**M3.2a simplefb — сделано (2026-11-16):** pure `Canvas` + `FOG_PANEL`
+(0x5C00_0000, 720x1650, stride 720, ARGB8888), QEMU synthetic selftest
+`SIMPLEFB TEST PASS`, 226 host tests; детали — `docs/M3_SIMPLEFB.md`.
+Осталось: аппаратная проверка на Redmi, DT/ABL descriptor, EL0 API; затем
+eMMC/HID/I2C.
 
 **M3.3 — Redmi 10C bring-up (этапность, каждая ступень = демо):**
 

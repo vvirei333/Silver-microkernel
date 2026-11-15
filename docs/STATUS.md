@@ -87,6 +87,13 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   - stock `wayland-info` from `wayland-utils` enumerates the compositor.
 - Vendored aarch64 libs/headers in `third_party/wayland-aarch64` (MIT).
 
+### Boot framebuffer (M3.2a)
+
+- Simplefb path: `FOG_PANEL` (0x5C00_0000, 720x1650, stride 720, ARGB8888)
+  paints the Redmi `cont_splash` panel; QEMU runs a 128x96 synthetic selftest
+  (`SIMPLEFB TEST PASS 128x96`). Pure canvas is host-tested. No EL0 API or
+  compositor yet; hardware photo is tomorrow's Redmi step.
+
 ### Phosh desktop
 
 - The real postmarketOS stack runs on the Linux ABI: **phoc 0.57** (Wayland

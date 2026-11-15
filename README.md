@@ -1449,6 +1449,7 @@ driver's contract.
 | [docs/VECTOR.md](docs/VECTOR.md) | Direction: console OS, host-rendered browser window, Linux ABI/Phosh assessment and staged plan |
 | [docs/MOBILE_LINUX_ARCH.md](docs/MOBILE_LINUX_ARCH.md) | How postmarketOS/Nura works as mobile Linux (boot, deviceinfo, initramfs, Alpine/systemd, Phosh/phoc services) and what to borrow for WerewolfOS |
 | [docs/M3_DRIVER.md](docs/M3_DRIVER.md) | M3.1a driver-task framework: region-scoped MMIO, driver resource table, `SYS_MMIO_GRANT`, limits and next DT slice |
+| [docs/M3_SIMPLEFB.md](docs/M3_SIMPLEFB.md) | M3.2a simplefb boot framebuffer: contract, Redmi panel constants, QEMU selftest, limits |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
 
 Current verification snapshot (2026-11-08, console product): **217 host

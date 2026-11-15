@@ -7104,3 +7104,24 @@ rather than spawning drivers itself, and PCI devices are not DT nodes.
 
 Verification: security 12/12 + health + 200k fuzz; Linux ABI matrix 26/26;
 Phosh demo clean; ping OK; cargo test --lib 224; --no-linux clean.
+
+### M3.2a: simplefb boot panel
+
+`src/simplefb.rs` is a pure `Canvas` over a packed u32 framebuffer with strict
+stride/bounds validation and a boot panel (gradient, accent band, card, pale
+disc). The Redmi `cont_splash` contract is `FOG_PANEL`: 0x5C00_0000, 720x1650,
+stride 720, ARGB8888, taken from the previous fog-ui bring-up.
+
+`simplefb_boot` in `main.rs`:
+- Fog maps the physical base through the high-half mapping and paints the
+  panel (`SIMPLEFB: FOG ...`);
+- QEMU (and non-fog) allocates a 128x96 surface from the frame allocator,
+  paints, verifies the first pixel and accent band, frees the frames and logs
+  `SIMPLEFB TEST PASS 128x96`.
+
+Host tests are 226; QEMU boot shows the PASS line; security 12/12, matrix
+26/26, Phosh demo clean, `--no-linux` clean, fog build compiles. The Fog panel
+has not run on hardware yet; tomorrow's Redmi boot is the first picture.
+
+Limits: descriptor is a constant, not yet parsed from DT/ABL; ARGB8888 only;
+no EL0 framebuffer API/compositor; eMMC/HID/I2C remain.
