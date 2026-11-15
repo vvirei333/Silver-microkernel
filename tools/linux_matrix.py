@@ -12,6 +12,7 @@ Usage:
 """
 import argparse
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -94,7 +95,12 @@ def main():
                     log.extend(sock.recv(65536))
                 except socket.timeout:
                     pass
-                if marker in log:
+                cleaned = re.sub(
+                    rb"EXIT:[^\r\n]*\r?\n|Program exited with status [0-9]+\r?\n",
+                    b"",
+                    log,
+                )
+                if marker in cleaned:
                     return True
             return False
 

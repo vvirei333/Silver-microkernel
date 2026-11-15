@@ -15,6 +15,7 @@ Usage:
 """
 import argparse
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -94,7 +95,15 @@ class Guest:
             except OSError:
                 return False
             self.log += data
-            if marker in self.log:
+            # A kernel EXIT line or a shell status line can land in the middle
+            # of a program's marker (console writes are not atomic across
+            # tasks). Remove only those injectable lines before matching.
+            cleaned = re.sub(
+                rb"EXIT:[^\r\n]*\r?\n|Program exited with status [0-9]+\r?\n",
+                b"",
+                self.log,
+            )
+            if marker in cleaned:
                 return True
         return False
 
