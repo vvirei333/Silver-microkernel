@@ -19,7 +19,7 @@ use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::{console, interrupts, smp};
 
-pub const MAX_NAME_LEN: usize = 32;
+pub const MAX_NAME_LEN: usize = 256;
 pub const MAX_PATH_LEN: usize = 191;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_APPEND: u64 = 2;
@@ -1576,7 +1576,7 @@ fn resolve_path(cwd: &str, path: &str) -> Result<String, ()> {
             ".." => {
                 parts.pop();
             }
-            name if name.len() <= MAX_NAME_LEN => parts.push(name),
+            name if name.len() < MAX_NAME_LEN => parts.push(name),
             _ => return Err(()),
         }
     }
@@ -1605,7 +1605,7 @@ fn components(path: &str) -> Option<Vec<&str>> {
             ".." => {
                 result.pop();
             }
-            name if name.len() <= MAX_NAME_LEN => result.push(name),
+            name if name.len() < MAX_NAME_LEN => result.push(name),
             _ => return None,
         }
     }
@@ -1620,7 +1620,7 @@ fn rel_components(path: &str) -> Result<Vec<&str>, ()> {
         match component {
             "" | "." => {}
             ".." => return Err(()),
-            name if name.len() <= MAX_NAME_LEN => result.push(name),
+            name if name.len() < MAX_NAME_LEN => result.push(name),
             _ => return Err(()),
         }
     }

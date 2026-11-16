@@ -7165,8 +7165,8 @@ runlevels completing, `Starting phosh ... ok`, `gtk-serve: screen mapped` and
 Kernel work this slice (all found by running real Alpine):
 - SFS symlink inodes (kind 3, target in data blocks, hop-budgeted resolve,
   `read_link`/`lstat_kind`/`link_len` in VFS, `write_link_at` in
-  `sfs_inject.py`, kind-3 support in `sfs_fsck.py`); 27-byte name limit kept,
-  long apk key names are skipped and reported;
+  `sfs_inject.py`, kind-3 support in `sfs_fsck.py`); names were still capped
+  at 27 bytes in this slice, so long apk key names were skipped;
 - shebang `execve` support; synthetic `src/procfs.rs` (`cmdline`,
   `filesystems`, `mounts`, `mountinfo`, `self/*`, `sys/kernel/hotplug`);
 - `mount`/`umount2` (tmpfs -> RamFs; proc/sysfs/dev accepted no-ops),
@@ -7211,3 +7211,31 @@ Gates: cargo test --lib 226/226, security 12/12, Linux matrix 27/27 (new
 [`docs/ALPINE_OPENRC.md`](docs/ALPINE_OPENRC.md). Next userspace slice: apk
 repositories/keys and replacing the Arch-staged Phosh with Alpine `phosh`/
 `phoc`.
+
+### SFS names up to 255 bytes (2026-11-17)
+
+Alpine's `apk` keys and any real package closure need names longer than 27
+bytes; the builder was skipping them. The directory format stays 32 bytes per
+entry, so **no image migration is needed**:
+
+- inline names (1..27 bytes) keep the old layout: inode, length byte, bytes;
+- longer names set the length byte to `0xFF` and store a block pointer and a
+  16-bit length; the full name lives at the start of one data block;
+- `dir_add`/`write_entry` allocate and release that block, `dir_remove` frees
+  it, the mount-time verifier marks it referenced, and `sfs_fsck.py` treats it
+  as owned (no false "leak");
+- `vfs::MAX_NAME_LEN` and the SFS limit are 255; `sfs_inject.py` grows the
+  same encoding.
+
+Evidence: `scripts/sfs_fsck.py disk.img` is clean with a 72-byte injected
+name, `linuxrun /sfs/linux-longname` opens it, verifies 12 bytes and finds it
+in `readdir`; the rebuilt Alpine image packs 532 files + 351 symlinks with
+only `libc.a` skipped for size, and still boots to the Phosh lock screen.
+Native creation was checked through the shell too: `touch /sfs/<53-byte
+name>` reports "created", a second `touch` resolves it back ("already
+exists"), `rm` removes it, and fsck is clean afterwards — the overflow name
+block is allocated and freed correctly.
+
+The `DirEntry` ABI grew from 32 to 256 name bytes (kernel and userspace
+`DIR_NAME_CAPACITY` kept in lockstep), and `vfs::MAX_NAME_LEN` is 256 with a
+`<` check so names are capped at 255.

@@ -30,7 +30,8 @@ the files above, patches BusyBox's interpreter to
 
 ## Why this shape
 
-- SFS names are limited to 27 bytes and there are no symlinks; the builder
+- SFS names were limited to 27 bytes when this slice ran (long names up to
+  255 and symlinks landed later, see `docs/ALPINE_OPENRC.md`); the builder
   installs the musl loader twice instead of relying on a `libc.musl` symlink.
 - Linux ABI already supports ET_DYN/PT_INTERP and the `/sfs` read prefix;
   musl and glibc binaries coexist as long as each ELF names its own loader.

@@ -35,7 +35,11 @@ INODE_KIND_FREE = 0
 INODE_KIND_FILE = 1
 INODE_KIND_DIR = 2
 INODE_KIND_SYMLINK = 3
-NAME_MAX = 27
+NAME_MAX = 255
+# Inline names fit after the 4-byte inode and 1-byte length. Longer names
+# live in their own data block and the length byte is NAME_MARK.
+NAME_INLINE = 27
+NAME_MARK = 0xFF
 
 
 class Image:
@@ -156,6 +160,20 @@ class Image:
                     result.extend(block for block in table if block)
         return result
 
+    def entry_name(self, entry: int) -> bytes:
+        length = self.data[entry + 4]
+        if length == NAME_MARK:
+            block = struct.unpack_from("<I", self.data, entry + 5)[0]
+            real = struct.unpack_from("<H", self.data, entry + 9)[0]
+            return bytes(self.data[block * BLOCK : block * BLOCK + real])
+        return bytes(self.data[entry + 5 : entry + 5 + length])
+
+    def entry_name_block(self, entry: int):
+        if self.data[entry + 4] != NAME_MARK:
+            return None
+        block = struct.unpack_from("<I", self.data, entry + 5)[0]
+        return block or None
+
     def find_entry(self, dir_index: int, name: str):
         encoded = name.encode()
         for block in self.dir_blocks(dir_index):
@@ -165,8 +183,7 @@ class Image:
                 inode = struct.unpack_from("<I", self.data, entry)[0]
                 if inode == 0:
                     continue
-                length = self.data[entry + 4]
-                if length == len(encoded) and self.data[entry + 5 : entry + 5 + length] == encoded:
+                if self.entry_name(entry) == encoded:
                     return inode
         return None
 
@@ -195,9 +212,21 @@ class Image:
 
     def write_entry(self, offset: int, inode: int, encoded: bytes) -> None:
         struct.pack_into("<I", self.data, offset, inode)
-        self.data[offset + 4] = len(encoded)
-        self.data[offset + 5 : offset + 5 + len(encoded)] = encoded
-        for byte in range(offset + 5 + len(encoded), offset + 32):
+        if len(encoded) <= NAME_INLINE:
+            self.data[offset + 4] = len(encoded)
+            self.data[offset + 5 : offset + 5 + len(encoded)] = encoded
+            for byte in range(offset + 5 + len(encoded), offset + 32):
+                self.data[byte] = 0
+            return
+        block = self.alloc_block()
+        self.set_used(block)
+        for byte in range(BLOCK):
+            self.data[block * BLOCK + byte] = 0
+        self.data[block * BLOCK : block * BLOCK + len(encoded)] = encoded
+        self.data[offset + 4] = NAME_MARK
+        struct.pack_into("<I", self.data, offset + 5, block)
+        struct.pack_into("<H", self.data, offset + 9, len(encoded))
+        for byte in range(offset + 11, offset + 32):
             self.data[byte] = 0
 
     # --- block lists ------------------------------------------------------
@@ -313,6 +342,9 @@ class Image:
             for slot in range(BLOCK // 32):
                 offset = start + slot * 32
                 if struct.unpack_from("<I", self.data, offset)[0] == target:
+                    name_block = self.entry_name_block(offset)
+                    if name_block is not None:
+                        self.set_used(name_block, False)
                     struct.pack_into("<I", self.data, offset, 0)
         self.free_file(target)
         return True

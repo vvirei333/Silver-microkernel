@@ -20,7 +20,9 @@ pub const BLOCK_SIZE: usize = 512;
 pub const INODE_SIZE: usize = 64;
 pub const DIR_ENTRY_SIZE: usize = 32;
 pub const DIR_ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DIR_ENTRY_SIZE;
-pub const NAME_MAX: usize = 27;
+pub const NAME_MAX: usize = 255;
+/// Legacy inline directory entries in this host-side copy.
+const INLINE_NAME_MAX: usize = 27;
 pub const DIRECT_BLOCKS: usize = 4;
 /// Pointers in one table block (512 / 4).
 pub const INDIRECT_POINTERS: usize = BLOCK_SIZE / 4;
@@ -36,7 +38,7 @@ pub const INODE_KIND_FREE: u32 = 0;
 pub const INODE_KIND_FILE: u32 = 1;
 pub const INODE_KIND_DIR: u32 = 2;
 
-pub const MAX_NAME_LEN: usize = 32;
+pub const MAX_NAME_LEN: usize = 256;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct DirEntry {
@@ -536,7 +538,7 @@ pub fn find_entry(
     dir: u32,
     name: &str,
 ) -> Option<(usize, usize)> {
-    if name.is_empty() || name.len() > NAME_MAX {
+    if name.is_empty() || name.len() > INLINE_NAME_MAX {
         return None;
     }
     let (_, _, blocks, indirect, _) = inode_get(image, superblock, dir)?;
@@ -552,7 +554,7 @@ pub fn find_entry(
                 continue;
             }
             let length = image[entry + 4] as usize;
-            if length != name.len() || length > NAME_MAX {
+            if length != name.len() || length > INLINE_NAME_MAX {
                 continue;
             }
             if &image[entry + 5..entry + 5 + length] == name.as_bytes() {
@@ -665,7 +667,7 @@ pub fn add_entry(
     name: &str,
     child: u32,
 ) -> Option<()> {
-    if name.is_empty() || name.len() > NAME_MAX {
+    if name.is_empty() || name.len() > INLINE_NAME_MAX {
         return None;
     }
     let (_, _, mut blocks, mut indirect, _) = inode_get(image, superblock, dir)?;
@@ -1231,7 +1233,7 @@ pub fn rename_entry_in_place(
     slot: usize,
     new_name: &str,
 ) -> bool {
-    if new_name.is_empty() || new_name.len() > NAME_MAX {
+    if new_name.is_empty() || new_name.len() > INLINE_NAME_MAX {
         return false;
     }
     let entry = block * BLOCK_SIZE + slot * DIR_ENTRY_SIZE;
@@ -1959,7 +1961,7 @@ mod tests {
                     continue;
                 }
                 let length = image[entry + 4] as usize;
-                if length == 0 || length > NAME_MAX {
+                if length == 0 || length > INLINE_NAME_MAX {
                     continue;
                 }
                 let (kind, _, _, _, _) = inode_get(image, sb, index)?;

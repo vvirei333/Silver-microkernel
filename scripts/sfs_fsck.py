@@ -56,6 +56,7 @@ def main(path: str) -> int:
     owners = {}
     files = 0
     dirs = 0
+    dir_data_blocks = []
 
     for index in range(inodes):
         off = itable * BLOCK + index * INODE_SIZE
@@ -77,6 +78,12 @@ def main(path: str) -> int:
                 problems.append(f"inode {index}: size {size} exceeds block-tree capacity")
         elif kind in (2,):
             dirs += 1
+            dir_data_blocks.extend(block for block in blocks if block)
+            if indirect:
+                dir_data_blocks.extend(
+                    block for block in struct.unpack_from("<128I", image, indirect * BLOCK)
+                    if block
+                )
         else:
             problems.append(f"inode {index}: unknown kind {kind}")
             continue
@@ -261,6 +268,43 @@ def main(path: str) -> int:
                 problems.append(f"inode {index}: block {block} not marked used in bitmap")
             if kind in (1, 3) and slot * BLOCK >= size:
                 problems.append(f"inode {index}: indirect block {block} beyond size {size}")
+
+    # Long names live in their own data block, referenced only by the
+    # directory entry's 0xFF marker.
+    for block in dir_data_blocks:
+        if not (data_start <= block < total):
+            continue
+        for slot in range(BLOCK // 32):
+            entry = block * BLOCK + slot * 32
+            if struct.unpack_from("<I", image, entry)[0] == 0:
+                continue
+            if image[entry + 4] != 0xFF:
+                continue
+            name_block = struct.unpack_from("<I", image, entry + 5)[0]
+            name_len = struct.unpack_from("<H", image, entry + 9)[0]
+            if not (1 <= name_len <= 255):
+                problems.append(
+                    f"dir block {block} entry {slot}: bad long-name length {name_len}"
+                )
+                continue
+            if not (data_start <= name_block < total):
+                problems.append(
+                    f"dir block {block} entry {slot}: name block {name_block} "
+                    f"outside data area"
+                )
+                continue
+            if name_block in owners:
+                problems.append(
+                    f"CROSS-LINK: name block {name_block} owned by {owners[name_block]} "
+                    f"and a directory entry in block {block}"
+                )
+            else:
+                owners[name_block] = f"dir block {block} entry {slot}"
+            if not used(name_block):
+                problems.append(
+                    f"dir block {block} entry {slot}: name block {name_block} "
+                    f"not marked used in bitmap"
+                )
 
     leaked = [b for b in range(data_start, total) if used(b) and b not in owners]
     free = sum(1 for b in range(data_start, total) if not used(b))

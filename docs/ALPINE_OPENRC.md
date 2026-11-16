@@ -46,9 +46,12 @@ links, `libc.musl-aarch64.so.1`). SFS now has a symlink inode:
 - `scripts/sfs_inject.py` grew `write_link_at()`, and freeing a symlink frees
   its data blocks like any other inode.
 
-SFS name limit stays 27 bytes. Long Alpine paths (notably `apk` signing keys
-with long hex names) are skipped at pack time and reported by the builder;
-nothing that boots needs them today.
+SFS names go up to 255 bytes now. The 32-byte directory entry is unchanged:
+names that fit inline (27 bytes) are stored as before, and longer names get a
+marker byte (`0xFF`) plus a pointer to one data block holding the full name.
+Old images keep working without migration. The builder packs the whole tree —
+532 files and 351 symlinks — and only `usr/lib/libc.a` is skipped (8 MiB file
+limit). The `apk` signing keys land in the image.
 
 `scripts/sfs_fsck.py` understands kind 3 and passes on the built image.
 

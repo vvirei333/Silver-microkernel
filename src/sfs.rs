@@ -29,7 +29,14 @@ const INODE_KIND_SYMLINK: u32 = 3;
 const MAX_SYMLINK_HOPS: u32 = 8;
 const DIR_ENTRY_SIZE: usize = 32;
 const DIR_ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DIR_ENTRY_SIZE;
-const NAME_LIMIT: usize = 27;
+/// Longest name a directory entry can carry (the on-disk ceiling).
+const NAME_LIMIT: usize = 255;
+/// Names that fit inline: 4-byte inode, 1-byte length, then the bytes.
+const NAME_INLINE_LIMIT: usize = DIR_ENTRY_SIZE - 5;
+/// Length byte sentinel: the name lives in its own data block.
+const NAME_LONG_MARK: u8 = 0xFF;
+const ENTRY_NAME_BLOCK: usize = 5;
+const ENTRY_NAME_LEN: usize = 9;
 const DOUBLE_FIRST_SLOT: usize = DIRECT_BLOCKS + INDIRECT_POINTERS;
 const TRIPLE_FIRST_SLOT: usize =
     DOUBLE_FIRST_SLOT + INDIRECT_POINTERS * INDIRECT_POINTERS;
@@ -101,6 +108,14 @@ fn put_u32_at(bytes: &mut [u8], offset: usize, value: u32) {
     bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn u16_at(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_le_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn put_u16_at(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_le_bytes());
+}
+
 fn u32_at(bytes: &[u8], offset: usize) -> u32 {
     u32::from_le_bytes([
         bytes[offset],
@@ -111,6 +126,42 @@ fn u32_at(bytes: &[u8], offset: usize) -> u32 {
 }
 
 /// Reads one block through the cache; the cache is never held across I/O.
+/// Fills one 32-byte directory entry. A zero `name_block` means the name is
+/// inline; otherwise the entry points at a block holding the full name.
+fn fill_dir_entry(
+    bytes: &mut [u8; BLOCK_SIZE],
+    offset: usize,
+    child: u32,
+    name: &str,
+    name_block: u32,
+) {
+    put_u32_at(bytes, offset, child);
+    for byte in &mut bytes[offset + 4..offset + DIR_ENTRY_SIZE] {
+        *byte = 0;
+    }
+    if name_block != 0 {
+        bytes[offset + 4] = NAME_LONG_MARK;
+        put_u32_at(bytes, offset + ENTRY_NAME_BLOCK, name_block);
+        put_u16_at(bytes, offset + ENTRY_NAME_LEN, name.len() as u16);
+    } else {
+        bytes[offset + 4] = name.len() as u8;
+        bytes[offset + 5..offset + 5 + name.len()].copy_from_slice(name.as_bytes());
+    }
+}
+
+/// Returns the overflow name block of an entry, if it has one.
+fn dir_entry_name_block(bytes: &[u8], offset: usize) -> Option<u32> {
+    if bytes[offset + 4] != NAME_LONG_MARK {
+        return None;
+    }
+    let block = u32_at(bytes, offset + ENTRY_NAME_BLOCK);
+    if block == 0 {
+        None
+    } else {
+        Some(block)
+    }
+}
+
 fn read_block(block: u32, out: &mut [u8; BLOCK_SIZE]) -> bool {
     {
         let cache = CACHE.lock();
@@ -475,16 +526,38 @@ impl Reader {
                 if child == 0 {
                     continue;
                 }
-                let length = bytes[offset + 4] as usize;
-                if length == 0 || length > NAME_LIMIT {
+                let Some(candidate) = self.entry_name(&bytes, offset) else {
                     continue;
-                }
-                if &bytes[offset + 5..offset + 5 + length] == name.as_bytes() {
+                };
+                if candidate == name.as_bytes() {
                     return Some(child);
                 }
             }
         }
         None
+    }
+
+    /// Name stored in one directory entry, following the overflow block.
+    fn entry_name(&self, bytes: &[u8; BLOCK_SIZE], offset: usize) -> Option<Vec<u8>> {
+        let length = bytes[offset + 4];
+        if length == NAME_LONG_MARK {
+            let block = dir_entry_name_block(bytes, offset)?;
+            let length = u16_at(bytes, offset + ENTRY_NAME_LEN) as usize;
+            if length == 0 || length > NAME_LIMIT {
+                return None;
+            }
+            let mut name_bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut name_bytes) {
+                return None;
+            }
+            Some(name_bytes[..length].to_vec())
+        } else {
+            let length = length as usize;
+            if length == 0 || length > NAME_INLINE_LIMIT {
+                return None;
+            }
+            Some(bytes[offset + 5..offset + 5 + length].to_vec())
+        }
     }
 
     fn read_at(&self, path: &str, offset: usize, limit: usize) -> Option<Vec<u8>> {
@@ -535,13 +608,13 @@ impl Reader {
                 if index == 0 {
                     continue;
                 }
-                let length = bytes[offset + 4] as usize;
-                if length == 0 || length > NAME_LIMIT {
+                let Some(entry_name) = self.entry_name(&bytes, offset) else {
                     continue;
-                }
+                };
+                let length = entry_name.len();
                 let child = self.inode(index)?;
                 let mut name = [0_u8; MAX_NAME_LEN];
-                name[..length].copy_from_slice(&bytes[offset + 5..offset + 5 + length]);
+                name[..length].copy_from_slice(&entry_name);
                 entries.push(DirEntry {
                     name,
                     name_len: length as u64,
@@ -963,31 +1036,54 @@ impl Reader {
     }
 
     fn dir_add(&self, parent: u32, name: &str, child: u32) -> bool {
-        if name.len() == 0 || name.len() > NAME_LIMIT {
+        if name.is_empty() || name.len() > NAME_LIMIT {
             return false;
         }
         let mut inode = match self.inode(parent) {
             Some(inode) if inode.is_dir() => inode,
             _ => return false,
         };
+        // Long names live in one data block so the directory entry stays
+        // 32 bytes and old images keep working.
+        let mut name_block = 0u32;
+        if name.len() > NAME_INLINE_LIMIT {
+            let Some(block) = self.allocate_block() else {
+                return false;
+            };
+            let mut data = [0_u8; BLOCK_SIZE];
+            data[..name.len()].copy_from_slice(name.as_bytes());
+            if !zero_block(block) || !write_block(block, &data) {
+                let _ = self.free_block(block);
+                return false;
+            }
+            name_block = block;
+        }
         for slot in 0..MAX_FILE_BLOCKS {
             let block = match self.block_at_checked(&inode, slot) {
                 Ok(Some(block)) => block,
                 Ok(None) => break,
-                Err(()) => return false,
+                Err(()) => {
+                    if name_block != 0 {
+                        let _ = self.free_block(name_block);
+                    }
+                    return false;
+                }
             };
             let mut bytes = [0_u8; BLOCK_SIZE];
             if !read_block(block, &mut bytes) {
+                if name_block != 0 {
+                    let _ = self.free_block(name_block);
+                }
                 return false;
             }
             for entry in 0..DIR_ENTRIES_PER_BLOCK {
                 let offset = entry * DIR_ENTRY_SIZE;
                 if u32_at(&bytes, offset) == 0 {
-                    put_u32_at(&mut bytes, offset, child);
-                    bytes[offset + 4] = name.len() as u8;
-                    bytes[offset + 5..offset + 5 + name.len()]
-                        .copy_from_slice(name.as_bytes());
-                    return write_block(block, &bytes);
+                    fill_dir_entry(&mut bytes, offset, child, name, name_block);
+                    if !write_block(block, &bytes) && name_block != 0 {
+                        let _ = self.free_block(name_block);
+                    }
+                    return true;
                 }
             }
         }
@@ -996,30 +1092,48 @@ impl Reader {
             match self.block_at_checked(&inode, slot) {
                 Ok(Some(_)) => {}
                 Ok(None) => break,
-                Err(()) => return false,
+                Err(()) => {
+                    if name_block != 0 {
+                        let _ = self.free_block(name_block);
+                    }
+                    return false;
+                }
             }
             slot += 1;
             if slot >= MAX_FILE_BLOCKS {
+                if name_block != 0 {
+                    let _ = self.free_block(name_block);
+                }
                 return false;
             }
         }
         let Some(block) = self.allocate_block() else {
+            if name_block != 0 {
+                let _ = self.free_block(name_block);
+            }
             return false;
         };
         if !zero_block(block) {
             let _ = self.free_block(block);
+            if name_block != 0 {
+                let _ = self.free_block(name_block);
+            }
             return false;
         }
         let mut bytes = [0_u8; BLOCK_SIZE];
-        put_u32_at(&mut bytes, 0, child);
-        bytes[4] = name.len() as u8;
-        bytes[5..5 + name.len()].copy_from_slice(name.as_bytes());
+        fill_dir_entry(&mut bytes, 0, child, name, name_block);
         if !write_block(block, &bytes) {
             let _ = self.free_block(block);
+            if name_block != 0 {
+                let _ = self.free_block(name_block);
+            }
             return false;
         }
         if !self.install_block(&mut inode, slot, block) {
             let _ = self.free_block(block);
+            if name_block != 0 {
+                let _ = self.free_block(name_block);
+            }
             return false;
         }
         self.write_inode(parent, inode)
@@ -1044,20 +1158,24 @@ impl Reader {
                 if child == 0 {
                     continue;
                 }
-                let length = bytes[offset + 4] as usize;
-                if length == 0 || length > NAME_LIMIT {
+                let Some(candidate) = self.entry_name(&bytes, offset) else {
+                    continue;
+                };
+                if candidate != name.as_bytes() {
                     continue;
                 }
-                if &bytes[offset + 5..offset + 5 + length] == name.as_bytes() {
-                    put_u32_at(&mut bytes, offset, 0);
-                    for byte in &mut bytes[offset + 4..offset + DIR_ENTRY_SIZE] {
-                        *byte = 0;
-                    }
-                    if !write_block(block, &bytes) {
-                        return None;
-                    }
-                    return Some(child);
+                let name_block = dir_entry_name_block(&bytes, offset);
+                put_u32_at(&mut bytes, offset, 0);
+                for byte in &mut bytes[offset + 4..offset + DIR_ENTRY_SIZE] {
+                    *byte = 0;
                 }
+                if !write_block(block, &bytes) {
+                    return None;
+                }
+                if let Some(name_block) = name_block {
+                    let _ = self.free_block(name_block);
+                }
+                return Some(child);
             }
         }
         None
@@ -1083,11 +1201,10 @@ impl Reader {
                 if child == 0 {
                     continue;
                 }
-                let length = bytes[offset + 4] as usize;
-                if length == 0 || length > NAME_LIMIT {
+                let Some(candidate) = self.entry_name(&bytes, offset) else {
                     continue;
-                }
-                if &bytes[offset + 5..offset + 5 + length] == name.as_bytes() {
+                };
+                if candidate == name.as_bytes() {
                     return Some((block, entry, child));
                 }
             }
@@ -1105,13 +1222,33 @@ impl Reader {
             return false;
         }
         let offset = slot * DIR_ENTRY_SIZE;
-        put_u32_at(&mut bytes, offset, child);
-        for byte in &mut bytes[offset + 4..offset + DIR_ENTRY_SIZE] {
-            *byte = 0;
+        let old_name_block = dir_entry_name_block(&bytes, offset);
+        let mut name_block = 0u32;
+        if name.len() > NAME_INLINE_LIMIT {
+            let Some(block) = self.allocate_block() else {
+                return false;
+            };
+            let mut data = [0_u8; BLOCK_SIZE];
+            data[..name.len()].copy_from_slice(name.as_bytes());
+            if !zero_block(block) || !write_block(block, &data) {
+                let _ = self.free_block(block);
+                return false;
+            }
+            name_block = block;
         }
-        bytes[offset + 4] = name.len() as u8;
-        bytes[offset + 5..offset + 5 + name.len()].copy_from_slice(name.as_bytes());
-        write_block(block, &bytes)
+        fill_dir_entry(&mut bytes, offset, child, name, name_block);
+        if !write_block(block, &bytes) {
+            if name_block != 0 {
+                let _ = self.free_block(name_block);
+            }
+            return false;
+        }
+        if let Some(old_name_block) = old_name_block {
+            if old_name_block != name_block {
+                let _ = self.free_block(old_name_block);
+            }
+        }
+        true
     }
 
     fn is_under(source: &[&str], destination: &[&str]) -> bool {
@@ -1476,6 +1613,18 @@ fn verify_image(reader: &Reader) -> bool {
                     if reader.inode(child).map(|child| child.kind) == Some(INODE_KIND_FREE) {
                         return false;
                     }
+                    if bytes[offset + 4] == NAME_LONG_MARK {
+                        let Some(name_block) = dir_entry_name_block(&bytes, offset) else {
+                            return false;
+                        };
+                        let length = u16_at(&bytes, offset + ENTRY_NAME_LEN) as usize;
+                        if length == 0 || length > NAME_LIMIT {
+                            return false;
+                        }
+                        if !mark_referenced(reader, &mut referenced, name_block) {
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -1696,3 +1845,4 @@ impl FileSystem for Sfs {
         true
     }
 }
+

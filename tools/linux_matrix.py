@@ -45,6 +45,7 @@ CASES = [
     ("linuxrun /sfs/linux-eventloop", b"event loop ok"),
     ("linuxrun /sfs/linux-scratch", b"scratch ok"),
     ("linuxrun /sfs/linux-stdio", b"stdio ok"),
+    ("linuxrun /sfs/linux-longname", b"long name ok"),
     ("linuxrun /sfs/linux-wayland", b"wayland ok"),
     ("linuxrun /sfs/linux-wlreal", b"libwayland 2 clients ok"),
     ("linuxrun /sfs/linux-wlinfo", b"wayland-info ok"),

@@ -44,7 +44,7 @@ REPOSITORIES = (
 # VFS refuses a single file above 8 MiB.
 MAX_FILE = 8 * 1024 * 1024
 # SFS directory entries store the name inline: 27 bytes.
-NAME_MAX = 27
+NAME_MAX = 255
 
 INITTAB = """# /etc/inittab
 ::sysinit:/sbin/boot-session
