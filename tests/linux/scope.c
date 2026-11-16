@@ -1,6 +1,11 @@
-/* Per-task Linux read scope: only /sfs is visible, /bin and / are not.
+/* Per-task Linux read scope under the Alpine root mapping.
  *
  *   linuxrun /sfs/linux-scope
+ *
+ * The Linux root is the SFS mount, so `/readme.txt` and `/sfs/readme.txt` are
+ * the same file and `/bin` is a real directory of the rootfs. The scope guard
+ * must still refuse anything that resolves *outside* the mount, which is what
+ * the `/sfs/..` alias does in the kernel tree.
  *
  * Expected: "scope ok" and exit 0.
  */
@@ -40,10 +45,12 @@ void _start(void) {
     const long AT_FDCWD = -100;
     const long EACCES = 13;
 
-    long denied = sys4(56, AT_FDCWD, (long)"/bin/hello", 0, 0);
-    if (denied != -EACCES) {
-        fail("read scope leaked\n", 18);
+    /* The root mapping: a rootfs path and its legacy alias name one file. */
+    long mapped = sys4(56, AT_FDCWD, (long)"/readme.txt", 0, 0);
+    if (mapped < 0) {
+        fail("root mapping failed\n", 19);
     }
+    sys1(57, mapped);
 
     long allowed = sys4(56, AT_FDCWD, (long)"/sfs/readme.txt", 0, 0);
     if (allowed < 0) {
@@ -51,7 +58,14 @@ void _start(void) {
     }
     sys1(57, allowed);
 
-    if (sys2(49, (long)"/bin", 0) != -EACCES) {
+    /* `/sfs/..` climbs out of the mount in the kernel tree; the Linux task
+     * must not see what is up there. */
+    long escaped = sys4(56, AT_FDCWD, (long)"/sfs/../readme.txt", 0, 0);
+    if (escaped != -EACCES) {
+        fail("read scope leaked\n", 18);
+    }
+
+    if (sys2(49, (long)"/sfs/..", 0) != -EACCES) {
         fail("chdir escaped scope\n", 21);
     }
     if (sys2(49, (long)"/sfs", 0) != 0) {

@@ -34,7 +34,9 @@ Active vector:
    AArch64 ELFs, implements the Linux syscall personality and maps it onto our
    VFS and drivers. With the feature off, none of it is linked in.
 3. **Phosh**: a software-rendered headless Wayland stack on top of the Linux
-   layer, exported into a host window.
+   layer, exported into a host window. The Linux root is **Alpine** (musl,
+   OpenRC, apk); `/sbin/init` → OpenRC → Phosh boots from a single SFS image
+   ([docs/ALPINE_OPENRC.md](docs/ALPINE_OPENRC.md)).
 
 Wolfser (the guest litehtml browser in the host-Qt window) remains available
 so pages can be viewed before the Linux stack is ready, but it is frozen
@@ -1451,6 +1453,7 @@ driver's contract.
 | [docs/M3_DRIVER.md](docs/M3_DRIVER.md) | M3.1a driver-task framework: region-scoped MMIO, driver resource table, `SYS_MMIO_GRANT`, limits and next DT slice |
 | [docs/M3_SIMPLEFB.md](docs/M3_SIMPLEFB.md) | M3.2a simplefb boot framebuffer: contract, Redmi panel constants, QEMU selftest, limits |
 | [docs/ALPINE_ENV.md](docs/ALPINE_ENV.md) | Alpine/musl userland on the Linux ABI: BusyBox, ash and apk-tools running from SFS; builder and limits |
+| [docs/ALPINE_OPENRC.md](docs/ALPINE_OPENRC.md) | Alpine + OpenRC + Phosh from one SFS image: Linux `/` = SFS `/sfs`, SFS symlinks, synthetic procfs, mount/PID-1/vfork fixes, the empty-deptree limitation |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
 
 Current verification snapshot (2026-11-08, console product): **217 host

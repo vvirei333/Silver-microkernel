@@ -352,6 +352,10 @@ pub struct Task {
     owns_space: bool,
     /// Thread-group id. `getpid` returns it; `gettid` returns `id`.
     tgid: u64,
+    /// Linux PID 1 view: an init process must report `getpid() == 1`, or
+    /// BusyBox init refuses to run. Set only for a task spawned from a
+    /// program named `init`; its children report `1` as their parent.
+    pid_one: bool,
     is_thread: bool,
     /// `CLONE_CHILD_CLEARTID`: clear this word and futex-wake it on exit.
     clear_child_tid: Option<u64>,
@@ -2887,6 +2891,33 @@ pub fn current_task_ppid() -> Option<u64> {
     current_task_mut().and_then(|task| task.ppid)
 }
 
+
+
+/// Linux `getpid`: PID 1 for an init task, the thread-group id otherwise.
+pub fn current_linux_pid() -> u64 {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
+        .map(|task| if task.pid_one { 1 } else { task.tgid })
+        .unwrap_or(0)
+}
+
+/// Linux `getppid`: a child of the init task reports 1, init reports 0.
+pub fn current_linux_ppid() -> u64 {
+    let Some(parent) = current_task_ppid() else {
+        return 0;
+    };
+    let manager = match scheduler_manager() {
+        Some(manager) => manager,
+        None => return 0,
+    };
+    manager
+        .tasks
+        .iter()
+        .find(|task| task.id == parent)
+        .map(|task| if task.pid_one { 1 } else { task.tgid })
+        .unwrap_or(0)
+}
+
 pub fn current_task_owns_console() -> bool {
     scheduler_manager()
         .and_then(|manager| manager.tasks.get(smp::current_index()))
@@ -3058,8 +3089,30 @@ pub fn read_path_allowed(task: u64, path: &str) -> bool {
 }
 
 /// Writable tree for Linux tasks. `/tmp` lives on the root RamFs, so it is a
-/// real, in-memory writable filesystem; SFS stays read-only.
+/// real, in-memory writable filesystem; SFS stays read-only **except** for the
+/// service subtrees a real init writes (`/run`, `/var`, `/etc`, `/tmp`).
 pub const LINUX_SCRATCH_PREFIX: &str = "/tmp";
+
+/// VFS paths a Linux task may write. SFS itself remains read-only for
+/// ordinary files; these are the subtrees OpenRC and its services need.
+pub const LINUX_WRITABLE_PREFIXES: [&str; 5] =
+    ["/tmp", "/sfs/run", "/sfs/var", "/sfs/etc", "/sfs/tmp"];
+
+/// Whether `path` is under a writable subtree for Linux tasks.
+pub fn linux_write_allowed(path: &str) -> bool {
+    LINUX_WRITABLE_PREFIXES
+        .iter()
+        .any(|prefix| silver_microkernel::path_is_under(path, prefix))
+}
+
+/// RAM-backed writable subtrees (`/tmp`, `/run`, `/var`). Unlike SFS, these
+/// report a non-executable `0644`: SFS stores no mode bits and every image
+/// file must stay executable for shell/service scripts.
+pub fn linux_ram_path(path: &str) -> bool {
+    ["/tmp", "/sfs/run", "/sfs/var"]
+        .iter()
+        .any(|prefix| silver_microkernel::path_is_under(path, prefix))
+}
 
 pub fn current_read_path_allowed(path: &str) -> bool {
     read_path_allowed(current_task_id(), path)
@@ -3989,6 +4042,19 @@ impl Drop for ForkParts {
 /// duplicated, and the child's parent is the caller.
 #[cfg(feature = "linux-abi")]
 pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u64> {
+    fork_current_with_sp(frame, None)
+}
+
+/// Fork the current Linux task. `user_sp` overrides the child's initial
+/// userspace stack: `clone(CLONE_VM|CLONE_VFORK)` from musl's `__clone`
+/// (used by `posix_spawn`) hands the child a dedicated stack and a function
+/// pointer stored at its top; resuming on the parent's stack would make the
+/// child read garbage and jump to it.
+#[cfg(feature = "linux-abi")]
+pub fn fork_current_with_sp(
+    frame: &[u64; crate::syscall::FRAME_QUADWORDS],
+    user_sp: Option<u64>,
+) -> Option<u64> {
     let manager = scheduler_manager()?;
     if !has_task_capacity(manager) {
         return None;
@@ -4387,7 +4453,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
 
     let mut context = TaskContext::zero();
     context.stack_pointer = frame_address as u64;
-    context.user_stack_pointer = user_stack_pointer;
+    context.user_stack_pointer = user_sp.unwrap_or(user_stack_pointer);
     context.elr = silver_fork_bootstrap as *const () as usize as u64;
     context.tls = parent_tls;
 
@@ -4401,6 +4467,7 @@ pub fn fork_current(frame: &[u64; crate::syscall::FRAME_QUADWORDS]) -> Option<u6
         read_prefix: parent_read_prefix,
         owns_space: true,
         tgid: child_id,
+        pid_one: false,
         is_thread: false,
         clear_child_tid: None,
         id: child_id,
@@ -4565,6 +4632,7 @@ pub fn spawn_thread(
         read_prefix,
         owns_space: false,
         tgid,
+        pid_one: false,
         is_thread: true,
         clear_child_tid,
         id,
@@ -6219,6 +6287,17 @@ impl Task {
         }
 
         #[cfg(feature = "linux-abi")]
+        let pid_one = personality == Personality::Linux
+            && argv
+                .first()
+                .map(|argument| {
+                    let name = argument.rsplit(|byte| *byte == b'/').next().unwrap_or(argument);
+                    name == b"init"
+                })
+                .unwrap_or(false);
+        #[cfg(not(feature = "linux-abi"))]
+        let pid_one = false;
+        #[cfg(feature = "linux-abi")]
         let read_prefix = match personality {
             Personality::Linux => Some(String::from("/sfs")),
             Personality::Native => None,
@@ -6234,6 +6313,7 @@ impl Task {
             read_prefix,
             owns_space: true,
             tgid: id,
+            pid_one,
             is_thread: false,
             clear_child_tid: None,
             id,
@@ -6253,7 +6333,11 @@ impl Task {
             resources_released: false,
             argv,
             envp,
-            cwd: String::from("/"),
+            cwd: match personality {
+                #[cfg(feature = "linux-abi")]
+                Personality::Linux => String::from("/sfs"),
+                Personality::Native => String::from("/"),
+            },
             owns_console: cfg!(feature = "demo-tasks"),
             context,
             fp: smp::FpState::zero(),

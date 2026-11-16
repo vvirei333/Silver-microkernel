@@ -52,6 +52,7 @@ const SYS_LSEEK: u64 = 62;
 const SYS_READ: u64 = 63;
 const SYS_WRITE: u64 = 64;
 const SYS_WRITEV: u64 = 66;
+const SYS_READV: u64 = 65;
 const SYS_READLINKAT: u64 = 78;
 const SYS_FSTAT: u64 = 80;
 const SYS_NEWFSTATAT: u64 = 79;
@@ -69,7 +70,7 @@ const SYS_KILL: u64 = 129;
 const SYS_TGKILL: u64 = 131;
 const SYS_SIGALTSTACK: u64 = 132;
 const SYS_RT_SIGACTION: u64 = 134;
-const SYS_RT_SIGRETURN: u64 = 139;
+pub const SYS_RT_SIGRETURN: u64 = 139;
 const SYS_CLOCK_GETRES: u64 = 114;
 const SYS_CLOCK_NANOSLEEP: u64 = 115;
 const SYS_NANOSLEEP: u64 = 101;
@@ -109,6 +110,22 @@ const SYS_MKDIRAT: u64 = 34;
 const SYS_UNLINKAT: u64 = 35;
 const SYS_RENAMEAT: u64 = 38;
 const SYS_RENAMEAT2: u64 = 276;
+const SYS_UMOUNT2: u64 = 39;
+const SYS_MOUNT: u64 = 40;
+const SYS_PIVOT_ROOT: u64 = 41;
+const SYS_STATFS: u64 = 43;
+const SYS_FSTATFS: u64 = 44;
+const SYS_CHROOT: u64 = 51;
+const SYS_SETPGID: u64 = 154;
+const SYS_GETPGID: u64 = 155;
+const SYS_GETSID: u64 = 156;
+const SYS_SETSID: u64 = 157;
+const SYS_SETHOSTNAME: u64 = 161;
+const SYS_GETRUSAGE: u64 = 165;
+const SYS_UMASK: u64 = 166;
+const SYS_SYSINFO: u64 = 179;
+const SYS_UTIMENSAT: u64 = 88;
+const SYS_FACCESSAT2: u64 = 439;
 const SYS_FTRUNCATE: u64 = 46;
 const SYS_FALLOCATE: u64 = 47;
 const SYS_SOCKET: u64 = 198;
@@ -158,6 +175,64 @@ const fn errno(code: u64) -> u64 {
     (code as i64).wrapping_neg() as u64
 }
 
+/// Kernel namespaces that stay global in the Linux view. Everything else an
+/// absolute path names lives in the SFS mount: Linux's `/` **is** the SFS
+/// root, the layout a postmarketOS-style rootfs expects.
+const GLOBAL_PREFIXES: [&str; 5] = ["/sfs", "/tmp", "/dev", "/proc", "/sys"];
+
+/// Maps a Linux absolute path into the kernel's VFS tree.
+///
+/// `--no-linux` tasks never call this. `/sfs` stays an alias so the existing
+/// Arch-staged Phosh image (which was patched to `/sfs/...`) keeps working.
+pub fn map_absolute(path: &str) -> String {
+    for prefix in GLOBAL_PREFIXES {
+        if path == prefix
+            || (path.starts_with(prefix) && path.as_bytes().get(prefix.len()) == Some(&b'/'))
+        {
+            return String::from(path);
+        }
+    }
+    let mut mapped = String::with_capacity(path.len() + 4);
+    mapped.push_str("/sfs");
+    mapped.push_str(path);
+    mapped
+}
+
+/// Resolves a Linux path (relative to `cwd`) into the VFS tree.
+pub fn resolve(cwd: &str, path: &str) -> Result<String, ()> {
+    if path.starts_with('/') {
+        crate::vfs::resolve("/", &map_absolute(path))
+    } else {
+        crate::vfs::resolve(cwd, path)
+    }
+}
+
+/// Like [`resolve`], but the result must be a directory.
+pub fn resolve_directory(cwd: &str, path: &str) -> Result<String, ()> {
+    let resolved = resolve(cwd, path)?;
+    if crate::vfs::resolve_directory("/", &resolved).is_ok() {
+        Ok(resolved)
+    } else {
+        Err(())
+    }
+}
+
+/// The reverse mapping for `getcwd`: hide the `/sfs` mount point.
+pub fn display_path(path: &str) -> String {
+    if path == "/sfs" {
+        return String::from("/");
+    }
+    match path.strip_prefix("/sfs/") {
+        Some(rest) => {
+            let mut shown = String::with_capacity(rest.len() + 1);
+            shown.push('/');
+            shown.push_str(rest);
+            shown
+        }
+        None => String::from(path),
+    }
+}
+
 /// `PROT_*` are identical in Linux and the Silver ABI (R=1, W=2, X=4).
 const MAP_FIXED: u64 = 0x10;
 
@@ -173,6 +248,8 @@ const MSG_CTRUNC: i32 = 0x8;
 /// `openat` / `newfstatat` conventions.
 const AT_FDCWD: i64 = -100;
 const AT_EMPTY_PATH: u64 = 0x1000;
+/// `newfstatat`/`statx`: report the link itself instead of its target.
+const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 /// `struct stat` mode classes.
 const S_IFLNK: u32 = 0o120000;
 const S_IFCHR: u32 = 0o020000;
@@ -195,6 +272,7 @@ fn dispatch_inner(
     match number {
         SYS_WRITE => linux_write(args[0], args[1], args[2]),
         SYS_WRITEV => linux_writev(args[0], args[1], args[2]),
+        SYS_READV => linux_readv(args[0], args[1], args[2]),
         SYS_READ => finish(linux_fd::read(scheduler::current_task_id(), args[0], args[1], args[2])),
         SYS_OPENAT => linux_openat(args[0], args[1], args[2], args[3]),
         SYS_EPOLL_CREATE1 => linux_epoll_create(args[0]),
@@ -265,6 +343,22 @@ fn dispatch_inner(
         SYS_FCHMOD | SYS_FCHOWN => linux_fchmod(args[0]),
         SYS_FCHMODAT | SYS_FCHOWNAT => linux_fchmodat(args[0], args[1]),
         SYS_CLOSE_RANGE => linux_close_range(args[0], args[1], args[2]),
+        SYS_MOUNT => linux_mount(args[0], args[1], args[2], args[3]),
+        SYS_UMOUNT2 => linux_umount(args[0], args[1]),
+        // The Linux root already is the SFS mount; a chroot cannot narrow it
+        // further because every path is mapped onto `/sfs`.
+        SYS_CHROOT => 0,
+        SYS_PIVOT_ROOT => errno(ENOSYS),
+        SYS_SETSID => scheduler::current_tgid(),
+        SYS_SETPGID | SYS_SETHOSTNAME => 0,
+        SYS_GETPGID | SYS_GETSID => scheduler::current_tgid(),
+        SYS_UMASK => 0o22,
+        SYS_GETRUSAGE => linux_zero_struct(args[1], 144),
+        SYS_SYSINFO => linux_zero_struct(args[0], 112),
+        SYS_STATFS => linux_zero_struct(args[1], 120),
+        SYS_FSTATFS => linux_zero_struct(args[2], 120),
+        SYS_UTIMENSAT => 0,
+        SYS_FACCESSAT2 => linux_faccessat(args[0], args[1], args[2]),
         SYS_FACCESSAT => linux_faccessat(args[0], args[1], args[2]),
         SYS_GETDENTS64 => finish(linux_fd::getdents64(
             scheduler::current_task_id(),
@@ -299,9 +393,9 @@ fn dispatch_inner(
         SYS_KILL => linux_kill(args[0] as i64, args[1]),
         SYS_TGKILL => linux_kill(args[1] as i64, args[2]),
         SYS_UNAME => linux_uname(args[0]),
-        SYS_GETPID => scheduler::current_tgid(),
+        SYS_GETPID => scheduler::current_linux_pid(),
         SYS_GETTID => scheduler::current_task_id(),
-        SYS_GETPPID => scheduler::current_task_ppid().unwrap_or(0),
+        SYS_GETPPID => scheduler::current_linux_ppid(),
         SYS_GETUID | SYS_GETEUID | SYS_GETGID | SYS_GETEGID => 0,
         SYS_GETRLIMIT => linux_getrlimit(args[0], args[1]),
         SYS_SCHED_GETAFFINITY => linux_sched_getaffinity(args[1], args[2]),
@@ -397,20 +491,50 @@ fn linux_execve(
         return errno(EFAULT);
     };
     let cwd = scheduler::current_task_cwd();
-    let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
-        return errno(ENOENT);
+    let mut target = path;
+    let mut arguments = argv;
+    let mut depth = 0u32;
+    let resolved = loop {
+        let Ok(resolved) = resolve(&cwd, &target) else {
+            return errno(ENOENT);
+        };
+        if !scheduler::current_read_path_allowed(&resolved) {
+            return errno(EACCES);
+        }
+        match crate::vfs::file_len(&cwd, &resolved) {
+            Ok(length) if length <= EXEC_LIMIT => {}
+            _ => return errno(ENOENT),
+        }
+        // A `#!` script is executed through its interpreter, like Linux: the
+        // kernel never tries to load shell text as an ELF.
+        let header = crate::vfs::read_at(&cwd, &resolved, 0, 256).unwrap_or_default();
+        if header.starts_with(b"#!") {
+            depth += 1;
+            if depth > 4 {
+                return errno(ENOEXEC);
+            }
+            let Some((interpreter, argument)) = parse_shebang(&header[2..]) else {
+                return errno(ENOEXEC);
+            };
+            let mut next = Vec::with_capacity(arguments.len() + 2);
+            next.push(interpreter.clone().into_bytes());
+            if let Some(argument) = argument {
+                next.push(argument.into_bytes());
+            }
+            next.push(target.clone().into_bytes());
+            for item in arguments.iter().skip(1) {
+                next.push(item.clone());
+            }
+            arguments = next;
+            target = interpreter;
+            continue;
+        }
+        break resolved;
     };
-    if !scheduler::current_read_path_allowed(&resolved) {
-        return errno(EACCES);
-    }
-    match crate::vfs::file_len(&cwd, &resolved) {
-        Ok(length) if length <= EXEC_LIMIT => {}
-        _ => return errno(ENOENT),
-    }
     let Ok(image) = crate::linux_elf::load_linux_program_path(&cwd, &resolved, EXEC_LIMIT) else {
         return errno(ENOEXEC);
     };
-    let Some(result) = scheduler::exec_linux_current(image, argv, envp) else {
+    let Some(result) = scheduler::exec_linux_current(image, arguments, envp) else {
         return errno(ENOMEM);
     };
     // A successful exec closes every `FD_CLOEXEC` descriptor. Rust's
@@ -426,6 +550,31 @@ fn linux_execve(
     0
 }
 
+/// Parses the rest of a `#!` line: the interpreter path and at most one
+/// optional argument (Linux passes the remainder as one argument).
+fn parse_shebang(bytes: &[u8]) -> Option<(String, Option<String>)> {
+    let line = bytes.split(|byte| *byte == b'\n').next()?;
+    let text = core::str::from_utf8(line).ok()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let (interpreter, rest) = match text.split_once(|character: char| character.is_whitespace()) {
+        Some((interpreter, rest)) => (interpreter, rest.trim()),
+        None => (text, ""),
+    };
+    if interpreter.is_empty() {
+        return None;
+    }
+    Some((
+        String::from(interpreter),
+        if rest.is_empty() {
+            None
+        } else {
+            Some(String::from(rest))
+        },
+    ))
+}
+
 /// `clone(2)` with fork semantics (`SIGCHLD`, no shared VM). Thread creation
 /// is not supported yet and is reported as `-ENOSYS`.
 fn linux_clone(
@@ -437,6 +586,7 @@ fn linux_clone(
     child_tid: u64,
 ) -> u64 {
     const CLONE_VM: u64 = 0x0000_0100;
+    const CLONE_VFORK: u64 = 0x0000_4000;
     const CLONE_SIGHAND: u64 = 0x0000_0800;
     const CLONE_THREAD: u64 = 0x0001_0000;
     const CLONE_SETTLS: u64 = 0x0008_0000;
@@ -445,6 +595,30 @@ fn linux_clone(
     const CLONE_CHILD_SETTID: u64 = 0x0100_0000;
 
     if flags & CLONE_VM != 0 {
+        if flags & CLONE_VFORK != 0 && flags & CLONE_THREAD == 0 {
+            // `vfork`: BusyBox, dash and musl's `posix_spawn` compile spawn
+            // paths against it. Real vfork shares the address space and
+            // suspends the parent until the child execs; a full copy is
+            // semantically safe for the `vfork`/`execve` pattern and keeps
+            // the parent runnable. A non-zero `stack` is musl's `__clone`
+            // trampoline: the child must start on *that* stack, because the
+            // function pointer it calls is stored at its top.
+            return match scheduler::fork_current_with_sp(
+                frame,
+                if stack != 0 { Some(stack) } else { None },
+            ) {
+                Some(pid) => {
+                    if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
+                        let _ = user_memory::copy_to_user(
+                            &(pid as u32).to_le_bytes(),
+                            parent_tid,
+                        );
+                    }
+                    pid
+                }
+                None => errno(EAGAIN),
+            };
+        }
         if flags & CLONE_THREAD == 0 {
             // Shared VM without a thread group would need a process object.
             return errno(ENOSYS);
@@ -472,7 +646,10 @@ fn linux_clone(
         };
     }
 
-    if stack != 0 || tls != 0 || flags & CLONE_THREAD != 0 || flags & CLONE_SIGHAND != 0 {
+    // A plain `fork` may still pass a stack/TLS pointer (musl's `fork`
+    // forwards TPIDR_EL0); `fork_current` copies the parent's TLS, so both
+    // are ignored rather than rejected.
+    if flags & CLONE_THREAD != 0 || flags & CLONE_SIGHAND != 0 {
         return errno(EINVAL);
     }
     match scheduler::fork_current(frame) {
@@ -1190,7 +1367,7 @@ fn linux_fchmodat(dirfd: u64, path_pointer: u64) -> u64 {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
-    match crate::vfs::resolve(&cwd, &path) {
+    match resolve(&cwd, &path) {
         Ok(_) => 0,
         Err(_) => errno(ENOENT),
     }
@@ -1552,30 +1729,87 @@ fn finish(result: Result<u64, u64>) -> u64 {
     }
 }
 
-/// `writev(2)`: scatter output over up to 16 `struct iovec`s.
-fn linux_writev(fd: u64, iovec: u64, count: u64) -> u64 {
-    const MAX_IOVECS: u64 = 16;
+/// Reads one `struct iovec` (base, length) out of user memory.
+fn iovec_at(iovec: u64, index: u64) -> Option<(u64, u64)> {
     const IOVEC_BYTES: u64 = 16;
+    let mut entry = [0_u8; 16];
+    let address = iovec.wrapping_add(index * IOVEC_BYTES);
+    if user_memory::copy_from_user(address, &mut entry).is_err() {
+        return None;
+    }
+    Some((
+        u64::from_le_bytes(entry[..8].try_into().unwrap()),
+        u64::from_le_bytes(entry[8..].try_into().unwrap()),
+    ))
+}
+
+/// `writev(2)`: scatter output over up to 64 `struct iovec`s.
+///
+/// musl's stdio writes every stream through `writev`, not `write`; the old
+/// implementation only accepted the console (`fd 1`/`2`) and returned
+/// `EBADF` for files, so `openrc` silently produced a zero-byte `deptree`.
+fn linux_writev(fd: u64, iovec: u64, count: u64) -> u64 {
+    const MAX_IOVECS: u64 = 64;
     if count > MAX_IOVECS {
         return errno(EINVAL);
     }
-    if fd != 1 && fd != 2 {
-        return errno(EBADF);
+    let mut total = 0u64;
+    for index in 0..count {
+        let Some((base, mut length)) = iovec_at(iovec, index) else {
+            return if total > 0 { total } else { errno(EFAULT) };
+        };
+        let mut address = base;
+        while length > 0 {
+            let written = linux_write(fd, address, length);
+            if (written as i64) < 0 {
+                return if total > 0 { total } else { written };
+            }
+            if written == 0 {
+                return total;
+            }
+            total += written;
+            address = address.wrapping_add(written);
+            length -= written;
+        }
+    }
+    total
+}
+
+/// `readv(2)`: gather input into up to 64 `struct iovec`s. musl's stdio
+/// reads streams through `readv`, so without this `deptree_load` and every
+/// other `FILE` read saw `ENOSYS`.
+fn linux_readv(fd: u64, iovec: u64, count: u64) -> u64 {
+    const MAX_IOVECS: u64 = 64;
+    if count > MAX_IOVECS {
+        return errno(EINVAL);
     }
     let mut total = 0u64;
     for index in 0..count {
-        let mut entry = [0_u8; 16];
-        let address = iovec.wrapping_add(index * IOVEC_BYTES);
-        if user_memory::copy_from_user(address, &mut entry).is_err() {
-            return errno(EFAULT);
+        let Some((base, length)) = iovec_at(iovec, index) else {
+            return if total > 0 { total } else { errno(EFAULT) };
+        };
+        let mut done = 0u64;
+        while done < length {
+            let remaining = length - done;
+            let read = finish(linux_fd::read(
+                scheduler::current_task_id(),
+                fd,
+                base.wrapping_add(done),
+                remaining,
+            ));
+            if (read as i64) < 0 {
+                return if total > 0 { total } else { read };
+            }
+            if read == 0 {
+                return total;
+            }
+            total += read;
+            done += read;
+            // A short read ends the call: the next descriptor must not block.
+            if read < remaining {
+                return total;
+            }
         }
-        let base = u64::from_le_bytes(entry[..8].try_into().unwrap());
-        let length = u64::from_le_bytes(entry[8..].try_into().unwrap());
-        let result = linux_write(fd, base, length);
-        if result == errno(EFAULT) {
-            return result;
-        }
-        total += length;
     }
     total
 }
@@ -1673,10 +1907,13 @@ fn linux_faccessat(dirfd: u64, path_ptr: u64, mode: u64) -> u64 {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
-    let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
+    let Ok(resolved) = resolve(&cwd, &path) else {
         return errno(ENOENT);
     };
-    if crate::sysfs::lookup(&resolved).is_some() || linux_fd::device_exists(&resolved) {
+    if crate::sysfs::lookup(&resolved).is_some()
+        || crate::procfs::lookup(&resolved).is_some()
+        || linux_fd::device_exists(&resolved)
+    {
         // Synthetic nodes are read-only; a write probe reports EROFS like the
         // rest of the image.
         return if mode & W_OK != 0 { errno(EROFS) } else { 0 };
@@ -1684,9 +1921,7 @@ fn linux_faccessat(dirfd: u64, path_ptr: u64, mode: u64) -> u64 {
     if !scheduler::current_read_path_allowed(&resolved) {
         return errno(EACCES);
     }
-    if mode & W_OK != 0
-        && !silver_microkernel::path_is_under(&resolved, crate::scheduler::LINUX_SCRATCH_PREFIX)
-    {
+    if mode & W_OK != 0 && !crate::scheduler::linux_write_allowed(&resolved) {
         // SFS is read-only; the Linux scratch tree (`/tmp`) is the one place
         // a toolkit may create caches. A blanket EROFS made fontconfig
         // declare every cache directory unwritable.
@@ -1721,10 +1956,11 @@ fn linux_newfstatat(dirfd: u64, path_ptr: u64, buffer: u64, flags: u64) -> u64 {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
-    let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
+    let Ok(resolved) = resolve(&cwd, &path) else {
         return errno(ENOENT);
     };
-    match stat_resolved(&cwd, &path, &resolved) {
+    let follow = flags & AT_SYMLINK_NOFOLLOW == 0;
+    match stat_resolved(&cwd, &path, &resolved, follow) {
         Ok((mode, size, ino, Some(rdev))) => {
             finish(linux_fd::write_stat_rdev(buffer, mode, size, ino, rdev).map(|_| 0))
         }
@@ -1740,6 +1976,7 @@ fn stat_resolved(
     cwd: &str,
     path: &str,
     resolved: &str,
+    follow: bool,
 ) -> Result<(u32, u64, u64, Option<u64>), u64> {
     if let Some(node) = crate::sysfs::lookup(resolved) {
         let (mode, size) = match node {
@@ -1749,24 +1986,35 @@ fn stat_resolved(
         };
         return Ok((mode, size, linux_fd::path_ino(resolved), None));
     }
+    if let Some(node) = crate::procfs::lookup(resolved) {
+        let (mode, size) = match node {
+            crate::procfs::Node::File(data) => (S_IFREG | 0o444, data.len() as u64),
+            crate::procfs::Node::Dir(names) => (S_IFDIR | 0o555, names.len() as u64),
+            crate::procfs::Node::Symlink(target) => (S_IFLNK | 0o777, target.len() as u64),
+        };
+        return Ok((mode, size, linux_fd::path_ino(resolved), None));
+    }
     if let Some((mode, rdev)) = synthetic_device_stat(resolved) {
         return Ok((mode, 0, linux_fd::path_ino(resolved), Some(rdev)));
     }
     if !scheduler::current_read_path_allowed(resolved) {
         return Err(EACCES);
     }
+    // `lstat`/`AT_SYMLINK_NOFOLLOW` reports the link itself. SFS stores the
+    // target in the inode; following it is the default `stat` path below.
+    if !follow && crate::vfs::lstat_kind("/", resolved).ok() == Some(3) {
+        let length = crate::vfs::link_len("/", resolved).unwrap_or(0) as u64;
+        return Ok((S_IFLNK | 0o777, length, linux_fd::path_ino(resolved), None));
+    }
     // Directories first: the SFS backend reports a directory inode's size as
     // 0, so `file_len` succeeds for one and used to classify it as a regular
     // file. Toolkits stat XDG/data directories and reject a "file" where a
     // directory is required (xkbcommon refused its own config root).
-    if crate::vfs::read_dir(cwd, path).is_ok() {
+    if crate::vfs::read_dir("/", resolved).is_ok() {
         return Ok((S_IFDIR | 0o755, 0, linux_fd::path_ino(resolved), None));
     }
-    if let Ok(size) = crate::vfs::file_len(cwd, path) {
-        let file_mode = if silver_microkernel::path_is_under(
-            resolved,
-            crate::scheduler::LINUX_SCRATCH_PREFIX,
-        ) {
+    if let Ok(size) = crate::vfs::file_len("/", resolved) {
+        let file_mode = if crate::scheduler::linux_ram_path(resolved) {
             S_IFREG | 0o644
         } else {
             // SFS stores no permission bits and is read-only; report files
@@ -1798,10 +2046,10 @@ fn linux_statx(dirfd: u64, path_ptr: u64, flags: u64, _mask: u64, buffer: u64) -
             Ok(cwd) => cwd,
             Err(code) => return code,
         };
-        let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
+        let Ok(resolved) = resolve(&cwd, &path) else {
             return errno(ENOENT);
         };
-        match stat_resolved(&cwd, &path, &resolved) {
+        match stat_resolved(&cwd, &path, &resolved, flags & AT_SYMLINK_NOFOLLOW == 0) {
             Ok(fields) => fields,
             Err(code) => return errno(code),
         }
@@ -1861,11 +2109,18 @@ fn linux_readlinkat(dirfd: u64, path_ptr: u64, buffer: u64, size: u64) -> u64 {
         Ok(cwd) => cwd,
         Err(code) => return code,
     };
-    let Ok(resolved) = crate::vfs::resolve(&cwd, &path) else {
+    let Ok(resolved) = resolve(&cwd, &path) else {
         return errno(ENOENT);
     };
-    let Some(target) = crate::sysfs::symlink(&resolved) else {
-        return errno(ENOENT);
+    let target = match crate::sysfs::symlink(&resolved) {
+        Some(target) => String::from(target),
+        None => match crate::procfs::lookup(&resolved) {
+            Some(crate::procfs::Node::Symlink(target)) => String::from(target),
+            _ => match crate::vfs::read_link("/", &resolved) {
+                Ok(target) => target,
+                Err(()) => return errno(EINVAL),
+            },
+        },
     };
     let bytes = target.as_bytes();
     let take = bytes.len().min(size as usize);
@@ -1916,7 +2171,7 @@ fn linux_fcntl(fd: u64, command: u64, argument: u64) -> u64 {
 }
 
 fn linux_getcwd(buffer: u64, capacity: u64) -> u64 {
-    let cwd = scheduler::current_task_cwd();
+    let cwd = display_path(&scheduler::current_task_cwd());
     let bytes = cwd.as_bytes();
     if bytes.len() + 1 > capacity as usize {
         return errno(ERANGE);
@@ -1942,11 +2197,13 @@ fn scratch_resolved(dirfd: u64, path_pointer: u64) -> Result<(String, String), u
         return Err(ENOENT);
     }
     let cwd = dirfd_cwd(dirfd)?;
-    let resolved = crate::vfs::resolve(&cwd, &path).map_err(|_| ENOENT)?;
-    if !silver_microkernel::path_is_under(&resolved, crate::scheduler::LINUX_SCRATCH_PREFIX) {
+    let resolved = resolve(&cwd, &path).map_err(|_| ENOENT)?;
+    if !crate::scheduler::linux_write_allowed(&resolved) {
         return Err(EROFS);
     }
-    Ok((cwd, path))
+    // The mapped absolute path is what the VFS mutation must use: a relative
+    // name under `/run` lives at `/sfs/run` in the kernel tree.
+    Ok((String::from("/"), resolved))
 }
 
 fn linux_mkdirat(dirfd: u64, path_pointer: u64, _mode: u64) -> u64 {
@@ -1974,7 +2231,7 @@ fn linux_unlinkat(dirfd: u64, path_pointer: u64, flags: u64) -> u64 {
     // scratch VFS; wlroots calls shm_unlink() on every buffer it allocates.
     if let Some(path) = user_string(path_pointer) {
         if let Ok(cwd) = dirfd_cwd(dirfd) {
-            if let Ok(resolved) = crate::vfs::resolve(&cwd, &path) {
+            if let Ok(resolved) = resolve(&cwd, &path) {
                 if let Some(name) = resolved.strip_prefix("/dev/shm/") {
                     return match linux_fd::shm_unlink(name) {
                         Ok(()) => 0,
@@ -2035,7 +2292,7 @@ fn linux_chdir(path_ptr: u64) -> u64 {
         return errno(EFAULT);
     };
     let cwd = scheduler::current_task_cwd();
-    let Ok(resolved) = crate::vfs::resolve_directory(&cwd, &path) else {
+    let Ok(resolved) = resolve_directory(&cwd, &path) else {
         return errno(ENOENT);
     };
     if !scheduler::current_read_path_allowed(&resolved) {
@@ -2581,4 +2838,71 @@ fn linux_getrandom(buffer: u64, length: u64, flags: u64) -> u64 {
         return errno(EFAULT);
     }
     length as u64
+}
+
+/// `mount(2)`. The kernel has no mountable block filesystems in the Linux
+/// view: `proc`/`sysfs`/`devtmpfs`/`cgroup*` are synthetic and answered from
+/// the kernel tables, and `tmpfs` becomes a `ramfs` backend inside the
+/// writable service subtrees. Flags are accepted and ignored.
+fn linux_mount(source: u64, target: u64, filesystem: u64, _flags: u64) -> u64 {
+    let _ = source;
+    let Some(target) = user_string(target) else {
+        return errno(EFAULT);
+    };
+    let filesystem = if filesystem == 0 {
+        String::new()
+    } else {
+        match user_string(filesystem) {
+            Some(name) => name,
+            None => return errno(EFAULT),
+        }
+    };
+    match filesystem.as_str() {
+        "proc" | "sysfs" | "devtmpfs" | "devpts" | "cgroup" | "cgroup2" | "securityfs"
+        | "debugfs" | "tracefs" | "mqueue" | "efivarfs" | "fusectl" | "configfs" => 0,
+        "tmpfs" | "ramfs" | "" => {
+            let Ok(resolved) = resolve("/", &target) else {
+                return errno(ENOENT);
+            };
+            if !scheduler::linux_write_allowed(&resolved) {
+                return errno(EACCES);
+            }
+            if crate::vfs::mount("/", &resolved, "ramfs", "", 0, |_| false).is_ok() {
+                return 0;
+            }
+            // An existing mount is success; a missing directory is ENOENT.
+            match crate::vfs::resolve_directory("/", &resolved) {
+                Ok(_) => 0,
+                Err(()) => errno(ENOENT),
+            }
+        }
+        _ => errno(EINVAL),
+    }
+}
+
+/// `umount2(2)`: synthetic mounts are permanent and the kernel never wants a
+/// Linux task to detach the root, so this is an idempotent success for a path
+/// that resolves and `ENOENT` otherwise.
+fn linux_umount(target: u64, _flags: u64) -> u64 {
+    let Some(target) = user_string(target) else {
+        return errno(EFAULT);
+    };
+    match resolve("/", &target) {
+        Ok(_) => 0,
+        Err(()) => errno(ENOENT),
+    }
+}
+
+/// Zero-fills a user structure for the calls whose values do not matter to a
+/// booting init (`getrusage`, `sysinfo`, `statfs`). A null pointer is a
+/// no-op, matching the kernel's tolerance for optional outputs.
+fn linux_zero_struct(pointer: u64, length: usize) -> u64 {
+    if pointer == 0 {
+        return 0;
+    }
+    let bytes = alloc::vec![0_u8; length];
+    if user_memory::copy_to_user(&bytes, pointer).is_err() {
+        return errno(EFAULT);
+    }
+    0
 }

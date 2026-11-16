@@ -2,7 +2,8 @@
  *
  *   linuxrun /sfs/linux-scratch
  *
- * Expected: "scratch ok" and exit 0.
+ * Expected: "scratch ok" and exit 0. `XDG_RUNTIME_DIR` is the writable
+ * scratch tree `/tmp`.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -17,7 +18,9 @@ int main(void) {
     if (runtime == 0 || strcmp(runtime, "/tmp") != 0) {
         return 17;
     }
-    if (mkdir("/tmp/wayland-0", 0700) != 0 && errno != EEXIST) {
+    char socket_dir[64];
+    snprintf(socket_dir, sizeof socket_dir, "%s/wayland-0", runtime);
+    if (mkdir(socket_dir, 0700) != 0 && errno != EEXIST) {
         perror("mkdir");
         return 2;
     }
@@ -70,7 +73,9 @@ int main(void) {
     close(fd);
 
     /* A file inside the runtime directory, then clean up. */
-    fd = open("/tmp/wayland-0/display.lock", O_CREAT | O_RDWR, 0600);
+    char display_lock[96];
+    snprintf(display_lock, sizeof display_lock, "%s/display.lock", socket_dir);
+    fd = open(display_lock, O_CREAT | O_RDWR, 0600);
     if (fd < 0 || write(fd, "1", 1) != 1) {
         return 12;
     }
@@ -78,10 +83,10 @@ int main(void) {
     if (unlink("/tmp/wtest.lock") != 0) {
         return 13;
     }
-    if (unlink("/tmp/wayland-0/display.lock") != 0) {
+    if (unlink(display_lock) != 0) {
         return 14;
     }
-    if (rmdir("/tmp/wayland-0") != 0) {
+    if (rmdir(socket_dir) != 0) {
         return 15;
     }
 

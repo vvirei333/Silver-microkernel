@@ -251,6 +251,8 @@ enum Target {
     Drm { render: bool },
     /// A file in the synthetic sysfs tree (DRM device description).
     Sysfs(&'static [u8], usize),
+    /// A file in the synthetic procfs tree (read-only, process must be init).
+    Proc(&'static [u8], usize),
     /// A synthetic directory listing (`/dev/dri`), with the next entry index.
     DirList {
         entries: &'static [&'static str],
@@ -293,6 +295,10 @@ enum Target {
 struct Table {
     task: u64,
     slots: Vec<Option<Target>>,
+    /// `O_ACCMODE` bits of the `open` that created each slot. `fdopen` and
+    /// friends cross-check the requested mode against `fcntl(F_GETFL)`, and a
+    /// hardcoded `O_RDONLY` made every write stream fail with `EINVAL`.
+    access: Vec<u64>,
     /// Descriptor numbers carrying `FD_CLOEXEC`. `execve` closes exactly
     /// these, which is how Rust's `Command` learns that `execvp` succeeded
     /// (the parent reads EOF from the exec-error socketpair).
@@ -316,6 +322,7 @@ fn with_table<R>(task: u64, action: impl FnOnce(&mut Table) -> R) -> R {
             tables.push(Table {
                 task,
                 slots,
+                access: alloc::vec![O_RDWR; 3],
                 cloexec: Vec::new(),
             });
             tables.len() - 1
@@ -482,45 +489,72 @@ impl Target {
 }
 
 /// Installs `target` at the lowest free slot, growing the table.
+/// `O_ACCMODE` value shared with the Linux ABI (read is `0`).
+const O_RDWR: u64 = 2;
+
+fn set_access(table: &mut Table, fd: u64, access: u64) {
+    while table.access.len() <= fd as usize {
+        table.access.push(O_RDWR);
+    }
+    table.access[fd as usize] = access;
+}
+
+fn access_at(table: &Table, fd: u64) -> u64 {
+    table.access.get(fd as usize).copied().unwrap_or(O_RDWR)
+}
+
+fn insert_in(table: &mut Table, target: Target) -> Option<u64> {
+    for (index, slot) in table.slots.iter_mut().enumerate() {
+        if slot.is_none() {
+            *slot = Some(target);
+            set_access(table, index as u64, O_RDWR);
+            return Some(index as u64);
+        }
+    }
+    if table.slots.len() >= MAX_FDS {
+        return None;
+    }
+    table.slots.push(Some(target));
+    set_access(table, (table.slots.len() - 1) as u64, O_RDWR);
+    Some((table.slots.len() - 1) as u64)
+}
+
 fn insert(task: u64, target: Target) -> Option<u64> {
+    with_table(task, |table| insert_in(table, target))
+}
+
+/// Like [`insert`], but records the descriptor's `O_ACCMODE` bits so
+/// `fcntl(F_GETFL)` answers what `open` was asked for.
+fn insert_access(task: u64, target: Target, access: u64) -> Option<u64> {
     with_table(task, |table| {
-        for (index, slot) in table.slots.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(target);
-                return Some(index as u64);
-            }
-        }
-        if table.slots.len() >= MAX_FDS {
-            return None;
-        }
-        table.slots.push(Some(target));
-        Some((table.slots.len() - 1) as u64)
+        let fd = insert_in(table, target)?;
+        set_access(table, fd, access);
+        Some(fd)
     })
 }
 
-/// Installs `target` at or above `minimum` (for `fcntl(F_DUPFD)`).
-fn insert_from(task: u64, target: Target, minimum: u64) -> Option<u64> {
-    with_table(task, |table| {
-        let mut index = minimum as usize;
-        while index < table.slots.len() {
-            if table.slots[index].is_none() {
-                table.slots[index] = Some(target);
-                return Some(index as u64);
-            }
-            index += 1;
+fn insert_from_in(table: &mut Table, target: Target, minimum: u64) -> Option<u64> {
+    let mut index = minimum as usize;
+    while index < table.slots.len() {
+        if table.slots[index].is_none() {
+            table.slots[index] = Some(target);
+            set_access(table, index as u64, O_RDWR);
+            return Some(index as u64);
         }
-        while table.slots.len() < index {
-            if table.slots.len() >= MAX_FDS {
-                return None;
-            }
-            table.slots.push(None);
-        }
+        index += 1;
+    }
+    while table.slots.len() < index {
         if table.slots.len() >= MAX_FDS {
             return None;
         }
-        table.slots.push(Some(target));
-        Some((table.slots.len() - 1) as u64)
-    })
+        table.slots.push(None);
+    }
+    if table.slots.len() >= MAX_FDS {
+        return None;
+    }
+    table.slots.push(Some(target));
+    set_access(table, (table.slots.len() - 1) as u64, O_RDWR);
+    Some((table.slots.len() - 1) as u64)
 }
 
 /// Nodes listed by the synthetic `/dev/dri` directory.
@@ -538,11 +572,30 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     const O_APPEND: u64 = 0o2000;
     const O_DIRECTORY: u64 = 0o200000;
 
-    let resolved = vfs::resolve(cwd, path).map_err(|_| ENOENT)?;
-    // Synthetic sysfs first: it exists only in the kernel.
+    let resolved = crate::linux_abi::resolve(cwd, path).map_err(|_| ENOENT)?;
+    // Synthetic procfs first: OpenRC reads a handful of /proc files.
+    if let Some(node) = crate::procfs::lookup(&resolved) {
+        return match node {
+            crate::procfs::Node::File(data) => {
+                insert_access(task, Target::Proc(data, 0), 0).ok_or(EMFILE)
+            }
+            crate::procfs::Node::Dir(entries) => {
+                insert_access(task, Target::DirList { entries, offset: 0 }, 0).ok_or(EMFILE)
+            }
+            crate::procfs::Node::Symlink(target) => {
+                match target {
+                    "/dev/console" => insert(task, Target::Console).ok_or(EMFILE),
+                    _ => Err(EINVAL),
+                }
+            }
+        };
+    }
+    // Synthetic sysfs next: it exists only in the kernel.
     if let Some(node) = crate::sysfs::lookup(&resolved) {
         return match node {
-            crate::sysfs::Node::File(data) => insert(task, Target::Sysfs(data, 0)).ok_or(EMFILE),
+            crate::sysfs::Node::File(data) => {
+                insert_access(task, Target::Sysfs(data, 0), 0).ok_or(EMFILE)
+            }
             crate::sysfs::Node::Dir => Err(EISDIR),
             crate::sysfs::Node::Symlink(_) => Err(EINVAL),
         };
@@ -573,6 +626,7 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         .ok_or(EMFILE);
     }
     let device = match resolved.as_str() {
+        "/dev/console" | "/dev/tty" => Some(Target::Console),
         "/dev/null" => Some(Target::Null),
         "/dev/zero" => Some(Target::Zero),
         "/dev/full" => Some(Target::Full),
@@ -602,22 +656,21 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     let wants_write =
         flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND) != 0;
     if wants_write {
-        // SFS is read-only; only the RamFs scratch tree accepts writes.
-        if !silver_microkernel::path_is_under(&resolved, crate::scheduler::LINUX_SCRATCH_PREFIX)
-        {
+        // SFS is read-only except for the service subtrees an init writes.
+        if !crate::scheduler::linux_write_allowed(&resolved) {
             return Err(EROFS);
         }
-        let exists = vfs::file_len(cwd, path).is_ok();
+        let exists = vfs::file_len("/", &resolved).is_ok();
         if flags & O_CREAT != 0 && flags & O_EXCL != 0 && exists {
             return Err(EEXIST);
         }
         if flags & O_TRUNC != 0 {
-            vfs::create(cwd, path).map_err(|_| EACCES)?;
+            vfs::create("/", &resolved).map_err(|_| EACCES)?;
         } else if !exists {
             if flags & O_CREAT == 0 {
                 return Err(ENOENT);
             }
-            vfs::create(cwd, path).map_err(|_| EACCES)?;
+            vfs::create("/", &resolved).map_err(|_| EACCES)?;
         }
         let vfs_flags = crate::vfs::OPEN_WRITE
             | if flags & O_APPEND != 0 {
@@ -625,19 +678,19 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
             } else {
                 0
             };
-        let fd = vfs::open(task, cwd, path, vfs_flags).map_err(|_| EACCES)?;
-        return insert(task, Target::Vfs(fd)).ok_or(EMFILE);
+        let fd = vfs::open(task, "/", &resolved, vfs_flags).map_err(|_| EACCES)?;
+        return insert_access(task, Target::Vfs(fd), flags & 0o3).ok_or(EMFILE);
     }
     if flags & O_DIRECTORY != 0 {
-        let fd = vfs::open_dir(task, cwd, path).map_err(|_| ENOENT)?;
-        return insert(task, Target::Vfs(fd)).ok_or(EMFILE);
+        let fd = vfs::open_dir(task, "/", &resolved).map_err(|_| ENOENT)?;
+        return insert_access(task, Target::Vfs(fd), flags & 0o3).ok_or(EMFILE);
     }
     // Linux allows opening a directory without O_DIRECTORY.
-    let vfs_fd = match vfs::open(task, cwd, path, 0) {
+    let vfs_fd = match vfs::open(task, "/", &resolved, 0) {
         Ok(fd) => fd,
-        Err(_) => vfs::open_dir(task, cwd, path).map_err(|_| ENOENT)?,
+        Err(_) => vfs::open_dir(task, "/", &resolved).map_err(|_| ENOENT)?,
     };
-    match insert(task, Target::Vfs(vfs_fd)) {
+    match insert_access(task, Target::Vfs(vfs_fd), flags & 0o3) {
         Some(fd) => Ok(fd),
         None => {
             let _ = vfs::close(task, vfs_fd);
@@ -679,16 +732,33 @@ fn close_vfs_if_last(task: u64, vfs_fd: u64) {
 }
 
 pub fn dup(task: u64, fd: u64) -> Result<u64, u64> {
-    let target = lookup(task, fd).ok_or(EBADF)?;
-    let new_fd = insert(task, target.clone()).ok_or(EMFILE)?;
-    target.retain_endpoint();
-    Ok(new_fd)
+    with_table(task, |table| {
+        let target = table
+            .slots
+            .get(fd as usize)
+            .and_then(|slot| slot.clone())
+            .ok_or(EBADF)?;
+        let access = access_at(table, fd);
+        let new_fd = insert_in(table, target.clone()).ok_or(EMFILE)?;
+        set_access(table, new_fd, access);
+        target.retain_endpoint();
+        Ok(new_fd)
+    })
 }
 
 pub fn dup_from(task: u64, fd: u64, minimum: u64, cloexec: bool) -> Result<u64, u64> {
-    let target = lookup(task, fd).ok_or(EBADF)?;
-    let new_fd = insert_from(task, target.clone(), minimum).ok_or(EMFILE)?;
-    target.retain_endpoint();
+    let new_fd = with_table(task, |table| {
+        let target = table
+            .slots
+            .get(fd as usize)
+            .and_then(|slot| slot.clone())
+            .ok_or(EBADF)?;
+        let access = access_at(table, fd);
+        let new_fd = insert_from_in(table, target.clone(), minimum).ok_or(EMFILE)?;
+        set_access(table, new_fd, access);
+        target.retain_endpoint();
+        Ok::<u64, u64>(new_fd)
+    })?;
     if cloexec {
         let _ = set_cloexec(task, new_fd, true);
     }
@@ -766,9 +836,11 @@ pub fn dup2(task: u64, oldfd: u64, newfd: u64) -> Result<u64, u64> {
             close_vfs_if_last(task, vfs_fd);
         }
     }
+    let access = with_table(task, |table| access_at(table, oldfd));
     target.retain_endpoint();
     with_table(task, |table| {
         table.slots[newfd as usize] = Some(target);
+        set_access(table, newfd, access);
         table.cloexec.retain(|&marked| marked != newfd);
     });
     Ok(newfd)
@@ -796,6 +868,22 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             // Advance the descriptor's offset in place.
             let _ = with_table(task, |table| {
                 if let Some(Target::Sysfs(_, position)) =
+                    table.slots.get_mut(fd as usize).and_then(|slot| slot.as_mut())
+                {
+                    *position += take;
+                }
+            });
+            Ok(take as u64)
+        }
+        Target::Proc(data, offset) => {
+            if offset >= data.len() {
+                return Ok(0);
+            }
+            let take = (count as usize).min(data.len() - offset);
+            user_memory::copy_to_user(&data[offset..offset + take], buffer)
+                .map_err(|_| EFAULT)?;
+            let _ = with_table(task, |table| {
+                if let Some(Target::Proc(_, position)) =
                     table.slots.get_mut(fd as usize).and_then(|slot| slot.as_mut())
                 {
                     *position += take;
@@ -930,6 +1018,7 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         | Target::GpuFb
         | Target::Drm { .. }
         | Target::Sysfs(_, _)
+        | Target::Proc(_, _)
         | Target::DirList { .. }
         | Target::Prime { .. } => Ok(count),
         Target::Full => Err(ENOSPC),
@@ -1094,6 +1183,7 @@ pub fn stat_fields(
             )),
         ),
         Target::Sysfs(data, _) => (S_IFREG | 0o444, data.len() as u64, fd.max(1), None),
+        Target::Proc(data, _) => (S_IFREG | 0o444, data.len() as u64, fd.max(1), None),
         Target::DirList { .. } => (S_IFDIR | 0o555, 0, fd.max(1), None),
         Target::Prime { size, .. } => (S_IFREG | 0o600, size as u64, fd.max(1), None),
         Target::Vfs(vfs_fd) => {
@@ -1102,12 +1192,10 @@ pub fn stat_fields(
             let path = vfs::fd_path(task, vfs_fd);
             let mode = if kind == vfs::FD_KIND_DIR {
                 S_IFDIR | 0o755
-            } else if path.as_deref().is_some_and(|path| {
-                silver_microkernel::path_is_under(
-                    path,
-                    crate::scheduler::LINUX_SCRATCH_PREFIX,
-                )
-            }) {
+            } else if path
+                .as_deref()
+                .is_some_and(crate::scheduler::linux_ram_path)
+            {
                 S_IFREG | 0o644
             } else {
                 // The SFS image carries no permission bits and is read-only;
@@ -1214,7 +1302,11 @@ pub fn getdents64(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u6
         output[used + 8..used + 16]
             .copy_from_slice(&((start + serialized + 1) as i64).to_le_bytes());
         output[used + 16..used + 18].copy_from_slice(&(record as u16).to_le_bytes());
-        output[used + 18] = if entry.kind == vfs::FD_KIND_DIR { 4 } else { 8 };
+        output[used + 18] = match entry.kind {
+            vfs::FD_KIND_DIR => 4,  // DT_DIR
+            3 => 10,                // DT_LNK
+            _ => 8,                 // DT_REG
+        };
         output[used + HEADER..used + HEADER + name_len].copy_from_slice(&entry.name[..name_len]);
         used += record;
         serialized += 1;
@@ -2180,8 +2272,9 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
     const O_RDWR: u64 = 2;
     const O_NONBLOCK: u64 = 0o4000;
     let target = lookup(task, fd)?;
+    let file_access = with_table(task, |table| access_at(table, fd));
     let (access, nonblock) = match target {
-        Target::Vfs(_) => (0, false),
+        Target::Vfs(_) => (file_access, false),
         Target::Pipe { read, .. } => (if read { 0 } else { O_WRONLY }, false),
         Target::Socket { nonblock, .. }
         | Target::Unbound { nonblock }
@@ -2197,6 +2290,7 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::GpuFb
         | Target::Drm { .. }
         | Target::Sysfs(_, _)
+        | Target::Proc(_, _)
         | Target::DirList { .. }
         | Target::Prime { .. }
         | Target::MemFd(_)
@@ -2239,7 +2333,7 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
         Target::Console | Target::Null => POLLIN | POLLOUT,
         Target::Zero | Target::Random => POLLIN,
         Target::Ivshmem | Target::GpuFb => POLLIN | POLLOUT,
-        Target::Sysfs(_, _) | Target::DirList { .. } => POLLIN | POLLOUT,
+        Target::Sysfs(_, _) | Target::Proc(_, _) | Target::DirList { .. } => POLLIN | POLLOUT,
         Target::Prime { .. } => POLLOUT,
         Target::Drm { .. } => {
             if crate::drm::event_pending() {
@@ -2346,10 +2440,12 @@ pub fn fork_table(parent: u64, child: u64) {
         slot.retain_endpoint();
     }
     let cloexec = source.cloexec.clone();
+    let access = source.access.clone();
     tables.retain(|table| table.task != child);
     tables.push(Table {
         task: child,
         slots,
+        access,
         cloexec,
     });
 }
@@ -2398,6 +2494,7 @@ pub fn is_prime(task: u64, fd: u64) -> bool {
 pub fn device_exists(path: &str) -> bool {
     match path {
         "/dev/null" | "/dev/zero" | "/dev/full" | "/dev/urandom" | "/dev/random" => true,
+        "/dev/console" | "/dev/tty" => true,
         "/dev/ivshmem" => true,
         "/dev/gpufb" => crate::virtio_gpu::size().is_some(),
         "/dev/dri" => crate::virtio_gpu::size().is_some(),

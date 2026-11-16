@@ -33,6 +33,7 @@
 #   linuxrun /sfs/linux-memfd  # memfd + MAP_SHARED across fork, prints 'shared memfd ok'
 #   linuxrun /sfs/linux-namedsock # bind/listen/accept/connect, prints 'named socket ok'
 #   linuxrun /sfs/linux-scratch # writable /tmp + mkdir/unlink/rename, prints 'scratch ok'
+#   linuxrun /sfs/linux-stdio   # writev/readv/fdopen/F_GETFL, prints 'stdio ok'
 #   linuxrun /sfs/linux-eventloop # epoll + timerfd + eventfd, prints 'event loop ok'
 #   linuxrun /sfs/linux-wayland # Wayland wire protocol + shm memfd, prints 'wayland ok'
 #   linuxrun /sfs/linux-wlreal  # real libwayland-client against the mini compositor
@@ -240,6 +241,7 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/futexping
     "$CC" -O2 -o build/scratch tests/linux/scratch.c
+    "$CC" -static -O2 -Wl,-z,max-page-size=4096 -o build/stdio tests/linux/stdio.c
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/scratch
     "$CC" -O2 -o build/eventloop tests/linux/eventloop.c
@@ -287,6 +289,7 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     python3 scripts/sfs_inject.py "$IMAGE" build/threadfork linux-threadfork
     python3 scripts/sfs_inject.py "$IMAGE" build/futexping linux-futexping
     python3 scripts/sfs_inject.py "$IMAGE" build/scratch linux-scratch
+python3 scripts/sfs_inject.py "$IMAGE" build/stdio linux-stdio
     python3 scripts/sfs_inject.py "$IMAGE" build/eventloop linux-eventloop
     DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit linuxrun /sfs/linux-groupsig linuxrun /sfs/linux-exitgroup linuxrun /sfs/linux-sockets linuxrun /sfs/linux-memfd linuxrun /sfs/linux-threadfork linuxrun /sfs/linux-futexping linuxrun /sfs/linux-scratch linuxrun /sfs/linux-eventloop$WLREAL"
 else

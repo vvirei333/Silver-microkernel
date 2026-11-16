@@ -38,7 +38,7 @@ pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
 /// backend. Accounting the logical length was not enough: `Vec` growth keeps
 /// spare capacity, so several backends could hold far more memory than
 /// `MAX_VFS_BYTES` while all lengths summed below it.
-pub const MAX_VFS_BYTES: usize = 1024 * 1024;
+pub const MAX_VFS_BYTES: usize = 8 * 1024 * 1024;
 /// Payload capacity reserved by all live RamFs backends. Kept in one place so
 /// a second mount cannot get a fresh per-backend allowance.
 static VFS_PAYLOAD_BYTES: AtomicUsize = AtomicUsize::new(0);
@@ -168,6 +168,22 @@ pub trait FileSystem {
         append: bool,
     ) -> Result<(usize, usize), ()>;
     fn len(&self, path: &str) -> Result<usize, ()>;
+    /// Reads a symlink's target without following the final component.
+    fn read_link(&self, path: &str) -> Result<String, ()> {
+        let _ = path;
+        Err(())
+    }
+    /// Kind of the final component without following it: 1 file, 2 dir,
+    /// 3 symlink.
+    fn lstat_kind(&self, path: &str) -> Result<u64, ()> {
+        let _ = path;
+        Err(())
+    }
+    /// Size of the final component without following a symlink.
+    fn link_len(&self, path: &str) -> Result<usize, ()> {
+        let _ = path;
+        Err(())
+    }
     /// Bootstrap-only whole-file write (initramfs seeding).
     fn seed_file(&mut self, path: &str, contents: &[u8]) -> Result<(), ()>;
     /// Whether this backend can account resources for quota checks.
@@ -1155,6 +1171,24 @@ impl Vfs {
         self.mounts[mount].fs.len(&relative)
     }
 
+    fn read_link(&self, cwd: &str, path: &str) -> Result<String, ()> {
+        let resolved = resolve_path(cwd, path)?;
+        let (mount, relative) = self.resolve(&resolved);
+        self.mounts[mount].fs.read_link(&relative)
+    }
+
+    fn lstat_kind(&self, cwd: &str, path: &str) -> Result<u64, ()> {
+        let resolved = resolve_path(cwd, path)?;
+        let (mount, relative) = self.resolve(&resolved);
+        self.mounts[mount].fs.lstat_kind(&relative)
+    }
+
+    fn link_len(&self, cwd: &str, path: &str) -> Result<usize, ()> {
+        let resolved = resolve_path(cwd, path)?;
+        let (mount, relative) = self.resolve(&resolved);
+        self.mounts[mount].fs.link_len(&relative)
+    }
+
     /// Resource accounting for the backend that owns `path`.
     fn usage(&self, cwd: &str, path: &str) -> Option<FsUsage> {
         let resolved = resolve_path(cwd, path).ok()?;
@@ -1449,6 +1483,22 @@ pub fn read_at(cwd: &str, path: &str, offset: usize, limit: usize) -> Result<Vec
 /// `SYS_SPAWN_PATH` target before kernel memory is allocated.
 pub fn file_len(cwd: &str, path: &str) -> Result<usize, ()> {
     with_vfs(|vfs| vfs.file_len(cwd, path))
+}
+
+/// Reads a symlink target without following it (Linux `readlink`).
+pub fn read_link(cwd: &str, path: &str) -> Result<String, ()> {
+    with_vfs(|vfs| vfs.read_link(cwd, path))
+}
+
+/// Kind of the final component without following a symlink: 1 file, 2 dir,
+/// 3 symlink. Used by `lstat`/`AT_SYMLINK_NOFOLLOW`.
+pub fn lstat_kind(cwd: &str, path: &str) -> Result<u64, ()> {
+    with_vfs(|vfs| vfs.lstat_kind(cwd, path))
+}
+
+/// Size of a symlink's target string (without following it).
+pub fn link_len(cwd: &str, path: &str) -> Result<usize, ()> {
+    with_vfs(|vfs| vfs.link_len(cwd, path))
 }
 
 /// Resource usage of `path` in whichever backend owns it. `None` means the

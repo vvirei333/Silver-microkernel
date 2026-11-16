@@ -34,6 +34,7 @@ TRIPLE_FIRST = DOUBLE_FIRST + INDIRECT_SQUARED
 INODE_KIND_FREE = 0
 INODE_KIND_FILE = 1
 INODE_KIND_DIR = 2
+INODE_KIND_SYMLINK = 3
 NAME_MAX = 27
 
 
@@ -246,7 +247,7 @@ class Image:
 
     def free_file(self, index: int) -> None:
         kind, _, blocks, indirect, double, triple = self.inode(index)
-        if kind != INODE_KIND_FILE:
+        if kind not in (INODE_KIND_FILE, INODE_KIND_SYMLINK):
             raise SystemExit(f"inode {index} is not a file")
         for block in self.block_list(blocks, indirect, double, triple):
             self.set_used(block, False)
@@ -327,13 +328,14 @@ class Image:
         parent = self.mkdir("/".join(parts[:-1])) if len(parts) > 1 else self.root
         self.write_file_in(parent, parts[-1], payload)
 
-    def write_file_in(self, dir_index: int, name: str, payload: bytes) -> None:
+    def write_inode_in(self, dir_index: int, name: str, payload: bytes,
+                       kind: int) -> None:
         existing = self.find_entry(dir_index, name)
         if existing is not None:
             self.free_file(existing)
             index = existing
         else:
-            index = self.alloc_inode(INODE_KIND_FILE)
+            index = self.alloc_inode(kind)
         blocks = [0, 0, 0, 0]
         indirect = 0
         double = 0
@@ -349,11 +351,20 @@ class Image:
             blocks, indirect, double, triple = self.append_block(
                 blocks, indirect, double, triple, block, slot
             )
-        self.set_inode(
-            index, INODE_KIND_FILE, len(payload), blocks, indirect, double, triple
-        )
+        self.set_inode(index, kind, len(payload), blocks, indirect, double, triple)
         if existing is None:
             self.add_entry(dir_index, name, index)
+
+    def write_file_in(self, dir_index: int, name: str, payload: bytes) -> None:
+        self.write_inode_in(dir_index, name, payload, INODE_KIND_FILE)
+
+    def write_link_at(self, path: str, target: str) -> None:
+        """Creates a symlink at `path` pointing at `target` (stored verbatim)."""
+        parts = [piece for piece in path.split("/") if piece]
+        if not parts:
+            raise SystemExit("empty link path")
+        parent = self.mkdir("/".join(parts[:-1])) if len(parts) > 1 else self.root
+        self.write_inode_in(parent, parts[-1], target.encode(), INODE_KIND_SYMLINK)
 
     def save(self) -> None:
         self.data.flush()

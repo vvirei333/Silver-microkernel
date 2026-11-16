@@ -247,7 +247,18 @@ extern "C" fn silver_handle_syscall(frame: *mut u64) {
 
     let result = dispatch_for_personality(frame, number);
 
-    frame[0] = result;
+    // `rt_sigreturn` has already restored the full user bank, x0 included;
+    // writing this syscall's own result over it would replace the resumed
+    // value with 0 (a `waitpid` would report 0 instead of the child pid).
+    #[cfg(feature = "linux-abi")]
+    let restored_by_sigreturn = scheduler::current_personality()
+        == scheduler::Personality::Linux
+        && number == crate::linux_abi::SYS_RT_SIGRETURN;
+    #[cfg(not(feature = "linux-abi"))]
+    let restored_by_sigreturn = false;
+    if !restored_by_sigreturn {
+        frame[0] = result;
+    }
     // A signal raised by this syscall (or by another task) is entered on the
     // way back to EL0. `frame[0]` is set first so delivery can replace x0 with
     // the signal number.
@@ -704,6 +715,9 @@ fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
             b"TERM=vt100".to_vec(),
             // Writable scratch tree for runtime sockets and lock files.
             b"TMPDIR=/tmp".to_vec(),
+            // Writable scratch tree for runtime sockets and lock files.
+            // The Wayland/Phosh stack and the ABI tests bind their sockets
+            // under /tmp; an init system that wants /run exports it itself.
             b"XDG_RUNTIME_DIR=/tmp".to_vec(),
             b"WAYLAND_DISPLAY=wayland-test".to_vec(),
             b"XDG_DATA_DIRS=/sfs/share".to_vec(),

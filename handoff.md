@@ -7147,3 +7147,67 @@ until then).
 
 Verification: alpine smoke passes; security 12/12, matrix 26/26, simplefb
 selftest, cargo test --lib 226, --no-linux clean.
+
+### Alpine + OpenRC + Phosh boots as the Linux root (2026-11-16)
+
+The full Alpine tree (minirootfs packages, OpenRC 0.63.2, dash, musl-dev) is
+now merged with the existing Phosh closure into one 3 GiB SFS image built by
+`tools/build_alpine_openrc.py`. Linux `/` maps to SFS `/sfs`; `/sfs`, `/tmp`,
+`/dev`, `/proc` and `/sys` stay global aliases so the Arch-staged Phosh paths
+keep resolving. `/tmp`, `/run`, `/var` are RamFs.
+
+Boot is postmarketOS-shaped: `/sbin/init` (BusyBox) reads `/etc/inittab`, runs
+`openrc sysinit` and `openrc boot`, then `rc-service phosh start`, which runs
+`/sfs/phosh-serve` in the background. Boot log shows the OpenRC banner, both
+runlevels completing, `Starting phosh ... ok`, `gtk-serve: screen mapped` and
+`shm frame committed`; a lock-screen frame was captured from ivshmem.
+
+Kernel work this slice (all found by running real Alpine):
+- SFS symlink inodes (kind 3, target in data blocks, hop-budgeted resolve,
+  `read_link`/`lstat_kind`/`link_len` in VFS, `write_link_at` in
+  `sfs_inject.py`, kind-3 support in `sfs_fsck.py`); 27-byte name limit kept,
+  long apk key names are skipped and reported;
+- shebang `execve` support; synthetic `src/procfs.rs` (`cmdline`,
+  `filesystems`, `mounts`, `mountinfo`, `self/*`, `sys/kernel/hotplug`);
+- `mount`/`umount2` (tmpfs -> RamFs; proc/sysfs/dev accepted no-ops),
+  `/dev/console`, PID-1 view for `/sbin/init`, vfork honouring musl's
+  `__clone` stack, and `rt_sigreturn` no longer clobbering saved `x0`;
+- SFS files report mode 0555 (executable), RamFs paths 0644.
+
+Two more ABI bugs surfaced while chasing the empty `rc` deptree and are fixed:
+
+- `writev` only accepted the console (`fd 1`/`2`) and returned `EBADF` for
+  files. musl's stdio sends *every* stream through `writev`, so `openrc`'s
+  `fdopen`/`fprintf` of `/run/openrc/deptree` silently produced a zero-byte
+  file. `writev` now works on any descriptor, with short-write handling.
+- `readv` was not implemented at all (musl stdio reads through it), so every
+  musl `FILE` read failed with `ENOSYS`. `readv` now gathers up to 64 iovecs
+  and stops on a short read.
+- `fcntl(F_GETFL)` reported a hardcoded `O_RDONLY`. glibc's `fdopen` checks
+  the access mode and failed with `EINVAL`; the `O_ACCMODE` bits from `open`
+  are now stored per descriptor and copied by `dup`/`dup2`/`fork`.
+
+Evidence: with the old kernel a `fdopen(openat(...)) + fprintf + fclose`
+sequence left a 0-byte file and `F_GETFL` answered `0` for an `O_WRONLY`
+descriptor; after the fix the same probe writes and reads back, and
+`/run/openrc/deptree` grows to 1508+ bytes with real `depinfo_*` lines.
+Regression: `tests/linux/stdio.c` (`linuxrun /sfs/linux-stdio`, "stdio ok")
+covers `writev`, `readv`, `fdopen` and `F_GETFL`.
+
+The built image boots through `/etc/inittab` -> `/sbin/boot-session`, which
+runs `openrc sysinit` with its output in `/tmp` (an OpenRC process writing to
+the console does not return on this ABI) and then `exec`s
+`rc-service phosh start`. Phosh publishes its lock screen to the ivshmem
+window (`assets/alpine-openrc-lock.png`); a full boot takes two to three
+minutes because `rc` regenerates `deptree` whenever it runs (all mtimes are 0).
+
+Remaining OpenRC issue: `openrc boot`/`openrc default` block silently, so the
+boot runlevel is skipped and the service is started by name. `rc-update show`
+lists `phosh | default` and the deptree is real now; fixing the runlevel
+transition (and the console-write stall behind it) is the next slice.
+
+Gates: cargo test --lib 226/226, security 12/12, Linux matrix 27/27 (new
+`linux-stdio` case), `--no-linux` clean. Details:
+[`docs/ALPINE_OPENRC.md`](docs/ALPINE_OPENRC.md). Next userspace slice: apk
+repositories/keys and replacing the Arch-staged Phosh with Alpine `phosh`/
+`phoc`.

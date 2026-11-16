@@ -49,7 +49,8 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   `clone`, `futex`, `rt_sigaction`/`rt_sigreturn`, `epoll`, `timerfd`,
   `eventfd`, `pipe2`, `memfd_create`, `ftruncate`/`fallocate`, `socketpair`,
   named `AF_UNIX`, `sendmsg`/`recvmsg` with `SCM_RIGHTS`, `getsockopt`
-  `SO_PEERCRED`, `stat`, `getdents`, `uname`, rlimits, `getrandom`.
+  `SO_PEERCRED`, `stat`, `getdents`, `readv`/`writev`, `uname`, rlimits,
+  `getrandom`.
 - Threads (`CLONE_VM`), per-thread TLS, futex join, shared thread-group fds,
   heap/mmap/image and signal dispositions; `exit_group` from any thread.
 - Writable `/tmp` with `O_CREAT`/`O_EXCL`/`O_TRUNC`, `mkdirat`, `unlinkat`,

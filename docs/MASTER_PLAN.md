@@ -211,8 +211,20 @@ eMMC/HID/I2C.
 **Alpine base — первый срез (2026-11-16):** Linux ABI запускает Alpine
 3.24 musl BusyBox, ash и `apk-tools 3.0.9` из SFS
 (`tools/build_alpine_env.py`, `tools/alpine_smoke.py`); см.
-`docs/ALPINE_ENV.md`. Следующий шаг — apk-репозитории/ключи и полный
-Alpine closure для Phosh.
+`docs/ALPINE_ENV.md`.
+
+**Alpine + OpenRC + Phosh — бут целиком (2026-11-16):** полный Alpine-рут
+(OpenRC 0.63.2, dash, musl-dev) слит с Phosh closure в один 3 GiB SFS-образ
+(`tools/build_alpine_openrc.py`). Linux `/` = SFS `/sfs`; `/sfs`,`/tmp`,`/dev`,
+`/proc`,`/sys` — глобальные алиасы, `/tmp`,`/run`,`/var` — RamFs. Boot:
+`/sbin/init` → inittab → `openrc sysinit`/`boot` → `rc-service phosh start`
+→ `gtk-serve: screen mapped`, кадр снят с ivshmem. Появились SFS-symlink
+(kind 3), shebang-exec, синтетический `/proc`, mount/umount2, `/dev/console`,
+PID-1 view, vfork со стеком musl, фикс `rt_sigreturn` x0. Известное:
+пустой deptree у `rc` → `default` не запускается, поэтому inittab зовёт
+`rc-service`. Гейты: 226 host-тестов, security 12/12, `--no-linux` чисто.
+Детали — `docs/ALPINE_OPENRC.md`. Следующий шаг — apk-репозитории/ключи и
+замена Arch-staged Phosh на Alpine `phosh`/`phoc`.
 
 **M3.3 — Redmi 10C bring-up (этапность, каждая ступень = демо):**
 

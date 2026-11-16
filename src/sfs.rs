@@ -11,7 +11,7 @@
 //! triple indirect: the maximum file is about 1 GiB by format, bounded by the
 //! image size in practice. `/tmp` remains a separate writable RamFs.
 
-use alloc::vec::Vec;
+use alloc::{string::String, vec::Vec};
 
 use crate::console;
 use crate::mutex::Mutex;
@@ -23,6 +23,10 @@ const MAGIC: u32 = 0x5346_5321;
 const INODE_KIND_FREE: u32 = 0;
 const INODE_KIND_FILE: u32 = 1;
 const INODE_KIND_DIR: u32 = 2;
+/// A symlink stores its target path in the data blocks; `size` is its length.
+const INODE_KIND_SYMLINK: u32 = 3;
+/// Maximum symlink hops while resolving one path (Linux uses 40).
+const MAX_SYMLINK_HOPS: u32 = 8;
 const DIR_ENTRY_SIZE: usize = 32;
 const DIR_ENTRIES_PER_BLOCK: usize = BLOCK_SIZE / DIR_ENTRY_SIZE;
 const NAME_LIMIT: usize = 27;
@@ -65,6 +69,9 @@ impl Inode {
     }
     fn is_file(&self) -> bool {
         self.kind == INODE_KIND_FILE
+    }
+    fn is_symlink(&self) -> bool {
+        self.kind == INODE_KIND_SYMLINK
     }
 }
 
@@ -339,15 +346,114 @@ impl Reader {
         self.block_at_checked(inode, slot).ok().flatten()
     }
 
+    /// Resolves a path to an inode, following symlinks in every component
+    /// (including the last one, which is `stat`/`open` semantics). A link
+    /// budget bounds a cycle to a failed lookup instead of a hang.
     fn resolve(&self, path: &str) -> Option<u32> {
+        let mut pending: Vec<String> = path
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .map(String::from)
+            .collect();
+        pending.reverse();
         let mut current = self.superblock.root_inode;
-        for part in path.split('/') {
-            if part.is_empty() {
+        let mut hops = 0u32;
+        while let Some(part) = pending.pop() {
+            let child = self.find_child(current, &part)?;
+            let inode = self.inode(child)?;
+            if inode.is_symlink() {
+                hops += 1;
+                if hops > MAX_SYMLINK_HOPS {
+                    return None;
+                }
+                let target = self.read_inode_data(&inode)?;
+                let target = core::str::from_utf8(&target).ok()?;
+                if target.starts_with('/') {
+                    current = self.superblock.root_inode;
+                }
+                let parts: Vec<String> = target
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .map(String::from)
+                    .collect();
+                for part in parts.into_iter().rev() {
+                    pending.push(part);
+                }
                 continue;
             }
-            current = self.find_child(current, part)?;
+            current = child;
         }
         Some(current)
+    }
+
+    /// Reads a whole inode payload without requiring a regular-file kind.
+    fn read_inode_data(&self, inode: &Inode) -> Option<Vec<u8>> {
+        let size = inode.size as usize;
+        let mut data = Vec::with_capacity(size);
+        let mut position = 0usize;
+        while position < size {
+            let slot = position / BLOCK_SIZE;
+            let block = self.block_at(inode, slot)?;
+            let within = position % BLOCK_SIZE;
+            let take = (BLOCK_SIZE - within).min(size - position);
+            let mut bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut bytes) {
+                return None;
+            }
+            data.extend_from_slice(&bytes[within..within + take]);
+            position += take;
+        }
+        Some(data)
+    }
+
+    /// Reads a symlink target without following the final component.
+    fn read_link(&self, path: &str) -> Option<Vec<u8>> {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if name.is_empty() {
+            return None;
+        }
+        let directory = if parent.is_empty() {
+            self.superblock.root_inode
+        } else {
+            self.resolve(parent)?
+        };
+        let child = self.find_child(directory, name)?;
+        let inode = self.inode(child)?;
+        if !inode.is_symlink() {
+            return None;
+        }
+        self.read_inode_data(&inode)
+    }
+
+    /// Kind of the final component without following it: 1 file, 2 dir,
+    /// 3 symlink. Used by `lstat`/`AT_SYMLINK_NOFOLLOW` and `readlink`.
+    fn lstat_kind(&self, path: &str) -> Option<u32> {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if name.is_empty() {
+            return None;
+        }
+        let directory = if parent.is_empty() {
+            self.superblock.root_inode
+        } else {
+            self.resolve(parent)?
+        };
+        let child = self.find_child(directory, name)?;
+        self.inode(child).map(|inode| inode.kind)
+    }
+
+    /// Size of the final component without following a symlink.
+    fn link_len(&self, path: &str) -> Option<usize> {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if name.is_empty() {
+            return None;
+        }
+        let directory = if parent.is_empty() {
+            self.superblock.root_inode
+        } else {
+            self.resolve(parent)?
+        };
+        let child = self.find_child(directory, name)?;
+        self.inode(child).map(|inode| inode.size as usize)
     }
 
     fn find_child(&self, directory: u32, name: &str) -> Option<u32> {
@@ -439,7 +545,13 @@ impl Reader {
                 entries.push(DirEntry {
                     name,
                     name_len: length as u64,
-                    kind: if child.is_dir() { 2 } else { 1 },
+                    kind: if child.is_dir() {
+                        2
+                    } else if child.is_symlink() {
+                        3
+                    } else {
+                        1
+                    },
                 });
             }
         }
@@ -1318,7 +1430,7 @@ fn verify_image(reader: &Reader) -> bool {
         };
         match inode.kind {
             INODE_KIND_FREE => continue,
-            INODE_KIND_FILE | INODE_KIND_DIR => {}
+            INODE_KIND_FILE | INODE_KIND_DIR | INODE_KIND_SYMLINK => {}
             _ => return false,
         }
         let limit = if inode.is_dir() {
@@ -1549,6 +1661,22 @@ impl FileSystem for Sfs {
     fn len(&self, path: &str) -> Result<usize, ()> {
         let reader = reader().ok_or(())?;
         reader.len(path).ok_or(())
+    }
+
+    fn read_link(&self, path: &str) -> Result<String, ()> {
+        let reader = reader().ok_or(())?;
+        let target = reader.read_link(path).ok_or(())?;
+        core::str::from_utf8(&target).map(String::from).map_err(|_| ())
+    }
+
+    fn lstat_kind(&self, path: &str) -> Result<u64, ()> {
+        let reader = reader().ok_or(())?;
+        reader.lstat_kind(path).map(u64::from).ok_or(())
+    }
+
+    fn link_len(&self, path: &str) -> Result<usize, ()> {
+        let reader = reader().ok_or(())?;
+        reader.link_len(path).ok_or(())
     }
 
     fn seed_file(&mut self, path: &str, contents: &[u8]) -> Result<(), ()> {

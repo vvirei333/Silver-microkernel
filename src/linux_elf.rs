@@ -352,6 +352,10 @@ fn attach_interpreter(
     path: &str,
     limit: usize,
 ) -> Result<(), LinuxElfError> {
+    // The interpreter path is an absolute Linux path (`/lib/ld-musl-...`);
+    // the Linux root is the SFS mount.
+    let mapped = crate::linux_abi::map_absolute(path);
+    let path = mapped.as_str();
     let length = crate::vfs::file_len(cwd, path).map_err(|_| LinuxElfError::InterpreterMissing)?;
     if length > limit {
         return Err(LinuxElfError::ImageTooLarge);

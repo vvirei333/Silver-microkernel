@@ -71,11 +71,11 @@ def main(path: str) -> int:
                     f"indirect {indirect} double {double} triple {triple}"
                 )
             continue
-        if kind == 1:
+        if kind in (1, 3):
             files += 1
             if size > MAX_FILE_BLOCKS * BLOCK:
                 problems.append(f"inode {index}: size {size} exceeds block-tree capacity")
-        elif kind == 2:
+        elif kind in (2,):
             dirs += 1
         else:
             problems.append(f"inode {index}: unknown kind {kind}")
@@ -95,7 +95,7 @@ def main(path: str) -> int:
                 owners[block] = index
             if not used(block):
                 problems.append(f"inode {index}: block {block} not marked used in bitmap")
-            if kind == 1 and slot * BLOCK >= size:
+            if kind in (1, 3) and slot * BLOCK >= size:
                 problems.append(f"inode {index}: block {block} beyond size {size}")
 
         if double != 0:
@@ -146,7 +146,7 @@ def main(path: str) -> int:
                         owners[block] = f"{index} double[{table_index}][{pointer}]"
                     if not used(block):
                         problems.append(f"inode {index}: block {block} not marked used in bitmap")
-                    if kind == 1 and slot * BLOCK >= size:
+                    if kind in (1, 3) and slot * BLOCK >= size:
                         problems.append(f"inode {index}: double block {block} beyond size {size}")
 
         if triple != 0:
@@ -223,7 +223,7 @@ def main(path: str) -> int:
                             problems.append(
                                 f"inode {index}: block {block} not marked used in bitmap"
                             )
-                        if kind == 1 and slot * BLOCK >= size:
+                        if kind in (1, 3) and slot * BLOCK >= size:
                             problems.append(
                                 f"inode {index}: triple block {block} beyond size {size}"
                             )
@@ -259,7 +259,7 @@ def main(path: str) -> int:
                 owners[block] = f"{index} indirect[{pointer}]"
             if not used(block):
                 problems.append(f"inode {index}: block {block} not marked used in bitmap")
-            if kind == 1 and slot * BLOCK >= size:
+            if kind in (1, 3) and slot * BLOCK >= size:
                 problems.append(f"inode {index}: indirect block {block} beyond size {size}")
 
     leaked = [b for b in range(data_start, total) if used(b) and b not in owners]

@@ -112,6 +112,7 @@ mod watchdog;
 mod vfs;
 #[cfg(not(feature = "std"))]
 mod wait_queue;
+mod procfs;
 
 #[cfg(not(feature = "std"))]
 use core::panic::PanicInfo;
@@ -1779,6 +1780,14 @@ pub extern "C" fn kernel_main() -> ! {
         let _ = vfs::mkdir("/", "/sfs");
         if vfs::mount("/", "/sfs", "sfs", "", 0, |_| false).is_ok() {
             ram_log::log("KSFS mounted");
+            // Service state belongs in RAM, not on the image: OpenRC writes
+            // `/run/openrc` and `/var/log` on every boot.
+            for point in ["/sfs/run", "/sfs/var"] {
+                let _ = vfs::mkdir("/", point);
+                if vfs::mount("/", point, "ramfs", "", 0, |_| false).is_ok() {
+                    ram_log::log("service ramfs");
+                }
+            }
             // Install the app bundles on first boot (or after a size change).
             seed::seed_apps();
             // `--gpu` attaches a virtio-gpu; the driver sets up a 2D scanout
