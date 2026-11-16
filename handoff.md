@@ -7239,3 +7239,33 @@ block is allocated and freed correctly.
 The `DirEntry` ABI grew from 32 to 256 name bytes (kernel and userspace
 `DIR_NAME_CAPACITY` kept in lockstep), and `vfs::MAX_NAME_LEN` is 256 with a
 `<` check so names are capped at 255.
+
+### Alpine phosh/phoc image: headless compositor starts (2026-11-17)
+
+`tools/build_alpine_phosh.py` builds an Alpine-only 2 GiB image from the 467
+package phosh/phoc closure (7917 files, 1074 symlinks, nothing skipped) and
+boots it without the Arch-staged tree. The boot chain is busybox init ->
+`/sbin/boot-session` -> `openrc sysinit` -> headless phoc
+(`WLR_BACKENDS=headless`, pixman, `LIBSEAT_BACKEND=builtin`) -> phosh.
+
+Kernel gaps this exposed and fixed:
+- the 8 MiB file cap rejected `libLLVM` (170 MiB) and `libwebkitgtk` (~70
+  MiB); `MAX_FILE_BYTES` is 256 MiB now, while native whole-file exec reads
+  stay at 32 MiB and the interpreter read at 8 MiB;
+- `linux-bigfile` reads a 12 MiB payload now (triple-indirect);
+- Linux `execve` rejected environments over 32 entries and strings over 255
+  bytes, so busybox `cp` failed with `EFAULT`/`ENOMEM` after OpenRC exported
+  its variables; the Linux stack builder allows 1024 entries / 4 KiB strings
+  (256 KiB total) and the native spawn protocol keeps 32;
+- `sendfile` and `copy_file_range` did not exist; `sendfile` did not advance
+  the input offset when `offset == NULL` (busybox copied one chunk forever).
+  Both are implemented over kernel buffers with the RamFs quota check.
+
+Evidence: guest compiles the GSettings schemas with Alpine's own
+`glib-compile-schemas` (qemu-user cannot relocate libgio), phoc starts on
+`wayland-0`, adds a `HEADLESS-1` output and prints "Enabling shell mode".
+
+Limits: no scanout yet (headless), dconf fails to allocate
+`/tmp/dconf/user` with EINVAL (writable MAP_SHARED on a RamFs file), and the
+phosh process that runs after shell mode is not verified. Details:
+[`docs/ALPINE_PHOSH.md`](docs/ALPINE_PHOSH.md).

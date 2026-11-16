@@ -3846,13 +3846,16 @@ pub fn exec_linux_current(
     envp: Vec<Vec<u8>>,
 ) -> Option<ExecResult> {
     let auxv = linux_auxv(AuxvImage::linux(&image));
-    let mut layout = silver_microkernel::build_linux_stack(
+    let mut layout = match silver_microkernel::build_linux_stack(
         &argv,
         &envp,
         &auxv,
         mmu::USER_STACK_VA + mmu::USER_STACK_SIZE,
         mmu::USER_STACK_SIZE - 1024,
-    )?;
+    ) {
+        Some(layout) => layout,
+        None => return None,
+    };
     // AT_RANDOM (the first 16 bytes) must be fresh per exec.
     crate::entropy::fill(&mut layout.block[..16]);
     let entry = image.entry;

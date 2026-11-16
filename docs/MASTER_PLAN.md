@@ -223,8 +223,16 @@ eMMC/HID/I2C.
 PID-1 view, vfork со стеком musl, фикс `rt_sigreturn` x0. Известное:
 пустой deptree у `rc` → `default` не запускается, поэтому inittab зовёт
 `rc-service`. Гейты: 226 host-тестов, security 12/12, `--no-linux` чисто.
-Детали — `docs/ALPINE_OPENRC.md`. Следующий шаг — apk-репозитории/ключи и
-замена Arch-staged Phosh на Alpine `phosh`/`phoc`.
+Детали — `docs/ALPINE_OPENRC.md`.
+
+**Alpine phosh/phoc — первый запуск (2026-11-17):** отдельный Alpine-only
+образ (`tools/build_alpine_phosh.py`, 467 пакетов, 7917 файлов) без Arch
+closure. Boot: init → boot-session → `openrc sysinit` → headless phoc
+(pixman, libseat builtin) → phosh. Появились лимит файла 256 MiB (libLLVM,
+libwebkitgtk), `sendfile`/`copy_file_range`, Linux exec-окружение до 1024
+записей. phoc доходит до `wayland-0` + `HEADLESS-1` + `Enabling shell mode`.
+Осталось: scanout (ivshmem/DRM), dconf `MAP_SHARED` на RamFs, phosh-сессия
+(elogind/dbus). Детали — `docs/ALPINE_PHOSH.md`.
 
 **M3.3 — Redmi 10C bring-up (этапность, каждая ступень = демо):**
 

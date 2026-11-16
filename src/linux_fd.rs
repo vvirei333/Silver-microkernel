@@ -949,6 +949,25 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
     }
 }
 
+/// Writes a kernel buffer to a descriptor (`sendfile`, `copy_file_range`).
+/// Only regular files and the null/zero devices are supported; a file write
+/// keeps the same RamFs quota check as the userspace `write` path.
+pub fn write_kernel(task: u64, fd: u64, bytes: &[u8]) -> Result<usize, u64> {
+    let task = crate::scheduler::fd_table_owner(task);
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    match target {
+        Target::Vfs(vfs_fd) => {
+            let blocks = (bytes.len().div_ceil(512) + 2) as u32;
+            if !crate::scheduler::fs_quota_allows(blocks, 0) {
+                return Err(ENOSPC);
+            }
+            vfs::write(task, vfs_fd, bytes).map_err(|_| EBADF)
+        }
+        Target::Null | Target::Zero => Ok(bytes.len()),
+        _ => Err(ENODEV),
+    }
+}
+
 /// Positional read used by file-backed `mmap`. Does not move the fd offset.
 pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize, u64> {
     let task = crate::scheduler::fd_table_owner(task);

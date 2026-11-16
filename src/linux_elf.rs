@@ -341,7 +341,8 @@ pub fn load_linux_program_path(
     let bias = if e_type == elf::ET_DYN { MAIN_BIAS } else { 0 };
     let mut image = load_linux_elf_from_source(&source, bias)?;
     if let Some(interp_path) = image.interp_path.clone() {
-        attach_interpreter(&mut image, cwd, &interp_path, crate::vfs::MAX_FILE_BYTES)?;
+        // Loaders/interpreter are well under this; keeps the read buffer small.
+        attach_interpreter(&mut image, cwd, &interp_path, 8 * 1024 * 1024)?;
     }
     Ok(image)
 }

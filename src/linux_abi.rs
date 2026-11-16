@@ -53,6 +53,8 @@ const SYS_READ: u64 = 63;
 const SYS_WRITE: u64 = 64;
 const SYS_WRITEV: u64 = 66;
 const SYS_READV: u64 = 65;
+const SYS_SENDFILE: u64 = 71;
+const SYS_COPY_FILE_RANGE: u64 = 285;
 const SYS_READLINKAT: u64 = 78;
 const SYS_FSTAT: u64 = 80;
 const SYS_NEWFSTATAT: u64 = 79;
@@ -259,6 +261,26 @@ const S_IFREG: u32 = 0o100000;
 /// Dispatches one Linux syscall. `frame` is the saved register bank, so
 /// `frame[0..6]` are `x0..x5` and `frame[8]` is the number in `x8`.
 pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
+    #[cfg(feature = "linux-abi-trace")]
+    {
+        let number = frame[8];
+        let result = dispatch_body(frame);
+        if (result as i64) < 0 && result != errno(ENOSYS) {
+            crate::console::write_str("LINUX ERR ");
+            crate::console::write_dec_u64(number);
+            crate::console::write_str(" -> ");
+            crate::console::write_dec_u64((result as i64).unsigned_abs());
+            crate::console::write_str("\r\n");
+        }
+        return result;
+    }
+    #[cfg(not(feature = "linux-abi-trace"))]
+    {
+        dispatch_body(frame)
+    }
+}
+
+fn dispatch_body(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
     let number = frame[8];
     let args = [frame[0], frame[1], frame[2], frame[3], frame[4], frame[5]];
     dispatch_inner(frame, number, args)
@@ -273,6 +295,10 @@ fn dispatch_inner(
         SYS_WRITE => linux_write(args[0], args[1], args[2]),
         SYS_WRITEV => linux_writev(args[0], args[1], args[2]),
         SYS_READV => linux_readv(args[0], args[1], args[2]),
+        SYS_SENDFILE => linux_sendfile(args[0], args[1], args[2], args[3]),
+        SYS_COPY_FILE_RANGE => linux_copy_file_range(
+            args[0], args[1], args[2], args[3], args[4], args[5],
+        ),
         SYS_READ => finish(linux_fd::read(scheduler::current_task_id(), args[0], args[1], args[2])),
         SYS_OPENAT => linux_openat(args[0], args[1], args[2], args[3]),
         SYS_EPOLL_CREATE1 => linux_epoll_create(args[0]),
@@ -1775,6 +1801,157 @@ fn linux_writev(fd: u64, iovec: u64, count: u64) -> u64 {
     total
 }
 
+/// Reads a `u64` from user memory (`off_t *` on AArch64).
+fn user_u64(address: u64) -> Option<u64> {
+    let mut raw = [0_u8; 8];
+    user_memory::copy_from_user(address, &mut raw).ok()?;
+    Some(u64::from_le_bytes(raw))
+}
+
+const SEEK_CUR: u64 = 1;
+const SEEK_SET: u64 = 0;
+
+/// `sendfile(2)`: copy between descriptors in 64 KiB kernel chunks.
+///
+/// busybox `cp` (and therefore the OpenRC/Alpine triggers) uses `sendfile`
+/// when both ends are files; without it `cp` failed with `EFAULT` and the
+/// glib schema copy in `boot-session` never ran.
+fn linux_sendfile(output: u64, input: u64, offset_ptr: u64, count: u64) -> u64 {
+    let task = scheduler::current_task_id();
+    let mut offset = if offset_ptr != 0 {
+        match user_u64(offset_ptr) {
+            Some(offset) => offset,
+            None => return errno(EFAULT),
+        }
+    } else {
+        match linux_fd::lseek(task, input, 0, SEEK_CUR) {
+            Ok(offset) => offset,
+            Err(code) => return errno(code),
+        }
+    };
+    let mut total = 0u64;
+    let mut buffer = alloc::vec![0_u8; 64 * 1024];
+    while total < count {
+        let want = (count - total).min(buffer.len() as u64) as usize;
+        let read = match linux_fd::pread(task, input, offset, &mut buffer[..want]) {
+            Ok(read) => read,
+            Err(code) => return if total > 0 { total } else { errno(code) },
+        };
+        if read == 0 {
+            break;
+        }
+        let mut written = 0usize;
+        while written < read {
+            let progress = match linux_fd::write_kernel(task, output, &buffer[written..read]) {
+                Ok(progress) => progress,
+                Err(code) => return if total > 0 { total } else { errno(code) },
+            };
+            if progress == 0 {
+                break;
+            }
+            written += progress;
+        }
+        total += written as u64;
+        offset += written as u64;
+        if written < read {
+            break;
+        }
+    }
+    if offset_ptr != 0 {
+        let mut raw = [0_u8; 8];
+        raw.copy_from_slice(&offset.to_le_bytes());
+        let _ = user_memory::copy_to_user(&raw, offset_ptr);
+    } else {
+        // `pread` does not move the descriptor; the caller expects sendfile to.
+        let _ = linux_fd::lseek(task, input, offset as i64, SEEK_SET);
+    }
+    total
+}
+
+/// `copy_file_range(2)`: the same chunked copy with independent offsets.
+/// When an offset pointer is given the descriptor's own offset must not move,
+/// so the output position is restored after the copy.
+fn linux_copy_file_range(
+    input: u64,
+    input_offset_ptr: u64,
+    output: u64,
+    output_offset_ptr: u64,
+    length: u64,
+    flags: u64,
+) -> u64 {
+    if flags != 0 {
+        return errno(EINVAL);
+    }
+    let task = scheduler::current_task_id();
+    let mut input_offset = if input_offset_ptr != 0 {
+        match user_u64(input_offset_ptr) {
+            Some(offset) => offset,
+            None => return errno(EFAULT),
+        }
+    } else {
+        match linux_fd::lseek(task, input, 0, SEEK_CUR) {
+            Ok(offset) => offset,
+            Err(code) => return errno(code),
+        }
+    };
+    let mut saved_output_offset = None;
+    let mut output_offset = 0u64;
+    if output_offset_ptr != 0 {
+        let Some(offset) = user_u64(output_offset_ptr) else {
+            return errno(EFAULT);
+        };
+        output_offset = offset;
+        saved_output_offset = linux_fd::lseek(task, output, 0, SEEK_CUR).ok().map(|offset| offset as i64);
+        if let Err(code) = linux_fd::lseek(task, output, offset as i64, SEEK_SET) {
+            return errno(code);
+        }
+    }
+    let mut total = 0u64;
+    let mut buffer = alloc::vec![0_u8; 64 * 1024];
+    while total < length {
+        let want = (length - total).min(buffer.len() as u64) as usize;
+        let read = match linux_fd::pread(task, input, input_offset, &mut buffer[..want]) {
+            Ok(read) => read,
+            Err(code) => return if total > 0 { total } else { errno(code) },
+        };
+        if read == 0 {
+            break;
+        }
+        let mut written = 0usize;
+        while written < read {
+            let progress = match linux_fd::write_kernel(task, output, &buffer[written..read]) {
+                Ok(progress) => progress,
+                Err(code) => return if total > 0 { total } else { errno(code) },
+            };
+            if progress == 0 {
+                break;
+            }
+            written += progress;
+        }
+        total += written as u64;
+        input_offset += written as u64;
+        if written < read {
+            break;
+        }
+    }
+    if input_offset_ptr != 0 {
+        let mut raw = [0_u8; 8];
+        raw.copy_from_slice(&input_offset.to_le_bytes());
+        let _ = user_memory::copy_to_user(&raw, input_offset_ptr);
+    } else {
+        let _ = linux_fd::lseek(task, input, input_offset as i64, SEEK_SET);
+    }
+    if output_offset_ptr != 0 {
+        let mut raw = [0_u8; 8];
+        raw.copy_from_slice(&(output_offset + total).to_le_bytes());
+        let _ = user_memory::copy_to_user(&raw, output_offset_ptr);
+        if let Some(original) = saved_output_offset {
+            let _ = linux_fd::lseek(task, output, original as i64, SEEK_SET);
+        }
+    }
+    total
+}
+
 /// `readv(2)`: gather input into up to 64 `struct iovec`s. musl's stdio
 /// reads streams through `readv`, so without this `deptree_load` and every
 /// other `FILE` read saw `ENOSYS`.
@@ -2323,9 +2500,6 @@ fn user_string(pointer: u64) -> Option<alloc::string::String> {
         if byte[0] == 0 {
             break;
         }
-        if bytes.len() >= 255 {
-            return None;
-        }
         bytes.push(byte[0]);
     }
     core::str::from_utf8(&bytes)
@@ -2336,18 +2510,30 @@ fn user_string(pointer: u64) -> Option<alloc::string::String> {
 /// Copies a `char *const argv[]`/`envp[]` array: up to 64 NUL-terminated
 /// strings, bounded like `user_string`. A null pointer means an empty array.
 fn user_string_array(pointer: u64) -> Option<Vec<Vec<u8>>> {
+    /// Linux allows large environments; the old 64-entry cap made `execve`
+    /// fail with `EFAULT` for any command whose environment grew past it
+    /// (busybox `cp` after OpenRC exported its variables).
+    const MAX_ENTRIES: u64 = 1024;
+    /// Total bytes of all strings, so a hostile array cannot exhaust the heap.
+    const MAX_BYTES: usize = 256 * 1024;
     let mut result = Vec::new();
+    let mut total = 0usize;
     if pointer == 0 {
         return Some(result);
     }
-    for index in 0..64u64 {
+    for index in 0..MAX_ENTRIES {
         let mut raw = [0_u8; 8];
         user_memory::copy_from_user(pointer.wrapping_add(index * 8), &mut raw).ok()?;
         let entry = u64::from_le_bytes(raw);
         if entry == 0 {
             return Some(result);
         }
-        result.push(user_string(entry)?.into_bytes());
+        let text = user_string(entry)?.into_bytes();
+        total = total.checked_add(text.len() + 1)?;
+        if total > MAX_BYTES {
+            return None;
+        }
+        result.push(text);
     }
     None
 }

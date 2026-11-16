@@ -41,8 +41,8 @@ REPOSITORIES = (
     "https://dl-cdn.alpinelinux.org/alpine/v3.24/main",
     "https://dl-cdn.alpinelinux.org/alpine/v3.24/community",
 )
-# VFS refuses a single file above 8 MiB.
-MAX_FILE = 8 * 1024 * 1024
+# VFS refuses a single file above 256 MiB (`vfs::MAX_FILE_BYTES`).
+MAX_FILE = 256 * 1024 * 1024
 # SFS directory entries store the name inline: 27 bytes.
 NAME_MAX = 255
 

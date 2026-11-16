@@ -15,7 +15,7 @@
 #   linuxrun /sfs/linux-ipc     # eventfd2+memfd+futex, prints 'ipc ok'
 #   linuxrun /sfs/linux-signal  # sigaction/sigprocmask/kill/SIGCHLD
 #   linuxrun /sfs/linux-pie     # ET_DYN + PT_INTERP, prints 'pie main', exit 7
-#   linuxrun /sfs/linux-bigfile # 64 MiB rootfs + 8 MiB file, prints 'rootfs ok'
+#   linuxrun /sfs/linux-bigfile # 64 MiB rootfs + 12 MiB file, prints 'rootfs ok'
 #   linuxrun /sfs/linux-mmapfile # file mmap + mprotect + MAP_FIXED, prints 'mmap ok'
 #   linuxrun /sfs/linux-sighandler # user handler + rt_sigframe/rt_sigreturn, prints 'sigframe ok'
 #   linuxrun /sfs/linux-asyncsig  # IRQ-delivered signal + sigaltstack, prints 'async sig ok'
@@ -133,12 +133,13 @@ python3 scripts/sfs_inject.py "$IMAGE" build/signal.elf linux-signal
 python3 scripts/sfs_inject.py "$IMAGE" build/pie-main.elf linux-pie
 python3 scripts/sfs_inject.py "$IMAGE" build/ld-test.elf ld-test
 
-# An 8 MiB payload proves the enlarged rootfs end to end (mount, VFS limits,
-# 64 KiB reads). Byte i is `i & 0xff`; tests/linux/bigfile.c verifies all of it.
+# A 12 MiB payload proves the enlarged rootfs end to end (mount, VFS limits,
+# 64 KiB reads) and exercises the triple-indirect block. Byte i is `i & 0xff`;
+# tests/linux/bigfile.c verifies all of it.
 python3 - <<'PY'
 from pathlib import Path
 block = bytes(range(256)) * 4096
-Path("build/big.bin").write_bytes((block * 8)[:8 * 1024 * 1024])
+Path("build/big.bin").write_bytes((block * 12)[:12 * 1024 * 1024])
 PY
 python3 scripts/sfs_inject.py "$IMAGE" build/big.bin big.bin
 python3 scripts/sfs_inject.py "$IMAGE" build/bigfile.elf linux-bigfile

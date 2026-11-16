@@ -2,10 +2,9 @@
  *
  *   linuxrun /sfs/linux-bigfile
  *
- * Reads /sfs/big.bin (8 MiB, byte i is `i & 0xff`) in 64 KiB chunks, checks
- * every byte and prints "rootfs ok". A kernel that still reads only the first
- * MiB of the disk image cannot mount the 16 MiB SFS at all, and the old
- * 512 KiB VFS/exec limits would reject this file.
+ * Reads /sfs/big.bin (12 MiB, byte i is `i & 0xff`) in 64 KiB chunks, checks
+ * every byte and prints "rootfs ok". Past the double-indirect tree the read
+ * path needs the triple-indirect block, which the 64 MiB file cap relies on.
  */
 static long sys5(long n, long a, long b, long c, long d, long e) {
     register long x8 __asm__("x8") = n;
@@ -78,7 +77,7 @@ void _start(void) {
     for (int index = 0; index < 8; index++) {
         size |= (long)stat[48 + index] << (index * 8);
     }
-    if (size != 8 * 1024 * 1024) {
+    if (size != 12 * 1024 * 1024) {
         fail("big.bin size wrong\n", 18);
     }
 

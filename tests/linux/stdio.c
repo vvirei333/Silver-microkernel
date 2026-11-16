@@ -10,11 +10,15 @@
  *
  * Expected: "stdio ok" and exit 0.
  */
+#define _GNU_SOURCE
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/sendfile.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 static int failed(const char *message) {
@@ -23,6 +27,12 @@ static int failed(const char *message) {
 }
 
 int main(void) {
+    /* Re-executed by the large-environment case below. */
+    if (getenv("STDIO_CHILD")) {
+        printf("large env ok\n");
+        return 0;
+    }
+
     /* writev on a regular file, not just the console. */
     int fd = open("/tmp/stdio-v", O_CREAT | O_TRUNC | O_WRONLY, 0600);
     if (fd < 0) return failed("open writev");
@@ -62,8 +72,63 @@ int main(void) {
     fclose(file);
     if (lines != 50) return failed("fdopen lines");
 
+    /* sendfile must copy and advance the input offset (busybox cp). */
+    int source = open("/tmp/stdio-sf-in", O_CREAT | O_TRUNC | O_RDWR, 0600);
+    int sink = open("/tmp/stdio-sf-out", O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (source < 0 || sink < 0) return failed("open sendfile");
+    if (write(source, "sendfile data", 13) != 13 || lseek(source, 0, SEEK_SET) != 0) {
+        return failed("prepare sendfile");
+    }
+    if (sendfile(sink, source, NULL, 13) != 13) return failed("sendfile");
+    char copied[16] = {0};
+    close(sink);
+    sink = open("/tmp/stdio-sf-out", O_RDONLY);
+    if (sink < 0 || read(sink, copied, 13) != 13 || memcmp(copied, "sendfile data", 13)) {
+        return failed("sendfile bytes");
+    }
+    if (read(source, copied, 1) != 0) return failed("sendfile offset");
+    close(source);
+    close(sink);
+
+    /* copy_file_range with explicit offsets. */
+    source = open("/tmp/stdio-sf-in", O_RDONLY);
+    sink = open("/tmp/stdio-sf-out", O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (source < 0 || sink < 0) return failed("open copy_file_range");
+    loff_t input_offset = 0;
+    loff_t output_offset = 0;
+    if (copy_file_range(source, &input_offset, sink, &output_offset, 13, 0) != 13) {
+        return failed("copy_file_range");
+    }
+    if (input_offset != 13 || output_offset != 13) return failed("copy_file_range offsets");
+    close(source);
+    close(sink);
+
     unlink("/tmp/stdio-v");
     unlink("/tmp/stdio-f");
+    unlink("/tmp/stdio-sf-in");
+    unlink("/tmp/stdio-sf-out");
+
+    /* An environment larger than the native 32-entry spawn cap must exec. */
+    pid_t child = fork();
+    if (child == 0) {
+        char *child_env[49];
+        static char slots[45][16];
+        int index = 0;
+        for (; index < 45; index++) {
+            snprintf(slots[index], sizeof slots[index], "STDIO_VAR_%d=x", index);
+            child_env[index] = slots[index];
+        }
+        child_env[45] = "STDIO_CHILD=1";
+        child_env[46] = "STDIO_CHILD2=1";
+        child_env[47] = "STDIO_CHILD3=1";
+        child_env[48] = NULL;
+        execve("/sfs/linux-stdio", (char *const[]){"/sfs/linux-stdio", 0}, child_env);
+        _exit(1);
+    }
+    int status = 0;
+    if (child < 0 || waitpid(child, &status, 0) != child) return failed("waitpid");
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) return failed("large env exec");
+
     printf("stdio ok\n");
     return 0;
 }

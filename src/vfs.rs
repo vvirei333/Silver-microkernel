@@ -27,13 +27,12 @@ pub const OPEN_APPEND: u64 = 2;
 pub const FD_KIND_FILE: u64 = 1;
 pub const FD_KIND_DIR: u64 = 2;
 
-/// Hard cap for a single file in the in-memory VFS. SFS itself tops out at
-/// `MAX_FILE_BLOCKS * 512` bytes (about 8.26 MiB: four direct, one indirect
-/// and one double-indirect tree), so 8 MiB lets a real `libc.so.6` through
-/// while staying inside the format. The Linux loader reads such a file into
-/// one temporary heap buffer; the kernel heap is sized for it (see
-/// `allocator::HEAP_PAGES`).
-pub const MAX_FILE_BYTES: usize = 8 * 1024 * 1024;
+/// Hard cap for a single file. The SFS block tree holds about 1 GiB (direct,
+/// single, double and triple indirect). The Alpine `phosh`/`phoc` closure
+/// ships `libLLVM` (~170 MiB) and `libwebkitgtk` (~70 MiB), so the format cap
+/// is 256 MiB. Whole-file reads are bounded separately (`EXEC_FILE_LIMIT`);
+/// exec and `mmap` stream the file in chunks.
+pub const MAX_FILE_BYTES: usize = 256 * 1024 * 1024;
 /// System-wide budget for file payload **capacity**, summed over every RamFs
 /// backend. Accounting the logical length was not enough: `Vec` growth keeps
 /// spare capacity, so several backends could hold far more memory than

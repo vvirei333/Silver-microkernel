@@ -113,7 +113,9 @@ const FS_BLOCK_SIZE: usize = 512;
 /// Upper bound on a file loaded for execution, so a huge VFS blob cannot be
 /// cloned into kernel memory before `elf::load_elf` rejects its segments. This
 /// matches the VFS file cap: the heap is only 2 MiB.
-const EXEC_FILE_LIMIT: usize = vfs::MAX_FILE_BYTES;
+/// Native ELFs are small; this bounds the whole-file read the native loader
+/// performs (`vfs::read_file`), independently of the 256 MiB format cap.
+const EXEC_FILE_LIMIT: usize = 32 * 1024 * 1024;
 /// A foreign (Linux) main executable is streamed from the VFS, so it may be
 /// larger than the whole-file read cap. The bound is the image frame budget
 /// (`linux_elf::MAX_IMAGE_PAGES`), not a transient heap buffer.

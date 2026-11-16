@@ -32,6 +32,9 @@ use alloc::vec::Vec;
 pub const SPAWN_ARGS_VERSION: u32 = 1;
 /// Hard cap on `argc` and `envc`, independent of the byte cap.
 pub const MAX_SPAWN_ARGS: usize = 32;
+/// Linux `execve` environments are routinely larger than the native spawn
+/// protocol's 32 entries (the kernel's spawn env plus OpenRC's exports).
+pub const MAX_LINUX_ARGS: usize = 1024;
 
 /// Parsed `SYS_SPAWN_ARGSV` block: the strings the new process will receive
 /// as `argv` and `envp`.
@@ -113,7 +116,7 @@ pub fn build_argv_envp(
     stack_top: usize,
     max_bytes: usize,
 ) -> Option<ArgvEnvBlock> {
-    build_stack(argv, envp, &[], stack_top, max_bytes)
+    build_stack(argv, envp, &[], stack_top, max_bytes, MAX_SPAWN_ARGS)
 }
 
 /// Builds the Linux initial stack: the same `argc/argv/envp` prefix plus an
@@ -133,7 +136,7 @@ pub fn build_linux_stack(
     stack_top: usize,
     max_bytes: usize,
 ) -> Option<ArgvEnvBlock> {
-    build_stack(argv, envp, auxv, stack_top, max_bytes)
+    build_stack(argv, envp, auxv, stack_top, max_bytes, MAX_LINUX_ARGS)
 }
 
 fn build_stack(
@@ -142,8 +145,9 @@ fn build_stack(
     auxv: &[(u64, u64)],
     stack_top: usize,
     max_bytes: usize,
+    max_entries: usize,
 ) -> Option<ArgvEnvBlock> {
-    if argv.len() > MAX_SPAWN_ARGS || envp.len() > MAX_SPAWN_ARGS {
+    if argv.len() > max_entries || envp.len() > max_entries {
         return None;
     }
     if argv.iter().chain(envp.iter()).any(|text| text.contains(&0)) {
