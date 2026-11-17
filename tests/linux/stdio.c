@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sendfile.h>
+#include <sys/stat.h>
 #include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -103,10 +104,27 @@ int main(void) {
     close(source);
     close(sink);
 
+    /* pwrite past EOF zero-fills the hole (dconf writes byte 1 of a fresh
+     * file and expects a two-byte file). */
+    int hole = open("/tmp/stdio-hole", O_CREAT | O_TRUNC | O_RDWR, 0600);
+    if (hole < 0) return failed("open hole");
+    if (pwrite(hole, "x", 1, 1) != 1) return failed("pwrite past EOF");
+    if (lseek(hole, 0, SEEK_CUR) != 0) return failed("pwrite moved offset");
+    struct stat hole_status;
+    if (fstat(hole, &hole_status) != 0 || hole_status.st_size != 2) {
+        return failed("pwrite size");
+    }
+    char hole_bytes[2] = {0};
+    if (pread(hole, hole_bytes, 2, 0) != 2 || hole_bytes[0] != 0 || hole_bytes[1] != 'x') {
+        return failed("pwrite hole bytes");
+    }
+    close(hole);
+
     unlink("/tmp/stdio-v");
     unlink("/tmp/stdio-f");
     unlink("/tmp/stdio-sf-in");
     unlink("/tmp/stdio-sf-out");
+    unlink("/tmp/stdio-hole");
 
     /* An environment larger than the native 32-entry spawn cap must exec. */
     pid_t child = fork();

@@ -67,19 +67,26 @@ phoc-server-Message: Enabling shell mode
 ```
 
 So the Alpine compositor initialises a headless output, owns the Wayland
-socket and switches to shell mode (it execs `/usr/bin/phosh` from there).
+socket, switches to shell mode and serves `wayland-0`. dconf stays quiet
+after the positional-write fix.
 
 ## Limits / next
 
 - No visible output: the headless backend has no scanout. The next slice is
   the same ivshmem surface the custom stack uses (or a DRM/KMS device for
   Linux tasks), so frames can be captured.
-- `dconf` logs `failed to allocate file '/tmp/dconf/user': Invalid argument`
-  repeatedly. A writable `MAP_SHARED` mapping of a RamFs file is likely
-  refused; dconf falls back to memory but the shell may store no settings.
-- `phosh` starting after "Enabling shell mode" is not yet verified: the log
-  ends there. Needs the session bus/logind question resolved (Alpine's phosh
-  expects elogind; the image has none).
+- dconf is fixed: `pwrite(fd, "", 1, 1)` into a fresh file returned `EINVAL`
+  because both the Linux `pwrite` path and the RamFs `write_at` refused
+  offsets past EOF. Positional writes now zero-fill the hole and do not move
+  the descriptor offset, matching Linux; the `dconf-CRITICAL` messages are
+  gone.
+- The compositor serves clients: `/tmp/wayland-0` exists 45 s into the boot
+  and `phoc` logs "Enabling shell mode". Whether the `phosh` process stays
+  alive after that is still unverified (the log shows several tasks exiting
+  with status 0 around that point).
+- `phosh` staying alive after "Enabling shell mode" is not yet verified. It
+  needs the session bus/logind question resolved (Alpine's phosh expects
+  elogind; the image has none) and a way to observe the process tree.
 - `libLLVM` is only needed by Mesa's `libgallium`; a pixman-only image could
   drop it later and shrink the image by ~170 MiB.
 - The two `>64 MiB` libraries make packing slower and need the 256 MiB cap;

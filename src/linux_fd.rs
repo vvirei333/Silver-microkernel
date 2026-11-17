@@ -1116,6 +1116,9 @@ pub fn lseek(task: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, u64> {
 /// does not move the descriptor offset.
 pub fn pwrite(task: u64, fd: u64, offset: u64, bytes: &[u8]) -> Result<usize, u64> {
     let target = lookup(task, fd).ok_or(EBADF)?;
+    if let Target::Vfs(vfs_fd) = target {
+        return vfs::pwrite(task, vfs_fd, offset, bytes).map_err(|_| EINVAL);
+    }
     let Target::MemFd(state) = target else {
         return Err(EINVAL);
     };

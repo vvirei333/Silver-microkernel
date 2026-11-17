@@ -79,6 +79,9 @@ if command -v dbus-launch >/dev/null 2>&1; then
     eval "$(dbus-launch --sh-syntax)"
 fi
 
+# Prove the compositor serves clients: the socket appears after startup.
+( sleep 45; if ls /tmp | grep -q wayland-0; then echo "WAYLAND SOCKET OK"; \
+  else echo "WAYLAND SOCKET MISSING"; ls /tmp; fi ) &
 exec /usr/bin/phoc -S -E /usr/bin/phosh
 """
 

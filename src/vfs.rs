@@ -503,9 +503,6 @@ impl FileSystem for RamFs {
         // O_APPEND semantics: every write starts at the current EOF, even if
         // another handle extended the file after this one was opened.
         let offset = if append { data.len() } else { offset };
-        if offset > data.len() {
-            return Err(());
-        }
         let Some(new_len) = offset.checked_add(bytes.len()) else {
             return Err(());
         };
@@ -514,10 +511,23 @@ impl FileSystem for RamFs {
         }
         let old_len = data.len();
         let old_capacity = data.capacity();
-        if new_len > old_capacity {
-            // Growing: build the replacement allocation first, validate the
-            // *actual* capacity against the shared budget, and only then swap.
-            // A full budget leaves the file and both counters untouched.
+        if new_len <= old_capacity && offset <= old_len {
+            // The write fits in already-accounted capacity: no allocation and
+            // therefore no budget change.
+            let remaining = old_len - offset;
+            if bytes.len() <= remaining {
+                data[offset..offset + bytes.len()].copy_from_slice(bytes);
+            } else {
+                if remaining != 0 {
+                    data[offset..].copy_from_slice(&bytes[..remaining]);
+                }
+                data.extend_from_slice(&bytes[remaining..]);
+            }
+        } else {
+            // Growing (or writing past EOF, which Linux allows and zero-fills):
+            // build the replacement allocation first, validate the *actual*
+            // capacity against the shared budget, and only then swap. A full
+            // budget leaves the file and both counters untouched.
             let Some(target) = capacity_target(new_len) else {
                 return Err(());
             };
@@ -530,32 +540,15 @@ impl FileSystem for RamFs {
                 return Err(());
             }
             grown.extend_from_slice(&data[..old_len]);
-            let remaining = old_len - offset;
-            if bytes.len() <= remaining {
-                grown[offset..offset + bytes.len()].copy_from_slice(bytes);
-            } else {
-                if remaining != 0 {
-                    grown[offset..].copy_from_slice(&bytes[..remaining]);
-                }
-                grown.extend_from_slice(&bytes[remaining..]);
+            if offset > old_len {
+                grown.resize(offset, 0);
             }
+            grown.extend_from_slice(bytes);
             *data = grown;
             self.bytes = self
                 .bytes
                 .saturating_sub(old_capacity)
                 .saturating_add(new_capacity);
-        } else {
-            // The write fits in already-accounted capacity: no allocation and
-            // therefore no budget change.
-            let remaining = old_len - offset;
-            if bytes.len() <= remaining {
-                data[offset..offset + bytes.len()].copy_from_slice(bytes);
-            } else {
-                if remaining != 0 {
-                    data[offset..].copy_from_slice(&bytes[..remaining]);
-                }
-                data.extend_from_slice(&bytes[remaining..]);
-            }
         }
         Ok((bytes.len(), offset + bytes.len()))
     }
@@ -1040,6 +1033,27 @@ impl Vfs {
         Ok(written)
     }
 
+    /// Positional write (`pwrite`): writes at `offset` without moving the
+    /// descriptor's offset. Offsets past EOF extend the file with zeros, which
+    /// is what dconf's one-byte `pwrite` into a fresh file needs.
+    fn pwrite(&mut self, owner: u64, fd: u64, offset: u64, bytes: &[u8]) -> Result<usize, ()> {
+        let index = self
+            .open_files
+            .iter()
+            .position(|file| file.owner == owner && file.fd == fd)
+            .ok_or(())?;
+        if !self.open_files[index].writable {
+            return Err(());
+        }
+        let path = self.open_files[index].path.clone();
+        let append = self.open_files[index].append;
+        let (mount, relative) = self.resolve(&path);
+        let (written, _) = self.mounts[mount]
+            .fs
+            .write_at(&relative, offset as usize, bytes, append)?;
+        Ok(written)
+    }
+
     /// `lseek(2)` on a plain file. Directories are not seekable in this VFS.
     fn lseek(&mut self, owner: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, ()> {
         let index = self
@@ -1405,6 +1419,11 @@ pub fn read_path_at(path: &str, offset: usize, limit: usize) -> Result<Vec<u8>, 
 
 pub fn write(owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
     with_vfs(|vfs| vfs.write(owner, fd, bytes))
+}
+
+/// Positional write that does not move the descriptor offset.
+pub fn pwrite(owner: u64, fd: u64, offset: u64, bytes: &[u8]) -> Result<usize, ()> {
+    with_vfs(|vfs| vfs.pwrite(owner, fd, offset, bytes))
 }
 
 pub fn read_dir(cwd: &str, path: &str) -> Result<Vec<DirEntry>, ()> {

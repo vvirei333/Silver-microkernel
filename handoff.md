@@ -7265,7 +7265,14 @@ Evidence: guest compiles the GSettings schemas with Alpine's own
 `glib-compile-schemas` (qemu-user cannot relocate libgio), phoc starts on
 `wayland-0`, adds a `HEADLESS-1` output and prints "Enabling shell mode".
 
-Limits: no scanout yet (headless), dconf fails to allocate
-`/tmp/dconf/user` with EINVAL (writable MAP_SHARED on a RamFs file), and the
-phosh process that runs after shell mode is not verified. Details:
+dconf's `failed to allocate '/tmp/dconf/user': EINVAL` was a real kernel
+bug: `pwrite(fd, "", 1, 1)` into a fresh file hit the `offset > len` rejection
+in the RamFs `write_at` (and `pwrite` only supported memfds). Positional
+writes now zero-fill past EOF and keep the descriptor offset unchanged; the
+dconf messages are gone and `linux-stdio` covers the case. The compositor
+serves clients: `/tmp/wayland-0` exists and phoc logs "Enabling shell mode".
+
+Limits: no scanout yet (headless), and whether phosh stays alive after shell
+mode is unverified (needs a session bus/logind and process observability).
+Details:
 [`docs/ALPINE_PHOSH.md`](docs/ALPINE_PHOSH.md).
