@@ -89,14 +89,23 @@ Task 8 killed: Page Fault at 0x00000000000000E9 (ESR: 0x92000006)
 ELR_EL1=0000000010046AF0          (phoc text)
 ```
 
-The syscall trace shows `mmap` returning `ENOMEM` shortly before the fault
-and `ppoll`/`futex` returning `EFAULT` on the tasks that die afterwards. The
-leading hypothesis is the wlroots swapchain: a 1024x768 shm buffer needs a
-3 MiB *contiguous* memfd backing (`MemFdFrames::ensure_frames` uses
-`alloc_user_contiguous_pages_tagged`), and a failed allocation leaves a NULL
-pointer that phoc dereferences. Next steps: verify the memfd allocation in
-isolation, then either make memfd backing non-contiguous (frame list) or
-pre-allocate the headless swapchain early in boot.
+The fault is the same instruction every time (`ELR 0x46AF0`, phoc text). With
+the matching `phoc-dbg` package that resolves to
+`phoc_xdg_toplevel_constructed` (`src/xdg-toplevel.c`), at the register of
+`wl_signal_add (&self->xdg_toplevel->base->surface->events.commit, ...)`:
+`self->xdg_toplevel` is a small garbage value (`0x11`) that passes the
+`g_assert (self->xdg_toplevel)` because it is non-NULL.
+
+It reproduces with **no client at all** (`phoc -E /bin/true`, not even a
+shell), with `-S -E phosh`, at 1 GiB and 2 GiB of RAM, and with wlroots/GLib
+debug logging on. A standalone memfd test (four 3 MiB `memfd_create` +
+`ftruncate` + `mmap` + memset runs) passes at the same point in boot, so a
+simple contiguous-allocation failure is not the whole story. The `mmap`
+`ENOMEM` seen in the trace and the garbage pointer both point at memory
+corruption inside phoc (wlroots `wlr_xdg_toplevel` or the GObject property)
+rather than a clean error return. Next steps: a gdb stub or core-dump path on
+the faulting task, and an audit of the syscalls phoc uses between output
+creation and the first toplevel construction.
 
 ## Limits / next
 

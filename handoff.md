@@ -7276,9 +7276,13 @@ Scanout attempt: `tools/screencopy.c` is a wlr-screencopy client that copies
 phoc's headless output into the Silver ivshmem window (glibc runtime deployed
 under `/opt/glibc`). It is blocked by a deterministic phoc crash: about a
 second after `HEADLESS-1` is added, phoc faults at `0xE9` (NULL + offset),
-with or without the shell, at 1 and 2 GiB RAM. The syscall trace shows
-`mmap` -> `ENOMEM` just before, so the wlroots swapchain's 3 MiB contiguous
-memfd backing is the leading suspect.
+with or without the shell, at 1 and 2 GiB RAM. With the matching `phoc-dbg`, the fault resolves to
+`phoc_xdg_toplevel_constructed` and the `wl_signal_add` for
+`self->xdg_toplevel->base->surface`, where `self->xdg_toplevel` is garbage
+(`0x11`) yet non-NULL. It reproduces with no client at all (`-E /bin/true`),
+at 1 and 2 GiB, with debug logging on; a 4x3 MiB memfd+mmap test passes at
+the same point in boot, so this looks like memory corruption inside phoc
+rather than a clean allocation failure.
 
 Limits: no scanout yet, and whether phosh stays alive after shell mode is
 unverified (needs a session bus/logind and process observability).
