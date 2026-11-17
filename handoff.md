@@ -7272,7 +7272,15 @@ writes now zero-fill past EOF and keep the descriptor offset unchanged; the
 dconf messages are gone and `linux-stdio` covers the case. The compositor
 serves clients: `/tmp/wayland-0` exists and phoc logs "Enabling shell mode".
 
-Limits: no scanout yet (headless), and whether phosh stays alive after shell
-mode is unverified (needs a session bus/logind and process observability).
+Scanout attempt: `tools/screencopy.c` is a wlr-screencopy client that copies
+phoc's headless output into the Silver ivshmem window (glibc runtime deployed
+under `/opt/glibc`). It is blocked by a deterministic phoc crash: about a
+second after `HEADLESS-1` is added, phoc faults at `0xE9` (NULL + offset),
+with or without the shell, at 1 and 2 GiB RAM. The syscall trace shows
+`mmap` -> `ENOMEM` just before, so the wlroots swapchain's 3 MiB contiguous
+memfd backing is the leading suspect.
+
+Limits: no scanout yet, and whether phosh stays alive after shell mode is
+unverified (needs a session bus/logind and process observability).
 Details:
 [`docs/ALPINE_PHOSH.md`](docs/ALPINE_PHOSH.md).

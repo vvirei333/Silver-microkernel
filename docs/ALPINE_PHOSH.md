@@ -70,11 +70,39 @@ So the Alpine compositor initialises a headless output, owns the Wayland
 socket, switches to shell mode and serves `wayland-0`. dconf stays quiet
 after the positional-write fix.
 
+## Scanout bridge (work in progress)
+
+`tools/screencopy.c` is a wlr-screencopy client: it connects to phoc's
+`wayland-0`, captures the headless output in shm, converts ARGB8888 to RGBA
+and publishes frames in the Silver window layout (magic `WIN1`, header at
+0x1000, pixels at 0x1000). It is built for glibc and deployed with its own
+runtime under `/opt/glibc` (`ld-linux`, `libc`, `libwayland-client`,
+`libffi`), because Alpine's musl headers are not installed in the stage.
+
+The tool is ready, but it cannot be exercised yet: on this ABI **phoc itself
+crashes** about a second after `HEADLESS-1` is added, with or without
+`-S -E phosh`, with 1 GiB and 2 GiB of guest RAM, debug logging on or off:
+
+```
+phoc-output: Output 'HEADLESS-1' added ...
+Task 8 killed: Page Fault at 0x00000000000000E9 (ESR: 0x92000006)
+ELR_EL1=0000000010046AF0          (phoc text)
+```
+
+The syscall trace shows `mmap` returning `ENOMEM` shortly before the fault
+and `ppoll`/`futex` returning `EFAULT` on the tasks that die afterwards. The
+leading hypothesis is the wlroots swapchain: a 1024x768 shm buffer needs a
+3 MiB *contiguous* memfd backing (`MemFdFrames::ensure_frames` uses
+`alloc_user_contiguous_pages_tagged`), and a failed allocation leaves a NULL
+pointer that phoc dereferences. Next steps: verify the memfd allocation in
+isolation, then either make memfd backing non-contiguous (frame list) or
+pre-allocate the headless swapchain early in boot.
+
 ## Limits / next
 
-- No visible output: the headless backend has no scanout. The next slice is
-  the same ivshmem surface the custom stack uses (or a DRM/KMS device for
-  Linux tasks), so frames can be captured.
+- No visible output yet: the headless backend has no scanout, and the
+  screencopy bridge is blocked by the phoc crash described above. Once phoc
+  stays up, the same ivshmem surface the custom stack used will show frames.
 - dconf is fixed: `pwrite(fd, "", 1, 1)` into a fresh file returned `EINVAL`
   because both the Linux `pwrite` path and the RamFs `write_at` refused
   offsets past EOF. Positional writes now zero-fill the hole and do not move
