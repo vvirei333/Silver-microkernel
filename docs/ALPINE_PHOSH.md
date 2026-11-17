@@ -97,14 +97,32 @@ the matching `phoc-dbg` package that resolves to
 `g_assert (self->xdg_toplevel)` because it is non-NULL.
 
 It reproduces with **no client at all** (`phoc -E /bin/true`, not even a
-shell), with `-S -E phosh`, at 1 GiB and 2 GiB of RAM, and with wlroots/GLib
-debug logging on. A standalone memfd test (four 3 MiB `memfd_create` +
-`ftruncate` + `mmap` + memset runs) passes at the same point in boot, so a
-simple contiguous-allocation failure is not the whole story. The `mmap`
-`ENOMEM` seen in the trace and the garbage pointer both point at memory
-corruption inside phoc (wlroots `wlr_xdg_toplevel` or the GObject property)
-rather than a clean error return. Next steps: a gdb stub or core-dump path on
-the faulting task, and an audit of the syscalls phoc uses between output
+shell), with `-S -E phosh`, at 1 GiB and 2 GiB of RAM, and with Xwayland
+explicitly disabled (`--no-xwayland`). A standalone memfd test (four 3 MiB
+`memfd_create` + `ftruncate` + `mmap` + memset runs) passes at the same point
+in boot, so a simple contiguous-allocation failure is not the whole story.
+
+The kernel now dumps the dying task's register bank on a user fault. At the
+crash:
+
+```
+x0=0x0000000000000011  x19=0x0000000044A41EA0  x29=0x000000007FE3F640
+x30=0x0000000020051C44  SP_EL0=0x000000007FE3E400
+```
+
+`x0` is the garbage pointer being followed; `x19` is the `PhocXdgToplevel`
+object and `x30` returns into a library around 0x2005_xxxx (GObject/GIO
+range). The crash is timing-sensitive: with `WLR_DEBUG=1` and
+`G_MESSAGES_DEBUG=all` phoc survived past output creation in one run, and
+then served clients. That combination (garbage object property, timing
+dependence, no syscall error) points at memory corruption inside phoc rather
+than a clean error return.
+
+When phoc dies, its Wayland listener disappears with the task: clients then
+get `ECONNREFUSED` on `/tmp/wayland-0` even though the socket node is still
+visible, which is exactly what the screencopy bridge reported. Next steps: a
+gdb remote stub (the register dump is already in place) to catch the write
+that installs `0x11`, and an audit of the syscalls phoc uses between output
 creation and the first toplevel construction.
 
 ## Limits / next

@@ -58,6 +58,7 @@ pub extern "C" fn silver_handle_user_fault(
     if recovered {
         0
     } else {
+        dump_user_frame(_frame);
         silver_handle_task_fault(esr, elr, far)
     }
 }
@@ -73,6 +74,33 @@ pub extern "C" fn silver_handle_user_fault(
     far: u64,
 ) -> u64 {
     silver_handle_task_fault(esr, elr, far)
+}
+
+/// Prints the saved EL0 register bank of the dying task. Frames are rare, so
+/// this stays unconditional: the values are what turns "Page Fault at 0xE9"
+/// into an actionable report (e.g. a pointer that should never be that small).
+fn dump_user_frame(frame: *mut u64) {
+    if frame.is_null() {
+        return;
+    }
+    let names = [
+        "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10",
+        "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20",
+        "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30",
+    ];
+    for (index, name) in names.iter().enumerate() {
+        console::write_str(name);
+        console::write_str("=0x");
+        console::write_hex_u64(unsafe { *frame.add(index) });
+        console::write_str(if index % 4 == 3 { "\r\n" } else { " " });
+    }
+    let sp: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, sp_el0", out(reg) sp);
+    }
+    console::write_str("SP_EL0=0x");
+    console::write_hex_u64(sp);
+    console::write_str("\r\n");
 }
 
 #[no_mangle]

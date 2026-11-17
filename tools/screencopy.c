@@ -270,9 +270,11 @@ static int capture_once(void) {
 }
 
 int main(void) {
-    display = wl_display_connect(NULL);
+    const char *name = getenv("WAYLAND_DISPLAY");
+    display = wl_display_connect(name ? name : "wayland-0");
     if (!display) {
-        fprintf(stderr, "screencopy: cannot connect\n");
+        fprintf(stderr, "screencopy: cannot connect (%s): %s\n",
+                name ? name : "wayland-0", strerror(errno));
         return 1;
     }
     struct wl_registry *registry = wl_display_get_registry(display);

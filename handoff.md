@@ -7279,10 +7279,13 @@ second after `HEADLESS-1` is added, phoc faults at `0xE9` (NULL + offset),
 with or without the shell, at 1 and 2 GiB RAM. With the matching `phoc-dbg`, the fault resolves to
 `phoc_xdg_toplevel_constructed` and the `wl_signal_add` for
 `self->xdg_toplevel->base->surface`, where `self->xdg_toplevel` is garbage
-(`0x11`) yet non-NULL. It reproduces with no client at all (`-E /bin/true`),
-at 1 and 2 GiB, with debug logging on; a 4x3 MiB memfd+mmap test passes at
-the same point in boot, so this looks like memory corruption inside phoc
-rather than a clean allocation failure.
+(`0x11`) yet non-NULL. It reproduces with no client at all (`-E /bin/true`), at 1 and 2 GiB, with
+`--no-xwayland`, and with debug logging on; a 4x3 MiB memfd+mmap test passes
+at the same point in boot. User faults now dump the whole register bank
+(`x0=0x11`, `x19` = the toplevel object, `x30` in the GObject/GIO range).
+The crash is timing-sensitive: under heavy GLib/wlroots logging phoc survived
+and served clients. When it dies its Wayland listener disappears with the
+task, so clients get ECONNREFUSED.
 
 Limits: no scanout yet, and whether phosh stays alive after shell mode is
 unverified (needs a session bus/logind and process observability).
