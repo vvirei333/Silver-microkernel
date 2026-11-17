@@ -250,6 +250,8 @@ fn execute(command: &str) {
             syscall::print("  clear      Clear the terminal screen\r\n");
             syscall::print("  uname      Print kernel name, version and architecture\r\n");
             syscall::print("  health     Kernel resource and leak snapshot\r\n");
+            syscall::print("  watch <addr> [len]  Arm a hardware write watchpoint (gdb-stub)\r\n");
+            syscall::print("  unwatch    Disarm the watchpoint\r\n");
             syscall::print("  du [path]  SFS inode/block usage of a subtree\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
             syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server> [arg]\r\n");
@@ -298,6 +300,11 @@ fn execute(command: &str) {
         Some("clear") => clear_screen(),
         Some("uname") => syscall::print("Silver Kernel v0.1.2 aarch64 (WerewolfOS)\r\n"),
         Some("health") => show_health(),
+        Some("watch") => watch_command(words.next(), words.next()),
+        Some("unwatch") => {
+            let _ = syscall::debug_watch(0, 0);
+            syscall::print("watch: off\r\n");
+        }
         Some("du") => show_usage(words.next()),
         Some("ps") => show_tasks(),
         Some("spawn") | Some("bg") => spawn_program(words.next(), words.next()),
@@ -1028,6 +1035,45 @@ fn write_file(path: &str, text: &str, append: bool) {
     syscall::print_dec_u64(wrote as u64);
     syscall::print(" bytes\r\n");
     let _ = syscall::fs_close(fd);
+}
+
+fn parse_hex(text: &str) -> Option<u64> {
+    let text = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")).unwrap_or(text);
+    if text.is_empty() {
+        return None;
+    }
+    let mut value = 0u64;
+    for byte in text.bytes() {
+        let digit = match byte {
+            b'0'..=b'9' => byte - b'0',
+            b'a'..=b'f' => byte - b'a' + 10,
+            b'A'..=b'F' => byte - b'A' + 10,
+            _ => return None,
+        };
+        value = value.checked_mul(16)?.checked_add(digit as u64)?;
+    }
+    Some(value)
+}
+
+fn watch_command(address: Option<&str>, length: Option<&str>) {
+    let Some(text) = address else {
+        syscall::print("Usage: watch <address> [length]\r\n");
+        return;
+    };
+    let Some(address) = parse_hex(text) else {
+        syscall::print("watch: bad address\r\n");
+        return;
+    };
+    let length = length.and_then(parse_hex).unwrap_or(8);
+    if syscall::debug_watch(address, length) {
+        syscall::print("watch: armed at 0x");
+        syscall::print_hex_u64(address);
+        syscall::print(" len=");
+        syscall::print_dec_u64(length as u64);
+        syscall::print("\r\n");
+    } else {
+        syscall::print("watch: failed (debug support or range)\r\n");
+    }
 }
 
 fn touch_command(path: Option<&str>) {

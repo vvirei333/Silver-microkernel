@@ -73,6 +73,8 @@ mod mutex;
 mod pl011;
 #[cfg(feature = "gdb-stub")]
 mod gdb;
+#[cfg(feature = "gdb-stub")]
+mod debug;
 #[cfg(not(feature = "std"))]
 mod platform;
 mod power;

@@ -42,6 +42,27 @@ Memory access uses the faulting task's active TTBR0. A request for an
 unmapped user address would fault in EL1, which is fatal: stick to addresses
 taken from registers (objects, stack) when inspecting.
 
+## Hardware write watchpoints
+
+`src/debug.rs` arms DBGWVR0/DBGWCR0 (LSC = store) and enables monitor debug in
+MDSCR_EL1. The native shell exposes it:
+
+```
+howl> watch 0x50000000      # 8-byte write watch (length optional)
+howl> unwatch
+```
+
+`tests/linux/watchtest.c` maps a fixed page and stores into it, so
+`watch 0x50000000` followed by `linuxrun /sfs/watchtest` is the self-test.
+On hardware the store raises EC 0x34 and the kernel enters the stub.
+
+**QEMU `virt` does not deliver the exception.** The registers read back with
+the written values, but the store completes and the test prints "watch
+survived" (with `-smp 1` too, so it is not task migration). The kernel side
+is ready for real hardware; on QEMU the next avenue is a software page watch
+(clear the PTE write bit for the containing page and handle the fault in
+`cow_fault`, with a single-step-free allow/reprotect policy).
+
 ## Limits
 
 - No single-step or breakpoints yet; the fault is final.

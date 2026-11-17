@@ -104,6 +104,9 @@ pub const SYS_RANDOM: u64 = 90;
 /// Returns the current memory-pressure level: 0 normal, 1 warning,
 /// 2 critical. Native ABI only; the Linux ABI keeps its own errno space.
 pub const SYS_MEMORY_PRESSURE: u64 = 91;
+/// Arm a hardware write watchpoint: `debug_watch(address, length)`.
+/// Debug builds only (`gdb-stub`).
+pub const SYS_DEBUG_WATCH: u64 = 92;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -327,6 +330,17 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
         SYS_MEMINFO_V2 => sys_meminfo_v2(frame[0]),
         SYS_RANDOM => sys_random(frame[0], frame[1]),
         SYS_MEMORY_PRESSURE => frame_allocator::pressure_level() as u64,
+        #[cfg(feature = "gdb-stub")]
+        SYS_DEBUG_WATCH => {
+            if frame[1] == 0 {
+                crate::debug::disarm();
+                0
+            } else if crate::debug::arm_write(frame[0], frame[1]) {
+                1
+            } else {
+                0
+            }
+        }
         SYS_HEALTH => sys_health(frame[0]),
         SYS_TASK_LIST => sys_task_list(frame[0], frame[1]),
         SYS_SPAWN_ARGS => sys_spawn_with_args(frame[0], frame[1], frame[2], frame[3]),

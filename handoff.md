@@ -7301,6 +7301,12 @@ register dump. It implements stop reason, register read, memory read/write,
 target.xml and detach; `tools/gdb_rsp.py` is a small deterministic client
 (`tools/gdb_rsp.py x19:0x100`, `--walk`).
 
+Hardware write watchpoints are wired too (`src/debug.rs`, `watch <addr>` in
+the native shell, SYS_DEBUG_WATCH = 92): DBGWVR0/DBGWCR0 + MDSCR_EL1 MDE/KDE.
+QEMU accepts the register writes (readback matches) but does not raise the
+watchpoint exception for the self-test store, so on QEMU the corruption must
+be caught another way (software page watch).
+
 The Alpine phoc crash was inspected with it: at the fault
 `x0=0x11`, `x19=0x2`, `x18=0x1` — small values that look like a Wayland
 message header (object id, opcode, size 0x11) rather than an object pointer,

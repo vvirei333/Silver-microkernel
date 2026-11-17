@@ -43,6 +43,7 @@ const SYS_FS_RENAME: u64 = 38;
 const SYS_FS_REPLACE: u64 = 87;
 const SYS_FS_USAGE: u64 = 88;
 const SYS_RANDOM: u64 = 90;
+const SYS_DEBUG_WATCH: u64 = 92;
 const SYS_CONSOLE_SET: u64 = 39;
 const SYS_TASK_RESUME: u64 = 40;
 const SYS_WAIT_EVENT: u64 = 41;
@@ -732,6 +733,12 @@ pub fn fs_replace(source: &str, destination: &str) -> bool {
             syscall2(SYS_FS_REPLACE, source_ptr, destination_ptr)
         })
     }) == 0
+}
+
+/// Arms a hardware write watchpoint on `address` for `length` bytes;
+/// `length == 0` disarms. Returns true when the kernel accepted it.
+pub fn debug_watch(address: u64, length: u64) -> bool {
+    unsafe { syscall2(SYS_DEBUG_WATCH, address, length) == 1 }
 }
 
 pub fn fs_usage(path: &str) -> Option<FsUsage> {
