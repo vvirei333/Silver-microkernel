@@ -7342,3 +7342,53 @@ while `pc` is `0x10046AF0` (phoc main + 0x46AF0). Interactive gdb is still
 awkward because QEMU's 16-byte PL011 RX FIFO drops bytes from gdb's
 whole-packet writes; the scripted client is the reliable path. Details:
 [`docs/GDB_STUB.md`](docs/GDB_STUB.md).
+
+### Windows port of the crash hunt (2026-11-18)
+
+The machine moved to Windows (no qemu-user, no WSL). The Alpine phosh stage
+was rebuilt without apk: `tools/alpine_repo.py` resolves the 441-package
+closure from APKINDEX (main+community, v3.24) and
+`tools/build_alpine_phosh_direct.py` unpacks the `.apk` data tars straight
+into a fresh SFS image (`build/werewolf-alpine-phosh.img`, 2 GiB / 32768
+inodes, 6487 files / 912 symlinks). Windows quirks handled: `/tmp` is
+invisible to host Python (image lives in `build/`), no AF_UNIX (serial is
+TCP via `tools/qemu_serial.py`, port from `WEREWOLF_SERIAL_PORT`), and the
+aarch64-none-elf toolchain is xPack at `F:\wolf-toolchains\...` (set
+`WOLF_ARM_TOOLCHAIN`; `userspace/build.rs` now accepts `.exe` binaries).
+Kernel build: `cargo build --release --target aarch64-unknown-none
+--no-default-features --features no_std,linux-abi,gdb-stub` — the feature
+`no_std` is mandatory (build.rs early-returns otherwise).
+
+Kernel soft-watch log mode (committed): `watch <addr> 4096` (or the
+`armwatch` native binary) arms a page watch that logs
+`WATCH far=... elr=...` for every write, allows the store, and re-protects
+the page at SVC entry. Allow paths cover mmap regions and private image-run
+pages; `install_linux_run` maps the watched Data page read-only at exec
+time. Verified on disk.img; on the Alpine image it logged exactly one hit —
+an ld.so string-copy (`pc=0x20018488`, foreign PIE 0x20000000) writing
+`0x44a410ff`.
+
+Two decisive environment findings:
+- This QEMU's `virt` DTB has a single PL011; the kernel gdb stub's second
+  UART (0x0904_0000) raises a synchronous external abort, so `serve()` is
+  dormant now (a user fault used to panic the kernel).
+- QEMU's own gdbstub (`-gdb tcp::1234`) works under TCG: attach stops the
+  VM, send `c` to resume; `Z1`/`Z2` are honored; interrupts need a raw
+  0x03 byte. `tools/qemu_gdb_watch.py` implements the client.
+
+The 0xE9 crash reproduces 1-in-1 (far=0xe9, elr=phoc+0x46af0), but
+addresses shift under perturbation: the fault dump sometimes reports
+x19=0 (dump reliability is suspect), and with the debugger attached other
+faults surface first (task far=0x51EE2B90, a GTK `cbk_idle_write` task).
+VA 0x44a41000 is used concurrently by several processes (an ld.so copy and
+a kernel COW run-copy both wrote it), so a plain address watchpoint catches
+foreign writers first.
+
+Next step (prepared, not yet run): hunt9 — set a Z1 breakpoint at
+phoc+0x46ACC (before the `wl_signal_add` for `request_resize`, the last
+call before the faulting load at 46aec/46af0), read x19 (the toplevel
+`self`), arm a Z2 write watch on `self+144`, continue, and step over
+foreign-PC hits until a stop with PC in the phoc range (0x10000000+) —
+that stop is the corrupting store. The hunt9 script (inline, see session
+log) was interrupted mid-run; re-create from this description or the
+gdbhunt5/6/8 variants in `build/gdbhunt*_out.txt`.
