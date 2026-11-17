@@ -102,6 +102,28 @@ session service is started by name (`rc-service phosh start`). `rc-update
 show` lists `phosh | default`. Fixing the runlevel transition (and the
 console-write stall behind it) is the next OpenRC slice.
 
+### Runlevel experiment (reverted, 2026-11-17)
+
+A standard inittab was tried: `boot-session` ran `openrc sysinit`,
+`openrc boot` and then `openrc default`, with `hostname`/`urandom` added to
+the boot runlevel. It did not converge and the builder change was reverted.
+
+What the logs showed:
+
+- From the `howl>` shell, `openrc sysinit >log` returns 0 in well under a
+  minute (two `[ ok ]` lines, no more).
+- As a child of PID 1 (`/sbin/boot-session`), the *same* redirected command
+  had still not returned after 680 s. Its log stops after the deptree cache
+  and one truncated error line (`les': No such file or directory`), and the
+  kernel reaps hundreds of short-lived tasks while it runs.
+- `rc-status` is not shipped at `/sbin/rc-status` in this root; using that
+  path only produced a shell `not found` (127).
+
+So the blocker is not the runlevel list: `openrc sysinit` itself behaves
+differently under PID 1. The next step is to compare the two environments
+(fd 0 tty state, `/run` mount, `softlevel`, `rc_environ_fd`) and to find which
+child keeps being spawned; the standard inittab can be re-applied after that.
+
 Service definition, `/etc/init.d/phosh`:
 
 ```sh

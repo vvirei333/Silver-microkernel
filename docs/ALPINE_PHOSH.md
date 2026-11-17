@@ -89,12 +89,15 @@ Task 8 killed: Page Fault at 0x00000000000000E9 (ESR: 0x92000006)
 ELR_EL1=0000000010046AF0          (phoc text)
 ```
 
-The fault is the same instruction every time (`ELR 0x46AF0`, phoc text). With
-the matching `phoc-dbg` package that resolves to
-`phoc_xdg_toplevel_constructed` (`src/xdg-toplevel.c`), at the register of
-`wl_signal_add (&self->xdg_toplevel->base->surface->events.commit, ...)`:
-`self->xdg_toplevel` is a small garbage value (`0x11`) that passes the
-`g_assert (self->xdg_toplevel)` because it is non-NULL.
+The fault is the same instruction every time (`ELR 0x46AF0`, phoc text). The
+installed package is phoc **0.55.1-r0** (not 0.57.0); with its `phoc-dbg` the
+instruction resolves to `src/xdg-toplevel.c:666`, the
+`events.request_maximize` registration at the end of
+`phoc_xdg_toplevel_constructed`. `self->xdg_toplevel` (offset 144) is `0x11`
+by then, although four earlier `wl_signal_add` calls in the same function used
+the same pointer successfully. `docs/PHOC_XDG_TOPLEVEL_CRASH.md` records the
+instruction, offsets and the narrowed window; the field is overwritten inside
+`constructed`, and the property setter is not the source of the bad value.
 
 It reproduces with **no client at all** (`phoc -E /bin/true`, not even a
 shell), with `-S -E phosh`, at 1 GiB and 2 GiB of RAM, and with Xwayland
