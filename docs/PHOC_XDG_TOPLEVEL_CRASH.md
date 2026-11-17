@@ -18,10 +18,17 @@ records what the fault is *not* and narrows where the bad value appears.
 ## Fault
 
 ```
-Task 8 killed: Page Fault at 0x00000000000000E9 (ESR: 0x0000000092000006)
-ELR_EL1=0000000010046AF0
-x0=0x0000000000000011  x19=0x0000000044A41E40  ...
+FAULT task=8 esr=0x0000000092000006 far=0x00000000000000e9 elr=0x0000000010046af0
+x0=0x0000000000000011  x19=0x0000000044A41E40  x30=0x0000000020051C44
+SP_EL0=0x000000007FE3E440 ...
 ```
+
+This is a **single-task** report. The earlier dumps in this investigation were
+assembled from many small console writes and two CPUs faulting at the same
+time could interleave their registers into one report (that is how a dump with
+`x19=0` next to this ELR appeared). The kernel now formats the whole report,
+including the task id, FAR, ELR and ESR, in one buffer and publishes it with
+one console write; `tools/fault_dump_check.py` is the regression.
 
 `ESR 0x92000006` is a data abort, read (`WnR=0`), translation fault level 2.
 The PIE base is `0x1000_0000`, so ELR is `phoc+0x46AF0`.

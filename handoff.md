@@ -7292,6 +7292,17 @@ field is overwritten *inside* `constructed`, not by the property setter. Full
 disassembly, offsets and the next debugging routes are in
 `docs/PHOC_XDG_TOPLEVEL_CRASH.md`.
 
+The fault dump itself was fixed first: it used to be a sequence of small
+console writes, so two simultaneous faults could interleave their registers
+into one report. It is now one buffer with a `FAULT task=... esr=... far=...
+elr=...` header, published with a single console write;
+`tools/fault_dump_check.py` boots `tests/linux/regdump.c` and asserts the
+sentinel registers and header. The clean task-8 dump gives `x19` = the
+`PhocXdgToplevel` (0x44A41E40) and `x30` = the GObject caller
+(0x20051C44) rather than the return address of the preceding listener
+registration, so the next question is why the return address does not match
+that call site.
+
 The crash is timing-sensitive: under heavy GLib/wlroots logging phoc survived
 and served clients. When it dies its Wayland listener disappears with the
 task, so clients get ECONNREFUSED.

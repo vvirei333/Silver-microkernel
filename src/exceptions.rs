@@ -54,7 +54,7 @@ pub extern "C" fn silver_handle_user_fault(
     #[cfg(feature = "gdb-stub")]
     if crate::debug::is_watchpoint(esr) {
         crate::debug::disarm();
-        dump_user_frame(_frame);
+        dump_user_frame(_frame, esr, elr, far);
         crate::gdb::serve(_frame, esr, elr, far);
         silver_handle_task_fault(esr, elr, far);
     }
@@ -65,14 +65,14 @@ pub extern "C" fn silver_handle_user_fault(
     #[cfg(feature = "gdb-stub")]
     if crate::debug::take_soft_hit() {
         crate::debug::disarm();
-        dump_user_frame(_frame);
+        dump_user_frame(_frame, esr, elr, far);
         crate::gdb::serve(_frame, esr, elr, far);
         silver_handle_task_fault(esr, elr, far);
     }
     if recovered {
         0
     } else {
-        dump_user_frame(_frame);
+        dump_user_frame(_frame, esr, elr, far);
         #[cfg(feature = "gdb-stub")]
         crate::gdb::serve(_frame, esr, elr, far);
         silver_handle_task_fault(esr, elr, far)
@@ -92,10 +92,52 @@ pub extern "C" fn silver_handle_user_fault(
     silver_handle_task_fault(esr, elr, far)
 }
 
-/// Prints the saved EL0 register bank of the dying task. Frames are rare, so
-/// this stays unconditional: the values are what turns "Page Fault at 0xE9"
-/// into an actionable report (e.g. a pointer that should never be that small).
-fn dump_user_frame(frame: *mut u64) {
+/// Appends bytes to the fixed fault-report buffer.
+fn push_bytes(line: &mut [u8], length: &mut usize, bytes: &[u8]) {
+    let room = line.len().saturating_sub(*length);
+    let take = bytes.len().min(room);
+    line[*length..*length + take].copy_from_slice(&bytes[..take]);
+    *length += take;
+}
+
+/// Appends a zero-padded 64-bit hex value (no `0x` prefix).
+fn push_hex(line: &mut [u8], length: &mut usize, value: u64) {
+    let mut digits = [b'0'; 16];
+    for (digit, shift) in digits.iter_mut().zip((0..16).rev()) {
+        let nibble = ((value >> (shift * 4)) & 0xF) as u8;
+        *digit = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+    }
+    push_bytes(line, length, &digits);
+}
+
+/// Appends an unsigned decimal value.
+fn push_number(line: &mut [u8], length: &mut usize, mut value: u64) {
+    let mut digits = [0_u8; 20];
+    let mut count = 0_usize;
+    loop {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    let mut reversed = [0_u8; 20];
+    for index in 0..count {
+        reversed[index] = digits[count - 1 - index];
+    }
+    push_bytes(line, length, &reversed[..count]);
+}
+
+/// Prints the saved EL0 register bank of the dying task.
+///
+/// The whole report is formatted into one buffer and published with a single
+/// console write: two CPUs can fault at the same time, and a sequence of
+/// small writes lets their registers interleave into a dump that then points
+/// at the wrong task. The header repeats the task id, FAR, ELR and ESR so a
+/// report can be attributed without relying on the adjacent "Task N killed"
+/// line, which is a separate write.
+fn dump_user_frame(frame: *mut u64, esr: u64, elr: u64, far: u64) {
     if frame.is_null() {
         return;
     }
@@ -104,19 +146,36 @@ fn dump_user_frame(frame: *mut u64) {
         "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20",
         "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30",
     ];
+    let mut line = [0_u8; 1152];
+    let mut length = 0_usize;
+
+    push_bytes(&mut line, &mut length, b"FAULT task=");
+    push_number(&mut line, &mut length, crate::scheduler::current_task_id());
+    push_bytes(&mut line, &mut length, b" esr=0x");
+    push_hex(&mut line, &mut length, esr);
+    push_bytes(&mut line, &mut length, b" far=0x");
+    push_hex(&mut line, &mut length, far);
+    push_bytes(&mut line, &mut length, b" elr=0x");
+    push_hex(&mut line, &mut length, elr);
+    push_bytes(&mut line, &mut length, b"\r\n");
     for (index, name) in names.iter().enumerate() {
-        console::write_str(name);
-        console::write_str("=0x");
-        console::write_hex_u64(unsafe { *frame.add(index) });
-        console::write_str(if index % 4 == 3 { "\r\n" } else { " " });
+        push_bytes(&mut line, &mut length, name.as_bytes());
+        push_bytes(&mut line, &mut length, b"=0x");
+        push_hex(&mut line, &mut length, unsafe { *frame.add(index) });
+        push_bytes(
+            &mut line,
+            &mut length,
+            if index % 4 == 3 { b"\r\n" } else { b" " },
+        );
     }
     let sp: u64;
     unsafe {
         core::arch::asm!("mrs {}, sp_el0", out(reg) sp);
     }
-    console::write_str("SP_EL0=0x");
-    console::write_hex_u64(sp);
-    console::write_str("\r\n");
+    push_bytes(&mut line, &mut length, b"SP_EL0=0x");
+    push_hex(&mut line, &mut length, sp);
+    push_bytes(&mut line, &mut length, b"\r\n");
+    console::write_bytes(&line[..length]);
 }
 
 #[no_mangle]
