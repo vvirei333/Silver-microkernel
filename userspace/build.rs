@@ -8,7 +8,10 @@ use std::process::Command;
 fn find_toolchain() -> Option<PathBuf> {
     if let Ok(path) = env::var("WOLF_ARM_TOOLCHAIN") {
         let path = PathBuf::from(path);
-        if path.join("bin/aarch64-none-elf-g++").exists() {
+        let gxx = path.join("bin/aarch64-none-elf-g++");
+        if gxx.exists()
+            || gxx.with_file_name("aarch64-none-elf-g++.exe").exists()
+        {
             return Some(path);
         }
     }
@@ -16,7 +19,10 @@ fn find_toolchain() -> Option<PathBuf> {
     let base = PathBuf::from(home).join(".local/toolchains");
     for entry in std::fs::read_dir(base).ok()? {
         let path = entry.ok()?.path();
-        if path.join("bin/aarch64-none-elf-g++").exists() {
+        let gxx = path.join("bin/aarch64-none-elf-g++");
+        if gxx.exists()
+            || gxx.with_file_name("aarch64-none-elf-g++.exe").exists()
+        {
             return Some(path);
         }
     }
@@ -32,6 +38,15 @@ fn library_path(compiler: &Path, name: &str) -> Option<PathBuf> {
         return None;
     }
     let path = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    let executable = if compiler.exists() {
+        compiler.to_path_buf()
+    } else {
+        // Windows toolchains are built as `<name>.exe`; the callers spawn the
+        // compiler itself and `-print-file-name` only needs it to run.
+        let suffixed = compiler.with_extension("exe");
+        if suffixed.exists() { suffixed } else { compiler.to_path_buf() }
+    };
+    let compiler = executable.as_path();
     if path.is_absolute() && path.exists() {
         Some(path)
     } else {

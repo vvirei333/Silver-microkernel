@@ -235,6 +235,10 @@ pub extern "C" fn silver_irq_signal_return(frame: *mut u64) {
 /// bank on the kernel stack; the result is written into frame[0] (x0).
 #[no_mangle]
 extern "C" fn silver_handle_syscall(frame: *mut u64) {
+    // The watched page was made writable to let a logged store retire; the
+    // store has executed by now, so read-only protection goes back on.
+    #[cfg(feature = "gdb-stub")]
+    crate::debug::reprotect_soft_page();
     // Kernel-lock protocol: a task executing kernel code holds the kernel
     // lock. Blocking paths release it around `schedule` and re-acquire on
     // resume, so this guard is dropped exactly once, on the syscall's final
@@ -339,7 +343,14 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
                 // Hardware first (real boards), plus the software page watch
                 // that QEMU TCG can honour.
                 let _hardware = crate::debug::arm_write(frame[0], frame[1]);
-                if crate::debug::arm_soft(frame[0], frame[1]) {
+                let armed = if frame[1] == 4096 {
+                    // Page watch in log mode: every write to the page is
+                    // reported with its store address and PC, none kills.
+                    crate::debug::arm_soft_log(frame[0], frame[1])
+                } else {
+                    crate::debug::arm_soft(frame[0], frame[1])
+                };
+                if armed {
                     1
                 } else {
                     0

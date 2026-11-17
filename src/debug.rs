@@ -15,6 +15,25 @@ static SOFT_ADDRESS: AtomicU64 = AtomicU64::new(0);
 static SOFT_LENGTH: AtomicU64 = AtomicU64::new(0);
 static SOFT_HIT: core::sync::atomic::AtomicBool =
     core::sync::atomic::AtomicBool::new(false);
+/// Log mode: every write to the watched page is reported to the console and
+/// allowed through, and the page is re-protected on the next SVC. This is how
+/// a page-granular watch finds one guilty store without killing the writer on
+/// the first legitimate access.
+static SOFT_LOG_MODE: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+/// Pending re-protect captured when a logged hit was allowed through.
+static REPROTECT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static REPROTECT_TTBR0: AtomicU64 = AtomicU64::new(0);
+static REPROTECT_PAGE: AtomicU64 = AtomicU64::new(0);
+static REPROTECT_PHYS: AtomicU64 = AtomicU64::new(0);
+static REPROTECT_PROT: AtomicU64 = AtomicU64::new(0);
+/// `far`/`elr` of the fault currently being handled, captured by the EL0
+/// fault path so `log_soft_hit` can report the exact store address and PC.
+static FAULT_FAR: AtomicU64 = AtomicU64::new(0);
+static FAULT_ELR: AtomicU64 = AtomicU64::new(0);
+static FAULT_VALID: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 const EC_WATCHPOINT_LOW: u64 = 0x34;
 
@@ -84,6 +103,9 @@ pub fn disarm() {
     write_wvr(0);
     enable_monitors(false);
     ARMED.store(0, Ordering::Release);
+    SOFT_LOG_MODE.store(false, Ordering::Release);
+    REPROTECT.store(false, Ordering::Release);
+    SOFT_LENGTH.store(0, Ordering::Release);
 }
 
 pub fn armed() -> u64 {
@@ -126,6 +148,102 @@ pub fn note_soft_hit() {
 
 pub fn take_soft_hit() -> bool {
     SOFT_HIT.swap(false, Ordering::Acquire)
+}
+
+/// Arms the software page watch in log mode: `length` is expected to cover a
+/// page (4096), every write to that page is reported and allowed through.
+pub fn arm_soft_log(address: u64, length: u64) -> bool {
+    if !arm_soft(address, length) {
+        return false;
+    }
+    SOFT_LOG_MODE.store(true, Ordering::Release);
+    true
+}
+
+pub fn log_mode() -> bool {
+    SOFT_LOG_MODE.load(Ordering::Acquire)
+}
+
+/// Captures the fault context for `log_soft_hit` (called from the EL0 fault
+/// path before the scheduler repairs the mapping).
+pub fn set_fault_context(far: u64, elr: u64) {
+    FAULT_FAR.store(far, Ordering::Release);
+    FAULT_ELR.store(elr, Ordering::Release);
+    FAULT_VALID.store(true, Ordering::Release);
+}
+
+pub fn clear_fault_context() {
+    FAULT_VALID.store(false, Ordering::Release);
+}
+
+/// True when the current `cow_fault` came from a real EL0 fault whose `far`
+/// and `elr` were captured.
+pub fn fault_context_valid() -> bool {
+    FAULT_VALID.load(Ordering::Acquire)
+}
+
+/// Reports one write to the watched page as a single console line: the store
+/// address (`far`), the PC (`elr`) and whether it hit the exact watched range.
+pub fn log_soft_hit(exact: bool) {
+    let far = FAULT_FAR.load(Ordering::Acquire);
+    let elr = FAULT_ELR.load(Ordering::Acquire);
+    let mut buffer = [0u8; 96];
+    let mut length = 0;
+    let header: &[u8] = if exact {
+        b"WATCH* far="
+    } else {
+        b"WATCH  far="
+    };
+    buffer[..header.len()].copy_from_slice(header);
+    length = header.len();
+    for (value, prefix) in [(far, None), (elr, Some(b" elr="))] {
+        if let Some(text) = prefix {
+            buffer[length..length + text.len()].copy_from_slice(text);
+            length += text.len();
+        }
+        for position in 0..16 {
+            let nibble = ((value >> (60 - 4 * position)) & 0xF) as u8;
+            buffer[length] = if nibble < 10 {
+                b'0' + nibble
+            } else {
+                b'a' + nibble - 10
+            };
+            length += 1;
+        }
+    }
+    buffer[length] = b'\r';
+    buffer[length + 1] = b'\n';
+    crate::console::write_bytes(&buffer[..length + 2]);
+}
+
+/// Remembers the mapping a logged hit was allowed through, so the next SVC
+/// can restore the read-only protection. `prot` is the region protection the
+/// page was mapped with (writable here).
+pub fn request_reprotect(ttbr0: u64, page: u64, physical: u64, prot: u64) {
+    REPROTECT_TTBR0.store(ttbr0, Ordering::Release);
+    REPROTECT_PAGE.store(page, Ordering::Release);
+    REPROTECT_PHYS.store(physical, Ordering::Release);
+    REPROTECT_PROT.store(prot, Ordering::Release);
+    REPROTECT.store(true, Ordering::Release);
+}
+
+/// Called at SVC entry: if a logged hit was allowed through earlier, make the
+/// watched page read-only again. The faulting store has retired by now.
+#[cfg(feature = "gdb-stub")]
+pub fn reprotect_soft_page() {
+    if !REPROTECT.swap(false, Ordering::Acquire) {
+        return;
+    }
+    let ttbr0 = REPROTECT_TTBR0.load(Ordering::Acquire);
+    let page = REPROTECT_PAGE.load(Ordering::Acquire);
+    let physical = REPROTECT_PHYS.load(Ordering::Acquire);
+    let prot = REPROTECT_PROT.load(Ordering::Acquire);
+    let _ = crate::mmu::map_user_page_at(
+        ttbr0 as usize,
+        page as usize,
+        physical as usize,
+        prot & !crate::mmu::PROT_WRITE,
+    );
 }
 
 pub fn is_watchpoint(esr: u64) -> bool {

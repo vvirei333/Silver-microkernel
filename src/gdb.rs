@@ -171,6 +171,16 @@ fn write_user(address: u64, bytes: &[u8]) -> bool {
 /// Serves the debugger after a user fault. Returns when the debugger detaches
 /// or continues, so the caller can run its normal kill path.
 pub fn serve(frame: *const u64, _esr: u64, elr: u64, _far: u64) {
+    // This QEMU build's `virt` machine exposes a single PL011 in its device
+    // tree (verified by dumping the DTB); the second UART this stub was
+    // written against (0x0904_0000) does not exist, and every MMIO touch
+    // raises a synchronous external abort that turns a user fault into a
+    // kernel panic. The software page watch in log mode prints its evidence
+    // to the console, so the stub stays dormant until it gains a real
+    // transport (QEMU's own `-gdb` gdbstub or a virtio-serial console).
+    let _ = (frame, elr);
+    return;
+    #[allow(unreachable_code)]
     initialize();
     for byte in b"\nGDB-STUB aarch64\n" {
         write_byte(*byte);

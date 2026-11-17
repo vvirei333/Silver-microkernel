@@ -6885,6 +6885,63 @@ impl Task {
         false
     }
 
+    /// Log-mode variant: lets the store through and remembers the mapping so
+    /// the next SVC re-protects the watched page (see `debug::reprotect_soft_page`).
+    #[cfg(feature = "gdb-stub")]
+    fn allow_watch_page_logged(&mut self, page: usize) -> bool {
+        let ttbr0 = self.ttbr0;
+        for region in &self.mmap_regions {
+            let start = region.virtual_address;
+            let end = start + region.page_count * crate::memory::PAGE_SIZE;
+            if page < start || page >= end {
+                continue;
+            }
+            let physical = if region.lazy {
+                let offset = ((page - start) / crate::memory::PAGE_SIZE) as u32;
+                match region.pages.get(&offset) {
+                    Some((physical, _)) => *physical,
+                    None => return false,
+                }
+            } else {
+                region.physical_start + (page - start)
+            };
+            crate::debug::request_reprotect(
+                ttbr0 as u64,
+                page as u64,
+                physical as u64,
+                region.prot as u64,
+            );
+            return mmu::map_user_page_at(ttbr0, page, physical, region.prot);
+        }
+        // Private Linux image run pages (already COWed to `Data`): the same
+        // allow/re-protect dance works on the task's own frame. A still-COW
+        // page must not be shared-written, so it falls through to the normal
+        // copy path, which re-protects the page itself.
+        let writable = mmu::PROT_READ | mmu::PROT_WRITE;
+        if let Some(image) = self.linux_image.as_ref() {
+            for run in &image.runs {
+                if page < run.virtual_address
+                    || page >= run.virtual_address + run.page_count * PAGE_SIZE
+                {
+                    continue;
+                }
+                let index = (page - run.virtual_address) / PAGE_SIZE;
+                if run.kinds[index] != crate::elf::PageKind::Data {
+                    return false;
+                }
+                let physical = run.physical_start + (page - run.virtual_address);
+                crate::debug::request_reprotect(
+                    ttbr0 as u64,
+                    page as u64,
+                    physical as u64,
+                    writable,
+                );
+                return mmu::map_user_page_at(ttbr0, page, physical, writable);
+            }
+        }
+        false
+    }
+
     fn lazy_page_fault(&mut self, index: usize, page: usize, esr: u64) -> bool {
         const WNR: u64 = 1 << 6;
         let prot = self.mmap_regions[index].prot;
@@ -6967,14 +7024,41 @@ impl Task {
         let ttbr0 = self.ttbr0;
         #[cfg(feature = "gdb-stub")]
         if esr & WNR != 0 && crate::debug::soft_page_is(page as u64) {
-            if crate::debug::soft_contains(address as u64) {
-                crate::debug::note_soft_hit();
-                return false;
+            if crate::debug::fault_context_valid() {
+                if crate::debug::soft_contains(address as u64) {
+                    if crate::debug::log_mode() {
+                        crate::debug::log_soft_hit(true);
+                        if self.allow_watch_page_logged(page) {
+                            return true;
+                        }
+                        // Not a pre-mapped page (still-COW image run, stack):
+                        // fall through to the normal handling below, which
+                        // copies the page and re-protects it in log mode.
+                    } else {
+                        crate::debug::note_soft_hit();
+                        return false;
+                    }
+                } else if crate::debug::log_mode() {
+                    crate::debug::log_soft_hit(false);
+                    if self.allow_watch_page_logged(page) {
+                        return true;
+                    }
+                }
+            } else {
+                // A kernel-initiated copy (memfd window, fork) cannot report
+                // a user PC; let it through without disturbing the watch.
+                if crate::debug::log_mode() {
+                    if self.allow_watch_page_logged(page) {
+                        return true;
+                    }
+                }
             }
             // Another field in the same page: let the store through. The
             // target field keeps its watch only if it was written first; a
             // fine-grained watch needs hardware support.
-            return self.allow_watch_page(page);
+            if !crate::debug::log_mode() {
+                return self.allow_watch_page(page);
+            }
         }
 
         // A lazily reserved anonymous page backs itself on first access,
@@ -7035,6 +7119,29 @@ impl Task {
                 run.physical_start = new_physical;
                 run.generation = new_generation;
                 run.kinds = kinds;
+                // Log mode: the just-remapped page is writable; put the watch
+                // back on the single faulting page so the next write logs and
+                // the SVC hook re-protects it again.
+                #[cfg(feature = "gdb-stub")]
+                if crate::debug::log_mode()
+                    && crate::debug::fault_context_valid()
+                    && crate::debug::soft_page_is(page as u64)
+                {
+                    let writable = mmu::PROT_READ | mmu::PROT_WRITE;
+                    let physical = new_physical + (page - run.virtual_address);
+                    let _ = mmu::map_user_page_at(
+                        ttbr0,
+                        page,
+                        physical,
+                        writable & !mmu::PROT_WRITE,
+                    );
+                    crate::debug::request_reprotect(
+                        ttbr0 as u64,
+                        page as u64,
+                        physical as u64,
+                        writable,
+                    );
+                }
                 return true;
             }
         }

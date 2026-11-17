@@ -1940,11 +1940,22 @@ pub fn install_linux_run(
                 return false;
             }
             let physical = physical_start + index * GRANULE;
+            // The software page watch (debug::arm_soft_log) needs the watched
+            // data page mapped read-only at exec time, so its first write
+            // faults into the logging path instead of passing silently.
+            let watched = crate::debug::soft_page_is(va as u64)
+                && kinds[index] == crate::elf::PageKind::Data;
+            if watched {
+                crate::console::write_str("WATCH-EXEC protected va=");
+                crate::console::write_hex_u64(va as u64);
+                crate::console::write_str("\r\n");
+            }
             let descriptor = match kinds[index] {
                 crate::elf::PageKind::Text => user_text_page(physical),
                 crate::elf::PageKind::ReadOnly | crate::elf::PageKind::Cow => {
                     user_rodata_page(physical)
                 }
+                crate::elf::PageKind::Data if watched => user_rodata_page(physical),
                 crate::elf::PageKind::Data => user_data_page(physical),
             };
             write_entry(l3, l3_index, descriptor);
