@@ -1453,6 +1453,7 @@ driver's contract.
 | [docs/M3_DRIVER.md](docs/M3_DRIVER.md) | M3.1a driver-task framework: region-scoped MMIO, driver resource table, `SYS_MMIO_GRANT`, limits and next DT slice |
 | [docs/M3_SIMPLEFB.md](docs/M3_SIMPLEFB.md) | M3.2a simplefb boot framebuffer: contract, Redmi panel constants, QEMU selftest, limits |
 | [docs/ALPINE_ENV.md](docs/ALPINE_ENV.md) | Alpine/musl userland on the Linux ABI: BusyBox, ash and apk-tools running from SFS; builder and limits |
+| [docs/GDB_STUB.md](docs/GDB_STUB.md) | GDB remote stub on the second PL011: build flags, packets, `tools/gdb_rsp.py`, and the FIFO limit that blocks interactive gdb |
 | [docs/ALPINE_PHOSH.md](docs/ALPINE_PHOSH.md) | Alpine-only image with Alpine's own `phosh`/`phoc`: builder, headless boot chain, the file-cap/exec-env/sendfile fixes, and the remaining scanout/dconf limits |
 | [docs/ALPINE_OPENRC.md](docs/ALPINE_OPENRC.md) | Alpine + OpenRC + Phosh from one SFS image: Linux `/` = SFS `/sfs`, SFS symlinks, synthetic procfs, mount/PID-1/vfork fixes, the empty-deptree limitation |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |

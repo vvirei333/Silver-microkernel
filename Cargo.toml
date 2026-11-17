@@ -36,6 +36,8 @@ linux-abi = []
 # Opt-in diagnostic: print one console line per unsupported Linux ABI syscall
 # (capped), used while bringing up a libc.
 linux-abi-trace = ["linux-abi"]
+# Minimal GDB remote stub on the second PL011 (QEMU -serial #2).
+gdb-stub = []
 fog = []
 # Explicit opt-in for the fog image's self-relocation to `__kernel_link_pa`.
 # Standard fog builds stay at the address ABL chose and park when it differs

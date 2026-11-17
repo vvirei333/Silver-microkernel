@@ -59,6 +59,8 @@ pub extern "C" fn silver_handle_user_fault(
         0
     } else {
         dump_user_frame(_frame);
+        #[cfg(feature = "gdb-stub")]
+        crate::gdb::serve(_frame, esr, elr, far);
         silver_handle_task_fault(esr, elr, far)
     }
 }

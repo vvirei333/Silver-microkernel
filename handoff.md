@@ -7291,3 +7291,20 @@ Limits: no scanout yet, and whether phosh stays alive after shell mode is
 unverified (needs a session bus/logind and process observability).
 Details:
 [`docs/ALPINE_PHOSH.md`](docs/ALPINE_PHOSH.md).
+
+
+### GDB remote stub on the second PL011 (2026-11-17)
+
+`src/gdb.rs` (feature `gdb-stub`) serves the GDB remote protocol on QEMU's
+second PL011 (`0x0904_0000`), entered from the user-fault path after the
+register dump. It implements stop reason, register read, memory read/write,
+target.xml and detach; `tools/gdb_rsp.py` is a small deterministic client
+(`tools/gdb_rsp.py x19:0x100`, `--walk`).
+
+The Alpine phoc crash was inspected with it: at the fault
+`x0=0x11`, `x19=0x2`, `x18=0x1` — small values that look like a Wayland
+message header (object id, opcode, size 0x11) rather than an object pointer,
+while `pc` is `0x10046AF0` (phoc main + 0x46AF0). Interactive gdb is still
+awkward because QEMU's 16-byte PL011 RX FIFO drops bytes from gdb's
+whole-packet writes; the scripted client is the reliable path. Details:
+[`docs/GDB_STUB.md`](docs/GDB_STUB.md).
