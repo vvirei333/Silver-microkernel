@@ -7304,8 +7304,16 @@ target.xml and detach; `tools/gdb_rsp.py` is a small deterministic client
 Hardware write watchpoints are wired too (`src/debug.rs`, `watch <addr>` in
 the native shell, SYS_DEBUG_WATCH = 92): DBGWVR0/DBGWCR0 + MDSCR_EL1 MDE/KDE.
 QEMU accepts the register writes (readback matches) but does not raise the
-watchpoint exception for the self-test store, so on QEMU the corruption must
-be caught another way (software page watch).
+hardware exception, so `watch` also arms a **software page watch**: mappings
+covering the watched page clear the write bit and a matching write fault
+stops in the stub. Verified with the self-test (stub stops at the store with
+`x0 = 0x50000000`). A write to another field in the same page is allowed
+through, so the page watch is one-shot.
+
+`apk` now runs inside the Alpine-only guest: `tools/alpine_apk_smoke.py`
+boots the image, runs `apk --no-network info` through a static launcher and
+asserts `alpine-baselayout` is listed. The openrc image still cannot: the
+Arch closure's glibc libz/libssl shadow Alpine's musl builds there.
 
 The Alpine phoc crash was inspected with it: at the fault
 `x0=0x11`, `x19=0x2`, `x18=0x1` — small values that look like a Wayland

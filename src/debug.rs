@@ -9,6 +9,12 @@
 use core::sync::atomic::{AtomicU64, Ordering};
 
 static ARMED: AtomicU64 = AtomicU64::new(0);
+/// Software watch: the containing page is made read-only, so the first write
+/// faults into `cow_fault` even on cores (QEMU TCG) that ignore DBGWCR.
+static SOFT_ADDRESS: AtomicU64 = AtomicU64::new(0);
+static SOFT_LENGTH: AtomicU64 = AtomicU64::new(0);
+static SOFT_HIT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
 
 const EC_WATCHPOINT_LOW: u64 = 0x34;
 
@@ -82,6 +88,44 @@ pub fn disarm() {
 
 pub fn armed() -> u64 {
     ARMED.load(Ordering::Acquire)
+}
+
+/// Arms the software watch. The page is protected lazily: `mmap_region` and
+/// `lazy_page_fault` call [`soft_page_is`] and clear the write bit.
+pub fn arm_soft(address: u64, length: u64) -> bool {
+    if length == 0 || length > 4096 || address < 0x1000 || address >= 0x0000_8000_0000_0000 {
+        return false;
+    }
+    SOFT_ADDRESS.store(address, Ordering::Release);
+    SOFT_LENGTH.store(length, Ordering::Release);
+    SOFT_HIT.store(false, Ordering::Release);
+    true
+}
+
+pub fn soft_armed() -> bool {
+    SOFT_LENGTH.load(Ordering::Acquire) != 0
+}
+
+pub fn soft_page() -> u64 {
+    SOFT_ADDRESS.load(Ordering::Acquire) & !0xfff
+}
+
+pub fn soft_page_is(page: u64) -> bool {
+    soft_armed() && page == soft_page()
+}
+
+pub fn soft_contains(address: u64) -> bool {
+    let start = SOFT_ADDRESS.load(Ordering::Acquire);
+    let length = SOFT_LENGTH.load(Ordering::Acquire);
+    address >= start && address < start.saturating_add(length)
+}
+
+pub fn note_soft_hit() {
+    SOFT_HIT.store(true, Ordering::Release);
+}
+
+pub fn take_soft_hit() -> bool {
+    SOFT_HIT.swap(false, Ordering::Acquire)
 }
 
 pub fn is_watchpoint(esr: u64) -> bool {

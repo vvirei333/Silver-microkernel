@@ -335,10 +335,15 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
             if frame[1] == 0 {
                 crate::debug::disarm();
                 0
-            } else if crate::debug::arm_write(frame[0], frame[1]) {
-                1
             } else {
-                0
+                // Hardware first (real boards), plus the software page watch
+                // that QEMU TCG can honour.
+                let _hardware = crate::debug::arm_write(frame[0], frame[1]);
+                if crate::debug::arm_soft(frame[0], frame[1]) {
+                    1
+                } else {
+                    0
+                }
             }
         }
         SYS_HEALTH => sys_health(frame[0]),

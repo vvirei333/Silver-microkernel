@@ -56,12 +56,18 @@ howl> unwatch
 `watch 0x50000000` followed by `linuxrun /sfs/watchtest` is the self-test.
 On hardware the store raises EC 0x34 and the kernel enters the stub.
 
-**QEMU `virt` does not deliver the exception.** The registers read back with
-the written values, but the store completes and the test prints "watch
-survived" (with `-smp 1` too, so it is not task migration). The kernel side
-is ready for real hardware; on QEMU the next avenue is a software page watch
-(clear the PTE write bit for the containing page and handle the fault in
-`cow_fault`, with a single-step-free allow/reprotect policy).
+**QEMU `virt` does not deliver the hardware exception.** The registers read
+back with the written values, but the store completes (with `-smp 1` too, so
+it is not task migration). The same `watch` command also arms a **software
+page watch**, which QEMU honours: mappings that cover the watched page clear
+their write bit (`lazy_page_fault`, eager `mmap_region`), and a write fault
+whose FAR is inside the watched range stops in the stub. A write to another
+field of the same page is allowed through (the page-level watch is
+one-shot), which is enough for the self-test and for a first look at a
+corrupted object.
+
+Verified with `watch 0x50000000` + `linuxrun /sfs/watchtest`: the stub stops
+with `pc` at the store and `x0 = 0x50000000`.
 
 ## Limits
 

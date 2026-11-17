@@ -137,6 +137,10 @@ def postprocess() -> None:
     ):
         (STAGE / directory).mkdir(parents=True, exist_ok=True)
 
+    (STAGE / "etc/apk/repositories").write_text(
+        "\n".join(REPOSITORIES) + "\n"
+    )
+    (STAGE / "etc/apk/arch").write_text("aarch64\n")
     (STAGE / "etc/inittab").write_text(INITTAB)
     (STAGE / "sbin/boot-session").write_text(BOOT_SESSION)
     service = STAGE / "etc/init.d/phosh"

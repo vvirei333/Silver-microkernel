@@ -125,6 +125,23 @@ gdb remote stub (the register dump is already in place) to catch the write
 that installs `0x11`, and an audit of the syscalls phoc uses between output
 creation and the first toplevel construction.
 
+## apk inside the guest
+
+The Alpine-only image carries a real package database and keys, and `apk`
+runs under the Linux ABI:
+
+```
+howl> linuxrun /sfs/apk-info          # static launcher for apk --no-network info
+abseil-cpp-base
+...
+```
+
+`tools/alpine_apk_smoke.py` injects the launcher, boots the image and asserts
+that `alpine-baselayout` appears in the listing (`PASS apk info`). The
+openrc image (`ALPINE_OPENRC.md`) cannot do this yet: it merges the Arch
+closure, whose glibc `libz.so.1`/`libssl.so.3` shadow Alpine's musl builds,
+so apk fails to relocate. The Alpine-only image is the right home for apk.
+
 ## Limits / next
 
 - No visible output yet: the headless backend has no scanout, and the

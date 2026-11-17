@@ -6615,6 +6615,21 @@ impl Task {
             }
         }
 
+        #[cfg(feature = "gdb-stub")]
+        {
+            let watch_page = crate::debug::soft_page() as usize;
+            let end = virtual_address + page_count * crate::memory::PAGE_SIZE;
+            if crate::debug::soft_armed() && watch_page >= virtual_address && watch_page < end {
+                let physical = physical_start + (watch_page - virtual_address);
+                let _ = mmu::map_user_pages_at(
+                    self.ttbr0,
+                    watch_page,
+                    physical,
+                    1,
+                    prot & !mmu::PROT_WRITE,
+                );
+            }
+        }
         let region = MmapRegion {
             virtual_address,
             page_count,
@@ -6845,6 +6860,31 @@ impl Task {
     /// Backs one page of a lazy anonymous region. `esr` decides whether a
     /// write is permitted; untouched pages are zero-filled.
     #[cfg(feature = "linux-abi")]
+    /// Makes the watched page writable again so an unrelated store in the
+    /// same page can complete (the page-level software watch is one-shot).
+    #[cfg(feature = "gdb-stub")]
+    fn allow_watch_page(&mut self, page: usize) -> bool {
+        let ttbr0 = self.ttbr0;
+        for region in &self.mmap_regions {
+            let start = region.virtual_address;
+            let end = start + region.page_count * crate::memory::PAGE_SIZE;
+            if page < start || page >= end {
+                continue;
+            }
+            let physical = if region.lazy {
+                let offset = ((page - start) / crate::memory::PAGE_SIZE) as u32;
+                match region.pages.get(&offset) {
+                    Some((physical, _)) => *physical,
+                    None => return false,
+                }
+            } else {
+                region.physical_start + (page - start)
+            };
+            return mmu::map_user_page_at(ttbr0, page, physical, region.prot);
+        }
+        false
+    }
+
     fn lazy_page_fault(&mut self, index: usize, page: usize, esr: u64) -> bool {
         const WNR: u64 = 1 << 6;
         let prot = self.mmap_regions[index].prot;
@@ -6898,6 +6938,15 @@ impl Task {
             self.release_frames(1);
             return false;
         }
+        #[cfg(feature = "gdb-stub")]
+        if crate::debug::soft_page_is(page as u64) {
+            let _ = mmu::map_user_page_at(
+                self.ttbr0,
+                page,
+                physical,
+                prot & !mmu::PROT_WRITE,
+            );
+        }
         self.mmap_regions[index]
             .pages
             .insert(offset, (physical, generation));
@@ -6916,6 +6965,17 @@ impl Task {
         }
         let page = address & !(PAGE_SIZE - 1);
         let ttbr0 = self.ttbr0;
+        #[cfg(feature = "gdb-stub")]
+        if esr & WNR != 0 && crate::debug::soft_page_is(page as u64) {
+            if crate::debug::soft_contains(address as u64) {
+                crate::debug::note_soft_hit();
+                return false;
+            }
+            // Another field in the same page: let the store through. The
+            // target field keeps its watch only if it was written first; a
+            // fine-grained watch needs hardware support.
+            return self.allow_watch_page(page);
+        }
 
         // A lazily reserved anonymous page backs itself on first access,
         // read or write. This is how a large `PROT_NONE` reservation from

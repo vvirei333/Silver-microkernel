@@ -62,6 +62,13 @@ pub extern "C" fn silver_handle_user_fault(
         let _kernel_lock = crate::smp::BklGuard::new();
         crate::scheduler::cow_fault(far as usize, esr)
     };
+    #[cfg(feature = "gdb-stub")]
+    if crate::debug::take_soft_hit() {
+        crate::debug::disarm();
+        dump_user_frame(_frame);
+        crate::gdb::serve(_frame, esr, elr, far);
+        silver_handle_task_fault(esr, elr, far);
+    }
     if recovered {
         0
     } else {
