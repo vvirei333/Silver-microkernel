@@ -119,12 +119,24 @@ static void frame_failed_event(void *data, struct zwlr_screencopy_frame_v1 *obje
     frame_failed = 1;
 }
 
+static void frame_linux_dmabuf(void *data, struct zwlr_screencopy_frame_v1 *object,
+                                int32_t fd) {
+    (void)data; (void)object;
+    close(fd); /* the pixman path never uses dmabuf */
+}
+
+static void frame_buffer_done(void *data, struct zwlr_screencopy_frame_v1 *object) {
+    (void)data; (void)object;
+}
+
 static const struct zwlr_screencopy_frame_v1_listener frame_listener = {
     .buffer = frame_buffer,
     .flags = frame_flags,
     .ready = frame_ready_event,
     .failed = frame_failed_event,
     .damage = frame_damage,
+    .linux_dmabuf = frame_linux_dmabuf,
+    .buffer_done = frame_buffer_done,
 };
 
 static int create_shm_buffer(void) {
@@ -178,63 +190,61 @@ static void destroy_frame(void) {
     have_buffer_info = 0;
 }
 
-static int publish(void) {
-    int fd = open("/dev/ivshmem", O_RDWR);
-    if (fd < 0) {
-        perror("open /dev/ivshmem");
-        return -1;
-    }
-    size_t map_size = WINDOW_HEADER + (size_t)frame_width * frame_height * 4;
-    volatile uint8_t *window = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
-                                    MAP_SHARED, fd, 0);
-    close(fd);
-    if (window == MAP_FAILED) {
-        perror("mmap ivshmem");
-        return -1;
-    }
-    uint32_t *header = (uint32_t *)window;
-    uint32_t sequence = header[0x18 / 4] + 1; /* odd: frame in progress */
-    header[0x00 / 4] = WINDOW_MAGIC;
-    header[0x04 / 4] = WINDOW_VERSION;
-    header[0x08 / 4] = frame_width;
-    header[0x0C / 4] = frame_height;
-    header[0x10 / 4] = frame_width * 4;
-    header[0x14 / 4] = WINDOW_RGBA;
-    header[0x18 / 4] = sequence;
-    header[0x1C / 4] = 0;
-    __sync_synchronize();
+/* Publish the captured frame into a file on the SFS root. The host reads
+ * the same bytes straight out of the disk image (the guest writes them
+ * through virtio-blk), so no ivshmem device is required.
+ *
+ * Layout: {magic, version, width, height, stride, format} then RGBA8888.
+ */
+#define SCANOUT_PATH "/frame.rgba"
 
+static int publish(void) {
+    int fd = open(SCANOUT_PATH, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0) {
+        perror("open " SCANOUT_PATH);
+        return -1;
+    }
+    uint32_t header[6] = {WINDOW_MAGIC, WINDOW_VERSION, frame_width,
+                          frame_height, frame_width * 4, frame_format};
+    if (write(fd, header, sizeof(header)) != (ssize_t)sizeof(header)) {
+        perror("write header");
+        close(fd);
+        return -1;
+    }
     const uint8_t *source = (const uint8_t *)pixels;
-    uint8_t *destination = (uint8_t *)window + WINDOW_PIXELS;
     int swap_red_blue = frame_format == WL_SHM_FORMAT_ARGB8888 ||
                         frame_format == WL_SHM_FORMAT_XRGB8888;
+    uint8_t row_buffer[4096 * 4];
     for (uint32_t row = 0; row < frame_height; row++) {
         const uint8_t *src = source + (size_t)row * frame_stride;
-        uint8_t *dst = destination + (size_t)row * frame_width * 4;
         if (!swap_red_blue) {
-            memcpy(dst, src, (size_t)frame_width * 4);
+            if (write(fd, src, (size_t)frame_width * 4) !=
+                (ssize_t)(frame_width * 4)) {
+                perror("write row");
+                close(fd);
+                return -1;
+            }
         } else {
             for (uint32_t column = 0; column < frame_width; column++) {
-                uint8_t b = src[column * 4 + 0];
-                uint8_t g = src[column * 4 + 1];
-                uint8_t r = src[column * 4 + 2];
-                uint8_t a = src[column * 4 + 3];
-                dst[column * 4 + 0] = r;
-                dst[column * 4 + 1] = g;
-                dst[column * 4 + 2] = b;
-                dst[column * 4 + 3] = a;
+                row_buffer[column * 4 + 0] = src[column * 4 + 2];
+                row_buffer[column * 4 + 1] = src[column * 4 + 1];
+                row_buffer[column * 4 + 2] = src[column * 4 + 0];
+                row_buffer[column * 4 + 3] = src[column * 4 + 3];
+            }
+            if (write(fd, row_buffer, (size_t)frame_width * 4) !=
+                (ssize_t)(frame_width * 4)) {
+                perror("write row");
+                close(fd);
+                return -1;
             }
         }
     }
-    __sync_synchronize();
-    header[0x18 / 4] = sequence + 1; /* even: stable */
-    header[0x1C / 4] = WINDOW_STATE_READY;
-    header[0x2C / 4] = 1; /* show the host window */
-    munmap((void *)window, map_size);
+    fsync(fd);
+    close(fd);
     frames_published++;
-    if (frames_published == 1) {
-        printf("SCREENCOPY FRAME %ux%u format=%u\n", frame_width, frame_height,
-               frame_format);
+    if (frames_published % 5 == 1) {
+        printf("SCREENCOPY FRAME %ux%u format=%u n=%d\n", frame_width,
+               frame_height, frame_format, frames_published);
         fflush(stdout);
     }
     return 0;
@@ -245,6 +255,7 @@ static int capture_once(void) {
         fprintf(stderr, "screencopy: missing manager/output/shm\n");
         return -1;
     }
+    fprintf(stderr, "sc: capture\n");
     frame = zwlr_screencopy_manager_v1_capture_output(manager, 0, output);
     if (!frame) return -1;
     zwlr_screencopy_frame_v1_add_listener(frame, &frame_listener, NULL);
@@ -256,6 +267,7 @@ static int capture_once(void) {
     }
     if (frame_failed) return -1;
     if (create_shm_buffer() != 0) return -1;
+    fprintf(stderr, "sc: copy\n");
     zwlr_screencopy_frame_v1_copy(frame, buffer);
     while (!frame_ready && !frame_failed) {
         if (wl_display_dispatch(display) < 0) return -1;
@@ -271,6 +283,7 @@ static int capture_once(void) {
 
 int main(void) {
     const char *name = getenv("WAYLAND_DISPLAY");
+    fprintf(stderr, "sc: connecting\n");
     display = wl_display_connect(name ? name : "wayland-0");
     if (!display) {
         fprintf(stderr, "screencopy: cannot connect (%s): %s\n",
@@ -279,8 +292,11 @@ int main(void) {
     }
     struct wl_registry *registry = wl_display_get_registry(display);
     wl_registry_add_listener(registry, &registry_listener, NULL);
-    wl_display_roundtrip(display);
-    wl_display_roundtrip(display);
+    fprintf(stderr, "sc: roundtrip 1\n");
+    if (wl_display_roundtrip(display) < 0) { fprintf(stderr, "sc: rt1 failed: %s\n", strerror(errno)); return 1; }
+    fprintf(stderr, "sc: roundtrip 2\n");
+    if (wl_display_roundtrip(display) < 0) { fprintf(stderr, "sc: rt2 failed: %s\n", strerror(errno)); return 1; }
+    fprintf(stderr, "sc: globals manager=%p output=%p shm=%p\n", (void*)manager, (void*)output, (void*)shm);
     if (!manager || !output || !shm) {
         fprintf(stderr, "screencopy: missing globals (manager=%p output=%p shm=%p)\n",
                 (void *)manager, (void *)output, (void *)shm);
@@ -288,7 +304,7 @@ int main(void) {
     }
     for (;;) {
         capture_once();
-        usleep(100 * 1000);
+        usleep(2 * 1000 * 1000);
     }
     return 0;
 }

@@ -2045,6 +2045,13 @@ pub fn connect(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
         // The queue takes ownership of the server end's reference.
         state.pending.push_back(pair.clone());
     }
+    crate::console::write_str("SOCKDBG connect task=");
+    crate::console::write_dec_u64(task);
+    crate::console::write_str(" path=");
+    crate::console::write_str(core::str::from_utf8(&path).unwrap_or("?"));
+    crate::console::write_str("
+
+");
     if replace_unbound(
         task,
         fd,
@@ -2072,6 +2079,11 @@ pub fn connect(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
 /// `accept(2)`/`accept4(2)`: pops one pending connection. Returns the new
 /// descriptor; the caller writes the (unnamed) peer address.
 pub fn accept(task: u64, fd: u64, nonblock_flag: bool) -> Result<u64, u64> {
+    crate::console::write_str("SOCKDBG accept task=");
+    crate::console::write_dec_u64(task);
+    crate::console::write_str("
+
+");
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::Listener { state, nonblock } = target else {
         return Err(EINVAL);
@@ -2419,7 +2431,18 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
         }
         Target::Unbound { .. } => POLLOUT,
         Target::Listener { state, .. } => {
-            if state.lock().pending.is_empty() {
+            let pending = state.lock().pending.len();
+            static LAST: core::sync::atomic::AtomicUsize =
+                core::sync::atomic::AtomicUsize::new(0);
+            let previous = LAST.swap(pending, Ordering::SeqCst);
+            if pending != previous {
+                crate::console::write_str("SOCKDBG listener pending=");
+                crate::console::write_dec_u64(pending as u64);
+                crate::console::write_str("
+
+");
+            }
+            if pending == 0 {
                 0
             } else {
                 POLLIN
