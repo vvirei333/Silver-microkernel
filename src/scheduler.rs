@@ -3045,6 +3045,246 @@ pub fn current_task_argv_prefix(buffer: &mut [u8]) -> usize {
     length
 }
 
+/// Prints the current task's virtual memory map to the console without
+/// allocating: every mmap region (with lazy/shared/file flags), the brk heap,
+/// the stack and the Linux image runs. Called from the fault dump — an
+/// overlap between two of these lines is the smoking gun for a VA collision.
+pub fn dump_current_task_map() {
+    let mut line = [0_u8; 160];
+    let mut push = |line: &mut [u8], length: &mut usize, text: &[u8]| {
+        let take = text.len().min(line.len() - *length);
+        line[*length..*length + take].copy_from_slice(&text[..take]);
+        *length += take;
+    };
+    if let Some(result) = scheduler_manager()
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
+        .map(|task| {
+            let mut total = 0usize;
+            crate::console::write_str("MAP regions:\r\n");
+            for region in &task.mmap_regions {
+                total += 1;
+                let mut length = 0;
+                push(&mut line, &mut length, b"MAP va=0x");
+                crate::console::write_bytes(&line[..length]);
+                crate::console::write_hex_u64(region.virtual_address as u64);
+                let mut length = 0;
+                push(&mut line, &mut length, b" pages=");
+                crate::console::write_bytes(&line[..length]);
+                crate::console::write_dec_u64(region.page_count as u64);
+                let mut length = 0;
+                push(
+                    &mut line,
+                    &mut length,
+                    if region.prot & crate::mmu::PROT_WRITE != 0 {
+                        b" rw"
+                    } else {
+                        b" r-"
+                    },
+                );
+                if region.prot & crate::mmu::PROT_EXEC != 0 {
+                    push(&mut line, &mut length, b"x");
+                }
+                if region.lazy {
+                    push(&mut line, &mut length, b" lazy(");
+                    crate::console::write_bytes(&line[..length]);
+                    crate::console::write_dec_u64(region.pages.len() as u64);
+                    let mut length = 0;
+                    push(&mut line, &mut length, b" touched)");
+                    crate::console::write_bytes(&line[..length]);
+                }
+                if region.shared.is_some() {
+                    let mut length = 0;
+                    push(&mut line, &mut length, b" MEMFD-WINDOW");
+                    crate::console::write_bytes(&line[..length]);
+                }
+                if let Some((path, offset)) = &region.file {
+                    let mut length = 0;
+                    push(&mut line, &mut length, b" file=\"");
+                    crate::console::write_bytes(&line[..length]);
+                    crate::console::write_str(path);
+                    let mut length = 0;
+                    push(&mut line, &mut length, b"\" off=");
+                    crate::console::write_bytes(&line[..length]);
+                    crate::console::write_dec_u64(*offset as u64);
+                }
+                crate::console::write_str("\r\n");
+            }
+            crate::console::write_str("HEAP va=0x");
+            crate::console::write_hex_u64(mmu::USER_HEAP_VA as u64);
+            crate::console::write_str(" pages=");
+            crate::console::write_dec_u64(task.heap_pages.len() as u64);
+            crate::console::write_str(" break=0x");
+            crate::console::write_hex_u64(task.program_break as u64);
+            crate::console::write_str("\r\nSTACK va=0x");
+            crate::console::write_hex_u64(task.user_stack.start as u64);
+            crate::console::write_str("\r\n");
+            if let Some(image) = &task.linux_image {
+                crate::console::write_str("IMAGE runs=");
+                crate::console::write_dec_u64(image.runs.len() as u64);
+                crate::console::write_str(" top=0x");
+                crate::console::write_hex_u64(image.upper_bound as u64);
+                crate::console::write_str("\r\n");
+                for run in &image.runs {
+                    crate::console::write_str("RUN va=0x");
+                    crate::console::write_hex_u64(run.virtual_address as u64);
+                    crate::console::write_str(" pages=");
+                    crate::console::write_dec_u64(run.page_count as u64);
+                    crate::console::write_str("\r\n");
+                }
+            }
+            total
+        })
+    {
+        crate::console::write_str("MAP total=");
+        crate::console::write_dec_u64(result as u64);
+        crate::console::write_str("\r\n");
+    }
+}
+
+/// Physical span owned by some mapping: `[start, start + pages*PAGE)`.
+#[derive(Clone, Copy)]
+struct PhysSpan {
+    start: usize,
+    pages: usize,
+    task_id: u64,
+    label: &'static str,
+}
+
+/// Bounded, allocation-free physical alias report: walks every task's mmap
+/// regions (contiguous runs, touched lazy pages, per-frame file mappings),
+/// Linux image runs and stacks, and prints any two spans that share physical
+/// frames. Two mappings on one frame is the smoking gun for the Wayland
+/// bytes landing in the wrong object.
+pub fn dump_physical_alias_report() {
+    const MAX_SPANS: usize = 2048;
+    // Kernel-stack budget: an array this large must live in BSS, not on the
+    // exception stack. Two CPUs faulting at once would race on it; the report
+    // is a diagnostic, so a garbled line is acceptable.
+    static SPANS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    static mut SPAN_STORAGE: [PhysSpan; MAX_SPANS] =
+        [PhysSpan { start: 0, pages: 0, task_id: 0, label: "" }; MAX_SPANS];
+    if SPANS.swap(true, Ordering::Acquire) {
+        return; // another CPU is already printing a report
+    }
+    let spans = unsafe { &mut *core::ptr::addr_of_mut!(SPAN_STORAGE) };
+    let mut count = 0usize;
+    let mut truncated = false;
+    let page = PAGE_SIZE;
+    let Some(_) = scheduler_manager() else {
+        return;
+    };
+    for manager in scheduler_manager() {
+        for task in &manager.tasks {
+            if task.id == 0 {
+                continue;
+            }
+            let id = task.id;
+            if count < MAX_SPANS {
+                spans[count] = PhysSpan {
+                    start: task.user_stack.start,
+                    pages: TASK_USER_STACK_SIZE / page,
+                    task_id: id,
+                    label: "stack",
+                };
+                count += 1;
+            } else {
+                truncated = true;
+            }
+            for region in &task.mmap_regions {
+                if count >= MAX_SPANS {
+                    truncated = true;
+                    break;
+                }
+                if region.lazy {
+                    for (offset, (physical, _)) in region.pages.iter() {
+                        if count >= MAX_SPANS {
+                            truncated = true;
+                            break;
+                        }
+                        spans[count] = PhysSpan {
+                            start: *physical,
+                            pages: 1,
+                            task_id: id,
+                            label: "lazy",
+                        };
+                        count += 1;
+                        let _ = offset;
+                    }
+                    for (physical, _) in &region.frames {
+                        if count >= MAX_SPANS {
+                            truncated = true;
+                            break;
+                        }
+                        spans[count] = PhysSpan {
+                            start: *physical,
+                            pages: 1,
+                            task_id: id,
+                            label: "frame",
+                        };
+                        count += 1;
+                    }
+                } else if region.physical_start != 0 {
+                    spans[count] = PhysSpan {
+                        start: region.physical_start,
+                        pages: region.page_count,
+                        task_id: id,
+                        label: "mmap",
+                    };
+                    count += 1;
+                }
+            }
+            if let Some(image) = &task.linux_image {
+                for run in &image.runs {
+                    if count >= MAX_SPANS {
+                        truncated = true;
+                        break;
+                    }
+                    spans[count] = PhysSpan {
+                        start: run.physical_start,
+                        pages: run.page_count,
+                        task_id: id,
+                        label: "run",
+                    };
+                    count += 1;
+                }
+            }
+        }
+    }
+    spans[..count].sort_by_key(|span| span.start);
+    crate::console::write_str("PHYSPANS total=");
+    crate::console::write_dec_u64(count as u64);
+    if truncated {
+        crate::console::write_str(" (truncated)");
+    }
+    crate::console::write_str("\r\n");
+    let mut aliases = 0;
+    for index in 1..count {
+        let previous = &spans[index - 1];
+        let current = &spans[index];
+        if current.start < previous.start + previous.pages * page {
+            aliases += 1;
+            crate::console::write_str("ALIAS phys=0x");
+            crate::console::write_hex_u64(current.start as u64);
+            crate::console::write_str(" task");
+            crate::console::write_dec_u64(previous.task_id as u64);
+            crate::console::write_str("(");
+            crate::console::write_str(previous.label);
+            crate::console::write_str(") vs task");
+            crate::console::write_dec_u64(current.task_id as u64);
+            crate::console::write_str("(");
+            crate::console::write_str(current.label);
+            crate::console::write_str(")\r\n");
+            if aliases >= 24 {
+                crate::console::write_str("ALIAS ...more suppressed\r\n");
+                break;
+            }
+        }
+    }
+    if aliases == 0 {
+        crate::console::write_str("ALIAS none\r\n");
+    }
+}
+
 pub fn current_task_arguments() -> Vec<u8> {
     scheduler_manager()
         .and_then(|manager| manager.tasks.get(smp::current_index()))

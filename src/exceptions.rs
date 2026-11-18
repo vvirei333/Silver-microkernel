@@ -209,7 +209,34 @@ fn dump_user_frame(frame: *mut u64, esr: u64, elr: u64, far: u64) {
             }
         }
     }
+    // The instruction bytes at ELR-16, read from the faulting task's own
+    // address space: they identify the code that actually faulted without
+    // trusting any symbol/base assumptions.
+    {
+        let mut code = [0_u8; 16];
+        let base = elr.saturating_sub(16) & !0x3;
+        if crate::user_memory::copy_from_user(base, &mut code).is_ok() {
+            push_bytes(&mut line, &mut length, b"CODE elr-16=0x");
+            push_hex(&mut line, &mut length, base);
+            push_bytes(&mut line, &mut length, b":");
+            for word in code.chunks_exact(4) {
+                let insn = u32::from_le_bytes(word.try_into().unwrap());
+                push_bytes(&mut line, &mut length, b" ");
+                let mut digits = [0_u8; 8];
+                for (index, byte) in digits.iter_mut().enumerate() {
+                    let nibble = ((insn >> (28 - 4 * index)) & 0xF) as u8;
+                    *byte = if nibble < 10 { b'0' + nibble } else { b'a' + nibble - 10 };
+                }
+                push_bytes(&mut line, &mut length, &digits);
+            }
+            push_bytes(&mut line, &mut length, b"\r\n");
+        }
+    }
     console::write_bytes(&line[..length]);
+    // The virtual map decides whether the corruption is a VA collision: two
+    // lines sharing an address range are the smoking gun.
+    crate::scheduler::dump_current_task_map();
+    crate::scheduler::dump_physical_alias_report();
 }
 
 #[no_mangle]
