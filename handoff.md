@@ -7496,3 +7496,33 @@ So the blocker was an upstream phoc 0.55.1 heap corruption, not a kernel
 bug. The Linux ABI + Phosh layer continues on the edge image; the debug
 tooling built along the way (fault dump with argv/mem/CODE/PHYS lines, VA
 map, physical alias report, QEMU gdbstub client) stays.
+
+### Scanout campaign on the edge image (2026-11-19)
+
+Goal: publish phoc's headless output to the host. Windows blockers and the
+chosen route:
+
+- The local QEMU build has no ivshmem device and no memory-backend-file
+  (`-object help` lists only memory-backend-ram), so the demo's ivshmem
+  window cannot exist. Chosen transport: the guest writes `/frame.rgba` on
+  the SFS root and the host reads the bytes straight out of the disk image
+  (virtio-blk writes land in the same file).
+- zig cc (`build/zig/...`) cross-compiles static aarch64-linux-musl. Dynamic
+  zig binaries crash inside the guest's ld-musl (kernel ELF-loader gap -
+  worth a follow-up), so everything must be `-static`. Alpine's libffi.a
+  references out-of-line `__aarch64_*_sync` helpers: implemented in
+  `tools/aarch64_atomics.c` (LL/SC loops, correct on any ARMv8).
+- `tools/screencopy-minimal.c` — a hand-rolled Wayland client on raw
+  syscalls (no libwayland): get_registry/bind (new_id is the LAST wire
+  argument), capture_output, wl_shm.create_pool over SCM_RIGHTS, frame copy,
+  RGBA8888 to /frame.rgba. Static binary works, connects to /tmp/wayland-0.
+
+Current blocker: **phoc accepts the first Wayland client (phosh) but never
+accepts ours.** SOCKDBG tracing in linux_fd.rs (connect/accept paths +
+listener pending transitions) shows: `connect task=141 path=/tmp/wayland-0`
+reaches the kernel, the pair is queued, `poll_ready` is level-correct for
+listeners, but phoc's event loop never calls accept a second time. Next
+steps: check how libwayland's event loop waits (epoll_wait? ppoll?) and
+whether our epoll/ppoll wakes for the listener fd on the second pending
+connection; the tracing already in place prints pending transitions, so a
+run will show whether the kernel ever reports the new connection.
