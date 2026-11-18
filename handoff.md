@@ -7453,3 +7453,23 @@ New facts and open threads:
   of the faulting page (far's page) and print it in the dump — if its
   physical equals another region's frame, the aliasing is real but was
   hidden by the cap.
+
+### PHYS lines and the narrowed suspect list (2026-11-18 late night)
+
+`user_physical_address` (mmu.rs) translates user VAs through ttbr0; the
+fault dump prints `PHYS far page=` / `PHYS x19 page=`. On the reference
+run x19=0x44A41E40 is backed by physical 0x43336000 and the Wayland wire
+bytes sit there again. Combined with the earlier results:
+
+- no VA overlap in the task's own map (110 regions),
+- no physical alias found (verdict provisional: the report truncated at
+  2048 spans),
+- recvmsg/write_iovecs bounds are correct,
+
+the writer reaches the heap page WITHOUT any mapping-level alias. The
+remaining suspects are kernel copy paths that use a stale or wrong
+destination VA (read() length accounting, a cached buffer address across a
+sleeping syscall / context switch), or frame-generation reuse on the
+COW/fork paths. Next: untruncated alias report (per-task caps), then a
+line-by-line audit of linux_fd read() and the socket data window, plus a
+PHYS dump for far's page on the translation-fault runs (far=0x51.. pages).
