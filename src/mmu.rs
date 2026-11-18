@@ -2684,6 +2684,35 @@ fn destroy_task_space_inner(
 
 /// Read-only check used by the address-space self-test: is the 4 KiB page at
 /// `virtual_address` present in `ttbr0`?
+/// Translates a user virtual address through `ttbr0` and returns the
+/// physical address backing it (page descriptor + intra-page offset), or
+/// `None` when the page is not mapped. Diagnostic use only.
+pub fn user_physical_address(ttbr0: usize, virtual_address: usize) -> Option<usize> {
+    if virtual_address < DRAM_BASE {
+        return None;
+    }
+    let l2_index = (virtual_address - DRAM_BASE) / BLOCK_2M;
+    if l2_index >= ENTRIES {
+        return None;
+    }
+    let root = root_of(ttbr0);
+    unsafe {
+        let l1_user = follow_table(root, 0);
+        let l2_user = follow_table(l1_user, 1);
+        let l2_entry = read_entry(l2_user, l2_index);
+        if l2_entry & DESC_TABLE != DESC_TABLE {
+            return None;
+        }
+        let l3 = descriptor_address(l2_entry) as usize;
+        let entry = read_entry(l3, (virtual_address >> 12) & 0x1FF);
+        if entry & DESC_PAGE != DESC_PAGE {
+            return None;
+        }
+        let frame = (entry & ADDRESS_MASK) as usize;
+        Some(frame | (virtual_address & (GRANULE - 1)))
+    }
+}
+
 pub fn user_page_is_mapped(ttbr0: usize, virtual_address: usize) -> bool {
     if virtual_address % GRANULE != 0 || virtual_address < DRAM_BASE {
         return false;

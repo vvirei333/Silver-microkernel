@@ -3285,6 +3285,14 @@ pub fn dump_physical_alias_report() {
     }
 }
 
+/// The current task's TTBR0, for fault-dump diagnostics.
+pub fn current_task_ttbr0() -> usize {
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
+        .map(|task| task.ttbr0)
+        .unwrap_or(0)
+}
+
 pub fn current_task_arguments() -> Vec<u8> {
     scheduler_manager()
         .and_then(|manager| manager.tasks.get(smp::current_index()))

@@ -232,6 +232,21 @@ fn dump_user_frame(frame: *mut u64, esr: u64, elr: u64, far: u64) {
             push_bytes(&mut line, &mut length, b"\r\n");
         }
     }
+    // Physical backing of the faulting page and of x19's page: if far's
+    // frame is owned by another region somewhere, the alias report and this
+    // line together nail the corruption down.
+    let ttbr0 = crate::scheduler::current_task_ttbr0();
+    for (label, address) in [("far", far), ("x19", unsafe { *frame.add(19) })] {
+        if let Some(physical) =
+            crate::mmu::user_physical_address(ttbr0, address as usize & !0xFFF)
+        {
+            push_bytes(&mut line, &mut length, b"PHYS ");
+            push_bytes(&mut line, &mut length, label.as_bytes());
+            push_bytes(&mut line, &mut length, b" page=0x");
+            push_hex(&mut line, &mut length, physical as u64 & !0xFFF);
+            push_bytes(&mut line, &mut length, b"\r\n");
+        }
+    }
     console::write_bytes(&line[..length]);
     // The virtual map decides whether the corruption is a VA collision: two
     // lines sharing an address range are the smoking gun.
