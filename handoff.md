@@ -7473,3 +7473,26 @@ sleeping syscall / context switch), or frame-generation reuse on the
 COW/fork paths. Next: untruncated alias report (per-task caps), then a
 line-by-line audit of linux_fd read() and the socket data window, plus a
 PHYS dump for far's page on the translation-fault runs (far=0x51.. pages).
+
+### RESOLVED: the phoc crash was upstream (2026-11-18, late)
+
+The kernel-side audit went: no VA overlap (110 regions), no physical alias
+(9361+ pages, report v2), recvmsg bounds clean, cow_copy_run/fork-lazy copy
+from live parent frames. The decisive observation came from the dump bytes
+themselves: "phoc" is the wl_seat name, "UTF-8"/"ASCII" are data-offer mime
+types, ids 6..12 are sequential client objects - phoc's OWN marshal output,
+and the marshal buffer is malloc'd in the same glibc arena as the toplevel
+object. That pointed at a phoc-side heap overflow, and the version pinned in
+the v3.24 image (phoc 0.55.1 + vendored wlroots 0.20) was the suspect.
+
+Test: an Alpine **edge** image (phoc/phosh 0.59.0, built with
+`ALPINE_RELEASE=edge tools/build_alpine_phosh_direct.py` -> 
+`build/werewolf-alpine-edge.img`) boots the same kernel: **zero faults**,
+"Enabling shell mode" reached, WAYLAND SOCKET OK. On v3.24 the same boot
+produced 5+ faults and the fatal far=0xE9 crash in
+phoc_xdg_toplevel_constructed.
+
+So the blocker was an upstream phoc 0.55.1 heap corruption, not a kernel
+bug. The Linux ABI + Phosh layer continues on the edge image; the debug
+tooling built along the way (fault dump with argv/mem/CODE/PHYS lines, VA
+map, physical alias report, QEMU gdbstub client) stays.
