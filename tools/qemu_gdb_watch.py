@@ -67,6 +67,8 @@ class GdbClient:
                 self.buffer.extend(self.sock.recv(4096))
             except socket.timeout:
                 pass
+            except ConnectionResetError:
+                return None
         return None
 
     def command(self, command: str, timeout: float = 30.0) -> str | None:

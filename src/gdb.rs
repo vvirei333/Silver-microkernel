@@ -23,6 +23,42 @@ const IMSC: *mut u32 = (UART_BASE + 0x38) as *mut u32;
 
 const PACKET_MAX: usize = 2048;
 
+/// Whether the stub's UART actually exists. `serve` is a no-op without it: on
+/// machines whose tree lists a single PL011 the stub's MMIO raises a
+/// synchronous external abort that turns a user fault into a kernel panic.
+/// Probed from the live device tree at boot (`probe_transport`).
+static TRANSPORT: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+
+/// Second-UART MMIO base this stub is written against.
+const STUB_UART_BASE: u64 = 0x0904_0000;
+
+/// Marks the stub usable when the live tree lists a PL011 at
+/// [`STUB_UART_BASE`]. Called once from boot with the handed-over DTB; a
+/// missing tree keeps the stub dormant (QEMU `-kernel` boots also have no
+/// second UART unless the machine provides one).
+#[cfg(feature = "gdb-stub")]
+pub fn probe_transport(dtb: Option<&[u8]>) {
+    let Some(data) = dtb else {
+        return;
+    };
+    let Some(tree) = crate::fdt::Fdt::new(data) else {
+        return;
+    };
+    let mut nodes = [crate::fdt::DriverNode {
+        kind: crate::fdt::DriverKind::Pl011,
+        mmio: crate::fdt::Region::default(),
+        irq: None,
+    }; crate::fdt::MAX_DRIVER_NODES];
+    let count = tree.driver_nodes(&mut nodes);
+    for node in &nodes[..count] {
+        if node.mmio.start <= STUB_UART_BASE && STUB_UART_BASE < node.mmio.end {
+            TRANSPORT.store(true, core::sync::atomic::Ordering::Release);
+            return;
+        }
+    }
+}
+
 const TARGET_XML: &str = "<?xml version=\"1.0\"?>\
 <!DOCTYPE target SYSTEM \"gdb-target.dtd\">\
 <target><architecture>aarch64</architecture><feature name=\"org.gnu.gdb.aarch64.core\">\
@@ -171,16 +207,13 @@ fn write_user(address: u64, bytes: &[u8]) -> bool {
 /// Serves the debugger after a user fault. Returns when the debugger detaches
 /// or continues, so the caller can run its normal kill path.
 pub fn serve(frame: *const u64, _esr: u64, elr: u64, _far: u64) {
-    // This QEMU build's `virt` machine exposes a single PL011 in its device
-    // tree (verified by dumping the DTB); the second UART this stub was
-    // written against (0x0904_0000) does not exist, and every MMIO touch
-    // raises a synchronous external abort that turns a user fault into a
-    // kernel panic. The software page watch in log mode prints its evidence
-    // to the console, so the stub stays dormant until it gains a real
-    // transport (QEMU's own `-gdb` gdbstub or a virtio-serial console).
-    let _ = (frame, elr);
-    return;
-    #[allow(unreachable_code)]
+    // Dormant unless the live tree lists the stub's second PL011: touching a
+    // missing MMIO region raises a synchronous external abort that turns a
+    // user fault into a kernel panic. See `probe_transport`.
+    if !TRANSPORT.load(core::sync::atomic::Ordering::Acquire) {
+        let _ = (frame, elr);
+        return;
+    }
     initialize();
     for byte in b"\nGDB-STUB aarch64\n" {
         write_byte(*byte);

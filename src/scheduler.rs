@@ -3017,6 +3017,34 @@ pub fn task_alive(id: u64) -> bool {
         .unwrap_or(false)
 }
 
+/// Copies the current task's `argv` into `buffer` without allocating, for
+/// fault dumps: `argv[0] argv[1] ...` up to the buffer size. Returns the
+/// number of bytes written.
+pub fn current_task_argv_prefix(buffer: &mut [u8]) -> usize {
+    let mut length = 0;
+    scheduler_manager()
+        .and_then(|manager| manager.tasks.get(smp::current_index()))
+        .map(|task| {
+            for argument in &task.argv {
+                if length >= buffer.len() {
+                    break;
+                }
+                if length > 0 && length < buffer.len() {
+                    buffer[length] = b' ';
+                    length += 1;
+                }
+                for byte in argument.iter() {
+                    if length >= buffer.len() {
+                        break;
+                    }
+                    buffer[length] = *byte;
+                    length += 1;
+                }
+            }
+        });
+    length
+}
+
 pub fn current_task_arguments() -> Vec<u8> {
     scheduler_manager()
         .and_then(|manager| manager.tasks.get(smp::current_index()))

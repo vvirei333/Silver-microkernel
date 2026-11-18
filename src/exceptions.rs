@@ -150,7 +150,7 @@ fn dump_user_frame(frame: *mut u64, esr: u64, elr: u64, far: u64) {
         "x11", "x12", "x13", "x14", "x15", "x16", "x17", "x18", "x19", "x20",
         "x21", "x22", "x23", "x24", "x25", "x26", "x27", "x28", "x29", "x30",
     ];
-    let mut line = [0_u8; 1152];
+    let mut line = [0_u8; 4096];
     let mut length = 0_usize;
 
     push_bytes(&mut line, &mut length, b"FAULT task=");
@@ -161,6 +161,12 @@ fn dump_user_frame(frame: *mut u64, esr: u64, elr: u64, far: u64) {
     push_hex(&mut line, &mut length, far);
     push_bytes(&mut line, &mut length, b" elr=0x");
     push_hex(&mut line, &mut length, elr);
+    // Identify the program: which binary faulted (busybox applet, openrc,
+    // phoc, ...) decides the whole investigation path.
+    push_bytes(&mut line, &mut length, b" argv=");
+    let mut argv = [0_u8; 96];
+    let argv_length = crate::scheduler::current_task_argv_prefix(&mut argv);
+    push_bytes(&mut line, &mut length, &argv[..argv_length]);
     push_bytes(&mut line, &mut length, b"\r\n");
     for (index, name) in names.iter().enumerate() {
         push_bytes(&mut line, &mut length, name.as_bytes());
@@ -179,6 +185,30 @@ fn dump_user_frame(frame: *mut u64, esr: u64, elr: u64, far: u64) {
     push_bytes(&mut line, &mut length, b"SP_EL0=0x");
     push_hex(&mut line, &mut length, sp);
     push_bytes(&mut line, &mut length, b"\r\n");
+    // Hex-dump the memory around x19 (frame[19]): for corrupted-object faults
+    // the shape of the neighborhood (pointer-like? protocol bytes?) says
+    // whether a wild kernel copy or an object overwrite is the culprit. The
+    // read is fault-safe and skips silently when x19 is not user memory.
+    {
+        const DUMP_RANGE: i64 = 96;
+        let x19 = unsafe { *frame.add(19) };
+        let start = x19.saturating_sub(DUMP_RANGE as u64) & !0x7;
+        let mut dump = [0_u8; 2 * DUMP_RANGE as usize];
+        if crate::user_memory::copy_from_user(start, &mut dump).is_ok() {
+            push_bytes(&mut line, &mut length, b"MEM x19-96:\r\n");
+            for word in dump.chunks_exact(8) {
+                push_bytes(&mut line, &mut length, b"  0x");
+                push_hex(&mut line, &mut length, start + (word.as_ptr() as usize - dump.as_ptr() as usize) as u64);
+                push_bytes(&mut line, &mut length, b"=0x");
+                push_hex(
+                    &mut line,
+                    &mut length,
+                    u64::from_le_bytes(word.try_into().unwrap()),
+                );
+                push_bytes(&mut line, &mut length, b"\r\n");
+            }
+        }
+    }
     console::write_bytes(&line[..length]);
 }
 
