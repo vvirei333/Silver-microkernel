@@ -3152,137 +3152,188 @@ struct PhysSpan {
 
 /// Bounded, allocation-free physical alias report: walks every task's mmap
 /// regions (contiguous runs, touched lazy pages, per-frame file mappings),
-/// Linux image runs and stacks, and prints any two spans that share physical
-/// frames. Two mappings on one frame is the smoking gun for the Wayland
-/// bytes landing in the wrong object.
+/// Linux image runs and stacks, and prints any two mappings that share
+/// physical frames. Two mappings on one frame is the smoking gun for the
+/// Wayland bytes landing in the wrong object.
 pub fn dump_physical_alias_report() {
-    const MAX_SPANS: usize = 2048;
-    // Kernel-stack budget: an array this large must live in BSS, not on the
-    // exception stack. Two CPUs faulting at once would race on it; the report
-    // is a diagnostic, so a garbled line is acceptable.
-    static SPANS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+    const MAX_SPANS: usize = 1024;
+    const MAX_PAGES: usize = 16384;
+    // Kernel-stack budget: arrays this large live in BSS, not on the
+    // exception stack. Two CPUs faulting at once would race on them; the
+    // report is a diagnostic, so a garbled line is acceptable.
+    static REPORTING: core::sync::atomic::AtomicBool =
+        core::sync::atomic::AtomicBool::new(false);
     static mut SPAN_STORAGE: [PhysSpan; MAX_SPANS] =
         [PhysSpan { start: 0, pages: 0, task_id: 0, label: "" }; MAX_SPANS];
-    if SPANS.swap(true, Ordering::Acquire) {
+    static mut PAGE_STORAGE: [PhysSpan; MAX_PAGES] =
+        [PhysSpan { start: 0, pages: 0, task_id: 0, label: "" }; MAX_PAGES];
+    if REPORTING.swap(true, Ordering::Acquire) {
         return; // another CPU is already printing a report
     }
     let spans = unsafe { &mut *core::ptr::addr_of_mut!(SPAN_STORAGE) };
-    let mut count = 0usize;
+    let pages = unsafe { &mut *core::ptr::addr_of_mut!(PAGE_STORAGE) };
+    let mut span_count = 0usize;
+    let mut page_count = 0usize;
     let mut truncated = false;
-    let page = PAGE_SIZE;
-    let Some(_) = scheduler_manager() else {
-        return;
-    };
-    for manager in scheduler_manager() {
-        for task in &manager.tasks {
-            if task.id == 0 {
-                continue;
-            }
-            let id = task.id;
-            if count < MAX_SPANS {
-                spans[count] = PhysSpan {
-                    start: task.user_stack.start,
-                    pages: TASK_USER_STACK_SIZE / page,
-                    task_id: id,
-                    label: "stack",
-                };
-                count += 1;
-            } else {
-                truncated = true;
-            }
-            for region in &task.mmap_regions {
-                if count >= MAX_SPANS {
+    let page_size = PAGE_SIZE;
+    if scheduler_manager().is_some() {
+        for manager in scheduler_manager() {
+            for task in &manager.tasks {
+                if task.id == 0 {
+                    continue;
+                }
+                let id = task.id;
+                if span_count < MAX_SPANS && task.user_stack.start != 0 {
+                    spans[span_count] = PhysSpan {
+                        start: task.user_stack.start,
+                        pages: TASK_USER_STACK_SIZE / page_size,
+                        task_id: id,
+                        label: "stack",
+                    };
+                    span_count += 1;
+                } else {
                     truncated = true;
-                    break;
                 }
-                if region.lazy {
-                    for (offset, (physical, _)) in region.pages.iter() {
-                        if count >= MAX_SPANS {
+                for region in &task.mmap_regions {
+                    if region.lazy {
+                        for (_, (physical, _)) in region.pages.iter() {
+                            if page_count >= MAX_PAGES {
+                                truncated = true;
+                                break;
+                            }
+                            pages[page_count] = PhysSpan {
+                                start: *physical,
+                                pages: 1,
+                                task_id: id,
+                                label: "lazy",
+                            };
+                            page_count += 1;
+                        }
+                        for (physical, _) in &region.frames {
+                            if page_count >= MAX_PAGES {
+                                truncated = true;
+                                break;
+                            }
+                            pages[page_count] = PhysSpan {
+                                start: *physical,
+                                pages: 1,
+                                task_id: id,
+                                label: "frame",
+                            };
+                            page_count += 1;
+                        }
+                    } else {
+                        if span_count >= MAX_SPANS {
                             truncated = true;
                             break;
                         }
-                        spans[count] = PhysSpan {
-                            start: *physical,
-                            pages: 1,
-                            task_id: id,
-                            label: "lazy",
-                        };
-                        count += 1;
-                        let _ = offset;
+                        if region.physical_start != 0 {
+                            spans[span_count] = PhysSpan {
+                                start: region.physical_start,
+                                pages: region.page_count,
+                                task_id: id,
+                                label: "mmap",
+                            };
+                            span_count += 1;
+                        }
                     }
-                    for (physical, _) in &region.frames {
-                        if count >= MAX_SPANS {
+                }
+                if let Some(image) = &task.linux_image {
+                    for run in &image.runs {
+                        if span_count >= MAX_SPANS {
                             truncated = true;
                             break;
                         }
-                        spans[count] = PhysSpan {
-                            start: *physical,
-                            pages: 1,
+                        spans[span_count] = PhysSpan {
+                            start: run.physical_start,
+                            pages: run.page_count,
                             task_id: id,
-                            label: "frame",
+                            label: "run",
                         };
-                        count += 1;
+                        span_count += 1;
                     }
-                } else if region.physical_start != 0 {
-                    spans[count] = PhysSpan {
-                        start: region.physical_start,
-                        pages: region.page_count,
-                        task_id: id,
-                        label: "mmap",
-                    };
-                    count += 1;
-                }
-            }
-            if let Some(image) = &task.linux_image {
-                for run in &image.runs {
-                    if count >= MAX_SPANS {
-                        truncated = true;
-                        break;
-                    }
-                    spans[count] = PhysSpan {
-                        start: run.physical_start,
-                        pages: run.page_count,
-                        task_id: id,
-                        label: "run",
-                    };
-                    count += 1;
                 }
             }
         }
     }
-    spans[..count].sort_by_key(|span| span.start);
-    crate::console::write_str("PHYSPANS total=");
-    crate::console::write_dec_u64(count as u64);
+    spans[..span_count].sort_by_key(|span| span.start);
+    pages[..page_count].sort_by_key(|span| span.start);
+    crate::console::write_str("PHYSPANS spans=");
+    crate::console::write_dec_u64(span_count as u64);
+    crate::console::write_str(" pages=");
+    crate::console::write_dec_u64(page_count as u64);
     if truncated {
         crate::console::write_str(" (truncated)");
     }
     crate::console::write_str("\r\n");
     let mut aliases = 0;
-    for index in 1..count {
+    let mut report = |aliases: &mut usize, first: &PhysSpan, second: &PhysSpan| {
+        *aliases += 1;
+        crate::console::write_str("ALIAS phys=0x");
+        crate::console::write_hex_u64(second.start as u64);
+        crate::console::write_str(" task");
+        crate::console::write_dec_u64(first.task_id);
+        crate::console::write_str("(");
+        crate::console::write_str(first.label);
+        crate::console::write_str(") vs task");
+        crate::console::write_dec_u64(second.task_id);
+        crate::console::write_str("(");
+        crate::console::write_str(second.label);
+        crate::console::write_str(")\r\n");
+    };
+    for index in 1..span_count {
         let previous = &spans[index - 1];
         let current = &spans[index];
-        if current.start < previous.start + previous.pages * page {
-            aliases += 1;
-            crate::console::write_str("ALIAS phys=0x");
-            crate::console::write_hex_u64(current.start as u64);
-            crate::console::write_str(" task");
-            crate::console::write_dec_u64(previous.task_id as u64);
-            crate::console::write_str("(");
-            crate::console::write_str(previous.label);
-            crate::console::write_str(") vs task");
-            crate::console::write_dec_u64(current.task_id as u64);
-            crate::console::write_str("(");
-            crate::console::write_str(current.label);
-            crate::console::write_str(")\r\n");
+        if current.start < previous.start + previous.pages * page_size {
+            report(&mut aliases, previous, current);
             if aliases >= 24 {
-                crate::console::write_str("ALIAS ...more suppressed\r\n");
                 break;
+            }
+        }
+    }
+    // A single-frame mapping landing inside a contiguous span of any task.
+    if aliases < 24 {
+        for entry in &pages[..page_count] {
+            let mut low = 0usize;
+            let mut high = span_count;
+            while low < high {
+                let middle = (low + high) / 2;
+                if spans[middle].start + spans[middle].pages * page_size
+                    <= entry.start
+                {
+                    low = middle + 1;
+                } else {
+                    high = middle;
+                }
+            }
+            if low < span_count && spans[low].start <= entry.start {
+                report(&mut aliases, &spans[low], entry);
+                if aliases >= 24 {
+                    break;
+                }
+            }
+        }
+    }
+    // Two single-frame mappings on the same physical page.
+    if aliases < 24 {
+        for index in 1..page_count {
+            if pages[index].start == pages[index - 1].start
+                && pages[index].start != 0
+            {
+                report(&mut aliases, &pages[index - 1], &pages[index]);
+                if aliases >= 24 {
+                    break;
+                }
             }
         }
     }
     if aliases == 0 {
         crate::console::write_str("ALIAS none\r\n");
     }
+    if aliases >= 24 {
+        crate::console::write_str("ALIAS ...more suppressed\r\n");
+    }
+    REPORTING.store(false, Ordering::Release);
 }
 
 /// The current task's TTBR0, for fault-dump diagnostics.

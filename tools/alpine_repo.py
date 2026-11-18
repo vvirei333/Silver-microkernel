@@ -23,9 +23,13 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
-REPOSITORIES = (
-    "https://dl-cdn.alpinelinux.org/alpine/v3.24/main",
-    "https://dl-cdn.alpinelinux.org/alpine/v3.24/community",
+import os
+
+# ALPINE_RELEASE selects the release line: v3.24 (default) or edge.
+ALPINE_RELEASE = os.environ.get("ALPINE_RELEASE", "v3.24")
+REPOSITORIES = tuple(
+    f"https://dl-cdn.alpinelinux.org/alpine/{ALPINE_RELEASE}/{repo}"
+    for repo in ("main", "community")
 )
 ARCH = "aarch64"
 

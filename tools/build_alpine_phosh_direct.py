@@ -29,7 +29,12 @@ from sfs_inject import Image  # noqa: E402
 import alpine_repo  # noqa: E402
 
 CACHE = ROOT / "build" / "apk-cache"
-TARGET = ROOT / "build" / "werewolf-alpine-phosh.img"
+import os as _os
+TARGET = ROOT / "build" / (
+    "werewolf-alpine-phosh.img"
+    if _os.environ.get("ALPINE_RELEASE", "v3.24") == "v3.24"
+    else f"werewolf-alpine-{_os.environ['ALPINE_RELEASE'].replace('.', '')}.img"
+)
 SIZE_MIB = 2048
 INODES = 32768
 MAX_FILE = 256 * 1024 * 1024  # vfs::MAX_FILE_BYTES
