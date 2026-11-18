@@ -7392,3 +7392,28 @@ foreign-PC hits until a stop with PC in the phoc range (0x10000000+) —
 that stop is the corrupting store. The hunt9 script (inline, see session
 log) was interrupted mid-run; re-create from this description or the
 gdbhunt5/6/8 variants in `build/gdbhunt*_out.txt`.
+
+### The 0x11 mystery is solved at the shape level (2026-11-18 evening)
+
+The fault dump now prints `argv=` (which binary faulted) and a fault-safe
+192-byte window around x19. Two facts landed at once:
+
+1. The crash is confirmed: `FAULT task=9 ... argv=/usr/bin/phoc -S -E
+   /usr/bin/phosh`, `x19=0x52296060` (a valid heap pointer; the object
+   address moves every run, which is why fixed-address watchpoints missed).
+2. The memory window around the dead object is full of **Wayland wire
+   bytes**: sequential object ids 6,7,8,9,a,b,c,d,e,f,10,11,12 with opcodes
+   and interface strings ("ASCII", "gio-proxy", "phoc", "UTF-8"). The
+   `0x11` in `self->xdg_toplevel` is object id 17 from that stream.
+
+So a phosh->phoc Wayland message is written over phoc's heap object — the
+prime suspects are a VA collision between kernel mmap regions (memfd window
+or arena sharing an address with the heap) or a wrong-target copy in the
+AF_UNIX/recvmsg path. This is a kernel (ABI) bug, not phoc, and it explains
+the timing sensitivity (whoever owns the colliding region changes with
+scheduling).
+
+Next session: map phoc's VA layout at the crash (kernel-side walk of the
+task's mmap_regions + heap + memfd windows — a `mapinfo` debug command or
+dump in the fault path) and find the overlap; then check the AF_UNIX read
+path for a copy that ignores the destination bounds.
