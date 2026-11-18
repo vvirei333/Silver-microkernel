@@ -7417,3 +7417,39 @@ Next session: map phoc's VA layout at the crash (kernel-side walk of the
 task's mmap_regions + heap + memfd windows — a `mapinfo` debug command or
 dump in the fault path) and find the overlap; then check the AF_UNIX read
 path for a copy that ignores the destination bounds.
+
+### Fault dump v3: VA map, physical aliases, code bytes (2026-11-18 night)
+
+The dump now prints three more things and they settled several questions:
+
+- `CODE elr-16` reads 16 instruction bytes from the faulting task's own
+  address space. They match the phoc 0.55.1 disassembly byte-for-byte
+  (`9102e000 f900a660 9104e261 f9404a60` at 0x10046ae0), so the binary and
+  the PIE base 0x10000000 are confirmed.
+- `dump_current_task_map` prints every mmap region, the heap, the stack and
+  the image runs (110 regions on the phoc run). **No VA overlap** — the
+  collision hypothesis loses its simplest form.
+- `dump_physical_alias_report` walks all tasks' physical spans (contiguous
+  regions, touched lazy pages, per-frame mappings, runs, stacks) and checks
+  for two spans sharing frames. Result: `ALIAS none` — but the report hit
+  the 2048-span cap (truncated), so the verdict is provisional.
+
+New facts and open threads:
+
+- x19 at the fault differs per run: 0x44A41E40, 0x52296060 (both valid
+  heap pointers), and 0x2 — the last is impossible for the
+  `ldr x0,[x19,#144]` chain, so the crash is being caught in several
+  distinct phases (the corruption is a moving target, consistent with the
+  timing sensitivity).
+- The second fault (`far=0x514aeb20`, argv=phoc) is a translation fault on
+  heap VAs AFTER the first task died: phoc's forked children die with the
+  parent.
+- recvmsg/write_iovecs bounds are correct; the read()/frame-generation
+  reuse path is the next audit target. The working hypothesis stays:
+  incoming Wayland bytes land in phoc's heap; find the writer.
+- Next steps: (1) rerun the alias report with per-task span caps so the
+  verdict is untruncated; (2) audit `linux_fd` read()/recvfor plain
+  descriptors for length or buffer reuse bugs; (3) dump the physical frame
+  of the faulting page (far's page) and print it in the dump — if its
+  physical equals another region's frame, the aliasing is real but was
+  hidden by the cap.
