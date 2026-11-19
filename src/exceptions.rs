@@ -49,6 +49,15 @@ pub static SYNTH_RING_INDEX: core::sync::atomic::AtomicUsize =
 #[no_mangle]
 pub static mut SYNTH_RING: [[u64; 6]; SYNTH_RING_LEN] = [[0; 6]; SYNTH_RING_LEN];
 
+pub const DUMP_RING_LEN: usize = 4;
+pub const DUMP_LINE_MAX: usize = 2048;
+pub static DUMP_RING_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+pub static mut DUMP_RING_LENGTHS: [u32; DUMP_RING_LEN] = [0; DUMP_RING_LEN];
+#[no_mangle]
+pub static mut DUMP_RING: [u8; DUMP_RING_LEN * DUMP_LINE_MAX] =
+    [0; DUMP_RING_LEN * DUMP_LINE_MAX];
+
 pub const FAULT_RING_LEN: usize = 32;
 pub static FAULT_RING_INDEX: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
@@ -302,6 +311,21 @@ fn dump_user_frame(frame: *mut u64, esr: u64, elr: u64, far: u64) {
         }
     }
     console::write_bytes(&line[..length]);
+    // The full report also lands in a static ring: console writes drop under
+    // load, and the QEMU monitor pmemsave path reads this reliably. Four
+    // slots, each holding one complete dump line.
+    DUMP_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    {
+        let slot = (DUMP_RING_INDEX.load(core::sync::atomic::Ordering::Relaxed) - 1) % DUMP_RING_LEN;
+        let take = length.min(DUMP_LINE_MAX);
+        unsafe {
+            let base = core::ptr::addr_of_mut!(DUMP_RING) as *mut u8;
+            let destination = base.add(slot * DUMP_LINE_MAX);
+            core::ptr::copy_nonoverlapping(line.as_ptr(), destination, take);
+            let lengths = core::ptr::addr_of_mut!(DUMP_RING_LENGTHS) as *mut u32;
+            *lengths.add(slot) = take as u32;
+        }
+    }
     // The virtual map decides whether the corruption is a VA collision: two
     // lines sharing an address range are the smoking gun.
     crate::scheduler::dump_current_task_map();
