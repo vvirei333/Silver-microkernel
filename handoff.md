@@ -7671,6 +7671,6 @@ addresses from nm after each rebuild; boot with
 `-monitor tcp:127.0.0.1:4445,server=on,wait=off` and
 `pmemsave 0x40000000 0x800000 dump.bin`.
 
-- After the loop is fixed: deniald should reach output discovery → Stage 3 (evdev
+- After the ADDFB fix: deniald should reach the render loop → Stage 3 (evdev
   /dev/input + udev /sys glue) → Stage 4 (screencopy-minimal as the first external
   client; the shell is embedded in Denial so the phoc accept gap may not matter).
