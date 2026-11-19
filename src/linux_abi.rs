@@ -32,6 +32,7 @@ static FUTEX_WAITERS: Mutex<Vec<FutexWaiter>> = Mutex::new(Vec::new());
 const SYS_DUP: u64 = 23;
 const SYS_DUP3: u64 = 24;
 const SYS_EVENTFD2: u64 = 19;
+const SYS_POLL: u64 = 7;
 const SYS_FUTEX: u64 = 98;
 const SYS_MEMFD_CREATE: u64 = 279;
 const SYS_IOCTL: u64 = 29;
@@ -339,6 +340,11 @@ fn dispatch_inner(
         }
         SYS_FUTEX => linux_futex(args[0], args[1], args[2], args[3]),
         SYS_PIPE2 => linux_pipe2(args[0], args[1]),
+        SYS_POLL => finish(linux_poll(
+            args[0],
+            args[1],
+            args[2] as i32 as i64,
+        )),
         SYS_PPOLL => finish(linux_ppoll(args[0], args[1], args[2])),
         SYS_CLOSE => finish(linux_fd::close(scheduler::current_task_id(), args[0]).map(|_| 0)),
         SYS_PREAD64 => linux_pread(args[0], args[1], args[2], args[3]),
@@ -510,6 +516,8 @@ fn linux_execve(
     if path.is_empty() {
         return errno(ENOENT);
     }
+    crate::console::write_str(&path);
+    crate::console::write_str("\r\n");
     let Some(argv) = user_string_array(argv_pointer) else {
         return errno(EFAULT);
     };
@@ -680,6 +688,8 @@ fn linux_clone(
     }
     match scheduler::fork_current(frame) {
         Some(pid) => {
+            crate::console::write_dec_u64(pid);
+            crate::console::write_str("\r\n");
             if flags & CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
                 let _ = user_memory::copy_to_user(&(pid as u32).to_le_bytes(), parent_tid);
             }
@@ -922,6 +932,23 @@ fn linux_pipe2(fds_pointer: u64, flags: u64) -> u64 {
     0
 }
 
+/// `poll(2)`: same readiness loop as `ppoll`, timeout in milliseconds
+/// (-1 = block, capped like `ppoll` so a stuck poll cannot wedge the kernel).
+/// seatd's main loop lives on this call; without it glibc `poll()` returns
+/// ENOSYS and the daemon exits immediately.
+fn linux_poll(
+    fds_pointer: u64,
+    nfds: u64,
+    timeout_ms: i64,
+) -> Result<u64, u64> {
+    let timeout = if timeout_ms < 0 {
+        None
+    } else {
+        Some(timeout_ms as u64)
+    };
+    poll_loop(fds_pointer, nfds, timeout)
+}
+
 /// `ppoll(2)`: readiness for up to 32 descriptors, with a timeout. A null
 /// timeout blocks, but is capped at 60 s so a stuck poll cannot wedge the
 /// kernel forever (there is no signal delivery to break it yet).
@@ -930,13 +957,6 @@ fn linux_ppoll(
     nfds: u64,
     timeout_pointer: u64,
 ) -> Result<u64, u64> {
-    const POLLERR: i16 = 0x008;
-    const POLLHUP: i16 = 0x010;
-    const POLLNVAL: i16 = 0x020;
-    if nfds > 32 {
-        return Err(EINVAL);
-    }
-    let count = nfds as usize;
     let timeout_ms = if timeout_pointer == 0 {
         None
     } else {
@@ -954,6 +974,21 @@ fn linux_ppoll(
             )
         }
     };
+    poll_loop(fds_pointer, nfds, timeout_ms)
+}
+
+fn poll_loop(
+    fds_pointer: u64,
+    nfds: u64,
+    timeout_ms: Option<u64>,
+) -> Result<u64, u64> {
+    const POLLERR: i16 = 0x008;
+    const POLLHUP: i16 = 0x010;
+    const POLLNVAL: i16 = 0x020;
+    if nfds > 32 {
+        return Err(EINVAL);
+    }
+    let count = nfds as usize;
     let start = timer::ticks();
     let deadline = timeout_ms.map(|ms| start + timer::milliseconds_to_ticks(ms));
     loop {
@@ -2033,6 +2068,53 @@ fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
             Err(_) => 0,
         };
     }
+    // Virtual-terminal ioctls for the synthetic VT console (`/dev/tty0`).
+    // seatd drives every session activation through them; without answers the
+    // seat never activates and clients cannot open devices.
+    if linux_fd::is_console(task, fd) {
+        const VT_OPENQRY: u64 = 0x5600;
+        const VT_SETMODE: u64 = 0x5601;
+        const VT_GETMODE: u64 = 0x5602;
+        const VT_GETSTATE: u64 = 0x5603;
+        const VT_SENDSIG: u64 = 0x5604;
+        const VT_RELDISP: u64 = 0x5605;
+        const VT_ACTIVATE: u64 = 0x5606;
+        const VT_WAITACTIVE: u64 = 0x5607;
+        const VT_DISALLOCATE: u64 = 0x5608;
+        const KDSETMODE: u64 = 0x4B3A;
+        const KDGETMODE: u64 = 0x4B3B;
+        const TIOCSCTTY: u64 = 0x540E;
+        match request {
+            VT_OPENQRY => {
+                let one = 1_u32.to_le_bytes();
+                if user_memory::copy_to_user(&one, argument).is_err() {
+                    return errno(EFAULT);
+                }
+                return 0;
+            }
+            VT_GETSTATE => {
+                // struct vt_stat { unsigned short v_active, v_signal, v_state; }
+                let mut stat = [0_u8; 6];
+                stat[0..2].copy_from_slice(&1_u16.to_le_bytes());
+                stat[4..6].copy_from_slice(&0x0002_u16.to_le_bytes());
+                if user_memory::copy_to_user(&stat, argument).is_err() {
+                    return errno(EFAULT);
+                }
+                return 0;
+            }
+            VT_GETMODE => {
+                // struct vt_mode { char mode(VT_AUTO=0), waitv; short relsig, acksig, frsig; }
+                let mode = [0_u8; 8];
+                if user_memory::copy_to_user(&mode, argument).is_err() {
+                    return errno(EFAULT);
+                }
+                return 0;
+            }
+            VT_SETMODE | VT_SENDSIG | VT_RELDISP | VT_ACTIVATE | VT_WAITACTIVE
+            | VT_DISALLOCATE | KDSETMODE | KDGETMODE | TIOCSCTTY => return 0,
+            _ => {}
+        }
+    }
     if fd > 2 {
         return errno(EBADF);
     }
@@ -2268,7 +2350,7 @@ fn synthetic_device_stat(path: &str) -> Option<(u32, u64)> {
             S_IFCHR | 0o666,
             linux_fd::makedev(crate::sysfs::DRM_MAJOR, crate::sysfs::CARD_MINOR),
         )),
-        "/dev/dri/renderD128" if crate::virtio_gpu::virgl_available() => Some((
+        "/dev/dri/renderD128" if crate::virtio_gpu::size().is_some() => Some((
             S_IFCHR | 0o666,
             linux_fd::makedev(crate::sysfs::DRM_MAJOR, crate::sysfs::RENDER_MINOR),
         )),
@@ -2591,6 +2673,8 @@ fn linux_nanosleep(request: u64, remaining: u64) -> u64 {
         .saturating_mul(1000)
         .saturating_add(nanoseconds / 1_000_000)
         .min(60_000);
+    crate::console::write_dec_u64(millis);
+    crate::console::write_str("\r\n");
     if millis != 0 {
         scheduler::sleep(millis);
     } else {

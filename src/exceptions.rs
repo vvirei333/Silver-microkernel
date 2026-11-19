@@ -185,6 +185,12 @@ fn dump_user_frame(frame: *mut u64, esr: u64, elr: u64, far: u64) {
     push_bytes(&mut line, &mut length, b"SP_EL0=0x");
     push_hex(&mut line, &mut length, sp);
     push_bytes(&mut line, &mut length, b"\r\n");
+    {
+        let mut diag = [0_u8; 160];
+        let diag_length = crate::scheduler::cow_diagnostic(far as usize, &mut diag);
+        push_bytes(&mut line, &mut length, &diag[..diag_length]);
+        push_bytes(&mut line, &mut length, b"\r\n");
+    }
     // Hex-dump the memory around x19 (frame[19]): for corrupted-object faults
     // the shape of the neighborhood (pointer-like? protocol bytes?) says
     // whether a wild kernel copy or an object overwrite is the culprit. The
@@ -194,7 +200,11 @@ fn dump_user_frame(frame: *mut u64, esr: u64, elr: u64, far: u64) {
         let x19 = unsafe { *frame.add(19) };
         let start = x19.saturating_sub(DUMP_RANGE as u64) & !0x7;
         let mut dump = [0_u8; 2 * DUMP_RANGE as usize];
-        if crate::user_memory::copy_from_user(start, &mut dump).is_ok() {
+        // Only probe plausibly-user pointers: a kernel VA here (a wild
+        // register at fault time) must not drive any page-table walk.
+        if start < (1_u64 << 48)
+            && crate::user_memory::copy_from_user(start, &mut dump).is_ok()
+        {
             push_bytes(&mut line, &mut length, b"MEM x19-96:\r\n");
             for word in dump.chunks_exact(8) {
                 push_bytes(&mut line, &mut length, b"  0x");

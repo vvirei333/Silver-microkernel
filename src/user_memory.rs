@@ -24,8 +24,13 @@ pub fn copy_from_user(source: u64, destination: &mut [u8]) -> Result<(), UserFau
         let take = (destination.len() - done).min(COPY_CHUNK);
         let window = &mut destination[done..done + take];
         if !mmu::valid_user_slice(source + done as u64, take as u64) {
+            // Backing a lazy page only makes sense for a plausibly user
+            // pointer; `back_user_pages` on a kernel address would walk the
+            // page tables far past the user tables.
             #[cfg(feature = "linux-abi")]
-            back_user_pages(source + done as u64, take, false);
+            if (source + done as u64) < (1_u64 << 48) {
+                back_user_pages(source + done as u64, take, false);
+            }
             if !mmu::valid_user_slice(source + done as u64, take as u64) {
                 return Err(UserFault);
             }
@@ -84,7 +89,9 @@ pub fn copy_to_user(source: &[u8], destination: u64) -> Result<(), UserFault> {
         let window = &source[done..done + take];
         if !mmu::valid_user_slice_mut(destination + done as u64, take as u64) {
             #[cfg(feature = "linux-abi")]
-            back_user_pages(destination + done as u64, take, true);
+            if (destination + done as u64) < (1_u64 << 48) {
+                back_user_pages(destination + done as u64, take, true);
+            }
             if !mmu::valid_user_slice_mut(destination + done as u64, take as u64) {
                 return Err(UserFault);
             }

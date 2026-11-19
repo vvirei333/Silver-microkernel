@@ -3583,6 +3583,118 @@ pub fn cow_fault(address: usize, esr: u64) -> bool {
     with_group_owner(|task| task.cow_fault(address, esr)).unwrap_or(false)
 }
 
+/// Last COW-path decision, for the fault dump (console writes from exception
+/// context drop under contention; this buffer is read back by
+/// [`cow_diagnostic`] instead). Fault context holds the kernel lock, so a
+/// plain static is single-writer.
+static COW_REASON: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+static mut COW_REASON_TEXT: [u8; 128] = [0_u8; 128];
+
+#[cfg(feature = "linux-abi")]
+fn cow_reason_set(text: &[u8]) {
+    let capacity = unsafe { (*core::ptr::addr_of!(COW_REASON_TEXT)).len() };
+    let take = text.len().min(capacity);
+    unsafe {
+        let base = core::ptr::addr_of_mut!(COW_REASON_TEXT) as *mut u8;
+        core::ptr::copy_nonoverlapping(text.as_ptr(), base, take);
+    }
+    COW_REASON.store(take, core::sync::atomic::Ordering::Release);
+}
+
+#[cfg(feature = "linux-abi")]
+fn cow_reason_get(buffer: &mut [u8]) -> usize {
+    let capacity = unsafe { (*core::ptr::addr_of!(COW_REASON_TEXT)).len() };
+    let take = COW_REASON.load(core::sync::atomic::Ordering::Acquire);
+    let take = take.min(buffer.len()).min(capacity);
+    unsafe {
+        let base = core::ptr::addr_of!(COW_REASON_TEXT) as *const u8;
+        buffer[..take].copy_from_slice(core::slice::from_raw_parts(base, take));
+    }
+    take
+}
+
+/// Diagnostic for the fault dump: which task the COW path would have acted
+/// on (the thread-group owner, not necessarily the faulting CPU's task), and
+/// which image run covers the address with which page kind. Returns the
+/// formatted length inside `buffer`.
+#[cfg(feature = "linux-abi")]
+pub fn cow_diagnostic(address: usize, buffer: &mut [u8]) -> usize {
+    let mut length = 0_usize;
+    fn push(buffer: &mut [u8], length: &mut usize, text: &[u8]) {
+        let room = buffer.len().saturating_sub(*length);
+        let take = text.len().min(room);
+        buffer[*length..*length + take].copy_from_slice(&text[..take]);
+        *length += take;
+    }
+    fn push_num(buffer: &mut [u8], length: &mut usize, mut value: u64) {
+        let mut digits = [0_u8; 20];
+        let mut count = 0;
+        loop {
+            digits[count] = b'0' + (value % 10) as u8;
+            count += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        for index in (0..count).rev() {
+            push(buffer, length, &[digits[index]]);
+        }
+    }
+    push(buffer, &mut length, b"COWDIAG task=");
+    push_num(buffer, &mut length, current_task_id());
+    push(buffer, &mut length, b" tgid=");
+    push_num(buffer, &mut length, current_tgid());
+    let owner = current_tgid();
+    let covered = scheduler_manager().and_then(|manager| {
+        manager.tasks.iter().find(|task| task.id == owner)
+    }).and_then(|task| {
+        let image = task.linux_image.as_ref()?;
+        let page = address & !(PAGE_SIZE - 1);
+        image.runs.iter().find_map(|run| {
+            if page >= run.virtual_address
+                && page < run.virtual_address + run.page_count * PAGE_SIZE
+            {
+                let index = (page - run.virtual_address) / PAGE_SIZE;
+                Some((
+                    run.virtual_address as u64,
+                    run.page_count as u64,
+                    run.kinds[index] as u64,
+                    run.physical_start as u64,
+                    index as u64,
+                ))
+            } else {
+                None
+            }
+        })
+    });
+    match covered {
+        Some((va, pages, kind, pa, index)) => {
+            push(buffer, &mut length, b" run va=");
+            push_num(buffer, &mut length, va);
+            push(buffer, &mut length, b" pages=");
+            push_num(buffer, &mut length, pages);
+            push(buffer, &mut length, b" idx=");
+            push_num(buffer, &mut length, index);
+            push(buffer, &mut length, b" kind=");
+            push_num(buffer, &mut length, kind);
+            push(buffer, &mut length, b" pa=");
+            push_num(buffer, &mut length, pa);
+        }
+        None => {
+            push(buffer, &mut length, b" no-covering-run-in-owner");
+        }
+    }
+    push(buffer, &mut length, b" frames used=");
+    push_num(buffer, &mut length, frame_allocator::used_pages() as u64);
+    push(buffer, &mut length, b" free=");
+    push_num(buffer, &mut length, frame_allocator::free_pages() as u64);
+    let reason_len = cow_reason_get(&mut buffer[length..]);
+    length += reason_len;
+    length
+}
+
 /// Allocates a fresh run and copies an old shared run into it.
 #[cfg(feature = "linux-abi")]
 fn cow_copy_run(
@@ -4864,25 +4976,51 @@ pub fn wait_child(pid: i64, nohang: bool) -> WaitChild {
     // A thread waits on behalf of its whole process: the child of a fork
     // performed by any thread is parented to the group leader.
     let parent = current_tgid();
-    let Some(manager) = scheduler_manager() else {
-        return WaitChild::NoChild;
-    };
-    let candidate = manager.tasks.iter().find(|task| {
+    // `wait4(-1)` must return any *terminated* child first. Blocking on the
+    // first child in table order stalls the caller (an interactive shell
+    // waiting on a foreground command) while an unrelated background child
+    // keeps running, so an unqualified wait polls for a zombie instead of
+    // parking inside one child's wait_inner forever.
+    let matches = |task: &Task| {
         task.ppid == Some(parent) && (pid <= 0 || task.id == pid as u64)
-    });
-    let Some(task) = candidate else {
-        return WaitChild::NoChild;
     };
-    let id = task.id;
-    let zombie = task.state == TaskState::Zombie;
-    if !zombie {
-        if nohang {
-            return WaitChild::StillRunning;
-        }
-    }
-    match wait_inner(id, false, true) {
-        Some(WaitEvent::Exited(status)) => WaitChild::Exited(id, status),
-        _ => WaitChild::NoChild,
+    loop {
+        let Some(manager) = scheduler_manager() else {
+            return WaitChild::NoChild;
+        };
+        let terminated = manager
+            .tasks
+            .iter()
+            .find(|task| matches(task) && task.state == TaskState::Zombie)
+            .map(|task| task.id);
+        // A `Dead` child becomes `Zombie` in the reaper; until then it counts
+        // as still running for wait purposes.
+        let running = manager
+            .tasks
+            .iter()
+            .any(|task| matches(task) && task.state != TaskState::Zombie);
+        let Some(id) = terminated else {
+            if !running {
+                return WaitChild::NoChild;
+            }
+            if nohang {
+                return WaitChild::StillRunning;
+            }
+            if pid > 0 {
+                // A qualified wait blocks on that child specifically.
+                return match wait_inner(pid as u64, false, true) {
+                    Some(WaitEvent::Exited(status)) => WaitChild::Exited(pid as u64, status),
+                    _ => WaitChild::NoChild,
+                };
+            }
+            drop(manager);
+            sleep(1);
+            continue;
+        };
+        return match wait_inner(id, false, true) {
+            Some(WaitEvent::Exited(status)) => WaitChild::Exited(id, status),
+            _ => WaitChild::NoChild,
+        };
     }
 }
 
@@ -7344,7 +7482,18 @@ impl Task {
     #[cfg(feature = "linux-abi")]
     fn cow_fault(&mut self, address: usize, esr: u64) -> bool {
         const WNR: u64 = 1 << 6;
+        cow_reason_set(b"enter");
         if self.ttbr0 == 0 {
+            cow_reason_set(b"no-ttbr0");
+            return false;
+        }
+        // Kernel-initiated copies can pass a kernel VA (a corrupted user
+        // register fed the fault dump's `copy_from_user`, for example). A
+        // page-table walk on such an address indexes far past the L2 table
+        // and faults inside the fault handler itself. Linux images may live
+        // well below DRAM_BASE (the loader honours the ELF's own bias), so
+        // only the kernel VA range is rejected here.
+        if (address as u64) >= (1_u64 << 48) {
             return false;
         }
         let page = address & !(PAGE_SIZE - 1);
@@ -7400,6 +7549,7 @@ impl Task {
         }
 
         if esr & WNR == 0 {
+            cow_reason_set(b"read-fault-no-handler");
             return false;
         }
 
@@ -7413,6 +7563,7 @@ impl Task {
                     run.kinds[index],
                     crate::elf::PageKind::Cow | crate::elf::PageKind::Data
                 ) {
+                    cow_reason_set(b"img refuse-kind");
                     return false;
                 }
                 let old_physical = run.physical_start;
@@ -7422,6 +7573,7 @@ impl Task {
                 let Some((new_physical, new_generation)) =
                     cow_copy_run(old_physical, count, old_generation)
                 else {
+                    cow_reason_set(b"img copy-fail");
                     return false;
                 };
                 let mut kinds = run.kinds.clone();
@@ -7431,6 +7583,7 @@ impl Task {
                     }
                 }
                 if !mmu::remap_user_kinds_at(ttbr0, virtual_address, new_physical, &kinds) {
+                    cow_reason_set(b"img remap-fail");
                     frame_allocator::free_contiguous_pages_tagged(
                         new_physical,
                         count,

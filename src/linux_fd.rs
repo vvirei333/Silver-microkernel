@@ -19,6 +19,7 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use crate::{mutex::Mutex, scheduler, user_memory, vfs};
 
@@ -573,6 +574,11 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     const O_DIRECTORY: u64 = 0o200000;
 
     let resolved = crate::linux_abi::resolve(cwd, path).map_err(|_| ENOENT)?;
+    if resolved.starts_with("/dev/") {
+        crate::console::write_str(&resolved);
+        crate::console::write_hex_u64(flags);
+        crate::console::write_str("\r\n");
+    }
     // Synthetic procfs first: OpenRC reads a handful of /proc files.
     if let Some(node) = crate::procfs::lookup(&resolved) {
         return match node {
@@ -625,8 +631,32 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         )
         .ok_or(EMFILE);
     }
-    let device = match resolved.as_str() {
-        "/dev/console" | "/dev/tty" => Some(Target::Console),
+    // `/dev/tty` plus the VT range (`/dev/tty0`..`/dev/tty63`): seatd opens
+    // the per-session VT path, so every numeric tty is the same console.
+    let tty_console = resolved
+        .strip_prefix("/dev/tty")
+        .map(|rest| rest.is_empty() || rest.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false);
+    // libdrm resolves devices through the PCI aliases under /dev/dri/by-path
+    // (`pci-0000:0a:00.0-card` / `-render`); they are the same nodes.
+    let dri_alias = resolved
+        .strip_prefix("/dev/dri/by-path/")
+        .filter(|_| crate::virtio_gpu::size().is_some())
+        .and_then(|name| {
+            if name.ends_with("-card") {
+                Some(Target::Drm { render: false })
+            } else if name.ends_with("-render") {
+                Some(Target::Drm { render: true })
+            } else {
+                None
+            }
+        });
+    let device = if tty_console {
+        Some(Target::Console)
+    } else if let Some(node) = dri_alias {
+        Some(node)
+    } else {
+        match resolved.as_str() {
         "/dev/null" => Some(Target::Null),
         "/dev/zero" => Some(Target::Zero),
         "/dev/full" => Some(Target::Full),
@@ -639,18 +669,21 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
             entries: DRM_NODES,
             offset: 0,
         }),
-        "/dev/dri/card0" if crate::virtio_gpu::size().is_some() => {
-            Some(Target::Drm { render: false })
+            "/dev/dri/card0" if crate::virtio_gpu::size().is_some() => {
+                Some(Target::Drm { render: false })
+            }
+            "/dev/dri/renderD128" if crate::virtio_gpu::size().is_some() => {
+                Some(Target::Drm { render: true })
+            }
+            _ => None,
         }
-        "/dev/dri/renderD128" if crate::virtio_gpu::virgl_available() => {
-            Some(Target::Drm { render: true })
-        }
-        _ => None,
     };
     if let Some(device) = device {
         return insert(task, device).ok_or(EMFILE);
     }
     if !crate::scheduler::read_path_allowed(task, &resolved) {
+        crate::console::write_str(&resolved);
+        crate::console::write_str("\r\n");
         return Err(EACCES);
     }
     let wants_write =
@@ -2537,6 +2570,17 @@ pub fn is_prime(task: u64, fd: u64) -> bool {
 
 /// True for the synthetic device nodes this kernel exposes under `/dev`.
 pub fn device_exists(path: &str) -> bool {
+    if let Some(name) = path.strip_prefix("/dev/dri/by-path/") {
+        return crate::virtio_gpu::size().is_some()
+            && (name.ends_with("-card") || name.ends_with("-render"));
+    }
+    if path
+        .strip_prefix("/dev/tty")
+        .map(|rest| rest.is_empty() || rest.bytes().all(|b| b.is_ascii_digit()))
+        .unwrap_or(false)
+    {
+        return true;
+    }
     match path {
         "/dev/null" | "/dev/zero" | "/dev/full" | "/dev/urandom" | "/dev/random" => true,
         "/dev/console" | "/dev/tty" => true,
@@ -2544,7 +2588,7 @@ pub fn device_exists(path: &str) -> bool {
         "/dev/gpufb" => crate::virtio_gpu::size().is_some(),
         "/dev/dri" => crate::virtio_gpu::size().is_some(),
         "/dev/dri/card0" => crate::virtio_gpu::size().is_some(),
-        "/dev/dri/renderD128" => crate::virtio_gpu::virgl_available(),
+        "/dev/dri/renderD128" => crate::virtio_gpu::size().is_some(),
         _ => false,
     }
 }
@@ -2601,6 +2645,12 @@ const S_IFREG: u32 = 0o100000;
 pub fn is_ivshmem(task: u64, fd: u64) -> bool {
     let task = crate::scheduler::fd_table_owner(task);
     matches!(lookup(task, fd), Some(Target::Ivshmem))
+}
+
+/// True when `fd` names the synthetic VT console (`/dev/tty0` included).
+pub fn is_console(task: u64, fd: u64) -> bool {
+    let task = crate::scheduler::fd_table_owner(task);
+    matches!(lookup(task, fd), Some(Target::Console))
 }
 
 /// True when `fd` names the DRM/KMS card.

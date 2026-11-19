@@ -2698,12 +2698,21 @@ pub fn user_physical_address(ttbr0: usize, virtual_address: usize) -> Option<usi
     let root = root_of(ttbr0);
     unsafe {
         let l1_user = follow_table(root, 0);
+        if !plausible_table_address(l1_user) {
+            return None;
+        }
         let l2_user = follow_table(l1_user, 1);
+        if !plausible_table_address(l2_user) {
+            return None;
+        }
         let l2_entry = read_entry(l2_user, l2_index);
         if l2_entry & DESC_TABLE != DESC_TABLE {
             return None;
         }
         let l3 = descriptor_address(l2_entry) as usize;
+        if !plausible_table_address(l3) {
+            return None;
+        }
         let entry = read_entry(l3, (virtual_address >> 12) & 0x1FF);
         if entry & DESC_PAGE != DESC_PAGE {
             return None;
@@ -2711,6 +2720,14 @@ pub fn user_physical_address(ttbr0: usize, virtual_address: usize) -> Option<usi
         let frame = (entry & ADDRESS_MASK) as usize;
         Some(frame | (virtual_address & (GRANULE - 1)))
     }
+}
+
+/// A table descriptor's address must be a real DRAM frame before a diagnostic
+/// walk follows it: a corrupted entry (table bits set, address bits near
+/// zero) would otherwise make the *fault dump* itself fault on the direct
+/// map and panic the kernel instead of reporting the user fault.
+fn plausible_table_address(address: usize) -> bool {
+    address >= DRAM_BASE && address < DRAM_END && address % GRANULE == 0
 }
 
 pub fn user_page_is_mapped(ttbr0: usize, virtual_address: usize) -> bool {
@@ -2724,12 +2741,21 @@ pub fn user_page_is_mapped(ttbr0: usize, virtual_address: usize) -> bool {
     let root = root_of(ttbr0);
     unsafe {
         let l1_user = follow_table(root, 0);
+        if !plausible_table_address(l1_user) {
+            return false;
+        }
         let l2_user = follow_table(l1_user, 1);
+        if !plausible_table_address(l2_user) {
+            return false;
+        }
         let l2_entry = read_entry(l2_user, l2_index);
         if l2_entry & DESC_TABLE != DESC_TABLE {
             return false;
         }
         let l3 = descriptor_address(l2_entry) as usize;
+        if !plausible_table_address(l3) {
+            return false;
+        }
         read_entry(l3, (virtual_address >> 12) & 0x1FF) & DESC_PAGE == DESC_PAGE
     }
 }
@@ -3232,6 +3258,9 @@ fn current_user_page_access(virtual_address: u64, write: bool) -> bool {
                 return false;
             }
             table = descriptor_address(descriptor) as usize;
+            if !plausible_table_address(table) {
+                return false;
+            }
         }
         let index = ((virtual_address >> 12) & 0x1FF) as usize;
         let descriptor = read_entry(table, index);
