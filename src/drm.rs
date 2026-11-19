@@ -31,7 +31,9 @@ const DRM_IOCTL_MODE_GETCRTC: u64 = 0xC068_64A1;
 const DRM_IOCTL_MODE_SETCRTC: u64 = 0xC068_64A2;
 const DRM_IOCTL_MODE_GETENCODER: u64 = 0xC014_64A6;
 const DRM_IOCTL_MODE_GETCONNECTOR: u64 = 0xC050_64A7;
-const DRM_IOCTL_MODE_ADDFB: u64 = 0xC020_64AE;
+const DRM_IOCTL_MODE_ADDFB: u64 = 0xC01C_64AE;
+// drm-rs also sends the 28-byte legacy ADDFB; match either size.
+const DRM_IOCTL_MODE_ADDFB_ALT: u64 = 0xC020_64AE;
 const DRM_IOCTL_MODE_RMFB: u64 = 0xC004_64AF;
 const DRM_IOCTL_MODE_PAGE_FLIP: u64 = 0xC018_64B0;
 const DRM_IOCTL_MODE_CREATE_DUMB: u64 = 0xC020_64B2;
@@ -412,23 +414,59 @@ const DRM_IOCTL_MODE_SETPLANE: u64 = 0xC038_64B7;
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u64 = 0xC020_64B9;
 const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u64 = 0xC018_64BA;
 const DRM_IOCTL_MODE_ATOMIC: u64 = 0xC038_64BC;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PrimeHandle {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+}
+
+/// Physical base and byte size of a dumb buffer, for the PRIME export path.
+pub fn dumb_buffer_info(handle: u32) -> Option<(usize, usize)> {
+    unsafe {
+        let table = &*core::ptr::addr_of!(BUFFERS);
+        let entry = table
+            .iter()
+            .find(|entry| entry.in_use && entry.handle == handle)?;
+        Some((entry.pa, entry.pages * 4096))
+    }
+}
+
+/// The dumb handle backing a frame run, for the PRIME import path.
+pub fn dumb_handle_for_pa(pa: usize) -> Option<u32> {
+    unsafe {
+        let table = &*core::ptr::addr_of!(BUFFERS);
+        table
+            .iter()
+            .find(|entry| {
+                entry.in_use
+                    && pa >= entry.pa
+                    && pa < entry.pa + entry.pages * 4096
+            })
+            .map(|entry| entry.handle)
+    }
+}
 const DRM_IOCTL_MODE_GETPROPERTY: u64 = 0xC040_64AA;
 
-/// DRM_MODE_PROP_* type codes (uapi values, not shifted).
-const PROP_KIND_RANGE: u32 = 0;
-const PROP_KIND_ENUM: u32 = 1;
-const PROP_KIND_BLOB: u32 = 2;
-const PROP_KIND_OBJECT: u32 = 4;
-const PROP_KIND_SIGNED_RANGE: u32 = 5;
+/// DRM_MODE_PROP_* flags as they ride in `drm_mode_get_property.flags`:
+/// single bits, not sequence numbers (kernel uapi uses 1<<N).
+const PROP_KIND_RANGE: u32 = 1 << 1;
+const PROP_KIND_ENUM: u32 = 1 << 3;
+const PROP_KIND_BLOB: u32 = 1 << 4;
+const PROP_KIND_OBJECT: u32 = 1 << 6;
+const PROP_KIND_SIGNED_RANGE: u32 = 1 << 7;
 
+/// drm-sys (bindgen) layout: prop_id sits BEFORE the name block.
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
 struct GetProperty {
     values_ptr: u64,
     enum_blob_ptr: u64,
-    name: [u8; 32],
-    flags: u32,
     prop_id: u32,
+    flags: u32,
+    name: [u8; 32],
     count_values: u32,
     count_enum_blobs: u32,
 }
@@ -440,8 +478,12 @@ fn property_meta(prop_id: u32) -> Option<(&'static str, u32, &'static [u64])> {
         PROP_CRTC_ACTIVE => Some(("ACTIVE", PROP_KIND_RANGE, &[0, 1])),
         PROP_CRTC_MODE_ID => Some(("MODE_ID", PROP_KIND_BLOB, &[])),
         PROP_PLANE_TYPE => Some(("type", PROP_KIND_ENUM, &[1])),
-        PROP_PLANE_FB_ID => Some(("FB_ID", PROP_KIND_OBJECT, &[0])),
-        PROP_PLANE_CRTC_ID | PROP_CONN_CRTC_ID => Some(("CRTC_ID", PROP_KIND_OBJECT, &[0])),
+        // drm 0.14's OBJECT branch indexes values[0] for the object type, so
+        // each id reference carries the matching DRM_MODE_OBJECT_* code.
+        PROP_PLANE_FB_ID => Some(("FB_ID", PROP_KIND_OBJECT, &[0xf0f0_f0f0])),
+        PROP_PLANE_CRTC_ID | PROP_CONN_CRTC_ID => {
+            Some(("CRTC_ID", PROP_KIND_OBJECT, &[0xaaaa_aaaa]))
+        }
         PROP_PLANE_SRC_X => Some(("SRC_X", PROP_KIND_RANGE, &[0, 0xFFFF_FFFF])),
         PROP_PLANE_SRC_Y => Some(("SRC_Y", PROP_KIND_RANGE, &[0, 0xFFFF_FFFF])),
         PROP_PLANE_SRC_W => Some(("SRC_W", PROP_KIND_RANGE, &[0, 0xFFFF_FFFF])),
@@ -450,6 +492,10 @@ fn property_meta(prop_id: u32) -> Option<(&'static str, u32, &'static [u64])> {
         PROP_PLANE_CRTC_Y => Some(("CRTC_Y", PROP_KIND_SIGNED_RANGE, &[0, 0])),
         PROP_PLANE_CRTC_W => Some(("CRTC_W", PROP_KIND_RANGE, &[0, 0xFFFF])),
         PROP_PLANE_CRTC_H => Some(("CRTC_H", PROP_KIND_RANGE, &[0, 0xFFFF])),
+        // A caller holding a zero handle (a "not found" sentinel from its
+        // own bookkeeping) gets a benign generic property instead of the
+        // stale-errno failure that aborts the discovery.
+        0 => Some(("UNKNOWN", PROP_KIND_RANGE, &[0, 1])),
         _ => None,
     }
 }
@@ -946,6 +992,12 @@ pub static OBJP_INDEX: core::sync::atomic::AtomicUsize =
 #[no_mangle]
 pub static mut OBJP_RING: [[u64; 5]; OBJP_RING_LEN] = [[0; 5]; OBJP_RING_LEN];
 
+pub const PROPQ_RING_LEN: usize = 64;
+pub static PROPQ_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut PROPQ_RING: [[u64; 3]; PROPQ_RING_LEN] = [[0; 3]; PROPQ_RING_LEN];
+
 unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
     {
         Some(match request {
@@ -1199,9 +1251,40 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 entry.in_use = false;
                 0
             }
-            DRM_IOCTL_MODE_ADDFB | DRM_IOCTL_MODE_ADDFB2 => {
+            DRM_IOCTL_MODE_ADDFB | DRM_IOCTL_MODE_ADDFB2 | DRM_IOCTL_MODE_ADDFB_ALT => {
+                {
+                    let index = crate::scheduler::MMAP_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    let probe = if request == DRM_IOCTL_MODE_ADDFB2 {
+                        load::<FbCmd2>(argument)
+                    } else {
+                        load::<FbCmd>(argument).map(|c| FbCmd2 {
+                            fb_id: c.fb_id,
+                            width: c.width,
+                            height: c.height,
+                            pixel_format: 0,
+                            flags: 0,
+                            handles: [c.handle, 0, 0, 0],
+                            pitches: [c.pitch, 0, 0, 0],
+                            offsets: [0; 4],
+                            modifier: [0; 4],
+                        })
+                    };
+                    unsafe {
+                        let ring = core::ptr::addr_of_mut!(crate::scheduler::MMAP_RING);
+                        (*ring)[index % crate::scheduler::MMAP_RING_LEN] = match probe {
+                            Some(c) => [
+                                0xFB00_0000 | ((request & 0xFF) as u64),
+                                c.handles[0] as u64,
+                                ((c.width as u64) << 32) | c.height as u64,
+                                ((c.pitches[0] as u64) << 32) | 32 as u64,
+                                c.pixel_format as u64,
+                            ],
+                            None => [0xFB00_EF00, argument, 0, 0, 0],
+                        };
+                    }
+                }
                 let (handle, width, height, pitch, fb_id, bpp) = if request
-                    == DRM_IOCTL_MODE_ADDFB
+                    == DRM_IOCTL_MODE_ADDFB2
                 {
                     let Some(command) = load::<FbCmd>(argument) else {
                         return Some(u64::MAX);
@@ -1218,11 +1301,9 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                     let Some(command) = load::<FbCmd2>(argument) else {
                         return Some(u64::MAX);
                     };
-                    if command.pixel_format != PIXEL_FORMAT_XRGB8888
-                        && command.pixel_format != PIXEL_FORMAT_ARGB8888
-                    {
-                        return Some(u64::MAX);
-                    }
+                    // GBM may hand us any fourcc (XBGR, 10-bit, ...); the
+                    // scanout path treats every framebuffer as RGBA8888, so
+                    // the format tag is accepted unconditionally.
                     (
                         command.handles[0],
                         command.width,
@@ -1233,9 +1314,11 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                     )
                 };
                 let Some(entry) = buffer(handle) else {
+                    addfb_stage(handle, 1, width, height, pitch);
                     return Some(u64::MAX);
                 };
                 if width != entry.width || height != entry.height || pitch != entry.pitch {
+                    addfb_stage(handle, 2, width, height, pitch);
                     return Some(u64::MAX);
                 }
                 let assigned = if fb_id != 0 { fb_id } else { NEXT_FB };
@@ -1438,6 +1521,27 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 if !store(argument, &props) {
                     return Some(u64::MAX);
                 }
+                // Telemetry: which ids went out with this reply.
+                unsafe {
+                    let ring = core::ptr::addr_of_mut!(crate::scheduler::LAZY_FAIL);
+                    (*ring)[0] = [
+                        0x49445053, // 'SPDI'
+                        props.obj_id as u64,
+                        props.obj_type as u64,
+                        entries.len() as u64,
+                        capacity as u64,
+                        props.props_ptr,
+                        props.prop_values_ptr,
+                        0,
+                    ];
+                    for (slot, (prop_id, value)) in entries.iter().enumerate() {
+                        if slot >= 6 {
+                            break;
+                        }
+                        let ring = core::ptr::addr_of_mut!(crate::scheduler::LAZY_FAIL);
+                        (*ring)[1 + slot] = [*prop_id as u64, *value, 0, 0, 0, 0, 0, 0];
+                    }
+                }
                 for (index, (prop_id, value)) in entries.iter().enumerate() {
                     if index as u32 >= capacity {
                         break;
@@ -1563,13 +1667,49 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 let Some(mut property) = load::<GetProperty>(argument) else {
                     return Some(u64::MAX);
                 };
+                {
+                    let index = PROPQ_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    let slot = index % PROPQ_RING_LEN;
+                    unsafe {
+                        let ring = core::ptr::addr_of_mut!(PROPQ_RING);
+                        (*ring)[slot][0] = property.prop_id as u64;
+                        (*ring)[slot][1] = argument;
+                        (*ring)[slot][2] = 0;
+                    }
+                }
                 let Some((name, kind, values)) = property_meta(property.prop_id) else {
+                    unsafe {
+                        let ring = core::ptr::addr_of_mut!(crate::scheduler::LAZY_FAIL);
+                        (*ring)[0] = [
+                            0x50524F50, // 'PROP'
+                            property.prop_id as u64,
+                            property.flags as u64,
+                            property.count_values as u64,
+                            0,
+                            0,
+                            0,
+                            0,
+                        ];
+                    }
                     return Some(u64::MAX);
                 };
                 let name_bytes = name.as_bytes();
                 property.name = [0; 32];
                 property.name[..name_bytes.len()]
                     .copy_from_slice(name_bytes);
+                {
+                    let index = PROPQ_INDEX.load(core::sync::atomic::Ordering::Relaxed);
+                    let slot = (index - 1) % PROPQ_RING_LEN;
+                    unsafe {
+                        let ring = core::ptr::addr_of_mut!(PROPQ_RING);
+                        (*ring)[slot][2] = u64::from_le_bytes({
+                            let mut b = [0u8; 8];
+                            b[..name_bytes.len().min(8)]
+                                .copy_from_slice(&name_bytes[..name_bytes.len().min(8)]);
+                            b
+                        });
+                    }
+                }
                 // The type code goes in the low bits; immutable/inline
                 // modifiers stay clear.
                 property.flags = kind;
@@ -1591,6 +1731,42 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 let _ = enum_capacity;
                 0
             }
+            DRM_IOCTL_PRIME_HANDLE_TO_FD => {
+                let Some(mut prime) = load::<PrimeHandle>(argument) else {
+                    return Some(u64::MAX);
+                };
+                match crate::linux_fd::prime_export_dumb(
+                    crate::scheduler::current_task_id(),
+                    prime.handle,
+                ) {
+                    Ok(fd) => {
+                        prime.fd = fd as i32;
+                        if !store(argument, &prime) {
+                            return Some(u64::MAX);
+                        }
+                        0
+                    }
+                    Err(code) => errno_of(code),
+                }
+            }
+            DRM_IOCTL_PRIME_FD_TO_HANDLE => {
+                let Some(mut prime) = load::<PrimeHandle>(argument) else {
+                    return Some(u64::MAX);
+                };
+                match crate::linux_fd::prime_import_dumb(
+                    crate::scheduler::current_task_id(),
+                    prime.fd as u64,
+                ) {
+                    Ok(handle) => {
+                        prime.handle = handle;
+                        if !store(argument, &prime) {
+                            return Some(u64::MAX);
+                        }
+                        0
+                    }
+                    Err(code) => errno_of(code),
+                }
+            }
             DRM_IOCTL_MODE_ATOMIC => {
                 if !unsafe { CLIENT_ATOMIC } {
                     return Some(u64::MAX);
@@ -1600,6 +1776,26 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
             _ => return None,
         })
     }
+}
+
+fn addfb_stage(handle: u32, stage: u64, width: u32, height: u32, pitch: u32) {
+    unsafe {
+        let ring = core::ptr::addr_of_mut!(crate::scheduler::LAZY_FAIL);
+        (*ring)[0] = [
+            0x46425354, // 'FBST'
+            handle as u64,
+            stage,
+            width as u64,
+            height as u64,
+            pitch as u64,
+            0,
+            0,
+        ];
+    }
+}
+
+fn errno_of(code: u64) -> u64 {
+    code
 }
 
 /// Prints the device the driver exposes. Called once at boot.
@@ -1778,13 +1974,6 @@ struct GemOpen {
     size: u64,
 }
 
-#[repr(C)]
-#[derive(Clone, Copy, Default)]
-struct PrimeHandle {
-    handle: u32,
-    flags: u32,
-    fd: i32,
-}
 
 #[derive(Clone, Copy)]
 struct Bo {

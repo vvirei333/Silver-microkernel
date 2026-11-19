@@ -2563,6 +2563,46 @@ pub fn prime_info(task: u64, fd: u64) -> Option<(usize, usize)> {
 }
 
 /// True when `fd` is a PRIME export.
+/// Exports a KMS dumb buffer as a shared fd (a memfd backed by the same
+/// contiguous frames, so the compositor's writes are visible through both).
+/// This is the PRIME `HANDLE_TO_FD` path the GBM surface flow needs.
+pub fn prime_export_dumb(task: u64, handle: u32) -> Result<u64, u64> {
+    let (physical_start, byte_size) =
+        crate::drm::dumb_buffer_info(handle).ok_or(ENOENT)?;
+    let page_count = byte_size.div_ceil(4096);
+    insert(
+        task,
+        Target::MemFd(Arc::new(Mutex::new(MemFdState {
+            data: Vec::new(),
+            len: page_count * 4096,
+            offset: 0,
+            frames: Some(MemFdFrames {
+                physical_start,
+                page_count,
+                generation: 0,
+            }),
+            maps: 0,
+            seals: 0,
+        }))),
+    )
+    .ok_or(EMFILE)
+}
+
+/// The reverse direction: a previously exported buffer fd maps back to its
+/// dumb GEM handle (`PRIME_FD_TO_HANDLE`).
+pub fn prime_import_dumb(task: u64, fd: u64) -> Result<u32, u64> {
+    let task = crate::scheduler::fd_table_owner(task);
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::MemFd(state) = target else {
+        return Err(ENOTSOCK);
+    };
+    let state = state.lock();
+    let Some(frames) = &state.frames else {
+        return Err(ENOENT);
+    };
+    crate::drm::dumb_handle_for_pa(frames.physical_start).ok_or(ENOENT)
+}
+
 pub fn is_prime(task: u64, fd: u64) -> bool {
     let task = crate::scheduler::fd_table_owner(task);
     matches!(lookup(task, fd), Some(Target::Prime { .. }))
