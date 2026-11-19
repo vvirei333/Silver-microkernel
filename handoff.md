@@ -7568,3 +7568,70 @@ top of the existing page-flip; (3) evdev + udev glue + seatd; (4) deniald
 boot with logs; (5) screencopy-minimal as the first external client (the
 shell is embedded, so we may be the only client and the phoc accept bug may
 not bite).
+
+## 2026-11-19 — Denial DE campaign: glibc runtime boots, atomic UAPI in, fault loop next
+
+Owner decision: **Denial (denialwm/denial, Smithay+Flutter) is the DE; phosh is dropped.**
+Packages come from GitHub releases v0.6.7: the aarch64 builds are glibc binaries
+(`denial-0.6.7-1-aarch64.pkg.tar.zst`, `denial-flutter-engine-1.0.6.7-1-aarch64.pkg.tar.zst`).
+The Alpine APK is x86_64-only and useless for us.
+
+### What works (all verified in QEMU boots)
+
+- **Stage 1 complete.** `tools/build_glibc_denial.py` builds
+  `build/werewolf-alpine-glibc-denial.img`: Alpine edge boot chain (busybox/openrc/bash)
+  + Debian trixie arm64 glibc stack (`tools/debian_repo.py`, Packages index resolver:
+  libc6, mesa/llvm for llvmpipe, seatd, libinput, libudev, glib, polkit, fontconfig) +
+  the two denial Arch packages. `LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu` per-process
+  (never for musl binaries). Debian seatd lives at **/usr/sbin/seatd**, not /usr/bin.
+  glibc loader, libc, libgcc, dlopen all work in the guest (`linuxrun /sfs/usr/bin/denialctl`
+  prints usage).
+- **Kernel fixes this campaign** (all committed):
+  - `SYS_POLL` (7) shares the ppoll loop: glibc daemons called poll() and died ENOSYS.
+  - `wait_child`: wait4(-1) polls for any zombie instead of parking on the first child
+    (interactive shells stalled with a live background child).
+  - `/dev/tty0..63` synthetic VT console + VT_*/KD_* ioctls (seatd activation needs them).
+  - `/dev/dri/by-path/pci-*-card|render` aliases (libdrm resolves nodes this way).
+  - `renderD128` no longer gated on virgl (works on plain virtio-gpu).
+  - `cow_fault` rejects kernel VAs only (a lower bound broke images below DRAM_BASE —
+    caught as an edge-image regression), `back_user_pages` skips kernel VAs,
+    fault dump skips MEM probe on wild registers, diagnostic PT walks validate table
+    addresses (a corrupt descriptor used to panic the dump at physmap[8]).
+- **DRM atomic UAPI** (`src/drm.rs`): SET_CLIENT_CAP (STEREO_3D/UNIVERSAL_PLANES/ATOMIC),
+  SET_MASTER/DROP_MASTER (**0x641e/0x641f** — verified from the ioctl ring; my first guess
+  0x640e/0x640f was wrong), GETPLANERESOURCES/GETPLANE/SETPLANE, OBJ_GETPROPERTIES/
+  OBJ_SETPROPERTY, CREATE/GET/DESTROYPROPBLOB, MODE_ATOMIC (validate + apply onto the
+  legacy present() path), FLIP_COMPLETE events. deniald now gets past
+  "does not expose atomic modesetting" — seatd activates it, DrmDevice initializes,
+  SET_CLIENT_CAP(ATOMIC) succeeds.
+- **Diagnostics** (all `no_mangle` statics, read via QEMU monitor `pmemsave` —
+  console prints DROP under busy syscall context, this is the reliable channel):
+  `IOC_RING` (last 64 card ioctls, boot with `-monitor tcp:127.0.0.1:4445,server=on,wait=off`,
+  `pmemsave 0x40000000 0x800000 dump.bin`; VA↔phys is 1:1 minus 0xffff000040000000),
+  `FAULT_RING` (task/esr/elr/far), `LAZY_FAIL`, `REGION_COVER` (address coverage in the
+  owner's mmap list). Symbol addresses come from `nm` after each rebuild.
+
+### The open bug (next session's first job)
+
+deniald dies ~right after `DrmDevice initializing`, once its threads
+(priority-guard/cpu-hints, tid 137/138) start. Fault ring shows the whole process:
+- threads 135/136/137/138: **instruction translation faults** at 0x40D3F200/0x40D8F400/
+  0x40D9BDE8 (elr == far — executing lazily mapped libflutter pages),
+- main 133: **write translation faults** at 0x41A8FE40/0x41A90150 then a PC-alignment
+  fault at 0x1 (corrupt return target).
+- REGION_COVER: every faulting address IS covered by a **lazy** region (regions=109-117),
+  LAZY_FAIL is EMPTY (charge/alloc/file-read/map never failed), and the same addresses
+  re-fault across boots — the fault→map→retry loop runs but the map "doesn't stick".
+  Suspects to check with a lazy-OK ring (record page/prot/physical per successful
+  lazy_page_fault): whether the PTE lands in the right L3 (l2_index = (va-DRAM_BASE)/2M
+  vs (va>>21)&511 — re-derive carefully), whether `finish_table_changes_for` broadcast
+  misses the faulting CPU (asid_of(ttbr0)?), and whether `mprotect` (glibc
+  stack/mprotect-heavy startup) demotes regions out of the lazy path.
+- Boot command: `python -I tools/qemu_serial.py --kernel
+  target/aarch64-unknown-none/release/silver_microkernel --image
+  build/werewolf-alpine-glibc-denial.img --extra=-device --extra=virtio-gpu-pci
+  --send "linuxrun /sfs/sbin/init" --wait "DENIAL: BOOT-COMPLETE" --timeout 170 --once`
+  (add `-monitor tcp:127.0.0.1:4445,server=on,wait=off` for dumps).
+- After the loop is fixed: deniald should reach output discovery → Stage 3 (evdev
+  /dev/input + udev /sys glue) → Stage 4 (screencopy-minimal as the first external
+  client; the shell is embedded in Denial so the phoc accept gap may not matter).
