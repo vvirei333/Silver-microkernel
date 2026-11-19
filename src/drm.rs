@@ -1301,13 +1301,24 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 plane.x = 0;
                 plane.y = 0;
                 plane.gamma_size = 0;
+                let format_capacity = plane.count_formats;
                 plane.count_formats = 2;
                 if !store(argument, &plane) {
                     return Some(u64::MAX);
                 }
+                // Same contract as OBJ_GETPROPERTIES: the reported count is
+                // the real one, the copy is capped at the caller's buffer.
+                let formats = [PIXEL_FORMAT_XRGB8888, PIXEL_FORMAT_ARGB8888];
                 if plane.format_type_ptr != 0 {
-                    let _ = store_u32(plane.format_type_ptr, PIXEL_FORMAT_XRGB8888);
-                    let _ = store_u32(plane.format_type_ptr + 4, PIXEL_FORMAT_ARGB8888);
+                    for (index, format) in formats.iter().enumerate() {
+                        if index as u32 >= format_capacity {
+                            break;
+                        }
+                        let _ = store_u32(
+                            plane.format_type_ptr + (index as u64) * 4,
+                            *format,
+                        );
+                    }
                 }
                 0
             }
@@ -1343,13 +1354,16 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 else {
                     return Some(u64::MAX);
                 };
-                let count = entries.len() as u32;
-                props.count_props = count;
+                // The caller's count caps the copy; the reported count is the
+                // real one (the caller reallocates and calls again). Writing
+                // past the caller's buffer corrupts its heap.
+                let capacity = props.count_props;
+                props.count_props = entries.len() as u32;
                 if !store(argument, &props) {
                     return Some(u64::MAX);
                 }
                 for (index, (prop_id, value)) in entries.iter().enumerate() {
-                    if index as u32 >= props.count_props && props.props_ptr != 0 {
+                    if index as u32 >= capacity {
                         break;
                     }
                     let _ = store_u32(props.props_ptr + (index as u64) * 4, *prop_id);

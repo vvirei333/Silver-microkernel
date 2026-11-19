@@ -43,19 +43,29 @@ pub extern "C" fn silver_handle_task_fault(esr: u64, elr: u64, far: u64) -> ! {
 /// EL0 fault entry from the vector. Returns `0` when a write to a COW page was
 /// repaired (the trampoline retries the instruction); any other fault falls
 /// through to the normal task kill, which never returns.
+pub const SYNTH_RING_LEN: usize = 32;
+pub static SYNTH_RING_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut SYNTH_RING: [[u64; 6]; SYNTH_RING_LEN] = [[0; 6]; SYNTH_RING_LEN];
+
 pub const FAULT_RING_LEN: usize = 32;
 pub static FAULT_RING_INDEX: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 #[no_mangle]
-pub static mut FAULT_RING: [(u64, u64, u64, u64); FAULT_RING_LEN] =
-    [(0, 0, 0, 0); FAULT_RING_LEN];
+pub static mut FAULT_RING: [[u64; 6]; FAULT_RING_LEN] =
+    [[0, 0, 0, 0, 0, 0]; FAULT_RING_LEN];
 
 fn fault_ring_record(esr: u64, elr: u64, far: u64) {
     let index = FAULT_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let task = scheduler::current_task_id();
+    // Region coverage of the faulting page in the thread-group owner's mmap
+    // list (0 none, 1 non-lazy, 2 lazy, 3 lazy with zero prot), recorded at
+    // fault entry so the ring shows context even after later faults wrap it.
+    let coverage = scheduler::fault_coverage(far as usize);
     unsafe {
         let ring = core::ptr::addr_of_mut!(FAULT_RING);
-        (*ring)[index % FAULT_RING_LEN] = (task, esr, elr, far);
+        (*ring)[index % FAULT_RING_LEN] = [task, esr, elr, far, coverage.0, coverage.1];
     }
 }
 
@@ -79,7 +89,24 @@ pub extern "C" fn silver_handle_user_fault(
     crate::debug::set_fault_context(far, elr);
     let recovered = {
         let _kernel_lock = crate::smp::BklGuard::new();
-        crate::scheduler::cow_fault(far as usize, esr)
+        let result = crate::scheduler::cow_fault(far as usize, esr);
+        // esr=0x40 marks a kernel-initiated copy (back_user_pages): the
+        // syscall wrote into a user buffer that is not backed. Record the
+        // calling syscall and its buffer pointer - that identifies which
+        // ioctl/read handed the kernel a bad address.
+        if !result && esr == 0x40 {
+            let index = SYNTH_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            unsafe {
+                let frame = _frame;
+                let x8 = *frame.add(8);
+                let x0 = *frame.add(0);
+                let x1 = *frame.add(1);
+                let ring = core::ptr::addr_of_mut!(SYNTH_RING);
+                (*ring)[index % SYNTH_RING_LEN] =
+                    [scheduler::current_task_id(), x8, x0, x1, far, 0];
+            }
+        }
+        result
     };
     #[cfg(feature = "gdb-stub")]
     crate::debug::clear_fault_context();

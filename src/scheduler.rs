@@ -3581,24 +3581,61 @@ pub fn signal_trampoline() -> Option<usize> {
 #[cfg(feature = "linux-abi")]
 pub fn cow_fault(address: usize, esr: u64) -> bool {
     let result = with_group_owner(|task| task.cow_fault(address, esr));
-    // Region coverage telemetry for the fault ring: did the owner know about
-    // this page at all, and as a lazy region?
-    if let Some(task) = scheduler_manager().and_then(|manager| {
-        manager.tasks.iter().find(|task| task.id == current_tgid())
-    }) {
-        let page = address & !(PAGE_SIZE - 1);
-        let mut coverage = 0_u64;
-        for region in &task.mmap_regions {
-            let start = region.virtual_address;
-            let end = start + region.page_count * PAGE_SIZE;
-            if page >= start && page < end {
-                coverage = if region.lazy { 2 } else { 1 };
-                break;
+    // Kill-only telemetry: ring wraps hide everything else, so record just
+    // the faults the handler could not recover (coverage: 0 none, 1 non-lazy
+    // region, 2 lazy region, 3 lazy region with a zero prot).
+    if result.is_none() || !result.unwrap_or(false) {
+        if let Some(task) = scheduler_manager().and_then(|manager| {
+            manager.tasks.iter().find(|task| task.id == current_tgid())
+        }) {
+            let page = address & !(PAGE_SIZE - 1);
+            let mut coverage = 0_u64;
+            let mut prot_seen = 0_u64;
+            for region in &task.mmap_regions {
+                let start = region.virtual_address;
+                let end = start + region.page_count * PAGE_SIZE;
+                if page >= start && page < end {
+                    coverage = if region.lazy { 2 } else { 1 };
+                    prot_seen = region.prot;
+                    break;
+                }
             }
+            if coverage == 2 && prot_seen == 0 {
+                coverage = 3;
+            }
+            crate::scheduler::region_cover_record(
+                address,
+                coverage,
+                task.mmap_regions.len() as u64,
+                esr,
+            );
         }
-        crate::scheduler::region_cover_record(address, coverage, task.mmap_regions.len() as u64);
     }
     result.unwrap_or(false)
+}
+
+/// Region coverage of one address in the thread-group owner's mmap list.
+/// Returns (coverage, region prot): 0 none, 1 non-lazy, 2 lazy, 3 lazy with
+/// a zero prot (an mprotect that never reached the reservation).
+#[cfg(feature = "linux-abi")]
+pub fn fault_coverage(address: usize) -> (u64, u64) {
+    let page = address & !(PAGE_SIZE - 1);
+    let Some(task) = scheduler_manager().and_then(|manager| {
+        manager.tasks.iter().find(|task| task.id == current_tgid())
+    }) else {
+        return (0, 0);
+    };
+    for region in &task.mmap_regions {
+        let start = region.virtual_address;
+        let end = start + region.page_count * PAGE_SIZE;
+        if page >= start && page < end {
+            if region.lazy {
+                return (if region.prot == 0 { 3 } else { 2 }, region.prot);
+            }
+            return (1, region.prot);
+        }
+    }
+    (0, 0)
 }
 
 pub const REGION_COVER_LEN: usize = 32;
@@ -3608,12 +3645,12 @@ pub static REGION_COVER_INDEX: core::sync::atomic::AtomicUsize =
 pub static mut REGION_COVER: [[u64; 6]; REGION_COVER_LEN] = [[0; 6]; REGION_COVER_LEN];
 
 #[cfg(feature = "linux-abi")]
-pub fn region_cover_record(address: usize, coverage: u64, regions: u64) {
+pub fn region_cover_record(address: usize, coverage: u64, regions: u64, esr: u64) {
     let index = REGION_COVER_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
     let task = current_task_id();
     unsafe {
         let ring = core::ptr::addr_of_mut!(REGION_COVER);
-        (*ring)[index % REGION_COVER_LEN] = [address as u64, coverage, regions, task, 0, 0];
+        (*ring)[index % REGION_COVER_LEN] = [address as u64, coverage, regions, task, esr, 0];
     }
 }
 
@@ -3647,6 +3684,33 @@ fn cow_reason_get(buffer: &mut [u8]) -> usize {
     }
     take
 }
+
+/// Every mmap/munmap the Linux ABI performs (address, length, prot|flags
+/// tag, task) so a monitor dump shows what bookkeeping produced a VA.
+pub const MMAP_RING_LEN: usize = 64;
+pub static MMAP_RING_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut MMAP_RING: [[u64; 5]; MMAP_RING_LEN] = [[0; 5]; MMAP_RING_LEN];
+
+#[cfg(feature = "linux-abi")]
+pub fn mmap_ring_record(kind: u64, address: usize, length: usize, prot: u64) {
+    let index = MMAP_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let task = current_task_id();
+    unsafe {
+        let ring = core::ptr::addr_of_mut!(MMAP_RING);
+        (*ring)[index % MMAP_RING_LEN] =
+            [kind, address as u64, length as u64, prot as u64, task];
+    }
+}
+
+/// Successful lazy backings (page, prot, physical, task) - paired with
+/// LAZY_FAIL to tell 'map does not stick' from 'map never runs'.
+pub const LAZY_OK_LEN: usize = 64;
+pub static LAZY_OK_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut LAZY_OK: [[u64; 6]; LAZY_OK_LEN] = [[0; 6]; LAZY_OK_LEN];
 
 /// Lazy-backing failures, read through the QEMU monitor dump the same way
 /// the fault ring is. 8 words per record: page, reason tag (4 bytes), mem
@@ -7548,6 +7612,18 @@ impl Task {
         self.mmap_regions[index]
             .pages
             .insert(offset, (physical, generation));
+        let index2 = LAZY_OK_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        unsafe {
+            let ring = core::ptr::addr_of_mut!(LAZY_OK);
+            (*ring)[index2 % LAZY_OK_LEN] = [
+                page as u64,
+                prot,
+                physical as u64,
+                current_task_id(),
+                0,
+                0,
+            ];
+        }
         true
     }
 

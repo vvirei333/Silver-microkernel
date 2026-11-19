@@ -2926,12 +2926,11 @@ fn linux_mmap(
             Some(address) if lazy => {
                 scheduler::mmap_anonymous_at_lazy(length as usize, prot, address)
             }
-            Some(address) => {
-                scheduler::mmap_anonymous_at(length as usize, prot, address)
-            }
+            Some(address) => scheduler::mmap_anonymous_at(length as usize, prot, address),
             None if lazy => scheduler::mmap_anonymous_lazy(length as usize, prot),
             None => scheduler::mmap_anonymous(length as usize, prot),
         };
+        scheduler::mmap_ring_record(0, placed.unwrap_or(0), length as usize, prot | flags);
         return placed.map(|placed| placed as u64).unwrap_or(errno(ENOMEM));
     }
 
@@ -3030,6 +3029,7 @@ fn linux_mmap(
             path,
             offset as usize,
         );
+        scheduler::mmap_ring_record(1, placed.unwrap_or(0), length as usize, prot | flags);
         return placed.map(|placed| placed as u64).unwrap_or(errno(ENOMEM));
     }
     let placed = scheduler::mmap_file_paged(length as usize, prot, fixed, |page_offset, buffer| {
@@ -3066,6 +3066,7 @@ fn linux_munmap(address: u64, length: u64) -> u64 {
     if address == 0 || length == 0 {
         return errno(EINVAL);
     }
+    scheduler::mmap_ring_record(3, address as usize, length as usize, 0);
     if scheduler::munmap(address as usize, length as usize) {
         0
     } else {
