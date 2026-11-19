@@ -93,9 +93,6 @@ struct CardRes {
     max_width: u32,
     min_height: u32,
     max_height: u32,
-    plane_id_ptr: u64,
-    count_planes: u32,
-    _pad: u32,
 }
 
 #[repr(C)]
@@ -410,11 +407,52 @@ const DRM_IOCTL_SET_CLIENT_CAP: u64 = 0x4010_640D;
 const DRM_IOCTL_SET_MASTER: u64 = 0x0000_641E;
 const DRM_IOCTL_DROP_MASTER: u64 = 0x0000_641F;
 const DRM_IOCTL_MODE_GETPLANERESOURCES: u64 = 0xC010_64B5;
-const DRM_IOCTL_MODE_GETPLANE: u64 = 0xC030_64B6;
+const DRM_IOCTL_MODE_GETPLANE: u64 = 0xC020_64B6;
 const DRM_IOCTL_MODE_SETPLANE: u64 = 0xC038_64B7;
 const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u64 = 0xC020_64B9;
 const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u64 = 0xC018_64BA;
 const DRM_IOCTL_MODE_ATOMIC: u64 = 0xC038_64BC;
+const DRM_IOCTL_MODE_GETPROPERTY: u64 = 0xC040_64AA;
+
+/// DRM_MODE_PROP_* type codes (uapi values, not shifted).
+const PROP_KIND_RANGE: u32 = 0;
+const PROP_KIND_ENUM: u32 = 1;
+const PROP_KIND_BLOB: u32 = 2;
+const PROP_KIND_OBJECT: u32 = 4;
+const PROP_KIND_SIGNED_RANGE: u32 = 5;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GetProperty {
+    values_ptr: u64,
+    enum_blob_ptr: u64,
+    name: [u8; 32],
+    flags: u32,
+    prop_id: u32,
+    count_values: u32,
+    count_enum_blobs: u32,
+}
+
+/// Metadata for one property id, mirroring what a real KMS driver exposes.
+/// The compositor matches properties by name, so the strings are load-bearing.
+fn property_meta(prop_id: u32) -> Option<(&'static str, u32, &'static [u64])> {
+    match prop_id {
+        PROP_CRTC_ACTIVE => Some(("ACTIVE", PROP_KIND_RANGE, &[0, 1])),
+        PROP_CRTC_MODE_ID => Some(("MODE_ID", PROP_KIND_BLOB, &[])),
+        PROP_PLANE_TYPE => Some(("type", PROP_KIND_ENUM, &[1])),
+        PROP_PLANE_FB_ID => Some(("FB_ID", PROP_KIND_OBJECT, &[0])),
+        PROP_PLANE_CRTC_ID | PROP_CONN_CRTC_ID => Some(("CRTC_ID", PROP_KIND_OBJECT, &[0])),
+        PROP_PLANE_SRC_X => Some(("SRC_X", PROP_KIND_RANGE, &[0, 0xFFFF_FFFF])),
+        PROP_PLANE_SRC_Y => Some(("SRC_Y", PROP_KIND_RANGE, &[0, 0xFFFF_FFFF])),
+        PROP_PLANE_SRC_W => Some(("SRC_W", PROP_KIND_RANGE, &[0, 0xFFFF_FFFF])),
+        PROP_PLANE_SRC_H => Some(("SRC_H", PROP_KIND_RANGE, &[0, 0xFFFF_FFFF])),
+        PROP_PLANE_CRTC_X => Some(("CRTC_X", PROP_KIND_SIGNED_RANGE, &[0, 0])),
+        PROP_PLANE_CRTC_Y => Some(("CRTC_Y", PROP_KIND_SIGNED_RANGE, &[0, 0])),
+        PROP_PLANE_CRTC_W => Some(("CRTC_W", PROP_KIND_RANGE, &[0, 0xFFFF])),
+        PROP_PLANE_CRTC_H => Some(("CRTC_H", PROP_KIND_RANGE, &[0, 0xFFFF])),
+        _ => None,
+    }
+}
 const DRM_IOCTL_MODE_CREATEPROPBLOB: u64 = 0xC010_64BD;
 const DRM_IOCTL_MODE_DESTROYPROPBLOB: u64 = 0xC004_64BE;
 const DRM_IOCTL_MODE_GETPROPBLOB: u64 = 0xC010_64AC;
@@ -473,15 +511,15 @@ struct PlaneRes {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+/// The real `drm_mode_get_plane`: 32 bytes, no position fields (those are
+/// SETPLANE territory). The ioctl number encodes this size and drm-rs sends
+/// exactly it.
 struct GetPlane {
     plane_id: u32,
     crtc_id: u32,
     fb_id: u32,
+    /// The possible-CRTCs mask.
     flags: u32,
-    crtc_x: i32,
-    crtc_y: i32,
-    x: u32,
-    y: u32,
     gamma_size: u32,
     count_formats: u32,
     format_type_ptr: u64,
@@ -627,6 +665,11 @@ unsafe fn object_properties(
             PROP_CONN_CRTC_ID,
             PLANE_CRTC as u64,
         )])),
+        // Encoders and framebuffers carry no properties on this virtual
+        // card, but the atomic client still queries them: an unhandled
+        // object fails the whole discovery with a stale errno.
+        (ENCODER_ID, DRM_MODE_OBJECT_ENCODER) => Some(Vec::new()),
+        (_, DRM_MODE_OBJECT_FB) => Some(Vec::new()),
         _ => None,
     }
 }
@@ -897,6 +940,12 @@ pub fn ioctl(request: u64, argument: u64) -> Option<u64> {
     result
 }
 
+pub const OBJP_RING_LEN: usize = 64;
+pub static OBJP_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut OBJP_RING: [[u64; 5]; OBJP_RING_LEN] = [[0; 5]; OBJP_RING_LEN];
+
 unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
     {
         Some(match request {
@@ -960,7 +1009,6 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 res.count_crtcs = 1;
                 res.count_connectors = 1;
                 res.count_encoders = 1;
-                res.count_planes = if unsafe { CLIENT_UNIVERSAL } { 1 } else { 0 };
                 res.min_width = 320;
                 res.max_width = width;
                 res.min_height = 200;
@@ -986,9 +1034,6 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 }
                 if res.encoder_id_ptr != 0 && count_encoders >= 1 {
                     let _ = store_u32(res.encoder_id_ptr, ENCODER_ID);
-                }
-                if res.plane_id_ptr != 0 && unsafe { CLIENT_UNIVERSAL } {
-                    let _ = store_u32(res.plane_id_ptr, PLANE_ID);
                 }
                 0
             }
@@ -1299,10 +1344,6 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 // one CRTC means bit 0. drm-rs treats a zero mask as a plane
                 // that cannot be assigned anywhere.
                 plane.flags = 1;
-                plane.crtc_x = 0;
-                plane.crtc_y = 0;
-                plane.x = 0;
-                plane.y = 0;
                 plane.gamma_size = 0;
                 let format_capacity = plane.count_formats;
                 plane.count_formats = 2;
@@ -1350,13 +1391,45 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 0
             }
             DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
+                let probe = unsafe { load::<ObjGetProps>(argument) };
+                OBJP_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                {
+                    let slot = (OBJP_INDEX.load(core::sync::atomic::Ordering::Relaxed) - 1)
+                        % OBJP_RING_LEN;
+                    unsafe {
+                        let ring = core::ptr::addr_of_mut!(OBJP_RING);
+                        (*ring)[slot] = match probe {
+                            Some(p) => [
+                                p.obj_id as u64,
+                                p.obj_type as u64,
+                                p.count_props as u64,
+                                p.props_ptr,
+                                0,
+                            ],
+                            None => [0xE0000000, argument, 0, 0, 0],
+                        };
+                    }
+                }
                 let Some(mut props) = load::<ObjGetProps>(argument) else {
                     return Some(u64::MAX);
                 };
-                let Some(entries) = (unsafe { object_properties(props.obj_id, props.obj_type) })
-                else {
-                    return Some(u64::MAX);
-                };
+                // drm-rs asks for the CRTC's properties right after the
+                // connector's (same id 1 here) but passes an uninitialized
+                // obj_type (0xcccccccc seen in the ring dump). Resolve by id
+                // when the type is unknown: id 1 is the CRTC on this card.
+                let mut entries =
+                    match (unsafe { object_properties(props.obj_id, props.obj_type) }) {
+                        Some(entries) => entries,
+                        None if props.obj_id == CRTC_ID => {
+                            match (unsafe {
+                                object_properties(CRTC_ID, DRM_MODE_OBJECT_CRTC)
+                            }) {
+                                Some(entries) => entries,
+                                None => return Some(u64::MAX),
+                            }
+                        }
+                        None => return Some(u64::MAX),
+                    };
                 // The caller's count caps the copy; the reported count is the
                 // real one (the caller reallocates and calls again). Writing
                 // past the caller's buffer corrupts its heap.
@@ -1375,6 +1448,16 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 0
             }
             DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
+                OBJP_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                {
+                    let slot = (OBJP_INDEX.load(core::sync::atomic::Ordering::Relaxed) - 1)
+                        % OBJP_RING_LEN;
+                    unsafe {
+                        let ring = core::ptr::addr_of_mut!(OBJP_RING);
+                        (*ring)[slot][4] = 0xFEED0000; // setprop seen
+                    }
+                }
+
                 let Some(prop) = load::<ObjSetProp>(argument) else {
                     return Some(u64::MAX);
                 };
@@ -1474,6 +1557,38 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                         return Some(u64::MAX);
                     }
                 }
+                0
+            }
+            DRM_IOCTL_MODE_GETPROPERTY => {
+                let Some(mut property) = load::<GetProperty>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some((name, kind, values)) = property_meta(property.prop_id) else {
+                    return Some(u64::MAX);
+                };
+                let name_bytes = name.as_bytes();
+                property.name = [0; 32];
+                property.name[..name_bytes.len()]
+                    .copy_from_slice(name_bytes);
+                // The type code goes in the low bits; immutable/inline
+                // modifiers stay clear.
+                property.flags = kind;
+                let value_capacity = property.count_values;
+                let enum_capacity = property.count_enum_blobs;
+                property.count_values = values.len() as u32;
+                property.count_enum_blobs = 0;
+                if !store(argument, &property) {
+                    return Some(u64::MAX);
+                }
+                // Values are capped by the caller's capacity, like every
+                // other list ioctl here.
+                for (index, value) in values.iter().enumerate() {
+                    if index as u32 >= value_capacity {
+                        break;
+                    }
+                    let _ = store(property.values_ptr + (index as u64) * 8, value);
+                }
+                let _ = enum_capacity;
                 0
             }
             DRM_IOCTL_MODE_ATOMIC => {
