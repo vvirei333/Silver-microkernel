@@ -7632,6 +7632,32 @@ deniald dies ~right after `DrmDevice initializing`, once its threads
   build/werewolf-alpine-glibc-denial.img --extra=-device --extra=virtio-gpu-pci
   --send "linuxrun /sfs/sbin/init" --wait "DENIAL: BOOT-COMPLETE" --timeout 170 --once`
   (add `-monitor tcp:127.0.0.1:4445,server=on,wait=off` for dumps).
+
+### Fault-chase status (end of 2026-11-19)
+
+The rings were extended and read across several boots; the picture:
+- deniald's per-thread faults on lazily mapped pages (libflutter code at
+  0x40D3F200/0x40D8F400/0x40D9BDE8, thread stacks 0x41A8F000/0x48000000/0x4C000000)
+  RECOVER correctly (FAULT_RING shows coverage=lazy prot=0x3/0x5; LAZY_OK records
+  the backings; LAZY_FAIL empty). The pthread stack pattern is mmap PROT_NONE
+  reservation + mprotect RW, and mprotect_range + split_region_at handle it.
+- The single root cause: task 133 (deniald main) **jumps to PC=1**
+  (EC=34 PC-alignment, elr=far=0x1) right after DrmDevice init + thread creation.
+  Everything after is fallout: exit_group marks the threads Dead, the reaper frees
+  the shared mmap_regions, and the still-running threads fault on unmapped
+  addresses (FAULT_RING coverage=NONE for those entries).
+- One boot also showed a kernel-initiated buffer fault (esr=0x40 synthetic from
+  back_user_pages) at 0x1dcd6000 (task 133) - inside the interpreter's image
+  area (MAIN_BIAS/INTERP_BIAS live below the mmap window). Not reproducible on
+  every boot; SYNTH_RING (task, syscall x8, x0, x1, far) is in place to catch it.
+- Signal delivery is NOT the cause: an all-signals-dropped experiment reproduced
+  the same PC=1 (experiment reverted).
+- Next steps: (1) gdb-stub breakpoint on deniald's indirect call just before the
+  PC=1 fault to catch the corrupt target live; (2) or bisect by stubbing our new
+  atomic ioctls one at a time (the crash appeared with the atomic layer; legacy
+  GetCRTC/GetResources were exercised by phoc for months without it); (3) or
+  dump deniald's GOT/vtable around 0x1 before the jump (pmemsave of the user
+  heap at 0x41C90000 + image runs at 0x10000000/0x20000000).
 - After the loop is fixed: deniald should reach output discovery → Stage 3 (evdev
   /dev/input + udev /sys glue) → Stage 4 (screencopy-minimal as the first external
   client; the shell is embedded in Denial so the phoc accept gap may not matter).
