@@ -7652,12 +7652,19 @@ The rings were extended and read across several boots; the picture:
   every boot; SYNTH_RING (task, syscall x8, x0, x1, far) is in place to catch it.
 - Signal delivery is NOT the cause: an all-signals-dropped experiment reproduced
   the same PC=1 (experiment reverted).
+- Bisection done: MODE_ATOMIC as a no-op still crashes (the commit path is
+  innocent), signal delivery dropped entirely still crashes (signals innocent),
+  so the corruption is in the DISCOVERY ioctls (GETPLANERESOURCES/GETPLANE/
+  OBJ_GETPROPERTIES/CREATE-GETPROPBLOB/GETRESOURCES-planes) or in how drm-rs
+  interprets their results. GETPLANE.flags now reports possible_crtcs=1 (drm-rs
+  treats a zero mask as an unassignable plane) - still crashes.
 - Next steps: (1) gdb-stub breakpoint on deniald's indirect call just before the
-  PC=1 fault to catch the corrupt target live; (2) or bisect by stubbing our new
-  atomic ioctls one at a time (the crash appeared with the atomic layer; legacy
-  GetCRTC/GetResources were exercised by phoc for months without it); (3) or
-  dump deniald's GOT/vtable around 0x1 before the jump (pmemsave of the user
-  heap at 0x41C90000 + image runs at 0x10000000/0x20000000).
+  PC=1 fault to catch the corrupt target live; (2) or dump deniald's
+  GOT/vtables around 0x1 before the jump (pmemsave of the user heap at
+  0x41C90000 + image runs at 0x10000000/0x20000000); (3) or bisect discovery
+  handlers: stub OBJ_GETPROPERTIES to report zero properties, then
+  CREATEPROPBLOB, then GETPLANE, one per boot; (4) or compare with a real
+  drm-rs trace (RUST_LOG=debug shows smithay::backend::drm traces).
 - After the loop is fixed: deniald should reach output discovery → Stage 3 (evdev
   /dev/input + udev /sys glue) → Stage 4 (screencopy-minimal as the first external
   client; the shell is embedded in Denial so the phoc accept gap may not matter).
