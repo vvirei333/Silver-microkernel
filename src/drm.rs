@@ -1295,7 +1295,10 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 }
                 plane.crtc_id = unsafe { PLANE_CRTC };
                 plane.fb_id = unsafe { PLANE_FB };
-                plane.flags = 0;
+                // drm_mode_get_plane.flags carries the possible-CRTCs mask;
+                // one CRTC means bit 0. drm-rs treats a zero mask as a plane
+                // that cannot be assigned anywhere.
+                plane.flags = 1;
                 plane.crtc_x = 0;
                 plane.crtc_y = 0;
                 plane.x = 0;
