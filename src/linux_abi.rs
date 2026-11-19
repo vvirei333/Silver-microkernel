@@ -2116,6 +2116,11 @@ fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
         }
     }
     if fd > 2 {
+        crate::console::write_str("IOC-EBADF fd=");
+        crate::console::write_dec_u64(fd);
+        crate::console::write_str(" req=0x");
+        crate::console::write_hex_u64(request);
+        crate::console::write_str("\r\n");
         return errno(EBADF);
     }
     if request != TIOCGWINSZ {

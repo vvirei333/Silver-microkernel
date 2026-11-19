@@ -20,6 +20,8 @@ use crate::frame_allocator;
 use crate::memory::phys_to_virt;
 use crate::user_memory;
 
+use alloc::vec::Vec;
+
 pub const MAX_BUFFERS: usize = 8;
 
 const DRM_IOCTL_VERSION: u64 = 0xC040_6400;
@@ -91,6 +93,9 @@ struct CardRes {
     max_width: u32,
     min_height: u32,
     max_height: u32,
+    plane_id_ptr: u64,
+    count_planes: u32,
+    _pad: u32,
 }
 
 #[repr(C)]
@@ -363,6 +368,11 @@ unsafe fn present(entry: &mut Dumb) -> bool {
 }
 
 unsafe fn queue_vblank(user_data: u64) {
+    queue_flip(user_data);
+}
+
+#[allow(dead_code)]
+unsafe fn queue_vblank_event(user_data: u64) {
     let event = &mut *core::ptr::addr_of_mut!(EVENT);
     event[0..4].copy_from_slice(&DRM_EVENT_VBLANK.to_le_bytes());
     event[4..8].copy_from_slice(&32u32.to_le_bytes());
@@ -386,6 +396,424 @@ pub fn read_event() -> Option<[u8; 32]> {
 
 pub fn event_pending() -> bool {
     unsafe { EVENT_PENDING }
+}
+
+// ---------------------------------------------------------------------------
+// Atomic modesetting UAPI. Denial's compositor (Smithay's AtomicDrmDevice)
+// refuses a device without it: the client advertises DRM_CLIENT_CAP_ATOMIC
+// through SET_CLIENT_CAP, discovers objects/properties through the OBJ_*
+// ioctls, builds mode blobs and commits through MODE_ATOMIC. The state here
+// is one CRTC with one primary plane; a commit lands on the same
+// present()/flip-event path the legacy ioctls use.
+
+const DRM_IOCTL_SET_CLIENT_CAP: u64 = 0x4010_640D;
+const DRM_IOCTL_SET_MASTER: u64 = 0x0000_641E;
+const DRM_IOCTL_DROP_MASTER: u64 = 0x0000_641F;
+const DRM_IOCTL_MODE_GETPLANERESOURCES: u64 = 0xC010_64B5;
+const DRM_IOCTL_MODE_GETPLANE: u64 = 0xC030_64B6;
+const DRM_IOCTL_MODE_SETPLANE: u64 = 0xC038_64B7;
+const DRM_IOCTL_MODE_OBJ_GETPROPERTIES: u64 = 0xC020_64B9;
+const DRM_IOCTL_MODE_OBJ_SETPROPERTY: u64 = 0xC018_64BA;
+const DRM_IOCTL_MODE_ATOMIC: u64 = 0xC038_64BC;
+const DRM_IOCTL_MODE_CREATEPROPBLOB: u64 = 0xC010_64BD;
+const DRM_IOCTL_MODE_DESTROYPROPBLOB: u64 = 0xC004_64BE;
+const DRM_IOCTL_MODE_GETPROPBLOB: u64 = 0xC010_64AC;
+
+const DRM_CAP_PRIME: u64 = 5;
+const DRM_CAP_CRTC_IN_VBLANK_EVENT: u64 = 18;
+const DRM_CLIENT_CAP_STEREO_3D: u64 = 1;
+const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
+const DRM_CLIENT_CAP_ATOMIC: u64 = 3;
+
+const DRM_MODE_OBJECT_CRTC: u32 = 0xaaaa_aaaa;
+const DRM_MODE_OBJECT_CONNECTOR: u32 = 0xc0c0_c0c0;
+const DRM_MODE_OBJECT_ENCODER: u32 = 0xe0e0_e0e0;
+const DRM_MODE_OBJECT_PLANE: u32 = 0xeeee_eeee;
+const DRM_MODE_OBJECT_FB: u32 = 0xf0f0_f0f0;
+
+const PLANE_ID: u32 = 2;
+const DRM_PLANE_TYPE_PRIMARY: u64 = 1;
+
+const PROP_CRTC_ACTIVE: u32 = 1;
+const PROP_CRTC_MODE_ID: u32 = 2;
+const PROP_PLANE_TYPE: u32 = 3;
+const PROP_PLANE_FB_ID: u32 = 4;
+const PROP_PLANE_CRTC_ID: u32 = 5;
+const PROP_PLANE_SRC_X: u32 = 6;
+const PROP_PLANE_SRC_Y: u32 = 7;
+const PROP_PLANE_SRC_W: u32 = 8;
+const PROP_PLANE_SRC_H: u32 = 9;
+const PROP_PLANE_CRTC_X: u32 = 10;
+const PROP_PLANE_CRTC_Y: u32 = 11;
+const PROP_PLANE_CRTC_W: u32 = 12;
+const PROP_PLANE_CRTC_H: u32 = 13;
+const PROP_CONN_CRTC_ID: u32 = 14;
+
+const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
+const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x100;
+const DRM_MODE_ATOMIC_NONBLOCK: u32 = 0x200;
+const DRM_MODE_ATOMIC_ALLOW_MODESET: u32 = 0x800;
+
+const DRM_EVENT_FLIP_COMPLETE: u32 = 0x02;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SetClientCap {
+    capability: u64,
+    value: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct PlaneRes {
+    plane_id_ptr: u64,
+    count_planes: u32,
+    _pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GetPlane {
+    plane_id: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    flags: u32,
+    crtc_x: i32,
+    crtc_y: i32,
+    x: u32,
+    y: u32,
+    gamma_size: u32,
+    count_formats: u32,
+    format_type_ptr: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SetPlane {
+    plane_id: u32,
+    crtc_id: u32,
+    fb_id: u32,
+    flags: u32,
+    crtc_x: i32,
+    crtc_y: i32,
+    x: u32,
+    y: u32,
+    crtc_w: u32,
+    crtc_h: u32,
+    src_x: u32,
+    src_y: u32,
+    src_w: u32,
+    src_h: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ObjGetProps {
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    count_props: u32,
+    obj_id: u32,
+    obj_type: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ObjSetProp {
+    value: u64,
+    prop_id: u32,
+    obj_id: u32,
+    obj_type: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ModeAtomic {
+    flags: u32,
+    count_objs: u32,
+    objs_ptr: u64,
+    count_props_ptr: u64,
+    props_ptr: u64,
+    prop_values_ptr: u64,
+    reserved: u64,
+    user_data: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct CreateBlob {
+    data: u64,
+    length: u32,
+    blob_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct DestroyBlob {
+    blob_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct GetBlob {
+    blob_id: u32,
+    length: u32,
+    data: u64,
+}
+
+static mut CLIENT_ATOMIC: bool = false;
+static mut CLIENT_UNIVERSAL: bool = false;
+static mut CRTC_ACTIVE: bool = false;
+static mut CRTC_MODE_BLOB: u32 = 0;
+static mut PLANE_FB: u32 = 0;
+static mut PLANE_CRTC: u32 = 0;
+static mut CURRENT_FB: u32 = 0;
+
+const MAX_BLOBS: usize = 32;
+const BLOB_DATA_MAX: usize = 128;
+
+#[derive(Clone, Copy)]
+struct Blob {
+    id: u32,
+    length: usize,
+    in_use: bool,
+    data: [u8; BLOB_DATA_MAX],
+}
+
+const EMPTY_BLOB: Blob = Blob {
+    id: 0,
+    length: 0,
+    in_use: false,
+    data: [0; BLOB_DATA_MAX],
+};
+
+static mut BLOBS: [Blob; MAX_BLOBS] = [EMPTY_BLOB; MAX_BLOBS];
+static mut NEXT_BLOB: u32 = 1;
+
+unsafe fn blob_for_id(id: u32) -> Option<&'static mut Blob> {
+    let table = &mut *core::ptr::addr_of_mut!(BLOBS);
+    table
+        .iter_mut()
+        .find(|blob| blob.in_use && blob.id == id)
+}
+
+/// The current property set of one object. Atomic clients discover the
+/// hardware through these lists; ids are stable across the session.
+unsafe fn object_properties(
+    obj_id: u32,
+    obj_type: u32,
+) -> Option<alloc::vec::Vec<(u32, u64)>> {
+    match (obj_id, obj_type) {
+        (CRTC_ID, DRM_MODE_OBJECT_CRTC) => Some(Vec::from([
+            (PROP_CRTC_ACTIVE, CRTC_ACTIVE as u64),
+            (PROP_CRTC_MODE_ID, CRTC_MODE_BLOB as u64),
+        ])),
+        (PLANE_ID, DRM_MODE_OBJECT_PLANE) => {
+            let (width, height) = crate::virtio_gpu::size().unwrap_or((1024, 768));
+            Some(Vec::from([
+                (PROP_PLANE_TYPE, DRM_PLANE_TYPE_PRIMARY),
+                (PROP_PLANE_FB_ID, PLANE_FB as u64),
+                (PROP_PLANE_CRTC_ID, PLANE_CRTC as u64),
+                (PROP_PLANE_SRC_X, 0),
+                (PROP_PLANE_SRC_Y, 0),
+                (PROP_PLANE_SRC_W, (width as u64) << 16),
+                (PROP_PLANE_SRC_H, (height as u64) << 16),
+                (PROP_PLANE_CRTC_X, 0),
+                (PROP_PLANE_CRTC_Y, 0),
+                (PROP_PLANE_CRTC_W, width as u64),
+                (PROP_PLANE_CRTC_H, height as u64),
+            ]))
+        }
+        (CONNECTOR_ID, DRM_MODE_OBJECT_CONNECTOR) => Some(Vec::from([(
+            PROP_CONN_CRTC_ID,
+            PLANE_CRTC as u64,
+        )])),
+        _ => None,
+    }
+}
+
+/// Validates one property against the object it is set on. Values that the
+/// one-CRTC hardware cannot represent are rejected before anything mutates.
+unsafe fn validate_property(prop_id: u32, value: u64) -> bool {
+    match prop_id {
+        PROP_CRTC_ACTIVE => value <= 1,
+        PROP_CRTC_MODE_ID => value == 0 || blob_for_id(value as u32).is_some(),
+        PROP_PLANE_TYPE => value == DRM_PLANE_TYPE_PRIMARY,
+        PROP_PLANE_FB_ID => value == 0 || buffer_for_fb(value as u32).is_some(),
+        PROP_PLANE_CRTC_ID | PROP_CONN_CRTC_ID => value == 0 || value == CRTC_ID as u64,
+        PROP_PLANE_SRC_W | PROP_PLANE_SRC_H => {
+            let (width, height) = crate::virtio_gpu::size().unwrap_or((1024, 768));
+            let span = (value >> 16) as u32;
+            span <= if prop_id == PROP_PLANE_SRC_W { width } else { height }
+                && (value & 0xFFFF) == 0
+        }
+        PROP_PLANE_CRTC_W | PROP_PLANE_CRTC_H => {
+            let (width, height) = crate::virtio_gpu::size().unwrap_or((1024, 768));
+            let span = value as u32;
+            span <= if prop_id == PROP_PLANE_CRTC_W { width } else { height }
+        }
+        PROP_PLANE_SRC_X | PROP_PLANE_SRC_Y | PROP_PLANE_CRTC_X | PROP_PLANE_CRTC_Y => {
+            value == 0
+        }
+        _ => false,
+    }
+}
+
+/// Applies one validated property to the live state.
+unsafe fn apply_property(prop_id: u32, value: u64) {
+    match prop_id {
+        PROP_CRTC_ACTIVE => CRTC_ACTIVE = value != 0,
+        PROP_CRTC_MODE_ID => CRTC_MODE_BLOB = value as u32,
+        PROP_PLANE_FB_ID => PLANE_FB = value as u32,
+        PROP_PLANE_CRTC_ID | PROP_CONN_CRTC_ID => PLANE_CRTC = value as u32,
+        _ => {}
+    }
+}
+
+/// Atomic commit: validate every object/property pair, then either report
+/// success (`TEST_ONLY`) or mutate the state and present the bound
+/// framebuffer. A commit with `PAGE_FLIP_EVENT` queues a flip-complete event
+/// the compositor reads like a legacy page flip.
+unsafe fn atomic_commit(argument: u64) -> u64 {
+    const EINVAL: u64 = 22;
+    const ENOENT: u64 = 2;
+    let Some(mut atomic) = load::<ModeAtomic>(argument) else {
+        return u64::MAX;
+    };
+    if atomic.count_objs == 0 {
+        return EINVAL;
+    }
+    // Validation pass: every (object, property, value) must resolve.
+    for index in 0..atomic.count_objs as u64 {
+        let raw = index * 8;
+        let mut pair = [0_u8; 8];
+        if user_memory::copy_from_user(atomic.objs_ptr + raw, &mut pair).is_err() {
+            return EFAULT_CODE;
+        }
+        let obj_id = u32::from_le_bytes(pair[0..4].try_into().unwrap());
+        let obj_type = u32::from_le_bytes(pair[4..8].try_into().unwrap());
+        if object_properties(obj_id, obj_type).is_none() {
+            return ENOENT;
+        }
+        let mut count_raw = [0_u8; 4];
+        if user_memory::copy_from_user(atomic.count_props_ptr + index * 4, &mut count_raw)
+            .is_err()
+        {
+            return EFAULT_CODE;
+        }
+        let count = u32::from_le_bytes(count_raw) as u64;
+        let mut prop_offset = 0_u64;
+        for prior in 0..index {
+            let mut raw_count = [0_u8; 4];
+            if user_memory::copy_from_user(atomic.count_props_ptr + prior * 4, &mut raw_count)
+                .is_err()
+            {
+                return EFAULT_CODE;
+            }
+            prop_offset += u32::from_le_bytes(raw_count) as u64;
+        }
+        for slot in 0..count {
+            let mut prop_raw = [0_u8; 4];
+            if user_memory::copy_from_user(
+                atomic.props_ptr + (prop_offset + slot) * 4,
+                &mut prop_raw,
+            )
+            .is_err()
+            {
+                return EFAULT_CODE;
+            }
+            let prop_id = u32::from_le_bytes(prop_raw);
+            let mut value_raw = [0_u8; 8];
+            if user_memory::copy_from_user(
+                atomic.prop_values_ptr + (prop_offset + slot) * 8,
+                &mut value_raw,
+            )
+            .is_err()
+            {
+                return EFAULT_CODE;
+            }
+            let value = u64::from_le_bytes(value_raw);
+            if !validate_property(prop_id, value) {
+                return EINVAL;
+            }
+        }
+    }
+    if atomic.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 {
+        return 0;
+    }
+    // Apply pass.
+    for index in 0..atomic.count_objs as u64 {
+        let mut pair = [0_u8; 8];
+        if user_memory::copy_from_user(atomic.objs_ptr + index * 8, &mut pair).is_err() {
+            return EFAULT_CODE;
+        }
+        let mut count_raw = [0_u8; 4];
+        if user_memory::copy_from_user(atomic.count_props_ptr + index * 4, &mut count_raw)
+            .is_err()
+        {
+            return EFAULT_CODE;
+        }
+        let count = u32::from_le_bytes(count_raw) as u64;
+        let mut prop_offset = 0_u64;
+        for prior in 0..index {
+            let mut raw_count = [0_u8; 4];
+            if user_memory::copy_from_user(atomic.count_props_ptr + prior * 4, &mut raw_count)
+                .is_err()
+            {
+                return EFAULT_CODE;
+            }
+            prop_offset += u32::from_le_bytes(raw_count) as u64;
+        }
+        for slot in 0..count {
+            let mut prop_raw = [0_u8; 4];
+            if user_memory::copy_from_user(
+                atomic.props_ptr + (prop_offset + slot) * 4,
+                &mut prop_raw,
+            )
+            .is_err()
+            {
+                return EFAULT_CODE;
+            }
+            let mut value_raw = [0_u8; 8];
+            if user_memory::copy_from_user(
+                atomic.prop_values_ptr + (prop_offset + slot) * 8,
+                &mut value_raw,
+            )
+            .is_err()
+            {
+                return EFAULT_CODE;
+            }
+            apply_property(
+                u32::from_le_bytes(prop_raw),
+                u64::from_le_bytes(value_raw),
+            );
+        }
+    }
+    // A framebuffer bound to the primary plane goes to scanout; the flip
+    // event reports completion through the same ring legacy flips use.
+    if PLANE_FB != 0 {
+        if let Some(entry) = buffer_for_fb(PLANE_FB) {
+            if !present(entry) {
+                return EINVAL;
+            }
+            CURRENT_FB = PLANE_FB;
+        }
+    }
+    if atomic.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
+        queue_flip(atomic.user_data);
+    }
+    0
+}
+
+const EFAULT_CODE: u64 = 14;
+
+unsafe fn queue_flip(user_data: u64) {
+    let event = &mut *core::ptr::addr_of_mut!(EVENT);
+    event[0..4].copy_from_slice(&DRM_EVENT_FLIP_COMPLETE.to_le_bytes());
+    event[4..8].copy_from_slice(&32u32.to_le_bytes());
+    event[8..16].copy_from_slice(&user_data.to_le_bytes());
+    event[24..28].copy_from_slice(&1u32.to_le_bytes()); // sequence
+    event[28..32].copy_from_slice(&CRTC_ID.to_le_bytes());
+    EVENT_PENDING = true;
 }
 
 /// Copies a rendered 3D resource back into its guest backing.
@@ -443,10 +871,34 @@ fn version_string(buffer: &[u8], pointer: u64, length: u64) {
     let _ = user_memory::copy_to_user(&buffer[..take], pointer);
 }
 
+/// Counts card ioctls so the console trace can be sampled instead of
+/// flooding (console writes from busy syscall context drop under contention).
+/// The last card ioctls (request, result or u64::MAX when unhandled) are
+/// kept in a ring that a QEMU monitor `pmemsave` dump can read instead.
+pub const IOC_RING_LEN: usize = 64;
+static IOC_RING_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut IOC_RING: [(u64, u64); IOC_RING_LEN] = [(0, 0); IOC_RING_LEN];
+
 /// Handles one ioctl. Returns `Some(0)` (or a small positive value) when the
 /// request belongs to DRM, `None` when it is not a DRM request at all.
 pub fn ioctl(request: u64, argument: u64) -> Option<u64> {
+    let result = unsafe { drm_ioctl_inner(request, argument) };
+    let index = IOC_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let record = match result {
+        Some(value) => (request, value),
+        None => (request, u64::MAX),
+    };
     unsafe {
+        let ring = core::ptr::addr_of_mut!(IOC_RING);
+        (*ring)[index % IOC_RING_LEN] = record;
+    }
+    result
+}
+
+unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
+    {
         Some(match request {
             DRM_IOCTL_VERSION => {
                 let Some(mut version) = load::<Version>(argument) else {
@@ -482,6 +934,8 @@ pub fn ioctl(request: u64, argument: u64) -> Option<u64> {
                 cap.value = match cap.capability {
                     DRM_CAP_DUMB_BUFFER => 1,
                     DRM_CAP_TIMESTAMP_MONOTONIC => 1,
+                    DRM_CAP_PRIME => 0x3, // import | export
+                    DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
                     _ => 0,
                 };
                 if !store(argument, &cap) {
@@ -506,6 +960,7 @@ pub fn ioctl(request: u64, argument: u64) -> Option<u64> {
                 res.count_crtcs = 1;
                 res.count_connectors = 1;
                 res.count_encoders = 1;
+                res.count_planes = if unsafe { CLIENT_UNIVERSAL } { 1 } else { 0 };
                 res.min_width = 320;
                 res.max_width = width;
                 res.min_height = 200;
@@ -532,6 +987,9 @@ pub fn ioctl(request: u64, argument: u64) -> Option<u64> {
                 if res.encoder_id_ptr != 0 && count_encoders >= 1 {
                     let _ = store_u32(res.encoder_id_ptr, ENCODER_ID);
                 }
+                if res.plane_id_ptr != 0 && unsafe { CLIENT_UNIVERSAL } {
+                    let _ = store_u32(res.plane_id_ptr, PLANE_ID);
+                }
                 0
             }
             DRM_IOCTL_MODE_GETCRTC => {
@@ -541,11 +999,11 @@ pub fn ioctl(request: u64, argument: u64) -> Option<u64> {
                 if crtc.crtc_id != CRTC_ID {
                     return Some(u64::MAX);
                 }
-                crtc.fb_id = 0;
+                crtc.fb_id = unsafe { CURRENT_FB };
                 crtc.x = 0;
                 crtc.y = 0;
                 crtc.gamma_size = 0;
-                crtc.mode_valid = 1;
+                crtc.mode_valid = unsafe { CRTC_ACTIVE as u32 };
                 crtc.mode = display_mode();
                 if !store(argument, &crtc) {
                     return Some(u64::MAX);
@@ -785,8 +1243,227 @@ pub fn ioctl(request: u64, argument: u64) -> Option<u64> {
                 if !present(entry) {
                     return Some(u64::MAX);
                 }
-                queue_vblank(flip.user_data);
+                queue_flip(flip.user_data);
                 0
+            }
+            DRM_IOCTL_SET_MASTER | DRM_IOCTL_DROP_MASTER => {
+                // Single-seat virtual card: master is always granted.
+                0
+            }
+            DRM_IOCTL_SET_CLIENT_CAP => {
+                let Some(cap) = load::<SetClientCap>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if cap.value != 0 && cap.value != 1 {
+                    return Some(u64::MAX);
+                }
+                match cap.capability {
+                    DRM_CLIENT_CAP_STEREO_3D => 0,
+                    DRM_CLIENT_CAP_UNIVERSAL_PLANES => {
+                        unsafe { CLIENT_UNIVERSAL = cap.value != 0 };
+                        0
+                    }
+                    DRM_CLIENT_CAP_ATOMIC => {
+                        unsafe { CLIENT_ATOMIC = cap.value != 0 };
+                        0
+                    }
+                    // Unknown client capabilities are refused like Linux.
+                    _ => u64::MAX,
+                }
+            }
+            DRM_IOCTL_MODE_GETPLANERESOURCES => {
+                let Some(mut res) = load::<PlaneRes>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let universal = unsafe { CLIENT_UNIVERSAL };
+                let count = if universal { 1 } else { 0 };
+                res.count_planes = count;
+                if !store(argument, &res) {
+                    return Some(u64::MAX);
+                }
+                if universal && res.plane_id_ptr != 0 {
+                    let _ = store_u32(res.plane_id_ptr, PLANE_ID);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_GETPLANE => {
+                let Some(mut plane) = load::<GetPlane>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if plane.plane_id != PLANE_ID || !unsafe { CLIENT_UNIVERSAL } {
+                    return Some(u64::MAX);
+                }
+                plane.crtc_id = unsafe { PLANE_CRTC };
+                plane.fb_id = unsafe { PLANE_FB };
+                plane.flags = 0;
+                plane.crtc_x = 0;
+                plane.crtc_y = 0;
+                plane.x = 0;
+                plane.y = 0;
+                plane.gamma_size = 0;
+                plane.count_formats = 2;
+                if !store(argument, &plane) {
+                    return Some(u64::MAX);
+                }
+                if plane.format_type_ptr != 0 {
+                    let _ = store_u32(plane.format_type_ptr, PIXEL_FORMAT_XRGB8888);
+                    let _ = store_u32(plane.format_type_ptr + 4, PIXEL_FORMAT_ARGB8888);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_SETPLANE => {
+                let Some(set) = load::<SetPlane>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if set.plane_id != PLANE_ID {
+                    return Some(u64::MAX);
+                }
+                if set.fb_id != 0 && buffer_for_fb(set.fb_id).is_none() {
+                    return Some(u64::MAX);
+                }
+                unsafe {
+                    PLANE_FB = set.fb_id;
+                    PLANE_CRTC = set.crtc_id;
+                }
+                if set.fb_id != 0 {
+                    if let Some(entry) = buffer_for_fb(set.fb_id) {
+                        if !present(entry) {
+                            return Some(u64::MAX);
+                        }
+                        unsafe { CURRENT_FB = set.fb_id };
+                    }
+                }
+                0
+            }
+            DRM_IOCTL_MODE_OBJ_GETPROPERTIES => {
+                let Some(mut props) = load::<ObjGetProps>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(entries) = (unsafe { object_properties(props.obj_id, props.obj_type) })
+                else {
+                    return Some(u64::MAX);
+                };
+                let count = entries.len() as u32;
+                props.count_props = count;
+                if !store(argument, &props) {
+                    return Some(u64::MAX);
+                }
+                for (index, (prop_id, value)) in entries.iter().enumerate() {
+                    if index as u32 >= props.count_props && props.props_ptr != 0 {
+                        break;
+                    }
+                    let _ = store_u32(props.props_ptr + (index as u64) * 4, *prop_id);
+                    let _ = store(props.prop_values_ptr + (index as u64) * 8, value);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_OBJ_SETPROPERTY => {
+                let Some(prop) = load::<ObjSetProp>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if unsafe { object_properties(prop.obj_id, prop.obj_type).is_none() } {
+                    return Some(u64::MAX);
+                }
+                if !unsafe { validate_property(prop.prop_id, prop.value) } {
+                    return Some(u64::MAX);
+                }
+                unsafe { apply_property(prop.prop_id, prop.value) };
+                if prop.prop_id == PROP_PLANE_FB_ID && prop.value != 0 {
+                    if let Some(entry) = buffer_for_fb(prop.value as u32) {
+                        if !present(entry) {
+                            return Some(u64::MAX);
+                        }
+                        unsafe { CURRENT_FB = prop.value as u32 };
+                    }
+                }
+                0
+            }
+            DRM_IOCTL_MODE_CREATEPROPBLOB => {
+                let Some(mut cmd) = load::<CreateBlob>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if cmd.length == 0 || cmd.length as usize > BLOB_DATA_MAX || cmd.data == 0 {
+                    return Some(u64::MAX);
+                }
+                let mut data = [0_u8; BLOB_DATA_MAX];
+                if user_memory::copy_from_user(cmd.data, &mut data[..cmd.length as usize])
+                    .is_err()
+                {
+                    return Some(u64::MAX);
+                }
+                let (created, id) = unsafe {
+                    let table = &mut *core::ptr::addr_of_mut!(BLOBS);
+                    let next = core::ptr::addr_of_mut!(NEXT_BLOB).read();
+                    match table.iter_mut().find(|blob| !blob.in_use) {
+                        Some(slot) => {
+                            *slot = Blob {
+                                id: next,
+                                length: cmd.length as usize,
+                                in_use: true,
+                                data,
+                            };
+                            core::ptr::addr_of_mut!(NEXT_BLOB).write(next + 1);
+                            (true, next)
+                        }
+                        None => (false, 0),
+                    }
+                };
+                if !created {
+                    return Some(u64::MAX);
+                }
+                cmd.blob_id = id;
+                if !store(argument, &cmd) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_DESTROYPROPBLOB => {
+                let Some(cmd) = load::<DestroyBlob>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let destroyed = unsafe {
+                    let table = &mut *core::ptr::addr_of_mut!(BLOBS);
+                    match table
+                        .iter_mut()
+                        .find(|blob| blob.in_use && blob.id == cmd.blob_id)
+                    {
+                        Some(blob) => {
+                            blob.in_use = false;
+                            true
+                        }
+                        None => false,
+                    }
+                };
+                if !destroyed {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_MODE_GETPROPBLOB => {
+                let Some(mut cmd) = load::<GetBlob>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(blob) = (unsafe { blob_for_id(cmd.blob_id) }) else {
+                    return Some(u64::MAX);
+                };
+                cmd.length = blob.length as u32;
+                if !store(argument, &cmd) {
+                    return Some(u64::MAX);
+                }
+                if cmd.data != 0 {
+                    let length = blob.length;
+                    let bytes = blob.data;
+                    if user_memory::copy_to_user(&bytes[..length], cmd.data).is_err() {
+                        return Some(u64::MAX);
+                    }
+                }
+                0
+            }
+            DRM_IOCTL_MODE_ATOMIC => {
+                if !unsafe { CLIENT_ATOMIC } {
+                    return Some(u64::MAX);
+                }
+                unsafe { atomic_commit(argument) }
             }
             _ => return None,
         })

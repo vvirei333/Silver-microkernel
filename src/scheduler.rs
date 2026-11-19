@@ -3614,6 +3614,38 @@ fn cow_reason_get(buffer: &mut [u8]) -> usize {
     take
 }
 
+/// Lazy-backing failures, read through the QEMU monitor dump the same way
+/// the fault ring is. 8 words per record: page, reason tag (4 bytes), mem
+/// frames, mmap bytes, region count, task.
+pub const LAZY_FAIL_LEN: usize = 32;
+pub static LAZY_FAIL_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut LAZY_FAIL: [[u64; 8]; LAZY_FAIL_LEN] = [[0; 8]; LAZY_FAIL_LEN];
+
+#[cfg(feature = "linux-abi")]
+pub fn lazy_fail_record(page: usize, reason: &[u8], mem_frames: usize, mmap_bytes: usize, regions: usize) {
+    let index = LAZY_FAIL_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let mut tag = [0_u8; 8];
+    let take = reason.len().min(8);
+    tag[..take].copy_from_slice(&reason[..take]);
+    let tag_word = u64::from_le_bytes(tag);
+    let task = current_task_id();
+    unsafe {
+        let ring = core::ptr::addr_of_mut!(LAZY_FAIL);
+        (*ring)[index % LAZY_FAIL_LEN] = [
+            page as u64,
+            tag_word,
+            mem_frames as u64,
+            mmap_bytes as u64,
+            regions as u64,
+            task,
+            0,
+            0,
+        ];
+    }
+}
+
 /// Diagnostic for the fault dump: which task the COW path would have acted
 /// on (the thread-group owner, not necessarily the faulting CPU's task), and
 /// which image run covers the address with which page kind. Returns the
@@ -7409,22 +7441,32 @@ impl Task {
 
     fn lazy_page_fault(&mut self, index: usize, page: usize, esr: u64) -> bool {
         const WNR: u64 = 1 << 6;
+        macro_rules! lazy_fail {
+            ($reason:expr) => {{
+                crate::scheduler::lazy_fail_record(page, $reason, self.mem_frames, self.mmap_bytes, self.mmap_regions.len());
+                return false;
+            }};
+        }
         let prot = self.mmap_regions[index].prot;
         let write = esr & WNR != 0;
         if prot == 0 || (write && prot & mmu::PROT_WRITE == 0) {
-            return false;
+            lazy_fail!(b"no-prot");
         }
         let offset = ((page - self.mmap_regions[index].virtual_address) / PAGE_SIZE) as u32;
         if self.mmap_regions[index].pages.contains_key(&offset) {
-            return false;
+            // Another thread backed this page while this one was on its way
+            // to the fault handler. The mapping exists, so the retry must
+            // succeed; killing the faulting task here would murder a healthy
+            // thread racing a sibling on a shared, lazily mapped region.
+            return true;
         }
         let source = self.mmap_regions[index].file.clone();
         if !self.charge_frames(1) {
-            return false;
+            lazy_fail!(b"charge");
         }
         let Some((physical, generation)) = frame_allocator::alloc_user_page_tagged() else {
             self.release_frames(1);
-            return false;
+            lazy_fail!(b"alloc");
         };
         unsafe {
             core::ptr::write_bytes(phys_to_virt(physical) as *mut u8, 0, PAGE_SIZE);
@@ -7451,14 +7493,14 @@ impl Task {
                     // empty page; fail the access instead.
                     let _ = frame_allocator::free_page_tagged(physical, generation);
                     self.release_frames(1);
-                    return false;
+                    lazy_fail!(b"io");
                 }
             }
         }
         if !mmu::map_user_page_at(self.ttbr0, page, physical, prot) {
             frame_allocator::free_page_tagged(physical, generation);
             self.release_frames(1);
-            return false;
+            lazy_fail!(b"map");
         }
         #[cfg(feature = "gdb-stub")]
         if crate::debug::soft_page_is(page as u64) {

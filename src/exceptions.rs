@@ -43,6 +43,22 @@ pub extern "C" fn silver_handle_task_fault(esr: u64, elr: u64, far: u64) -> ! {
 /// EL0 fault entry from the vector. Returns `0` when a write to a COW page was
 /// repaired (the trampoline retries the instruction); any other fault falls
 /// through to the normal task kill, which never returns.
+pub const FAULT_RING_LEN: usize = 32;
+pub static FAULT_RING_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut FAULT_RING: [(u64, u64, u64, u64); FAULT_RING_LEN] =
+    [(0, 0, 0, 0); FAULT_RING_LEN];
+
+fn fault_ring_record(esr: u64, elr: u64, far: u64) {
+    let index = FAULT_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let task = scheduler::current_task_id();
+    unsafe {
+        let ring = core::ptr::addr_of_mut!(FAULT_RING);
+        (*ring)[index % FAULT_RING_LEN] = (task, esr, elr, far);
+    }
+}
+
 #[cfg(feature = "linux-abi")]
 #[no_mangle]
 pub extern "C" fn silver_handle_user_fault(
@@ -51,6 +67,7 @@ pub extern "C" fn silver_handle_user_fault(
     elr: u64,
     far: u64,
 ) -> u64 {
+    fault_ring_record(esr, elr, far);
     #[cfg(feature = "gdb-stub")]
     if crate::debug::is_watchpoint(esr) {
         crate::debug::disarm();
