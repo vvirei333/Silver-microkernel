@@ -7633,38 +7633,44 @@ deniald dies ~right after `DrmDevice initializing`, once its threads
   --send "linuxrun /sfs/sbin/init" --wait "DENIAL: BOOT-COMPLETE" --timeout 170 --once`
   (add `-monitor tcp:127.0.0.1:4445,server=on,wait=off` for dumps).
 
-### Fault-chase status (end of 2026-11-19)
+### Campaign status (end of 2026-11-19, late)
 
-The rings were extended and read across several boots; the picture:
-- deniald's per-thread faults on lazily mapped pages (libflutter code at
-  0x40D3F200/0x40D8F400/0x40D9BDE8, thread stacks 0x41A8F000/0x48000000/0x4C000000)
-  RECOVER correctly (FAULT_RING shows coverage=lazy prot=0x3/0x5; LAZY_OK records
-  the backings; LAZY_FAIL empty). The pthread stack pattern is mmap PROT_NONE
-  reservation + mprotect RW, and mprotect_range + split_region_at handle it.
-- The single root cause: task 133 (deniald main) **jumps to PC=1**
-  (EC=34 PC-alignment, elr=far=0x1) right after DrmDevice init + thread creation.
-  Everything after is fallout: exit_group marks the threads Dead, the reaper frees
-  the shared mmap_regions, and the still-running threads fault on unmapped
-  addresses (FAULT_RING coverage=NONE for those entries).
-- One boot also showed a kernel-initiated buffer fault (esr=0x40 synthetic from
-  back_user_pages) at 0x1dcd6000 (task 133) - inside the interpreter's image
-  area (MAIN_BIAS/INTERP_BIAS live below the mmap window). Not reproducible on
-  every boot; SYNTH_RING (task, syscall x8, x0, x1, far) is in place to catch it.
-- Signal delivery is NOT the cause: an all-signals-dropped experiment reproduced
-  the same PC=1 (experiment reverted).
-- Bisection done: MODE_ATOMIC as a no-op still crashes (the commit path is
-  innocent), signal delivery dropped entirely still crashes (signals innocent),
-  so the corruption is in the DISCOVERY ioctls (GETPLANERESOURCES/GETPLANE/
-  OBJ_GETPROPERTIES/CREATE-GETPROPBLOB/GETRESOURCES-planes) or in how drm-rs
-  interprets their results. GETPLANE.flags now reports possible_crtcs=1 (drm-rs
-  treats a zero mask as an unassignable plane) - still crashes.
-- Next steps: (1) gdb-stub breakpoint on deniald's indirect call just before the
-  PC=1 fault to catch the corrupt target live; (2) or dump deniald's
-  GOT/vtables around 0x1 before the jump (pmemsave of the user heap at
-  0x41C90000 + image runs at 0x10000000/0x20000000); (3) or bisect discovery
-  handlers: stub OBJ_GETPROPERTIES to report zero properties, then
-  CREATEPROPBLOB, then GETPLANE, one per boot; (4) or compare with a real
-  drm-rs trace (RUST_LOG=debug shows smithay::backend::drm traces).
+**PC=1 SOLVED**: GETRESOURCES wrote 80 bytes into the caller's 64-byte
+drm_mode_card_res (the invented plane_id_ptr/count_planes tail) - the caller's
+saved LR was overwritten with count_planes=1. CardRes restored to 64 bytes.
+
+deniald now boots MUCH deeper, in order:
+1. seatd activation clean (SET_MASTER 0x641e/0x641f, VT ioctls, no errors)
+2. SET_CLIENT_CAP(ATOMIC) accepted; GET_CAP/GETRESOURCES ok
+3. OBJ_GETPROPS discovery: connector(1), crtc via id-fallback (drm-rs passes
+   uninitialized obj_type 0xcccccccc - resolved by id), plane(2) - all ok
+4. GETPROPERTY (0xC04064AA) implemented with drm-sys layout (prop_id @16,
+   name @24) and REAL uapi flag bits (RANGE=1<<1, ENUM=1<<3, BLOB=1<<4,
+   OBJECT=1<<6, SIGNED_RANGE=1<<7 - sequence numbers were wrong and broke
+   drm 0.14's property decoder, crashing values[0] on empty vecs)
+5. PRIME_HANDLE_TO_FD/FD_TO_HANDLE (0xC00C642D/E): dumb buffers export/import
+   through a memfd backed by the same contiguous frames - gbm_bo_get_fd works
+6. output discovery: "DRM connector added Virtual-1", "connected KMS output
+   1280x800", "Initializing drm surface (crtc 1:plane 2)"
+7. **EGL Initialized**: EGL 1.5, PLATFORM_GBM_KHR, Mesa via our GBM
+
+**Current stop**: ADDFB2 (0xC06864B8) and legacy ADDFB for the GBM scanout fb
+fail with a residual errno (unhandled -> stale EPERM), although the arg probe
+shows perfect input: handle=1, 1280x800, pitch=5120, XRGB8888. Legacy ADDFB
+now accepts 0xC01C64AE (drm-rs's 28-byte number) and any fourcc; `addfb_stage`
+telemetry (LAZY_FAIL[0]: marker 'FBST', handle, stage, w, h, pitch - stage 1
+= buffer() miss, stage 2 = geometry mismatch) was just added but NOT yet read.
+Next boot: read LAZY_FAIL after the failure (nm the ring, pmemsave, parse) and
+fix the rejected stage. Also on the list: VIRTGPU_GETPARAM returns u64::MAX
+for unknown params (should answer 0); Mesa may probe more params later.
+
+Debug rings available (all no_mangle, pmemsave-readable): IOC_RING, FAULT_RING,
+OBJP_RING (OBJ_GETPROPS args), PROPQ_RING (GETPROPERTY calls with names),
+LAZY_FAIL (ADDfB stage / unknown prop), MMAP_RING (mmap bookkeeping). Get
+addresses from nm after each rebuild; boot with
+`-monitor tcp:127.0.0.1:4445,server=on,wait=off` and
+`pmemsave 0x40000000 0x800000 dump.bin`.
+
 - After the loop is fixed: deniald should reach output discovery → Stage 3 (evdev
   /dev/input + udev /sys glue) → Stage 4 (screencopy-minimal as the first external
   client; the shell is embedded in Denial so the phoc accept gap may not matter).
