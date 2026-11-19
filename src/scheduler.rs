@@ -3580,7 +3580,41 @@ pub fn signal_trampoline() -> Option<usize> {
 /// copied and remapped, so the exception trampoline can retry the instruction.
 #[cfg(feature = "linux-abi")]
 pub fn cow_fault(address: usize, esr: u64) -> bool {
-    with_group_owner(|task| task.cow_fault(address, esr)).unwrap_or(false)
+    let result = with_group_owner(|task| task.cow_fault(address, esr));
+    // Region coverage telemetry for the fault ring: did the owner know about
+    // this page at all, and as a lazy region?
+    if let Some(task) = scheduler_manager().and_then(|manager| {
+        manager.tasks.iter().find(|task| task.id == current_tgid())
+    }) {
+        let page = address & !(PAGE_SIZE - 1);
+        let mut coverage = 0_u64;
+        for region in &task.mmap_regions {
+            let start = region.virtual_address;
+            let end = start + region.page_count * PAGE_SIZE;
+            if page >= start && page < end {
+                coverage = if region.lazy { 2 } else { 1 };
+                break;
+            }
+        }
+        crate::scheduler::region_cover_record(address, coverage, task.mmap_regions.len() as u64);
+    }
+    result.unwrap_or(false)
+}
+
+pub const REGION_COVER_LEN: usize = 32;
+pub static REGION_COVER_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut REGION_COVER: [[u64; 6]; REGION_COVER_LEN] = [[0; 6]; REGION_COVER_LEN];
+
+#[cfg(feature = "linux-abi")]
+pub fn region_cover_record(address: usize, coverage: u64, regions: u64) {
+    let index = REGION_COVER_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let task = current_task_id();
+    unsafe {
+        let ring = core::ptr::addr_of_mut!(REGION_COVER);
+        (*ring)[index % REGION_COVER_LEN] = [address as u64, coverage, regions, task, 0, 0];
+    }
 }
 
 /// Last COW-path decision, for the fault dump (console writes from exception
