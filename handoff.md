@@ -7526,3 +7526,45 @@ steps: check how libwayland's event loop waits (epoll_wait? ppoll?) and
 whether our epoll/ppoll wakes for the listener fd on the second pending
 connection; the tracing already in place prints pending transitions, so a
 run will show whether the kernel ever reports the new connection.
+
+### Denial integration: reality check (2026-11-19)
+
+Decision: drop phosh/phoc and adopt the **Denial** desktop environment
+(github.com/denialwm/denial, GPL-3.0) as the DE for the Linux ABI layer,
+following its architecture (Rust compositor core + embedded Flutter shell +
+bounded control protocols).
+
+Facts established:
+- Release v0.6.7 ships `denial-0.6.7-r1.apk` (Alpine), but that APK is
+  **x86_64 only** (e_machine=62). The aarch64 builds are glibc packages:
+  `denial-0.6.7-1-aarch64.pkg.tar.zst` (Arch ARM) and the arm64 deb/rpm.
+  deniald is static musl on Alpine with DT_NEEDED on libgcompat (glibc
+  shim), libgbm, libseat, libudev, libinput, libxkbcommon, libpulse,
+  linux-pam, ddcutil and its own libdenial-pthread-stack/resolver-bridge
+  shims; the Flutter engine is dlopened (libflutter_engine.so + libapp.so).
+- tools/build_alpine_denial.py builds a v3.24 image with the dependency
+  closure (gcompat seatd eudev mesa-egl mesa-gbm mesa libinput libxkbcommon
+  pulseaudio linux-pam ddcutil dbus) and unpacks the denial APKs; the x86_64
+  binaries obviously cannot run on aarch64, so the next build needs the
+  aarch64 glibc packages staged into the image (ld-linux + glibc + the same
+  dependency set from Debian arm64/Arch ARM), which the project already did
+  once for Phosh (the Arch-staged tree).
+- Kernel substrate that ALREADY exists: /dev/dri/card0 with dumb buffers,
+  ADDFB/ADDFB2, page flips, vblank read events (drm.rs), /dev/dri/renderD128
+  in the synthetic dir, PRIME fd export, /dev/gpufb scanout, Mesa loader
+  shim (tests/linux/drm_shim.c).
+- Kernel gaps for deniald: (1) DRM atomic commit - Volition submits atomic
+  plane requests, our card only has legacy SetCRTC/PageFlip; (2) evdev input
+  - /dev/input/event* does not exist (no virtio-input driver, no evdev read
+  format); (3) udev glue - libinput/eudev enumerate through /sys and
+  uevents; (4) seatd session - DRM master handoff (drmSetMaster) and
+  /dev/input ownership; (5) EGL/GLES - Impeller renders through llvmpipe on
+  GBM (mesa), which our dumb-buffer GBM + drm_shim should satisfy once Mesa
+  runs.
+
+Staged plan: (1) stage an aarch64 glibc runtime + denial package set into
+the SFS (deb/pkg unpacker; Python 3.14 has zstd); (2) kernel DRM atomic on
+top of the existing page-flip; (3) evdev + udev glue + seatd; (4) deniald
+boot with logs; (5) screencopy-minimal as the first external client (the
+shell is embedded, so we may be the only client and the phoc accept bug may
+not bite).
