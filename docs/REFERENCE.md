@@ -19,8 +19,9 @@ Active vector (see [`VECTOR.md`](VECTOR.md)):
 
 - console OS on QEMU/desktop;
 - a browser in a separate window rendered by a Qt host over a shared surface;
-- **Linux ABI + Phosh** as the active long-term goal (owner decision:
-  months, not years), with a software-rendered headless Wayland path.
+- **Linux ABI + Denial DE** as the active long-term goal (owner decision
+  2026-11-19: phosh/phoc parked; the desktop is denialwm's deniald, rendered
+  through our DRM/KMS with Mesa software rendering).
 
 The Legion Y700 tablet target is forgotten. The Redmi port is parked.
 
@@ -95,10 +96,12 @@ describes a supported build.
    find-in-page, persistent bookmarks, host zoom and one-field GET/POST forms
    work; PNG/JPEG/GIF images are decoded in-guest with stb_image. JavaScript,
    media, larger reader/CSS budgets and full-page layout do not yet; the Linux
-   ABI/Phosh track brings a WebKit/Gecko-class engine for those and for YouTube.
-6. **Linux ABI/Phosh are not started.** The kernel personality layer, static
-   musl binaries, headless Wayland and the Phosh stack are the active
-   long-term track; see [`VECTOR.md`](VECTOR.md).
+   ABI/Denial track brings a WebKit/Gecko-class engine for those and for YouTube.
+6. **Linux ABI is deep, the Denial DE is in progress.** The kernel personality
+   layer runs static and dynamic glibc binaries, GLib/GIO, Wayland compositors
+   (phoc historically; now deniald) and real Mesa/EGL. The active long-term
+   track is the Denial DE campaign; see [`VECTOR.md`](VECTOR.md) and
+   `handoff.md` "2026-11-20".
 7. **Unix toolbox, first layer done.** A multi-call `utils` ELF provides
    `grep`, `wc`, `head`, `tail`, `cp`, `find`, `seq`, `basename`, `dirname`,
    `true`, `false` and `sleep`; `ls`, `cat`, `echo`, `say`, `sl` remain
@@ -134,11 +137,14 @@ network driver reports a probe failure and the shell continues.
 
 ## Next work
 
-1. Harden TLS: more roots, RTC-backed certificate time, a real entropy source
+1. Denial DE campaign (active): resolve the systemd-crate `isatty_safe(fd=13)`
+   abort, reach the deniald render loop with the Flutter shell on the virtio-gpu
+   scanout, then evdev/libinput input, then screencopy-minimal as the first
+   external Wayland client (details in `handoff.md` "2026-11-20").
+2. Harden TLS: more roots, RTC-backed certificate time, a real entropy source
    and a TLS 1.2 fallback.
-2. Wolfser: larger reader/CSS budgets, full forms/widgets, keep-alive and
+3. Wolfser: larger reader/CSS budgets, full forms/widgets, keep-alive and
    damage rectangles.
-3. Window transport on real hardware (host-side streaming or a local console).
-4. Linux ABI: static musl binaries, then busybox `sh`.
-5. Phosh: headless Wayland, GTK software render, D-Bus + logind stub, `phosh`.
-6. Parked: QEMU PSCI shutdown, fog TLB proof, GENI UART on `rain`, tablet.
+4. Window transport on real hardware (host-side streaming or a local console).
+5. Parked: phosh/phoc, QEMU PSCI shutdown, fog TLB proof, GENI UART on `rain`,
+   tablet.

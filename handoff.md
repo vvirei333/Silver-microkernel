@@ -7674,3 +7674,150 @@ addresses from nm after each rebuild; boot with
 - After the ADDFB fix: deniald should reach the render loop → Stage 3 (evdev
   /dev/input + udev /sys glue) → Stage 4 (screencopy-minimal as the first external
   client; the shell is embedded in Denial so the phoc accept gap may not matter).
+
+## 2026-11-20 — deniald full-DE boot campaign (TestOnly broken through)
+
+Started from the 2026-11-19 "Current stop" (ADDFB2 rejected for the GBM
+scanout fb). Closed it and then chased deniald's startup all the way to the
+systemd-crate tty assertion. deniald now reaches **Wayland socket creation**
+("Created new socket wayland-1") and the portal IPC server
+("Denial portal IPC listening path=/tmp/denial/portal.sock").
+
+### DRM fixes (closed the 11-19 stop)
+
+1. **ADDFB bug 1 - swapped layouts**: the handler extracted args from FbCmd
+   (legacy) for ADDFB2 and from FbCmd2 for legacy ADDFB. For ADDFB2 that read
+   `handles[1]` (always 0 for GBM) as the buffer handle -> stage-1 miss.
+   Fixed: ADDFB2 loads FbCmd2, legacy loads FbCmd.
+2. **ADDFB bug 2 - exact geometry equality**: Mesa's GBM aligns the bo height
+   (800 -> 832 rows) while the fb keeps 800, so `width/height/pitch ==` failed
+   (stage 2). Real DRM has no dumb-geometry record for a GEM handle - it only
+   requires the backing storage to fit. Fixed: capacity check
+   `pitch * height <= entry.pages * 4096`.
+   (Confirmed by reading BUFFERS from a pmemsave dump; note `struct Dumb` has
+   no `#[repr(C)]`, so Rust reordered the fields: pa@0, pages@8, handle@16,
+   generation@20, width@24...)
+3. **CLOSEFB (0xC00864D0)**: drm-rs 0.14 closes framebuffers through CLOSEFB
+   before falling back to RMFB. Same 4-byte fb id arm as RMFB now.
+4. **MODE_ATOMIC objs layout**: the atomic uapi passes a PLAIN u32 object-id
+   array - no (id, type) pairs (types only appear in OBJ_GETPROPS/SETPROP).
+   drm-rs sends raw handles straight through (verified in drm-ffi/src/mode.rs
+   `atomic_commit`). The old validator read 8-byte pairs and glued (crtc=1,
+   plane=2) into (id=1, type=2) -> ENOENT. Both validation and apply passes
+   now read 4-byte ids and resolve by id only.
+5. VIRTGPU_GETPARAM unknown params answer value=0 instead of u64::MAX.
+
+### deniald CLI (why TestOnly)
+
+`options.rs runtime_limit()`: TestOnly unless `--flutter-bundle` is passed
+(then UntilLogout), and `--flutter-bundle requires --wayland`. The binary was
+built with the xwayland feature, and Xwayland is not staged, so the session
+line is now:
+
+```
+LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu /usr/bin/deniald --flutter-bundle /usr/lib/denial/flutter --wayland --no-xwayland > /tmp/deniald.log 2>&1
+```
+
+boot-session also runs `/usr/sbin/seatd` (Debian path) and `mkdir /run/seatd`
+(plain mkdir - busybox `mkdir -p` hits a stat('/') quirk on the SFS root).
+
+### Kernel syscalls/features added for the glibc DE stack
+
+- **signalfd4 (74)**: Target::SignalFd {mask, queued, nonblock}; raise()
+  routes matching signals into the fd before the pending bit (fd tables are
+  locked and released BEFORE the signal table - no nesting); read drains
+  128-byte signalfd_siginfo records; poll ready = queue non-empty. Needed by
+  calloop's Signals::new - deniald's first `?`.
+- **fsync/fdatasync (82/83) -> 0** (RAM-backed scratch VFS; nothing to flush).
+  Was ENOSYS -> "shortcut file I/O failed" fatal.
+- **rt_sigtimedwait (137)**: dequeue one pending signal from the set, with a
+  bounded poll/sleep loop, EAGAIN on timeout.
+- **SOCK_SEQPACKET (5)** accepted for AF_UNIX socket() (socketpair already
+  accepted it). deniald's portal IPC creates one.
+- **Socket namespace stat/unlink**: bound AF_UNIX listeners live only in the
+  kernel LISTENERS registry (no VFS node). deniald stats/chmods/unlinks the
+  portal socket path right after binding: `listener_exists`/`listener_unlink`
+  in linux_fd, stat_resolved reports S_IFSOCK for listener paths, unlinkat
+  removes from the registry.
+- **AF_NETLINK (16) stub**: socket(AF_NETLINK, SOCK_RAW/DGRAM, 15 = uevent) ->
+  Target::Netlink; bind -> 0 (before read_sockaddr!), send -> Ok, read ->
+  EAGAIN, poll -> 0. libudev's udev monitor.
+- **inotify stub**: init1 (26), add_watch (27) -> monotonic wd, rm_watch (28).
+  No events are ever queued.
+- **sched**: setscheduler (119) / getscheduler (120) / setattr (274) /
+  getattr (275, capped size 256) - SCHED_OTHER; setparam (142) -> 0;
+  setpriority/getpriority (140/141) -> 0; clock_adjtime (264) -> 0.
+- **procfs**: /proc/self/maps (Dart VM reads it at startup - open used to fall
+  through to VFS EACCES and kill deniald before its logger was up),
+  /proc/self/environ, /proc/cpuinfo (llvmpipe), /proc/sys/kernel/osrelease.
+  Unknown /proc/* and /sys/* now return clean ENOENT (open, statx,
+  faccessat) instead of the VFS EACCES.
+- **mkdirat/unlinkat errno**: missing parent -> ENOENT (Rust create_dir_all
+  only recurses on ENOENT; EACCES aborted xcursor_sentinel's theme setup);
+  failed unlink -> ENOENT.
+- **/dev listings**: "/dev" DirList (dri, input, shm, null, zero, full,
+  urandom, random, console, tty0, tty1), "/dev/input" DirList (empty until
+  the evdev stage), synthetic_device_stat reports the dir roots as S_IFDIR.
+- **Group-kill on signals (major)**: linux_kill for a default-terminating
+  signal against SELF used exit_current_with_status - killed only the current
+  thread. glibc abort() -> tgkill -> the leader died alone while sibling
+  threads kept running on the shared address space -> "MMU: destroy refused,
+  space still running on a CPU" leak + sibling faults on dead pages. Fixed:
+  self-kill goes through exit_group; linux_signal::terminate() too; exit_group
+  sends `smp::ipi_reschedule_others()` after marking siblings Dead.
+- FAIL_RING (no_mangle, pmemsave-readable): every EACCES / ENOSYS /
+  EPROTONOSUPPORT / EAFNOSUPPORT syscall failure with (nr, errno, args 0-2,
+  first 24 path bytes). This is what made the whole campaign tractable.
+
+### Debug tooling
+
+- `tools/boot_dump.py` (NEW): boots the denial image, sends
+  `linuxrun /sfs/sbin/init`, waits for the `DENIAL: log end` marker, then
+  stops the VM and pmemsave's 0x40000000..0x48000000 through the monitor on
+  port 4445. Usage: `python -I tools/boot_dump.py --dump build/fbstN.bin
+  --log build/denial-bootNN.log --timeout 150`. Serial log + rings.
+- The console DROPS bytes under load. deniald's stderr now goes to
+  /tmp/deniald.log and boot-session `cat`s it after exit (with sleep 2) - the
+  replay reaches serial while the system is quiet. This is how the fatal
+  messages are captured reliably.
+- nm the ring addresses after EVERY rebuild (FAIL_RING moved twice today).
+
+### Where it stopped (current stop, next session's first job)
+
+deniald's stderr ends with:
+
+```
+INFO smithay::backend::drm::device: DrmDevice initializing
+Assertion 'errno != EBADF || IN_SET(fd, STDIN_FILENO, STDOUT_FILENO,
+STDERR_FILENO)' failed at src/basic/terminal-util.c:76, function
+isatty_safe(). Aborting.
+```
+
+The kernel console shows `IOC-EBADF fd=13 req=0x5401` (TCGETS) right before
+the abort: some code (systemd-crate glue inside deniald, exact crate/caller
+not identified) calls `isatty_safe(fd=13)`; fd 13 is not open in our kernel ->
+EBADF -> the assert (EBADF is only tolerated for fds 0-2) aborts the process
+(SIGABRT, clean group kill now - no more thread-fault dumps).
+
+Ideas for next session:
+1. Identify the caller: isatty_safe is systemd's C terminal-util, linked
+   through some deniald dependency (compositor/Cargo.toml grep showed nothing;
+   check Cargo.lock or the binary's strings for neighboring symbols).
+2. Figure out what fd 13 SHOULD be - some fd the real stack holds that ours
+   does not (libseat? epoll? journal?). Trace deniald's fd allocation.
+3. Pragmatic dodge (weigh carefully): return ENOTTY instead of EBADF from
+   ioctl on an unopened fd - the assert passes (errno != EBADF) and isatty
+   returns 0. Semantic lie for genuinely-bad fds; keep the IOC-EBADF trace.
+
+Before that fatal, the previous boot's flow had already created the Wayland
+socket ("Created new socket wayland-1" via smithay) - so after the assertion
+is solved, the compositor should reach the KMS scanout / render loop quickly.
+
+### Queued after the current stop
+
+- Stage 3: evdev /dev/input/event* + udev /sys/class/input glue so libinput
+  finds devices (currently /dev/input is an empty dir).
+- Stage 4: screencopy-minimal as the first external Wayland client.
+- Cleanup: LAZY_FAIL markers (FBST/ATMI/ATMV/SPDI), FAIL_RING, IOC-EBADF
+  traces, /dev open prints - remove once deniald is stable.
+- procfs.rs:157 unreachable-pattern warning (cpuinfo arm placement) - tidy.

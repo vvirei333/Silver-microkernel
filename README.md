@@ -10,20 +10,22 @@ interfaces, capability model, SFS format and userspace are original.
 capabilities, limits, the full Linux ABI test matrix and the next steps.
 
 Active target: QEMU `virt` (ARM Virt Board), Cortex-A72, developed from a
-Linux desktop. The product is a **console OS that provides the base OS**
+Windows/Linux desktop. The product is a **console OS that provides the base OS**
 (kernel, drivers, network, files); applications — including the browser — come
-from Linux through the compatibility layer. **Linux ABI + Phosh is the active
-long-term goal** (owner decision: months, not years). The Legion Y700 tablet
-target is forgotten; the Redmi 10C hardware port is parked until the OS layer
+from Linux through the compatibility layer. **Linux ABI + Denial DE is the
+active long-term goal** (owner decision 2026-11-19: the phosh/phoc stack is
+parked; the desktop is Denial — denialwm's Smithay+Flutter compositor).
+The Legion Y700 tablet target is forgotten; the Redmi 10C hardware port is
+parked until the OS layer
 is ready (see [redmi10c_poc/README.md](redmi10c_poc/README.md)).
 
-## Project direction (2026-11-09)
+## Project direction (updated 2026-11-20)
 
 The project is a **console-first OS that provides the base OS**: kernel,
 drivers, networking, files and basic operations stay native. Applications —
 including the browser — come **from Linux through a compatibility layer**
-instead of being rewritten in the native userspace. **Linux ABI + Phosh is the
-active goal**; Wolfser is a temporary browser (a stopgap) and is not the
+instead of being rewritten in the native userspace. **Linux ABI + Denial DE is
+the active goal**; Wolfser is a temporary browser (a stopgap) and is not the
 product path.
 
 Active vector:
@@ -33,10 +35,13 @@ Active vector:
 2. **Linux ABI module**: an optional (`linux-abi`) layer that loads foreign
    AArch64 ELFs, implements the Linux syscall personality and maps it onto our
    VFS and drivers. With the feature off, none of it is linked in.
-3. **Phosh**: a software-rendered headless Wayland stack on top of the Linux
-   layer, exported into a host window. The Linux root is **Alpine** (musl,
-   OpenRC, apk); `/sbin/init` → OpenRC → Phosh boots from a single SFS image
-   ([docs/ALPINE_OPENRC.md](docs/ALPINE_OPENRC.md)).
+3. **Denial DE**: the desktop compositor is `deniald` (Smithay + embedded
+   Flutter shell), driven through our DRM/KMS (virtio-gpu) with Mesa
+   software rendering. The Linux root mixes Alpine (boot chain) with a
+   Debian trixie arm64 glibc runtime (`tools/build_glibc_denial.py`);
+   phosh/phoc images and tooling stay in the tree but are parked
+   ([docs/ALPINE_OPENRC.md](docs/ALPINE_OPENRC.md),
+   [docs/STATUS.md](docs/STATUS.md)).
 
 Wolfser (the guest litehtml browser in the host-Qt window) remains available
 so pages can be viewed before the Linux stack is ready, but it is frozen
@@ -57,16 +62,17 @@ enemies of this project — they are proof it worked.
 Reference device: **Redmi 10C (SM6225)** — the first phone target once the OS
 layer is ready (parked for now, see `redmi10c_poc/`).
 
-## Demo — Phosh on the Silver microkernel
+## Demo — Phosh on the Silver microkernel (0.1.2 milestone)
 
 ![WerewolfOS 0.1.2 demo](assets/demo-0.1.2.gif)
 
-30 seconds of the real desktop: the Phosh lock screen, unlock, the app grid,
-type-ahead search, launching the GTK Terminal and running `ls /sfs`. The
-frames are the pixels the kernel published into the host window (software
-rendering, 1024×768); `tools/demo.py` reproduces the run and re-records it.
-A higher-quality [MP4](assets/demo-0.1.2.mp4) and a
-[still](assets/demo-0.1.2-terminal.png) are in `assets/`.
+30 seconds of the real desktop from the 0.1.2 milestone: the Phosh lock
+screen, unlock, the app grid, type-ahead search, launching the GTK Terminal
+and running `ls /sfs`. The frames are the pixels the kernel published into the
+host window (software rendering, 1024×768); `tools/demo.py` reproduces the run
+and re-records it. A higher-quality [MP4](assets/demo-0.1.2.mp4) and a
+[still](assets/demo-0.1.2-terminal.png) are in `assets/`. The active desktop
+track is now Denial DE (see the direction section above).
 
 ## Screenshot
 

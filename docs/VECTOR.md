@@ -1,4 +1,4 @@
-# Вектор проекта — активный статус (2026-11-08)
+# Вектор проекта — активный статус (2026-11-20)
 
 Этот документ — источник истины о направлении. Технические детали — в
 [`REFERENCE.md`](REFERENCE.md) и [`ARCHITECTURE.md`](ARCHITECTURE.md).
@@ -21,9 +21,9 @@
 - **Сеть — наша, в консоли.** `net_server`/smoltcp (DHCP, DNS, TCP, HTTP,
   TLS) остаётся базовой возможностью ОС; Linux-приложения получают её через
   слой совместимости.
-- **Linux ABI + Phosh — активная цель.** Горизонт — **месяцы** (решение
-  владельца проекта). Ниже — узкий технический срез, который делает это
-  достижимым.
+- **Linux ABI + Denial DE — активная цель** (решение 2026-11-19: phosh
+  брошен, прикладной DE — Denial/denialwm, Smithay+Flutter). Горизонт —
+  **месяцы**. Ниже — узкий технический срез, который делает это достижимым.
 
 ## 1. Консоль (база)
 
@@ -117,34 +117,44 @@ Linux-номер syscall (x8) и транслирует в VFS/память/IPC.
 Acceptance: busybox `ls/cat/sh` и статический `hello` работают без
 Silver-специфичных патчей.
 
-## 4. Phosh (активная цель, месяцы)
+## 4. Denial DE (активная цель, месяцы)
 
-Ключевой приём: **Phosh без GPU и DRM** на первом этапе.
+**Пивот 2026-11-19:** phosh/phoc брошены (upstream-баги, GTK-стек тяжёлый).
+Прикладной DE — **Denial (denialwm/denial)**: Wayland-композитор на Smithay,
+шелл — Flutter, встроенный в процесс композитора (deniald). Скриншот-путь
+не нужен: рендер идёт через наш DRM (virtio-gpu) → scanout.
 
-- **Wayland-композитор**: `phoc`/`wlroots` с headless или pixman-бэкендом;
-  композитный кадр уходит в общий буфер → host Qt-окно.
-- **Рендер приложений**: GTK/Cairo в software-режиме; GPU/EGL не требуется
-  для первого запуска.
-- **D-Bus**: `dbus-broker` или совместимый демон; минимум для GNOME-сервисов.
-- **systemd/logind**: заглушка-сервис с нужным D-Bus-интерфейсом
-  (Phosh не требует полного systemd для базового запуска).
-- **Ввод**: host input ring → Wayland seat (libinput-совместимый слой).
-- **Сеть**: наш net_server + DHCP/DNS; NetworkManager можно заменить
-  заглушкой на первом этапе.
+- **Стек**: Alpine edge boot chain + Debian trixie arm64 glibc-рунтайм
+  (mesa/llvmpipe, seatd, libinput, glib) + denial aarch64 пакеты;
+  образ `build/werewolf-alpine-glibc-denial.img`, билдер
+  `tools/build_glibc_denial.py`, резолвер `tools/debian_repo.py`.
+- **deniald** запускается с `--flutter-bundle /usr/lib/denial/flutter
+  --wayland --no-xwayland` (без бандла — RuntimeLimit::TestOnly, выход после
+  self-теста).
+- Ядро получило большой glibc-компат-слой: signalfd, inotify, fsync,
+  rt_sigtimedwait, SOCK_SEQPACKET, AF_NETLINK-стаб (udev monitor),
+  sched_*/priority, procfs maps/environ/cpuinfo, mkdirat-ENOENT семантика,
+  socket-namespace stat/unlink, group-kill при терминирующих сигналах,
+  полный DRM atomic UAPI (SET_CLIENT_CAP, planes, properties, blobs,
+  CLOSEFB, PRIME export/import, ADDFB2).
+- **Текущий статус**: deniald доходит до "Created new socket wayland-1"
+  (Wayland-сервер) и "DrmDevice initializing"; текущий стоп — assert
+  systemd-crate `isatty_safe(fd=13)` → EBADF (fd не открыт у нас). Детали и
+  методики — в `handoff.md` "2026-11-20".
 
 Вехи:
 
 | Веха | Результат |
 | --- | --- |
-| P1 | Linux ABI: busybox `sh` |
-| P2 | headless Wayland-композитор рисует тестовое окно в host-окно |
-| P3 | GTK3-приложение рисуется через software-рендер |
-| P4 | D-Bus + заглушка logind, запуск `phosh` |
-| P5 | Phosh shell + базовые приложения, ввод с хоста |
+| P1 | Linux ABI: busybox `sh`, glibc-бинарники |
+| P2 | deniald проходит seatd/DrmDevice/EGL (llvmpipe) |
+| P3 | deniald доходит до Wayland-сокета и KMS-сканаута (текущая точка) |
+| P4 | render loop + Flutter-шелл на экране; ввод (evdev/libinput) |
+| P5 | screencopy-minimal как первый внешний Wayland-клиент |
 
-Риски (не отменяют цель): семантика D-Bus/systemd, динамический линкер и
-glibc-поведение, корректность futex/потоков, производительность software-
-рендера, ввод. Каждый риск закрывается своей вехой.
+Риски: glibc-поведение (треды/exit_group/futex), системная интеграция deniald
+(systemd-crate, portal IPC, D-Bus), ввод через udev/evdev, производительность
+llvmpipe. Каждый риск закрывается своей вехой; диагностика — кольца + pmemsave.
 
 ## 4a. Референс: Veda (только архитектура)
 
@@ -170,19 +180,22 @@ glibc-поведение, корректность futex/потоков, про�
 - **Legion Y700 / SM8650**: профиль `tablet` собирается, но не развивается.
 - **Redmi 10C / fog**: RAM-only порт остаётся задокументированным
   ([`PORTING_FOG.md`](PORTING_FOG.md)), но активная работа — сначала
-  QEMU/десктоп и Linux ABI/Phosh.
+  QEMU/десктоп и Linux ABI/Denial.
+- **Phosh/phoc**: брошены 2026-11-19 (upstream phoc 0.55.1 heap corruption
+  и тяжёлый GTK-стек); образы и наработки сохранены, не развиваются.
 - **Своя графика/композитор**: удалены; окно — только host Qt + один surface.
 
 ## 6. Ближайший порядок работ
 
-1. **Linux ABI + Phosh** — единственный путь к браузеру и приложениям:
-   - [сделано] статические glibc-бинарники, файловые сисколлы, fd-модель,
-     `/dev`, мелкие сисколлы libc;
-   - дальше `pipe2`/`ppoll`/`eventfd`/`memfd` + `futex`/`rt_sigaction`;
-   - затем `ET_DYN` + `ld.so`, rootfs и busybox `sh`;
-   - затем headless Wayland → GTK → D-Bus → `phosh`.
+1. **Denial DE** — единственный путь к браузеру и приложениям:
+   - [сделано] Linux ABI (статика+динамика glibc), файлы, треды, futex,
+     Wayland/D-Bus транспорт, полный DRM atomic, glibc-компат-слой;
+   - [сделано] deniald проходит seatd → DrmDevice → EGL → Wayland-сокет;
+   - дальше: assert `isatty_safe(fd=13)` (текущий стоп, см. handoff.md);
+   - затем: render loop/Flutter-шелл, evdev/libinput ввод;
+   - затем: screencopy-minimal как первый внешний клиент.
 2. Сеть как база ОС: keep-alive, больше корней TLS, RTC/энтропия. Это
    обслуживание базы, не прикладной слой.
 3. Wolfser: только поддержка current-состояния (багфиксы), без новых
    функций. Собственный минимальный браузер в host-окне — не развиваем.
-4. Парковка: планшет, Redmi, своя графика/композитор.
+4. Парковка: планшет, Redmi, phosh, своя графика/композитор.

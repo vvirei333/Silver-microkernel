@@ -1,10 +1,12 @@
-# WEREWOLFOS / SILVER KERNEL — МАСТЕР-ПЛАН (2026-11-14)
+# WEREWOLFOS / SILVER KERNEL — МАСТЕР-ПЛАН (2026-11-14; вектор обновлён 2026-11-20)
 
 **Вектор проекта:** консольная ОС = свой базовый слой (микроядро Rust AArch64,
 capability-модель, SFS, сеть, Howl) + Linux ABI (userspace-процесс, НЕ VM) +
-Phosh. Reference device: **Redmi 10C (SM6225)**. Лицензия MIT. Философия:
-форки/копии = валидация. Конечная амбиция: самостоятельная 3-я категория
-мобильных ОС + RISC-V.
+**Denial DE** (пивот 2026-11-19: phosh/phoc брошены, прикладной DE —
+denialwm/denial, Smithay+Flutter; детали в `docs/VECTOR.md` и
+`handoff.md` "2026-11-20"). Reference device: **Redmi 10C (SM6225)**.
+Лицензия MIT. Философия: форки/копии = валидация. Конечная амбиция:
+самостоятельная 3-я категория мобильных ОС + RISC-V.
 
 ## ПРИНЦИПЫ ДЛЯ ИСПОЛНИТЕЛЯ (обязательные)
 
@@ -20,7 +22,11 @@ Phosh. Reference device: **Redmi 10C (SM6225)**. Лицензия MIT. Фило�
 
 ---
 
-## M0. ЗАКРЫТЬ PHOSH-БЛОКЕРЫ (текущее, 1-2 недели)
+## M0. ЗАКРЫТЬ PHOSH-БЛОКЕРЫ
+
+> **ЗАКРЫТО/ОБСОЛЕТЕЛО (2026-11-19):** CRITICAL — upstream-баг phoc 0.55.1,
+> подтверждён чистым бутом edge-образа; phosh брошен, вектор — Denial DE.
+> Раздел ниже — исторический.
 
 **M0.1 — CRITICAL stacked-surface** (`phoc-output-CRITICAL: Stacked surface ... not in same layer`)
 

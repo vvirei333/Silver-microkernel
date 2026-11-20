@@ -1,12 +1,18 @@
 # WerewolfOS — current project status
 
-_Last refreshed: 2026-11-15 (release 0.1.2: Phosh desktop, M0 closed)._
+_Last refreshed: 2026-11-20 (Denial DE campaign; release 0.1.2 remains the
+last tagged milestone)._
 
 WerewolfOS is a native AArch64 console microkernel with its own drivers, VFS,
-network stack and shell. Linux programs — including a real `libwayland-client`
-and stock distro binaries — run through an **optional `linux-abi` module**.
-Removing that Cargo feature leaves no Linux loader or syscall code in the
-kernel binary.
+network stack and shell. Linux programs — including real desktop stacks
+(libwayland, Mesa/EGL, GTK, Smithay-based compositors) — run through an
+**optional `linux-abi` module**. Removing that Cargo feature leaves no Linux
+loader or syscall code in the kernel binary.
+
+**Direction (2026-11-19):** the desktop layer is **Denial (denialwm)** — a
+Smithay+Flutter Wayland compositor (`deniald`) — replacing the parked
+phosh/phoc stack. See `docs/VECTOR.md` and `handoff.md` "2026-11-20" for the
+campaign state.
 
 ## Architecture
 
@@ -95,23 +101,47 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   (`SIMPLEFB TEST PASS 128x96`). Pure canvas is host-tested. No EL0 API or
   compositor yet; hardware photo is tomorrow's Redmi step.
 
-### Phosh desktop
+### Phosh desktop (parked 2026-11-19)
 
-- The real postmarketOS stack runs on the Linux ABI: **phoc 0.57** (Wayland
+- The real postmarketOS stack ran on the Linux ABI: **phoc 0.57** (Wayland
   compositor) and **Phosh 0.57** (GTK3 shell), software-rendered with the
   pixman renderer (GL disabled).
 - Nested 1024×768 scanout published into the host window through ivshmem; the
   repo's proxy (`tests/linux/wayland_real.c`, `SERVE_PHOC`) serves the nested
   compositor.
-- Works end to end: lock screen, unlock, app grid, type-ahead search, launching
-  a GTK Terminal, typing and running commands.
-- Lock-screen background is painted from the same night-sky wallpaper through
-  a GTK3 CSS file seeded by `phosh-serve` (0.1.3 fix; 0.1.2 had a black lock
-  screen). Screenshot: `assets/lockscreen-0.1.3.png`.
+- Worked end to end: lock screen, unlock, app grid, type-ahead search,
+  launching a GTK Terminal, typing and running commands.
 - Demo: `assets/demo-0.1.2.gif`, reproducible with `tools/demo.py`.
-- Known cosmetic gaps: the host cursor is not drawn, and the overview fold
-  still logs the upstream `Stacked surface … not in same layer` CRITICAL (the
-  same message appears on PureOS phones).
+- **Parked**: the upstream phoc 0.55.1 heap corruption (resolved as an
+  upstream bug on 2026-11-18) plus the heavy GTK stack led to the Denial
+  pivot below; the images and tooling stay in the tree, nothing develops.
+
+### Denial DE campaign (2026-11-19/20, active)
+
+- **Denial (denialwm/denial)**: Smithay-based Wayland compositor with an
+  embedded Flutter shell (`deniald`). Image
+  `build/werewolf-alpine-glibc-denial.img`: Alpine edge boot chain + Debian
+  trixie arm64 glibc runtime (mesa/llvmpipe, seatd, libinput, glib) + denial
+  aarch64 packages. Builders: `tools/build_glibc_denial.py` +
+  `tools/debian_repo.py`.
+- deniald 0.6.7 boots in full-DE mode (`--flutter-bundle
+  /usr/lib/denial/flutter --wayland --no-xwayland`; without the bundle it
+  intentionally runs a TestOnly self-test and exits): seatd activation →
+  DRM atomic discovery → **EGL Initialized / GLES 3.2 llvmpipe** → portal
+  IPC listening → **Wayland socket created** → DrmDevice initializing.
+- The kernel grew a large glibc-compat layer for this: signalfd4, fsync,
+  rt_sigtimedwait, SOCK_SEQPACKET, an AF_NETLINK stub for libudev, inotify,
+  sched_*/priority set, procfs maps/environ/cpuinfo/osrelease, mkdirat
+  missing-parent→ENOENT semantics, socket-namespace stat/unlink,
+  **group-kill on terminating signals** (self-kill → exit_group), and a
+  complete DRM atomic UAPI (planes, properties, blobs, CLOSEFB, PRIME
+  export/import, ADDFB2 with real DRM capacity semantics).
+- **Current stop**: a systemd-crate assertion inside deniald —
+  `isatty_safe(fd=13)` gets EBADF from our kernel (fd not open) and aborts.
+  Diagnosis and the fix plan are in `handoff.md` "2026-11-20".
+- Debugging method: `no_mangle` static rings (FAIL_RING, IOC_RING,
+  FAULT_RING, LAZY_FAIL) read through QEMU monitor `pmemsave`; helper
+  `tools/boot_dump.py` boots, dumps and replays deniald's stderr after exit.
 
 ### D-Bus
 - EXTERNAL auth (`SO_PEERCRED`), `Hello` method call, method return, signals.
