@@ -48,6 +48,21 @@ const SYS_CHDIR: u64 = 49;
 const SYS_OPENAT: u64 = 56;
 const SYS_PIPE2: u64 = 59;
 const SYS_PPOLL: u64 = 73;
+const SYS_SIGNALFD4: u64 = 74;
+const SYS_FSYNC: u64 = 82;
+const SYS_FDATASYNC: u64 = 83;
+const SYS_RT_SIGTIMEDWAIT: u64 = 137;
+const SYS_SCHED_SETPARAM: u64 = 142;
+const SYS_SCHED_SETSCHEDULER: u64 = 119;
+const SYS_SCHED_GETSCHEDULER: u64 = 120;
+const SYS_INOTIFY_INIT1: u64 = 26;
+const SYS_INOTIFY_ADD_WATCH: u64 = 27;
+const SYS_INOTIFY_RM_WATCH: u64 = 28;
+const SYS_SET_PRIORITY: u64 = 140;
+const SYS_GET_PRIORITY: u64 = 141;
+const SYS_SCHED_GETATTR: u64 = 275;
+const SYS_SCHED_SETATTR: u64 = 274;
+const SYS_CLOCK_ADJTIME: u64 = 264;
 const SYS_CLOSE: u64 = 57;
 const SYS_LSEEK: u64 = 62;
 const SYS_READ: u64 = 63;
@@ -256,29 +271,78 @@ const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
 /// `struct stat` mode classes.
 const S_IFLNK: u32 = 0o120000;
 const S_IFCHR: u32 = 0o020000;
+const S_IFSOCK: u32 = 0o140000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
 
+/// Watch ids for the inotify stub.
+static INOTIFY_WD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
+
+/// `sched_getattr(2)`: SCHED_OTHER, no runtime constraints. The caller's
+/// size field is untrusted - a kernel Vec with a user capacity would panic
+/// the allocator, so anything past the struct cap reports EINVAL.
+fn linux_sched_getattr(attr_pointer: u64, size: u64) -> u64 {
+    if attr_pointer == 0 || size < 48 || size > 256 {
+        return errno(EINVAL);
+    }
+    let mut attr = alloc::vec![0_u8; size as usize];
+    attr[0..4].copy_from_slice(&((size as u32).to_le_bytes())); // size
+    attr[4..8].copy_from_slice(&0_u32.to_le_bytes()); // SCHED_OTHER
+    if user_memory::copy_to_user(&attr, attr_pointer).is_err() {
+        return errno(EFAULT);
+    }
+    0
+}
+
 /// Dispatches one Linux syscall. `frame` is the saved register bank, so
 /// `frame[0..6]` are `x0..x5` and `frame[8]` is the number in `x8`.
+/// EACCES failures (number, flags, path[48 bytes]) for pmemsave parsing -
+/// the console drops prints under load, the ring does not. Only EACCES is
+/// kept so the idle boot loop does not overwrite the interesting failures.
+pub const FAIL_RING_LEN: usize = 32;
+static FAIL_RING_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut FAIL_RING: [[u64; 8]; FAIL_RING_LEN] = [[0; 8]; FAIL_RING_LEN];
+
 pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
-    #[cfg(feature = "linux-abi-trace")]
-    {
-        let number = frame[8];
-        let result = dispatch_body(frame);
-        if (result as i64) < 0 && result != errno(ENOSYS) {
+    let number = frame[8];
+    let result = dispatch_body(frame);
+    if (result as i64) < 0 {
+        let code = (result as i64).unsigned_abs();
+        #[cfg(feature = "linux-abi-trace")]
+        {
             crate::console::write_str("LINUX ERR ");
             crate::console::write_dec_u64(number);
             crate::console::write_str(" -> ");
-            crate::console::write_dec_u64((result as i64).unsigned_abs());
+            crate::console::write_dec_u64(code);
             crate::console::write_str("\r\n");
         }
-        return result;
+        // EACCES/ENOSYS/EPROTONOSUPPORT/EAFNOSUPPORT carry the boot-blocking
+        // failures; the noisy idle loop (ENOENT/ECHILD/ENOMEM) must not flush
+        // it.
+        if code == EACCES || code == ENOSYS || code == EPROTONOSUPPORT || code == EAFNOSUPPORT {
+            let index = FAIL_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            let mut path = [0_u8; 48];
+            // The path argument is arg1 for every path syscall (openat,
+            // faccessat, mkdirat, unlinkat, newfstatat, statx...).
+            let _ = user_memory::copy_from_user(frame[1], &mut path);
+            let slot = index % FAIL_RING_LEN;
+            let mut record = [0_u64; 8];
+            record[0] = number;
+            record[1] = code;
+            record[2] = frame[0];
+            record[3] = frame[1];
+            record[4] = frame[2];
+            for (word, bytes) in record[5..].iter_mut().zip(path.chunks_exact(8)) {
+                *word = u64::from_le_bytes(bytes.try_into().unwrap());
+            }
+            unsafe {
+                FAIL_RING[slot] = record;
+            }
+        }
     }
-    #[cfg(not(feature = "linux-abi-trace"))]
-    {
-        dispatch_body(frame)
-    }
+    result
 }
 
 fn dispatch_body(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
@@ -416,6 +480,51 @@ fn dispatch_inner(
         SYS_SET_ROBUST_LIST => 0, // single-threaded: nothing to register
         SYS_CLOCK_GETTIME => linux_clock_gettime(args[0], args[1]),
         SYS_RT_SIGPROCMASK => linux_rt_sigprocmask(args[0], args[1], args[2]),
+        SYS_SIGNALFD4 => linux_signalfd4(args[0], args[1], args[2], args[3]),
+        SYS_FSYNC | SYS_FDATASYNC => {
+            // The VFS is RAM-backed (scratch tree) or writes straight through
+            // to the SFS image; there is no dirty page cache to flush.
+            finish(Ok(0))
+        }
+        SYS_RT_SIGTIMEDWAIT => linux_rt_sigtimedwait(args[0], args[1], args[3]),
+        SYS_SCHED_SETPARAM => 0,
+        // SCHED_OTHER for everything: the worker-priority warnings from
+        // deniald's cpu_scheduling want a clean "accepted" answer.
+        SYS_SCHED_SETSCHEDULER => {
+            if args[1] > 2 {
+                errno(EINVAL)
+            } else {
+                0
+            }
+        }
+        // The policy is the return value itself (0 = SCHED_OTHER).
+        SYS_SCHED_GETSCHEDULER => 0,
+        SYS_INOTIFY_INIT1 => finish(linux_fd::inotify_init(
+            scheduler::current_task_id(),
+            args[0] & 0x800 != 0,
+        )),
+        SYS_INOTIFY_ADD_WATCH => {
+            if !linux_fd::is_inotify(scheduler::current_task_id(), args[0]) {
+                errno(EBADF)
+            } else {
+                // Static watch ids: the instance never reports events, so the
+                // id only needs to be valid for rm_watch.
+                INOTIFY_WD.fetch_add(1, core::sync::atomic::Ordering::Relaxed) as u64
+            }
+        }
+        SYS_INOTIFY_RM_WATCH => {
+            if !linux_fd::is_inotify(scheduler::current_task_id(), args[0]) {
+                errno(EBADF)
+            } else {
+                0
+            }
+        }
+        SYS_SET_PRIORITY => 0,
+        // The nice value is the return value itself.
+        SYS_GET_PRIORITY => 0,
+        SYS_SCHED_SETATTR => 0,
+        SYS_SCHED_GETATTR => linux_sched_getattr(args[1], args[2]),
+        SYS_CLOCK_ADJTIME => 0,
         SYS_RT_SIGACTION => linux_rt_sigaction(args[0], args[1], args[2]),
         SYS_RT_SIGRETURN => {
             crate::linux_signal::restore_frame(frame);
@@ -1397,11 +1506,25 @@ fn linux_sockname(task: u64, fd: u64, address: u64, length_pointer: u64) -> u64 
 }
 
 fn linux_socket(domain: u64, kind: u64, protocol: u64) -> u64 {
+    if domain == 16 {
+        // AF_NETLINK: only libudev's uevent monitor uses it. The stub accepts
+        // binds and sends but never reports data (no uevent publisher).
+        let base = kind & 0xf;
+        if base == 2 || base == 3 || protocol == 15 {
+            return finish(linux_fd::netlink_socket(
+                scheduler::current_task_id(),
+                kind & SOCK_NONBLOCK != 0,
+            ));
+        }
+        return errno(EPROTONOSUPPORT);
+    }
     if domain != AF_UNIX {
         return errno(EAFNOSUPPORT);
     }
     let base = kind & 0xf;
-    if (base != 1 && base != 2) || protocol != 0 {
+    // SOCK_SEQPACKET callers (stream semantics here) are accepted: the
+    // deniald startup path creates one before its first session log.
+    if (base != 1 && base != 2 && base != 5) || protocol != 0 {
         return errno(EPROTONOSUPPORT);
     }
     finish(linux_fd::socket(
@@ -1477,6 +1600,11 @@ fn linux_flock(fd: u64, operation: u64) -> u64 {
 }
 
 fn linux_bind(fd: u64, address: u64, length: u64) -> u64 {
+    // Netlink binds carry sockaddr_nl, not a unix path; the stub accepts
+    // them as-is (libudev binds NETLINK_KOBJECT_UEVENT group 2).
+    if linux_fd::is_netlink(scheduler::current_task_id(), fd) {
+        return 0;
+    }
     let path = match read_sockaddr(address, length) {
         Ok(path) => path,
         Err(code) => return errno(code),
@@ -1608,6 +1736,71 @@ fn linux_rt_sigprocmask(how: u64, set_pointer: u64, old_pointer: u64) -> u64 {
     0
 }
 
+/// `signalfd4(2)`: create or update a descriptor that receives its masked
+/// signals as readable records. calloop's `Signals` source needs it; without
+/// it the compositor's first `?` fails with a stale errno.
+fn linux_signalfd4(fd: u64, set_pointer: u64, size: u64, flags: u64) -> u64 {
+    const SFD_NONBLOCK: u64 = 0x4000;
+    if size != 8 {
+        return errno(EINVAL);
+    }
+    let mut raw = [0_u8; 8];
+    if set_pointer != 0 && user_memory::copy_from_user(set_pointer, &mut raw).is_err() {
+        return errno(EFAULT);
+    }
+    let mask = if set_pointer == 0 { 0 } else { u64::from_le_bytes(raw) };
+    let fd = fd as i64 as i32 as i64;
+    finish(crate::linux_fd::signalfd(
+        scheduler::current_task_id(),
+        fd,
+        mask,
+        flags & SFD_NONBLOCK != 0,
+    ))
+}
+
+/// `rt_sigtimedwait(2)`: dequeue one pending signal from the set atomically.
+/// With a null timeout this is the polling variant; a timeout polls and
+/// sleeps until a matching signal arrives or the deadline passes.
+fn linux_rt_sigtimedwait(set_pointer: u64, info_pointer: u64, _size: u64) -> u64 {
+    const SIGINFO_SIZE: usize = 128;
+    let task = scheduler::current_task_id();
+    let mut set = [0_u8; 8];
+    if set_pointer != 0 && user_memory::copy_from_user(set_pointer, &mut set).is_err() {
+        return errno(EFAULT);
+    }
+    let mask = if set_pointer == 0 {
+        0
+    } else {
+        u64::from_le_bytes(set)
+    };
+    if mask == 0 {
+        return errno(EINVAL);
+    }
+    let deadline = timer::ticks().saturating_add(timer::milliseconds_to_ticks(100));
+    loop {
+        let pending = crate::linux_signal::pending(task) & mask;
+        for signal in 1..=64_u32 {
+            if pending & (1 << (signal - 1)) == 0 {
+                continue;
+            }
+            crate::linux_signal::clear_pending(task, signal);
+            if info_pointer != 0 {
+                let mut record = [0_u8; SIGINFO_SIZE];
+                record[0..4].copy_from_slice(&signal.to_le_bytes()); // ssi_signo
+                record[12..16].copy_from_slice(&(-1_i32).to_le_bytes()); // SI_KERNEL
+                if user_memory::copy_to_user(&record, info_pointer).is_err() {
+                    return errno(EFAULT);
+                }
+            }
+            return signal as u64;
+        }
+        if timer::ticks() >= deadline {
+            return errno(EAGAIN);
+        }
+        scheduler::sleep(1);
+    }
+}
+
 /// `rt_sigaction(2)`: store/retrieve one disposition. The AArch64
 /// `struct sigaction` is `{ handler, flags, restorer, mask }` (32 bytes).
 fn linux_rt_sigaction(signal: u64, action_pointer: u64, old_pointer: u64) -> u64 {
@@ -1733,7 +1926,11 @@ fn linux_kill(pid: i64, signal: u64) -> u64 {
     if handler == crate::linux_signal::SIG_DFL {
         if crate::linux_signal::default_terminates(signal) || signal == crate::linux_signal::SIGKILL {
             if target == task {
-                scheduler::exit_current_with_status(128 + signal as u64);
+                // A default-terminating signal ends the whole thread group
+                // (glibc abort() raises against itself): the other threads
+                // share the leader's address space and would fault on the
+                // torn-down pages if the leader died alone.
+                scheduler::exit_group(128 + signal as u64);
             }
             let _ = scheduler::kill_task(target);
         }
@@ -2182,6 +2379,11 @@ fn linux_faccessat(dirfd: u64, path_ptr: u64, mode: u64) -> u64 {
         // rest of the image.
         return if mode & W_OK != 0 { errno(EROFS) } else { 0 };
     }
+    // Unlisted /proc and /sys nodes do not exist: probing libraries expect
+    // the clean ENOENT, not the VFS read-path EACCES.
+    if resolved == "/proc" || resolved.starts_with("/proc/") || resolved.starts_with("/sys/") {
+        return errno(ENOENT);
+    }
     if !scheduler::current_read_path_allowed(&resolved) {
         return errno(EACCES);
     }
@@ -2287,6 +2489,11 @@ fn stat_resolved(
         };
         return Ok((file_mode, size as u64, linux_fd::path_ino(resolved), None));
     }
+    // Bound AF_UNIX sockets live only in the kernel registry; deniald stats
+    // its portal socket right after binding it.
+    if linux_fd::listener_exists(resolved.as_bytes()) {
+        return Ok((S_IFSOCK | 0o600, 0, linux_fd::path_ino(resolved), None));
+    }
     Err(ENOENT)
 }
 
@@ -2351,6 +2558,9 @@ fn write_statx(
 fn synthetic_device_stat(path: &str) -> Option<(u32, u64)> {
     const S_IFCHR: u32 = 0o020000;
     match path {
+        // Synthetic directory roots (udev enumerate stats and scans them).
+        "/dev" | "/dev/input" => Some((S_IFDIR | 0o755, 0)),
+        "/dev/dri" if crate::virtio_gpu::size().is_some() => Some((S_IFDIR | 0o755, 0)),
         "/dev/dri/card0" if crate::virtio_gpu::size().is_some() => Some((
             S_IFCHR | 0o666,
             linux_fd::makedev(crate::sysfs::DRM_MAJOR, crate::sysfs::CARD_MINOR),
@@ -2481,7 +2691,19 @@ fn linux_mkdirat(dirfd: u64, path_pointer: u64, _mode: u64) -> u64 {
             if crate::vfs::resolve_directory(&cwd, &path).is_ok() {
                 errno(EEXIST)
             } else {
-                errno(EACCES)
+                // POSIX: a missing parent is ENOENT, not EACCES. Rust's
+                // create_dir_all only recurses on ENOENT - reporting EACCES
+                // here aborts xcursor_sentinel's theme-directory setup.
+                let parent = match path.rsplit_once('/') {
+                    Some(("", _)) => "/",
+                    Some((base, _)) => base,
+                    None => "/",
+                };
+                if crate::vfs::resolve_directory(&cwd, parent).is_ok() {
+                    errno(EACCES)
+                } else {
+                    errno(ENOENT)
+                }
             }
         }
     }
@@ -2502,6 +2724,10 @@ fn linux_unlinkat(dirfd: u64, path_pointer: u64, flags: u64) -> u64 {
                         Err(code) => errno(code),
                     };
                 }
+                // A stale bound socket node: the registry is the only state.
+                if linux_fd::listener_unlink(resolved.as_bytes()) {
+                    return 0;
+                }
             }
         }
     }
@@ -2517,7 +2743,10 @@ fn linux_unlinkat(dirfd: u64, path_pointer: u64, flags: u64) -> u64 {
     if result.is_ok() {
         0
     } else {
-        errno(EACCES)
+        // A failed removal here means the target is missing (the write
+        // permission was already checked by scratch_resolved); callers such
+        // as OpenRC's shutdown loop expect the POSIX ENOENT.
+        errno(ENOENT)
     }
 }
 

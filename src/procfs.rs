@@ -65,6 +65,22 @@ Threads:\t1\n";
 const SELF_CMDLINE: &[u8] = b"/sbin/init\0";
 const SELF_COMM: &[u8] = b"init\n";
 const HOTPLUG: &[u8] = b"/sbin/mdev\n";
+// The session environment gio launches services with (NUL-separated, like
+// a real environ block).
+const SELF_ENVIRON: &[u8] = b"HOME=/root\0PATH=/usr/bin:/bin\0XDG_RUNTIME_DIR=/tmp\0\0";
+// llvmpipe reads /proc/cpuinfo for the core count ("Can't read /proc/cpuinfo:
+// Permission denied" in the Mesa log).
+const CPUINFO: &[u8] = b"processor\t: 0\n\
+model name\t: QEMU virt cortex-a72\n\
+processor\t: 1\n\
+model name\t: QEMU virt cortex-a72\n";
+const OSRELEASE: &[u8] = b"6.12.0-silver\n";
+// The Dart VM reads /proc/self/maps at startup; without the node the open
+// falls through to the VFS and fails with EACCES, which kills deniald before
+// its logging is even up. A minimal, plausibly-shaped map is enough.
+const SELF_MAPS: &[u8] = b"00400000-00401000 r-xp 00000000 00:00 0   /usr/bin/deniald\n\
+00401000-00402000 rw-p 00000000 00:00 0   [heap]\n\
+7f0000000000-7f0000100000 rw-p 00000000 00:00 0   [stack]\n";
 
 const ROOT: &[&str] = &[
     "cmdline",
@@ -82,7 +98,7 @@ const ROOT: &[&str] = &[
     "1",
     "sys",
 ];
-const PROCESS: &[&str] = &["cmdline", "comm", "status", "fd", "mountinfo", "mounts"];
+const PROCESS: &[&str] = &["cmdline", "comm", "status", "fd", "mountinfo", "mounts", "maps"];
 const FD: &[&str] = &["0", "1", "2"];
 const SYS: &[&str] = &["kernel"];
 const SYS_KERNEL: &[&str] = &["hotplug"];
@@ -94,6 +110,8 @@ fn process_file(name: &str) -> Option<&'static [u8]> {
         "status" => STATUS,
         "mountinfo" => MOUNTINFO,
         "mounts" => MOUNTS,
+        "maps" => SELF_MAPS,
+        "environ" => SELF_ENVIRON,
         _ => return None,
     })
 }
@@ -137,9 +155,11 @@ pub fn lookup(path: &str) -> Option<Node> {
             _ => None,
         },
         ("self" | "1", Some("fd"), None) => Some(Node::Dir(FD)),
+        ("cpuinfo", None, None) => Some(Node::File(CPUINFO)),
         ("sys", None, None) => Some(Node::Dir(SYS)),
         ("sys", Some("kernel"), None) => Some(Node::Dir(SYS_KERNEL)),
         ("sys", Some("kernel"), Some("hotplug")) => Some(Node::File(HOTPLUG)),
+        ("sys", Some("kernel"), Some("osrelease")) => Some(Node::File(OSRELEASE)),
         _ => None,
     }
 }

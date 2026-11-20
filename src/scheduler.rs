@@ -2824,6 +2824,10 @@ pub fn exit_group(status: u64) -> ! {
     for id in wake {
         wake_for_signal(id);
     }
+    // A sibling Running on another CPU does not become wakeable (state Dead
+    // is not Sleeping/Blocked); kick every CPU so its own `schedule` observes
+    // the death and switches away instead of faulting on the dying space.
+    smp::ipi_reschedule_others();
     if !is_leader {
         // The leader is now Dead; its reaper releases the shared space. This
         // thread only has to leave its own context.

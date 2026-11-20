@@ -34,6 +34,8 @@ const DRM_IOCTL_MODE_GETCONNECTOR: u64 = 0xC050_64A7;
 const DRM_IOCTL_MODE_ADDFB: u64 = 0xC01C_64AE;
 // drm-rs also sends the 28-byte legacy ADDFB; match either size.
 const DRM_IOCTL_MODE_ADDFB_ALT: u64 = 0xC020_64AE;
+// drm-rs 0.14 closes framebuffers through CLOSEFB before falling back to RMFB.
+const DRM_IOCTL_MODE_CLOSEFB: u64 = 0xC008_64D0;
 const DRM_IOCTL_MODE_RMFB: u64 = 0xC004_64AF;
 const DRM_IOCTL_MODE_PAGE_FLIP: u64 = 0xC018_64B0;
 const DRM_IOCTL_MODE_CREATE_DUMB: u64 = 0xC020_64B2;
@@ -771,16 +773,30 @@ unsafe fn atomic_commit(argument: u64) -> u64 {
     if atomic.count_objs == 0 {
         return EINVAL;
     }
-    // Validation pass: every (object, property, value) must resolve.
+    // Validation pass: every (object, property, value) must resolve. The
+    // atomic uapi passes a plain u32 object-id array - no (id, type) pairs;
+    // drm-rs sends the raw handles straight through.
     for index in 0..atomic.count_objs as u64 {
-        let raw = index * 8;
-        let mut pair = [0_u8; 8];
-        if user_memory::copy_from_user(atomic.objs_ptr + raw, &mut pair).is_err() {
+        let mut raw = [0_u8; 4];
+        if user_memory::copy_from_user(atomic.objs_ptr + index * 4, &mut raw).is_err() {
             return EFAULT_CODE;
         }
-        let obj_id = u32::from_le_bytes(pair[0..4].try_into().unwrap());
-        let obj_type = u32::from_le_bytes(pair[4..8].try_into().unwrap());
-        if object_properties(obj_id, obj_type).is_none() {
+        let obj_id = u32::from_le_bytes(raw);
+        if obj_id != CRTC_ID && obj_id != PLANE_ID && obj_id != CONNECTOR_ID {
+            // 'ATMI': atomic commit referenced an unknown object.
+            unsafe {
+                let ring = core::ptr::addr_of_mut!(crate::scheduler::LAZY_FAIL);
+                (*ring)[0] = [
+                    0x41544D49, // 'ATMI'
+                    atomic.count_objs as u64,
+                    index,
+                    obj_id as u64,
+                    0,
+                    0,
+                    0,
+                    0,
+                ];
+            }
             return ENOENT;
         }
         let mut count_raw = [0_u8; 4];
@@ -822,6 +838,20 @@ unsafe fn atomic_commit(argument: u64) -> u64 {
             }
             let value = u64::from_le_bytes(value_raw);
             if !validate_property(prop_id, value) {
+                // 'ATMV': atomic commit sent a value the property rejects.
+                unsafe {
+                    let ring = core::ptr::addr_of_mut!(crate::scheduler::LAZY_FAIL);
+                    (*ring)[0] = [
+                        0x41544D56, // 'ATMV'
+                        prop_id as u64,
+                        value,
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                    ];
+                }
                 return EINVAL;
             }
         }
@@ -829,10 +859,11 @@ unsafe fn atomic_commit(argument: u64) -> u64 {
     if atomic.flags & DRM_MODE_ATOMIC_TEST_ONLY != 0 {
         return 0;
     }
-    // Apply pass.
+    // Apply pass: object ids are plain u32 handles here as well; properties
+    // are applied to the card-wide state regardless of the carrier object.
     for index in 0..atomic.count_objs as u64 {
-        let mut pair = [0_u8; 8];
-        if user_memory::copy_from_user(atomic.objs_ptr + index * 8, &mut pair).is_err() {
+        let mut obj_raw = [0_u8; 4];
+        if user_memory::copy_from_user(atomic.objs_ptr + index * 4, &mut obj_raw).is_err() {
             return EFAULT_CODE;
         }
         let mut count_raw = [0_u8; 4];
@@ -1283,21 +1314,12 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                         };
                     }
                 }
+                // ADDFB2 carries drm_mode_fb_cmd2; legacy ADDFB carries
+                // drm_mode_fb_cmd. Loading the wrong layout reads handles[1]
+                // (always 0 for GBM) as the handle and rejects with stage 1.
                 let (handle, width, height, pitch, fb_id, bpp) = if request
                     == DRM_IOCTL_MODE_ADDFB2
                 {
-                    let Some(command) = load::<FbCmd>(argument) else {
-                        return Some(u64::MAX);
-                    };
-                    (
-                        command.handle,
-                        command.width,
-                        command.height,
-                        command.pitch,
-                        command.fb_id,
-                        command.bpp,
-                    )
-                } else {
                     let Some(command) = load::<FbCmd2>(argument) else {
                         return Some(u64::MAX);
                     };
@@ -1312,12 +1334,28 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                         command.fb_id,
                         32,
                     )
+                } else {
+                    let Some(command) = load::<FbCmd>(argument) else {
+                        return Some(u64::MAX);
+                    };
+                    (
+                        command.handle,
+                        command.width,
+                        command.height,
+                        command.pitch,
+                        command.fb_id,
+                        command.bpp,
+                    )
                 };
                 let Some(entry) = buffer(handle) else {
                     addfb_stage(handle, 1, width, height, pitch);
                     return Some(u64::MAX);
                 };
-                if width != entry.width || height != entry.height || pitch != entry.pitch {
+                // Real DRM keeps no dumb-geometry record for a GEM handle: it
+                // only requires the backing storage to be large enough. Mesa's
+                // GBM aligns the bo height (800 -> 832 rows) while the fb keeps
+                // 800, so exact equality fails - check capacity instead.
+                if pitch as usize * height as usize > entry.pages * 4096 {
                     addfb_stage(handle, 2, width, height, pitch);
                     return Some(u64::MAX);
                 }
@@ -1346,7 +1384,9 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                 }
                 0
             }
-            DRM_IOCTL_MODE_RMFB => {
+            DRM_IOCTL_MODE_RMFB | DRM_IOCTL_MODE_CLOSEFB => {
+                // CLOSEFB (0xC00864D0) is drm-rs 0.14's preferred fb close;
+                // it carries the same 4-byte fb id as RMFB.
                 let Some(fb) = load::<u32>(argument) else {
                     return Some(u64::MAX);
                 };
@@ -2075,7 +2115,9 @@ pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
                         }
                     }
                     VIRTGPU_PARAM_EXPLICIT_DEBUG_NAME => 0,
-                    _ => return Some(u64::MAX),
+                    // Unknown params: report value 0 ("unsupported") instead
+                    // of leaving the request unhandled with a stale errno.
+                    _ => 0,
                 };
                 if output == 0
                     || user_memory::copy_to_user(&value.to_le_bytes(), output).is_err()

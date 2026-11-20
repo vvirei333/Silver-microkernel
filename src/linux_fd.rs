@@ -291,6 +291,20 @@ enum Target {
         state: Arc<Mutex<TimerFdState>>,
         nonblock: bool,
     },
+    /// `signalfd(2)`: signals routed here instead of the pending bit.
+    SignalFd(Arc<Mutex<SignalFdState>>),
+    /// AF_NETLINK socket (libudev's uevent monitor). No kernel uevent source
+    /// exists yet, so the fd accepts binds/sends but never becomes readable.
+    Netlink { nonblock: bool },
+    /// `inotify` instance (deniald's settings watcher). No filesystem events
+    /// are published, so reads block/EAGAIN forever.
+    Inotify { nonblock: bool },
+}
+
+struct SignalFdState {
+    mask: u64,
+    nonblock: bool,
+    queued: Vec<u32>,
 }
 
 struct Table {
@@ -560,6 +574,13 @@ fn insert_from_in(table: &mut Table, target: Target, minimum: u64) -> Option<u64
 
 /// Nodes listed by the synthetic `/dev/dri` directory.
 const DRM_NODES: &[&str] = &["card0", "renderD128"];
+/// `/dev` listing: udev enumerate and glib scan the device root. `input` is
+/// empty until the evdev stage lands; libinput then finds no devices and the
+/// compositor runs headless-of-input.
+const DEV_NODES: &[&str] = &[
+    "dri", "input", "shm", "null", "zero", "full", "urandom", "random", "console", "tty0", "tty1",
+];
+const INPUT_NODES: &[&str] = &[];
 
 /// `openat(2)`. Write flags are rejected for real files (the VFS view is
 /// read-only), but synthetic devices accept writes.
@@ -605,6 +626,11 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
             crate::sysfs::Node::Dir => Err(EISDIR),
             crate::sysfs::Node::Symlink(_) => Err(EINVAL),
         };
+    }
+    // Anything else under the synthetic /proc and /sys trees does not exist:
+    // probing libraries expect the clean ENOENT instead of the VFS EACCES.
+    if resolved == "/proc" || resolved.starts_with("/proc/") || resolved.starts_with("/sys/") {
+        return Err(ENOENT);
     }
     if let Some(name) = resolved.strip_prefix("/dev/shm/") {
         if name.is_empty() || name.contains('/') {
@@ -665,6 +691,14 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         // Only present when the machine has a virtio-gpu the driver brought
         // up; the compositor then presents through the GPU as well.
         "/dev/gpufb" if crate::virtio_gpu::size().is_some() => Some(Target::GpuFb),
+        "/dev" => Some(Target::DirList {
+            entries: DEV_NODES,
+            offset: 0,
+        }),
+        "/dev/input" => Some(Target::DirList {
+            entries: INPUT_NODES,
+            offset: 0,
+        }),
         "/dev/dri" if crate::virtio_gpu::size().is_some() => Some(Target::DirList {
             entries: DRM_NODES,
             offset: 0,
@@ -966,6 +1000,7 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             pipe_read(&state, buffer, count)
         }
         Target::EventFd { state, nonblock } => eventfd_read(&state, nonblock, buffer),
+        Target::SignalFd(state) => signalfd_read(&state, buffer, count),
         Target::MemFd(state) => memfd_read(&state, buffer, count),
         Target::Socket { state, end, nonblock } => {
             let mut chunk = alloc::vec![0_u8; (count as usize).min(64 * 1024)];
@@ -977,6 +1012,10 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             Ok(read as u64)
         }
         Target::Unbound { .. } | Target::Listener { .. } => Err(ENOTCONN),
+        // The netlink stub never carries uevent data.
+        Target::Netlink { .. } => Err(EAGAIN),
+        // No filesystem events are published either.
+        Target::Inotify { .. } => Err(EAGAIN),
         Target::TimerFd { state, nonblock } => timerfd_read(&state, nonblock, buffer),
         Target::Epoll(_) => Err(EINVAL),
     }
@@ -1103,7 +1142,10 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             socket_send_locked(&state, end, &bytes, Vec::new())
         }
         Target::Unbound { .. } | Target::Listener { .. } => Err(ENOTCONN),
-        Target::TimerFd { .. } | Target::Epoll(_) => Err(EINVAL),
+        // Netlink sends vanish (no kernel uevent publisher reads them).
+        Target::Netlink { .. } => Ok(count),
+        Target::Inotify { .. } => Err(EINVAL),
+        Target::TimerFd { .. } | Target::Epoll(_) | Target::SignalFd(_) => Err(EINVAL),
     }
 }
 
@@ -1262,14 +1304,13 @@ pub fn stat_fields(
             (mode, size as u64, ino, None)
         }
         Target::Pipe { .. } => (S_IFIFO | 0o600, 0, fd.max(1), None),
-        Target::EventFd { .. } => (S_IFREG | 0o600, 0, fd.max(1), None),
+        Target::EventFd { .. } | Target::SignalFd(_) => (S_IFREG | 0o600, 0, fd.max(1), None),
         Target::MemFd(state) => (S_IFREG | 0o600, state.lock().len() as u64, fd.max(1), None),
         Target::Socket { .. } | Target::Unbound { .. } | Target::Listener { .. } => {
             (S_IFSOCK | 0o600, 0, fd.max(1), None)
         }
-        Target::Epoll(_) | Target::TimerFd { .. } => {
-            (S_IFREG | 0o600, 0, fd.max(1), None)
-        }
+        Target::Epoll(_) | Target::TimerFd { .. } | Target::Netlink { .. }
+        | Target::Inotify { .. } => (S_IFSOCK | 0o600, 0, fd.max(1), None),
     })
 }
 
@@ -1413,6 +1454,102 @@ pub fn eventfd(task: u64, initial: u64, nonblock: bool) -> Result<u64, u64> {
         },
     )
     .ok_or(EMFILE)
+}
+
+/// `signalfd4(2)`: `fd = -1` creates the descriptor, otherwise it updates the
+/// mask of an existing signalfd.
+pub fn signalfd(task: u64, fd: i64, mask: u64, nonblock: bool) -> Result<u64, u64> {
+    if fd == -1 {
+        return insert(
+            task,
+            Target::SignalFd(Arc::new(Mutex::new(SignalFdState {
+                mask,
+                nonblock,
+                queued: Vec::new(),
+            }))),
+        )
+        .ok_or(EMFILE);
+    }
+    let target = lookup(task, fd as u64).ok_or(EBADF)?;
+    let Target::SignalFd(state) = target else {
+        return Err(EINVAL);
+    };
+    state.lock().mask = mask;
+    Ok(fd as u64)
+}
+
+/// Routes one signal into a matching signalfd of `task` instead of the
+/// pending bit. Called from `linux_signal::raise` before the signal table is
+/// touched, so the two table locks never nest.
+pub fn signalfd_deliver(task: u64, signal: u32) -> bool {
+    let bit = match signal {
+        0 => return false,
+        n if n <= 64 => 1u64 << (n - 1),
+        _ => return false,
+    };
+    let task = crate::scheduler::fd_table_owner(task);
+    let mut tables = TABLES.lock();
+    let Some(table) = tables.iter_mut().find(|table| table.task == task) else {
+        return false;
+    };
+    for slot in table.slots.iter().flatten() {
+        if let Target::SignalFd(state) = slot {
+            let mut state = state.lock();
+            if state.mask & bit != 0 {
+                state.queued.push(signal);
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Drains queued signals into `signalfd_siginfo` records (128 bytes each).
+fn signalfd_read(
+    state: &Arc<Mutex<SignalFdState>>,
+    buffer: u64,
+    count: u64,
+) -> Result<u64, u64> {
+    const SIGINFO_SIZE: usize = 128;
+    let mut state = state.lock();
+    if state.queued.is_empty() {
+        // Callers poll first; an empty read then means the queue was drained
+        // concurrently, which nonblocking readers treat as EAGAIN.
+        return Err(EAGAIN);
+    }
+    let mut written = 0_u64;
+    while !state.queued.is_empty() && written + SIGINFO_SIZE as u64 <= count {
+        let signal = state.queued.remove(0);
+        let mut record = [0_u8; SIGINFO_SIZE];
+        record[0..4].copy_from_slice(&signal.to_le_bytes()); // ssi_signo
+        user_memory::copy_to_user(&record, buffer + written).map_err(|_| EFAULT)?;
+        written += SIGINFO_SIZE as u64;
+    }
+    Ok(written)
+}
+
+/// Creates an AF_NETLINK socket stub for libudev's uevent monitor.
+pub fn netlink_socket(task: u64, nonblock: bool) -> Result<u64, u64> {
+    insert(task, Target::Netlink { nonblock }).ok_or(EMFILE)
+}
+
+/// Whether the descriptor is the netlink stub (bind/send path checks).
+pub fn is_netlink(task: u64, fd: u64) -> bool {
+    matches!(
+        lookup(task, fd),
+        Some(Target::Netlink { .. })
+    )
+}
+
+/// Creates an inotify instance. Watch descriptors are handed out by the ABI
+/// layer; no events are ever queued.
+pub fn inotify_init(task: u64, nonblock: bool) -> Result<u64, u64> {
+    insert(task, Target::Inotify { nonblock }).ok_or(EMFILE)
+}
+
+/// Whether the descriptor is an inotify instance.
+pub fn is_inotify(task: u64, fd: u64) -> bool {
+    matches!(lookup(task, fd), Some(Target::Inotify { .. }))
 }
 
 /// Creates an anonymous in-memory file (`memfd_create`). File-backed `mmap`
@@ -1992,6 +2129,24 @@ fn replace_unbound(task: u64, fd: u64, replacement: Target) -> Result<(), u64> {
 }
 
 /// `bind(2)` for a filesystem or abstract `AF_UNIX` path.
+/// Whether a bound AF_UNIX listener lives at `path`. The bind namespace is
+/// kernel-side only (no VFS node is created), so the stat/chmod/unlink
+/// syscalls that tooling runs against a socket path consult this registry.
+pub fn listener_exists(path: &[u8]) -> bool {
+    LISTENERS
+        .lock()
+        .iter()
+        .any(|entry| entry.lock().path == path)
+}
+
+/// Removes a bound listener at `path` (unlink of a stale socket node).
+pub fn listener_unlink(path: &[u8]) -> bool {
+    let mut registry = LISTENERS.lock();
+    let before = registry.len();
+    registry.retain(|entry| entry.lock().path != path);
+    registry.len() != before
+}
+
 pub fn bind(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
     if path.is_empty() {
         return Err(EINVAL);
@@ -2347,6 +2502,8 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::Unbound { nonblock }
         | Target::Listener { nonblock, .. }
         | Target::EventFd { nonblock, .. } => (O_RDWR, nonblock),
+        Target::SignalFd(state) => (O_RDWR, state.lock().nonblock),
+        Target::Netlink { nonblock } | Target::Inotify { nonblock } => (O_RDWR, nonblock),
         Target::TimerFd { nonblock, .. } => (O_RDWR, nonblock),
         Target::Console
         | Target::Null
@@ -2379,6 +2536,14 @@ pub fn set_nonblock(task: u64, fd: u64, nonblock: bool) -> Result<(), u64> {
             | Some(Target::Listener { nonblock: flag, .. })
             | Some(Target::TimerFd { nonblock: flag, .. })
             | Some(Target::EventFd { nonblock: flag, .. }) => {
+                *flag = nonblock;
+                true
+            }
+            Some(Target::SignalFd(state)) => {
+                state.lock().nonblock = nonblock;
+                true
+            }
+            Some(Target::Netlink { nonblock: flag }) | Some(Target::Inotify { nonblock: flag }) => {
                 *flag = nonblock;
                 true
             }
@@ -2440,6 +2605,16 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
             }
             ready
         }
+        Target::SignalFd(state) => {
+            if !state.lock().queued.is_empty() {
+                POLLIN
+            } else {
+                0
+            }
+        }
+        // No uevent publisher: the monitor never reports readable.
+        Target::Netlink { .. } => 0,
+        Target::Inotify { .. } => 0,
         Target::MemFd(_) => POLLIN | POLLOUT,
         Target::Socket { state, end, .. } => {
             let socket = state.lock();
@@ -2626,6 +2801,7 @@ pub fn device_exists(path: &str) -> bool {
         "/dev/console" | "/dev/tty" => true,
         "/dev/ivshmem" => true,
         "/dev/gpufb" => crate::virtio_gpu::size().is_some(),
+        "/dev" | "/dev/input" => true,
         "/dev/dri" => crate::virtio_gpu::size().is_some(),
         "/dev/dri/card0" => crate::virtio_gpu::size().is_some(),
         "/dev/dri/renderD128" => crate::virtio_gpu::size().is_some(),

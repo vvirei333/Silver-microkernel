@@ -80,13 +80,24 @@ export GBM_BACKENDS_PATH=/usr/lib/aarch64-linux-gnu
 export LIBSEAT_BACKEND=seatd
 
 # seatd owns the DRM/input device handoff for libseat's seat backend.
-mkdir -p /run/seatd
-LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu /usr/bin/seatd -g root >/tmp/seatd.log 2>&1 &
+# Debian ships seatd in /usr/sbin; plain mkdir (no -p) avoids the busybox
+# mkdir -p stat('/') quirk against the SFS root.
+mkdir /run/seatd 2>/dev/null
+LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu /usr/sbin/seatd -g root >/tmp/seatd.log 2>&1 &
 sleep 1
 
 echo "DENIAL: starting deniald"
-LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu /usr/bin/deniald
+# --flutter-bundle switches runtime_limit() from TestOnly to UntilLogout:
+# without it deniald exits right after the diagnostic scanout test.
+export RUST_LOG=debug
+# The console drops bytes under load; the file keeps the full stderr and the
+# quiet `cat` after exit replays it over serial.
+LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu /usr/bin/deniald --flutter-bundle /usr/lib/denial/flutter --wayland --no-xwayland > /tmp/deniald.log 2>&1
 echo "DENIAL: deniald exited ($?)"
+# Let the abort/fault console flood subside before replaying stderr.
+sleep 2
+cat /tmp/deniald.log
+echo "DENIAL: log end"
 """
 
 

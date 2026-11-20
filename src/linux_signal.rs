@@ -146,6 +146,12 @@ pub fn raise(task: u64, signal: u32) -> bool {
     {
         return false;
     }
+    // A signalfd whose mask contains the signal receives it instead of the
+    // pending bit. The fd tables are locked and released here, before the
+    // signal table below, so the two locks never nest.
+    if crate::linux_fd::signalfd_deliver(task, signal) {
+        return true;
+    }
     with_table(task, |table| {
         table.pending |= bit;
         true
@@ -218,7 +224,10 @@ fn write_user_sp(sp: u64) {
 }
 
 fn terminate(signal: u32) -> ! {
-    scheduler::exit_current_with_status(128 + signal as u64)
+    // A default-terminating signal ends the whole thread group: the other
+    // threads share the leader's address space, and leaving any of them
+    // running turns the leader's teardown into faults on dead pages.
+    scheduler::exit_group(128 + signal as u64)
 }
 
 /// Builds and enters one pending user handler, if any. Runs immediately
