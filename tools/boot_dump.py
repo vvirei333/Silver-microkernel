@@ -72,6 +72,7 @@ def main() -> int:
     parser.add_argument("--dump", default="build/fbst.bin")
     parser.add_argument("--timeout", type=float, default=170.0)
     parser.add_argument("--log", default="build/denial-boot-dump.log")
+    parser.add_argument("--dump-size", default="0x800000")
     parser.add_argument("--send", default=None)
     args = parser.parse_args()
 
@@ -97,7 +98,7 @@ def main() -> int:
         log.flush()
         monitor_command("stop")
         monitor_command(
-            f"pmemsave 0x40000000 0x800000 \"{(ROOT / args.dump).as_posix()}\"")
+            f"pmemsave 0x40000000 {args.dump_size} \"{(ROOT / args.dump).as_posix()}\"")
         dumped = True
         print(f"dumped to {args.dump}", flush=True)
         monitor_command("quit")

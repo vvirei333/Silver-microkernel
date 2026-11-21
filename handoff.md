@@ -7950,3 +7950,66 @@ nm the ring addresses after every rebuild (TRACE_RING moved twice today).
 - Stage 4: screencopy-minimal as the first external Wayland client.
 - Cleanup: the UDMABUF-OPEN/IOCTL/CREATE debug prints, F_ADD_SEALS failure
   print, FAIL_RING/TRACE_RING scaffolding, the /dev open console prints.
+
+### 2026-11-21 (later) — ICU closed; new stop = Flutter engine idle, no first frame
+
+What was ruled out and what is new, in order:
+
+1. ICU theory CLOSED. The freestanding probe (`tests/linux/icuprobe.c`,
+   staged as `/sfs/icuprobe`) opens icudtl.dat, mmaps it and touches ALL
+   2656 pages: open fd OK, mmap 0x40a00000, every page fills, sum
+   0x0003b1e2, exit 0. First `test_icu` probe (glibc, zig-built) also
+   verified the header bytes. File-backed lazy fill is correct.
+   CAUTION: a probe bug (paths joined with 
+, no NUL) once produced fake
+   ENOENTs for libapp.so — the kernel VFS was never broken there; a probe
+   must pass NUL-terminated strings.
+2. The "5000"/"50" console spam and the /dev open prints are KERNEL debug
+   prints (`linux_fd::open` /dev arm, clone/exec prints in linux_abi) plus
+   interleaving; the passwd spawn loop was deniald's account-metadata
+   fallback (no D-Bus). Quieted by staging /etc/passwd, /etc/shadow,
+   /etc/group and a `/usr/bin/passwd` stub script that answers
+   `passwd -S user`.
+3. Page-fault forensics added to the kernel kill path
+   (exceptions.rs -> scheduler::debug_fault_region / debug_task_trace /
+   debug_lazy_fail): dumps the mmap regions around FAR, the dying task's
+   last syscalls from TRACE_RING and its LAZY_FAIL records. With it, the
+   intermittent deniald death was caught once: write fault into its OWN
+   lazy anonymous region 0x80a66000-0x81266000 (2048 pages, faultpages=0,
+   937 regions in the task) plus a fork child faulting on an image page.
+   Cause not yet pinned (fill failed silently? charge/alloc?); it did NOT
+   recur in later boots.
+4. Current stop, stable across many boots: deniald survives, the engine
+   session starts ("starting Flutter ... generation=1"), flutter-display/
+   raster/io threads run event loops (epoll+timerfd created, blocked in
+   epoll_pwait2, timerfd never armed - an idle loop is plausible), deniald
+   keeps its session_lock retry loop, the log freezes after the two
+   cpu_scheduling WARNs - and NO DRM atomic commit is ever issued after
+   engine start. The scanout buffers in guest RAM are the old colorbars
+   diagnostic and a solid black buffer: the Flutter UI never drew its
+   first frame.
+5. deniald source study (github main): the first frame needs
+   `set_outputs_visible(powered_outputs > 0)` (OutputScheduler::new),
+   a generation-matched FrameReady event and either the KMS frame clock
+   (enable_kms_frame_clock is called) or vsync replies. Next suspects:
+   scanout.powered staying false, vsync/frame-clock delivery, or the
+   isolate never running. tool/boot_dump.py gained --dump-size (a 1GB
+   dump located the in-RAM deniald.log copies; the log's last line really
+   is the flutter-raster WARN - the engine is silent, not erroring).
+
+Boot tools added this round: `--dump-size` for pmemsave beyond 8 MiB,
+filtered periodic tails in BOOT_SESSION (session_lock filtered), icuprobe
+staging, minimal /etc account db + passwd stub in the image builder.
+
+### Queued (updated)
+
+- Why the engine never draws: check scanout.powered / outputs-visible
+  gating, KMS frame clock vsync path, FrameReady generation. Candidate
+  kernel-side gaps: nothing obvious - engine threads simply idle.
+- The intermittent lazy-region fill failure (FAULTCTX/LAZY_FAIL now print
+  on kill; wait for a recurrence with the new forensics).
+- Stage 3: evdev /dev/input + udev /sys/class/input glue for libinput.
+- Stage 4: screencopy-minimal as the first external Wayland client.
+- Cleanup: UDMABUF-OPEN/IOCTL/CREATE prints, F_ADD_SEALS print, FAIL_RING/
+  TRACE_RING scaffolding, /dev open prints, VFSDBG/EXECFAIL prints,
+  procfs.rs unreachable-pattern warning.

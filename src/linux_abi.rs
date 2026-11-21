@@ -280,7 +280,7 @@ static INOTIFY_WD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32
 
 /// Last-N syscall trace of Linux guest tasks (nr, arg0, arg1, result, task).
 pub const TRACE_RING_LEN: usize = 2048;
-static TRACE_RING_INDEX: core::sync::atomic::AtomicUsize =
+pub(crate) static TRACE_RING_INDEX: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 #[no_mangle]
 pub static mut TRACE_RING: [[u64; 5]; TRACE_RING_LEN] = [[0; 5]; TRACE_RING_LEN];
@@ -667,6 +667,9 @@ fn linux_execve(
     let mut depth = 0u32;
     let resolved = loop {
         let Ok(resolved) = resolve(&cwd, &target) else {
+            crate::console::write_str("EXECFAIL resolve ");
+            crate::console::write_str(&target);
+            crate::console::write_str("\r\n");
             return errno(ENOENT);
         };
         if !scheduler::current_read_path_allowed(&resolved) {
@@ -674,7 +677,12 @@ fn linux_execve(
         }
         match crate::vfs::file_len(&cwd, &resolved) {
             Ok(length) if length <= EXEC_LIMIT => {}
-            _ => return errno(ENOENT),
+            _ => {
+                crate::console::write_str("EXECFAIL len ");
+                crate::console::write_str(&resolved);
+                crate::console::write_str("\r\n");
+                return errno(ENOENT);
+            }
         }
         // A `#!` script is executed through its interpreter, like Linux: the
         // kernel never tries to load shell text as an ELF.

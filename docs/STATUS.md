@@ -147,12 +147,14 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   built with zig cc): the real library asserts deep inside its helpers when
   systemd is absent; libudev.so.1 embeds the same sources statically, so the
   builder also NOPs its fds_are_same_mount assert branches.
-- **Current stop**: the Flutter engine session starts (display/raster
-  threads) but its ICU init fails on icudtl.dat (`context->IsValid()`) —
-  the file is present and the 10.8 MiB private mapping succeeded in the
-  trace; suspect the file-backed lazy fill content. Details, the staged
-  probe binary (/sfs/test-icu) and the next steps in `handoff.md`
-  "2026-11-21".
+- **Current stop** (2026-11-21 evening): ICU is ruled out — the staged
+  /sfs/icuprobe touches all 2656 pages of icudtl.dat through the lazy
+  file mmap and every one fills correctly. The engine session now starts
+  and its threads run idle event loops, but no DRM atomic commit is ever
+  issued and the scanout buffers stay black: the Flutter UI never draws
+  its first frame. Next suspects live in deniald's output gating
+  (set_outputs_visible(powered>0), KMS frame clock / vsync, FrameReady
+  generation). Details in `handoff.md` "2026-11-21 (later)".
 - Debugging method: `no_mangle` static rings (TRACE_RING syscall history,
   FAIL_RING, IOC_RING, FAULT_RING, LAZY_FAIL) read through QEMU monitor
   `pmemsave`; helper `tools/boot_dump.py` boots, dumps and replays deniald's

@@ -811,17 +811,32 @@ impl Vfs {
         if flags & !(OPEN_WRITE | OPEN_APPEND) != 0
             || (flags & OPEN_APPEND != 0 && flags & OPEN_WRITE == 0)
         {
+            crate::console::write_str("VFSDBG flags
+");
             return Err(());
         }
         let resolved = resolve_path(cwd, path)?;
         let (mount, relative) = self.resolve(&resolved);
         if self.mounts[mount].fs.is_directory(&relative)? {
+            crate::console::write_str("VFSDBG isdir ");
+            crate::console::write_str(&resolved);
+            crate::console::write_str("
+");
             return Err(());
         }
         // Opening a path that does not exist must fail here. Without this
         // probe the old code recorded an OpenFile for any non-directory name
         // and only failed on the first read, as EBADF instead of ENOENT.
-        let length = self.mounts[mount].fs.len(&relative)?;
+        let length = match self.mounts[mount].fs.len(&relative) {
+            Ok(length) => length,
+            Err(()) => {
+                crate::console::write_str("VFSDBG len ");
+                crate::console::write_str(&resolved);
+                crate::console::write_str("
+");
+                return Err(());
+            }
+        };
         let append = flags & OPEN_APPEND != 0;
         let offset = if append { length } else { 0 };
 

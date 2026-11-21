@@ -86,10 +86,30 @@ mkdir /run/seatd 2>/dev/null
 LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu /usr/sbin/seatd -g root >/tmp/seatd.log 2>&1 &
 sleep 1
 
+# One-shot file-mmap validation BEFORE deniald: the flutter engine reads
+# icudtl.dat through a private file mapping; print what the guest actually
+# sees. Runs first so the result is never swallowed by an engine hang.
+echo "ICU-TEST begin"
+/sfs/test-icu
+echo "ICU-TEST end"
+# Whole-file lazy-fill probe: deniald's leader died on a page fault reading
+# ~0x3f1ec into a file mapping; touch every page of icudtl.dat.
+echo "ICUPROBE begin"
+/sfs/icuprobe
+echo "ICUPROBE end ($?)"
+
 echo "DENIAL: starting deniald"
 # Live replay of the stderr log while the session runs: the log file holds
 # the tracing output, the console drops bytes, so a delayed cat bridges them.
 ( sleep 90; echo "DENIAL: --- log snapshot ---"; cat /tmp/deniald.log ) &
+# The engine keeps running past the first snapshot; periodic tails catch the
+# failure line even when the final post-exit replay never reaches the
+# byte-starved console. session_lock retries retry every 2s and drown the
+# interesting lines, so they are filtered out.
+( sleep 100; echo "DENIAL: --- tail 100 ---"; tail -c 20000 /tmp/deniald.log | grep -v session_lock | tail -c 2500 ) &
+( sleep 130; echo "DENIAL: --- tail 130 ---"; tail -c 20000 /tmp/deniald.log | grep -v session_lock | tail -c 2500 ) &
+( sleep 160; echo "DENIAL: --- tail 160 ---"; tail -c 20000 /tmp/deniald.log | grep -v session_lock | tail -c 2500 ) &
+( sleep 190; echo "DENIAL: --- tail 190 ---"; tail -c 20000 /tmp/deniald.log | grep -v session_lock | tail -c 2500 ) &
 # --flutter-bundle switches runtime_limit() from TestOnly to UntilLogout:
 # without it deniald exits right after the diagnostic scanout test.
 export RUST_LOG=debug
@@ -107,11 +127,6 @@ echo "DENIAL: deniald exited ($?)"
 sleep 2
 cat /tmp/deniald.log
 echo "DENIAL: log end"
-# One-shot file-mmap validation: the flutter engine reads icudtl.dat through
-# a private file mapping; print what the guest actually sees.
-echo "ICU-TEST begin"
-/sfs/test-icu
-echo "ICU-TEST end"
 """
 
 
@@ -255,10 +270,33 @@ def main() -> int:
         ("\n".join(alpine_repo.REPOSITORIES) + "\n").encode())
     image.write_file_at("/etc/apk/arch", b"aarch64\n")
     image.write_file_at("/etc/machine-id", (MACHINE_ID + "\n").encode())
+    # Account database: deniald's authentication module retries passwd -S in
+    # a loop while "account metadata is unavailable", flooding the console
+    # with passwd spawn noise. A minimal root/uid-5000 user closes the loop.
+    image.write_file_at("/etc/passwd",
+                        b"root:x:0:0:root:/root:/bin/sh\n"
+                        b"user:x:5000:5000:user:/home/user:/bin/sh\n")
+    image.write_file_at("/etc/shadow",
+                        b"root:*:20000:0:99999:7:::\n"
+                        b"user:*:20000:0:99999:7:::\n")
+    image.write_file_at("/etc/group", b"root:x:0:\nuser:x:5000:\n")
+    # The guest has no D-Bus, so deniald's account-metadata fallback spawns
+    # passwd in an endless retry loop and floods the console. Answer with a
+    # plausible `passwd -S user` line and stop the loop.
+    image.write_file_at("/usr/bin/passwd",
+                        b"#!/bin/sh\n"
+                        b'echo "user P 11/21/2026 0 99999 7 -1"\n'
+                        b"exit 0\n")
     icu_test = ROOT / "build/testbin/test_icu"
+    # /sfs in the guest is a kernel alias for the image root, so the file
+    # goes to the image root and is reached as /sfs/test-icu.
     if icu_test.exists():
-        image.write_file_at("/sfs/test-icu", icu_test.read_bytes())
-        print("  test binary staged at /sfs/test-icu")
+        image.write_file_at("/test-icu", icu_test.read_bytes())
+        print("  test binary staged at /sfs/test-icu (image /test-icu)")
+    icu_probe = ROOT / "build/testbin/icuprobe"
+    if icu_probe.exists():
+        image.write_file_at("/icuprobe", icu_probe.read_bytes())
+        print("  icuprobe staged at /sfs/icuprobe")
     image.write_file_at("/var/lib/dbus/machine-id", (MACHINE_ID + "\n").encode())
     # busybox applet links: unpack() captured the applet list when it wrote
     # /etc/busybox-paths.d/busybox; replay it like apk's trigger would.

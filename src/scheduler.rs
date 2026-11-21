@@ -6517,6 +6517,111 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     }
 }
 
+/// Fault forensics for a dying task: which mmap region covers (or nearly
+/// covers) the faulting address, and the neighboring regions. Read-only, no
+/// allocation, no locks — runs in exception context.
+pub fn debug_fault_region(far: usize) {
+    let Some(task) = current_task_mut() else {
+        console::write_str("FAULTCTX no task\r\n");
+        return;
+    };
+    console::write_str("FAULTCTX regions=");
+    console::write_dec_u64(task.mmap_regions.len() as u64);
+    console::write_str("\r\n");
+    let mut near = 0;
+    for region in &task.mmap_regions {
+        let start = region.virtual_address;
+        let end = start + region.page_count * PAGE_SIZE;
+        if far + PAGE_SIZE * 16 < start || far >= end + PAGE_SIZE * 16 {
+            continue;
+        }
+        near += 1;
+        if near > 6 {
+            break;
+        }
+        console::write_str("  region 0x");
+        console::write_hex_u64(start as u64);
+        console::write_str("-0x");
+        console::write_hex_u64(end as u64);
+        console::write_str(" lazy=");
+        console::write_dec_u64(region.lazy as u64);
+        console::write_str(" phys=0x");
+        console::write_hex_u64(region.physical_start as u64);
+        console::write_str(" pages=");
+        console::write_dec_u64(region.page_count as u64);
+        console::write_str(" frames=");
+        console::write_dec_u64(region.frames.len() as u64);
+        console::write_str(" faultpages=");
+        console::write_dec_u64(region.pages.len() as u64);
+        if let Some((path, offset)) = &region.file {
+            console::write_str(" file=");
+            console::write_str(path);
+            console::write_str("+");
+            console::write_dec_u64(*offset as u64);
+        }
+        console::write_str("\r\n");
+    }
+    if near == 0 {
+        console::write_str("  (none within 16 pages)\r\n");
+    }
+}
+
+/// Lazy-fill failure records for `task_id`, reverse order.
+pub fn debug_lazy_fail(task_id: u64, limit: usize) {
+    let index = LAZY_FAIL_INDEX.load(core::sync::atomic::Ordering::Relaxed);
+    if index == 0 {
+        return;
+    }
+    let ring = unsafe { core::ptr::addr_of!(LAZY_FAIL).as_ref().unwrap() };
+    let mut shown = 0;
+    let mut cursor = index;
+    while shown < limit && cursor > 0 {
+        cursor -= 1;
+        let slot = ring[cursor % LAZY_FAIL_LEN];
+        if slot[5] != task_id {
+            continue;
+        }
+        let tag = slot[1].to_le_bytes();
+        console::write_str("  lazyfail page=0x");
+        console::write_hex_u64(slot[0]);
+        console::write_str(" reason=");
+        console::write_str(core::str::from_utf8(&tag).unwrap_or("?"));
+        console::write_str(" frames=");
+        console::write_dec_u64(slot[2]);
+        console::write_str(" mmap_bytes=");
+        console::write_dec_u64(slot[3]);
+        console::write_str(" regions=");
+        console::write_dec_u64(slot[4]);
+        console::write_str("\r\n");
+        shown += 1;
+    }
+}
+
+/// Last syscalls of `task_id` from the trace ring, reverse order.
+pub fn debug_task_trace(task_id: u64, limit: usize) {
+    let ring = unsafe { &crate::linux_abi::TRACE_RING };
+    let index = crate::linux_abi::TRACE_RING_INDEX
+        .load(core::sync::atomic::Ordering::Relaxed);
+    let mut shown = 0;
+    let mut cursor = index;
+    while shown < limit && cursor > 0 {
+        cursor -= 1;
+        let slot = ring[cursor % crate::linux_abi::TRACE_RING_LEN];
+        if slot[4] == task_id {
+            console::write_str("  nr=");
+            console::write_dec_u64(slot[0]);
+            console::write_str(" a0=0x");
+            console::write_hex_u64(slot[1]);
+            console::write_str(" a1=0x");
+            console::write_hex_u64(slot[2]);
+            console::write_str(" ret=0x");
+            console::write_hex_u64(slot[3]);
+            console::write_str("\r\n");
+            shown += 1;
+        }
+    }
+}
+
 fn current_task_mut() -> Option<&'static mut Task> {
     let manager = scheduler_manager()?;
     // Bounds-checked borrow. The former `get_mut(index).map(|_| &mut
