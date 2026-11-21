@@ -1048,6 +1048,17 @@ impl Vfs {
         Ok(written)
     }
 
+    /// Truncate an existing writable file without changing its open offset.
+    fn truncate_zero(&mut self, owner: u64, fd: u64) -> Result<(), ()> {
+        let file = self.open_files.iter().find(|file| file.owner == owner && file.fd == fd).ok_or(())?;
+        if !file.writable || file.directory {
+            return Err(());
+        }
+        let path = file.path.clone();
+        let (mount, relative) = self.resolve(&path);
+        self.mounts[mount].fs.create_file(&relative)
+    }
+
     /// Positional write (`pwrite`): writes at `offset` without moving the
     /// descriptor's offset. Offsets past EOF extend the file with zeros, which
     /// is what dconf's one-byte `pwrite` into a fresh file needs.
@@ -1436,6 +1447,11 @@ pub fn write(owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
     with_vfs(|vfs| vfs.write(owner, fd, bytes))
 }
 
+/// Truncate a writable open file to zero without changing its offset.
+pub fn truncate_zero(owner: u64, fd: u64) -> Result<(), ()> {
+    with_vfs(|vfs| vfs.truncate_zero(owner, fd))
+}
+
 /// Positional write that does not move the descriptor offset.
 pub fn pwrite(owner: u64, fd: u64, offset: u64, bytes: &[u8]) -> Result<usize, ()> {
     with_vfs(|vfs| vfs.pwrite(owner, fd, offset, bytes))
@@ -1765,6 +1781,21 @@ fn self_test_inner(stage: &mut u32) -> bool {
         return false;
     }
     *stage = 6;
+    let writable = match open(0, "/", "/tmp/vfs_selftest/file", OPEN_WRITE) {
+        Ok(fd) => fd,
+        Err(_) => return false,
+    };
+    let readonly = match open(0, "/", "/tmp/vfs_selftest/file", 0) {
+        Ok(fd) => fd,
+        Err(_) => return false,
+    };
+    if truncate_zero(0, readonly).is_ok() || truncate_zero(0, writable).is_err()
+        || read_file("/", "/tmp/vfs_selftest/file").ok().as_deref() != Some(&[])
+        || write(0, writable, b"hello").is_err()
+        || close(0, writable).is_err() || close(0, readonly).is_err()
+    {
+        return false;
+    }
     match read_file("/", "/tmp/vfs_selftest/file") {
         Ok(data) if data == b"hello".to_vec() => {}
         _ => return false,

@@ -2036,6 +2036,23 @@ fn memfd_write(
     Ok(total as u64)
 }
 
+/// `ftruncate(2)` on a memfd or an ordinary writable file. Ordinary files
+/// currently support only truncation to zero; other lengths fail explicitly.
+pub fn truncate(task: u64, fd: u64, length: u64) -> Result<(), u64> {
+    let task = crate::scheduler::fd_table_owner(task);
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    if (length as i64) < 0 { return Err(EINVAL); }
+    match target {
+        Target::MemFd(_) => memfd_truncate(task, fd, length as usize),
+        Target::Vfs(vfs_fd) => {
+            if with_table(task, |table| access_at(table, fd)) == 0 { return Err(EINVAL); }
+            if length != 0 { return Err(EINVAL); }
+            vfs::truncate_zero(task, vfs_fd).map_err(|_| EINVAL)
+        }
+        _ => Err(EINVAL),
+    }
+}
+
 /// `ftruncate(2)` / `fallocate(2)` on a memfd. The file is backed lazily; a
 /// resize is refused while a shared mapping pins the current run.
 pub fn memfd_truncate(task: u64, fd: u64, length: usize) -> Result<(), u64> {

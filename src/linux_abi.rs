@@ -410,10 +410,10 @@ fn dispatch_inner(
         )),
         SYS_MEMFD_CREATE => finish(linux_fd::memfd(scheduler::current_task_id())),
         SYS_FTRUNCATE => finish(
-            linux_fd::memfd_truncate(
+            linux_fd::truncate(
                 scheduler::current_task_id(),
                 args[0],
-                args[1] as usize,
+                args[1],
             )
             .map(|_| 0),
         ),
