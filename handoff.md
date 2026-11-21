@@ -7821,3 +7821,132 @@ is solved, the compositor should reach the KMS scanout / render loop quickly.
 - Cleanup: LAZY_FAIL markers (FBST/ATMI/ATMV/SPDI), FAIL_RING, IOC-EBADF
   traces, /dev open prints - remove once deniald is stable.
 - procfs.rs:157 unreachable-pattern warning (cpuinfo arm placement) - tidy.
+
+## 2026-11-21 — full-DE boots to the Flutter engine; stop = ICU context init
+
+Continued from the 2026-11-20 stop (systemd-crate isatty_safe(fd=13)). Closed
+that chain completely and reached **the Flutter engine session start**:
+deniald's full-DE flow now runs portal IPC → Wayland frontend listening →
+GPU transfer destination context bound (llvmpipe) → atomic TEST_ONLY accepted
+→ Denial control socket listening → **"starting Flutter with retained prepared
+output targets"** → flutter-display/flutter-raster threads created.
+
+### Current stop (next session's first job)
+
+Flutter's ICU init fails:
+
+```
+[FATAL:.flutter/fml/icu_util.cc(97)] Check failed: context->IsValid().
+Must be able to initialize the ICU context. Tried:
+/usr/lib/denial/flutter/data/icudtl.dat
+```
+
+Facts gathered: the file exists in the image (10 876 560 bytes, header
+`9000da27 14000000 00000200 436d6e44` = the ICU magic); the engine's private
+mapping SUCCEEDED in the trace (`mmap(0, 0xa5f690) -> 0x80325000` — exactly
+the file size); then IsValid fails. Suspect the file-backed lazy fill
+(`read_path_at` per page) returns wrong/empty content for this mapping, or
+the IsValid check is on something else. A validation binary is already staged
+(`/sfs/test-icu`, source `build/testbin/test_icu.c` — opens/stats/mmaps the
+icudtl and prints the first 8 bytes) and BOOT_SESSION has ICU-TEST lines that
+run it after the "DENIAL: log end" marker; the last boot never got there
+because deniald no longer exits (the engine hangs somewhere at startup) —
+raise the boot timeout and read the test output, or run the test binary
+before deniald.
+
+Also observed while the engine hangs: a child loop spawning `/usr/bin/passwd`
+(status 1) then `/bin/passwd` (127) with `MMAP LEAK: teardown could not unmap
+range 0x7FFC1000 / 0x80A21000 / 0x80A31000` warnings (ranges in the MMIO
+window), plus "5000" spam — source unidentified.
+
+### How the previous stops were closed (chronological)
+
+1. **isatty_safe(fd=13)**: our ioctl returned EBADF for any fd>2 with an
+   unrecognized request even when the fd was OPEN. POSIX: an open non-tty fd
+   answers ENOTTY; EBADF only means "not open". linux_ioctl's tail now checks
+   the descriptor (`status_flags`), answers ENOTTY otherwise, and TCGETS on a
+   console target returns a zeroed termios (isatty=true).
+2. **fds_are_same_mount**: statx now returns STATX_MNT_ID (mask bit 0x8000 +
+   stx_mnt_id at offset 144, id 1 for the whole synthetic tree).
+3. **libsystemd SHIM** (owner decision: cut systemd off instead of chasing
+   its asserts): only libseat1 and libpolkit-gobject import sd_* symbols
+   (26 total); a freestanding aarch64 stub
+   (`build/analysis/libsystemd_shim.c`, built with zig cc, no libc) replaces
+   Debian's libsystemd.so.0.40.0 in the image and answers "no systemd" for
+   everything. libseat falls back to the seatd backend on its own.
+4. **libudev embeds the same systemd sources statically** (its
+   fds_are_same_mount asserts live inside libudev.so.1!) — the builder NOPs
+   the two `tbnz` branches into the assert blocks (offsets 0x21E94/0x21F14,
+   verified against the expected encodings, hardcoded offsets — recheck on a
+   libudev update).
+5. **GBM_BACKENDS_PATH** was pointing at the wrong directory: Debian's
+   `dri_gbm.so` lives in `/usr/lib/aarch64-linux-gnu/gbm/`; the env now lists
+   that first. GBM init loads the backend and EGL/GLES (llvmpipe) comes up in
+   the full-DE flow. `--software-rendering` was also added to the deniald
+   command line (MESA_LOADER_DRIVER_OVERRIDE=kms_swrast).
+6. **udmabuf**: llvmpipe's native fence support needs `/dev/udmabuf`
+   (`caps->native_fence_fd = dummy_sync_fd != -1`, built from a dmabuf +
+   DMA_BUF_IOCTL_EXPORT_SYNC_FILE). Implemented: the controller fd, and
+   UDMABUF_CREATE with the MODERN number 0x40187542 (the uapi renumbered
+   UDMABUF_CREATE from 0x15 to 0x42, 24-byte struct) wrapping a memfd into a
+   dmabuf fd (both descriptors share one MemFdState, so mmaps/reads agree),
+   plus DMA_BUF_IOCTL_EXPORT_SYNC_FILE = **0xC0086202 (_IOWR — the first
+   attempt used the wrong direction _IOW and Mesa got ENOTTY)** returning a
+   signalled eventfd, and DMA_BUF_IOCTL_SYNC as a no-op.
+7. **DRM syncobj**: CREATE/DESTROY/HANDLE_TO_FD/FD_TO_HANDLE/WAIT/RESET/
+   SIGNAL/EVENTFD (0x64BF..0x64C6), a boolean signalled table, eventfd-backed
+   fence fds, bounded WAIT loops, plus DRM_CAP_SYNCOBJ=1 in GETPARAM.
+8. **Explicit scanout fencing properties**: plane IN_FENCE_FD (signed range,
+   -1..INT_MAX) and CRTC OUT_FENCE_PTR (range, u64) with validate/apply; the
+   atomic commit writes a signalled eventfd fd into OUT_FENCE_PTR.
+9. Kernel additions along the way: fsync/fdatasync→0, rt_sigtimedwait (137),
+   SOCK_SEQPACKET for AF_UNIX socket(), signalfd4 (74) with raise() routing
+   into the fd before the pending bit, inotify stub (26/27/28), AF_NETLINK
+   stub (libudev's uevent monitor), sched_set/getscheduler (119/120),
+   sched_setattr/getattr (**274/275 — do NOT reuse 215: the first attempt
+   collided with SYS_MUNMAP and a garbage arg reached a kernel Vec alloc and
+   panicked the kernel**), setpriority/getpriority (140/141), clock_adjtime
+   (264), /proc/self/maps + environ + cpuinfo (8 processors) + osrelease,
+   mkdirat missing-parent → ENOENT (create_dir_all), /proc//sys unknown →
+   clean ENOENT, /proc/<pid>/fdinfo/<fd> (mnt_id line, memfd-backed).
+10. **VA window widened**: the stack moved to 0xF0000000 (its own L1 block —
+    a second L2 table; SPACE_TABLE_FRAMES 9→10), the mmap window is now
+    0x40A00000..0xF0000000 (~2.9 GiB), MAX_MMAP_BYTES_PER_TASK 1→2 GiB (Mesa/
+    LLVM reserves ~193 MiB of sparse arenas per GPU context), MAX_MMAP_REGIONS
+    1024→4096, /proc/cpuinfo says 8 processors, QEMU runs -smp 8,
+    LP_NUM_THREADS=1 caps the llvmpipe arenas.
+11. **Group-kill**: linux_kill for a default-terminating signal against self
+    used exit_current_with_status — glibc abort() left sibling threads running
+    on the torn-down space (faults + MMU destroy refused + leaks). Self-kill
+    now goes through exit_group; exit_group kicks an IPI reschedule after
+    marking siblings Dead.
+12. Diagnostics: TRACE_RING (last 2048 syscalls of tasks >=120: nr/args/ret/
+    task, mprotect+prlimit+futex+priority filtered out) — with fd numbers
+    visible, "which fd should have been open" answers itself. boot_dump.py
+    gained --send and a live stderr-log replay (`sleep 90; cat
+    /tmp/deniald.log` in the boot session) for inspecting a still-running
+    session.
+
+### Boot invocation (current)
+
+```
+python -I tools/boot_dump.py --dump build/fbstN.bin --log build/denial-bootNN.log --timeout 180
+```
+
+boot-session runs: seatd (/usr/sbin) →
+`deniald --flutter-bundle /usr/lib/denial/flutter --wayland --no-xwayland
+--software-rendering > /tmp/deniald.log 2>&1` with
+RUST_LOG=debug, MESA_DEBUG=1, LIBGL_DEBUG=verbose, LP_NUM_THREADS=1,
+GBM_BACKENDS_PATH=/usr/lib/aarch64-linux-gnu/gbm:/usr/lib/aarch64-linux-gnu.
+nm the ring addresses after every rebuild (TRACE_RING moved twice today).
+
+### Queued
+
+- ICU: run the /sfs/test-icu probe (see the current stop), fix the file-mmap
+  content path or whatever IsValid checks.
+- The passwd-spawn loop and the MMAP LEAK teardown warnings during the
+  Flutter startup.
+- Stage 3: evdev /dev/input + udev /sys/class/input glue for libinput.
+- Stage 4: screencopy-minimal as the first external Wayland client.
+- Cleanup: the UDMABUF-OPEN/IOCTL/CREATE debug prints, F_ADD_SEALS failure
+  print, FAIL_RING/TRACE_RING scaffolding, the /dev open console prints.

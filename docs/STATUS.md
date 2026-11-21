@@ -136,12 +136,27 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   **group-kill on terminating signals** (self-kill → exit_group), and a
   complete DRM atomic UAPI (planes, properties, blobs, CLOSEFB, PRIME
   export/import, ADDFB2 with real DRM capacity semantics).
-- **Current stop**: a systemd-crate assertion inside deniald —
-  `isatty_safe(fd=13)` gets EBADF from our kernel (fd not open) and aborts.
-  Diagnosis and the fix plan are in `handoff.md` "2026-11-20".
-- Debugging method: `no_mangle` static rings (FAIL_RING, IOC_RING,
-  FAULT_RING, LAZY_FAIL) read through QEMU monitor `pmemsave`; helper
-  `tools/boot_dump.py` boots, dumps and replays deniald's stderr after exit.
+- The kernel gained a large glibc/graphics compat layer for this: ioctl
+  ENOTTY-vs-EBADF semantics, STATX_MNT_ID, /proc fdinfo, signalfd4,
+  inotify, AF_NETLINK stub, fsync, rt_sigtimedwait, SOCK_SEQPACKET,
+  sched_*/priority, group-kill on terminating signals, a widened user VA
+  window (stack at 0xF0000000, mmap ~2.9 GiB), DRM syncobj ioctls +
+  DRM_CAP_SYNCOBJ, plane IN_FENCE_FD / CRTC OUT_FENCE_PTR fencing
+  properties, and a /dev/udmabuf controller (llvmpipe's native fences).
+- **libsystemd is replaced by a shim** in the image (26 sd_* stub symbols,
+  built with zig cc): the real library asserts deep inside its helpers when
+  systemd is absent; libudev.so.1 embeds the same sources statically, so the
+  builder also NOPs its fds_are_same_mount assert branches.
+- **Current stop**: the Flutter engine session starts (display/raster
+  threads) but its ICU init fails on icudtl.dat (`context->IsValid()`) —
+  the file is present and the 10.8 MiB private mapping succeeded in the
+  trace; suspect the file-backed lazy fill content. Details, the staged
+  probe binary (/sfs/test-icu) and the next steps in `handoff.md`
+  "2026-11-21".
+- Debugging method: `no_mangle` static rings (TRACE_RING syscall history,
+  FAIL_RING, IOC_RING, FAULT_RING, LAZY_FAIL) read through QEMU monitor
+  `pmemsave`; helper `tools/boot_dump.py` boots, dumps and replays deniald's
+  stderr after exit.
 
 ### D-Bus
 - EXTERNAL auth (`SO_PEERCRED`), `Hello` method call, method return, signals.

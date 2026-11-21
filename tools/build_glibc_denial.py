@@ -76,7 +76,7 @@ export XDG_RUNTIME_DIR=/tmp
 mkdir /tmp/.config 2>/dev/null
 mkdir /tmp/.cache 2>/dev/null
 chmod 700 /tmp
-export GBM_BACKENDS_PATH=/usr/lib/aarch64-linux-gnu
+export GBM_BACKENDS_PATH=/usr/lib/aarch64-linux-gnu/gbm:/usr/lib/aarch64-linux-gnu
 export LIBSEAT_BACKEND=seatd
 
 # seatd owns the DRM/input device handoff for libseat's seat backend.
@@ -87,17 +87,31 @@ LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu /usr/sbin/seatd -g root >/tmp/seatd.l
 sleep 1
 
 echo "DENIAL: starting deniald"
+# Live replay of the stderr log while the session runs: the log file holds
+# the tracing output, the console drops bytes, so a delayed cat bridges them.
+( sleep 90; echo "DENIAL: --- log snapshot ---"; cat /tmp/deniald.log ) &
 # --flutter-bundle switches runtime_limit() from TestOnly to UntilLogout:
 # without it deniald exits right after the diagnostic scanout test.
 export RUST_LOG=debug
+export MESA_DEBUG=1
+export LIBGL_DEBUG=verbose
+# llvmpipe sizes its per-thread JIT/Gallium arenas by the core count it sees
+# (~193 MiB per thread); with 8 CPUs that exhausts the guest mmap window and
+# the transfer worker dies on a NULL deref. Two threads fit comfortably.
+export LP_NUM_THREADS=1
 # The console drops bytes under load; the file keeps the full stderr and the
 # quiet `cat` after exit replays it over serial.
-LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu /usr/bin/deniald --flutter-bundle /usr/lib/denial/flutter --wayland --no-xwayland > /tmp/deniald.log 2>&1
+LD_LIBRARY_PATH=/usr/lib/aarch64-linux-gnu /usr/bin/deniald --flutter-bundle /usr/lib/denial/flutter --wayland --no-xwayland --software-rendering > /tmp/deniald.log 2>&1
 echo "DENIAL: deniald exited ($?)"
 # Let the abort/fault console flood subside before replaying stderr.
 sleep 2
 cat /tmp/deniald.log
 echo "DENIAL: log end"
+# One-shot file-mmap validation: the flutter engine reads icudtl.dat through
+# a private file mapping; print what the guest actually sees.
+echo "ICU-TEST begin"
+/sfs/test-icu
+echo "ICU-TEST end"
 """
 
 
@@ -193,6 +207,39 @@ def main() -> int:
                         b"/usr/lib/aarch64-linux-gnu\n"
                         b"/usr/local/lib/aarch64-linux-gnu\n")
 
+    # libsystemd shim: the real library asserts deep inside its helpers when
+    # systemd is absent (isatty_safe, fds_are_same_mount) and aborts the
+    # compositor. Only libseat1 and libpolkit-gobject import sd_* symbols
+    # (26 total); replace the .so with a freestanding stub that answers
+    # "no systemd available" for all of them.
+    shim = ROOT / "build/analysis/libsystemd-shim.so.0"
+    if shim.exists():
+        image.write_file_at("/usr/lib/aarch64-linux-gnu/libsystemd.so.0.40.0",
+                            shim.read_bytes())
+        print("  libsystemd replaced with the stub shim")
+    else:
+        print("  WARNING: libsystemd shim missing, keeping the Debian library")
+
+    # libudev.so.1 embeds the same systemd basic sources statically (Debian
+    # builds it self-contained), so its own fds_are_same_mount asserts on a
+    # negative mount id and aborts the compositor. NOP the two conditional
+    # branches into the assert blocks; the function then compares whatever
+    # ids it collected, which is meaningless on this single-filesystem view.
+    udev_path = "/usr/lib/aarch64-linux-gnu/libudev.so.1.7.10"
+    payload = hardlinks.get(udev_path)
+    if payload is not None:
+        patched = bytearray(payload)
+        for offset, expected in ((0x21E94, 0x37F80781), (0x21F14, 0x37F804A0)):
+            actual = int.from_bytes(patched[offset:offset + 4], "little")
+            if actual != expected:
+                sys.exit(f"libudev patch site mismatch at {offset:#x}: "
+                         f"{actual:#x} != {expected:#x}")
+            patched[offset:offset + 4] = (0xD503201F).to_bytes(4, "little")
+        image.write_file_at(udev_path, bytes(patched))
+        print("  libudev fds_are_same_mount asserts NOPed")
+    else:
+        print("  WARNING: libudev payload not found, asserts stay active")
+
     # postprocess (same shape as the other denial builder)
     for directory in ("dev", "proc", "sys", "run", "tmp", "root", "home",
                       "mnt", "media", "srv", "opt", "usr/local",
@@ -208,6 +255,10 @@ def main() -> int:
         ("\n".join(alpine_repo.REPOSITORIES) + "\n").encode())
     image.write_file_at("/etc/apk/arch", b"aarch64\n")
     image.write_file_at("/etc/machine-id", (MACHINE_ID + "\n").encode())
+    icu_test = ROOT / "build/testbin/test_icu"
+    if icu_test.exists():
+        image.write_file_at("/sfs/test-icu", icu_test.read_bytes())
+        print("  test binary staged at /sfs/test-icu")
     image.write_file_at("/var/lib/dbus/machine-id", (MACHINE_ID + "\n").encode())
     # busybox applet links: unpack() captured the applet list when it wrote
     # /etc/busybox-paths.d/busybox; replay it like apk's trigger would.

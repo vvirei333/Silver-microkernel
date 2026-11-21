@@ -43,8 +43,28 @@ const DRM_IOCTL_MODE_MAP_DUMB: u64 = 0xC010_64B3;
 const DRM_IOCTL_MODE_DESTROY_DUMB: u64 = 0xC004_64B4;
 const DRM_IOCTL_MODE_ADDFB2: u64 = 0xC068_64B8;
 
+// Syncobj: Mesa probes SYNCOBJ_EVENTFD during EGL init and advertises
+// EGL_ANDROID_native_fence_sync only when it answers. The GPU transfer
+// worker requires that extension. llvmpipe completes fences on the CPU, so
+// a signaled-bit table plus eventfd-backed fence fds is enough.
+const DRM_IOCTL_SYNCOBJ_CREATE: u64 = 0xC008_64BF;
+const DRM_IOCTL_SYNCOBJ_DESTROY: u64 = 0xC004_64C0;
+const DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD: u64 = 0xC018_64C1;
+const DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE: u64 = 0xC018_64C2;
+const DRM_IOCTL_SYNCOBJ_WAIT: u64 = 0xC018_64C3;
+const DRM_IOCTL_SYNCOBJ_RESET: u64 = 0xC010_64C4;
+const DRM_IOCTL_SYNCOBJ_SIGNAL: u64 = 0xC010_64C5;
+const DRM_IOCTL_SYNCOBJ_EVENTFD: u64 = 0xC018_64C6;
+const DRM_SYNCOBJ_CREATE_SIGNALED: u32 = 1;
+const DRM_SYNCOBJ_FD_FLAGS_EXPORT_SYNC_FILE: u32 = 1;
+const DRM_SYNCOBJ_FD_FLAGS_IMPORT_SYNC_FILE: u32 = 1;
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL: u32 = 1;
+const DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT: u32 = 2;
+const DRM_SYNCOBJ_EVENTFD_FLAGS_SIGNAL: u32 = 1;
+
 const DRM_CAP_DUMB_BUFFER: u64 = 1;
 const DRM_CAP_TIMESTAMP_MONOTONIC: u64 = 6;
+const DRM_CAP_SYNCOBJ: u64 = 17;
 
 const DRM_MODE_CONNECTED: u32 = 1;
 const DRM_MODE_CONNECTOR_VIRTUAL: u32 = 15;
@@ -219,6 +239,58 @@ struct FbCmd2 {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+struct SyncobjCreate {
+    handle: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SyncobjDestroy {
+    handle: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SyncobjFd {
+    handle: u32,
+    flags: u32,
+    fd: i32,
+    pad: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SyncobjWait {
+    handles_ptr: u64,
+    count_handles: u32,
+    flags: u32,
+    first_signaled: i32,
+    pad: u32,
+    timeout_nsec: i64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SyncobjArray {
+    handles_ptr: u64,
+    count_handles: u32,
+    flags: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct SyncobjEventfd {
+    handle: u32,
+    fd: i32,
+    flags: u32,
+    pad: u32,
+    point: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 struct PageFlip {
     crtc_id: u32,
     fb_id: u32,
@@ -261,6 +333,47 @@ const EMPTY_DUMB: Dumb = Dumb {
 static mut BUFFERS: [Dumb; MAX_BUFFERS] = [EMPTY_DUMB; MAX_BUFFERS];
 static mut NEXT_HANDLE: u32 = 1;
 static mut NEXT_FB: u32 = 1;
+
+// Syncobj handles: handle -> signalled. llvmpipe completes fences on the
+// CPU, so a boolean table plus eventfd-backed fence fds covers every path
+// Mesa uses on this driver.
+const SYNCOBJ_MAX: usize = 64;
+static mut SYNCOBJS: [(u32, bool); SYNCOBJ_MAX] = [(0, false); SYNCOBJ_MAX];
+static mut NEXT_SYNCOBJ: u32 = 1;
+
+fn syncobj_slot(handle: u32) -> Option<usize> {
+    let table = unsafe { &*core::ptr::addr_of!(SYNCOBJS) };
+    table.iter().position(|entry| entry.0 == handle)
+}
+
+fn syncobj_signalled(handle: u32) -> bool {
+    syncobj_slot(handle).map(|slot| unsafe { (*core::ptr::addr_of!(SYNCOBJS))[slot].1 }).unwrap_or(false)
+}
+
+fn syncobj_set(handle: u32, signalled: bool) {
+    if let Some(slot) = syncobj_slot(handle) {
+        unsafe {
+            (*core::ptr::addr_of_mut!(SYNCOBJS))[slot].1 = signalled;
+        }
+    }
+}
+
+fn syncobj_alloc(signalled: bool) -> Option<u32> {
+    let table = unsafe { &mut *core::ptr::addr_of_mut!(SYNCOBJS) };
+    let slot = table.iter().position(|entry| entry.0 == 0)?;
+    let handle = unsafe { NEXT_SYNCOBJ };
+    unsafe { NEXT_SYNCOBJ += 1 };
+    table[slot] = (handle, signalled);
+    Some(handle)
+}
+
+fn syncobj_destroy(handle: u32) {
+    if let Some(slot) = syncobj_slot(handle) {
+        unsafe {
+            (*core::ptr::addr_of_mut!(SYNCOBJS))[slot] = (0, false);
+        }
+    }
+}
 
 // One pending page-flip event. A compositor polls and reads it; there is no
 // reason to queue more than one flip ahead.
@@ -494,6 +607,14 @@ fn property_meta(prop_id: u32) -> Option<(&'static str, u32, &'static [u64])> {
         PROP_PLANE_CRTC_Y => Some(("CRTC_Y", PROP_KIND_SIGNED_RANGE, &[0, 0])),
         PROP_PLANE_CRTC_W => Some(("CRTC_W", PROP_KIND_RANGE, &[0, 0xFFFF])),
         PROP_PLANE_CRTC_H => Some(("CRTC_H", PROP_KIND_RANGE, &[0, 0xFFFF])),
+        // Explicit scanout fencing: deniald requires both. The in-fence fd
+        // is a signed range (a -1 fd means "no fence"); the out-fence slot
+        // is a user pointer carrying the fence fd the kernel writes back.
+        PROP_PLANE_IN_FENCE_FD => Some(("IN_FENCE_FD", PROP_KIND_SIGNED_RANGE, &[
+            (-1i64 as u64),
+            0x7FFF_FFFF,
+        ])),
+        PROP_CRTC_OUT_FENCE_PTR => Some(("OUT_FENCE_PTR", PROP_KIND_RANGE, &[0, u64::MAX])),
         // A caller holding a zero handle (a "not found" sentinel from its
         // own bookkeeping) gets a benign generic property instead of the
         // stale-errno failure that aborts the discovery.
@@ -534,6 +655,8 @@ const PROP_PLANE_CRTC_Y: u32 = 11;
 const PROP_PLANE_CRTC_W: u32 = 12;
 const PROP_PLANE_CRTC_H: u32 = 13;
 const PROP_CONN_CRTC_ID: u32 = 14;
+const PROP_PLANE_IN_FENCE_FD: u32 = 15;
+const PROP_CRTC_OUT_FENCE_PTR: u32 = 16;
 
 const DRM_MODE_PAGE_FLIP_EVENT: u32 = 0x01;
 const DRM_MODE_ATOMIC_TEST_ONLY: u32 = 0x100;
@@ -653,6 +776,9 @@ static mut CRTC_MODE_BLOB: u32 = 0;
 static mut PLANE_FB: u32 = 0;
 static mut PLANE_CRTC: u32 = 0;
 static mut CURRENT_FB: u32 = 0;
+/// `OUT_FENCE_PTR` set by the current atomic commit: a user address the
+/// kernel writes the out-fence fd into once the commit lands.
+static mut OUT_FENCE_PTR: u64 = 0;
 
 const MAX_BLOBS: usize = 32;
 const BLOB_DATA_MAX: usize = 128;
@@ -692,6 +818,7 @@ unsafe fn object_properties(
         (CRTC_ID, DRM_MODE_OBJECT_CRTC) => Some(Vec::from([
             (PROP_CRTC_ACTIVE, CRTC_ACTIVE as u64),
             (PROP_CRTC_MODE_ID, CRTC_MODE_BLOB as u64),
+            (PROP_CRTC_OUT_FENCE_PTR, 0),
         ])),
         (PLANE_ID, DRM_MODE_OBJECT_PLANE) => {
             let (width, height) = crate::virtio_gpu::size().unwrap_or((1024, 768));
@@ -707,6 +834,7 @@ unsafe fn object_properties(
                 (PROP_PLANE_CRTC_Y, 0),
                 (PROP_PLANE_CRTC_W, width as u64),
                 (PROP_PLANE_CRTC_H, height as u64),
+                (PROP_PLANE_IN_FENCE_FD, -1i64 as u64),
             ]))
         }
         (CONNECTOR_ID, DRM_MODE_OBJECT_CONNECTOR) => Some(Vec::from([(
@@ -745,6 +873,11 @@ unsafe fn validate_property(prop_id: u32, value: u64) -> bool {
         PROP_PLANE_SRC_X | PROP_PLANE_SRC_Y | PROP_PLANE_CRTC_X | PROP_PLANE_CRTC_Y => {
             value == 0
         }
+        // Explicit fencing: the CPU pipeline completes fences before the
+        // commit lands, so any in-fence fd is accepted and the out-fence
+        // pointer is a userspace address (validated as nonzero).
+        PROP_PLANE_IN_FENCE_FD => true,
+        PROP_CRTC_OUT_FENCE_PTR => value != 0,
         _ => false,
     }
 }
@@ -756,6 +889,7 @@ unsafe fn apply_property(prop_id: u32, value: u64) {
         PROP_CRTC_MODE_ID => CRTC_MODE_BLOB = value as u32,
         PROP_PLANE_FB_ID => PLANE_FB = value as u32,
         PROP_PLANE_CRTC_ID | PROP_CONN_CRTC_ID => PLANE_CRTC = value as u32,
+        PROP_CRTC_OUT_FENCE_PTR => OUT_FENCE_PTR = value,
         _ => {}
     }
 }
@@ -918,6 +1052,16 @@ unsafe fn atomic_commit(argument: u64) -> u64 {
             CURRENT_FB = PLANE_FB;
         }
     }
+    // Explicit scanout fencing: hand the committer a signalled fence fd -
+    // the CPU pipeline has already finished everything the commit shows.
+    let out_fence_ptr = OUT_FENCE_PTR;
+    OUT_FENCE_PTR = 0;
+    if out_fence_ptr != 0 {
+        let task = crate::scheduler::current_task_id();
+        if let Ok(fd) = crate::linux_fd::eventfd(task, 1, true) {
+            let _ = user_memory::copy_to_user(&(fd as u32).to_le_bytes(), out_fence_ptr);
+        }
+    }
     if atomic.flags & DRM_MODE_PAGE_FLIP_EVENT != 0 {
         queue_flip(atomic.user_data);
     }
@@ -925,6 +1069,11 @@ unsafe fn atomic_commit(argument: u64) -> u64 {
 }
 
 const EFAULT_CODE: u64 = 14;
+const EINVAL_CODE: u64 = 22;
+const ENOSPC_CODE: u64 = 28;
+const EBUSY_CODE: u64 = 16;
+const ETIME_CODE: u64 = 62;
+const ENOMEM_CODE: u64 = 12;
 
 unsafe fn queue_flip(user_data: u64) {
     let event = &mut *core::ptr::addr_of_mut!(EVENT);
@@ -1068,6 +1217,10 @@ unsafe fn drm_ioctl_inner(request: u64, argument: u64) -> Option<u64> {
                     DRM_CAP_TIMESTAMP_MONOTONIC => 1,
                     DRM_CAP_PRIME => 0x3, // import | export
                     DRM_CAP_CRTC_IN_VBLANK_EVENT => 1,
+                    // Mesa advertises EGL_ANDROID_native_fence_sync (the GPU
+                    // transfer worker requires it) only when the device
+                    // claims syncobj support.
+                    DRM_CAP_SYNCOBJ => 1,
                     _ => 0,
                 };
                 if !store(argument, &cap) {
@@ -2090,6 +2243,164 @@ pub fn map_bo(length: usize, offset: usize) -> Option<usize> {
 pub fn render_ioctl(request: u64, argument: u64) -> Option<u64> {
     unsafe {
         Some(match request {
+            DRM_IOCTL_SYNCOBJ_CREATE => {
+                let Some(mut command) = load::<SyncobjCreate>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let Some(handle) =
+                    syncobj_alloc(command.flags & DRM_SYNCOBJ_CREATE_SIGNALED != 0)
+                else {
+                    return Some(ENOSPC_CODE);
+                };
+                command.handle = handle;
+                if !store(argument, &command) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_SYNCOBJ_DESTROY => {
+                let Some(command) = load::<SyncobjDestroy>(argument) else {
+                    return Some(u64::MAX);
+                };
+                syncobj_destroy(command.handle);
+                0
+            }
+            DRM_IOCTL_SYNCOBJ_HANDLE_TO_FD => {
+                let Some(mut command) = load::<SyncobjFd>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if !syncobj_signalled(command.handle) {
+                    // The caller may only want a fence fd that becomes
+                    // readable when the fence completes; llvmpipe completes
+                    // during the flush that precedes the export, so an
+                    // unsignalled handle here has nothing to wait on yet.
+                    return Some(EINVAL_CODE);
+                }
+                let task = crate::scheduler::current_task_id();
+                let Ok(fd) = crate::linux_fd::eventfd(task, 1, true) else {
+                    return Some(ENOMEM_CODE);
+                };
+                command.fd = fd as i32;
+                if !store(argument, &command) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_SYNCOBJ_FD_TO_HANDLE => {
+                let Some(mut command) = load::<SyncobjFd>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let task = crate::scheduler::current_task_id();
+                let signalled =
+                    crate::linux_fd::eventfd_peek(task, command.fd as u64)
+                        .map(|value| value > 0)
+                        .unwrap_or(false);
+                let Some(handle) = syncobj_alloc(signalled) else {
+                    return Some(ENOSPC_CODE);
+                };
+                command.handle = handle;
+                if !store(argument, &command) {
+                    return Some(u64::MAX);
+                }
+                0
+            }
+            DRM_IOCTL_SYNCOBJ_WAIT => {
+                let Some(wait) = load::<SyncobjWait>(argument) else {
+                    return Some(u64::MAX);
+                };
+                if wait.count_handles == 0 || wait.handles_ptr == 0 {
+                    return Some(EINVAL_CODE);
+                }
+                let deadline = if wait.timeout_nsec >= 0x7FFF_FFFF_FFFF_FFFF {
+                    crate::timer::ticks() + 10_000
+                } else {
+                    crate::timer::ticks()
+                        + crate::timer::milliseconds_to_ticks(
+                            (wait.timeout_nsec / 1_000_000).min(10_000) as u64,
+                        )
+                };
+                loop {
+                    let mut first_signalled: Option<u32> = None;
+                    let mut all = true;
+                    let mut any = false;
+                    for index in 0..wait.count_handles as u64 {
+                        let mut raw = [0_u8; 4];
+                        if user_memory::copy_from_user(
+                            wait.handles_ptr + index * 4,
+                            &mut raw,
+                        )
+                        .is_err()
+                        {
+                            return Some(EFAULT_CODE);
+                        }
+                        let handle = u32::from_le_bytes(raw);
+                        if syncobj_signalled(handle) {
+                            any = true;
+                            if first_signalled.is_none() {
+                                first_signalled = Some(index as u32);
+                            }
+                        } else {
+                            all = false;
+                        }
+                    }
+                    let satisfied = if wait.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_ALL != 0 {
+                        all
+                    } else {
+                        any
+                    };
+                    if satisfied {
+                        if let Some(first) = first_signalled {
+                            let mut command = wait;
+                            command.first_signaled = first as i32;
+                            if !store(argument, &command) {
+                                return Some(u64::MAX);
+                            }
+                        }
+                        return Some(0);
+                    }
+                    if wait.flags & DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT == 0 {
+                        return Some(EBUSY_CODE);
+                    }
+                    if crate::timer::ticks() >= deadline {
+                        return Some(ETIME_CODE);
+                    }
+                    crate::scheduler::sleep(1);
+                }
+            }
+            DRM_IOCTL_SYNCOBJ_RESET | DRM_IOCTL_SYNCOBJ_SIGNAL => {
+                let Some(array) = load::<SyncobjArray>(argument) else {
+                    return Some(u64::MAX);
+                };
+                let signalled = request == DRM_IOCTL_SYNCOBJ_SIGNAL;
+                for index in 0..array.count_handles as u64 {
+                    let mut raw = [0_u8; 4];
+                    if user_memory::copy_from_user(array.handles_ptr + index * 4, &mut raw)
+                        .is_err()
+                    {
+                        return Some(EFAULT_CODE);
+                    }
+                    syncobj_set(u32::from_le_bytes(raw), signalled);
+                }
+                0
+            }
+            DRM_IOCTL_SYNCOBJ_EVENTFD => {
+                let Some(eventfd) = load::<SyncobjEventfd>(argument) else {
+                    return Some(u64::MAX);
+                };
+                // llvmpipe completes on the CPU: by the time Mesa wires an
+                // eventfd to a syncobj the fence is either already signalled
+                // or completes during the next flush, which runs before the
+                // waiter reads. Signal the eventfd when the handle is
+                // signalled now; otherwise arm nothing and let the caller's
+                // next flush re-arm through the SIGNAL path.
+                if syncobj_signalled(eventfd.handle)
+                    && eventfd.flags & DRM_SYNCOBJ_EVENTFD_FLAGS_SIGNAL != 0
+                {
+                    let task = crate::scheduler::current_task_id();
+                    crate::linux_fd::eventfd_signal(task, eventfd.fd as u64, 1);
+                }
+                0
+            }
             DRM_IOCTL_VIRTGPU_GETPARAM => {
                 let Some(mut getparam) = load::<VirtgpuGetparam>(argument) else {
                     return Some(u64::MAX);

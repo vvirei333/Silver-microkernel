@@ -193,12 +193,19 @@ const USER_HEAP_L2_INDEX: usize = (USER_HEAP_VA - DRAM_BASE) / BLOCK_2M;
 /// Sixty-four pages (256 KiB) leave room for the guest TLS handshake and the
 /// litehtml layout recursion. The old two-page stack faulted on the guard page
 /// during the first HTTPS request; the browser engine needs even more.
-pub const USER_STACK_GUARD_VA: usize = USER_IMAGE_VA + 0x3FE0_0000;
+///
+/// The stack lives in its own 1 GiB L1 block (0xF0000000..) instead of the
+/// top of the first L2 table: the mmap window below it must stay wide enough
+/// for Mesa/LLVM arena reservations (~193 MiB per GPU worker context).
+pub const USER_STACK_GUARD_VA: usize = USER_IMAGE_VA + 0xB000_0000;
 /// Every task's own stack appears at this user VA, backed by different PAs.
 pub const USER_STACK_VA: usize = USER_STACK_GUARD_VA + GRANULE;
 pub const USER_STACK_PAGES: usize = 64;
 pub const USER_STACK_SIZE: usize = USER_STACK_PAGES * GRANULE;
-const USER_STACK_L2_INDEX: usize = (USER_STACK_VA - DRAM_BASE) / BLOCK_2M;
+/// L1 slot of the stack's 1 GiB block.
+const USER_STACK_L1_INDEX: usize = (USER_STACK_VA >> 30) & 0x1FF;
+/// L2 slot inside that block.
+const USER_STACK_L2_INDEX: usize = (USER_STACK_VA >> 21) & 0x1FF;
 /// L3 slot of the first mapped stack page. Slot 0 is the guard page; the
 /// stack table is zeroed on allocation, so the guard entry stays invalid.
 const USER_STACK_L3_INDEX: usize = (USER_STACK_VA >> 12) & 0x1FF;
@@ -803,10 +810,11 @@ fn clean_table_lines(table_start: usize, table_bytes: usize) {
 // Per-task user address spaces
 // ---------------------------------------------------------------------------
 
-/// Frames a freshly created address space owns: root, user L1/L2, image/heap/
-/// stack L3s, and the private L1/L2/L3 trio. Charged to the task's memory
-/// ledger as one flat cost; `mmap` adds its own L3 estimate separately.
-pub const SPACE_TABLE_FRAMES: usize = 9;
+/// Frames a freshly created address space owns: root, user L1/L2, the high
+/// L2 for the stack's 1 GiB block, image/heap/stack L3s, and the private
+/// L1/L2/L3 trio. Charged to the task's memory ledger as one flat cost;
+/// `mmap` adds its own L3 estimate separately.
+pub const SPACE_TABLE_FRAMES: usize = 10;
 /// One L3 table covers 2 MiB. The ELF loader's window is 8 MiB, so an image
 /// may need up to four image L3 tables (the first one is preallocated).
 const IMAGE_L3_TABLES: usize = crate::elf::USER_IMAGE_SIZE / BLOCK_2M;
@@ -900,7 +908,8 @@ pub fn create_task_space(
         extra_tokens[index] = token;
     }
 
-    let [l0, l1_user, l2_user, l3_image, l3_heap, l3_stack, l1_priv, l2_priv, l3_priv] = pages;
+    let [l0, l1_user, l2_user, l2_stack_high, l3_image, l3_heap, l3_stack, l1_priv, l2_priv, l3_priv] =
+        pages;
 
     unsafe {
         for &page in &pages {
@@ -942,7 +951,10 @@ pub fn create_task_space(
         }
 
         if user_stack_start != 0 {
-            write_entry(l2_user, USER_STACK_L2_INDEX, l3_stack as u64 | DESC_TABLE);
+            // The stack block lives in its own L2 above the first 1 GiB: the
+            // mmap window below stays wide (see USER_STACK_GUARD_VA).
+            write_entry(l1_user, USER_STACK_L1_INDEX, l2_stack_high as u64 | DESC_TABLE);
+            write_entry(l2_stack_high, USER_STACK_L2_INDEX, l3_stack as u64 | DESC_TABLE);
             // Slot 0 remains zero: that is the guard page below the stack.
             for index in 0..USER_STACK_PAGES {
                 let physical = user_stack_start + index * GRANULE;

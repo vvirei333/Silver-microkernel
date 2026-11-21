@@ -148,8 +148,8 @@ Silver-специфичных патчей.
 | --- | --- |
 | P1 | Linux ABI: busybox `sh`, glibc-бинарники |
 | P2 | deniald проходит seatd/DrmDevice/EGL (llvmpipe) |
-| P3 | deniald доходит до Wayland-сокета и KMS-сканаута (текущая точка) |
-| P4 | render loop + Flutter-шелл на экране; ввод (evdev/libinput) |
+| P3 | [сделано] deniald: Wayland-сокет, portal IPC, GPU transfer, atomic TEST_ONLY, control socket — полный DE-флоу до старта Flutter |
+| P4 | [текущая точка] Flutter engine стартует; стоп = ICU init на icudtl.dat (см. handoff "2026-11-21"); затем render loop + шелл на экране |
 | P5 | screencopy-minimal как первый внешний Wayland-клиент |
 
 Риски: glibc-поведение (треды/exit_group/futex), системная интеграция deniald

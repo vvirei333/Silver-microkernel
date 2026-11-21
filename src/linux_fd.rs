@@ -299,6 +299,9 @@ enum Target {
     /// `inotify` instance (deniald's settings watcher). No filesystem events
     /// are published, so reads block/EAGAIN forever.
     Inotify { nonblock: bool },
+    /// The `/dev/udmabuf` controller fd: `UDMABUF_CREATE` turns a memfd into
+    /// a dmabuf fd (served as a second MemFd target over the same state).
+    Udmabuf,
 }
 
 struct SignalFdState {
@@ -600,6 +603,38 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         crate::console::write_hex_u64(flags);
         crate::console::write_str("\r\n");
     }
+    // Per-fd fdinfo: systemd's fds_are_same_mount() reads
+    // /proc/<pid>/fdinfo/<fd> for the "mnt_id" line and asserts on failure.
+    // The content is dynamic (per fd), so it is served through a memfd.
+    // Only the caller's own thread group is served; another pid's fdinfo is
+    // ENOENT like on a real kernel without permission.
+    if resolved.starts_with("/proc/") {
+        if let Some((pid_str, fd_str)) = resolved[5..].split_once("/fdinfo/") {
+            let own = match pid_str {
+                "self" => true,
+                p => p.parse::<u64>().ok().map(|pid| {
+                    pid == crate::scheduler::current_tgid()
+                        || pid == crate::scheduler::current_task_id()
+                }).unwrap_or(false),
+            };
+            if own {
+                let number = fd_str.parse::<u64>().map_err(|_| ENOENT)?;
+                let bytes = fdinfo_content(task, number).ok_or(ENOENT)?;
+                return insert(
+                    task,
+                    Target::MemFd(Arc::new(Mutex::new(MemFdState {
+                        data: bytes.clone(),
+                        len: bytes.len(),
+                        offset: 0,
+                        frames: None,
+                        maps: 0,
+                        seals: 0,
+                    }))),
+                )
+                .ok_or(EMFILE);
+            }
+        }
+    }
     // Synthetic procfs first: OpenRC reads a handful of /proc files.
     if let Some(node) = crate::procfs::lookup(&resolved) {
         return match node {
@@ -688,6 +723,13 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         "/dev/full" => Some(Target::Full),
         "/dev/urandom" | "/dev/random" => Some(Target::Random),
         "/dev/ivshmem" => Some(Target::Ivshmem),
+        // The udmabuf controller: llvmpipe opens it to turn memfds into
+        // dmabuf fds, which is how it builds its native fence support.
+        "/dev/udmabuf" => {
+            crate::console::write_str("UDMABUF-OPEN
+");
+            Some(Target::Udmabuf)
+        }
         // Only present when the machine has a virtio-gpu the driver brought
         // up; the compositor then presents through the GPU as well.
         "/dev/gpufb" if crate::virtio_gpu::size().is_some() => Some(Target::GpuFb),
@@ -925,6 +967,8 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         Target::Console => Ok(0),
         Target::DirList { .. } => Err(EISDIR),
         Target::Prime { .. } => Err(EINVAL),
+        // The controller fd carries no data; the dmabuf form is a MemFd.
+        Target::Udmabuf => Err(EINVAL),
         Target::Sysfs(data, offset) => {
             if offset >= data.len() {
                 return Ok(0);
@@ -1145,6 +1189,7 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         // Netlink sends vanish (no kernel uevent publisher reads them).
         Target::Netlink { .. } => Ok(count),
         Target::Inotify { .. } => Err(EINVAL),
+        Target::Udmabuf => Err(EINVAL),
         Target::TimerFd { .. } | Target::Epoll(_) | Target::SignalFd(_) => Err(EINVAL),
     }
 }
@@ -1311,6 +1356,7 @@ pub fn stat_fields(
         }
         Target::Epoll(_) | Target::TimerFd { .. } | Target::Netlink { .. }
         | Target::Inotify { .. } => (S_IFSOCK | 0o600, 0, fd.max(1), None),
+        Target::Udmabuf => (S_IFCHR | 0o600, 0, fd.max(1), None),
     })
 }
 
@@ -1547,9 +1593,73 @@ pub fn inotify_init(task: u64, nonblock: bool) -> Result<u64, u64> {
     insert(task, Target::Inotify { nonblock }).ok_or(EMFILE)
 }
 
+/// Current eventfd counter without consuming it. DRM syncobj export hands
+/// Mesa an eventfd-backed fence fd and needs to know whether it is signalled.
+pub fn eventfd_peek(task: u64, fd: u64) -> Option<u64> {
+    let target = lookup(task, fd)?;
+    match target {
+        Target::EventFd { state, .. } => Some(*state.lock()),
+        _ => None,
+    }
+}
+
+/// Adds `value` to an eventfd's counter (the syncobj signal path).
+pub fn eventfd_signal(task: u64, fd: u64, value: u64) -> bool {
+    let Some(target) = lookup(task, fd) else {
+        return false;
+    };
+    match target {
+        Target::EventFd { state, .. } => {
+            let mut counter = state.lock();
+            *counter = counter.saturating_add(value);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// `procfs` fdinfo content for one descriptor: pos, octal flags and the
+/// single mount id. `None` when the descriptor is not open (the caller
+/// reports ENOENT like the real kernel does).
+fn fdinfo_content(task: u64, fd: u64) -> Option<alloc::vec::Vec<u8>> {
+    let flags = status_flags(task, fd)?;
+    Some(
+        alloc::format!(
+            "pos:\t0\nflags:\t0{:o}\nmnt_id:\t1\n",
+            flags
+        )
+        .into_bytes(),
+    )
+}
+
 /// Whether the descriptor is an inotify instance.
 pub fn is_inotify(task: u64, fd: u64) -> bool {
     matches!(lookup(task, fd), Some(Target::Inotify { .. }))
+}
+
+/// Whether the descriptor is the udmabuf controller.
+pub fn is_udmabuf(task: u64, fd: u64) -> bool {
+    matches!(lookup(task, fd), Some(Target::Udmabuf))
+}
+
+/// Whether the descriptor backs a dmabuf-compatible memory object.
+pub fn is_memfd(task: u64, fd: u64) -> bool {
+    matches!(lookup(task, fd), Some(Target::MemFd(_)))
+}
+
+/// `UDMABUF_CREATE`: wraps an existing memfd in a second descriptor that
+/// acts as the dmabuf. The real kernel shares the pages; here both
+/// descriptors reference the same `MemFdState`, so mmaps, reads and writes
+/// stay in sync.
+pub fn udmabuf_create(task: u64, memfd: u64, _offset: u64, size: u64) -> Result<u64, u64> {
+    let target = lookup(task, memfd).ok_or(EBADF)?;
+    let Target::MemFd(state) = target else {
+        return Err(EINVAL);
+    };
+    if state.lock().len() < size as usize {
+        return Err(EINVAL);
+    }
+    insert(task, Target::MemFd(state)).ok_or(EMFILE)
 }
 
 /// Creates an anonymous in-memory file (`memfd_create`). File-backed `mmap`
@@ -2518,6 +2628,7 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::DirList { .. }
         | Target::Prime { .. }
         | Target::MemFd(_)
+        | Target::Udmabuf
         | Target::Epoll(_) => (O_RDWR, false),
     };
     Some(access | if nonblock { O_NONBLOCK } else { 0 })
@@ -2615,6 +2726,7 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
         // No uevent publisher: the monitor never reports readable.
         Target::Netlink { .. } => 0,
         Target::Inotify { .. } => 0,
+        Target::Udmabuf => POLLOUT,
         Target::MemFd(_) => POLLIN | POLLOUT,
         Target::Socket { state, end, .. } => {
             let socket = state.lock();

@@ -2062,7 +2062,7 @@ fn has_task_capacity(manager: &TaskManager) -> bool {
 /// Upper bound on a task's anonymous mappings. The virtual window allows far
 /// more entries than the 128 MiB DRAM can back; this cap bounds the metadata
 /// Vec itself, not just the frames.
-const MAX_MMAP_REGIONS: usize = 1024;
+const MAX_MMAP_REGIONS: usize = 4096;
 
 /// Per-task cap on mapping bytes. The mmap window is ~1 GiB but DRAM is
 /// shared by every task, so one EL0 task must not be able to claim the whole
@@ -2071,8 +2071,11 @@ const MAX_MMAP_REGIONS: usize = 1024;
 /// the global frame reserve stays the last line of defence.
 // A large value because lazily reserved ranges (glibc's 128 MiB heap probe)
 // count toward it while committing no frames. The real bound on memory is the
-// per-task frame ledger, charged one page at a time.
-const MAX_MMAP_BYTES_PER_TASK: usize = 1024 * 1024 * 1024;
+// per-task frame ledger, charged one page at a time. Mesa/LLVM reserves
+// ~193 MiB of sparse JIT/Gallium arenas per GPU context (compositor +
+// transfer worker), which needs more than the historical 1 GiB now that the
+// user VA window reaches 0xF0000000.
+const MAX_MMAP_BYTES_PER_TASK: usize = 2 * 1024 * 1024 * 1024;
 
 pub fn exit_current() -> ! {
     exit_current_with_status(0)

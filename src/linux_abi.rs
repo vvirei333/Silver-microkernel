@@ -278,6 +278,13 @@ const S_IFREG: u32 = 0o100000;
 /// Watch ids for the inotify stub.
 static INOTIFY_WD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
+/// Last-N syscall trace of Linux guest tasks (nr, arg0, arg1, result, task).
+pub const TRACE_RING_LEN: usize = 2048;
+static TRACE_RING_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut TRACE_RING: [[u64; 5]; TRACE_RING_LEN] = [[0; 5]; TRACE_RING_LEN];
+
 /// `sched_getattr(2)`: SCHED_OTHER, no runtime constraints. The caller's
 /// size field is untrusted - a kernel Vec with a user capacity would panic
 /// the allocator, so anything past the struct cap reports EINVAL.
@@ -308,6 +315,27 @@ pub static mut FAIL_RING: [[u64; 8]; FAIL_RING_LEN] = [[0; 8]; FAIL_RING_LEN];
 pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
     let number = frame[8];
     let result = dispatch_body(frame);
+    // Last-N syscall trace of the Linux guest stack: (nr, arg0, arg1,
+    // result, task). With the fd numbers visible, a "which fd should have
+    // been open" question answers itself from the open/close history around
+    // the failing call. Native tasks (init, shell, net_server) have small
+    // ids and are skipped; the boot-session's OpenRC helpers stay below 120
+    // as well, so their sysinit loops cannot flush the window.
+    // mprotect/prlimit/futex floods from Mesa/GLib would wash the ring out;
+    // they are never the interesting failures.
+    if crate::scheduler::current_task_id() >= 120
+        && !matches!(number, 226 | 172 | 98 | 141 | 119 | 120 | 274 | 275)
+    {
+        let index = TRACE_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        let slot = index % TRACE_RING_LEN;
+        unsafe {
+            TRACE_RING[slot][0] = number;
+            TRACE_RING[slot][1] = frame[0];
+            TRACE_RING[slot][2] = frame[1];
+            TRACE_RING[slot][3] = result;
+            TRACE_RING[slot][4] = crate::scheduler::current_task_id();
+        }
+    }
     if (result as i64) < 0 {
         let code = (result as i64).unsigned_abs();
         #[cfg(feature = "linux-abi-trace")]
@@ -2227,9 +2255,16 @@ fn linux_readv(fd: u64, iovec: u64, count: u64) -> u64 {
 /// console. Everything else reports "not a tty".
 fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
     const TIOCGWINSZ: u64 = 0x5413;
+    const TCGETS: u64 = 0x5401;
     const FIONBIO: u64 = 0x5421;
     /// `_IO('W', 0x01)`: present the current `/dev/gpufb` contents.
     const GPU_IOCTL_FLUSH: u64 = 0x5701;
+    /// udmabuf: turn a memfd into a dmabuf fd. The modern uapi renumbered
+    /// UDMABUF_CREATE from 0x15 to 0x42 (24-byte struct udmabuf_create).
+    const UDMABUF_CREATE: u64 = 0x4018_7542;
+    /// dma-buf ioctls llvmpipe runs on its dummy dmabuf.
+    const DMA_BUF_SYNC: u64 = 0x4008_6200;
+    const DMA_BUF_EXPORT_SYNC_FILE: u64 = 0xC008_6202;
     let task = scheduler::current_task_id();
     if linux_fd::is_drm(task, fd) {
         if let Some(result) = crate::drm::ioctl(request, argument) {
@@ -2312,15 +2347,84 @@ fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
             _ => {}
         }
     }
-    if fd > 2 {
-        crate::console::write_str("IOC-EBADF fd=");
-        crate::console::write_dec_u64(fd);
-        crate::console::write_str(" req=0x");
+    if linux_fd::is_udmabuf(task, fd) {
+        crate::console::write_str("UDMABUF-IOCTL req=0x");
         crate::console::write_hex_u64(request);
         crate::console::write_str("\r\n");
+    }
+    if request == UDMABUF_CREATE && linux_fd::is_udmabuf(task, fd) {
+        // struct udmabuf_create { u32 memfd, u32 flags, u64 offset, u64 size }
+        let mut raw = [0_u8; 24];
+        if user_memory::copy_from_user(argument, &mut raw).is_err() {
+            return errno(EFAULT);
+        }
+        let memfd = u64::from(raw[0])
+            | u64::from(raw[1]) << 8
+            | u64::from(raw[2]) << 16
+            | u64::from(raw[3]) << 24;
+        let size = u64::from(raw[16])
+            | u64::from(raw[17]) << 8
+            | u64::from(raw[18]) << 16
+            | u64::from(raw[19]) << 24
+            | u64::from(raw[20]) << 32
+            | u64::from(raw[21]) << 40
+            | u64::from(raw[22]) << 48
+            | u64::from(raw[23]) << 56;
+        let result = linux_fd::udmabuf_create(task, memfd, 0, size);
+        crate::console::write_str("UDMABUF-CREATE memfd=");
+        crate::console::write_dec_u64(memfd);
+        crate::console::write_str(" size=");
+        crate::console::write_dec_u64(size);
+        crate::console::write_str(" -> ");
+        match &result {
+            Ok(fd) => crate::console::write_dec_u64(*fd),
+            Err(code) => crate::console::write_dec_u64(*code),
+        }
+        crate::console::write_str("\r\n");
+        return finish(result);
+    }
+    if linux_fd::is_memfd(task, fd) {
+        if request == DMA_BUF_EXPORT_SYNC_FILE {
+            // struct dma_buf_export_sync_file { u32 flags, s32 fd }: the fence
+            // completes on the CPU, so the exported sync file is signalled.
+            let Ok(sync_fd) = linux_fd::eventfd(task, 1, true) else {
+                return errno(ENOMEM);
+            };
+            let mut out = [0_u8; 8];
+            out[4..8].copy_from_slice(&(sync_fd as i32).to_le_bytes());
+            if user_memory::copy_to_user(&out, argument).is_err() {
+                return errno(EFAULT);
+            }
+            return 0;
+        }
+        if request == DMA_BUF_SYNC {
+            // CPU-side memory: the read/write barriers are no-ops here.
+            return 0;
+        }
+    }
+    if request == TCGETS {
+        // glibc's isatty() probes TCGETS; a console answers with a zeroed
+        // termios so isatty returns true.
+        if linux_fd::is_console(task, fd) {
+            let termios = [0_u8; 60];
+            if user_memory::copy_to_user(&termios, argument).is_err() {
+                return errno(EFAULT);
+            }
+            return 0;
+        }
+    }
+    // Everything that reached here is not a device with a specific handler.
+    // The POSIX answer for an OPEN descriptor is ENOTTY ("inappropriate
+    // ioctl for device"); EBADF only means the descriptor is not open.
+    // libsystemd's isatty_safe asserts on EBADF for fds above stdio - the
+    // deniald startup died on exactly that distinction.
+    if linux_fd::status_flags(task, fd).is_none() {
         return errno(EBADF);
     }
     if request != TIOCGWINSZ {
+        return errno(ENOTTY);
+    }
+    if !linux_fd::is_console(task, fd) {
         return errno(ENOTTY);
     }
     // struct winsize { unsigned short ws_row, ws_col, ws_xpixel, ws_ypixel }
@@ -2539,8 +2643,12 @@ fn write_statx(
     rdev: Option<u64>,
 ) -> Result<(), u64> {
     const STATX_BASIC_STATS: u32 = 0x7ff;
+    // systemd's fds_are_same_mount() statx's fds with STATX_MNT_ID and
+    // asserts the result: without the bit the mount id reads as an error and
+    // the assert aborts the process.
+    const STATX_MNT_ID: u32 = 0x8000;
     let mut raw = [0_u8; 256];
-    raw[0..4].copy_from_slice(&STATX_BASIC_STATS.to_le_bytes());
+    raw[0..4].copy_from_slice(&(STATX_BASIC_STATS | STATX_MNT_ID).to_le_bytes());
     raw[4..8].copy_from_slice(&4096_u32.to_le_bytes());
     raw[16..20].copy_from_slice(&1_u32.to_le_bytes());
     raw[28..30].copy_from_slice(&(mode as u16).to_le_bytes());
@@ -2551,6 +2659,9 @@ fn write_statx(
         raw[128..132].copy_from_slice(&linux_fd::major(device).to_le_bytes());
         raw[132..136].copy_from_slice(&linux_fd::minor(device).to_le_bytes());
     }
+    // One mount id for the whole synthetic tree: same-mount comparisons see
+    // every descriptor as shared, which matches the single-filesystem view.
+    raw[144..152].copy_from_slice(&1_u64.to_le_bytes());
     user_memory::copy_to_user(&raw, buffer).map_err(|_| EFAULT)
 }
 
@@ -2634,7 +2745,13 @@ fn linux_fcntl(fd: u64, command: u64, argument: u64) -> u64 {
             0
         }
         F_ADD_SEALS => {
-            finish(linux_fd::memfd_add_seals(task, fd, argument as u32).map(|_| 0))
+            let result = linux_fd::memfd_add_seals(task, fd, argument as u32).map(|_| 0);
+            if result.is_err() {
+                crate::console::write_str("F_ADD_SEALS fd=");
+                crate::console::write_dec_u64(fd);
+                crate::console::write_str(" failed\r\n");
+            }
+            finish(result)
         }
         F_GET_SEALS => match linux_fd::memfd_get_seals(task, fd) {
             Ok(seals) => u64::from(seals),

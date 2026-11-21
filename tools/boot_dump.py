@@ -27,7 +27,7 @@ MONITOR_PORT = 4445
 def qemu_command() -> list[str]:
     return [
         "qemu-system-aarch64", "-machine", "virt", "-cpu", "cortex-a72",
-        "-smp", "2", "-m", "1024M",
+        "-smp", "8", "-m", "1024M",
         "-kernel", str(KERNEL),
         "-drive", f"file={IMAGE},format=raw,if=none,id=hd",
         "-device", "virtio-blk-pci,drive=hd",
@@ -72,6 +72,7 @@ def main() -> int:
     parser.add_argument("--dump", default="build/fbst.bin")
     parser.add_argument("--timeout", type=float, default=170.0)
     parser.add_argument("--log", default="build/denial-boot-dump.log")
+    parser.add_argument("--send", default=None)
     args = parser.parse_args()
 
     env = dict(os.environ)

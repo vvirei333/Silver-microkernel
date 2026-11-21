@@ -73,6 +73,18 @@ const SELF_ENVIRON: &[u8] = b"HOME=/root\0PATH=/usr/bin:/bin\0XDG_RUNTIME_DIR=/t
 const CPUINFO: &[u8] = b"processor\t: 0\n\
 model name\t: QEMU virt cortex-a72\n\
 processor\t: 1\n\
+model name\t: QEMU virt cortex-a72\n\
+processor\t: 2\n\
+model name\t: QEMU virt cortex-a72\n\
+processor\t: 3\n\
+model name\t: QEMU virt cortex-a72\n\
+processor\t: 4\n\
+model name\t: QEMU virt cortex-a72\n\
+processor\t: 5\n\
+model name\t: QEMU virt cortex-a72\n\
+processor\t: 6\n\
+model name\t: QEMU virt cortex-a72\n\
+processor\t: 7\n\
 model name\t: QEMU virt cortex-a72\n";
 const OSRELEASE: &[u8] = b"6.12.0-silver\n";
 // The Dart VM reads /proc/self/maps at startup; without the node the open
