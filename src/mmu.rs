@@ -1250,7 +1250,6 @@ fn map_user_pages_at_inner(
     let root = root_of(ttbr0);
     unsafe {
         let l1_user = follow_table(root, 0);
-        let l2_user = follow_table(l1_user, 1);
         // All-or-nothing: `done` counts fully installed pages; every failure
         // path unrolls them before returning. The rollback cannot refuse:
         // each of the `done` slots was written by this call, so its L2 link
@@ -1258,8 +1257,26 @@ fn map_user_pages_at_inner(
         let mut done = 0usize;
         for index in 0..page_count {
             let va = virtual_address + index * GRANULE;
-            let l2_index = (va - DRAM_BASE) / BLOCK_2M;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_index = (va >> 21) & (ENTRIES - 1);
             let l3_index = (va >> 12) & 0x1FF;
+            let l1_entry = read_entry(l1_user, l1_index);
+            let l2_user = if l1_entry == 0 {
+                let Some(table) = alloc_registered_table(root) else {
+                    if done != 0 { unmap_user_pages_at(ttbr0, virtual_address, done); }
+                    finish_table_changes_for(ttbr0);
+                    return false;
+                };
+                write_entry(l1_user, l1_index, table as u64 | DESC_TABLE);
+                clean_entry_line(l1_user, l1_index);
+                table
+            } else if l1_entry & DESC_TABLE == DESC_TABLE {
+                descriptor_address(l1_entry) as usize
+            } else {
+                if done != 0 { unmap_user_pages_at(ttbr0, virtual_address, done); }
+                finish_table_changes_for(ttbr0);
+                return false;
+            };
             let l2_entry = read_entry(l2_user, l2_index);
             let l3 = if l2_entry == 0 {
                 let Some((page, generation)) = frame_allocator::alloc_page_tagged() else {
@@ -1360,8 +1377,10 @@ pub fn replace_user_page(
     let root = root_of(ttbr0);
     unsafe {
         let l1_user = follow_table(root, 0);
-        let l2_user = follow_table(l1_user, 1);
-        let l2_index = (virtual_address - DRAM_BASE) / BLOCK_2M;
+        let l1_entry = read_entry(l1_user, (virtual_address >> 30) & (ENTRIES - 1));
+        if l1_entry & DESC_TABLE != DESC_TABLE { return false; }
+        let l2_user = descriptor_address(l1_entry) as usize;
+        let l2_index = (virtual_address >> 21) & (ENTRIES - 1);
         let l3_index = (virtual_address >> 12) & 0x1FF;
         let l2_entry = read_entry(l2_user, l2_index);
         if l2_entry & DESC_TABLE != DESC_TABLE {
@@ -1763,16 +1782,19 @@ pub fn unmap_user_pages_at_lenient(
     let Some(end) = virtual_address.checked_add(span) else {
         return false;
     };
-    if end > DRAM_BASE + 0x4000_0000 {
+    if end > USER_STACK_VA + USER_STACK_SIZE {
         return false;
     }
     let root = root_of(ttbr0);
     unsafe {
         let l1_user = follow_table(root, 0);
-        let l2_user = follow_table(l1_user, 1);
         for index in 0..page_count {
             let va = virtual_address + index * GRANULE;
-            let l2_index = (va - DRAM_BASE) / BLOCK_2M;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l1_entry = read_entry(l1_user, l1_index);
+            if l1_entry & DESC_TABLE != DESC_TABLE { continue; }
+            let l2_user = descriptor_address(l1_entry) as usize;
+            let l2_index = (va >> 21) & (ENTRIES - 1);
             let l3_index = (va >> 12) & 0x1FF;
             let l2_entry = read_entry(l2_user, l2_index);
             if l2_entry & DESC_TABLE != DESC_TABLE {
@@ -1784,8 +1806,8 @@ pub fn unmap_user_pages_at_lenient(
             }
             write_entry(l3, l3_index, 0);
             clean_entry_line(l3, l3_index);
-            let persistent = l2_index == USER_HEAP_L2_INDEX
-                || l2_index == USER_STACK_L2_INDEX;
+            let persistent = (l1_index == 1 && l2_index == USER_HEAP_L2_INDEX)
+                || (l1_index == USER_STACK_L1_INDEX && l2_index == USER_STACK_L2_INDEX);
             if !persistent && table_empty(l3) {
                 write_entry(l2_user, l2_index, 0);
                 clean_entry_line(l2_user, l2_index);
@@ -1808,19 +1830,21 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
     let Some(end) = virtual_address.checked_add(span) else {
         return false;
     };
-    if end > DRAM_BASE + 0x4000_0000 {
+    if end > USER_STACK_VA + USER_STACK_SIZE {
         return false;
     }
     let root = root_of(ttbr0);
     unsafe {
         let l1_user = follow_table(root, 0);
-        let l2_user = follow_table(l1_user, 1);
 
         // Pre-scan: no mutation until every page in the range is proven to be
         // a live 4 KiB mapping in this address space.
         for index in 0..page_count {
             let va = virtual_address + index * GRANULE;
-            let l2_index = (va - DRAM_BASE) / BLOCK_2M;
+            let l1_entry = read_entry(l1_user, (va >> 30) & (ENTRIES - 1));
+            if l1_entry & DESC_TABLE != DESC_TABLE { return false; }
+            let l2_user = descriptor_address(l1_entry) as usize;
+            let l2_index = (va >> 21) & (ENTRIES - 1);
             let l3_index = (va >> 12) & 0x1FF;
             let l2_entry = read_entry(l2_user, l2_index);
             if l2_entry & DESC_TABLE != DESC_TABLE {
@@ -1836,7 +1860,9 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
         // with the kernel lock held and the task is not executing.
         for index in 0..page_count {
             let va = virtual_address + index * GRANULE;
-            let l2_index = (va - DRAM_BASE) / BLOCK_2M;
+            let l1_index = (va >> 30) & (ENTRIES - 1);
+            let l2_user = descriptor_address(read_entry(l1_user, l1_index)) as usize;
+            let l2_index = (va >> 21) & (ENTRIES - 1);
             let l3_index = (va >> 12) & 0x1FF;
             let l3 = descriptor_address(read_entry(l2_user, l2_index)) as usize;
             write_entry(l3, l3_index, 0);
@@ -1845,8 +1871,8 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
             // fixed stack window reuse them after an unmap empties the last
             // page. Freeing them would leave map/unmap_user_heap_page
             // following a now-zero L2 descriptor into physical address 0.
-            let persistent = l2_index == USER_HEAP_L2_INDEX
-                || l2_index == USER_STACK_L2_INDEX;
+            let persistent = (l1_index == 1 && l2_index == USER_HEAP_L2_INDEX)
+                || (l1_index == USER_STACK_L1_INDEX && l2_index == USER_STACK_L2_INDEX);
             if !persistent && table_empty(l3) {
                 write_entry(l2_user, l2_index, 0);
                 clean_entry_line(l2_user, l2_index);
@@ -1955,8 +1981,11 @@ pub fn install_linux_run(
             // The software page watch (debug::arm_soft_log) needs the watched
             // data page mapped read-only at exec time, so its first write
             // faults into the logging path instead of passing silently.
+            #[cfg(feature = "gdb-stub")]
             let watched = crate::debug::soft_page_is(va as u64)
                 && kinds[index] == crate::elf::PageKind::Data;
+            #[cfg(not(feature = "gdb-stub"))]
+            let watched = false;
             if watched {
                 crate::console::write_str("WATCH-EXEC protected va=");
                 crate::console::write_hex_u64(va as u64);
@@ -1996,7 +2025,6 @@ pub fn install_linux_image(ttbr0: usize, image: &crate::linux_elf::LinuxImage) -
     true
 }
 
-#[cfg(feature = "linux-abi")]
 fn alloc_registered_table(root: usize) -> Option<usize> {
     let (page, generation) = frame_allocator::alloc_page_tagged()?;
     unsafe {
@@ -2703,17 +2731,16 @@ pub fn user_physical_address(ttbr0: usize, virtual_address: usize) -> Option<usi
     if virtual_address < DRAM_BASE {
         return None;
     }
-    let l2_index = (virtual_address - DRAM_BASE) / BLOCK_2M;
-    if l2_index >= ENTRIES {
-        return None;
-    }
+    let l2_index = (virtual_address >> 21) & (ENTRIES - 1);
     let root = root_of(ttbr0);
     unsafe {
         let l1_user = follow_table(root, 0);
         if !plausible_table_address(l1_user) {
             return None;
         }
-        let l2_user = follow_table(l1_user, 1);
+        let l1_entry = read_entry(l1_user, (virtual_address >> 30) & (ENTRIES - 1));
+        if l1_entry & DESC_TABLE != DESC_TABLE { return None; }
+        let l2_user = descriptor_address(l1_entry) as usize;
         if !plausible_table_address(l2_user) {
             return None;
         }
@@ -2746,17 +2773,16 @@ pub fn user_page_is_mapped(ttbr0: usize, virtual_address: usize) -> bool {
     if virtual_address % GRANULE != 0 || virtual_address < DRAM_BASE {
         return false;
     }
-    let l2_index = (virtual_address - DRAM_BASE) / BLOCK_2M;
-    if l2_index >= ENTRIES {
-        return false;
-    }
+    let l2_index = (virtual_address >> 21) & (ENTRIES - 1);
     let root = root_of(ttbr0);
     unsafe {
         let l1_user = follow_table(root, 0);
         if !plausible_table_address(l1_user) {
             return false;
         }
-        let l2_user = follow_table(l1_user, 1);
+        let l1_entry = read_entry(l1_user, (virtual_address >> 30) & (ENTRIES - 1));
+        if l1_entry & DESC_TABLE != DESC_TABLE { return false; }
+        let l2_user = descriptor_address(l1_entry) as usize;
         if !plausible_table_address(l2_user) {
             return false;
         }
@@ -2799,6 +2825,16 @@ pub fn run_self_test() -> bool {
     let unmapped = mapped && unmap_user_pages_at(root, va, 1);
     let gone = mapped && !user_page_is_mapped(root, va);
 
+    // Exercise both sides of the 1 GiB L1 boundary and the former Denial
+    // fault address. Each mapping must be independently visible and removable.
+    let mut wide_ok = true;
+    for high_va in [0x7fff_f000, 0x8000_0000, 0x8122_f000, 0xc000_0000] {
+        let installed = map_user_pages_at(root, high_va, data, 1, PROT_WRITE);
+        let visible = installed && user_physical_address(root, high_va) == Some(data);
+        let removed = installed && unmap_user_pages_at(root, high_va, 1);
+        wide_ok &= installed && visible && removed && !user_page_is_mapped(root, high_va);
+    }
+
     frame_allocator::free_page_tagged(data, data_generation);
     let space_released = destroy_task_space(space, private, private_generation, asid_of(root));
     // Stale/double teardown: the registry record is gone, so this must fail
@@ -2806,7 +2842,7 @@ pub fn run_self_test() -> bool {
     // result, not a fault.
     let stale_refused = !destroy_task_space_inner(space, 0, 0, asid_of(root), false);
 
-    mapped && partial_refused && still_mapped && unmapped && gone && space_released && stale_refused
+    mapped && partial_refused && still_mapped && unmapped && gone && wide_ok && space_released && stale_refused
 }
 
 /// Proves the enlarged user DMA window really spans more than one 2 MiB L2
