@@ -324,8 +324,10 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
     // mprotect/prlimit/futex floods from Mesa/GLib would wash the ring out;
     // they are never the interesting failures.
     if crate::scheduler::current_task_id() >= 120
-        && !matches!(number, 226 | 172 | 98 | 141 | 119 | 120 | 274 | 275)
+        && !matches!(number, 226 | 172 | 141 | 119 | 120 | 274 | 275)
     {
+        // futex (98) is traced for the engine-idle investigation; the ring
+        // fills faster, so dumps must be taken close to the moment.
         let index = TRACE_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let slot = index % TRACE_RING_LEN;
         unsafe {

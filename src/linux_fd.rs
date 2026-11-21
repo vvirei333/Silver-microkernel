@@ -597,7 +597,15 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     const O_APPEND: u64 = 0o2000;
     const O_DIRECTORY: u64 = 0o200000;
 
-    let resolved = crate::linux_abi::resolve(cwd, path).map_err(|_| ENOENT)?;
+    let resolved = match crate::linux_abi::resolve(cwd, path) {
+        Ok(resolved) => resolved,
+        Err(()) => {
+            crate::console::write_str("OPENFAIL resolve ");
+            crate::console::write_str(path);
+            crate::console::write_str("\r\n");
+            return Err(ENOENT);
+        }
+    };
     if resolved.starts_with("/dev/") {
         crate::console::write_str(&resolved);
         crate::console::write_hex_u64(flags);
@@ -797,7 +805,15 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     // Linux allows opening a directory without O_DIRECTORY.
     let vfs_fd = match vfs::open(task, "/", &resolved, 0) {
         Ok(fd) => fd,
-        Err(_) => vfs::open_dir(task, "/", &resolved).map_err(|_| ENOENT)?,
+        Err(_) => match vfs::open_dir(task, "/", &resolved) {
+            Ok(fd) => fd,
+            Err(()) => {
+                crate::console::write_str("OPENFAIL vfs ");
+                crate::console::write_str(&resolved);
+                crate::console::write_str("\r\n");
+                return Err(ENOENT);
+            }
+        },
     };
     match insert_access(task, Target::Vfs(vfs_fd), flags & 0o3) {
         Some(fd) => Ok(fd),

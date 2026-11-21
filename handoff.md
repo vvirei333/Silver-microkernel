@@ -8013,3 +8013,40 @@ staging, minimal /etc account db + passwd stub in the image builder.
 - Cleanup: UDMABUF-OPEN/IOCTL/CREATE prints, F_ADD_SEALS print, FAIL_RING/
   TRACE_RING scaffolding, /dev open prints, VFSDBG/EXECFAIL prints,
   procfs.rs unreachable-pattern warning.
+
+### 2026-11-21 (night) — engine idle stop narrowed to the frame clock
+
+Ring forensics with futex (98) un-filtered in TRACE_RING:
+
+- deniald leader = ring task 146. It clones the three engine threads
+  (clone(220, flags 0x3d0f00) -> 169/170/171), mmaps icudtl.dat (10.8 MB ->
+  0x7ffc1000), then blocks on futexes.
+- Engine threads each: set name/priority, create ONE epoll (fd 68/70/72) +
+  ONE timerfd (fd 69/71/73), epoll_ctl ADD, then futex WAIT_BITSET
+  (invisible until return) — they are the engine's runner threads waiting
+  for frame-clock ticks. No pipe/eventfd is created.
+- Main <-> threads exchange WAKEs (futex WAKE|PRIVATE ret=1 seen), so the
+  whole stack is alive but NOBODY produces work: no PlatformTask posts, no
+  on_vsync replies, no DRM atomic commits, framebuffers stay black.
+- deniald::FlutterRuntime::start enables `kms_frame_clock` (OutputScheduler
+  calls runtime.enable_kms_frame_clock()); with that flag engine_session
+  deliberately DROPS engine vsync events and relies on the KMS lane. The
+  only on_vsync_after call in deniald main is in the !kms_frame_clock
+  branch — so the wake for the frame clock must come from the engine fork
+  (denialwm/flutter, branch denial/3.47.5) or from Volition submitting.
+- The 20-byte fd 68/72 writes seen earlier are NOT engine posts: they are
+  deniald's session-lock lockfile retry loop (open/flock/read 20/
+  ftruncate->EINVAL/write/close every ~2 s). NOTE: our kernel returns
+  EINVAL for ftruncate where Linux returns 0 — that keeps the loop alive;
+  a kernel fix candidate (quiet + correctness).
+- No OPENFAIL for any flutter file in later boots: VFS/libapp.so/ICU are
+  clean. The earlier "libapp.so ... os error 2" strings in RAM are rodata
+  fragments, not live errors.
+
+Next session: read denialwm/flutter (fork, denial/3.47.5) for the frame
+clock wake path in kms_frame_clock mode — who arms the runner timerfds or
+wakes the WAIT_BITSET sleeps; alternatively run deniald's own audit path
+(deniald logs an OutputScheduler audit periodically? not seen) or try
+disabling the KMS frame clock if a flag exists. Kernel-side TODOs from
+this round: ftruncate should succeed (0) like Linux; TRACE_RING futex
+filter is now OFF (rings fill faster — dump close to the moment).
