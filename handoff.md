@@ -8050,3 +8050,66 @@ wakes the WAIT_BITSET sleeps; alternatively run deniald's own audit path
 disabling the KMS frame clock if a flag exists. Kernel-side TODOs from
 this round: ftruncate should succeed (0) like Linux; TRACE_RING futex
 filter is now OFF (rings fill faster — dump close to the moment).
+
+### 2026-11-22 — deniald death ROOT CAUSE caught; wl-client probe staged
+
+Night session results, in order:
+
+1. **The intermittent deniald death is explained.** The kill-path forensics
+   (FAULTCTX + LAZY_FAIL) caught a recurrence with the exact reason:
+
+       Task 146 killed: Page Fault at 0x8122FF20 (ESR 0x92000046, write, L2 tf)
+       FAULTCTX regions=937
+       lazyfail page=0x81230000 reason=map  frames=41066 mmap_bytes=1079058432
+       lazyfail page=0x8122F000 reason=map
+
+   The lazy fill allocates the data frame fine (frames=41066) and then fails
+   inside `mmu::map_user_pages_at_inner` (reason=map). The candidates are the
+   F1/F2/F3 failure arms of that function: L3-table alloc refused, unexpected
+   L2 descriptor kind, or the target L3 slot already mapped. With 937 mmap
+   regions the suspect is the page-table bookkeeping (likely
+   `page_table_register` refusing or an F3 collision from a stale region
+   entry after fork/teardown). Fix direction: make the fill failure recover
+   like Linux (ENOMEM / retry), never a task kill, and find why map refuses
+   with free frames. THIS is the next kernel task.
+2. **Minimal external Wayland client landed** (stage 4 start):
+   `tests/linux/wl_client.c` + `tests/linux/wl_client_wire.h`, staged as
+   `/sfs/wl-client`, runs 45 s after deniald in BOOT_SESSION. Connects to
+   `/tmp/wayland-1`, binds wl_compositor/wl_shm, fills a 128x128 XRGB memfd
+   buffer, attaches/damages/commits, syncs. Lessons: aarch64 memfd_create is
+   279 (not 319); static writable data needs the multi-segment `wayland.ld`
+   (hello.ld's single RX segment makes the loader reject W+X and the shell
+   falls back to script mode).
+3. Client status: connect to wayland-1 SUCCEEDS (kernel registers the pending
+   connection), but deniald never accepts — no SOCKDBG accept for the wayland
+   listener, while seatd's listener works. "SOCKDBG listener ready" print
+   added to poll_ready's Listener arm; in the run where deniald died early
+   the probe never executed. Need a boot where deniald survives past t=45 s
+   to see whether deniald's loop reacts to the listener POLLIN.
+4. deniald source study (main branch): startup does an initial real KMS
+   commit right after FlutterRuntime::start; the completion INFO line
+   ("started Rust Flutter embedder...") never appears in RAM copies of
+   deniald.log, but abort() also never fires and deniald keeps cycling its
+   event loop — so start() most likely SUCCEEDED and the absence is a
+   page-cache artifact of the RAM dump; treat "no completion line" as
+   inconclusive. The frame-clock mystery stays open: engine threads idle in
+   futex WAIT_BITSET, timerfd never armed, no atomic commits.
+5. README head rewritten per review feedback: 20-line elevator pitch
+   (what/goal/status), details pushed below; the review also suggested
+   promoting Phosh demo until Denial shows a frame — demo section left as
+   is for now.
+
+### Queued (updated, priority order)
+
+- FIX `mmu::map_user_pages_at_inner` failure path: find why map refuses with
+  free frames (F1/F2/F3 arms), and make lazy-fill failure survivable
+  (ENOMEM to the faulting access / retry) instead of killing the task.
+- wl-client: rerun on a surviving boot; if deniald accepts + responds, watch
+  for a real atomic commit in TRACE_RING (ioctls 29) — that splits "compositor
+  pipeline broken" from "engine frame clock broken".
+- Frame clock: continue the denialwm/flutter (denial/3.47.5) study for the
+  kms_frame_clock wake path.
+- Kernel TODO: ftruncate should return 0 like Linux (session-lock loop).
+- Stage 3: evdev /dev/input + udev /sys/class/input glue for libinput.
+- Cleanup: SOCKDBG prints, VFSDBG, OPENFAIL/EXECFAIL, UDMABUF prints,
+  FAIL_RING/TRACE_RING scaffolding, futex filter is OFF in TRACE_RING.

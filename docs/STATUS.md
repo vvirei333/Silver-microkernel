@@ -147,14 +147,15 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   built with zig cc): the real library asserts deep inside its helpers when
   systemd is absent; libudev.so.1 embeds the same sources statically, so the
   builder also NOPs its fds_are_same_mount assert branches.
-- **Current stop** (2026-11-21 evening): ICU is ruled out — the staged
-  /sfs/icuprobe touches all 2656 pages of icudtl.dat through the lazy
-  file mmap and every one fills correctly. The engine session now starts
-  and its threads run idle event loops, but no DRM atomic commit is ever
-  issued and the scanout buffers stay black: the Flutter UI never draws
-  its first frame. Next suspects live in deniald's output gating
-  (set_outputs_visible(powered>0), KMS frame clock / vsync, FrameReady
-  generation). Details in `handoff.md` "2026-11-21 (later)".
+- **Current stop** (2026-11-22): two fronts. (1) The intermittent deniald
+  kill is explained: the lazy file/anon fill fails inside
+  `mmu::map_user_pages_at_inner` (LAZY_FAIL reason=map) despite 41k free
+  frames — a page-table bookkeeping bug (937 mmap regions in the task); the
+  fill failure then kills the task instead of returning ENOMEM. (2) The
+  Flutter engine still never draws frame 1: threads idle in futex waits, no
+  atomic commits; an external Wayland client probe (`/sfs/wl-client`,
+  stage 4 start) is in place to separate the compositor pipeline from the
+  engine frame clock. Details in `handoff.md` "2026-11-22".
 - Debugging method: `no_mangle` static rings (TRACE_RING syscall history,
   FAIL_RING, IOC_RING, FAULT_RING, LAZY_FAIL) read through QEMU monitor
   `pmemsave`; helper `tools/boot_dump.py` boots, dumps and replays deniald's

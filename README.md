@@ -1,23 +1,24 @@
 # WerewolfOS / Silver Kernel
 
-WerewolfOS is an open mobile operating system built around the Silver Kernel:
-an AArch64 microkernel written in Rust. The kernel stays small and security-
-focused; drivers, services, Howl and applications run in isolated EL0 tasks.
-The architecture is inspired by XNU, Redox and other proven systems, but the
-interfaces, capability model, SFS format and userspace are original.
+**Silver** is a bare-metal AArch64 microkernel written in Rust, with an
+optional Linux ABI layer.
 
-**Fresh status snapshot:** [docs/STATUS.md](docs/STATUS.md) — current
-capabilities, limits, the full Linux ABI test matrix and the next steps.
+**Goal:** run real Linux userspace — glibc, Wayland, Mesa, full desktop
+environments — on top of a small capability-based microkernel, without a
+Linux kernel underneath.
 
-Active target: QEMU `virt` (ARM Virt Board), Cortex-A72, developed from a
-Windows/Linux desktop. The product is a **console OS that provides the base OS**
-(kernel, drivers, network, files); applications — including the browser — come
-from Linux through the compatibility layer. **Linux ABI + Denial DE is the
-active long-term goal** (owner decision 2026-11-19: the phosh/phoc stack is
-parked; the desktop is Denial — denialwm's Smithay+Flutter compositor).
-The Legion Y700 tablet target is forgotten; the Redmi 10C hardware port is
-parked until the OS layer
-is ready (see [redmi10c_poc/README.md](redmi10c_poc/README.md)).
+**Status:** the console OS works (SMP, SFS, networking, shell, native
+EL0 apps); the Linux ABI boots a real Debian arm64 stack and is driving
+[Denial DE](https://github.com/denialwm/denial) (Smithay + Flutter
+compositor) through our own DRM/KMS — the desktop is being brought up,
+frame by frame.
+
+- Fresh status snapshot: [docs/STATUS.md](docs/STATUS.md) — capabilities,
+  limits, the full Linux ABI test matrix, next steps.
+- Manifesto and community links at the bottom.
+- Active target: QEMU `virt` (Cortex-A72), developed from a Windows/Linux
+  desktop. Hardware ports (Redmi 10C) are parked until the OS layer is
+  ready ([redmi10c_poc/README.md](redmi10c_poc/README.md)).
 
 ## Project direction (updated 2026-11-20)
 

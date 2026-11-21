@@ -149,7 +149,7 @@ Silver-специфичных патчей.
 | P1 | Linux ABI: busybox `sh`, glibc-бинарники |
 | P2 | deniald проходит seatd/DrmDevice/EGL (llvmpipe) |
 | P3 | [сделано] deniald: Wayland-сокет, portal IPC, GPU transfer, atomic TEST_ONLY, control socket — полный DE-флоу до старта Flutter |
-| P4 | [текущая точка] Flutter engine стартует; стоп = ICU init на icudtl.dat (см. handoff "2026-11-21"); затем render loop + шелл на экране |
+| P4 | [текущая точка] ICU закрыт (проба заполняет все 2656 страниц); intermittent kill = bug в mmu::map_user_pages_at_inner (lazyfail reason=map при свободных фреймах) — чинить; engine idle (frame clock не тикает), wl-client probe staged (см. handoff "2026-11-22") |
 | P5 | screencopy-minimal как первый внешний Wayland-клиент |
 
 Риски: glibc-поведение (треды/exit_group/futex), системная интеграция deniald

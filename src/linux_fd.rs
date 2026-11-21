@@ -2778,6 +2778,13 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
 
 ");
             }
+            if pending > 0 {
+                crate::console::write_str("SOCKDBG listener ready task=");
+                crate::console::write_dec_u64(task);
+                crate::console::write_str("
+
+");
+            }
             if pending == 0 {
                 0
             } else {

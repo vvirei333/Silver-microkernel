@@ -99,6 +99,9 @@ echo "ICUPROBE begin"
 echo "ICUPROBE end ($?)"
 
 echo "DENIAL: starting deniald"
+# External Wayland client probe: commits a shm buffer against deniald's own
+# compositor to see whether the render pipeline reacts to a client at all.
+( sleep 45; echo "WL-CLIENT begin"; /sfs/wl-client; echo "WL-CLIENT end ($?)" ) &
 # Live replay of the stderr log while the session runs: the log file holds
 # the tracing output, the console drops bytes, so a delayed cat bridges them.
 ( sleep 90; echo "DENIAL: --- log snapshot ---"; cat /tmp/deniald.log ) &
@@ -297,6 +300,10 @@ def main() -> int:
     if icu_probe.exists():
         image.write_file_at("/icuprobe", icu_probe.read_bytes())
         print("  icuprobe staged at /sfs/icuprobe")
+    wl_client = ROOT / "build/testbin/wl-client"
+    if wl_client.exists():
+        image.write_file_at("/wl-client", wl_client.read_bytes())
+        print("  wl-client staged at /sfs/wl-client")
     image.write_file_at("/var/lib/dbus/machine-id", (MACHINE_ID + "\n").encode())
     # busybox applet links: unpack() captured the applet list when it wrote
     # /etc/busybox-paths.d/busybox; replay it like apk's trigger would.
