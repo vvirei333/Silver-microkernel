@@ -4,13 +4,18 @@ use linked_list_allocator::LockedHeap;
 
 use crate::{exceptions, frame_allocator, memory, console};
 
-/// Kernel heap size in 4 KiB pages. 4096 pages (16 MiB) is sized for the
-/// larger rootfs: the Linux loader reads a whole `ld.so`/libc image into a
-/// temporary heap buffer before copying it into user frames, and the VFS
-/// per-file cap below is 8 MiB. The old 2 MiB heap could not hold a real
-/// `libc.so.6` (about 2.2 MiB). The demo resource probe still needs at least
-/// 512 pages for its 512 KiB `RamFs` growth; this is strictly more.
+/// Kernel heap size in 4 KiB pages.
+///
+/// The console product reserves 4096 pages (16 MiB): enough for the 8 MiB VFS
+/// whole-file cap and the 512 KiB RamFs growth test, and 16 MiB less RAM pinned
+/// than the Linux-capable build. The Linux ABI keeps 8192 pages (32 MiB) because
+/// the ELF loader stages a whole `ld.so`/libc image on the heap and Mesa/GLib
+/// clients allocate more temporary state; shrinking them to 16 MiB was not
+/// verified, so the feature gate keeps that risk out of the console build.
+#[cfg(feature = "linux-abi")]
 pub const HEAP_PAGES: usize = 8192;
+#[cfg(not(feature = "linux-abi"))]
+pub const HEAP_PAGES: usize = 4096;
 pub const HEAP_SIZE: usize = HEAP_PAGES * crate::memory::PAGE_SIZE;
 
 struct KernelAllocator {

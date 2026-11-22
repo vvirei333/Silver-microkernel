@@ -3127,6 +3127,8 @@ pub fn dump_current_task_map() {
             crate::console::write_str("\r\nSTACK va=0x");
             crate::console::write_hex_u64(task.user_stack.start as u64);
             crate::console::write_str("\r\n");
+            #[cfg(feature = "linux-abi")]
+            #[cfg(feature = "linux-abi")]
             if let Some(image) = &task.linux_image {
                 crate::console::write_str("IMAGE runs=");
                 crate::console::write_dec_u64(image.runs.len() as u64);
@@ -3247,6 +3249,7 @@ pub fn dump_physical_alias_report() {
                         }
                     }
                 }
+                #[cfg(feature = "linux-abi")]
                 if let Some(image) = &task.linux_image {
                     for run in &image.runs {
                         if span_count >= MAX_SPANS {
@@ -6600,6 +6603,7 @@ pub fn debug_lazy_fail(task_id: u64, limit: usize) {
 }
 
 /// Last syscalls of `task_id` from the trace ring, reverse order.
+#[cfg(feature = "linux-abi")]
 pub fn debug_task_trace(task_id: u64, limit: usize) {
     // The ring is written by other CPUs. Read it through a raw pointer: a
     // shared reference to a mutable static would be UB even for a diagnostic
@@ -6628,6 +6632,29 @@ pub fn debug_task_trace(task_id: u64, limit: usize) {
             shown += 1;
         }
     }
+}
+
+#[cfg(not(feature = "linux-abi"))]
+pub fn debug_task_trace(_task_id: u64, _limit: usize) {}
+
+#[cfg(not(feature = "linux-abi"))]
+pub fn fault_coverage(_address: usize) -> (u64, u64) {
+    (0, 0)
+}
+
+#[cfg(not(feature = "linux-abi"))]
+pub fn lazy_fail_record(
+    _page: usize,
+    _reason: &[u8],
+    _mem_frames: usize,
+    _mmap_bytes: usize,
+    _regions: usize,
+) {
+}
+
+#[cfg(not(feature = "linux-abi"))]
+pub fn cow_diagnostic(_address: usize, _buffer: &mut [u8]) -> usize {
+    0
 }
 
 fn current_task_mut() -> Option<&'static mut Task> {
@@ -7633,6 +7660,7 @@ impl Task {
         // page must not be shared-written, so it falls through to the normal
         // copy path, which re-protects the page itself.
         let writable = mmu::PROT_READ | mmu::PROT_WRITE;
+        #[cfg(feature = "linux-abi")]
         if let Some(image) = self.linux_image.as_ref() {
             for run in &image.runs {
                 if page < run.virtual_address

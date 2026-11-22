@@ -263,7 +263,9 @@ fn execute(command: &str) {
             syscall::print("  Ctrl-Z     Stop the foreground task and return to shell\r\n");
             syscall::print("  kill <cap> Kill a task\r\n");
             syscall::print("  wait <cap> Wait for a task and print its exit status\r\n");
-            syscall::print("  poweroff   Power the machine down through PSCI\r\n");
+            syscall::print("  svc restart <name>\r\n");
+            syscall::print("             Restart a supervised service (scout, net_driver,\r\n");
+            syscall::print("             net_server, howl, howler); it also auto-restarts\r\n");
             syscall::print("  reboot     Reset the machine through PSCI\r\n");
             syscall::print("  grep <pattern> <file> | wc <file> | head/tail [n] <file>\r\n");
             syscall::print("  cp <src> <dst> | find [path] | seq N | basename/dirname <path>\r\n");
@@ -312,6 +314,7 @@ fn execute(command: &str) {
         Some("fg") => foreground_task(words.next()),
         Some("kill") => kill_task(words.next()),
         Some("wait") => wait_task(words.next()),
+        Some("svc") => svc_command(words.next(), words.next()),
         Some("poweroff") => syscall::power_off(),
         Some("reboot") => syscall::power_reset(),
         Some("grep") | Some("wc") | Some("head") | Some("tail") | Some("cp")
@@ -1258,6 +1261,47 @@ fn kill_task(cap_id: Option<&str>) {
         syscall::print("\r\n");
     } else {
         syscall::print("kill: invalid capability or task already exited\r\n");
+    }
+}
+
+/// `svc restart <name>`: asks silverd to restart one supervised service.
+/// The supervisor owns the child capabilities, so the shell cannot kill and
+/// respawn a service without bypassing the restart policy.
+fn svc_command(action: Option<&str>, name: Option<&str>) {
+    if action != Some("restart") {
+        syscall::print("usage: svc restart <scout|net_driver|net_server|howl|howler>\r\n");
+        return;
+    }
+    let Some(name) = name else {
+        syscall::print("usage: svc restart <scout|net_driver|net_server|howl|howler>\r\n");
+        return;
+    };
+    if !matches!(
+        name,
+        "scout" | "net_driver" | "net_server" | "howl" | "howler"
+    ) {
+        syscall::print("svc: unknown service '");
+        syscall::print(name);
+        syscall::print("'\r\n");
+        return;
+    }
+    let Some(supervisor) = find_task_id(syscall::PROGRAM_SILVERD) else {
+        syscall::print("svc: silverd is not running\r\n");
+        return;
+    };
+
+    const SVC_RESTART: u8 = 0xF1;
+    let mut payload = [0_u8; ipc::PAYLOAD_SIZE];
+    payload[0] = SVC_RESTART;
+    let bytes = name.as_bytes();
+    let length = bytes.len().min(payload.len() - 1);
+    payload[1..1 + length].copy_from_slice(&bytes[..length]);
+    if syscall::send(supervisor, &ipc::Message::new(0, &payload)) {
+        syscall::print("svc: restart '");
+        syscall::print(name);
+        syscall::print("' requested; run 'ps' in a second\r\n");
+    } else {
+        syscall::print("svc: supervisor mailbox is unavailable\r\n");
     }
 }
 

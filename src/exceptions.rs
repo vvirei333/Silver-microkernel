@@ -25,6 +25,7 @@ pub extern "C" fn silver_handle_task_fault(esr: u64, elr: u64, far: u64) -> ! {
         // Fault forensics: the mmap region around FAR and the dying task's
         // last syscalls. Both are read-only ring/region walks, no allocation.
         scheduler::debug_fault_region(far as usize);
+        #[cfg(feature = "linux-abi")]
         scheduler::debug_task_trace(task_id, 10);
         scheduler::debug_lazy_fail(task_id, 6);
         scheduler::dump_switch_trace();

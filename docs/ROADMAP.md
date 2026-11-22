@@ -25,8 +25,11 @@ ftruncate errno correctness, driver-process split for gpu/blk.
 Done: silverd, Howl, Scout, net_server (DHCP/DNS/TCP/TLS), Unix toolbox,
 dynamic ELF loader, SFS + fsck, bundles with integrity.
 
-Open: in-OS package manager (PLANNED), service manager beyond silverd's
-fixed tree (PLANNED), real RamFs (PARTIALLY), persistent writable SFS
+Done: `silverd` supervises its fixed five-service tree with bounded restart
+backoff, dependency-aware pair restarts and zombie reaping.
+
+Open: in-OS package manager (PLANNED), a configurable service registry beyond
+the fixed tree (PLANNED), real RamFs (PARTIALLY), persistent writable SFS
 (PLANNED).
 
 ## Phase 3 — Linux Compatibility — PARTIALLY IMPLEMENTED (active)

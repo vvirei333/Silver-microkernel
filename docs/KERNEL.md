@@ -24,10 +24,8 @@ same kernel through a platform abstraction (`platform.rs`).
   per touched page and fills it from SFS at fault time; anonymous
   reservations (glibc arenas) allocate on first touch.
 - **DMA**: bounded DMA window + leases (`memory.rs`, `driver_resources.rs`).
-- **Known issue (2026-11-22)**: the lazy fill can fail in
-  `mmu::map_user_pages_at_inner` under heavy region churn (~900 regions);
-  the failure currently kills the faulting task instead of reporting ENOMEM.
-  Being fixed; see STATUS.md.
+- The 2026-11-22 lazy-fill failure was the 1 GiB-boundary L2 walk bug, fixed
+  in `6846e49`; the generic walk is covered by a boot self-test.
 
 ## 2. Scheduler and SMP — IMPLEMENTED
 

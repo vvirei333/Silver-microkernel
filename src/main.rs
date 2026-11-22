@@ -106,6 +106,7 @@ mod user_memory;
 mod sfs;
 mod sfs_format;
 mod user_program;
+#[cfg(feature = "linux-abi")]
 mod drm;
 mod sysfs;
 mod virtio_blk;
@@ -1799,6 +1800,7 @@ pub extern "C" fn kernel_main() -> ! {
             // `--gpu` attaches a virtio-gpu; the driver sets up a 2D scanout
             // and draws a test pattern when the device is present.
             if virtio_gpu::init() {
+                #[cfg(feature = "linux-abi")]
                 drm::report();
             }
         }

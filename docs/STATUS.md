@@ -65,6 +65,10 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 - Console shell (`howl`) with file, process, mount, network and health
   commands; `linuxrun-<app>` resolves `/sfs/apps/<app>` then `/sfs/<app>` and
   supplies the Wayland/XDG environment.
+- `silverd` is a table-driven service supervisor: five fixed services, no
+  heap allocation, bounded exponential restart backoff, dependency-aware pair
+  restarts (net driver/server, shell/input), and zombie reaping. The shell
+  exposes `svc restart <name>` for controlled restarts.
 - Fastfetch-style boot banner, kernel/userspace version **0.1.2**.
 
 ### Linux ABI
@@ -192,7 +196,7 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 | Resource | Limit |
 |---|---|
 | SFS image | 64 MiB, 2048 inodes, read on demand (256 KiB block cache) |
-| Kernel heap | 16 MiB |
+| Kernel heap | 16 MiB console / 32 MiB with `linux-abi` |
 | Single SFS file | ~1 GiB tree / image-bound (triple indirect) |
 | Main Linux executable | 32 MiB, streamed into its frames |
 | Whole-file read | 8 MiB (`MAX_FILE_BYTES`; interpreter and signed bundles) |
