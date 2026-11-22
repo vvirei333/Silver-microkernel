@@ -855,7 +855,7 @@ scripts/sign_bundle.py verify /tmp/werewolf-dev.pub app.elf app.manifest
 
 Never commit `*.key` (it is in `.gitignore`). Signing is authenticity for a
 single build-time publisher key; rotation, revocation and per-publisher
-keyrings are future work (`docs/FINAL_AUDIT.md`).
+keyrings are future work (`docs/archive/FINAL_AUDIT.md`).
 
 ## Phase 7: EL0 fault containment + teardown — complete
 
@@ -1456,17 +1456,17 @@ driver's contract.
 | [redmi10c_poc/README.md](redmi10c_poc/README.md) | Authoritative Redmi 10C / fog bring-up: design, live-FDT policy, fail-closed relocation, QEMU tests, unconfirmed hardware parameters |
 | [SMP_STATUS.md](SMP_STATUS.md) | SMP: QEMU bring-up of up to eight CPU slots (verified on four and six) behind the `smp` feature, round-qualified quiescence, FIFO ready queues, per-CPU timer checks, a stall watchdog and boot selftests; true cross-PE TLB stress and physical SMP are not verified |
 | [handoff.md](handoff.md) | Architecture invariants, technical debt, historical checkpoints and next steps |
-| [docs/FINAL_AUDIT.md](docs/FINAL_AUDIT.md) | Historical audit: DMA window, Ed25519 signing, evidence and known limitations (surface/graphics parts superseded by the graphics removal) |
-| [docs/PORTING_FOG.md](docs/PORTING_FOG.md) | Redmi 10C port plan (parked): console-over-UART/storage/power path, hardware unknowns and regression matrix |
-| [docs/REFERENCE.md](docs/REFERENCE.md) | Reference console product: definition, acceptance checklist, current status, known gaps and next work |
+| [docs/FINAL_AUDIT.md](docs/archive/FINAL_AUDIT.md) | Historical audit: DMA window, Ed25519 signing, evidence and known limitations (surface/graphics parts superseded by the graphics removal) |
+| [docs/PORTING_FOG.md](docs/archive/PORTING_FOG.md) | Redmi 10C port plan (parked): console-over-UART/storage/power path, hardware unknowns and regression matrix |
+| [docs/REFERENCE.md](docs/archive/REFERENCE.md) | Reference console product: definition, acceptance checklist, current status, known gaps and next work |
 | [docs/VECTOR.md](docs/VECTOR.md) | Direction: console OS, host-rendered browser window, Linux ABI/Phosh assessment and staged plan |
-| [docs/MOBILE_LINUX_ARCH.md](docs/MOBILE_LINUX_ARCH.md) | How postmarketOS/Nura works as mobile Linux (boot, deviceinfo, initramfs, Alpine/systemd, Phosh/phoc services) and what to borrow for WerewolfOS |
-| [docs/M3_DRIVER.md](docs/M3_DRIVER.md) | M3.1a driver-task framework: region-scoped MMIO, driver resource table, `SYS_MMIO_GRANT`, limits and next DT slice |
-| [docs/M3_SIMPLEFB.md](docs/M3_SIMPLEFB.md) | M3.2a simplefb boot framebuffer: contract, Redmi panel constants, QEMU selftest, limits |
-| [docs/ALPINE_ENV.md](docs/ALPINE_ENV.md) | Alpine/musl userland on the Linux ABI: BusyBox, ash and apk-tools running from SFS; builder and limits |
-| [docs/GDB_STUB.md](docs/GDB_STUB.md) | GDB remote stub on the second PL011: build flags, packets, `tools/gdb_rsp.py`, and the FIFO limit that blocks interactive gdb |
-| [docs/ALPINE_PHOSH.md](docs/ALPINE_PHOSH.md) | Alpine-only image with Alpine's own `phosh`/`phoc`: builder, headless boot chain, the file-cap/exec-env/sendfile fixes, and the remaining scanout/dconf limits |
-| [docs/ALPINE_OPENRC.md](docs/ALPINE_OPENRC.md) | Alpine + OpenRC + Phosh from one SFS image: Linux `/` = SFS `/sfs`, SFS symlinks, synthetic procfs, mount/PID-1/vfork fixes, the empty-deptree limitation |
+| [docs/MOBILE_LINUX_ARCH.md](docs/archive/MOBILE_LINUX_ARCH.md) | How postmarketOS/Nura works as mobile Linux (boot, deviceinfo, initramfs, Alpine/systemd, Phosh/phoc services) and what to borrow for WerewolfOS |
+| [docs/M3_DRIVER.md](docs/archive/M3_DRIVER.md) | M3.1a driver-task framework: region-scoped MMIO, driver resource table, `SYS_MMIO_GRANT`, limits and next DT slice |
+| [docs/M3_SIMPLEFB.md](docs/archive/M3_SIMPLEFB.md) | M3.2a simplefb boot framebuffer: contract, Redmi panel constants, QEMU selftest, limits |
+| [docs/ALPINE_ENV.md](docs/archive/ALPINE_ENV.md) | Alpine/musl userland on the Linux ABI: BusyBox, ash and apk-tools running from SFS; builder and limits |
+| [docs/GDB_STUB.md](docs/archive/GDB_STUB.md) | GDB remote stub on the second PL011: build flags, packets, `tools/gdb_rsp.py`, and the FIFO limit that blocks interactive gdb |
+| [docs/ALPINE_PHOSH.md](docs/archive/ALPINE_PHOSH.md) | Alpine-only image with Alpine's own `phosh`/`phoc`: builder, headless boot chain, the file-cap/exec-env/sendfile fixes, and the remaining scanout/dconf limits |
+| [docs/ALPINE_OPENRC.md](docs/archive/ALPINE_OPENRC.md) | Alpine + OpenRC + Phosh from one SFS image: Linux `/` = SFS `/sfs`, SFS symlinks, synthetic procfs, mount/PID-1/vfork fixes, the empty-deptree limitation |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
 
 Current verification snapshot (2026-11-08, console product): **217 host
