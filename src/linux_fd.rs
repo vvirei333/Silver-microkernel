@@ -1772,11 +1772,15 @@ pub fn epoll_ctl(
 const EPOLLONESHOT: u32 = 0x4000_0000;
 
 fn epoll_ready_mask(task: u64, fd: u64, requested: u32) -> u32 {
+    epoll_ready_mask_at(task, fd, requested, 0)
+}
+
+fn epoll_ready_mask_at(task: u64, fd: u64, requested: u32, depth: u8) -> u32 {
     const EPOLLIN: u32 = 0x001;
     const EPOLLOUT: u32 = 0x004;
     const EPOLLERR: u32 = 0x008;
     const EPOLLHUP: u32 = 0x010;
-    let Some(bits) = poll_ready(task, fd) else {
+    let Some(bits) = poll_ready_at(task, fd, depth) else {
         return 0;
     };
     let mut ready = 0;
@@ -1828,15 +1832,6 @@ pub fn epoll_wait(
                 let mask = epoll_ready_mask(task, entry.fd, entry.events);
                 if mask != 0 {
                     ready.push((mask, entry.data));
-                    // Temporary: identifies permanently-ready fds that spin a
-                    // compositor event loop without ever being drained.
-                    crate::console::write_str("EPOLLR fd=");
-                    crate::console::write_dec_u64(entry.fd);
-                    crate::console::write_str(" mask=0x");
-                    crate::console::write_hex_u64(mask as u64);
-                    crate::console::write_str(" data=0x");
-                    crate::console::write_hex_u64(entry.data);
-                    crate::console::write_str("\r\n");
                     if entry.events & EPOLLONESHOT != 0 {
                         entry.armed = false;
                     }
@@ -2739,6 +2734,10 @@ pub fn set_nonblock(task: u64, fd: u64, nonblock: bool) -> Result<(), u64> {
 
 /// Readiness bits for `ppoll`. `None` means the descriptor is not open.
 pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
+    poll_ready_at(task, fd, 0)
+}
+
+fn poll_ready_at(task: u64, fd: u64, depth: u8) -> Option<i16> {
     const POLLIN: i16 = 0x001;
     const POLLOUT: i16 = 0x004;
     const POLLERR: i16 = 0x008;
@@ -2855,7 +2854,27 @@ pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
                 0
             }
         }
-        Target::Epoll(_) => POLLIN | POLLOUT,
+        // An epoll descriptor is readable only while one of its armed
+        // entries is ready. Reporting it always ready makes a nested event
+        // loop (calloop creates one) spin in `epoll_wait` and never service
+        // the real descriptors. Copy the entries first so a malformed cycle
+        // cannot deadlock on the same mutex; the depth cap bounds the walk.
+        Target::Epoll(state) => {
+            if depth >= 8 {
+                0
+            } else {
+                let entries: Vec<(u64, u32, bool)> = state
+                    .lock()
+                    .entries
+                    .iter()
+                    .map(|entry| (entry.fd, entry.events, entry.armed))
+                    .collect();
+                let ready = entries.iter().any(|&(fd, events, armed)| {
+                    armed && epoll_ready_mask_at(task, fd, events, depth + 1) != 0
+                });
+                if ready { POLLIN } else { 0 }
+            }
+        }
     })
 }
 
