@@ -1217,6 +1217,27 @@ pub fn map_user_page_at(
     map_user_pages_at_inner(ttbr0, virtual_address, physical, 1, prot, false, false)
 }
 
+/// Failure diagnostics ring for `map_user_pages_at_inner`:
+/// `(faulting page VA, arm id, extra, task)`. Arms: 1 = L3 frame alloc
+/// refused, 2 = table registration refused, 3 = unexpected L2 descriptor
+/// (extra = the raw descriptor), 4 = target PTE already live (extra = the
+/// existing entry). Read from a pmemsave dump after the kill; the ring makes
+/// the "reason=map" LAZY_FAIL record specific.
+pub const MMU_FAIL_LEN: usize = 32;
+static MMU_FAIL_INDEX: core::sync::atomic::AtomicUsize =
+    core::sync::atomic::AtomicUsize::new(0);
+#[no_mangle]
+pub static mut MMU_FAIL: [[u64; 4]; MMU_FAIL_LEN] = [[0; 4]; MMU_FAIL_LEN];
+
+fn mmu_fail_record(page: usize, arm: u64, extra: u64) {
+    let index = MMU_FAIL_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    let task = crate::scheduler::current_task_id();
+    unsafe {
+        let ring = core::ptr::addr_of_mut!(MMU_FAIL);
+        (*ring)[index % MMU_FAIL_LEN] = [page as u64, arm, extra, task];
+    }
+}
+
 /// Shared implementation of the two entry points above.
 fn map_user_pages_at_inner(
     ttbr0: usize,
@@ -1281,6 +1302,7 @@ fn map_user_pages_at_inner(
             let l3 = if l2_entry == 0 {
                 let Some((page, generation)) = frame_allocator::alloc_page_tagged() else {
                     // F1: no frame left for a new L3 table.
+                    mmu_fail_record(va, 1, done as u64);
                     unmap_user_pages_at(ttbr0, virtual_address, done);
                     finish_table_changes_for(ttbr0);
                     return false;
@@ -1290,6 +1312,7 @@ fn map_user_pages_at_inner(
                     // Registration refused: the L2 entry below is only written
                     // after a successful registration, so the frame is still
                     // unlinked and its own tag is correct.
+                    mmu_fail_record(va, 2, done as u64);
                     frame_allocator::free_page_tagged(page, generation);
                     unmap_user_pages_at(ttbr0, virtual_address, done);
                     finish_table_changes_for(ttbr0);
@@ -1307,12 +1330,14 @@ fn map_user_pages_at_inner(
                 descriptor_address(l2_entry) as usize
             } else {
                 // F2: unexpected descriptor kind in the user L2.
+                mmu_fail_record(va, 3, l2_entry);
                 unmap_user_pages_at(ttbr0, virtual_address, done);
                 finish_table_changes_for(ttbr0);
                 return false;
             };
             if read_entry(l3, l3_index) != 0 {
                 // F3: target slot already mapped.
+                mmu_fail_record(va, 4, read_entry(l3, l3_index));
                 unmap_user_pages_at(ttbr0, virtual_address, done);
                 finish_table_changes_for(ttbr0);
                 return false;

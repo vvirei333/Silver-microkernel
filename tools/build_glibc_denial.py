@@ -101,7 +101,9 @@ echo "ICUPROBE end ($?)"
 echo "DENIAL: starting deniald"
 # External Wayland client probe: commits a shm buffer against deniald's own
 # compositor to see whether the render pipeline reacts to a client at all.
-( sleep 45; echo "WL-CLIENT begin"; /sfs/wl-client; echo "WL-CLIENT end ($?)" ) &
+# External Wayland client probe: retries every 3 s so the freshest
+# accept/close sequence is always recent in the kernel trace ring.
+( sleep 45; echo "WL-CLIENT begin"; i=0; while [ $i -lt 30 ]; do /sfs/wl-client && break; i=$((i+1)); sleep 3; done; echo "WL-CLIENT end ($?)" ) &
 # Live replay of the stderr log while the session runs: the log file holds
 # the tracing output, the console drops bytes, so a delayed cat bridges them.
 ( sleep 90; echo "DENIAL: --- log snapshot ---"; cat /tmp/deniald.log ) &

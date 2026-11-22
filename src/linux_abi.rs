@@ -279,7 +279,7 @@ const S_IFREG: u32 = 0o100000;
 static INOTIFY_WD: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
 /// Last-N syscall trace of Linux guest tasks (nr, arg0, arg1, result, task).
-pub const TRACE_RING_LEN: usize = 2048;
+pub const TRACE_RING_LEN: usize = 8192;
 pub(crate) static TRACE_RING_INDEX: core::sync::atomic::AtomicUsize =
     core::sync::atomic::AtomicUsize::new(0);
 #[no_mangle]
@@ -324,10 +324,12 @@ pub fn dispatch(frame: &mut [u64; crate::syscall::FRAME_QUADWORDS]) -> u64 {
     // mprotect/prlimit/futex floods from Mesa/GLib would wash the ring out;
     // they are never the interesting failures.
     if crate::scheduler::current_task_id() >= 120
-        && !matches!(number, 226 | 172 | 141 | 119 | 120 | 274 | 275)
+        && !matches!(number, 226 | 172 | 141 | 119 | 120 | 274 | 275 | 113)
     {
-        // futex (98) is traced for the engine-idle investigation; the ring
-        // fills faster, so dumps must be taken close to the moment.
+        // futex (98) is traced for the engine-idle investigation; clock_gettime
+        // (113) is filtered — a busy compositor loop emits thousands per
+        // minute and drowns the failure window. Dumps must stay close to the
+        // moment either way.
         let index = TRACE_RING_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         let slot = index % TRACE_RING_LEN;
         unsafe {

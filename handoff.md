@@ -8113,3 +8113,46 @@ Night session results, in order:
 - Stage 3: evdev /dev/input + udev /sys/class/input glue for libinput.
 - Cleanup: SOCKDBG prints, VFSDBG, OPENFAIL/EXECFAIL, UDMABUF prints,
   FAIL_RING/TRACE_RING scaffolding, futex filter is OFF in TRACE_RING.
+
+### 2026-11-22 (day) — wayland client handshake works; dispatch livelock found
+
+1. **mmu::map_user_pages_at_inner**: added the MMU_FAIL ring (arms 1..4 with
+   the raw descriptor as extra) at every failure return; no recurrence in
+   four boots yet (the kill is intermittent).
+2. **wl-client probe progress** (tests/linux/wl_client.c, staged
+   /sfs/wl-client, BOOT_SESSION retries every 3 s):
+   - fixed MY client bug: get_registry must be sent on object 1
+     (wl_display); sending it on the not-yet-bound registry object made
+     Smithay raise a protocol error and disconnect instantly (client saw
+     EOF with zero data queued).
+   - after the fix the FULL registry handshake works: deniald read the two
+     12-byte requests (SOCKRD task=149 fd=91 ret=12 x2) and the client
+     received 2168 bytes of globals.
+   - THEN deniald stops dispatching: it never reads the follow-up messages
+     (bind/shm_pool) and its event loop spins level-triggered on the
+     listener fd and the client socket fd (EPOLR fd=14 + fd=19 alternating,
+     hundreds of lines), with the client's messages sitting unread. This
+     livelock is the current suspect for why deniald's event pipeline
+     (including the Flutter frame clock) never advances.
+   - kernel prints added for the hunt: EPOLR (every ready epoll entry with
+     fd/mask/data), SOCKCL (socket close), SOCKEOF (why recv returned 0),
+     SOCKRD (socket read with ret). All temporary — cleanup TODO.
+   - probe gotchas fixed along the way: aarch64 memfd_create is 279, static
+     .data needs wayland.ld (W+X loader rejection), TRACE_RING_LEN bumped
+     to 8192, clock_gettime filtered from TRACE_RING (a busy compositor
+     loop floods it), dumps must stay within ~90 s of boot.
+3. deniald's own helper spawns now surface: /usr/bin/denial-settings and
+   /usr/bin/denial-polkit-agent are missing from the image (EXECFAIL), and
+   libpulse.so.0 / libddcutil.so.5 OPENFAIL — the denial package's runtime
+   deps need staging in the builder (harmless for rendering, noisy).
+
+### Queued (updated)
+
+- Next: why deniald's loop stops dispatching a client after the first two
+  messages — check Smithay's internal poller/eventfd chain against our
+  epoll/eventfd semantics (eventfd read must reset to 0; level semantics on
+  the display Generic source). The EPOLR spam itself shows the spin.
+- MMU_FAIL ring: wait for a kill recurrence to read the arm.
+- Stage deniald runtime deps (denial-settings, denial-polkit-agent,
+  libpulse) in the image builder to reduce noise.
+- Frame clock / first frame unchanged (see previous section).

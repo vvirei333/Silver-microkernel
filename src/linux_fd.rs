@@ -834,6 +834,15 @@ pub fn close(task: u64, fd: u64) -> Result<(), u64> {
         slot
     })
     .ok_or(EBADF)?;
+    // Temporary: socket teardown forensics — pairs a client EOF with the
+    // closer's task and fd.
+    if matches!(target, Target::Socket { .. }) {
+        crate::console::write_str("SOCKCL task=");
+        crate::console::write_dec_u64(task);
+        crate::console::write_str(" fd=");
+        crate::console::write_dec_u64(fd);
+        crate::console::write_str("\r\n");
+    }
     target.release_endpoint();
     if let Target::Vfs(vfs_fd) = target {
         close_vfs_if_last(task, vfs_fd);
@@ -1819,6 +1828,15 @@ pub fn epoll_wait(
                 let mask = epoll_ready_mask(task, entry.fd, entry.events);
                 if mask != 0 {
                     ready.push((mask, entry.data));
+                    // Temporary: identifies permanently-ready fds that spin a
+                    // compositor event loop without ever being drained.
+                    crate::console::write_str("EPOLLR fd=");
+                    crate::console::write_dec_u64(entry.fd);
+                    crate::console::write_str(" mask=0x");
+                    crate::console::write_hex_u64(mask as u64);
+                    crate::console::write_str(" data=0x");
+                    crate::console::write_hex_u64(entry.data);
+                    crate::console::write_str("\r\n");
                     if entry.events & EPOLLONESHOT != 0 {
                         entry.armed = false;
                     }
@@ -2533,6 +2551,11 @@ fn socket_recv_message(
     loop {
         let mut socket = state.lock();
         if socket.ends[end].read_closed {
+            crate::console::write_str("SOCKEOF own task=");
+            crate::console::write_dec_u64(crate::scheduler::current_task_id());
+            crate::console::write_str(" end=");
+            crate::console::write_dec_u64(end as u64);
+            crate::console::write_str("\r\n");
             return Ok((0, Vec::new()));
         }
         if let Some(message) = socket.ends[end].incoming.front_mut() {
@@ -2551,6 +2574,13 @@ fn socket_recv_message(
             return Ok((take, fds));
         }
         if socket.ends[peer].write_closed {
+            crate::console::write_str("SOCKEOF peer task=");
+            crate::console::write_dec_u64(crate::scheduler::current_task_id());
+            crate::console::write_str(" end=");
+            crate::console::write_dec_u64(end as u64);
+            crate::console::write_str(" pending_in=");
+            crate::console::write_dec_u64(socket.ends[end].incoming.len() as u64);
+            crate::console::write_str("\r\n");
             return Ok((0, Vec::new()));
         }
         drop(socket);
@@ -2589,6 +2619,15 @@ pub fn socket_recv(
         return Err(ENOTSOCK);
     };
     let (read, fds) = socket_recv_message(&state, end, nonblock || nonblock_hint, buffer)?;
+    // Temporary: pairs server-side socket reads with the wayland client flow.
+    crate::console::write_str("SOCKRD task=");
+    crate::console::write_dec_u64(task);
+    crate::console::write_str(" fd=");
+    crate::console::write_dec_u64(fd);
+    crate::console::write_str(" ret=");
+    crate::console::write_dec_u64(read as u64);
+    crate::console::write_str("
+");
     let mut numbers = Vec::new();
     for target in fds {
         if let Some(number) = insert_transferred(task, target) {

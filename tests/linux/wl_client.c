@@ -44,13 +44,29 @@ static void line_hex(const char *prefix, unsigned value) {
     emit(buffer, at);
 }
 
+static int attempts;
+static void retry_sleep(void) {
+    struct { long seconds; long nanoseconds; } spec = { 3, 0 };
+    sys6(115 /* clock_nanosleep */, 1 /* CLOCK_MONOTONIC */, 0, (long)&spec, 0, 0, 0);
+}
+
 void _start(void) {
+    if (attempts > 0) {
+        line("wl-client: retrying");
+        retry_sleep();
+        if (attempts > 25) {
+            line("wl-client: giving up");
+            sys6(93, 1, 0, 0, 0, 0, 0);
+        }
+    }
+    attempts++;
     line("wl-client: connecting");
     long socket = sys6(198, 1 /* AF_UNIX */, 2 /* SOCK_STREAM */, 0, 0, 0, 0);
     if (socket < 0) { line("socket failed"); sys6(93, 1, 0, 0, 0, 0, 0); }
     if (connect_path(socket, SOCKET_PATH) < 0) {
         line("connect failed");
-        sys6(93, 1, 0, 0, 0, 0, 0);
+        retry_sleep();
+        sys6(93, 1, 0, 0, 0, 0, 0); // unreachable; main() loop handles retries
     }
     line("connected");
 
@@ -78,7 +94,7 @@ void _start(void) {
     long wrote = sys6(64, memfd, (long)pixels, size, 0, 0, 0);
     line_hex("wrote", (unsigned)wrote);
 
-    begin(registry_id, 1 /* get_registry */);
+    begin(1 /* wl_display */, 1 /* get_registry */);
     put_new_id(registry_id);
     finish();
     send_message(socket, -1);
@@ -93,7 +109,11 @@ void _start(void) {
     for (int turn = 0; turn < 200 && !got_done; turn++) {
         long got = receive_message(socket);
         if (got == -2) { continue; }
-        if (got <= 0) { line("registry read failed"); sys6(93, 1, 0, 0, 0, 0, 0); }
+        if (got <= 0) {
+            line("registry read failed");
+            line_hex("recv", (unsigned)got);
+            sys3(93, 0, 0, 0); // retry the whole handshake from _start
+        }
         while (parse_next_message()) {
             unsigned object = object_of();
             unsigned opcode = opcode_of();
@@ -120,7 +140,7 @@ void _start(void) {
     line_hex("shm_name", shm_name);
     if (!compositor_name || !shm_name) {
         line("missing globals");
-        sys6(93, 1, 0, 0, 0, 0, 0);
+        sys3(93, 0, 0, 0); // retry
     }
 
     // bind wl_compositor (version 1) and wl_shm.
