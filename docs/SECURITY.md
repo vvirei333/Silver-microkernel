@@ -214,8 +214,8 @@ is an excuse for a memory-safety bug.
 ## Disclosure and fix protocol
 
 1. **Do not open a public issue** for a memory-safety bug, capability bypass,
-   or a user-triggerable kernel panic. Contact the maintainer (Telegram in
-   `README.md`) with `file:line`, the call sequence and a reproducer.
+   or a user-triggerable kernel panic. Contact the maintainer privately with
+   `file:line`, the call sequence and a reproducer.
 2. A finding is reproduced as a guest test under `tests/security/` (or a host
    unit test when it is pure logic) **before** the fix. The runner is
    `tools/security_test.py`; a fix without a failing-then-passing test is not

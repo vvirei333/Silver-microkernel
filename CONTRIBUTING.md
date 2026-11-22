@@ -81,5 +81,5 @@ merged.
 - Bugs and regressions: open an issue with the boot log (`serial.log`), the
   exact QEMU command and the commit hash.
 - Security: do not open a public issue for a memory-safety or capability
-  bypass; contact the maintainer (Telegram in `README.md`) first. A
+  bypass; contact the maintainer privately first. A
   `SECURITY.md` with the disclosure process lands with M2.

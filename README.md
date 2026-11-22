@@ -15,7 +15,7 @@ frame by frame.
 
 - Fresh status snapshot: [docs/STATUS.md](docs/STATUS.md) — capabilities,
   limits, the full Linux ABI test matrix, next steps.
-- Manifesto and community links at the bottom.
+- Manifesto at the bottom.
 - Active target: QEMU `virt` (Cortex-A72), developed from a Windows/Linux
   desktop. Hardware ports (Redmi 10C) are parked until the OS layer is
   ready ([redmi10c_poc/README.md](redmi10c_poc/README.md)).
@@ -54,10 +54,6 @@ image level:
 Wolfser (the guest litehtml browser) remains available as a legacy demo but
 is frozen. The tablet target is abandoned; hardware ports are parked until
 the QEMU desktop milestone lands.
-
-## Community
-
-🐺 Developer Telegram: [Сильвер не кодит](https://t.me/rustdev_rs)
 
 ## Manifesto
 
