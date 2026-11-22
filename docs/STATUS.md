@@ -29,10 +29,11 @@ replacing the parked phosh/phoc stack. See [ARCHITECTURE.md](ARCHITECTURE.md),
 | Persistent writable SFS / journaling | PLANNED | scratch-only writes today |
 | Hardware ports (Redmi 10C `fog`) | PARKED | platform support merged behind feature flags |
 
-Known open kernel issue (2026-11-22): the lazy-fill can fail in
-`mmu::map_user_pages_at_inner` under heavy region churn and the failure
-currently kills the faulting task instead of returning ENOMEM; root-caused,
-fix in progress.
+Resolved kernel issue (2026-11-22, fix `6846e49`): the intermittent
+lazy-fill failure in `mmu::map_user_pages_at_inner` under heavy region churn
+was the L2 walk indexing past the end of a table when a user range crossed a
+1 GiB boundary. The walk is now generic for map/unmap/mprotect/physical
+lookup, and a boot self-test covers the crossing. No open MMU issue is known.
 
 ## Architecture
 

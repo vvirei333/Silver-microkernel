@@ -188,14 +188,13 @@ pub fn log_soft_hit(exact: bool) {
     let far = FAULT_FAR.load(Ordering::Acquire);
     let elr = FAULT_ELR.load(Ordering::Acquire);
     let mut buffer = [0u8; 96];
-    let mut length = 0;
     let header: &[u8] = if exact {
         b"WATCH* far="
     } else {
         b"WATCH  far="
     };
     buffer[..header.len()].copy_from_slice(header);
-    length = header.len();
+    let mut length = header.len();
     for (value, prefix) in [(far, None), (elr, Some(b" elr="))] {
         if let Some(text) = prefix {
             buffer[length..length + text.len()].copy_from_slice(text);

@@ -5152,7 +5152,7 @@ pub fn wait_child(pid: i64, nohang: bool) -> WaitChild {
                     _ => WaitChild::NoChild,
                 };
             }
-            drop(manager);
+            // The borrow ends before sleeping; no guard is held here.
             sleep(1);
             continue;
         };
@@ -6601,14 +6601,20 @@ pub fn debug_lazy_fail(task_id: u64, limit: usize) {
 
 /// Last syscalls of `task_id` from the trace ring, reverse order.
 pub fn debug_task_trace(task_id: u64, limit: usize) {
-    let ring = unsafe { &crate::linux_abi::TRACE_RING };
+    // The ring is written by other CPUs. Read it through a raw pointer: a
+    // shared reference to a mutable static would be UB even for a diagnostic
+    // dump, and a torn record is acceptable here.
+    let ring = core::ptr::addr_of!(crate::linux_abi::TRACE_RING)
+        .cast::<[u64; 5]>();
     let index = crate::linux_abi::TRACE_RING_INDEX
         .load(core::sync::atomic::Ordering::Relaxed);
     let mut shown = 0;
     let mut cursor = index;
     while shown < limit && cursor > 0 {
         cursor -= 1;
-        let slot = ring[cursor % crate::linux_abi::TRACE_RING_LEN];
+        let slot = unsafe {
+            core::ptr::read_volatile(ring.add(cursor % crate::linux_abi::TRACE_RING_LEN))
+        };
         if slot[4] == task_id {
             console::write_str("  nr=");
             console::write_dec_u64(slot[0]);

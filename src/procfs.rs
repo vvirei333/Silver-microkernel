@@ -161,12 +161,15 @@ pub fn lookup(path: &str) -> Option<Node> {
             Some(Node::File(data))
         }
         ("self" | "1", None, None) => Some(Node::Dir(PROCESS)),
-        ("self" | "1", Some(name), None) => process_file(name).map(Node::File),
+        // `fd` is a synthetic directory; it must be matched before the
+        // generic process-file arm, which otherwise swallows it and makes
+        // /proc/self/fd (and every /proc/self/fd/N link) unreachable.
+        ("self" | "1", Some("fd"), None) => Some(Node::Dir(FD)),
         ("self" | "1", Some("fd"), Some(name)) => match name {
             "0" | "1" | "2" => Some(Node::Symlink("/dev/console")),
             _ => None,
         },
-        ("self" | "1", Some("fd"), None) => Some(Node::Dir(FD)),
+        ("self" | "1", Some(name), None) => process_file(name).map(Node::File),
         ("cpuinfo", None, None) => Some(Node::File(CPUINFO)),
         ("sys", None, None) => Some(Node::Dir(SYS)),
         ("sys", Some("kernel"), None) => Some(Node::Dir(SYS_KERNEL)),
@@ -181,5 +184,36 @@ pub fn entries(path: &str) -> Option<&'static [&'static str]> {
     match lookup(path)? {
         Node::Dir(names) => Some(names),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn self_fd_is_a_directory_not_a_process_file() {
+        assert!(matches!(lookup("/proc/self/fd"), Some(Node::Dir(fd)) if fd == FD));
+        assert!(matches!(lookup("/proc/1/fd"), Some(Node::Dir(fd)) if fd == FD));
+    }
+
+    #[test]
+    fn self_fd_entries_are_console_symlinks() {
+        assert!(matches!(
+            lookup("/proc/self/fd/0"),
+            Some(Node::Symlink("/dev/console"))
+        ));
+        assert!(matches!(
+            lookup("/proc/self/fd/2"),
+            Some(Node::Symlink("/dev/console"))
+        ));
+        assert!(lookup("/proc/self/fd/9").is_none());
+    }
+
+    #[test]
+    fn generic_process_files_still_resolve() {
+        assert!(matches!(lookup("/proc/self/maps"), Some(Node::File(_))));
+        assert!(matches!(lookup("/proc/self/status"), Some(Node::File(_))));
+        assert!(lookup("/proc/self/not-a-file").is_none());
     }
 }
