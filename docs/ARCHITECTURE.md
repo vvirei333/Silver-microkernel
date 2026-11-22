@@ -1,142 +1,120 @@
-# Архитектура WerewolfOS (консольный продукт)
+# WerewolfOS System Architecture
 
-> **Обновлено 2026-11-20.** Вектор развития пересмотрен: полноценная
-> графическая ОС выпилена. Композитор, framebuffer-бэкенды, kernel surface
-> objects, input-драйвер и домашний экран удалены. Продукт — консольная ОС.
-> Окно браузера рисуется на хосте (Qt) через общий RGBA-surface. Активная
-> долгосрочная цель — **Linux ABI + Denial DE** (пивот 2026-11-19: phosh/phoc
-> брошены; DE — denialwm/denial, Smithay-композитор deniald с встроенным
-> Flutter-шеллом, рендер через наш DRM/KMS virtio-gpu, Mesa software render;
-> решение владельца: месяцы, не годы). Планшет (Y700) забыт;
-> Redmi-порт припаркован. Исторические документы (`FINAL_AUDIT.md`,
-> `AUDIT_DELTA_FIXES.md`) описывают удалённые части.
+> Status: living document, English edition 2026-11-22. The superseded Russian
+> console-era draft is kept at [ARCHITECTURE.ru-2026-11-20.md](ARCHITECTURE.ru-2026-11-20.md).
+> Implementation status markers follow [STATUS.md](STATUS.md): **IMPLEMENTED**,
+> **PARTIALLY IMPLEMENTED**, **EXPERIMENTAL**, **PLANNED**.
 
-## 1. Принципы
+## 1. One OS, one kernel, several userspace configurations
 
-1. **Ядро — Rust, минимальное.** Планировщик, MMU, IPC, capability, таймеры,
-   прерывания, virtio-blk, SFS. Ядро не знает про пиксели, окна и приложения.
-2. **Драйверы — отдельные процессы.** Доступ к MMIO/PCI только через
-   capability. Падение драйвера не роняет систему. Планируемая реализация —
-   C++ с C ABI на границе.
-3. **Консоль — продукт.** Shell, Unix-подобные утилиты, SFS, сеть, UART.
-   Никакого композитора и домашнего экрана в загрузочной цепочке.
-4. **Приложения — бандлы.** Манифест + ELF + ресурсы; язык любой, лишь бы он
-   умел говорить с syscall/IPC ABI.
-5. **Свобода пользователя.** nameserver, сеть, shell и утилиты заменяемы.
+WerewolfOS is a single operating system built on the **Silver microkernel** —
+an independent, no_std Rust kernel targeting AArch64. WerewolfOS is both the
+kernel and its userspace layers, including the Linux compatibility layer:
+there is no separate "guest OS" below the kernel.
 
-## 2. Слои
+The kernel deliberately knows nothing about which configuration is running.
+Configurations are assembled at the image level from shared system components:
+
+| Configuration | Userspace | Linux ABI | Status |
+|---|---|---|---|
+| Console / IoT | Silver native userspace (Howl, services, toolbox) | Optional | IMPLEMENTED (primary) |
+| Mobile | Debian arm64 glibc stack + OpenRC + Denial WM (Wayland) | Required | PARTIALLY IMPLEMENTED (active development) |
+
+Gaming profiles, RISC-V ports and other future directions are not covered
+here; they are not being worked on and are not claimed anywhere.
+
+## 2. Layer diagram
+
+```mermaid
+graph TB
+    subgraph L4["Applications"]
+        N1["Native: Howl shell, tools, bundles"]
+        L1["Linux: deniald, GTK/GLib apps, Debian tools"]
+    end
+    subgraph L3["System services"]
+        S1["silverd (init)"]
+        S2["net_server (smoltcp stack)"]
+        S3["nameserver (Scout)"]
+    end
+    subgraph L2["Compatibility"]
+        A1["Linux ABI (feature linux-abi)<br/>syscall personality, fd tables,<br/>procfs/sysfs, DRM KMS UAPI"]
+    end
+    subgraph L1["Silver Microkernel (no_std Rust, AArch64)"]
+        K1["Scheduler + SMP + IPI"]
+        K2["MMU / ASID / page tables"]
+        K3["IPC channels + capabilities"]
+        K4["VFS / SFS"]
+        K5["IRQ + timer + watchdog"]
+    end
+    subgraph L0["Hardware (QEMU virt, Cortex-A72)"]
+        H1["virtio-gpu / virtio-blk / virtio-net"]
+        H2["PL011 UART, GICv3, ARM timer"]
+    end
+    N1 --> K3
+    L1 --> A1 --> K1
+    S1 --> K3
+    S2 --> K4
+    A1 --> K4
+    K1 --> H2
+    K3 --> H1
+```
+
+The Linux ABI is a kernel feature, not a second kernel: with the `linux-abi`
+cargo feature disabled, none of it is linked and the image is purely native.
+
+## 3. Core design rules
+
+1. **The kernel depends on no distribution.** Alpine, OpenRC, Debian and
+   Denial WM are image-level components of the Mobile configuration. The
+   kernel's boot chain (silverd init, SFS) is native and self-contained.
+2. **Drivers are isolated tasks, not kernel code.** MMIO/IRQ/PCI access is
+   granted through capabilities; a crashed driver does not crash the system.
+   (Kernel-side plumbing IMPLEMENTED; full driver-process split for every
+   device is PARTIALLY IMPLEMENTED — virtio-net/net_server already runs this
+   way.)
+3. **Fail closed.** Every resource the kernel hands out (frames, IRQs, DMA,
+   scheduling classes) passes a policy check (`mem_policy`, `irq_policy`,
+   `gicv3_policy`, `watchdog_policy`, `sched_policy`, `cache_policy`).
+4. **One fault domain per task.** EL0 faults kill the task and are reaped by
+   the kernel; a kernel panic is reserved for kernel bugs.
+5. **No marketing claims.** Every capability is marked with its verification
+   level in STATUS.md. What is not tested is not claimed.
+
+## 4. Boot chain (QEMU `virt`)
 
 ```
-+--------------------------------------------------------------+
-| L4  Утилиты и приложения  ls/cat/echo/... + бандлы в /sfs/apps |
-+--------------------------------------------------------------+
-| L3  Системные сервисы     silverd (init), nameserver (scout), |
-|     (Rust)                Howl (shell), Howler (UART)         |
-+--------------------------------------------------------------+
-| L2  Драйверы              net_driver + net_server (smoltcp); |
-|     (Rust, позже C++)     storage — будущий eMMC/UFS драйвер  |
-+--------------------------------------------------------------+
-| L1  Ядро (Rust)           sched, MMU, IPC, capabilities,      |
-|                           virtio-blk, SFS, таймеры, GIC       |
-+--------------------------------------------------------------+
-| L0  Загрузка              Boot ROM/ABL (телефон), QEMU -kernel|
-+--------------------------------------------------------------+
+QEMU -machine virt -cpu cortex-a72 -smp N
+  └─ Silver kernel image (relocatable, linked per platform)
+       ├─ early UART console (PL011)
+       ├─ FDT parsing (memory, virtio, GIC)
+       ├─ frame allocator + mem reserve pass
+       ├─ MMU/ASID/SMP self-tests (fail closed on mismatch)
+       ├─ virtio probes: gpu, blk, net
+       └─ silverd (native init) spawns:
+             ├─ net_server (smoltcp: DHCP/DNS/TCP/TLS)
+             ├─ nameserver (Scout IPC name resolution)
+             └─ Howl (shell) / native tools
+       Linux ABI images boot instead via `linuxrun /sfs/sbin/init`
+       (busybox + OpenRC + Debian glibc stack for Mobile).
 ```
 
-### L1. Silver Kernel
+## 5. Inter-component contracts
 
-Планировщик с приоритетами и SMP, ASID-теги, capability-модель, IPC-почтовые
-ящики, virtio-blk (polled, в ядре), SFS с чтением и записью, VFS с
-монтированием бэкендов, PSCI power-off/reset.
+| Boundary | Mechanism | Notes |
+|---|---|---|
+| Kernel ↔ native task | Syscall ABI (EL0 SVC), IPC channels | Channel-based, capability-checked |
+| Kernel ↔ Linux task | Linux syscall personality (`linux_abi.rs`) | Same kernel services, translated |
+| Task ↔ task | IPC channels over named endpoints (Scout) | Owned capabilities |
+| Task ↔ device | Device fds (`Target::*` in `linux_fd.rs`) / native caps | DRM, udmabuf, input planned |
+| Kernel ↔ block/net HW | virtio-mmio in-kernel + userspace stack process | Partitioned per device |
 
-Отвечает за изоляцию адресных пространств, доставку сообщений, планирование,
-файловые операции. Не знает про приложения.
+## 6. Where the code lives
 
-### L2. Драйверы
-
-- `net_driver` + `net_server` — virtio-net + smoltcp: DHCP, ARP/IPv4, ICMP,
-  DNS и TCP; клиентские запросы идут через общий DMA-window, поверх него
-  работают `ping`, `dns`, `wget` и `ip`;
-- storage — ядро владеет virtio-blk на QEMU; для телефона нужен eMMC/UFS
-  драйвер с тем же блочным контрактом;
-- `gpu`, `input`, `audio`, `camera` — **удалены/не входят в продукт**.
-
-Правила для C++: freestanding, без исключений и RTTI, только C ABI на границе.
-
-### L3. Сервисы
-
-- `silverd` — init: поднимает Scout, сеть, Howl и Howler, раздаёт capability,
-  обслуживает mailbox и перезапускает упавшие сервисы;
-- `scout` — nameserver;
-- `howl` — интерактивный shell с Unix-подобными командами;
-- `wolfser` — поисковая строка/адрес, HTTP-клиент, HTML→текст и отрисовка в
-  ivshmem-surface (окно на хосте: `tools/window-viewer` на Qt6);
-- `howler` — UART-драйвер ввода (Ctrl-Z, доставка байтов shell'у).
-
-### L4. Утилиты и приложения
-
-Отдельные EL0-программы. Часть встроена в образ (`ls`, `cat`, `echo`, `say`,
-`sl`, `bigdir`, `bigfile`), часть лежит в `/sfs/apps` и запускается через
-`run <path>`. План — busybox-подобный multi-call бинарник.
-
-## 3. IPC и ABI
-
-- Сообщение: `sender: u64`, `payload: [u8; 32]` — уже в ядре.
-- Крупные данные — через разделяемую DMA-память, дескриптор передаётся
-  в сообщении (так работает сеть).
-- Обработчики: `send`, `receive`, `receive_from`, таймауты.
-- C++-сервисы — тонкий shim `silver_send()`, `silver_recv()`,
-  `silver_map_dma()`, без libc.
-
-## 4. Безопасность
-
-| Эталонная мобильная ОС | Silver |
-| --- | --- |
-| entitlements | capability в манифесте + выдача ядром |
-| sandbox profile | набор capability + отсутствие доступа к чужим task id |
-| code signing | Ed25519-подпись бандла поверх SHA-256 |
-| менеджер сервисов | `silverd` |
-
-`CAP_MOUNT` и `CAP_POWER` вынесены из `CAP_ALL`: spawn-хэндл не превращается
-в собственное право. Shell консольного продукта получает `CAP_POWER` только
-политикой ядра. `CAP_SURFACE` и поверхностные syscall'ы удалены вместе с
-графикой.
-
-## 5. Цепочка загрузки
-
-| Этап | Silver |
-| --- | --- |
-| Boot ROM | Boot ROM устройства |
-| загрузчик | ABL / загрузчик (на QEMU — `-kernel`) |
-| ядро | `silver_microkernel` (Rust) |
-| init | `silverd` |
-| оболочка | `howl` + `howler` |
-
-## 6. Что уже есть и чего нет
-
-Есть: загрузка до `howl>` в QEMU и на `rain` (RAM-only, без UART-консоли),
-SFS в ядре, capability-модель, подпись бандлов, сеть ARP/IPv4/ICMP, SMP,
-PSCI power-off/reset, консольные утилиты, `health`/`du`/`fsck`.
-
-Есть: консоль, сеть (DHCP/DNS/TCP/HTTP), Wolfser в host-окне с поиском.
-Нет: TLS/HTTPS, eMMC/UFS, UART-консоль на телефоне, полный Unix-toolbox,
-CSS/изображения/ссылки в браузере.
-
-## 7. Linux ABI (активная цель)
-
-Personality-слой в ядре: задача с `Abi::Linux`, разбор Linux-номеров syscall
-и трансляция в VFS/память/IPC. Этапы: статические musl-бинарники → потоки
-(`clone`/`futex`/сигналы) → динамический линкер → `/proc`, `/sys`, D-Bus.
-
-Phosh запускается через **headless Wayland + software-рендер**: композитный
-кадр уходит в общий буфер, host Qt показывает окно. GPU/DRM на первом этапе не
-нужны. Детали и вехи — в [`VECTOR.md`](VECTOR.md).
-
-## 8. Следующие шаги
-
-1. Сеть: TLS-клиент и `https://`.
-2. Host-окно: общий surface + viewer, damage/input.
-3. Браузер: HTTP + HTML-подмножество в общем surface.
-4. Linux ABI: статические musl, затем busybox `sh`.
-5. Phosh: headless Wayland → GTK → D-Bus → `phosh`.
-6. Припарковано: UART/Redmi, eMMC/UFS, планшет.
+| Path | Contents |
+|---|---|
+| `src/` | The kernel crate (single binary, feature-gated layers) |
+| `userspace/` | Native userspace crate (silverd, Howl, net_server, tools, ELF engine) |
+| `tests/linux/` | Freestanding Linux-ABI test programs (glibc-free probes) |
+| `tools/` | Image builders (Alpine edge + Debian trixie staging), boot/dump scripts |
+| `scripts/` | SFS image creation/injection/fsck tooling |
+| `docs/` | This documentation set |

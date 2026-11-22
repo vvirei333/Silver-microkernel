@@ -20,36 +20,40 @@ frame by frame.
   desktop. Hardware ports (Redmi 10C) are parked until the OS layer is
   ready ([redmi10c_poc/README.md](redmi10c_poc/README.md)).
 
-## Project direction (updated 2026-11-20)
+## Documentation
 
-The project is a **console-first OS that provides the base OS**: kernel,
-drivers, networking, files and basic operations stay native. Applications —
-including the browser — come **from Linux through a compatibility layer**
-instead of being rewritten in the native userspace. **Linux ABI + Denial DE is
-the active goal**; Wolfser is a temporary browser (a stopgap) and is not the
-product path.
+| Document | Contents |
+|---|---|
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture, layers, boot chain |
+| [docs/KERNEL.md](docs/KERNEL.md) | Silver microkernel internals (memory, scheduler, IPC, drivers) |
+| [docs/USERSPACE.md](docs/USERSPACE.md) | Native userspace: silverd, Howl, net_server, toolbox |
+| [docs/CONFIGURATIONS.md](docs/CONFIGURATIONS.md) | Console/IoT and Mobile configurations |
+| [docs/LINUX_ABI.md](docs/LINUX_ABI.md) | Linux compatibility layer: what runs, what is missing |
+| [docs/DENIAL.md](docs/DENIAL.md) | Denial WM on WerewolfOS (Mobile desktop) |
+| [docs/FILESYSTEMS.md](docs/FILESYSTEMS.md) | SFS, scratch tree, synthetic /proc /sys /dev |
+| [docs/SECURITY.md](docs/SECURITY.md) | Security model, trust boundaries, disclosure |
+| [docs/DRIVER_MODEL.md](docs/DRIVER_MODEL.md) | Driver/device model and deviations |
+| [docs/DESIGN_DECISIONS.md](docs/DESIGN_DECISIONS.md) | Decisions with reasons, BSD-idea analysis |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Phases against the real code |
+| [docs/STATUS.md](docs/STATUS.md) | Implementation status with verification markers |
 
-Active vector:
+## Project direction
 
-1. **Console OS / base**: Silver kernel + SFS + network + Howl + Unix toolbox.
-   `net_server`/smoltcp (DHCP, DNS, TCP, HTTP, TLS) is deliberately ours.
-2. **Linux ABI module**: an optional (`linux-abi`) layer that loads foreign
-   AArch64 ELFs, implements the Linux syscall personality and maps it onto our
-   VFS and drivers. With the feature off, none of it is linked in.
-3. **Denial DE**: the desktop compositor is `deniald` (Smithay + embedded
-   Flutter shell), driven through our DRM/KMS (virtio-gpu) with Mesa
-   software rendering. The Linux root mixes Alpine (boot chain) with a
-   Debian trixie arm64 glibc runtime (`tools/build_glibc_denial.py`);
-   phosh/phoc images and tooling stay in the tree but are parked
-   ([docs/ALPINE_OPENRC.md](docs/ALPINE_OPENRC.md),
-   [docs/STATUS.md](docs/STATUS.md)).
+The kernel depends on no distribution. Configurations are assembled at the
+image level:
 
-Wolfser (the guest litehtml browser in the host-Qt window) remains available
-so pages can be viewed before the Linux stack is ready, but it is frozen
-except for bug fixes. See [`docs/VECTOR.md`](docs/VECTOR.md).
+1. **Console / IoT** — native userspace: Silver kernel + SFS + network + Howl
+   + Unix toolbox. The net_server/smoltcp stack (DHCP, DNS, TCP, HTTP, TLS)
+   is deliberately ours.
+2. **Mobile** — the same kernel booting a Linux userspace chain through the
+   `linux-abi` layer: Alpine boot chain (busybox + OpenRC) with a Debian
+   trixie arm64 glibc runtime, and **Denial WM** (denialwm/denial — a
+   Smithay compositor with an embedded Flutter shell) rendering through our
+   own DRM/KMS UAPI with Mesa software rendering.
 
-The tablet is out. Hardware phones are parked behind the QEMU/desktop
-milestone.
+Wolfser (the guest litehtml browser) remains available as a legacy demo but
+is frozen. The tablet target is abandoned; hardware ports are parked until
+the QEMU desktop milestone lands.
 
 ## Community
 

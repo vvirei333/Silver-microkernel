@@ -1,18 +1,38 @@
-# WerewolfOS — current project status
+# WerewolfOS — Implementation Status
 
-_Last refreshed: 2026-11-20 (Denial DE campaign; release 0.1.2 remains the
-last tagged milestone)._
+_Last refreshed: 2026-11-22. Verification markers: **IMPLEMENTED** (proven
+by code + boot self-tests or reproducible QEMU runs), **PARTIALLY
+IMPLEMENTED**, **EXPERIMENTAL**, **PLANNED**. Detailed session notes live in
+`handoff.md` (working notes); this file is the public summary._
 
-WerewolfOS is a native AArch64 console microkernel with its own drivers, VFS,
-network stack and shell. Linux programs — including real desktop stacks
-(libwayland, Mesa/EGL, GTK, Smithay-based compositors) — run through an
-**optional `linux-abi` module**. Removing that Cargo feature leaves no Linux
-loader or syscall code in the kernel binary.
+WerewolfOS is one OS on the Silver microkernel (AArch64, no_std Rust) with
+configurations assembled at the image level: **Console/IoT** (native
+userspace) and **Mobile** (Linux ABI + OpenRC + Denial WM). The desktop
+layer is **Denial (denialwm)** — a Smithay+Flutter Wayland compositor —
+replacing the parked phosh/phoc stack. See [ARCHITECTURE.md](ARCHITECTURE.md),
+[KERNEL.md](KERNEL.md), [LINUX_ABI.md](LINUX_ABI.md), [ROADMAP.md](ROADMAP.md).
 
-**Direction (2026-11-19):** the desktop layer is **Denial (denialwm)** — a
-Smithay+Flutter Wayland compositor (`deniald`) — replacing the parked
-phosh/phoc stack. See `docs/VECTOR.md` and `handoff.md` "2026-11-20" for the
-campaign state.
+## Verification snapshot
+
+| Area | Marker | Evidence |
+|---|---|---|
+| Kernel: MMU/ASID, SMP scheduler, IPC/capabilities, EL0 containment | IMPLEMENTED | boot self-tests, fault-containment tests |
+| Native userspace (silverd, Howl, net_server, toolbox) | IMPLEMENTED | console runs |
+| SFS + VFS + scratch writes | IMPLEMENTED | VFS self-test, fsck |
+| Network (virtio-net device, smoltcp userspace stack) | IMPLEMENTED | DHCP/DNS/TCP/TLS fetches |
+| Linux ABI core (exec, mmap, fds, epoll, futex, signals, AF_UNIX) | IMPLEMENTED | tests/linux suite, glibc stacks boot |
+| Mesa llvmpipe over DRM/KMS + udmabuf + syncobj fencing | IMPLEMENTED | deniald reaches GPU-transfer/TEST_ONLY stages |
+| Denial WM boot to engine session start | PARTIALLY IMPLEMENTED | deniald log stages verified |
+| First rendered desktop frame | IN PROGRESS — current stop | scanout buffers verified black; no post-engine atomic commits |
+| evdev input / udev glue for libinput | PLANNED | /dev/input empty today |
+| Package manager (in-OS) | PLANNED | host-side builders only |
+| Persistent writable SFS / journaling | PLANNED | scratch-only writes today |
+| Hardware ports (Redmi 10C `fog`) | PARKED | platform support merged behind feature flags |
+
+Known open kernel issue (2026-11-22): the lazy-fill can fail in
+`mmu::map_user_pages_at_inner` under heavy region churn and the failure
+currently kills the faulting task instead of returning ENOMEM; root-caused,
+fix in progress.
 
 ## Architecture
 
