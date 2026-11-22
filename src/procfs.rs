@@ -92,7 +92,7 @@ const OSRELEASE: &[u8] = b"6.12.0-silver\n";
 // its logging is even up. A minimal, plausibly-shaped map is enough.
 const SELF_MAPS: &[u8] = b"00400000-00401000 r-xp 00000000 00:00 0   /usr/bin/deniald\n\
 00401000-00402000 rw-p 00000000 00:00 0   [heap]\n\
-7f0000000000-7f0000100000 rw-p 00000000 00:00 0   [stack]\n";
+f0001000-f0041000 rw-p 00000000 00:00 0   [stack]\n";
 
 const ROOT: &[&str] = &[
     "cmdline",

@@ -2061,8 +2061,10 @@ fn has_task_capacity(manager: &TaskManager) -> bool {
 
 /// Upper bound on a task's anonymous mappings. The virtual window allows far
 /// more entries than the 128 MiB DRAM can back; this cap bounds the metadata
-/// Vec itself, not just the frames.
-const MAX_MMAP_REGIONS: usize = 4096;
+/// Vec itself, not just the frames. Denial's Flutter/Mesa process fragments
+/// its window past 4096 entries during startup (fontconfig + GL caches), so
+/// leave headroom while keeping the metadata bounded to a few MiB.
+const MAX_MMAP_REGIONS: usize = 16384;
 
 /// Per-task cap on mapping bytes. The mmap window is ~1 GiB but DRAM is
 /// shared by every task, so one EL0 task must not be able to claim the whole
@@ -8251,8 +8253,21 @@ impl Task {
                 }
                 cursor = next.min(end);
             }
-            // At most two splits (start and end), and each split adds one.
-            if self.mmap_regions.len() + 2 > MAX_MMAP_REGIONS {
+            // Only a boundary strictly inside a region needs a split. Most
+            // `mprotect` calls are page-aligned with an existing region and
+            // need none, so do not reserve two slots unconditionally: with a
+            // full table that would reject a no-op protection change.
+            let mut splits = 0;
+            for boundary in [address, end] {
+                if self.mmap_regions.iter().any(|region| {
+                    let region_end =
+                        region.virtual_address + region.page_count * PAGE_SIZE;
+                    region.virtual_address < boundary && boundary < region_end
+                }) {
+                    splits += 1;
+                }
+            }
+            if self.mmap_regions.len() + splits > MAX_MMAP_REGIONS {
                 return false;
             }
             // Lazy reservations may not have a frame behind every page yet;
