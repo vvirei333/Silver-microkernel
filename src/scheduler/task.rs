@@ -154,6 +154,26 @@ pub enum Personality {
     Linux,
 }
 
+/// Upper bound on a task's anonymous mappings. The virtual window allows far
+/// more entries than the 128 MiB DRAM can back; this cap bounds the metadata
+/// Vec itself, not just the frames. Denial's Flutter/Mesa process fragments
+/// its window past 4096 entries during startup (fontconfig + GL caches), so
+/// leave headroom while keeping the metadata bounded to a few MiB.
+pub(super) const MAX_MMAP_REGIONS: usize = 16384;
+
+/// Per-task cap on mapping bytes. The mmap window is ~1 GiB but DRAM is
+/// shared by every task, so one EL0 task must not be able to claim the whole
+/// machine and starve the scheduler, IPC and the kernel heap. The GTK3
+/// library set is ~80 MiB of segments; 160 MiB leaves room for its heap while
+/// the global frame reserve stays the last line of defence.
+// A large value because lazily reserved ranges (glibc's 128 MiB heap probe)
+// count toward it while committing no frames. The real bound on memory is the
+// per-task frame ledger, charged one page at a time. Mesa/LLVM reserves
+// ~193 MiB of sparse JIT/Gallium arenas per GPU context (compositor +
+// transfer worker), which needs more than the historical 1 GiB now that the
+// user VA window reaches 0xF0000000.
+pub(super) const MAX_MMAP_BYTES_PER_TASK: usize = 2 * 1024 * 1024 * 1024;
+
 pub struct Task {
     pub id: u64,
     pub state: TaskState,

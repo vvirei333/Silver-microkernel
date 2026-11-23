@@ -21,7 +21,6 @@
 /// library so `cargo test --lib` can cover them; this module adds the only
 /// part that needs hardware: reading `MIDR_EL1`.
 pub use silver_microkernel::board::Kind;
-pub use silver_microkernel::board::{kind_from_compatible, force_from_compatible};
 
 /// Records the identity proved by the live FDT. Called once, before the
 /// console is initialised.

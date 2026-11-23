@@ -68,7 +68,7 @@ enum Active {
 }
 
 fn active() -> Active {
-    use crate::devices::{choose_console, ConsoleTransport, DriverKind};
+    use crate::devices::{choose_console, ConsoleTransport};
 
     // A UART the live device tree describes wins over any per-machine default:
     // a new board becomes console-capable by being described, not by adding a
