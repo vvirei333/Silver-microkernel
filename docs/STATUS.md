@@ -86,8 +86,8 @@ bought, and the command stays available to catch regressions.
 | Path | Before | After | Change |
 |---|---|---|---|
 | `sleep(0)` yield | 5 028 851 ns (200/s) | 4 723 ns (211 000/s) | ~1000x: a runnable task is no longer parked in `wfi` until the next 10 ms tick |
-| SFS `open`+`close` | 70 416 ns | 30 038 ns | 2.3x: O(1) direct-mapped block cache, allocation-free path walk, in-place directory-name compare |
-| SFS `open`+`read(8B)`+`close` | 103 993 ns | 45 756 ns | 2.3x |
+| SFS `open`+`close` | 70 416 ns | 22 503 ns | 3.1x: O(1) direct-mapped block cache, allocation-free path walk, in-place directory-name compare, one backend lookup per open |
+| SFS `open`+`read(8B)`+`close` | 103 993 ns | 30 815 ns | 3.4x |
 | RamFs `open`+`close` (VFS floor) | 16 385 ns | 12 991 ns | unchanged; this is VFS + trap |
 | syscall round trip | 3 226 ns | 3 024 ns | unchanged |
 | anonymous page fault | 406 ns/page | 399 ns/page | unchanged |
@@ -105,6 +105,24 @@ Console-image fixes in the same pass:
 - **No debug output on failed opens.** `Vfs::open` printed `VFSDBG …` plus the
   resolved path to the shared console on every rejection (console noise and a
   path leak any task could trigger); the error is returned to the caller only.
+- **One backend lookup per open.** `Vfs::open` asked the backend twice
+  (`is_directory`, then `len`), i.e. two full SFS path walks;
+  `FileSystem::metadata` answers both in one walk (default implementation keeps
+  every backend correct).
+- **`spawn`/`bg` take text arguments** (`spawn ls /sfs`, `bg cat <path>`); a
+  decimal argument still selects the numeric form. `spawn` hands the console
+  over and returns, `bg` keeps it — which is what the help always said, but the
+  two verbs ran the same code. Fire-and-forget children are reaped by the shell
+  at the next command (a bounded 16-handle ring), so `ps`/`health` no longer
+  accumulate `dead`/`zombie` records.
+- **The shell blocks on its mailbox instead of polling.** It used to poll
+  `receive_timeout(.., 0)` with a 1 ms sleep: a wakeup every tick and typing
+  latency bounded by the 10 ms tick. The blocking receive is woken by the UART
+  driver's first byte; the idle shell costs no wakeups.
+- **Console lines are atomic.** Kernel `console::write_*` and `SYS_PRINT` lock
+  per call, so a line assembled from several calls could be cut in half by
+  another CPU (visible as `Spawned task ID=EXIT: task=10 …`). `console::Line`
+  and `syscall::Line` assemble in a stack buffer and emit with one write.
 
 ### Linux ABI
 - Static and dynamic glibc programs; real `ld.so`, PIE/`PT_INTERP`, `$ORIGIN`.

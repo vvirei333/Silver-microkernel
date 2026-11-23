@@ -27,8 +27,11 @@ dynamic ELF loader, SFS + fsck, bundles with integrity.
 
 Done (2026-11-23): `bench` (cycle-accurate fast-path timings at EL0), atomic
 console handoff for foreground commands, O(1) SFS block cache, allocation-free
-SFS path walk, scheduler yield that resumes a runnable task instead of parking
-the CPU until the next tick. Numbers in [STATUS.md](STATUS.md).
+SFS path walk, one backend lookup per `open` (`FileSystem::metadata`),
+scheduler yield that resumes a runnable task instead of parking the CPU until
+the next tick, `spawn`/`bg` with text arguments plus in-shell reaping, a shell
+that blocks on its mailbox instead of polling, and atomic console lines.
+Numbers in [STATUS.md](STATUS.md).
 
 Done: `silverd` supervises its fixed five-service tree with bounded restart
 backoff, dependency-aware pair restarts and zombie reaping.
