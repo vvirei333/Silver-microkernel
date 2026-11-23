@@ -107,7 +107,8 @@ Release notes for this version: [`RELEASE.md`](RELEASE.md). Contributions:
 - [x] User-memory reserve: anonymous `mmap`, `brk`, DMA, ELF-image and per-task stack frames are refused once granting them would drop free frames below 1/8 of RAM (capped at half), so user tasks cannot starve the kernel; the boot test proves the gate is one-sided (`MEM RESERVE PASS`)
 - [x] Per-task memory ledger: every frame a task can pin (address-space tables, stacks, ELF image, `brk`, `mmap`, DMA) is charged to one counter bounded at 1/4 of usable RAM; the boot test charges, refuses past a forced limit, releases and reopens the gate (`TASK LEDGER PASS`)
 - [x] Partial `munmap`: any page-aligned sub-range of one anonymous mapping is unmapped, its frames are returned to the allocator, and the bookkeeping splits into up to two regions; a hole is reusable by the next first-fit `mmap`. Host-tested range math plus a boot proof (`MMAP SPLIT PASS`)
-- [x] Console ownership + job control: `bg`/`fg`, Ctrl-Z, `Stopped`, resume and shell recovery
+- [x] Console ownership + job control: `bg`/`fg`, Ctrl-Z, `Stopped`, resume and shell recovery; foreground commands hand the console over *inside* the spawn (`SYS_SPAWN_ARGS_CONSOLE`), so a fast child cannot finish before it can print
+- [x] `bench`: cycle-accurate fast-path timings from userspace (`CNTPCT_EL0` unmasked at EL0) — syscall trap, scheduler yield, SFS/RamFs open, anonymous page faults, copy bandwidth
 - [x] Lifecycle cleanup: address spaces, mailboxes, file handles, wait queues and owned mutexes
 - [x] Blocking mutex with FIFO wait queue, ownership tracking and RAII guard
 - [x] Bounded IPC: 16-message mailboxes, blocking send/backpressure and receive timeouts

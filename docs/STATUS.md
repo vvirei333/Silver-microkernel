@@ -17,6 +17,7 @@ replacing the parked phosh/phoc stack. See [ARCHITECTURE.md](ARCHITECTURE.md),
 | Area | Marker | Evidence |
 |---|---|---|
 | Kernel: MMU/ASID, SMP scheduler, IPC/capabilities, EL0 containment | IMPLEMENTED | boot self-tests, fault-containment tests |
+| Performance instrumentation (`bench`), console handoff, SFS/VFS fast paths | IMPLEMENTED | `bench` rows below, 26/26 matrix, `smp-selftest` |
 | Native userspace (silverd, Howl, net_server, toolbox) | IMPLEMENTED | console runs |
 | SFS + VFS + scratch writes | IMPLEMENTED | VFS self-test, fsck |
 | Network (virtio-net device, smoltcp userspace stack) | IMPLEMENTED | DHCP/DNS/TCP/TLS fetches |
@@ -70,6 +71,40 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   restarts (net driver/server, shell/input), and zombie reaping. The shell
   exposes `svc restart <name>` for controlled restarts.
 - Fastfetch-style boot banner, kernel/userspace version **0.1.2**.
+- `bench` in the shell: cycle-accurate fast-path timings for the syscall trap,
+  scheduler yield, the SFS and RamFs open paths, anonymous page faults and a
+  raw copy baseline. EL0 reads `CNTPCT_EL0` directly (the kernel unmasks it per
+  CPU in `timer::enable_el0_counter`), so the measured window contains no clock
+  syscall of its own.
+
+### Measured fast paths (QEMU `virt`, Cortex-A72, TCG, 62.5 MHz counter)
+
+`bench` numbers from the console image, before -> after the 2026-11-23 pass.
+Absolute values are TCG-emulation costs; the ratios are what the changes
+bought, and the command stays available to catch regressions.
+
+| Path | Before | After | Change |
+|---|---|---|---|
+| `sleep(0)` yield | 5 028 851 ns (200/s) | 4 723 ns (211 000/s) | ~1000x: a runnable task is no longer parked in `wfi` until the next 10 ms tick |
+| SFS `open`+`close` | 70 416 ns | 30 038 ns | 2.3x: O(1) direct-mapped block cache, allocation-free path walk, in-place directory-name compare |
+| SFS `open`+`read(8B)`+`close` | 103 993 ns | 45 756 ns | 2.3x |
+| RamFs `open`+`close` (VFS floor) | 16 385 ns | 12 991 ns | unchanged; this is VFS + trap |
+| syscall round trip | 3 226 ns | 3 024 ns | unchanged |
+| anonymous page fault | 406 ns/page | 399 ns/page | unchanged |
+| `memcpy` 64 KiB | 2 181 MiB/s | ~1 800-2 400 MiB/s | noise floor |
+
+Console-image fixes in the same pass:
+
+- **Atomic console handoff.** The shell used to `SYS_SPAWN` then
+  `SYS_CONSOLE_SET`; the child is Ready immediately, so one timer tick in that
+  window let a fast command (`cat` of a small file) finish with no console and
+  lose its output, after which the handoff failed on a zombie. Foreground
+  utilities now use `SYS_SPAWN_ARGS_CONSOLE`, which hands over the console
+  inside the spawn (the caller must own the console or hold
+  `CAP_CONSOLE_GRANT`, so a plain driver still cannot grab it).
+- **No debug output on failed opens.** `Vfs::open` printed `VFSDBG …` plus the
+  resolved path to the shared console on every rejection (console noise and a
+  path leak any task could trigger); the error is returned to the caller only.
 
 ### Linux ABI
 - Static and dynamic glibc programs; real `ld.so`, PIE/`PT_INTERP`, `$ORIGIN`.
@@ -248,7 +283,7 @@ The same list can be run manually at `howl>`:
 | `linuxrun /sfs/linux-dbus` | `dbus ok` |
 | `health` | 0 zombies, 0 open files, 0 DMA leaks |
 
-Host-side: `cargo test --lib` → **222 tests**. Feature builds: `no_std`,
+Host-side: `cargo test --lib` → **229 tests**. Feature builds: `no_std`,
 `no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,smp-selftest`; the
 `--no-linux` build is clean (the switch is also a regression test for Linux
 code leaking into the kernel).

@@ -25,6 +25,11 @@ ftruncate errno correctness, driver-process split for gpu/blk.
 Done: silverd, Howl, Scout, net_server (DHCP/DNS/TCP/TLS), Unix toolbox,
 dynamic ELF loader, SFS + fsck, bundles with integrity.
 
+Done (2026-11-23): `bench` (cycle-accurate fast-path timings at EL0), atomic
+console handoff for foreground commands, O(1) SFS block cache, allocation-free
+SFS path walk, scheduler yield that resumes a runnable task instead of parking
+the CPU until the next tick. Numbers in [STATUS.md](STATUS.md).
+
 Done: `silverd` supervises its fixed five-service tree with bounded restart
 backoff, dependency-aware pair restarts and zombie reaping.
 
