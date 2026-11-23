@@ -2,13 +2,13 @@
 # Builds the ConsoleOS release bundle for the version in Cargo.toml.
 #
 # Output (never committed, ignored by git):
-#   dist/werewolfos-<version>/
+#   dist/werewolfos-<version>-<variant>/     (variant: consoleos | consoleos-minimal)
 #     silver_microkernel        the release kernel ELF (linux-abi included)
 #     disk.img                  the SFS image it boots from
 #     INSTALL.md                the install/quickstart guide
 #     MANIFEST                  version, features, toolchain, build date
 #     SHA256SUMS                checksums of the three files above
-#   dist/werewolfos-<version>-consoleos-aarch64.tar.gz
+#   dist/werewolfos-<version>-<variant>-aarch64.tar.gz
 #
 # Usage:
 #   scripts/make_release.sh                 build + package
@@ -23,9 +23,13 @@ cd "$(dirname "$0")/.."
 
 FEATURES="no_std,linux-abi"
 SMOKE=0
+SMOKE_ARGS=""
+VARIANT="consoleos"
 for argument in "$@"; do
     case "$argument" in
-        --no-linux) FEATURES="no_std" ;;
+        # The console-only kernel links no Linux loader/syscall code at all;
+        # two variants must not share an artifact name.
+        --no-linux) FEATURES="no_std"; SMOKE_ARGS="--no-linux"; VARIANT="consoleos-minimal" ;;
         --smoke) SMOKE=1 ;;
         *) echo "usage: $0 [--no-linux] [--smoke]" >&2; exit 1 ;;
     esac
@@ -39,8 +43,8 @@ if [ -z "$VERSION" ]; then
     exit 1
 fi
 
-NAME="werewolfos-$VERSION-consoleos-aarch64"
-OUT="dist/werewolfos-$VERSION"
+NAME="werewolfos-$VERSION-$VARIANT-aarch64"
+OUT="dist/werewolfos-$VERSION-$VARIANT"
 
 echo "==> building Silver $VERSION ($FEATURES)"
 cargo build --release --target aarch64-unknown-none \
@@ -82,7 +86,7 @@ echo "==> tarball: dist/$NAME.tar.gz"
 
 if [ "$SMOKE" -eq 1 ]; then
     echo "==> booting the packaged artifacts in QEMU"
-    python3 scripts/release_smoke.py \
+    python3 scripts/release_smoke.py $SMOKE_ARGS \
         --kernel "$OUT/silver_microkernel" \
         --image "$OUT/disk.img"
 fi
