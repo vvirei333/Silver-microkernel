@@ -1585,6 +1585,11 @@ pub extern "C" fn kernel_main() -> ! {
             console::write_str("\r\n");
         }
     }
+    if let Some(intid) = crate::driver_resources::timer_intid() {
+        console::write_str("DRIVER TIMER=DT intid=");
+        console::write_dec_u64(u64::from(intid));
+        console::write_str("\r\n");
+    }
 
     #[cfg(feature = "fog")]
     {
@@ -1770,6 +1775,9 @@ pub extern "C" fn kernel_main() -> ! {
     // console: a GICv2 gets the distributor and CPU-interface bases the tree
     // describes (they are not at a fixed offset from each other on real
     // controllers), a GICv3 keeps its system-register path.
+    if let Some(intid) = crate::driver_resources::timer_intid() {
+        gic::set_timer_irq(intid);
+    }
     match crate::driver_resources::gic_bases() {
         Some((distributor, cpu_interface)) => gic::init_at(distributor, cpu_interface),
         None => gic::init(),

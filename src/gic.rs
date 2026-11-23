@@ -27,12 +27,26 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::irq_policy::{self, MaskScope, UnmaskableAction};
 use crate::{console, exceptions, gicv3, memory, platform, scheduler, timer};
 
-/// Non-secure physical timer PPI. QEMU virt and SM8650 use PPI 14 (INTID 30);
-/// SM6225/khaje wires the ARMv8 timer as PPI 2 (INTID 18).
+/// Non-secure physical timer PPI used when no device tree names one.
+///
+/// QEMU virt and SM8650 use PPI 14 (INTID 30); SM6225/khaje wires the ARMv8
+/// timer as PPI 2 (INTID 18). A tree with an `arm,armv8-timer` node wins over
+/// both: `driver_resources` binds the INTID and `set_timer_irq` applies it.
 #[cfg(feature = "fog")]
-pub const TIMER_IRQ: u32 = 18;
+const DEFAULT_TIMER_IRQ: u32 = 18;
 #[cfg(not(feature = "fog"))]
-pub const TIMER_IRQ: u32 = 30;
+const DEFAULT_TIMER_IRQ: u32 = 30;
+
+/// Timer INTID bound from the live tree (0 = not bound).
+static TIMER_INTID: AtomicU32 = AtomicU32::new(0);
+
+/// Binds the timer PPI the tree describes. Ignored for implausible values: a
+/// wild INTID must not be enabled in the distributor.
+pub fn set_timer_irq(intid: u32) {
+    if intid != 0 && intid < 1024 {
+        TIMER_INTID.store(intid, Ordering::Release);
+    }
+}
 /// QEMU virt DTB: PL011 is SPI 1, so its GIC interrupt ID is 32 + 1.
 /// SM6225 SE4 debug UART is SPI 331, so INTID 32 + 331 = 363.
 #[cfg(feature = "fog")]
@@ -97,9 +111,13 @@ const GICC_EOIR: usize = 0x010;
 /// INTID of the non-secure physical timer for the active controller.
 pub fn timer_irq() -> u32 {
     if platform::detect().uses_gicv3() {
-        gicv3::timer_irq()
+        return gicv3::timer_irq();
+    }
+    let bound = TIMER_INTID.load(Ordering::Acquire);
+    if bound != 0 {
+        bound
     } else {
-        TIMER_IRQ
+        DEFAULT_TIMER_IRQ
     }
 }
 
@@ -159,12 +177,12 @@ pub fn init() {
     // The timer PPI is a banked interrupt (INTID < 32): its enable bit is
     // per-CPU, so it is enabled in `cpu_init`, not here.
     write8(
-        dist() + GICD_IPRIORITYR + TIMER_IRQ as usize,
+        dist() + GICD_IPRIORITYR + timer_irq() as usize,
         0xA0,
     );
 
-    let config_offset = GICD_ICFGR + (TIMER_IRQ as usize / 16) * 4;
-    let config_shift = (TIMER_IRQ as usize % 16) * 2;
+    let config_offset = GICD_ICFGR + (timer_irq() as usize / 16) * 4;
+    let config_shift = (timer_irq() as usize % 16) * 2;
     write32(
         dist() + config_offset,
         read32(dist() + config_offset) & !(0b11_u32 << config_shift),
@@ -194,7 +212,7 @@ pub fn init() {
     enable_irq(RESCHEDULE_IRQ);
     enable_irq(QUIESCE_IRQ);
     // BISECT: monolithic original ordering (timer enable before GICD/GICC enable)
-    enable_irq(TIMER_IRQ);
+    enable_irq(timer_irq());
     write32(cpu_iface() + GICC_PMR, 0xFF);
     write32(cpu_iface() + GICC_BPR, 0);
     write32(dist() + GICD_CTLR, 1);
@@ -213,7 +231,7 @@ pub fn cpu_init() -> bool {
     // Banked enable: SGI0 (reschedule), SGI1 (quiesce) and this CPU's timer PPI.
     enable_irq(RESCHEDULE_IRQ);
     enable_irq(QUIESCE_IRQ);
-    enable_irq(TIMER_IRQ);
+    enable_irq(timer_irq());
 
     write32(cpu_iface() + GICC_PMR, 0xFF);
     write32(cpu_iface() + GICC_BPR, 0);
@@ -250,7 +268,7 @@ pub fn diag_timer_snapshot() {
     } else {
         // GICv2: SGIs+PPIs are banked; ISPENDR0/ISENABLER0 hold the PPI
         // state of the calling PE.
-        let ppi_bit = 1_u32 << (TIMER_IRQ % 32);
+        let ppi_bit = 1_u32 << (timer_irq() % 32);
         let pend = unsafe { ptr::read_volatile((dist() + GICD_ISPENDR) as *const u32) };
         let en = unsafe { ptr::read_volatile((dist() + GICD_ISENABLER) as *const u32) };
         let ctlr = unsafe { ptr::read_volatile((cpu_iface() + GICC_CTLR) as *const u32) };
@@ -395,7 +413,7 @@ pub extern "C" fn silver_handle_irq() {
     let acknowledge_register = acknowledge();
     let irq = acknowledge_register & 0x3FF;
 
-    if irq != TIMER_IRQ && irq != RESCHEDULE_IRQ && irq != QUIESCE_IRQ && irq != SPURIOUS_IRQ {
+    if irq != timer_irq() && irq != RESCHEDULE_IRQ && irq != QUIESCE_IRQ && irq != SPURIOUS_IRQ {
         // The probe and the wake must be one kernel-lock-protected step:
         // another CPU could otherwise change the binding in between.
         let _bkl = crate::smp::BklGuard::new();
@@ -422,7 +440,7 @@ pub extern "C" fn silver_handle_irq() {
             end_interrupt(acknowledge_register);
             crate::smp::quiesce_ack_and_wait();
         }
-        TIMER_IRQ => {
+        _ if irq == timer_irq() => {
             crate::smp::probe(20);
             timer::handle_irq();
             end_interrupt(acknowledge_register);

@@ -1239,39 +1239,66 @@ impl<'a, 'o> Visitor<'a> for DriverFinder<'o> {
     }
 }
 
-#[derive(Default)]
-struct TimerFinder {
-    current_timer: bool,
+/// Per-node state of the timer visitor (see [`UartState`]).
+#[derive(Clone, Copy, Default)]
+struct TimerState {
+    is_timer: bool,
     irq: Option<u32>,
+}
+
+struct TimerFinder {
+    depth: usize,
+    nodes: [TimerState; MAX_DEPTH],
+    irq: Option<u32>,
+}
+
+impl Default for TimerFinder {
+    fn default() -> Self {
+        TimerFinder {
+            depth: 0,
+            nodes: [TimerState::default(); MAX_DEPTH],
+            irq: None,
+        }
+    }
 }
 
 impl<'a> Visitor<'a> for TimerFinder {
     fn begin(&mut self, _path: &str, _name: &str) {
-        self.current_timer = false;
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.nodes[self.depth] = TimerState::default();
+        self.depth += 1;
     }
 
     fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        let Some(state) = self.nodes.get_mut(index) else {
+            return;
+        };
         match name {
             "compatible" => {
                 let mut rest = value;
                 while let Some(text) = next_string(&mut rest) {
                     if text == "arm,armv8-timer" {
-                        self.current_timer = true;
+                        state.is_timer = true;
                     }
                 }
             }
-            "interrupts" => {
-                if self.current_timer && self.irq.is_none() {
-                    // The DT binding order is: secure physical, non-secure
-                    // physical, virtual, hypervisor. The second entry is the
-                    // one CNTP_* drives.
-                    let second = value.get(12..24);
-                    if let Some(entry) = second {
-                        if read_be32(entry, 0) == Some(1) {
-                            if let Some(ppi) = read_be32(entry, 4) {
-                                if ppi < 16 {
-                                    self.irq = Some(16 + ppi);
-                                }
+            // Recorded regardless of order: `dtc` writes `interrupts` before
+            // `compatible` on QEMU's own tree, and the match is decided at
+            // node end instead of trusting property order.
+            "interrupts" if state.irq.is_none() => {
+                // The DT binding order is: secure physical, non-secure
+                // physical, virtual, hypervisor. The second entry is the one
+                // CNTP_* drives.
+                if let Some(entry) = value.get(12..24) {
+                    if read_be32(entry, 0) == Some(1) {
+                        if let Some(ppi) = read_be32(entry, 4) {
+                            if ppi < 16 {
+                                state.irq = Some(16 + ppi);
                             }
                         }
                     }
@@ -1281,7 +1308,16 @@ impl<'a> Visitor<'a> for TimerFinder {
         }
     }
 
-    fn end(&mut self, _path: &str) {}
+    fn end(&mut self, _path: &str) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        self.depth -= 1;
+        let state = self.nodes[index];
+        if self.irq.is_none() && state.is_timer {
+            self.irq = state.irq;
+        }
+    }
 }
 
 #[derive(Default)]
@@ -2066,6 +2102,28 @@ mod tests {
         let uart = fdt.find_uart().unwrap();
         assert_eq!(uart.base, 0x0900_0000);
         assert_eq!(uart.kind, UartKind::Pl011);
+    }
+
+    #[test]
+    fn timer_is_found_when_interrupts_precede_compatible() {
+        // `dtc` writes QEMU's timer node as interrupts-first. Requiring
+        // `compatible` to be seen before the cells made the timer PPI read as
+        // absent on a real tree.
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.prop_u32("#address-cells", 2);
+        dtb.prop_u32("#size-cells", 2);
+        dtb.begin("timer");
+        dtb.prop_u32_array(
+            "interrupts",
+            &[1, 13, 0x304, 1, 14, 0x304, 1, 11, 0x304, 1, 10, 0x304],
+        );
+        dtb.prop_str("compatible", "arm,armv8-timer\0arm,armv7-timer");
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        // Non-secure physical timer is the second entry: PPI 14 -> INTID 30.
+        assert_eq!(Fdt::new(&blob).unwrap().timer_irq(), Some(30));
     }
 
     #[test]

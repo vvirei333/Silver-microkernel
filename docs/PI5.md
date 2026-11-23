@@ -17,7 +17,7 @@ the same plan applies one step earlier in the SoC family.
 | CPU | 4× Cortex-A76, AArch64, EL2 → EL1 handoff from firmware | known |
 | Boot | EEPROM bootloader → `config.txt`/`cmdline.txt` → arm64 kernel image or `armstub8`; the load address and entry contract come from the firmware, not from us | known shape, exact address to verify |
 | Console | PL011 debug UART (uart10 on a Pi 5) at 115200 8N1 on the header | known shape; base, INTID and reference clock are read from the node, including the Pi's `clocks = <&clk_uart>` phandle form |
-| Interrupts | GIC-400, ARM generic timer PPI | known shape; distributor and CPU-interface bases are now read from the node (verified on QEMU's tree) |
+| Interrupts | GIC-400, ARM generic timer PPI | known shape; distributor and CPU-interface bases and the timer PPI INTID are all read from the tree (verified on QEMU's tree) |
 | Secondary cores / power | PSCI via firmware | expected, to be confirmed |
 | Storage | most I/O on Pi 5 sits behind the **RP1 southbridge over PCIe**; the SD/eMMC path must be confirmed from the live DTB (`lspci` on a running Linux shows the RP1) | **unknown — the main risk** |
 | Firmware services | mailbox for poweroff/reboot, framebuffer (not needed for a console image) | known shape, to be implemented |
@@ -89,6 +89,22 @@ build is bit-for-bit the same placement as before. Verified by linking a kernel
 at `0x4020_0000`, producing the matching `text_offset = 0x200000` Image and
 booting it: the shell comes up and `health` is clean, so the mechanism is not
 just a build flag.
+
+### The timer PPI comes from the tree as well
+
+The non-secure physical timer's INTID was a platform constant (30 on QEMU,
+18 on khaje). It is now bound from the `arm,armv8-timer` node like every other
+device, with the old constants kept only as a no-tree fallback. Same
+property-order trap as the GIC: `dtc` writes `interrupts` *before*
+`compatible`, so the timer read as absent until the parser stopped trusting
+property order (now covered by a regression test built from QEMU's real cell
+layout). Boot evidence:
+
+```
+DRIVER GIC=DT dist=0x0000000008000000 cpu=0x0000000008010000
+DRIVER TIMER=DT intid=30
+TIMER TEST: ticks=30
+```
 
 ### The interrupt controller is a device, too
 
@@ -163,6 +179,7 @@ The most useful contributions are *data from real hardware*, not patches:
 
 | Date | Change | Evidence |
 |---|---|---|
+| 2026-11-23 | Timer PPI from the tree: INTID bound from `arm,armv8-timer` (`gic::set_timer_irq`), platform constant only as a no-tree fallback; fixed the same property-order bug in `TimerFinder` (QEMU writes `interrupts` first). | regression test with the real cell layout; 249 host tests; smoke 8/8; `smp-selftest` 10/10; boot log `DRIVER TIMER=DT intid=30` |
 | 2026-11-23 | Interrupt controller from the tree: GIC distributor and CPU-interface bases bound from the node (`gic::init_at`), no fixed offset assumed. Found and fixed a real visitor bug (property order `reg` before `compatible`, and children resetting the parent's captured state) — the GIC was silently ignored on any real tree. | 2 regression tests (real property order, matching node with a child); 248 host tests; smoke 8/8; `smp-selftest` 10/10 on `-smp 4`; boot log shows `DRIVER GIC=DT` |
 | 2026-11-23 | UART clock phandle resolution: `clocks = <&clk_uart>` is followed to the provider node and its rate read, so the Pi's own spelling works without vendor-specific code. Verified on QEMU's stock device tree (`clk=24000000` from `apb-pclk`, reached only through the phandle) with the shell still running. | 2 new `fdt` tests (phandle resolution incl. unknown phandle, direct value wins); 246 host tests; smoke 8/8 |
 | 2026-11-23 | Load address is a build parameter: `SILVER_LINK_PA` / `SILVER_DRAM_BASE` / `SILVER_KERNEL_VIRT_BASE` → `--defsym`, with `DEFINED()` guards in `linker.ld`; `scripts/make_image.py` now reads `__dram_base` from the ELF instead of assuming QEMU. Verified by booting an image linked at 0x4020_0000 (`text_offset = 0x200000`) through the Image protocol: console, shell and `health` all work; the default build boots unchanged (smoke 8/8). | 244 host tests, five feature builds, smoke 8/8, custom-base boot log |

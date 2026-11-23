@@ -48,6 +48,8 @@ const UART_KIND_GENI: u8 = 2;
 /// GIC distributor base/size bound from the live tree (0 when absent).
 static GIC_BASE: AtomicU64 = AtomicU64::new(0);
 static GIC_SIZE: AtomicU64 = AtomicU64::new(0);
+/// Timer PPI INTID bound from the tree (0 = not published).
+static TIMER_INTID: AtomicU32 = AtomicU32::new(0);
 /// GICv2 CPU interface base/size. It is *not* at a fixed offset from the
 /// distributor on real controllers, so it is bound separately.
 static GIC_CPU_BASE: AtomicU64 = AtomicU64::new(0);
@@ -107,6 +109,12 @@ pub fn init(dtb: Option<&[u8]>) {
         if uart.base == UART_BASE.load(Ordering::Acquire) {
             UART_CLK.store(uart.clock.unwrap_or(0), Ordering::Release);
         }
+    }
+
+    // The timer PPI is named by the `arm,armv8-timer` node; without it the
+    // controller keeps its platform default.
+    if let Some(intid) = tree.timer_irq() {
+        TIMER_INTID.store(intid, Ordering::Release);
     }
 
     // The interrupt controller is a device like any other: if the tree
@@ -193,6 +201,12 @@ pub fn gic_range() -> Option<Range> {
         Kind::Qemu => Some(QEMU_GIC),
         _ => None,
     }
+}
+
+/// Timer INTID the tree names, if any.
+pub fn timer_intid() -> Option<u32> {
+    let intid = TIMER_INTID.load(Ordering::Acquire);
+    (intid != 0).then_some(intid)
 }
 
 /// Whether the interrupt controller came from the live device tree (as
