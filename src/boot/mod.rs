@@ -222,3 +222,7 @@ pub fn get() -> Option<BootParams> {
     let params = unsafe { core::ptr::read(core::ptr::addr_of!(BOOT_PARAMS)) };
     (params.magic == BOOT_MAGIC).then_some(params)
 }
+
+/// Boot-time assembly: entry stub and exception vectors.
+#[cfg(target_arch = "aarch64")]
+mod asm;

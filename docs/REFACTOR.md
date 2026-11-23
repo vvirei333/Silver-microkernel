@@ -28,6 +28,7 @@ is its own commit so a regression can be bisected to a move.
 | Step | Result |
 |---|---|
 | `src/scheduler.rs` → module directory | `scheduler/mod.rs` + `scheduler/selftest.rs` (849 lines). Moved the 11 `run_*` boot probes, their probe task entries and the churn stress state; re-exported so callers are untouched. |
+| `main.rs` → `boot/asm.rs` | The 1 243 lines of `global_asm!` (entry stub, exception vectors, assembler macros) moved out of `main.rs` into `boot/asm.rs`; `main.rs` 1 912 → 669 lines. The `sym`/`const` operands were already crate-absolute, so the generated image is unchanged: same boot log, same self-tests. |
 | `scheduler/switch.rs` | `start`, `schedule_released`, `schedule`, plus the ready-queue engine (`ready_for_queue`, `enqueue_ready`, `dequeue_ready`, `pop_best`, `rebuild_ready_queues`, `cpu_is_idle`, `push_migrate*`, `find_next_task`) — 553 moved lines. `mod.rs` 4 945 → 4 398. Queue helpers are `pub(super)`; `spawn` imports `enqueue_ready` from the sibling module explicitly. Verified: 244 tests, smoke 8/8, `smp-selftest` 10/10 on `-smp 4`. |
 | `scheduler/task.rs` | `Task`, `TaskState`, `TaskContext`, `TaskInfo`, `Personality`, `MmapRegion`, `SharedMapping` and the whole `impl Task` block (`brk`/`mmap`/region bookkeeping, ~1 730 lines) — 1 966 moved lines. `mod.rs` 7 939 → 5 975. Fields the parent still reads are `pub(super)`; nothing left the module. Verified: 229 tests, smoke 8/8, `smp-selftest` 9/9, `bench` unchanged (yield 6.0 µs, SFS open 21.6 µs). |
 | `scheduler/spawn.rs` | Task creation: `spawn_kernel`, `spawn_idle`, `spawn_user*`, `spawn_elf*`, `spawn_linux_elf_with_args`, `spawn_thread`, `spawn_elf_task`, `spawn_inner`, `initial_self_rights` — 571 moved lines. `mod.rs` 5 510 → 4 945. Boot-only helpers became `pub(super)`; the entry points other subsystems call are `pub` and re-exported. `current_task_pid` stayed (fork/exec uses it too). Verified: 240 tests, smoke 8/8, `smp-selftest` 10/10 on `-smp 4`, health 0 zombie. |
@@ -37,7 +38,7 @@ is its own commit so a regression can be bisected to a move.
 
 | # | Step | Target | Why this order |
 |---|---|---|---|
-| 1 | `main.rs` → `boot/` | boot milestones into `boot/console.rs` / `boot/mem.rs` / `boot/selftest.rs` | Boot order is linear; split by milestone group, not by line count |
+| 1 | `boot/` (Rust side, remaining) | `kernel_main`'s milestone groups into `boot/console.rs` / `boot/mem.rs` / `boot/drivers.rs` / `boot/selftest.rs`; the asm is already out | Boot order is linear; split by milestone group, not by line count |
 | 2 | `silvershell.rs` → `shell/` | `shell/commands.rs`, `shell/files.rs`, `shell/net.rs`, `shell/proc.rs`, `shell/bench.rs`, keeping `_start`/loop in the bin | The shell is the console product's front door; splitting it makes command work reviewable |
 | 3 | `linux_abi.rs` → `linux_abi/` | `dispatch.rs`, `process.rs`, `memory.rs`, `fs.rs`, `ipc.rs` | Largest remaining file after the scheduler; the ABI groups are already visible in the dispatch table |
 
