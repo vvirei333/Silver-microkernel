@@ -99,6 +99,12 @@ pub struct UartNode {
     pub kind: UartKind,
     /// INTID from the node's `interrupts` property (SPI 32 + n, PPI 16 + n).
     pub irq: Option<u32>,
+    /// `clock-frequency` in Hz, when the node publishes it.
+    ///
+    /// A UART's baud divisor is a function of its reference clock, so a board
+    /// whose UART runs at 48 MHz needs a different divisor from one at 24 MHz.
+    /// Reading it here is what keeps `pl011` from assuming QEMU's clock.
+    pub clock: Option<u32>,
 }
 
 /// A driver bindable from the live tree. The kernel's driver table maps this
@@ -803,6 +809,7 @@ struct UartFinder {
     current_base: Option<u64>,
     current_kind: Option<UartKind>,
     current_irq: Option<u32>,
+    current_clock: Option<u32>,
     current_is_uart: bool,
     current_debug: bool,
     current_disabled: bool,
@@ -814,6 +821,7 @@ impl<'a> Visitor<'a> for UartFinder {
         self.current_base = unit_address(name);
         self.current_kind = None;
         self.current_irq = None;
+        self.current_clock = None;
         self.current_is_uart = false;
         self.current_debug = false;
         self.current_disabled = false;
@@ -860,6 +868,22 @@ impl<'a> Visitor<'a> for UartFinder {
                     }
                 }
             }
+            // A UART names its reference clock in one of two ways on the node
+            // itself: `clock-frequency` (fixed-clock style, common in vendor
+            // trees) or the first entry of `assigned-clock-rates`. A board that
+            // names its clock only by phandle (`clocks = <&clk_uart>`) needs
+            // phandle resolution, which this parser does not do yet — the
+            // driver then keeps its documented default rather than guessing.
+            "clock-frequency" | "assigned-clock-rates" if self.current_clock.is_none() => {
+                // Plausibility bound only: a UART reference clock outside
+                // 1 MHz..1 GHz cannot produce a sane divisor, and a wild value
+                // must not become a garbage register write.
+                if let Some(hz) = read_be32(value, 0) {
+                    if (1_000_000..=1_000_000_000).contains(&hz) {
+                        self.current_clock = Some(hz);
+                    }
+                }
+            }
             "status" => {
                 if let Some(text) = first_string(value) {
                     if text == "disabled" {
@@ -886,6 +910,7 @@ impl<'a> Visitor<'a> for UartFinder {
             debug: self.current_debug,
             kind,
             irq: self.current_irq.take(),
+            clock: self.current_clock.take(),
         };
         match self.best {
             None => self.best = Some(candidate),
@@ -1861,6 +1886,72 @@ mod tests {
         let uart = fdt.find_uart().unwrap();
         assert_eq!(uart.base, 0x0900_0000);
         assert_eq!(uart.kind, UartKind::Pl011);
+    }
+
+    #[test]
+    fn uart_reference_clock_is_read_from_the_node() {
+        // A UART's baud divisor depends on its reference clock: QEMU's PL011
+        // runs at 24 MHz, a Pi 5 debug UART at 48 MHz. Reading it from the tree
+        // is what removes the last hardcoded number from the console path.
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.prop_u32("#address-cells", 1);
+        dtb.prop_u32("#size-cells", 1);
+        dtb.begin("serial@9000000");
+        dtb.prop_str("compatible", "arm,pl011");
+        dtb.prop_reg1("reg", 0x0900_0000, 0x1000);
+        dtb.prop_u32("clock-frequency", 48_000_000);
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let uart = Fdt::new(&blob).unwrap().find_uart().unwrap();
+        assert_eq!(uart.clock, Some(48_000_000));
+    }
+
+    #[test]
+    fn assigned_clock_rates_is_accepted_as_the_reference_clock() {
+        // `assigned-clock-rates` is the other spelling used on the node itself
+        // (first cell wins). Boards that name a phandle instead are documented
+        // as unsupported, not silently guessed.
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.prop_u32("#address-cells", 1);
+        dtb.prop_u32("#size-cells", 1);
+        dtb.begin("serial@9000000");
+        dtb.prop_str("compatible", "arm,pl011");
+        dtb.prop_reg1("reg", 0x0900_0000, 0x1000);
+        dtb.prop_u32_array("assigned-clock-rates", &[48_000_000, 24_000_000]);
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let uart = Fdt::new(&blob).unwrap().find_uart().unwrap();
+        assert_eq!(uart.clock, Some(48_000_000));
+    }
+
+    #[test]
+    fn a_node_without_a_reference_clock_leaves_it_unset() {
+        // No `clock-frequency` means "the driver's default", not zero: a zero
+        // divisor would program the UART into an unusable state.
+        let blob = sample_dtb().build();
+        let uart = Fdt::new(&blob).unwrap().find_uart().unwrap();
+        assert_eq!(uart.clock, None);
+    }
+
+    #[test]
+    fn an_implausible_reference_clock_is_ignored() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.prop_u32("#address-cells", 1);
+        dtb.prop_u32("#size-cells", 1);
+        dtb.begin("serial@9000000");
+        dtb.prop_str("compatible", "arm,pl011");
+        dtb.prop_reg1("reg", 0x0900_0000, 0x1000);
+        dtb.prop_u32("clock-frequency", 0);
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let uart = Fdt::new(&blob).unwrap().find_uart().unwrap();
+        assert_eq!(uart.clock, None);
     }
 
     #[test]

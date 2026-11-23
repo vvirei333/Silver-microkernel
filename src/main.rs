@@ -1568,6 +1568,10 @@ pub extern "C" fn kernel_main() -> ! {
             console::write_str(" irq=");
             console::write_dec_u64(u64::from(intid));
         }
+        if let Some(hz) = crate::driver_resources::uart_clock() {
+            console::write_str(" clk=");
+            console::write_dec_u64(u64::from(hz));
+        }
         console::write_str("\r\n");
     }
 

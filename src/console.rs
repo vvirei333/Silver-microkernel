@@ -130,7 +130,14 @@ pub fn init() {
             if base == 0 {
                 base = crate::driver_resources::uart_range().map_or(0, |range| range.base);
             }
-            crate::pl011::init_at(base);
+            // A reference clock from the tree replaces the documented default;
+            // the baud divisor is then correct for this machine's UART.
+            match crate::driver_resources::uart_clock() {
+                Some(hz) => crate::pl011::init_at_clock(base, hz),
+                None => {
+                    crate::pl011::init_at(base);
+                }
+            }
         }
         Active::Geni => {
             let base = match platform::detect() {

@@ -37,6 +37,10 @@ static UART_SIZE: AtomicU64 = AtomicU64::new(0);
 static UART_IRQ: AtomicU32 = AtomicU32::new(0);
 /// Which driver the bound UART node needs: 1 = PL011, 2 = GENI.
 static UART_KIND: AtomicU8 = AtomicU8::new(0);
+/// The UART's reference clock in Hz from the tree (0 = not published). The
+/// baud divisor is a function of it, so a board whose node names 48 MHz must
+/// not be programmed with QEMU's 24 MHz constants.
+static UART_CLK: AtomicU32 = AtomicU32::new(0);
 
 const UART_KIND_PL011: u8 = 1;
 const UART_KIND_GENI: u8 = 2;
@@ -93,6 +97,14 @@ pub fn init(dtb: Option<&[u8]>) {
             UART_IRQ.store(irq, Ordering::Release);
         }
     }
+    // The reference clock belongs to the same node, so take it from the same
+    // lookup; only trust it when it describes the UART we actually bound.
+    if let Some(uart) = tree.find_uart() {
+        if uart.base == UART_BASE.load(Ordering::Acquire) {
+            UART_CLK.store(uart.clock.unwrap_or(0), Ordering::Release);
+        }
+    }
+
     // The interrupt controller is a device like any other: if the tree
     // describes one, that is the range drivers may be granted.
     if let Some(gic) = tree.gic() {
@@ -124,6 +136,13 @@ pub fn dtb_uart_node() -> Option<(DriverKind, Range, Option<u32>)> {
 /// UART this kernel can drive.
 pub fn uart_range() -> Option<Range> {
     dtb_uart_range().or_else(default_uart_range)
+}
+
+/// The console UART's reference clock in Hz, from the tree when the node
+/// publishes one. `None` means the driver should use its documented default.
+pub fn uart_clock() -> Option<u32> {
+    let hz = UART_CLK.load(Ordering::Acquire);
+    (hz != 0).then_some(hz)
 }
 
 /// The console UART INTID, from the tree when it names one.

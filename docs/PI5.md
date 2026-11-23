@@ -16,7 +16,7 @@ the same plan applies one step earlier in the SoC family.
 |---|---|---|
 | CPU | 4× Cortex-A76, AArch64, EL2 → EL1 handoff from firmware | known |
 | Boot | EEPROM bootloader → `config.txt`/`cmdline.txt` → arm64 kernel image or `armstub8`; the load address and entry contract come from the firmware, not from us | known shape, exact address to verify |
-| Console | PL011 debug UART (uart10 on a Pi 5) at 115200 8N1 on the header | known shape, base to be read from the DTB |
+| Console | PL011 debug UART (uart10 on a Pi 5) at 115200 8N1 on the header | known shape; base, INTID and reference clock are read from the node (note: the Pi tree names its clock by phandle, which the parser does not resolve yet — see below) |
 | Interrupts | GIC-400, ARM generic timer PPI | known shape, bases to be read from the DTB |
 | Secondary cores / power | PSCI via firmware | expected, to be confirmed |
 | Storage | most I/O on Pi 5 sits behind the **RP1 southbridge over PCIe**; the SD/eMMC path must be confirmed from the live DTB (`lspci` on a running Linux shows the RP1) | **unknown — the main risk** |
@@ -34,7 +34,7 @@ Two rules follow from the right-hand column:
 
 | # | Milestone | Acceptance | Blocking work |
 |---|---|---|---|
-| P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base passed in from the DTB~~ (done and verified under QEMU's Image boot), linker base for the board, entry/placement contract of the Pi firmware, UART clock for the baud divisor |
+| P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base and reference clock from the DTB~~ (done, both verified under QEMU's Image boot), linker base for the board, entry/placement contract of the Pi firmware |
 | P1 | Interrupts and time | timer tick, GIC init, `health`/`uptime` advancing, no fault | GIC-400 base from the DTB, timer PPI selection, PSCI SMP bring-up |
 | P2 | Console userspace from RAM | `howl>` prompt and `help` **with no storage at all** (SFS image embedded or seeded into RamFs) | embedding a minimal SFS into the kernel image, platform-independent VFS init |
 | P3 | Root filesystem on the board | `ls /sfs` reads the real image; `cat`, `spawn`, `bench fs` work | storage path: RP1/PCIe + SD, or USB mass storage — whichever the DTB shows |
@@ -73,6 +73,24 @@ same boot reaches `howl>`, runs `health` (0 zombie, 0 open, 0 leaked DMA) and
 `bench fs` (SFS open+close ~19-23 µs), so the tree-first path is a working
 console, not a special diagnostic mode.
 
+### The baud divisor follows the node's clock
+
+The UART's divisor is a function of its reference clock, so `pl011` no longer
+hardcodes QEMU's 24 MHz. `fdt` reads `clock-frequency` (or the first
+`assigned-clock-rates` cell) from the console node within a plausibility range,
+`driver_resources` stores it, and the console calls `init_at_clock`. Booting a
+tree that declares 48 MHz prints it back:
+
+```
+DRIVER UART=DT base=0x0000000009000000 size=0x0000000000001000 irq=33 clk=48000000
+```
+
+**Known gap, stated rather than hidden:** the Raspberry Pi device trees name the
+UART clock by phandle (`clocks = <&clk_uart>`), whose rate lives on the
+referenced fixed-clock node. This parser does not resolve phandles yet, so on a
+Pi the driver would fall back to the documented default until that lands (or
+until the firmware/`config.txt` sets the UART clock to the assumed value).
+
 ## What a board owner can do today
 
 The most useful contributions are *data from real hardware*, not patches:
@@ -100,6 +118,7 @@ The most useful contributions are *data from real hardware*, not patches:
 
 | Date | Change | Evidence |
 |---|---|---|
+| 2026-11-23 | Baud divisor from the device tree: `fdt` parses `clock-frequency`/`assigned-clock-rates` on the console node (bounded to 1 MHz..1 GHz, so a wild value cannot become a register write), `driver_resources` stores it, `pl011::init_at_clock` uses it. Verified by booting a tree that declares 48 MHz: the log line carries `clk=48000000` and the console still runs. Phandle-only clocks remain unresolved (documented above). | 4 new `fdt` tests (read, `assigned-clock-rates`, unset, implausible); 244 host tests total; smoke 8/8 |
 | 2026-11-23 | Tree-first console verified end to end: `scripts/make_image.py` turns the ELF into an AArch64 Image with a correct `text_offset`; booting it with `-dtb` prints `DRIVER UART=DT base=0x9000000 ... irq=33`, then serves `howl>`/`health`/`bench fs`. **Correction:** an earlier note here claimed the generic boot stub does not record `x0`; that was wrong — it does (`str x22, [x3, #0x28]` in the common publish block). QEMU's *ELF* load path passes no tree, which is why the ELF boot shows no `DT` line. | raw-Image boot log above; bench 19.2-23.2 µs open+close on both paths (same code), `-smp 4` self-tests unchanged |
 | 2026-11-23 | The console decision is now pure, tested policy: `choose_console(described, builtin)` in `src/devices.rs` — tree wins, built-in map is only a fallback, nothing described means silence. `fdt` moved from being compiled twice into a single library module the binary re-exports, so the parser the tests cover is the parser the kernel runs. | 240 host tests (4 policy tests: "the tree wins over the built-in map", "a tree alone is enough", "the built-in map is only a fallback", "nothing described means no console") |
 | 2026-11-23 | Devices are chosen from the tree before the board: `driver_resources` is the one device map, `console::active()` asks it first, and `pl011` is now address-agnostic (`init_at(base)`, divisor from a UART clock). `mmio_range`/`irq` no longer branch on a board name — a console driver gets the UART, a probe gets the GIC, whoever they are. | 236 host tests; all six `secprobe` cases `ok` (incl. `irq_orphan`, `mmio_range_confine`); release smoke 8/8; `no_std`, `linux-abi`, `fog`, `tablet` builds |

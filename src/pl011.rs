@@ -25,9 +25,10 @@ const ICR: usize = 0x44;
 
 /// UART reference clock assumed by [`init_at`], in Hz.
 ///
-/// 24 MHz is what QEMU `virt` uses. A board whose UART clock differs needs
-/// `clock-frequency` from its node (see `docs/PI5.md`, P0) — the divisor below
-/// is only correct for the clock it is told about.
+/// 24 MHz is what QEMU `virt` uses. When the device tree publishes the clock
+/// (`clock-frequency` or the first `assigned-clock-rates` cell, resolved by
+/// `driver_resources`), the console passes it to [`init_at_clock`] instead, so
+/// the divisor is correct for that machine's UART rather than for QEMU's.
 pub const DEFAULT_UART_CLK: u32 = 24_000_000;
 
 pub fn physical_base() -> u64 {
