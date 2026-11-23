@@ -2,6 +2,11 @@ use std::{env, fs, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo:rerun-if-changed=userspace");
+    // One source of truth for the release version: Cargo.toml. Modules use
+    // `env!("SILVER_VERSION")`, and the userspace sub-build receives the same
+    // value, so the kernel banner, `uname` and `utsname` can never disagree.
+    let version = env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
+    println!("cargo:rustc-env=SILVER_VERSION={version}");
     println!("cargo:rerun-if-changed=logo.txt");
     if env::var_os("CARGO_FEATURE_NO_STD").is_none() {
         return;
@@ -46,6 +51,7 @@ fn main() {
     // userspace/.cargo/config.toml, and an inherited CARGO_ENCODED_RUSTFLAGS
     // would override it and link the user binaries at the wrong address.
     command
+        .env("SILVER_VERSION", &version)
         .env_remove("RUSTFLAGS")
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .current_dir(root.join("userspace"))

@@ -70,7 +70,14 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
   heap allocation, bounded exponential restart backoff, dependency-aware pair
   restarts (net driver/server, shell/input), and zombie reaping. The shell
   exposes `svc restart <name>` for controlled restarts.
-- Fastfetch-style boot banner, kernel/userspace version **0.1.2**.
+- Fastfetch-style boot banner; the version (**1.0.3**) comes from
+  `Cargo.toml` through `build.rs`, so the banner, `uname` and the Linux
+  `utsname` cannot drift apart.
+- ConsoleOS release bundle: `scripts/make_release.sh` builds the kernel +
+  image, writes `MANIFEST`/`SHA256SUMS`, produces a tarball, and
+  `scripts/release_smoke.py` boots the *packaged* artifacts as a gate
+  (banner, `uname` version, `ls`/`cat` over SFS, a native utility, a Linux
+  ELF, `bench`, `health`). Install guide: [INSTALL.md](INSTALL.md).
 - `bench` in the shell: cycle-accurate fast-path timings for the syscall trap,
   scheduler yield, the SFS and RamFs open paths, anonymous page faults and a
   raw copy baseline. EL0 reads `CNTPCT_EL0` directly (the kernel unmasks it per
@@ -305,6 +312,10 @@ Host-side: `cargo test --lib` → **229 tests**. Feature builds: `no_std`,
 `no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,smp-selftest`; the
 `--no-linux` build is clean (the switch is also a regression test for Linux
 code leaking into the kernel).
+
+**Release 1.0.3 gate (2026-11-23): `scripts/release_smoke.py` 8/8 green on the
+packaged artifacts** (`uname` reports 1.0.3, SFS read, native utility, Linux
+ELF exit 42, `bench`, `health` 0 zombie / 0 open / 0 DMA leaks).
 
 **Release 0.1.2 matrix run (2026-11-15): 26/26 green**, including
 `health` → `zombie 0 / open 0 / leaked 0`. Two stale pieces found and fixed

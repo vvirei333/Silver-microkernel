@@ -89,6 +89,13 @@ fn build_engine(root: &Path, out: &Path, toolchain: &Path) {
 }
 
 fn main() {
+    // The kernel passes `SILVER_VERSION` down so a user binary reports the same
+    // release as the kernel it was embedded into; a standalone userspace build
+    // falls back to this crate's own version.
+    println!("cargo:rerun-if-env-changed=SILVER_VERSION");
+    let version = env::var("SILVER_VERSION")
+        .unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string());
+    println!("cargo:rustc-env=SILVER_VERSION={version}");
     println!("cargo:rerun-if-changed=linker.ld");
     println!("cargo:rerun-if-changed=linker_tablet.ld");
     // The user image base must match the kernel's `elf::USER_IMAGE_VA` for the

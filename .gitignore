@@ -17,3 +17,6 @@ redmi10c_poc/out/
 
 # Python bytecode from the image injection helper.
 __pycache__/
+
+# Release bundles (scripts/make_release.sh)
+dist/

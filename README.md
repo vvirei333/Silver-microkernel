@@ -24,6 +24,7 @@ frame by frame.
 
 | Document | Contents |
 |---|---|
+| [docs/INSTALL.md](docs/INSTALL.md) | Install and quickstart: QEMU today, board status and port checklist |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture, layers, boot chain |
 | [docs/KERNEL.md](docs/KERNEL.md) | Silver microkernel internals (memory, scheduler, IPC, drivers) |
 | [docs/USERSPACE.md](docs/USERSPACE.md) | Native userspace: silverd, Howl, net_server, toolbox |

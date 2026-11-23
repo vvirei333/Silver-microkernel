@@ -22,6 +22,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 KERNEL = ROOT / "target/aarch64-unknown-none/release/silver_microkernel"
 SERIAL = "/tmp/werewolf-matrix.serial"
+RELEASE_VERSION = re.search(
+    r'^version = "(.+)"$', (ROOT / "Cargo.toml").read_text(), re.MULTILINE
+).group(1)
 
 CASES = [
     ("linuxrun /sfs/linux-hello", b"hello from linux abi"),
@@ -50,7 +53,9 @@ CASES = [
     ("linuxrun /sfs/linux-wlreal", b"libwayland 2 clients ok"),
     ("linuxrun /sfs/linux-wlinfo", b"wayland-info ok"),
     ("linuxrun /sfs/linux-dbus", b"dbus ok"),
-    ("uname", b"v0.1.2"),
+    # The version comes from Cargo.toml, so a release bump cannot leave this
+    # matrix checking a stale string.
+    ("uname", f"v{RELEASE_VERSION}".encode()),
     ("health", b"zombie 0"),
 ]
 

@@ -3094,7 +3094,7 @@ fn linux_uname(buffer: u64) -> u64 {
     let fields: [&[u8]; 6] = [
         b"Linux",
         b"werewolf",
-        b"0.1.2",
+        silver_microkernel::VERSION.as_bytes(),
         b"#1 SMP",
         b"aarch64",
         b"(none)",

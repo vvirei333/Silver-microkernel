@@ -32,6 +32,12 @@ pub mod watchdog_policy;
 
 use alloc::vec::Vec;
 
+/// Release version, taken from `Cargo.toml` at build time (`build.rs`).
+///
+/// The banner, `uname` and the Linux `utsname` all read this, so a release bump
+/// is one edit and they cannot drift apart.
+pub const VERSION: &str = env!("SILVER_VERSION");
+
 /// Version tag of the `SYS_SPAWN_ARGSV` argument block.
 pub const SPAWN_ARGS_VERSION: u32 = 1;
 /// Hard cap on `argc` and `envc`, independent of the byte cap.

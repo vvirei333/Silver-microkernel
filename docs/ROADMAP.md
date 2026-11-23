@@ -36,8 +36,18 @@ Numbers in [STATUS.md](STATUS.md).
 Done: `silverd` supervises its fixed five-service tree with bounded restart
 backoff, dependency-aware pair restarts and zombie reaping.
 
+Done (2026-11-23, release track 1.0.3): versioned release bundle
+(`scripts/make_release.sh` -> `MANIFEST` + `SHA256SUMS` + tarball), a release
+gate that boots the packaged artifacts (`scripts/release_smoke.py`), and
+[docs/INSTALL.md](../docs/INSTALL.md) with the QEMU quickstart plus an honest
+board status/port checklist (Raspberry Pi 4/5 are *not* supported: SD/eMMC,
+board platform + linker base, GIC-400/UART bases from the FDT and a firmware
+boot chain are missing). Persistence of SFS writes across a reboot is verified
+(write -> reboot -> read -> `scripts/sfs_fsck.py` clean), so the remaining
+filesystem gap is crash consistency, not persistence.
+
 Open: in-OS package manager (PLANNED), a configurable service registry beyond
-the fixed tree (PLANNED), real RamFs (PARTIALLY), persistent writable SFS
+the fixed tree (PLANNED), real RamFs (PARTIALLY), crash-consistent SFS writes
 (PLANNED).
 
 ## Phase 3 — Linux Compatibility — PARTIALLY IMPLEMENTED (active)
