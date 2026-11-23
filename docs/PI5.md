@@ -34,7 +34,7 @@ Two rules follow from the right-hand column:
 
 | # | Milestone | Acceptance | Blocking work |
 |---|---|---|---|
-| P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base passed in from the DTB~~ (done: the console asks the device map first), **capture x0 on the generic boot entry** (today only the fog stub records the DTB — measured: QEMU `-kernel ... -dtb` delivers `dtb_pa = 0` to this entry, so the tree-first path cannot be exercised on QEMU until the stub records x0 there), linker base, relocatable/per-firmware entry, UART clock for the baud divisor |
+| P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base passed in from the DTB~~ (done and verified under QEMU's Image boot), linker base for the board, entry/placement contract of the Pi firmware, UART clock for the baud divisor |
 | P1 | Interrupts and time | timer tick, GIC init, `health`/`uptime` advancing, no fault | GIC-400 base from the DTB, timer PPI selection, PSCI SMP bring-up |
 | P2 | Console userspace from RAM | `howl>` prompt and `help` **with no storage at all** (SFS image embedded or seeded into RamFs) | embedding a minimal SFS into the kernel image, platform-independent VFS init |
 | P3 | Root filesystem on the board | `ls /sfs` reads the real image; `cat`, `spawn`, `bench fs` work | storage path: RP1/PCIe + SD, or USB mass storage — whichever the DTB shows |
@@ -43,6 +43,35 @@ Two rules follow from the right-hand column:
 
 P2 is deliberately before P3: it proves the console product on real hardware
 without waiting for the storage stack, which is the riskiest part of the board.
+
+## The tree-first path is verified, not assumed
+
+Booting a flat Image (not an ELF) hands the kernel a real device tree, and the
+kernel binds the console from it:
+
+```bash
+python3 scripts/make_image.py                       # ELF -> dist/silver.img
+qemu-system-aarch64 -machine virt,dumpdtb=/tmp/virt.dtb -cpu cortex-a72 \
+  -smp 2 -m 1024M -display none                     # produce a tree
+qemu-system-aarch64 -machine virt -cpu cortex-a72 -smp 2 -m 1024M -display none \
+  -dtb /tmp/virt.dtb -kernel dist/silver.img \
+  -drive file=disk.img,format=raw,if=none,id=hd -device virtio-blk-pci,drive=hd \
+  -serial mon:stdio
+```
+
+boot log:
+
+```
+PLATFORM=QEMU
+DRIVER UART=DT base=0x0000000009000000 size=0x0000000000001000 irq=33
+```
+
+No address in that line came from the kernel: the UART base, its size and its
+INTID were read from the tree, the console transport was chosen by
+`choose_console`, and `pl011` was initialised with the base it was handed. The
+same boot reaches `howl>`, runs `health` (0 zombie, 0 open, 0 leaked DMA) and
+`bench fs` (SFS open+close ~19-23 µs), so the tree-first path is a working
+console, not a special diagnostic mode.
 
 ## What a board owner can do today
 
@@ -71,6 +100,7 @@ The most useful contributions are *data from real hardware*, not patches:
 
 | Date | Change | Evidence |
 |---|---|---|
+| 2026-11-23 | Tree-first console verified end to end: `scripts/make_image.py` turns the ELF into an AArch64 Image with a correct `text_offset`; booting it with `-dtb` prints `DRIVER UART=DT base=0x9000000 ... irq=33`, then serves `howl>`/`health`/`bench fs`. **Correction:** an earlier note here claimed the generic boot stub does not record `x0`; that was wrong — it does (`str x22, [x3, #0x28]` in the common publish block). QEMU's *ELF* load path passes no tree, which is why the ELF boot shows no `DT` line. | raw-Image boot log above; bench 19.2-23.2 µs open+close on both paths (same code), `-smp 4` self-tests unchanged |
 | 2026-11-23 | The console decision is now pure, tested policy: `choose_console(described, builtin)` in `src/devices.rs` — tree wins, built-in map is only a fallback, nothing described means silence. `fdt` moved from being compiled twice into a single library module the binary re-exports, so the parser the tests cover is the parser the kernel runs. | 240 host tests (4 policy tests: "the tree wins over the built-in map", "a tree alone is enough", "the built-in map is only a fallback", "nothing described means no console") |
 | 2026-11-23 | Devices are chosen from the tree before the board: `driver_resources` is the one device map, `console::active()` asks it first, and `pl011` is now address-agnostic (`init_at(base)`, divisor from a UART clock). `mmio_range`/`irq` no longer branch on a board name — a console driver gets the UART, a probe gets the GIC, whoever they are. | 236 host tests; all six `secprobe` cases `ok` (incl. `irq_orphan`, `mmio_range_confine`); release smoke 8/8; `no_std`, `linux-abi`, `fog`, `tablet` builds |
 | 2026-11-23 | `Kind::Bcm2712` exists and is proved from the DT root `compatible` (`brcm,bcm2712`, `raspberrypi,5-*`) by `kind_from_compatible` in `src/board.rs`; MIDR deliberately does not map Cortex-A76, so no board can be guessed from the CPU. `console.rs` maps BCM2712 to "no output" until the PL011 base is passed in. | 7 host tests (`cargo test --lib board`) including "Pi 4 is not claimed as a Pi 5" and "a substring is not a match"; QEMU boot unchanged (release smoke 8/8) |
