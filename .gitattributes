@@ -1,2 +1,10 @@
+# Line-ending policy.
+# The tree is normalized to LF in the index so Windows and Linux checkouts
+# produce the same diffs (the 42k-line phantom diff after a Windows session
+# was pure CRLF noise). Windows-only scripts keep CRLF so cmd.exe keeps
+# working; captured serial logs are byte-exact and must never be converted.
+* text=auto eol=lf
+*.bat text eol=crlf
+*.cmd text eol=crlf
 # The serial capture must keep its exact bytes (CRLF, ANSI escapes).
 assets/*.ansi -text
