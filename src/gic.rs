@@ -22,7 +22,7 @@
 //! from `wait_irq`, so the kernel wakes the task after masking.
 
 use core::ptr;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use crate::irq_policy::{self, MaskScope, UnmaskableAction};
 use crate::{console, exceptions, gicv3, memory, platform, scheduler, timer};
@@ -55,8 +55,28 @@ static UNMASKABLE_STREAK: AtomicU32 = AtomicU32::new(0);
 static UNKNOWN_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 const UNKNOWN_LOG_LIMIT: u32 = 4;
 
-const DISTRIBUTOR_BASE: usize = memory::phys_to_virt(0x0800_0000);
-const CPU_INTERFACE_BASE: usize = memory::phys_to_virt(0x0801_0000);
+/// Physical bases of the GICv2 the boot path bound.
+///
+/// Zero means "not bound": every accessor then does nothing, because writing
+/// an interrupt controller's registers at a guessed address can take the whole
+/// machine down. QEMU `virt` uses 0x0800_0000/0x0801_0000, but a board's
+/// distributor and CPU interface are not at a fixed offset from each other, so
+/// both come from the device tree (`driver_resources`).
+static DISTRIBUTOR_PA: AtomicU64 = AtomicU64::new(0);
+static CPU_INTERFACE_PA: AtomicU64 = AtomicU64::new(0);
+
+/// Physical base of the GIC distributor this boot uses (0 = unbound).
+pub fn distributor_base() -> u64 {
+    DISTRIBUTOR_PA.load(Ordering::Acquire)
+}
+
+fn dist() -> usize {
+    memory::phys_to_virt(DISTRIBUTOR_PA.load(Ordering::Relaxed) as usize)
+}
+
+fn cpu_iface() -> usize {
+    memory::phys_to_virt(CPU_INTERFACE_PA.load(Ordering::Relaxed) as usize)
+}
 
 const GICD_CTLR: usize = 0x000;
 const GICD_ISENABLER: usize = 0x100;
@@ -103,32 +123,51 @@ pub fn timer_available() -> bool {
     }
 }
 
+/// Binds the GICv2 the boot path found and programs the shared distributor.
+///
+/// Both bases are parameters: the distributor and the CPU interface are not at
+/// a fixed offset from each other on real controllers, so taking them from the
+/// device tree is what makes this driver portable. A zero base means the
+/// platform has no GICv2 this kernel can drive, and interrupts stay masked.
+pub fn init_at(distributor_pa: u64, cpu_interface_pa: u64) {
+    if platform::detect().uses_gicv3() {
+        gicv3::init();
+        return;
+    }
+    if distributor_pa == 0 || cpu_interface_pa == 0 {
+        return;
+    }
+    DISTRIBUTOR_PA.store(distributor_pa, Ordering::Release);
+    CPU_INTERFACE_PA.store(cpu_interface_pa, Ordering::Release);
+    init();
+}
+
 pub fn init() {
     if platform::detect().uses_gicv3() {
         gicv3::init();
         return;
     }
-    if platform::detect() == platform::Kind::Unknown {
+    if distributor_base() == 0 {
         // No proven interrupt controller: leave interrupts masked. The boot
         // path still reaches its diagnostic halt instead of writing to an
         // unverified distributor address.
         return;
     }
 
-    write32(DISTRIBUTOR_BASE + GICD_CTLR, 0);
+    write32(dist() + GICD_CTLR, 0);
 
     // The timer PPI is a banked interrupt (INTID < 32): its enable bit is
     // per-CPU, so it is enabled in `cpu_init`, not here.
     write8(
-        DISTRIBUTOR_BASE + GICD_IPRIORITYR + TIMER_IRQ as usize,
+        dist() + GICD_IPRIORITYR + TIMER_IRQ as usize,
         0xA0,
     );
 
     let config_offset = GICD_ICFGR + (TIMER_IRQ as usize / 16) * 4;
     let config_shift = (TIMER_IRQ as usize % 16) * 2;
     write32(
-        DISTRIBUTOR_BASE + config_offset,
-        read32(DISTRIBUTOR_BASE + config_offset) & !(0b11_u32 << config_shift),
+        dist() + config_offset,
+        read32(dist() + config_offset) & !(0b11_u32 << config_shift),
     );
 
     // UART RX is level-triggered and initially routed to CPU interface 0.
@@ -136,17 +175,17 @@ pub fn init() {
     let priority_offset = GICD_IPRIORITYR + (UART_IRQ as usize / 4) * 4;
     let priority_shift = (UART_IRQ as usize % 4) * 8;
     write32(
-        DISTRIBUTOR_BASE + priority_offset,
-        (read32(DISTRIBUTOR_BASE + priority_offset) & !(0xFF_u32 << priority_shift))
+        dist() + priority_offset,
+        (read32(dist() + priority_offset) & !(0xFF_u32 << priority_shift))
             | (0x80_u32 << priority_shift),
     );
     let target_offset = GICD_ITARGETSR + (UART_IRQ as usize / 4) * 4;
-    write32(DISTRIBUTOR_BASE + target_offset, 0x0101_0101);
+    write32(dist() + target_offset, 0x0101_0101);
     let config_offset = GICD_ICFGR + (UART_IRQ as usize / 16) * 4;
     let config_shift = (UART_IRQ as usize % 16) * 2;
     write32(
-        DISTRIBUTOR_BASE + config_offset,
-        read32(DISTRIBUTOR_BASE + config_offset) & !(0b11_u32 << config_shift),
+        dist() + config_offset,
+        read32(dist() + config_offset) & !(0b11_u32 << config_shift),
     );
     enable_irq(UART_IRQ);
 
@@ -156,10 +195,10 @@ pub fn init() {
     enable_irq(QUIESCE_IRQ);
     // BISECT: monolithic original ordering (timer enable before GICD/GICC enable)
     enable_irq(TIMER_IRQ);
-    write32(CPU_INTERFACE_BASE + GICC_PMR, 0xFF);
-    write32(CPU_INTERFACE_BASE + GICC_BPR, 0);
-    write32(DISTRIBUTOR_BASE + GICD_CTLR, 1);
-    write32(CPU_INTERFACE_BASE + GICC_CTLR, 1);
+    write32(cpu_iface() + GICC_PMR, 0xFF);
+    write32(cpu_iface() + GICC_BPR, 0);
+    write32(dist() + GICD_CTLR, 1);
+    write32(cpu_iface() + GICC_CTLR, 1);
 }
 
 /// Per-CPU interrupt controller setup: the banked SGI/PPI enables (INTIDs
@@ -176,14 +215,14 @@ pub fn cpu_init() -> bool {
     enable_irq(QUIESCE_IRQ);
     enable_irq(TIMER_IRQ);
 
-    write32(CPU_INTERFACE_BASE + GICC_PMR, 0xFF);
-    write32(CPU_INTERFACE_BASE + GICC_BPR, 0);
-    write32(CPU_INTERFACE_BASE + GICC_CTLR, 1);
+    write32(cpu_iface() + GICC_PMR, 0xFF);
+    write32(cpu_iface() + GICC_BPR, 0);
+    write32(cpu_iface() + GICC_CTLR, 1);
 
     // Banked SGI enables must read back on this PE before it is published:
     // an AP without SGI0/SGI1 cannot take part in rescheduling or quiescence.
     let expected = (1_u32 << RESCHEDULE_IRQ) | (1_u32 << QUIESCE_IRQ);
-    read32(DISTRIBUTOR_BASE + GICD_ISENABLER) & expected == expected
+    read32(dist() + GICD_ISENABLER) & expected == expected
 }
 
 /// P3 diagnostic: one coherent snapshot of the physical-timer PPI delivery
@@ -212,10 +251,10 @@ pub fn diag_timer_snapshot() {
         // GICv2: SGIs+PPIs are banked; ISPENDR0/ISENABLER0 hold the PPI
         // state of the calling PE.
         let ppi_bit = 1_u32 << (TIMER_IRQ % 32);
-        let pend = unsafe { ptr::read_volatile((DISTRIBUTOR_BASE + GICD_ISPENDR) as *const u32) };
-        let en = unsafe { ptr::read_volatile((DISTRIBUTOR_BASE + GICD_ISENABLER) as *const u32) };
-        let ctlr = unsafe { ptr::read_volatile((CPU_INTERFACE_BASE + GICC_CTLR) as *const u32) };
-        let pmr = unsafe { ptr::read_volatile((CPU_INTERFACE_BASE + GICC_PMR) as *const u32) };
+        let pend = unsafe { ptr::read_volatile((dist() + GICD_ISPENDR) as *const u32) };
+        let en = unsafe { ptr::read_volatile((dist() + GICD_ISENABLER) as *const u32) };
+        let ctlr = unsafe { ptr::read_volatile((cpu_iface() + GICC_CTLR) as *const u32) };
+        let pmr = unsafe { ptr::read_volatile((cpu_iface() + GICC_PMR) as *const u32) };
         crate::smp::DIAG_SNAP.store_volatile(2, pend & ppi_bit);
         crate::smp::DIAG_SNAP.store_volatile(3, en & ppi_bit);
         crate::smp::DIAG_SNAP.store_volatile(4, ctlr);
@@ -234,7 +273,7 @@ pub fn send_sgi_all_but_self(intid: u32) {
         return;
     }
     write32(
-        DISTRIBUTOR_BASE + GICD_SGIR,
+        dist() + GICD_SGIR,
         (0b01_u32 << 24) | (intid & 0x0F),
     );
 }
@@ -256,7 +295,7 @@ pub fn enable_irq(irq: u32) {
         return;
     }
     let offset = GICD_ISENABLER + (irq as usize / 32) * 4;
-    write32(DISTRIBUTOR_BASE + offset, 1_u32 << (irq % 32));
+    write32(dist() + offset, 1_u32 << (irq % 32));
 }
 
 pub fn disable_irq(irq: u32) {
@@ -265,7 +304,7 @@ pub fn disable_irq(irq: u32) {
         return;
     }
     let offset = GICD_ICENABLER + (irq as usize / 32) * 4;
-    write32(DISTRIBUTOR_BASE + offset, 1_u32 << (irq % 32));
+    write32(dist() + offset, 1_u32 << (irq % 32));
 }
 
 /// Masks one INTID in the register scope that owns it and confirms the
@@ -283,8 +322,8 @@ pub fn mask_irq(intid: u32) -> bool {
     // SGI/PPI enables are banked per CPU in word 0; SPIs live in the
     // distributor's shared words. Both use ISENABLER/ICENABLER at the same
     // offsets, but the write must go to the matching scope.
-    write32(DISTRIBUTOR_BASE + GICD_ICENABLER + offset, bit);
-    read32(DISTRIBUTOR_BASE + GICD_ISENABLER + offset) & bit == 0
+    write32(dist() + GICD_ICENABLER + offset, bit);
+    read32(dist() + GICD_ISENABLER + offset) & bit == 0
 }
 
 /// Diagnostic + bounded fallback for an unknown, unbound INTID.
@@ -335,7 +374,7 @@ pub fn acknowledge() -> u32 {
     if platform::detect().uses_gicv3() {
         return gicv3::acknowledge();
     }
-    read32(CPU_INTERFACE_BASE + GICC_IAR)
+    read32(cpu_iface() + GICC_IAR)
 }
 
 pub fn end_interrupt(acknowledge_register: u32) {
@@ -343,7 +382,7 @@ pub fn end_interrupt(acknowledge_register: u32) {
         gicv3::end_interrupt(acknowledge_register);
         return;
     }
-    write32(CPU_INTERFACE_BASE + GICC_EOIR, acknowledge_register);
+    write32(cpu_iface() + GICC_EOIR, acknowledge_register);
 }
 
 #[no_mangle]

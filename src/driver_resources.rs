@@ -48,6 +48,10 @@ const UART_KIND_GENI: u8 = 2;
 /// GIC distributor base/size bound from the live tree (0 when absent).
 static GIC_BASE: AtomicU64 = AtomicU64::new(0);
 static GIC_SIZE: AtomicU64 = AtomicU64::new(0);
+/// GICv2 CPU interface base/size. It is *not* at a fixed offset from the
+/// distributor on real controllers, so it is bound separately.
+static GIC_CPU_BASE: AtomicU64 = AtomicU64::new(0);
+static GIC_CPU_SIZE: AtomicU64 = AtomicU64::new(0);
 
 const MAX_MMIO_CLAIMS: usize = 16;
 
@@ -114,6 +118,10 @@ pub fn init(dtb: Option<&[u8]>) {
             crate::fdt::GicKind::V3 => 0x1_0000,
         };
         GIC_SIZE.store(size, Ordering::Release);
+        if gic.kind == crate::fdt::GicKind::V2 {
+            GIC_CPU_BASE.store(gic.second, Ordering::Release);
+            GIC_CPU_SIZE.store(gic.second_size, Ordering::Release);
+        }
     }
 }
 
@@ -158,16 +166,54 @@ pub fn uart_intid() -> Option<u32> {
     }
 }
 
-/// The GIC distributor range: the tree's description first, then the emulated
-/// machine's fixed map. A board without a tree gets nothing, which fails closed.
+/// The GIC range a driver may be granted: the tree's description first, then
+/// the emulated machine's fixed map. A board without a tree gets nothing, which
+/// fails closed.
+///
+/// GICv2 is described as two regions (distributor, CPU interface). A program
+/// that probes interrupts needs both, so the window spans from the lower base
+/// to the end of the upper one when they are adjacent-ish; otherwise the
+/// distributor is reported, which is what the classic QEMU layout needs.
 pub fn gic_range() -> Option<Range> {
     let base = GIC_BASE.load(Ordering::Acquire);
     let size = GIC_SIZE.load(Ordering::Acquire);
     if base != 0 && size != 0 {
+        let cpu = GIC_CPU_BASE.load(Ordering::Acquire);
+        let cpu_size = GIC_CPU_SIZE.load(Ordering::Acquire);
+        if cpu != 0 && cpu_size != 0 && cpu >= base {
+            let end = cpu.saturating_add(cpu_size);
+            return Some(Range {
+                base,
+                size: end.saturating_sub(base),
+            });
+        }
         return Some(Range { base, size });
     }
     match platform::detect() {
         Kind::Qemu => Some(QEMU_GIC),
+        _ => None,
+    }
+}
+
+/// Whether the interrupt controller came from the live device tree (as
+/// opposed to the built-in map). Diagnostics use this to show the port that
+/// the tree was actually the source.
+pub fn gic_bound_from_tree() -> bool {
+    GIC_BASE.load(Ordering::Acquire) != 0
+}
+
+/// Distributor and GICv2 CPU interface bases, ready for `gic::init_at`.
+///
+/// `None` means "let `gic::init` decide": either the machine uses a GICv3
+/// (system-register interface, handled by `gicv3`) or nothing has been bound.
+pub fn gic_bases() -> Option<(u64, u64)> {
+    let dist = GIC_BASE.load(Ordering::Acquire);
+    let cpu = GIC_CPU_BASE.load(Ordering::Acquire);
+    if dist != 0 && cpu != 0 {
+        return Some((dist, cpu));
+    }
+    match platform::detect() {
+        Kind::Qemu => Some((QEMU_GIC.base, QEMU_GIC.base + 0x1_0000)),
         _ => None,
     }
 }

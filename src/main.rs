@@ -1574,6 +1574,17 @@ pub extern "C" fn kernel_main() -> ! {
         }
         console::write_str("\r\n");
     }
+    // Evidence that the interrupt controller, like the console, came from the
+    // tree description rather than from a built-in table.
+    if crate::driver_resources::gic_bound_from_tree() {
+        if let Some((distributor, cpu_interface)) = crate::driver_resources::gic_bases() {
+            console::write_str("DRIVER GIC=DT dist=0x");
+            console::write_hex_u64(distributor);
+            console::write_str(" cpu=0x");
+            console::write_hex_u64(cpu_interface);
+            console::write_str("\r\n");
+        }
+    }
 
     #[cfg(feature = "fog")]
     {
@@ -1755,7 +1766,14 @@ pub extern "C" fn kernel_main() -> ! {
     // The tablet/fog path shares the QEMU boot sequence from here on: gic::init
     // dispatches to gicv3, and the timer PPI is selected per platform (INTID
     // 30 on SM8650, 18 on SM6225/khaje).
-    gic::init();
+    // The interrupt controller is bound from the same device map as the
+    // console: a GICv2 gets the distributor and CPU-interface bases the tree
+    // describes (they are not at a fixed offset from each other on real
+    // controllers), a GICv3 keeps its system-register path.
+    match crate::driver_resources::gic_bases() {
+        Some((distributor, cpu_interface)) => gic::init_at(distributor, cpu_interface),
+        None => gic::init(),
+    }
     timer::init();
     #[cfg(feature = "fog-auto-reset")]
     fog::arm_auto_reset(30);

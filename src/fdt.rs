@@ -423,8 +423,8 @@ impl<'a> Fdt<'a> {
         }
         let mut finder = ClockFinder {
             wanted: phandle,
-            current_phandle: None,
-            current_rate: None,
+            depth: 0,
+            nodes: [ClockState::default(); MAX_DEPTH],
             rate: None,
         };
         self.walk(&mut finder)?;
@@ -440,10 +440,8 @@ impl<'a> Fdt<'a> {
         let mut finder = DriverFinder {
             out,
             count: 0,
-            current_kind: None,
-            current_range: None,
-            current_irq: None,
-            current_disabled: false,
+            depth: 0,
+            nodes: [DriverState::default(); MAX_DEPTH],
         };
         let _ = self.walk(&mut finder);
         finder.count
@@ -838,46 +836,74 @@ impl<'a> Visitor<'a> for CpuCounter {
     fn end(&mut self, _path: &str) {}
 }
 
-#[derive(Default)]
+/// Per-node state of the UART visitor.
+///
+/// One entry per nesting level: a matching node may have children (a debug
+/// UART with a pinmux child, a GIC with a `v2m` frame), and a single shared
+/// state would let the child's `begin` erase the parent's properties before the
+/// parent's `end` ran. That was a real bug: the GIC on QEMU's own tree was
+/// discarded because its `v2m` child reset the captured range.
+#[derive(Clone, Copy, Default)]
+struct UartState {
+    base: Option<u64>,
+    kind: Option<UartKind>,
+    irq: Option<u32>,
+    clock: Option<u32>,
+    clock_phandle: Option<u32>,
+    is_uart: bool,
+    debug: bool,
+    disabled: bool,
+}
+
 struct UartFinder {
-    current_base: Option<u64>,
-    current_kind: Option<UartKind>,
-    current_irq: Option<u32>,
-    current_clock: Option<u32>,
-    current_clock_phandle: Option<u32>,
-    current_is_uart: bool,
-    current_debug: bool,
-    current_disabled: bool,
+    depth: usize,
+    nodes: [UartState; MAX_DEPTH],
     best: Option<UartNode>,
+}
+
+impl Default for UartFinder {
+    fn default() -> Self {
+        UartFinder {
+            depth: 0,
+            nodes: [UartState::default(); MAX_DEPTH],
+            best: None,
+        }
+    }
 }
 
 impl<'a> Visitor<'a> for UartFinder {
     fn begin(&mut self, _path: &str, name: &str) {
-        self.current_base = unit_address(name);
-        self.current_kind = None;
-        self.current_irq = None;
-        self.current_clock = None;
-        self.current_clock_phandle = None;
-        self.current_is_uart = false;
-        self.current_debug = false;
-        self.current_disabled = false;
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.nodes[self.depth] = UartState {
+            base: unit_address(name),
+            ..UartState::default()
+        };
+        self.depth += 1;
     }
 
     fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        let Some(state) = self.nodes.get_mut(index) else {
+            return;
+        };
         match name {
             "compatible" => {
                 let mut rest = value;
                 while let Some(text) = next_string(&mut rest) {
                     if text == "qcom,geni-debug-uart" {
-                        self.current_is_uart = true;
-                        self.current_debug = true;
-                        self.current_kind = Some(UartKind::Geni);
+                        state.is_uart = true;
+                        state.debug = true;
+                        state.kind = Some(UartKind::Geni);
                     } else if text == "qcom,geni-uart" {
-                        self.current_is_uart = true;
-                        self.current_kind = Some(UartKind::Geni);
+                        state.is_uart = true;
+                        state.kind = Some(UartKind::Geni);
                     } else if text == "arm,pl011" {
-                        self.current_is_uart = true;
-                        self.current_kind = Some(UartKind::Pl011);
+                        state.is_uart = true;
+                        state.kind = Some(UartKind::Pl011);
                     }
                 }
             }
@@ -885,50 +911,45 @@ impl<'a> Visitor<'a> for UartFinder {
                 // QEMU's PL011 uses `reg = <base size>` with 2/2 cells; the
                 // unit address is normally present too, but fall back to reg
                 // when it is not.
-                if self.current_base.is_none() {
-                    self.current_base = parse_primary_address(value);
+                if state.base.is_none() {
+                    state.base = parse_primary_address(value);
                 }
             }
             "interrupts" => {
                 if value.len() >= 12 && read_be32(value, 0) == Some(0) {
                     if let Some(number) = read_be32(value, 4) {
                         if number < 1024 {
-                            self.current_irq = Some(32 + number);
+                            state.irq = Some(32 + number);
                         }
                     }
                 } else if value.len() >= 12 && read_be32(value, 0) == Some(1) {
                     if let Some(number) = read_be32(value, 4) {
                         if number < 16 {
-                            self.current_irq = Some(16 + number);
+                            state.irq = Some(16 + number);
                         }
                     }
+                }
+            }
+            "clocks" if state.clock_phandle.is_none() => {
+                if let Some(phandle) = read_be32(value, 0) {
+                    state.clock_phandle = Some(phandle);
                 }
             }
             // A UART names its reference clock in one of three ways: directly
             // as `clock-frequency`, as the first `assigned-clock-rates` cell, or
             // by phandle (`clocks = <&clk_uart>`, the Raspberry Pi spelling)
             // which `find_uart` resolves with `clock_rate_of` after the walk.
-            // `clocks = <&provider index ...>`: the first cell is the
-            // provider's phandle. Recorded, then resolved by `find_uart`.
-            "clocks" if self.current_clock_phandle.is_none() => {
-                if let Some(phandle) = read_be32(value, 0) {
-                    self.current_clock_phandle = Some(phandle);
-                }
-            }
-            "clock-frequency" | "assigned-clock-rates" if self.current_clock.is_none() => {
-                // Plausibility bound only: a UART reference clock outside
-                // 1 MHz..1 GHz cannot produce a sane divisor, and a wild value
-                // must not become a garbage register write.
+            "clock-frequency" | "assigned-clock-rates" if state.clock.is_none() => {
                 if let Some(hz) = read_be32(value, 0) {
                     if (1_000_000..=1_000_000_000).contains(&hz) {
-                        self.current_clock = Some(hz);
+                        state.clock = Some(hz);
                     }
                 }
             }
             "status" => {
                 if let Some(text) = first_string(value) {
                     if text == "disabled" {
-                        self.current_disabled = true;
+                        state.disabled = true;
                     }
                 }
             }
@@ -937,22 +958,24 @@ impl<'a> Visitor<'a> for UartFinder {
     }
 
     fn end(&mut self, _path: &str) {
-        let Some(base) = self.current_base.take() else {
+        let Some(index) = self.depth.checked_sub(1) else {
             return;
         };
-        let Some(kind) = self.current_kind.take() else {
+        self.depth -= 1;
+        let state = self.nodes[index];
+        let (Some(base), Some(kind)) = (state.base, state.kind) else {
             return;
         };
-        if !self.current_is_uart || self.current_disabled || base == 0 {
+        if !state.is_uart || state.disabled || base == 0 {
             return;
         }
         let candidate = UartNode {
             base,
-            debug: self.current_debug,
+            debug: state.debug,
             kind,
-            irq: self.current_irq.take(),
-            clock: self.current_clock.take(),
-            clock_phandle: self.current_clock_phandle.take(),
+            irq: state.irq,
+            clock: state.clock,
+            clock_phandle: state.clock_phandle,
         };
         match self.best {
             None => self.best = Some(candidate),
@@ -962,31 +985,46 @@ impl<'a> Visitor<'a> for UartFinder {
     }
 }
 
-/// Finds the clock provider named by a `clocks` phandle and reads its rate.
+/// Per-node state of the clock-provider visitor (see [`UartState`]).
+#[derive(Clone, Copy, Default)]
+struct ClockState {
+    phandle: Option<u32>,
+    rate: Option<u32>,
+}
+
 struct ClockFinder {
     wanted: u32,
-    current_phandle: Option<u32>,
-    current_rate: Option<u32>,
+    depth: usize,
+    nodes: [ClockState; MAX_DEPTH],
     rate: Option<u32>,
 }
 
 impl<'a> Visitor<'a> for ClockFinder {
     fn begin(&mut self, _path: &str, _name: &str) {
-        self.current_phandle = None;
-        self.current_rate = None;
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.nodes[self.depth] = ClockState::default();
+        self.depth += 1;
     }
 
     fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        let Some(state) = self.nodes.get_mut(index) else {
+            return;
+        };
         match name {
             // Property order is not guaranteed: `clock-frequency` is often
             // written before `phandle`, so collect both and decide on `end`.
             "phandle" | "linux,phandle" => {
-                self.current_phandle = read_be32(value, 0);
+                state.phandle = read_be32(value, 0);
             }
             "clock-frequency" | "assigned-clock-rates" => {
                 if let Some(hz) = read_be32(value, 0) {
                     if (1_000_000..=1_000_000_000).contains(&hz) {
-                        self.current_rate = Some(hz);
+                        state.rate = Some(hz);
                     }
                 }
             }
@@ -995,58 +1033,85 @@ impl<'a> Visitor<'a> for ClockFinder {
     }
 
     fn end(&mut self, _path: &str) {
-        if self.rate.is_none() && self.current_phandle == Some(self.wanted) {
-            self.rate = self.current_rate.take();
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        self.depth -= 1;
+        let state = self.nodes[index];
+        if self.rate.is_none() && state.phandle == Some(self.wanted) {
+            self.rate = state.rate;
         }
-        self.current_phandle = None;
-        self.current_rate = None;
     }
 }
 
-#[derive(Default)]
-struct GicFinder {
-    current_kind: Option<GicKind>,
+/// Per-node state of the interrupt-controller visitor (see [`UartState`]).
+#[derive(Clone, Copy, Default)]
+struct GicState {
+    kind: Option<GicKind>,
     distributor: Option<u64>,
     second: Option<u64>,
     second_size: Option<u64>,
     stride: Option<u64>,
+}
+
+struct GicFinder {
+    depth: usize,
+    nodes: [GicState; MAX_DEPTH],
     best: Option<GicInfo>,
+}
+
+impl Default for GicFinder {
+    fn default() -> Self {
+        GicFinder {
+            depth: 0,
+            nodes: [GicState::default(); MAX_DEPTH],
+            best: None,
+        }
+    }
 }
 
 impl<'a> Visitor<'a> for GicFinder {
     fn begin(&mut self, _path: &str, _name: &str) {
-        self.current_kind = None;
-        self.distributor = None;
-        self.second = None;
-        self.second_size = None;
-        self.stride = None;
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.nodes[self.depth] = GicState::default();
+        self.depth += 1;
     }
 
     fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        let Some(state) = self.nodes.get_mut(index) else {
+            return;
+        };
         match name {
             "compatible" => {
                 let mut rest = value;
                 while let Some(text) = next_string(&mut rest) {
                     if text == "arm,gic-v3" {
-                        self.current_kind = Some(GicKind::V3);
+                        state.kind = Some(GicKind::V3);
                     } else if text == "arm,cortex-a15-gic" || text == "arm,gic-400" {
-                        self.current_kind = Some(GicKind::V2);
+                        state.kind = Some(GicKind::V2);
                     }
                 }
             }
+            // Property order is NOT guaranteed: `dtc` emits alphabetical
+            // order, which puts `reg` before `compatible`. Recording the range
+            // unconditionally and validating at node end is what makes a
+            // real-world tree parse.
             "reg" => {
-                if self.current_kind.is_some() {
-                    if let Some((distributor, _, second, second_size)) = parse_gic_reg(value) {
-                        self.distributor = Some(distributor);
-                        self.second = Some(second);
-                        self.second_size = Some(second_size);
-                    }
+                if let Some((distributor, _, second, second_size)) = parse_gic_reg(value) {
+                    state.distributor = Some(distributor);
+                    state.second = Some(second);
+                    state.second_size = Some(second_size);
                 }
             }
             "redistributor-stride" => {
                 if let Some(cells) = read_be32(value, 0) {
                     if cells != 0 {
-                        self.stride = Some(u64::from(cells));
+                        state.stride = Some(u64::from(cells));
                     }
                 }
             }
@@ -1055,17 +1120,25 @@ impl<'a> Visitor<'a> for GicFinder {
     }
 
     fn end(&mut self, _path: &str) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        self.depth -= 1;
+        let state = self.nodes[index];
         let (Some(kind), Some(distributor), Some(second)) =
-            (self.current_kind, self.distributor, self.second)
+            (state.kind, state.distributor, state.second)
         else {
             return;
         };
+        if distributor == 0 {
+            return;
+        }
         let info = GicInfo {
             kind,
             distributor,
             second,
-            second_size: self.second_size.unwrap_or(0),
-            stride: self.stride.unwrap_or(0x2_0000),
+            second_size: state.second_size.unwrap_or(0),
+            stride: state.stride.unwrap_or(0x2_0000),
         };
         if self.best.is_none() {
             self.best = Some(info);
@@ -1073,51 +1146,71 @@ impl<'a> Visitor<'a> for GicFinder {
     }
 }
 
+/// Per-node state of the driver-node visitor (see [`UartState`]).
+#[derive(Clone, Copy, Default)]
+struct DriverState {
+    kind: Option<DriverKind>,
+    range: Option<Region>,
+    irq: Option<u32>,
+    disabled: bool,
+}
+
 struct DriverFinder<'o> {
     out: &'o mut [DriverNode],
     count: usize,
-    current_kind: Option<DriverKind>,
-    current_range: Option<Region>,
-    current_irq: Option<u32>,
-    current_disabled: bool,
+    depth: usize,
+    nodes: [DriverState; MAX_DEPTH],
 }
 
 impl<'a, 'o> Visitor<'a> for DriverFinder<'o> {
     fn begin(&mut self, _path: &str, _name: &str) {
-        self.current_kind = None;
-        self.current_range = None;
-        self.current_irq = None;
-        self.current_disabled = false;
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.nodes[self.depth] = DriverState::default();
+        self.depth += 1;
     }
 
     fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        let Some(state) = self.nodes.get_mut(index) else {
+            return;
+        };
         match name {
             "compatible" => {
                 let mut rest = value;
                 while let Some(text) = next_string(&mut rest) {
                     if text == "arm,pl011" {
-                        self.current_kind = Some(DriverKind::Pl011);
+                        state.kind = Some(DriverKind::Pl011);
                     } else if text == "qcom,geni-uart" || text == "qcom,geni-debug-uart" {
-                        self.current_kind = Some(DriverKind::GeniUart);
+                        state.kind = Some(DriverKind::GeniUart);
                     }
                 }
             }
-            "reg" if self.current_range.is_none() => {
-                self.current_range = parse_reg_range(value);
+            "reg" if state.range.is_none() => {
+                state.range = parse_reg_range(value);
             }
-            "interrupts" if self.current_irq.is_none() && value.len() >= 12 => {
-                let kind = read_be32(value, 0);
-                let number = read_be32(value, 4);
-                self.current_irq = match (kind, number) {
-                    (Some(0), Some(number)) if number < 1024 => Some(32 + number),
-                    (Some(1), Some(number)) if number < 16 => Some(16 + number),
-                    _ => None,
-                };
+            "interrupts" => {
+                if value.len() >= 12 && read_be32(value, 0) == Some(0) {
+                    if let Some(number) = read_be32(value, 4) {
+                        if number < 1024 {
+                            state.irq = Some(32 + number);
+                        }
+                    }
+                } else if value.len() >= 12 && read_be32(value, 0) == Some(1) {
+                    if let Some(number) = read_be32(value, 4) {
+                        if number < 16 {
+                            state.irq = Some(16 + number);
+                        }
+                    }
+                }
             }
             "status" => {
                 if let Some(text) = first_string(value) {
                     if text == "disabled" {
-                        self.current_disabled = true;
+                        state.disabled = true;
                     }
                 }
             }
@@ -1126,19 +1219,22 @@ impl<'a, 'o> Visitor<'a> for DriverFinder<'o> {
     }
 
     fn end(&mut self, _path: &str) {
-        let (Some(kind), Some(mmio)) = (self.current_kind, self.current_range) else {
+        let Some(index) = self.depth.checked_sub(1) else {
             return;
         };
-        let irq = self.current_irq;
-        // Consume the node state: the parent's `end` must not push the same
-        // binding again with the child's range still in the finder.
-        self.current_kind = None;
-        self.current_range = None;
-        self.current_irq = None;
-        if self.current_disabled || self.count >= self.out.len() {
+        self.depth -= 1;
+        let state = self.nodes[index];
+        let (Some(kind), Some(mmio)) = (state.kind, state.range) else {
+            return;
+        };
+        if state.disabled || self.count >= self.out.len() {
             return;
         }
-        self.out[self.count] = DriverNode { kind, mmio, irq };
+        self.out[self.count] = DriverNode {
+            kind,
+            mmio,
+            irq: state.irq,
+        };
         self.count += 1;
     }
 }
@@ -1783,6 +1879,7 @@ mod tests {
 
     // --- parser tests -----------------------------------------------------
 
+
     #[test]
     fn header_and_identity_are_parsed() {
         let blob = sample_dtb().build();
@@ -1969,6 +2066,54 @@ mod tests {
         let uart = fdt.find_uart().unwrap();
         assert_eq!(uart.base, 0x0900_0000);
         assert_eq!(uart.kind, UartKind::Pl011);
+    }
+
+    #[test]
+    fn a_matching_node_with_a_child_is_still_found() {
+        // QEMU's GIC carries a `v2m` frame child, and real SoCs carry several
+        // children under interrupt controllers. A visitor with one shared state
+        // lost the parent's properties when the child's `begin` ran — the
+        // controller was silently ignored on a real tree (live bug).
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.prop_u32("#address-cells", 2);
+        dtb.prop_u32("#size-cells", 2);
+        dtb.begin("intc@8000000");
+        dtb.prop_str("compatible", "arm,cortex-a15-gic");
+        dtb.prop_two_reg2("reg", 0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000);
+        dtb.begin("v2m@8020000");
+        dtb.prop_reg2("reg", 0x0802_0000, 0x1000);
+        dtb.prop_str("compatible", "arm,gic-v2m-frame");
+        dtb.end();
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let gic = Fdt::new(&blob).unwrap().gic().expect("gic found");
+        assert_eq!(gic.distributor, 0x0800_0000);
+        assert_eq!(gic.second, 0x0801_0000);
+    }
+
+    #[test]
+    fn gic_is_found_when_reg_precedes_compatible() {
+        // `dtc` sorts properties, so `reg` normally comes before `compatible`.
+        // Parsing that order is the difference between taking interrupts from
+        // the tree and silently ignoring the controller (a live bug: QEMU's
+        // own tree is written this way).
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.prop_u32("#address-cells", 2);
+        dtb.prop_u32("#size-cells", 2);
+        dtb.begin("intc@8000000");
+        dtb.prop_two_reg2("reg", 0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000);
+        dtb.prop_str("compatible", "arm,cortex-a15-gic");
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let gic = Fdt::new(&blob).unwrap().gic().expect("gic found");
+        assert_eq!(gic.kind, GicKind::V2);
+        assert_eq!(gic.distributor, 0x0800_0000);
+        assert_eq!(gic.second, 0x0801_0000);
+        assert_eq!(gic.second_size, 0x1_0000);
     }
 
     #[test]
