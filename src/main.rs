@@ -40,7 +40,11 @@ mod elf_loader;
 #[cfg(not(feature = "std"))]
 mod exceptions;
 #[cfg(not(feature = "std"))]
-mod fdt;
+// `fdt` and `devices` are shared with the library instead of being compiled a
+// second time here: one implementation, one set of host tests, and the bin only
+// adds the hardware half. Both stay reachable as `crate::fdt` / `crate::devices`.
+pub use silver_microkernel::devices;
+pub use silver_microkernel::fdt;
 #[cfg(not(feature = "std"))]
 mod fog;
 #[cfg(not(feature = "std"))]

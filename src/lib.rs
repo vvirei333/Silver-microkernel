@@ -10,6 +10,7 @@ extern crate alloc;
 
 pub mod board;
 pub mod bundle;
+pub mod devices;
 pub mod bundle_sig;
 pub mod cache_policy;
 pub mod fdt;

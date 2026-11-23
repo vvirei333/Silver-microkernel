@@ -104,11 +104,10 @@ pub struct UartNode {
 /// A driver bindable from the live tree. The kernel's driver table maps this
 /// kind to the EL0 program that owns the node; the spawn path grants exactly
 /// this MMIO range and INTID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum DriverKind {
-    Pl011,
-    GeniUart,
-}
+///
+/// Defined in the shared library (`src/devices.rs`) so the "which driver serves
+/// which role" policy can be tested without a machine.
+pub use crate::devices::DriverKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DriverNode {

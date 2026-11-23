@@ -68,37 +68,52 @@ enum Active {
 }
 
 fn active() -> Active {
-    // A UART the live device tree describes wins over any per-machine default.
-    // This is the portable path: a new board becomes console-capable by being
-    // described, not by adding a match arm here. `pl011`/`geni_uart` take the
-    // base as a parameter, so no driver assumes an address.
-    if let Some((kind, range, _)) = crate::driver_resources::dtb_uart_node() {
-        return match kind {
-            crate::fdt::DriverKind::Pl011 => {
-                PL011_BASE.store(range.base, core::sync::atomic::Ordering::Release);
-                Active::Pl011
-            }
-            crate::fdt::DriverKind::GeniUart => Active::Geni,
-        };
-    }
+    use crate::devices::{choose_console, ConsoleTransport, DriverKind};
 
-    // No tree: fall back to the machine the CPU/identity proves we are on. A
-    // board without a tree has no console, which fails closed (silence) rather
-    // than writing to an unproven MMIO address.
-    match platform::detect() {
-        Kind::Qemu => Active::Pl011,
-        Kind::Sm8650 => Active::Geni,
-        Kind::Fog => {
-            let info = crate::fog::info();
-            match info.uart_kind {
-                UartKind::Geni => Active::Geni,
-                UartKind::Pl011 => {
-                    PL011_BASE.store(info.uart_pa, core::sync::atomic::Ordering::Release);
-                    Active::Pl011
-                }
-            }
+    // A UART the live device tree describes wins over any per-machine default:
+    // a new board becomes console-capable by being described, not by adding a
+    // match arm here. The base is taken from the same node, so no driver
+    // assumes an address.
+    let described = crate::driver_resources::dtb_uart_node();
+    let builtin = builtin_uart_kind();
+
+    match choose_console(described.map(|node| node.0), builtin) {
+        ConsoleTransport::Pl011 => {
+            let base = match described {
+                Some((_, range, _)) => range.base,
+                None => builtin_pl011_base(),
+            };
+            PL011_BASE.store(base, core::sync::atomic::Ordering::Release);
+            Active::Pl011
         }
-        Kind::Bcm2712 | Kind::Unknown => Active::None,
+        ConsoleTransport::Geni => Active::Geni,
+        ConsoleTransport::None => Active::None,
+    }
+}
+
+/// The UART the platform's built-in map offers when no tree was passed.
+fn builtin_uart_kind() -> Option<crate::devices::DriverKind> {
+    use crate::devices::DriverKind;
+    match platform::detect() {
+        Kind::Qemu => Some(DriverKind::Pl011),
+        Kind::Sm8650 => Some(DriverKind::GeniUart),
+        Kind::Fog => match crate::fog::info().uart_kind {
+            UartKind::Pl011 => Some(DriverKind::Pl011),
+            UartKind::Geni => Some(DriverKind::GeniUart),
+        },
+        // Fails closed: no tree and no built-in UART means silence, never an
+        // address copied from another machine.
+        Kind::Bcm2712 | Kind::Unknown => None,
+    }
+}
+
+/// Physical base for the built-in PL011 (no tree): the fog probe publishes it,
+/// everything else uses the platform's UART range.
+fn builtin_pl011_base() -> u64 {
+    if platform::detect() == Kind::Fog {
+        crate::fog::info().uart_pa
+    } else {
+        crate::driver_resources::uart_range().map_or(0, |range| range.base)
     }
 }
 
