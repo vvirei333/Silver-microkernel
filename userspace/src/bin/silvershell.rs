@@ -182,6 +182,9 @@ fn report_gui_press(label: &[u8]) {
 
 fn execute(command: &str) {
     let command = command.trim();
+    // Reap finished `spawn`/`bg` children before doing anything else, so `ps`
+    // and `health` reflect live tasks instead of accumulating dead records.
+    reap_unreaped();
     if command == "echo" {
         run_utility(syscall::PROGRAM_ECHO, "");
         return;
@@ -256,9 +259,10 @@ fn execute(command: &str) {
             syscall::print("  unwatch    Disarm the watchpoint\r\n");
             syscall::print("  du [path]  SFS inode/block usage of a subtree\r\n");
             syscall::print("  ps         List tasks and their states\r\n");
-            syscall::print("  spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|block_driver|sfs_server> [arg]\r\n");
-            syscall::print("  bg <program> [arg]\r\n");
-            syscall::print("             Spawn without console ownership\r\n");
+            syscall::print("  spawn <program> [arg|text]\r\n");
+            syscall::print("             Start a task and hand it the console\r\n");
+            syscall::print("  bg <program> [arg|text]\r\n");
+            syscall::print("             Start a task and keep the console\r\n");
             syscall::print("  secprobe <grant_foreign|dma_cross_read|mailbox_quota|dma_region_confine|irq_orphan>\r\n");
             syscall::print("             Native M2 capability/IPC regression (security suite)\r\n");
             syscall::print("  fg <cap>   Resume a task in the foreground\r\n");
@@ -312,7 +316,8 @@ fn execute(command: &str) {
         }
         Some("du") => show_usage(words.next()),
         Some("ps") => show_tasks(),
-        Some("spawn") | Some("bg") => spawn_program(words.next(), words.next()),
+        Some("spawn") => spawn_program(words.next(), words.next(), false),
+        Some("bg") => spawn_program(words.next(), words.next(), true),
         Some("secprobe") => secprobe_command(words.next()),
         Some("fg") => foreground_task(words.next()),
         Some("kill") => kill_task(words.next()),
@@ -1804,7 +1809,59 @@ fn secprobe_command(test: Option<&str>) {
     }
 }
 
-fn spawn_program(program: Option<&str>, argument: Option<&str>) {
+// ---------------------------------------------------------------------------
+// Reaping fire-and-forget spawns
+// ---------------------------------------------------------------------------
+
+/// Cap handles of `spawn`/`bg` children whose exit nobody waits for.
+///
+/// The kernel keeps an exited task as a zombie record until its parent reaps
+/// it (capped at 64, oldest statuses dropped), so eight `spawn` commands used to
+/// leave `health` reporting `zombie 8` and `ps` listing dead tasks. The shell
+/// now remembers the handles it did not wait for and reaps them here, without
+/// ever blocking: a task that is still alive is skipped.
+///
+/// `static mut` matches the rest of this single-threaded program (see
+/// `NET_WINDOW`); the shell runs on one task and nothing here is re-entered.
+const UNREAPED_CAPACITY: usize = 16;
+static mut UNREAPED: [(u64, u64); UNREAPED_CAPACITY] = [(0, 0); UNREAPED_CAPACITY];
+static mut UNREAPED_NEXT: usize = 0;
+
+fn remember_unreaped(cap_id: u64) {
+    let Some(task_id) = syscall::cap_get_task_id(cap_id) else {
+        return;
+    };
+    unsafe {
+        UNREAPED[UNREAPED_NEXT % UNREAPED_CAPACITY] = (cap_id, task_id);
+        UNREAPED_NEXT = UNREAPED_NEXT.wrapping_add(1);
+    }
+}
+
+fn reap_unreaped() {
+    unsafe {
+        for slot in UNREAPED.iter_mut() {
+            if slot.1 == 0 || syscall::task_alive(slot.1) {
+                continue;
+            }
+            let _ = syscall::wait(slot.0);
+            *slot = (0, 0);
+        }
+    }
+}
+
+/// `spawn <program> [arg|text]` / `bg <program> [arg|text]`.
+///
+/// `spawn` hands the console to the child and returns without waiting (the
+/// console returns to the shell when the child exits); `bg` keeps it. That is
+/// the difference the help text always promised but the old code did not
+/// implement: both verbs ran the identical fire-and-forget spawn.
+///
+/// The argument used to have to be a decimal integer, so `spawn ls /sfs` and
+/// `spawn cat /sfs/readme.txt` were rejected with "Argument must be a
+/// non-negative decimal integer." A decimal argument still selects the numeric
+/// form (programs like `howler` take an INTID); anything else is passed to the
+/// child as its argument string.
+fn spawn_program(program: Option<&str>, argument: Option<&str>, background: bool) {
     let Some(program) = program else {
         syscall::print(
             "Usage: spawn <demo|silverd|scout|howl|howler|ls|cat|echo|say|sl|utils|wolfser|net_driver|net_server> [arg]\r\n",
@@ -1831,20 +1888,20 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>) {
             return;
         }
     };
-    let argument = match argument {
-        Some(text) => match parse_number(text) {
-            Some(value) => value,
-            None => {
-                syscall::print("Argument must be a non-negative decimal integer.\r\n");
-                return;
-            }
-        },
-        None => 0,
-    };
+    let numeric = argument.and_then(parse_number);
+    let text_argument = argument.filter(|_| numeric.is_none());
+    let numeric = numeric.unwrap_or(0);
 
-    if let Some(cap_id) = syscall::spawn(program, argument) {
+    let cap_id = match (background, text_argument) {
+        (true, Some(text)) => syscall::spawn_with_args(program, numeric, text),
+        (true, None) => syscall::spawn(program, numeric),
+        (false, Some(text)) => syscall::spawn_with_args_console(program, numeric, text),
+        (false, None) => syscall::spawn_with_args_console(program, numeric, ""),
+    };
+    if let Some(cap_id) = cap_id {
         if let Some(id) = syscall::cap_get_task_id(cap_id) {
             grant_device_rights(cap_id, id, program);
+            remember_unreaped(cap_id);
             syscall::print("Spawned task ID=");
             syscall::print_dec_u64(id);
             syscall::print(" CapId=");
