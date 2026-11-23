@@ -52,8 +52,16 @@ pub fn seed_apps() {
         let _ = write!(&mut manifest, "{byte:02x}");
     }
     manifest.push('\n');
-    if crate::vfs::seed_file("/", "/sfs/apps/scopeprobe.manifest", manifest.as_bytes()).is_err() {
-        crate::console::write_str("SEED: failed to install scopeprobe manifest\r\n");
+    // Only when it actually differs: the manifest used to be rewritten on every
+    // boot, so booting a tracked `disk.img` mutated it even when the embedded
+    // ELF had not changed (the same-length digest line showed up as a binary
+    // diff in git after every run). The ELF above already skips on a size match.
+    let current = crate::vfs::read_file("/", "/sfs/apps/scopeprobe.manifest");
+    if current.as_deref() != Ok(manifest.as_bytes()) {
+        if crate::vfs::seed_file("/", "/sfs/apps/scopeprobe.manifest", manifest.as_bytes()).is_err()
+        {
+            crate::console::write_str("SEED: failed to install scopeprobe manifest\r\n");
+        }
     }
 }
 
