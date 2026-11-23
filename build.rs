@@ -24,6 +24,32 @@ fn main() {
     };
     println!("cargo:rustc-link-arg=-T{linker}");
 
+    // Placement override for a board bootloader. The linker script keeps the
+    // QEMU defaults and only uses these when `--defsym` defines them, so a
+    // default build is unchanged. `SILVER_DRAM_BASE` is where the loader puts
+    // DRAM (the MMU's identity alias and the boot stub read it); `SILVER_LINK_PA`
+    // is where the image is loaded; `SILVER_KERNEL_VIRT_BASE` is the high-half
+    // window and should not change in practice.
+    for (var, sym) in [
+        ("SILVER_LINK_PA", "__silver_link_pa"),
+        ("SILVER_DRAM_BASE", "__silver_dram_base"),
+        ("SILVER_KERNEL_VIRT_BASE", "__silver_kernel_virt_base"),
+    ] {
+        println!("cargo:rerun-if-env-changed={var}");
+        let Ok(raw) = env::var(var) else { continue };
+        let text = raw.trim();
+        let value = match text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            Some(hex) => u64::from_str_radix(hex, 16),
+            None => text.parse::<u64>(),
+        }
+        .unwrap_or_else(|_| panic!("{var} must be a decimal or 0x-prefixed u64, got {raw:?}"));
+        assert!(
+            value % 0x1000 == 0,
+            "{var}=0x{value:x} is not page aligned (the image is mapped by page)"
+        );
+        println!("cargo:rustc-link-arg=--defsym={sym}=0x{value:x}");
+    }
+
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
 
     // Bundle signing key. `SILVER_BUNDLE_PUBKEY` wins; otherwise a checked-in

@@ -77,7 +77,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--elf", type=Path, default=DEFAULT_ELF)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT)
-    parser.add_argument("--dram-base", type=lambda v: int(v, 0), default=0x4000_0000)
+    parser.add_argument("--dram-base", type=lambda v: int(v, 0), default=None,
+                        help="DRAM base; default: the ELF's __dram_base symbol")
     parser.add_argument("--text-offset", type=lambda v: int(v, 0), default=None,
                         help="override the computed load offset (default: link - dram base)")
     args = parser.parse_args()
@@ -95,13 +96,23 @@ def main() -> int:
         link_pa = symbol_address(args.elf, "__kernel_link_pa")
     except SystemExit:
         link_pa = symbol_address(args.elf, "_head")
+
+    # The DRAM base comes from the same build that set the link address, so a
+    # board build (`SILVER_DRAM_BASE=...`) needs no extra flag here. The
+    # override exists for an image built by other means.
+    dram_base = args.dram_base
+    if dram_base is None:
+        try:
+            dram_base = symbol_address(args.elf, "__dram_base")
+        except SystemExit:
+            dram_base = 0x4000_0000
     text_offset = args.text_offset
     if text_offset is None:
-        text_offset = link_pa - args.dram_base
+        text_offset = link_pa - dram_base
         if text_offset < 0:
             raise SystemExit(
-                f"link address 0x{link_pa:x} is below the DRAM base 0x{args.dram_base:x}; "
-                "pass --dram-base 0 if this image is linked at physical 0"
+                f"link address 0x{link_pa:x} is below the DRAM base 0x{dram_base:x}; "
+                "pass --dram-base explicitly if the build's __dram_base is wrong"
             )
     if len(image) < HEADER_SIZE + 0x40:
         raise SystemExit("payload is too small to contain an AArch64 Image header")
@@ -123,7 +134,7 @@ def main() -> int:
     struct.pack_into("<Q", image, TEXT_OFFSET_OFFSET, text_offset)
     args.out.write_bytes(bytes(image))
 
-    load_pa = args.dram_base + text_offset
+    load_pa = dram_base + text_offset
     print(f"{args.out}  {len(image)} bytes ({image_size_field} with .bss)")
     print(f"  link address 0x{link_pa:x}  text_offset 0x{text_offset:x}  load at 0x{load_pa:x}")
     print("  QEMU check (delivers a device tree, so the tree-first console is used):")

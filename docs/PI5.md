@@ -34,7 +34,7 @@ Two rules follow from the right-hand column:
 
 | # | Milestone | Acceptance | Blocking work |
 |---|---|---|---|
-| P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base and reference clock from the DTB~~ (done, both verified under QEMU's Image boot), linker base for the board, entry/placement contract of the Pi firmware |
+| P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base and reference clock from the DTB~~ (done), ~~link base as a build parameter~~ (done), remaining: the Pi firmware's entry contract (EL2/armstub, secondary-core release) and confirming its `kernel_address` |
 | P1 | Interrupts and time | timer tick, GIC init, `health`/`uptime` advancing, no fault | GIC-400 base from the DTB, timer PPI selection, PSCI SMP bring-up |
 | P2 | Console userspace from RAM | `howl>` prompt and `help` **with no storage at all** (SFS image embedded or seeded into RamFs) | embedding a minimal SFS into the kernel image, platform-independent VFS init |
 | P3 | Root filesystem on the board | `ls /sfs` reads the real image; `cat`, `spawn`, `bench fs` work | storage path: RP1/PCIe + SD, or USB mass storage — whichever the DTB shows |
@@ -72,6 +72,23 @@ INTID were read from the tree, the console transport was chosen by
 same boot reaches `howl>`, runs `health` (0 zombie, 0 open, 0 leaked DMA) and
 `bench fs` (SFS open+close ~19-23 µs), so the tree-first path is a working
 console, not a special diagnostic mode.
+
+### The load address is a build parameter, not a patched linker script
+
+`linker.ld` keeps the QEMU defaults and accepts overrides, so a board build is
+one environment variable away:
+
+```bash
+SILVER_LINK_PA=0x80000 SILVER_DRAM_BASE=0x0 cargo kernel   # example: load at 0x80000
+python3 scripts/make_image.py                              # reads __kernel_link_pa/__dram_base
+```
+
+`build.rs` validates the values (decimal or `0x`, page aligned) and passes them
+as `--defsym`; the linker script uses them only when defined, so the default
+build is bit-for-bit the same placement as before. Verified by linking a kernel
+at `0x4020_0000`, producing the matching `text_offset = 0x200000` Image and
+booting it: the shell comes up and `health` is clean, so the mechanism is not
+just a build flag.
 
 ### The baud divisor follows the node's clock
 
@@ -118,6 +135,7 @@ The most useful contributions are *data from real hardware*, not patches:
 
 | Date | Change | Evidence |
 |---|---|---|
+| 2026-11-23 | Load address is a build parameter: `SILVER_LINK_PA` / `SILVER_DRAM_BASE` / `SILVER_KERNEL_VIRT_BASE` → `--defsym`, with `DEFINED()` guards in `linker.ld`; `scripts/make_image.py` now reads `__dram_base` from the ELF instead of assuming QEMU. Verified by booting an image linked at 0x4020_0000 (`text_offset = 0x200000`) through the Image protocol: console, shell and `health` all work; the default build boots unchanged (smoke 8/8). | 244 host tests, five feature builds, smoke 8/8, custom-base boot log |
 | 2026-11-23 | Baud divisor from the device tree: `fdt` parses `clock-frequency`/`assigned-clock-rates` on the console node (bounded to 1 MHz..1 GHz, so a wild value cannot become a register write), `driver_resources` stores it, `pl011::init_at_clock` uses it. Verified by booting a tree that declares 48 MHz: the log line carries `clk=48000000` and the console still runs. Phandle-only clocks remain unresolved (documented above). | 4 new `fdt` tests (read, `assigned-clock-rates`, unset, implausible); 244 host tests total; smoke 8/8 |
 | 2026-11-23 | Tree-first console verified end to end: `scripts/make_image.py` turns the ELF into an AArch64 Image with a correct `text_offset`; booting it with `-dtb` prints `DRIVER UART=DT base=0x9000000 ... irq=33`, then serves `howl>`/`health`/`bench fs`. **Correction:** an earlier note here claimed the generic boot stub does not record `x0`; that was wrong — it does (`str x22, [x3, #0x28]` in the common publish block). QEMU's *ELF* load path passes no tree, which is why the ELF boot shows no `DT` line. | raw-Image boot log above; bench 19.2-23.2 µs open+close on both paths (same code), `-smp 4` self-tests unchanged |
 | 2026-11-23 | The console decision is now pure, tested policy: `choose_console(described, builtin)` in `src/devices.rs` — tree wins, built-in map is only a fallback, nothing described means silence. `fdt` moved from being compiled twice into a single library module the binary re-exports, so the parser the tests cover is the parser the kernel runs. | 240 host tests (4 policy tests: "the tree wins over the built-in map", "a tree alone is enough", "the built-in map is only a fallback", "nothing described means no console") |
