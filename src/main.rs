@@ -1493,7 +1493,20 @@ pub extern "C" fn kernel_main() -> ! {
 
     mmu::init();
 
-    // Console first: a bad memory map must be *reported* before the
+    // Devices before the console: on a new machine the tree is what names the
+    // UART, so the console cannot be chosen before the tree is read. Parsing
+    // needs the MMU (it reads through `phys_to_virt`), hence the order.
+    // QEMU without a DTB keeps the fixed PL011/PCI table; fog gets the UART
+    // base/size/INTID from its node. A missing/disabled node binds nothing.
+    {
+        let params = boot::get();
+        let dtb = params.as_ref().and_then(fog::dtb_slice);
+        crate::driver_resources::init(dtb);
+        #[cfg(feature = "gdb-stub")]
+        crate::gdb::probe_transport(dtb);
+    }
+
+    // Console first after that: a bad memory map must be *reported* before the
     // allocator asserts on an empty window.
     console::init();
     // Cache state is reported on every console-capable profile. The boot
@@ -1540,16 +1553,6 @@ pub extern "C" fn kernel_main() -> ! {
         }
     }
 
-    // Bind driver resources from the live tree once. QEMU without a DTB keeps
-    // the fixed PL011/PCI table; fog gets the UART base/size/INTID from its
-    // node. A missing/disabled node leaves the driver without a range.
-    {
-        let params = boot::get();
-        let dtb = params.as_ref().and_then(fog::dtb_slice);
-        crate::driver_resources::init(dtb);
-        #[cfg(feature = "gdb-stub")]
-        crate::gdb::probe_transport(dtb);
-    }
     // Evidence that the live tree, not the static fallback, supplied the
     // console UART. Printed only when a DTB was handed over.
     if let Some((range, irq)) = crate::driver_resources::dtb_uart() {

@@ -1,17 +1,50 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::smp::SpinLock;
 
-const BASE: usize = crate::memory::phys_to_virt(0x0900_0000);
-const DR: *mut u32 = BASE as *mut u32;
-const FR: *const u32 = (BASE + 0x18) as *const u32;
-const IBRD: *mut u32 = (BASE + 0x24) as *mut u32;
-const FBRD: *mut u32 = (BASE + 0x28) as *mut u32;
-const LCR_H: *mut u32 = (BASE + 0x2C) as *mut u32;
-const CR: *mut u32 = (BASE + 0x30) as *mut u32;
-const IFLS: *mut u32 = (BASE + 0x34) as *mut u32;
-const IMSC: *mut u32 = (BASE + 0x38) as *mut u32;
-const ICR: *mut u32 = (BASE + 0x44) as *mut u32;
+/// Physical base of the PL011 this boot actually drives.
+///
+/// Deliberately a runtime value: the driver is a *device* driver, not a board
+/// driver. The base comes from the live device tree (any machine that describes
+/// an `arm,pl011` node) and only falls back to the QEMU `virt` address when the
+/// loader passed no tree. Zero means "not bound yet" — every accessor is a
+/// no-op then, because writing to a guessed address is a bus abort, not a
+/// diagnostic.
+static BASE_PA: AtomicU64 = AtomicU64::new(0);
+
+// Register offsets from the PL011 base (ARM PrimeCell UART PL011 TRM).
+const DR: usize = 0x00;
+const FR: usize = 0x18;
+const IBRD: usize = 0x24;
+const FBRD: usize = 0x28;
+const LCR_H: usize = 0x2C;
+const CR: usize = 0x30;
+const IFLS: usize = 0x34;
+const IMSC: usize = 0x38;
+const ICR: usize = 0x44;
+
+/// UART reference clock assumed by [`init_at`], in Hz.
+///
+/// 24 MHz is what QEMU `virt` uses. A board whose UART clock differs needs
+/// `clock-frequency` from its node (see `docs/PI5.md`, P0) — the divisor below
+/// is only correct for the clock it is told about.
+pub const DEFAULT_UART_CLK: u32 = 24_000_000;
+
+pub fn physical_base() -> u64 {
+    BASE_PA.load(Ordering::Acquire)
+}
+
+fn register(offset: usize) -> usize {
+    crate::memory::phys_to_virt(BASE_PA.load(Ordering::Relaxed) as usize) + offset
+}
+
+unsafe fn write_reg(offset: usize, value: u32) {
+    core::ptr::write_volatile(register(offset) as *mut u32, value);
+}
+
+unsafe fn read_reg(offset: usize) -> u32 {
+    core::ptr::read_volatile(register(offset) as *const u32)
+}
 
 const CTRL_Z: u8 = 0x1A;
 const RX_INTERRUPT: u32 = 1 << 4;
@@ -28,20 +61,43 @@ static mut RX_LEN: usize = 0;
 /// IRQ masking alone is not a cross-CPU exclusion.
 static RX_LOCK: SpinLock<()> = SpinLock::new(());
 
-pub fn init() {
+/// Binds the driver to a physical base and configures 115200 8N1 using
+/// [`DEFAULT_UART_CLK`]. Returns `false` (and drives nothing) for a zero base.
+pub fn init_at(physical_base: u64) -> bool {
+    if physical_base == 0 {
+        return false;
+    }
+    BASE_PA.store(physical_base, Ordering::Release);
+    init_at_clock(physical_base, DEFAULT_UART_CLK);
+    true
+}
+
+/// Same, with an explicit UART reference clock.
+pub fn init_at_clock(physical_base: u64, uart_clk: u32) {
+    if physical_base == 0 {
+        return;
+    }
+    BASE_PA.store(physical_base, Ordering::Release);
+
+    // IBRD:FBRD = uart_clk / (16 * baud) as a 6.6 fixed-point value.
+    let baud = 115_200u64;
+    let divisor = (u64::from(uart_clk) * 64) / (16 * baud);
+    let ibrd = (divisor >> 6) as u32;
+    let fbrd = (divisor & 0x3F) as u32;
+
     unsafe {
-        core::ptr::write_volatile(CR, 0);
-        core::ptr::write_volatile(IMSC, 0);
-        core::ptr::write_volatile(ICR, RX_INTERRUPT | RX_TIMEOUT_INTERRUPT);
-        core::ptr::write_volatile(IBRD, 13);
-        core::ptr::write_volatile(FBRD, 1);
-        core::ptr::write_volatile(LCR_H, (1 << 4) | (0b11 << 5));
+        write_reg(CR, 0);
+        write_reg(IMSC, 0);
+        write_reg(ICR, RX_INTERRUPT | RX_TIMEOUT_INTERRUPT);
+        write_reg(IBRD, ibrd);
+        write_reg(FBRD, fbrd);
+        write_reg(LCR_H, (1 << 4) | (0b11 << 5));
         // RX at 1/8 FIFO full; RTIM makes a single pending byte arrive without
         // waiting for the threshold. Clear stale interrupts before unmasking.
-        core::ptr::write_volatile(IFLS, 0);
-        core::ptr::write_volatile(ICR, RX_INTERRUPT | RX_TIMEOUT_INTERRUPT);
-        core::ptr::write_volatile(CR, 1 | (1 << 8) | (1 << 9));
-        core::ptr::write_volatile(IMSC, RX_INTERRUPT | RX_TIMEOUT_INTERRUPT);
+        write_reg(IFLS, 0);
+        write_reg(ICR, RX_INTERRUPT | RX_TIMEOUT_INTERRUPT);
+        write_reg(CR, 1 | (1 << 8) | (1 << 9));
+        write_reg(IMSC, RX_INTERRUPT | RX_TIMEOUT_INTERRUPT);
     }
 }
 
@@ -57,7 +113,7 @@ pub fn handle_irq() {
         }
     }
     unsafe {
-        core::ptr::write_volatile(ICR, RX_INTERRUPT | RX_TIMEOUT_INTERRUPT);
+        write_reg(ICR, RX_INTERRUPT | RX_TIMEOUT_INTERRUPT);
     }
     crate::interrupts::restore_irq(saved_daif);
 }
@@ -76,10 +132,10 @@ pub fn read_byte() -> Option<u8> {
 
 fn read_hardware() -> Option<u8> {
     // Bit 4 of FR is RXFE (RX FIFO empty).
-    if unsafe { core::ptr::read_volatile(FR) } & (1 << 4) != 0 {
+    if unsafe { read_reg(FR) } & (1 << 4) != 0 {
         return None;
     }
-    Some(unsafe { core::ptr::read_volatile(DR) } as u8)
+    Some(unsafe { read_reg(DR) } as u8)
 }
 
 fn push_rx(byte: u8) {
@@ -157,6 +213,9 @@ pub fn run_ring_self_test() -> bool {
 }
 
 pub fn write_byte(byte: u8) {
+    if physical_base() == 0 {
+        return;
+    }
     // Wait for TX FIFO space with IRQs unmasked — but restore the caller's
     // DAIF afterwards so this stays transparent in any context (syscall
     // handlers, the scheduler's BAD SP guard, panic dumps). Spinning on TXFF
@@ -165,9 +224,9 @@ pub fn write_byte(byte: u8) {
     // masked timer can never preempt a spinning syscall handler. The
     // trampolines keep ELR/SPSR in their stack frames, so taking an IRQ
     // mid-print is safe — the handler returns exactly here.
-    if unsafe { core::ptr::read_volatile(FR) } & (1 << 5) != 0 {
+    if unsafe { read_reg(FR) } & (1 << 5) != 0 {
         let saved_daif = crate::interrupts::save_and_disable_irq();
-        while unsafe { core::ptr::read_volatile(FR) } & (1 << 5) != 0 {
+        while unsafe { read_reg(FR) } & (1 << 5) != 0 {
             crate::interrupts::enable_irq();
             core::hint::spin_loop();
         }
@@ -175,7 +234,7 @@ pub fn write_byte(byte: u8) {
     }
 
     unsafe {
-        core::ptr::write_volatile(DR, u32::from(byte));
+        write_reg(DR, u32::from(byte));
     }
 }
 

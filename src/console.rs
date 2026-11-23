@@ -68,6 +68,23 @@ enum Active {
 }
 
 fn active() -> Active {
+    // A UART the live device tree describes wins over any per-machine default.
+    // This is the portable path: a new board becomes console-capable by being
+    // described, not by adding a match arm here. `pl011`/`geni_uart` take the
+    // base as a parameter, so no driver assumes an address.
+    if let Some((kind, range, _)) = crate::driver_resources::dtb_uart_node() {
+        return match kind {
+            crate::fdt::DriverKind::Pl011 => {
+                PL011_BASE.store(range.base, core::sync::atomic::Ordering::Release);
+                Active::Pl011
+            }
+            crate::fdt::DriverKind::GeniUart => Active::Geni,
+        };
+    }
+
+    // No tree: fall back to the machine the CPU/identity proves we are on. A
+    // board without a tree has no console, which fails closed (silence) rather
+    // than writing to an unproven MMIO address.
     match platform::detect() {
         Kind::Qemu => Active::Pl011,
         Kind::Sm8650 => Active::Geni,
@@ -75,26 +92,31 @@ fn active() -> Active {
             let info = crate::fog::info();
             match info.uart_kind {
                 UartKind::Geni => Active::Geni,
-                // The PL011 driver is QEMU's fixed-base implementation. Only
-                // enable it when the live tree names that exact base; a
-                // different PL011 belongs to a driver we do not have yet.
-                UartKind::Pl011 if info.uart_pa == 0x0900_0000 => Active::Pl011,
-                UartKind::Pl011 => Active::None,
+                UartKind::Pl011 => {
+                    PL011_BASE.store(info.uart_pa, core::sync::atomic::Ordering::Release);
+                    Active::Pl011
+                }
             }
         }
-        // Pi 5: the debug UART is a PL011, but its base must come from the
-        // device tree and `pl011.rs` still drives QEMU's fixed address. P0 of
-        // `docs/PI5.md` is exactly this: a PL011 whose base is passed in. Until
-        // then, silence — writing to an unproven MMIO address is a bus abort,
-        // not a diagnostic.
-        Kind::Bcm2712 => Active::None,
-        Kind::Unknown => Active::None,
+        Kind::Bcm2712 | Kind::Unknown => Active::None,
     }
 }
 
+/// Physical base of the PL011 the console drives. Set by `active()` from the
+/// live tree (or the platform default) before `pl011::init_at` runs.
+static PL011_BASE: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
 pub fn init() {
     match active() {
-        Active::Pl011 => crate::pl011::init(),
+        Active::Pl011 => {
+            // `active()` records the tree-bound base; without a tree the
+            // machine's built-in UART map supplies it.
+            let mut base = PL011_BASE.load(core::sync::atomic::Ordering::Acquire);
+            if base == 0 {
+                base = crate::driver_resources::uart_range().map_or(0, |range| range.base);
+            }
+            crate::pl011::init_at(base);
+        }
         Active::Geni => {
             let base = match platform::detect() {
                 Kind::Fog => crate::fog::info().uart_pa as usize,

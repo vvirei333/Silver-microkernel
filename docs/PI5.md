@@ -34,7 +34,7 @@ Two rules follow from the right-hand column:
 
 | # | Milestone | Acceptance | Blocking work |
 |---|---|---|---|
-| P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done: identity + DT matcher, host-tested), linker base, relocatable/per-firmware entry, PL011 base passed in from the DTB |
+| P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base passed in from the DTB~~ (done: the console asks the device map first), **capture x0 on the generic boot entry** (today only the fog stub records the DTB), linker base, relocatable/per-firmware entry, UART clock for the baud divisor |
 | P1 | Interrupts and time | timer tick, GIC init, `health`/`uptime` advancing, no fault | GIC-400 base from the DTB, timer PPI selection, PSCI SMP bring-up |
 | P2 | Console userspace from RAM | `howl>` prompt and `help` **with no storage at all** (SFS image embedded or seeded into RamFs) | embedding a minimal SFS into the kernel image, platform-independent VFS init |
 | P3 | Root filesystem on the board | `ls /sfs` reads the real image; `cat`, `spawn`, `bench fs` work | storage path: RP1/PCIe + SD, or USB mass storage — whichever the DTB shows |
@@ -71,4 +71,5 @@ The most useful contributions are *data from real hardware*, not patches:
 
 | Date | Change | Evidence |
 |---|---|---|
+| 2026-11-23 | Devices are chosen from the tree before the board: `driver_resources` is the one device map, `console::active()` asks it first, and `pl011` is now address-agnostic (`init_at(base)`, divisor from a UART clock). `mmio_range`/`irq` no longer branch on a board name — a console driver gets the UART, a probe gets the GIC, whoever they are. | 236 host tests; all six `secprobe` cases `ok` (incl. `irq_orphan`, `mmio_range_confine`); release smoke 8/8; `no_std`, `linux-abi`, `fog`, `tablet` builds |
 | 2026-11-23 | `Kind::Bcm2712` exists and is proved from the DT root `compatible` (`brcm,bcm2712`, `raspberrypi,5-*`) by `kind_from_compatible` in `src/board.rs`; MIDR deliberately does not map Cortex-A76, so no board can be guessed from the CPU. `console.rs` maps BCM2712 to "no output" until the PL011 base is passed in. | 7 host tests (`cargo test --lib board`) including "Pi 4 is not claimed as a Pi 5" and "a substring is not a match"; QEMU boot unchanged (release smoke 8/8) |

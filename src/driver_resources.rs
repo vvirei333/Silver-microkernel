@@ -11,7 +11,7 @@
 //! fixed PL011 address. A missing or disabled node leaves the driver
 //! unbound (dead hardware, not a crash).
 
-use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering};
 
 use crate::fdt::{DriverKind, DriverNode, MAX_DRIVER_NODES};
 use crate::mutex::Mutex;
@@ -35,6 +35,15 @@ static UART_BASE: AtomicU64 = AtomicU64::new(0);
 static UART_SIZE: AtomicU64 = AtomicU64::new(0);
 /// Zero means the DT did not describe an interrupt for the UART.
 static UART_IRQ: AtomicU32 = AtomicU32::new(0);
+/// Which driver the bound UART node needs: 1 = PL011, 2 = GENI.
+static UART_KIND: AtomicU8 = AtomicU8::new(0);
+
+const UART_KIND_PL011: u8 = 1;
+const UART_KIND_GENI: u8 = 2;
+
+/// GIC distributor base/size bound from the live tree (0 when absent).
+static GIC_BASE: AtomicU64 = AtomicU64::new(0);
+static GIC_SIZE: AtomicU64 = AtomicU64::new(0);
 
 const MAX_MMIO_CLAIMS: usize = 16;
 
@@ -73,34 +82,115 @@ pub fn init(dtb: Option<&[u8]>) {
     if let Some(node) = chosen {
         UART_BASE.store(node.mmio.start, Ordering::Release);
         UART_SIZE.store(node.mmio.size(), Ordering::Release);
+        UART_KIND.store(
+            match node.kind {
+                DriverKind::Pl011 => UART_KIND_PL011,
+                DriverKind::GeniUart => UART_KIND_GENI,
+            },
+            Ordering::Release,
+        );
         if let Some(irq) = node.irq {
             UART_IRQ.store(irq, Ordering::Release);
         }
     }
+    // The interrupt controller is a device like any other: if the tree
+    // describes one, that is the range drivers may be granted.
+    if let Some(gic) = tree.gic() {
+        GIC_BASE.store(gic.distributor, Ordering::Release);
+        let size = match gic.kind {
+            crate::fdt::GicKind::V2 => 0x1000,
+            crate::fdt::GicKind::V3 => 0x1_0000,
+        };
+        GIC_SIZE.store(size, Ordering::Release);
+    }
 }
 
-/// Range a program may map as device MMIO, if any. The spawn path adds it as
-/// a self `CAP_MMIO` region; it is not inheritable through a generic handle.
-pub fn mmio_range(program: u64) -> Option<Range> {
-    match (platform::detect(), program) {
-        (Kind::Qemu, crate::user_program::HOWLER) => Some(dtb_uart_range().unwrap_or(QEMU_UART)),
-        // The shell holds the GIC range only to delegate it to the IRQ probe.
-        (Kind::Qemu, crate::user_program::HOWL) => Some(QEMU_GIC),
-        // NET_DRIVER and WOLFSER obtain their BAR ranges through
-        // SYS_MMIO_CLAIM after PCI enumeration; the platform only publishes
-        // the window below.
-        (Kind::Fog, crate::user_program::HOWLER) => dtb_uart_range().or_else(|| {
+/// The console UART the live tree binds, if any: driver kind, MMIO range and
+/// INTID. This is the portable path — a machine is supported by describing it,
+/// not by naming it in the kernel.
+pub fn dtb_uart_node() -> Option<(DriverKind, Range, Option<u32>)> {
+    let range = dtb_uart_range()?;
+    let kind = match UART_KIND.load(Ordering::Acquire) {
+        UART_KIND_PL011 => DriverKind::Pl011,
+        UART_KIND_GENI => DriverKind::GeniUart,
+        _ => return None,
+    };
+    let irq = UART_IRQ.load(Ordering::Acquire);
+    Some((kind, range, (irq != 0).then_some(irq)))
+}
+
+/// The console UART range, from the tree when there is one and from the
+/// machine's built-in map otherwise. `None` means this platform has no console
+/// UART this kernel can drive.
+pub fn uart_range() -> Option<Range> {
+    dtb_uart_range().or_else(default_uart_range)
+}
+
+/// The console UART INTID, from the tree when it names one.
+pub fn uart_intid() -> Option<u32> {
+    let irq = UART_IRQ.load(Ordering::Acquire);
+    if irq != 0 {
+        return Some(irq);
+    }
+    match platform::detect() {
+        Kind::Qemu => Some(QEMU_UART_IRQ),
+        Kind::Sm8650 => Some(crate::gic::uart_irq()),
+        _ => None,
+    }
+}
+
+/// The GIC distributor range: the tree's description first, then the emulated
+/// machine's fixed map. A board without a tree gets nothing, which fails closed.
+pub fn gic_range() -> Option<Range> {
+    let base = GIC_BASE.load(Ordering::Acquire);
+    let size = GIC_SIZE.load(Ordering::Acquire);
+    if base != 0 && size != 0 {
+        return Some(Range { base, size });
+    }
+    match platform::detect() {
+        Kind::Qemu => Some(QEMU_GIC),
+        _ => None,
+    }
+}
+
+/// Built-in UART map for machines this kernel can boot without a device tree.
+///
+/// This is a *fallback table*, not the primary source: any tree that names a
+/// UART wins. Keeping it here means the device paths above never branch on a
+/// board name.
+fn default_uart_range() -> Option<Range> {
+    match platform::detect() {
+        Kind::Qemu => Some(QEMU_UART),
+        Kind::Fog => {
             let base = crate::geni_uart::physical_base();
             (base != 0).then_some(Range {
                 base: base as u64,
                 size: 0x1000,
             })
-        }),
-        // Tablet profile is parked but must not regress if booted.
-        (Kind::Sm8650, crate::user_program::HOWLER) => Some(Range {
+        }
+        Kind::Sm8650 => Some(Range {
             base: 0x0089_C000,
             size: 0x1000,
         }),
+        Kind::Bcm2712 | Kind::Unknown => None,
+    }
+}
+
+/// Range a program may map as device MMIO, if any. The spawn path adds it as
+/// a self `CAP_MMIO` region; it is not inheritable through a generic handle.
+///
+/// The answer depends on the *program*, not on the board: a console driver gets
+/// the UART, an IRQ probe gets the interrupt controller, and everything else
+/// must go through `claim_mmio`. Which addresses those are comes from the live
+/// tree (`init`), with the built-in map only as a fallback.
+pub fn mmio_range(program: u64) -> Option<Range> {
+    match program {
+        crate::user_program::HOWLER => uart_range(),
+        // The shell holds the GIC range only to delegate it to the IRQ probe.
+        crate::user_program::HOWL => gic_range(),
+        // NET_DRIVER and WOLFSER obtain their BAR ranges through
+        // SYS_MMIO_CLAIM after PCI enumeration; the platform only publishes
+        // the window below.
         _ => None,
     }
 }
@@ -109,16 +199,8 @@ pub fn mmio_range(program: u64) -> Option<Range> {
 /// means no node-scoped IRQ; a broad `CAP_IRQ` (trusted shell/test probe) is
 /// still accepted by `bind_irq`.
 pub fn irq(program: u64) -> Option<u32> {
-    match (platform::detect(), program) {
-        (Kind::Qemu, crate::user_program::HOWLER) => {
-            let from_dt = UART_IRQ.load(Ordering::Acquire);
-            Some(if from_dt != 0 { from_dt } else { QEMU_UART_IRQ })
-        }
-        (Kind::Fog, crate::user_program::HOWLER) => {
-            let irq = UART_IRQ.load(Ordering::Acquire);
-            (irq != 0).then_some(irq)
-        }
-        (Kind::Sm8650, crate::user_program::HOWLER) => Some(crate::gic::uart_irq()),
+    match program {
+        crate::user_program::HOWLER => uart_intid(),
         _ => None,
     }
 }
