@@ -16,7 +16,7 @@ the same plan applies one step earlier in the SoC family.
 |---|---|---|
 | CPU | 4× Cortex-A76, AArch64, EL2 → EL1 handoff from firmware | known |
 | Boot | EEPROM bootloader → `config.txt`/`cmdline.txt` → arm64 kernel image or `armstub8`; the load address and entry contract come from the firmware, not from us | known shape, exact address to verify |
-| Console | PL011 debug UART (uart10 on a Pi 5) at 115200 8N1 on the header | known shape; base, INTID and reference clock are read from the node (note: the Pi tree names its clock by phandle, which the parser does not resolve yet — see below) |
+| Console | PL011 debug UART (uart10 on a Pi 5) at 115200 8N1 on the header | known shape; base, INTID and reference clock are read from the node, including the Pi's `clocks = <&clk_uart>` phandle form |
 | Interrupts | GIC-400, ARM generic timer PPI | known shape, bases to be read from the DTB |
 | Secondary cores / power | PSCI via firmware | expected, to be confirmed |
 | Storage | most I/O on Pi 5 sits behind the **RP1 southbridge over PCIe**; the SD/eMMC path must be confirmed from the live DTB (`lspci` on a running Linux shows the RP1) | **unknown — the main risk** |
@@ -102,11 +102,16 @@ tree that declares 48 MHz prints it back:
 DRIVER UART=DT base=0x0000000009000000 size=0x0000000000001000 irq=33 clk=48000000
 ```
 
-**Known gap, stated rather than hidden:** the Raspberry Pi device trees name the
-UART clock by phandle (`clocks = <&clk_uart>`), whose rate lives on the
-referenced fixed-clock node. This parser does not resolve phandles yet, so on a
-Pi the driver would fall back to the documented default until that lands (or
-until the firmware/`config.txt` sets the UART clock to the assumed value).
+The Raspberry Pi device trees name that clock by phandle
+(`clocks = <&clk_uart>`), whose rate lives on the referenced fixed-clock node.
+`fdt` resolves the phandle to the provider node and reads its rate (with the
+same plausibility bound), and a node's own `clock-frequency` wins over the
+phandle. This is verified on QEMU's unpatched tree, which uses the same spelling
+(`clocks = <0x8000 ...>` → `apb-pclk`):
+
+```
+DRIVER UART=DT base=0x0000000009000000 size=0x0000000000001000 irq=33 clk=24000000
+```
 
 ## What a board owner can do today
 
@@ -135,6 +140,7 @@ The most useful contributions are *data from real hardware*, not patches:
 
 | Date | Change | Evidence |
 |---|---|---|
+| 2026-11-23 | UART clock phandle resolution: `clocks = <&clk_uart>` is followed to the provider node and its rate read, so the Pi's own spelling works without vendor-specific code. Verified on QEMU's stock device tree (`clk=24000000` from `apb-pclk`, reached only through the phandle) with the shell still running. | 2 new `fdt` tests (phandle resolution incl. unknown phandle, direct value wins); 246 host tests; smoke 8/8 |
 | 2026-11-23 | Load address is a build parameter: `SILVER_LINK_PA` / `SILVER_DRAM_BASE` / `SILVER_KERNEL_VIRT_BASE` → `--defsym`, with `DEFINED()` guards in `linker.ld`; `scripts/make_image.py` now reads `__dram_base` from the ELF instead of assuming QEMU. Verified by booting an image linked at 0x4020_0000 (`text_offset = 0x200000`) through the Image protocol: console, shell and `health` all work; the default build boots unchanged (smoke 8/8). | 244 host tests, five feature builds, smoke 8/8, custom-base boot log |
 | 2026-11-23 | Baud divisor from the device tree: `fdt` parses `clock-frequency`/`assigned-clock-rates` on the console node (bounded to 1 MHz..1 GHz, so a wild value cannot become a register write), `driver_resources` stores it, `pl011::init_at_clock` uses it. Verified by booting a tree that declares 48 MHz: the log line carries `clk=48000000` and the console still runs. Phandle-only clocks remain unresolved (documented above). | 4 new `fdt` tests (read, `assigned-clock-rates`, unset, implausible); 244 host tests total; smoke 8/8 |
 | 2026-11-23 | Tree-first console verified end to end: `scripts/make_image.py` turns the ELF into an AArch64 Image with a correct `text_offset`; booting it with `-dtb` prints `DRIVER UART=DT base=0x9000000 ... irq=33`, then serves `howl>`/`health`/`bench fs`. **Correction:** an earlier note here claimed the generic boot stub does not record `x0`; that was wrong — it does (`str x22, [x3, #0x28]` in the common publish block). QEMU's *ELF* load path passes no tree, which is why the ELF boot shows no `DT` line. | raw-Image boot log above; bench 19.2-23.2 µs open+close on both paths (same code), `-smp 4` self-tests unchanged |

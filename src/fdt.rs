@@ -99,12 +99,18 @@ pub struct UartNode {
     pub kind: UartKind,
     /// INTID from the node's `interrupts` property (SPI 32 + n, PPI 16 + n).
     pub irq: Option<u32>,
-    /// `clock-frequency` in Hz, when the node publishes it.
+    /// `clock-frequency` in Hz, when the node publishes it (directly or through
+    /// the clock node its `clocks` property points at).
     ///
     /// A UART's baud divisor is a function of its reference clock, so a board
     /// whose UART runs at 48 MHz needs a different divisor from one at 24 MHz.
     /// Reading it here is what keeps `pl011` from assuming QEMU's clock.
     pub clock: Option<u32>,
+    /// First `clocks` cell: the phandle of the clock provider, if named.
+    ///
+    /// `find_uart` resolves it with [`Fdt::clock_rate_of`] after the walk, which
+    /// is how Raspberry Pi trees express the UART clock.
+    pub clock_phandle: Option<u32>,
 }
 
 /// A driver bindable from the live tree. The kernel's driver table maps this
@@ -394,7 +400,35 @@ impl<'a> Fdt<'a> {
     pub fn find_uart(&self) -> Option<UartNode> {
         let mut visitor = UartFinder::default();
         self.walk(&mut visitor)?;
-        visitor.best
+        let mut best = visitor.best?;
+        // Boards that name the clock by phandle (Raspberry Pi does:
+        // `clocks = <&clk_uart>`) only carry the rate on the provider node, so
+        // resolve it here rather than leaving the driver on its default.
+        if best.clock.is_none() {
+            if let Some(phandle) = best.clock_phandle {
+                best.clock = self.clock_rate_of(phandle);
+            }
+        }
+        Some(best)
+    }
+
+    /// Rate in Hz published by the clock provider with this `phandle`.
+    ///
+    /// A provider is a `fixed-clock`/`clock-*` node carrying `clock-frequency`
+    /// (or the first `assigned-clock-rates` cell). The same plausibility bound
+    /// as [`UartNode::clock`] applies: a wild value must not reach a divisor.
+    pub fn clock_rate_of(&self, phandle: u32) -> Option<u32> {
+        if phandle == 0 {
+            return None;
+        }
+        let mut finder = ClockFinder {
+            wanted: phandle,
+            current_phandle: None,
+            current_rate: None,
+            rate: None,
+        };
+        self.walk(&mut finder)?;
+        finder.rate
     }
 
     /// Every enabled node a known driver can bind, in tree order. The node's
@@ -810,6 +844,7 @@ struct UartFinder {
     current_kind: Option<UartKind>,
     current_irq: Option<u32>,
     current_clock: Option<u32>,
+    current_clock_phandle: Option<u32>,
     current_is_uart: bool,
     current_debug: bool,
     current_disabled: bool,
@@ -822,6 +857,7 @@ impl<'a> Visitor<'a> for UartFinder {
         self.current_kind = None;
         self.current_irq = None;
         self.current_clock = None;
+        self.current_clock_phandle = None;
         self.current_is_uart = false;
         self.current_debug = false;
         self.current_disabled = false;
@@ -868,12 +904,17 @@ impl<'a> Visitor<'a> for UartFinder {
                     }
                 }
             }
-            // A UART names its reference clock in one of two ways on the node
-            // itself: `clock-frequency` (fixed-clock style, common in vendor
-            // trees) or the first entry of `assigned-clock-rates`. A board that
-            // names its clock only by phandle (`clocks = <&clk_uart>`) needs
-            // phandle resolution, which this parser does not do yet — the
-            // driver then keeps its documented default rather than guessing.
+            // A UART names its reference clock in one of three ways: directly
+            // as `clock-frequency`, as the first `assigned-clock-rates` cell, or
+            // by phandle (`clocks = <&clk_uart>`, the Raspberry Pi spelling)
+            // which `find_uart` resolves with `clock_rate_of` after the walk.
+            // `clocks = <&provider index ...>`: the first cell is the
+            // provider's phandle. Recorded, then resolved by `find_uart`.
+            "clocks" if self.current_clock_phandle.is_none() => {
+                if let Some(phandle) = read_be32(value, 0) {
+                    self.current_clock_phandle = Some(phandle);
+                }
+            }
             "clock-frequency" | "assigned-clock-rates" if self.current_clock.is_none() => {
                 // Plausibility bound only: a UART reference clock outside
                 // 1 MHz..1 GHz cannot produce a sane divisor, and a wild value
@@ -911,12 +952,54 @@ impl<'a> Visitor<'a> for UartFinder {
             kind,
             irq: self.current_irq.take(),
             clock: self.current_clock.take(),
+            clock_phandle: self.current_clock_phandle.take(),
         };
         match self.best {
             None => self.best = Some(candidate),
             Some(existing) if !existing.debug && candidate.debug => self.best = Some(candidate),
             _ => {}
         }
+    }
+}
+
+/// Finds the clock provider named by a `clocks` phandle and reads its rate.
+struct ClockFinder {
+    wanted: u32,
+    current_phandle: Option<u32>,
+    current_rate: Option<u32>,
+    rate: Option<u32>,
+}
+
+impl<'a> Visitor<'a> for ClockFinder {
+    fn begin(&mut self, _path: &str, _name: &str) {
+        self.current_phandle = None;
+        self.current_rate = None;
+    }
+
+    fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        match name {
+            // Property order is not guaranteed: `clock-frequency` is often
+            // written before `phandle`, so collect both and decide on `end`.
+            "phandle" | "linux,phandle" => {
+                self.current_phandle = read_be32(value, 0);
+            }
+            "clock-frequency" | "assigned-clock-rates" => {
+                if let Some(hz) = read_be32(value, 0) {
+                    if (1_000_000..=1_000_000_000).contains(&hz) {
+                        self.current_rate = Some(hz);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, _path: &str) {
+        if self.rate.is_none() && self.current_phandle == Some(self.wanted) {
+            self.rate = self.current_rate.take();
+        }
+        self.current_phandle = None;
+        self.current_rate = None;
     }
 }
 
@@ -1921,6 +2004,58 @@ mod tests {
         dtb.prop_str("compatible", "arm,pl011");
         dtb.prop_reg1("reg", 0x0900_0000, 0x1000);
         dtb.prop_u32_array("assigned-clock-rates", &[48_000_000, 24_000_000]);
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let uart = Fdt::new(&blob).unwrap().find_uart().unwrap();
+        assert_eq!(uart.clock, Some(48_000_000));
+    }
+
+    #[test]
+    fn the_reference_clock_is_resolved_through_a_phandle() {
+        // The Raspberry Pi spelling: the UART points at a fixed-clock node.
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.prop_u32("#address-cells", 1);
+        dtb.prop_u32("#size-cells", 1);
+        dtb.begin("clk-uart");
+        dtb.prop_str("compatible", "fixed-clock");
+        dtb.prop_u32("#clock-cells", 0);
+        dtb.prop_u32("clock-frequency", 48_000_000);
+        dtb.prop_u32("phandle", 0x8000);
+        dtb.end();
+        dtb.begin("serial@9000000");
+        dtb.prop_str("compatible", "arm,pl011");
+        dtb.prop_reg1("reg", 0x0900_0000, 0x1000);
+        dtb.prop_u32_array("clocks", &[0x8000, 0]);
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let fdt = Fdt::new(&blob).unwrap();
+        let uart = fdt.find_uart().unwrap();
+        assert_eq!(uart.clock_phandle, Some(0x8000));
+        assert_eq!(uart.clock, Some(48_000_000));
+        // An unknown phandle stays unresolved instead of guessing.
+        assert_eq!(fdt.clock_rate_of(0x8001), None);
+        assert_eq!(fdt.clock_rate_of(0), None);
+    }
+
+    #[test]
+    fn a_direct_clock_frequency_wins_over_a_phandle() {
+        // Both present: the node's own value is the more specific statement.
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.prop_u32("#address-cells", 1);
+        dtb.prop_u32("#size-cells", 1);
+        dtb.begin("clk-uart");
+        dtb.prop_u32("clock-frequency", 24_000_000);
+        dtb.prop_u32("phandle", 0x8000);
+        dtb.end();
+        dtb.begin("serial@9000000");
+        dtb.prop_str("compatible", "arm,pl011");
+        dtb.prop_reg1("reg", 0x0900_0000, 0x1000);
+        dtb.prop_u32("clock-frequency", 48_000_000);
+        dtb.prop_u32_array("clocks", &[0x8000, 0]);
         dtb.end();
         dtb.end();
         let blob = dtb.build();
