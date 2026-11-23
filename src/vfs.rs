@@ -808,35 +808,23 @@ impl Vfs {
     }
 
     fn open(&mut self, owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {
+        // A rejected open returns Err to the caller; it must not print. The old
+        // VFSDBG lines echoed the resolved path to the shared console on every
+        // failure, which any task could trigger (console noise + path leak).
         if flags & !(OPEN_WRITE | OPEN_APPEND) != 0
             || (flags & OPEN_APPEND != 0 && flags & OPEN_WRITE == 0)
         {
-            crate::console::write_str("VFSDBG flags
-");
             return Err(());
         }
         let resolved = resolve_path(cwd, path)?;
         let (mount, relative) = self.resolve(&resolved);
         if self.mounts[mount].fs.is_directory(&relative)? {
-            crate::console::write_str("VFSDBG isdir ");
-            crate::console::write_str(&resolved);
-            crate::console::write_str("
-");
             return Err(());
         }
         // Opening a path that does not exist must fail here. Without this
         // probe the old code recorded an OpenFile for any non-directory name
         // and only failed on the first read, as EBADF instead of ENOENT.
-        let length = match self.mounts[mount].fs.len(&relative) {
-            Ok(length) => length,
-            Err(()) => {
-                crate::console::write_str("VFSDBG len ");
-                crate::console::write_str(&resolved);
-                crate::console::write_str("
-");
-                return Err(());
-            }
-        };
+        let length = self.mounts[mount].fs.len(&relative)?;
         let append = flags & OPEN_APPEND != 0;
         let offset = if append { length } else { 0 };
 

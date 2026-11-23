@@ -4041,6 +4041,27 @@ pub fn schedule() {
         interrupts::restore_irq(saved_daif);
         return;
     };
+    // A runnable task must not be punished with a full idle round trip.
+    // `find_next_task` only sees queued tasks, and the outgoing task is enqueued
+    // *after* this decision, so when it is Ready on this CPU (it yielded, or a
+    // tick preempted it) and the only candidate is an idle task, the "switch"
+    // would park the CPU in `wfi` until the next tick. That capped a `yield`
+    // loop at the tick rate: `bench sched` measured ~200 yields/s (5 ms each,
+    // half of the 10 ms tick) instead of a same-CPU resumption. Idle still runs
+    // whenever nothing is runnable, i.e. when the outgoing task is not Ready.
+    if had_current
+        && !live_is_dead
+        && manager.tasks[next_index].is_idle
+        && manager.tasks[current_index].state == TaskState::Ready
+        && !manager.tasks[current_index].is_idle
+    {
+        manager.tasks[current_index].state = TaskState::Running;
+        SCHED_PASS_ACTIVE[pass_cpu].store(false, Ordering::Release);
+        smp::bkl_release();
+        interrupts::restore_irq(saved_daif);
+        return;
+    }
+
     if had_current && next_index == current_index && !live_is_dead {
         // Self-continuation: this CPU keeps running the same task and keeps
         // holding the kernel lock for it. The probe above marked it Ready so
@@ -4185,7 +4206,7 @@ pub fn schedule() {
 }
 
 fn spawn_kernel(entry: extern "C" fn() -> !) -> Option<u64> {
-    spawn_inner(Some(entry), None, Vec::new(), Vec::new(), Vec::new())
+    spawn_inner(Some(entry), None, Vec::new(), Vec::new(), Vec::new(), false)
 }
 
 /// Spawns one idle task and marks it explicitly. Boot idle is id 0; AP idle
@@ -4221,6 +4242,7 @@ pub fn spawn_user(program: u64, argument: u64) -> Option<u64> {
         Vec::new(),
         Vec::new(),
         Vec::new(),
+        false,
     )
 }
 
@@ -5584,6 +5606,20 @@ pub fn cap_find_for_target(target: u64, rights: u32) -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether the current task may lend the console to a child it is spawning.
+///
+/// The console owner can (that is what owning it means), and so can a task that
+/// holds `CAP_CONSOLE_GRANT` directly. `SYS_CONSOLE_SET` checks a capability
+/// *handle* instead, which every spawner has for its own child; this check is
+/// about the caller's own position, so a plain driver cannot grab the console
+/// by spawning a helper.
+pub fn current_task_can_lend_console() -> bool {
+    current_task_mut().map_or(false, |task| {
+        let id = task.id;
+        task.owns_console || task.cap_table.has_self_rights(id, capability::CAP_CONSOLE_GRANT)
+    })
+}
+
 pub fn current_task_has_rights(rights: u32) -> bool {
     current_task_mut()
         .map(|task| {
@@ -5895,6 +5931,33 @@ pub fn spawn_user_with_args_and_cap(
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
 }
 
+/// Spawns an embedded program and makes it the console owner in the same
+/// scheduler pass (`SYS_SPAWN_ARGS_CONSOLE`).
+///
+/// This is what the shell uses for foreground commands: the child cannot run
+/// before it owns the console, so a fast utility cannot exit outputless
+/// between `SYS_SPAWN` and `SYS_CONSOLE_SET`. The caller must hold
+/// `CAP_CONSOLE_GRANT`; the syscall layer checks that before calling in.
+pub fn spawn_user_with_args_console_and_cap(
+    program: u64,
+    argument: u64,
+    arguments: Vec<u8>,
+) -> Option<capability::CapId> {
+    if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
+        return None;
+    }
+    let task_id = spawn_inner(
+        None,
+        Some((program, argument)),
+        arguments,
+        Vec::new(),
+        Vec::new(),
+        true,
+    )?;
+    let parent = current_task_mut()?;
+    Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
+}
+
 pub fn spawn_user_with_args(program: u64, argument: u64, arguments: Vec<u8>) -> Option<u64> {
     spawn_inner(
         None,
@@ -5902,6 +5965,7 @@ pub fn spawn_user_with_args(program: u64, argument: u64, arguments: Vec<u8>) -> 
         arguments,
         Vec::new(),
         Vec::new(),
+        false,
     )
 }
 
@@ -5917,7 +5981,7 @@ pub fn spawn_user_with_argv_envp_and_cap(
     if current_task_mut().map_or(true, |task| !task.cap_table.has_capacity()) {
         return None;
     }
-    let task_id = spawn_inner(None, Some((program, argument)), Vec::new(), argv, envp)?;
+    let task_id = spawn_inner(None, Some((program, argument)), Vec::new(), argv, envp, false)?;
     let parent = current_task_mut()?;
     Some(parent.cap_table.insert(task_id, capability::CAP_ALL))
 }
@@ -5937,6 +6001,7 @@ fn spawn_inner(
     arguments: Vec<u8>,
     argv: Vec<Vec<u8>>,
     envp: Vec<Vec<u8>>,
+    console_to_child: bool,
 ) -> Option<u64> {
     let manager = scheduler_manager()?;
     if !has_task_capacity(manager) {
@@ -5991,6 +6056,24 @@ fn spawn_inner(
     manager.next_id += 1;
     // A freshly spawned task starts Ready: queue it on the spawning CPU.
     let index = manager.tasks.len() - 1;
+    if console_to_child {
+        // Atomic console handoff. `SYS_SPAWN` returns to a caller that then has
+        // to call `SYS_CONSOLE_SET`, and the child is already Ready: one timer
+        // tick in that window lets a fast command (`cat` of a small file) run to
+        // completion while it still owns no console, so its output is discarded
+        // and the handoff afterwards fails because the task is a zombie. Doing
+        // the handoff here closes the window: the child is the console owner
+        // before it can be dispatched at all.
+        let caller = current_task_id();
+        for candidate in &mut manager.tasks {
+            candidate.owns_console = candidate.id == id;
+        }
+        manager.console_parent = if caller == IDLE_TASK_ID {
+            None
+        } else {
+            Some(caller)
+        };
+    }
     enqueue_ready(manager, smp::this_cpu_id(), index);
     Some(id)
 }

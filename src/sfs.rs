@@ -92,16 +92,24 @@ static STATE: Mutex<State> = Mutex::new(State {
     device_blocks: 0,
 });
 
+/// Direct-mapped block cache: block `b` always lives in slot `b % CACHE_BLOCKS`.
+///
+/// It used to be a ring that searched all 512 slots by key on every access. Each
+/// SFS lookup touches ~7 blocks (root inode, directory data, file inode, …), so
+/// a single `open` paid ~3 500 key comparisons that produced nothing; `bench fs`
+/// measured 70 µs per open. `% CACHE_BLOCKS` makes lookup O(1) and needs no extra
+/// memory. The price is that two blocks mapping to the same slot evict each
+/// other; with 131 072 blocks on a 64 MiB image collisions are rare, and the
+/// access pattern (superblock, inode table, directory blocks, sequential data)
+/// keeps a working set that stays resident.
 struct Cache {
     keys: [u32; CACHE_BLOCKS],
     data: [[u8; BLOCK_SIZE]; CACHE_BLOCKS],
-    next: usize,
 }
 
 static CACHE: Mutex<Cache> = Mutex::new(Cache {
     keys: [u32::MAX; CACHE_BLOCKS],
     data: [[0_u8; BLOCK_SIZE]; CACHE_BLOCKS],
-    next: 0,
 });
 
 fn put_u32_at(bytes: &mut [u8], offset: usize, value: u32) {
@@ -163,23 +171,25 @@ fn dir_entry_name_block(bytes: &[u8], offset: usize) -> Option<u32> {
 }
 
 fn read_block(block: u32, out: &mut [u8; BLOCK_SIZE]) -> bool {
+    let slot = block as usize % CACHE_BLOCKS;
     {
         let cache = CACHE.lock();
-        for index in 0..CACHE_BLOCKS {
-            if cache.keys[index] == block {
-                out.copy_from_slice(&cache.data[index]);
-                return true;
-            }
+        if cache.keys[slot] == block {
+            out.copy_from_slice(&cache.data[slot]);
+            return true;
         }
     }
     if !virtio_blk::read_sector(block as u64, out) {
         return false;
     }
     let mut cache = CACHE.lock();
-    let index = cache.next;
-    cache.next = (index + 1) % CACHE_BLOCKS;
-    cache.keys[index] = block;
-    cache.data[index].copy_from_slice(out);
+    // Re-check under the lock: another CPU may have loaded this block while the
+    // device read was in flight. Its copy is equally valid, so keep whichever
+    // key is there rather than clobbering it with our own.
+    if cache.keys[slot] != block {
+        cache.keys[slot] = block;
+        cache.data[slot].copy_from_slice(out);
+    }
     true
 }
 
@@ -229,17 +239,10 @@ fn write_block(block: u32, data: &[u8; BLOCK_SIZE]) -> bool {
     if !virtio_blk::write_sector(block as u64, data) {
         return false;
     }
+    let slot = block as usize % CACHE_BLOCKS;
     let mut cache = CACHE.lock();
-    for index in 0..CACHE_BLOCKS {
-        if cache.keys[index] == block {
-            cache.data[index].copy_from_slice(data);
-            return true;
-        }
-    }
-    let index = cache.next;
-    cache.next = (index + 1) % CACHE_BLOCKS;
-    cache.keys[index] = block;
-    cache.data[index].copy_from_slice(data);
+    cache.keys[slot] = block;
+    cache.data[slot].copy_from_slice(data);
     true
 }
 
@@ -401,16 +404,27 @@ impl Reader {
     /// (including the last one, which is `stat`/`open` semantics). A link
     /// budget bounds a cycle to a failed lookup instead of a hang.
     fn resolve(&self, path: &str) -> Option<u32> {
-        let mut pending: Vec<String> = path
-            .split('/')
-            .filter(|part| !part.is_empty())
-            .map(String::from)
-            .collect();
-        pending.reverse();
+        // Walking the path used to allocate a `String` per component and a
+        // `Vec` to hold them; every `open` resolves twice (directory check and
+        // length), so a simple lookup paid for several mallocs before it read
+        // anything. Components now borrow from `path`; only a symlink forces an
+        // owned remainder, pushed onto `pending` in front of the path iterator.
+        let mut components = path.split('/').filter(|part| !part.is_empty());
+        let mut pending: Vec<String> = Vec::new(); // Symlink remainder, front first.
         let mut current = self.superblock.root_inode;
         let mut hops = 0u32;
-        while let Some(part) = pending.pop() {
-            let child = self.find_child(current, &part)?;
+        loop {
+            // `part` borrows either the pushed-back symlink component (kept
+            // alive for this iteration by `next_pending`) or the path iterator.
+            let next_pending = pending.pop();
+            let part = match &next_pending {
+                Some(part) => part.as_str(),
+                None => match components.next() {
+                    Some(part) => part,
+                    None => break,
+                },
+            };
+            let child = self.find_child(current, part)?;
             let inode = self.inode(child)?;
             if inode.is_symlink() {
                 hops += 1;
@@ -430,9 +444,9 @@ impl Reader {
                 for part in parts.into_iter().rev() {
                     pending.push(part);
                 }
-                continue;
+            } else {
+                current = child;
             }
-            current = child;
         }
         Some(current)
     }
@@ -526,15 +540,43 @@ impl Reader {
                 if child == 0 {
                     continue;
                 }
-                let Some(candidate) = self.entry_name(&bytes, offset) else {
-                    continue;
-                };
-                if candidate == name.as_bytes() {
+                if self.entry_name_matches(&bytes, offset, name) {
                     return Some(child);
                 }
             }
         }
         None
+    }
+
+    /// Compares one directory entry's name to `name` without materialising it.
+    ///
+    /// `entry_name` allocates a `Vec` per entry, and `find_child` inspects every
+    /// entry of every directory block, so a lookup of `/sfs/readme.txt` used to
+    /// allocate once per entry in `/sfs` (dozens) before it found a match. The
+    /// length check comes first, so a long-name entry whose size already
+    /// differs never even pays the overflow-block read.
+    fn entry_name_matches(&self, bytes: &[u8; BLOCK_SIZE], offset: usize, name: &str) -> bool {
+        let length = bytes[offset + 4];
+        if length == NAME_LONG_MARK {
+            let Some(block) = dir_entry_name_block(bytes, offset) else {
+                return false;
+            };
+            let length = u16_at(bytes, offset + ENTRY_NAME_LEN) as usize;
+            if length == 0 || length > NAME_LIMIT || length != name.len() {
+                return false;
+            }
+            let mut name_bytes = [0_u8; BLOCK_SIZE];
+            if !read_block(block, &mut name_bytes) {
+                return false;
+            }
+            &name_bytes[..length] == name.as_bytes()
+        } else {
+            let length = length as usize;
+            if length == 0 || length > NAME_INLINE_LIMIT || length != name.len() {
+                return false;
+            }
+            &bytes[offset + 5..offset + 5 + length] == name.as_bytes()
+        }
     }
 
     /// Name stored in one directory entry, following the overflow block.

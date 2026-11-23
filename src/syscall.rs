@@ -84,6 +84,10 @@ pub const SYS_MMIO_GRANT: u64 = 102;
 pub const SYS_MMIO_CLAIM: u64 = 103;
 /// Whether the platform/DT bound a driver program.
 pub const SYS_DRIVER_BOUND: u64 = 104;
+/// Like `SYS_SPAWN_ARGS`, but the new task owns the console before it is
+/// dispatched: no window in which a fast child can run (and lose its output)
+/// before the parent hands it the console.
+pub const SYS_SPAWN_ARGS_CONSOLE: u64 = 105;
 /// Spawns a dynamically loaded ELF with the AArch64 **Linux** syscall
 /// personality (`x8` = Linux syscall number) instead of the Silver table.
 pub const SYS_SPAWN_LINUX_PATH: u64 = 98;
@@ -360,6 +364,9 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
         SYS_HEALTH => sys_health(frame[0]),
         SYS_TASK_LIST => sys_task_list(frame[0], frame[1]),
         SYS_SPAWN_ARGS => sys_spawn_with_args(frame[0], frame[1], frame[2], frame[3]),
+        SYS_SPAWN_ARGS_CONSOLE => {
+            sys_spawn_with_args_console(frame[0], frame[1], frame[2], frame[3])
+        }
         SYS_ARGS => sys_arguments(frame[0], frame[1]),
         SYS_WAIT => scheduler::capability_task_id_with_rights(frame[0], capability::CAP_WAIT)
             .and_then(scheduler::wait_for_task)
@@ -554,6 +561,28 @@ fn sys_spawn_with_args(program: u64, argument: u64, ptr: u64, len: u64) -> u64 {
         return SYSCALL_ERROR;
     }
     scheduler::spawn_user_with_args_and_cap(program, argument, arguments).unwrap_or(SYSCALL_ERROR)
+}
+
+/// `SYS_SPAWN_ARGS_CONSOLE(program, argument, ptr, len)`.
+///
+/// Identical argument handling to [`sys_spawn_with_args`], plus the console
+/// handoff performed inside the spawn (see
+/// `scheduler::spawn_user_with_args_console_and_cap`). The caller must hold
+/// `CAP_CONSOLE_GRANT`: it is lending the console it owns, not taking someone
+/// else's.
+fn sys_spawn_with_args_console(program: u64, argument: u64, ptr: u64, len: u64) -> u64 {
+    if !scheduler::current_task_can_lend_console() {
+        return SYSCALL_ERROR;
+    }
+    if len > ARGUMENT_LIMIT as u64 {
+        return SYSCALL_ERROR;
+    }
+    let mut arguments = vec![0_u8; len as usize];
+    if user_memory::copy_from_user(ptr, &mut arguments).is_err() {
+        return SYSCALL_ERROR;
+    }
+    scheduler::spawn_user_with_args_console_and_cap(program, argument, arguments)
+        .unwrap_or(SYSCALL_ERROR)
 }
 
 /// `SYS_WAITPID(pid, status_ptr)`: waits for an authorized child (direct child

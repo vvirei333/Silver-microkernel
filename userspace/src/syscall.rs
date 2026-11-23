@@ -54,6 +54,8 @@ const SYS_DMA_GRANT_SELF: u64 = 101;
 const SYS_MMIO_GRANT: u64 = 102;
 const SYS_MMIO_CLAIM: u64 = 103;
 const SYS_DRIVER_BOUND: u64 = 104;
+/// Spawn with the console handed to the child inside the spawn itself.
+const SYS_SPAWN_ARGS_CONSOLE: u64 = 105;
 const SYS_MAP_PHYS: u64 = 62;
 const SYS_MAP_PHYS_NC: u64 = 96;
 const SYS_BIND_IRQ: u64 = 63;
@@ -230,6 +232,35 @@ pub fn read() -> Option<u8> {
 
 pub fn uptime_ticks() -> u64 {
     unsafe { syscall0(SYS_UPTIME) }
+}
+
+/// Reads the always-on system counter (`CNTPCT_EL0`) straight from EL0.
+///
+/// The kernel unmasks EL0 access per CPU in `timer::enable_el0_counter`, so this
+/// costs one `mrs` and no trap: benchmarks can time user-space loops without a
+/// syscall inside the window they measure (which would cost more than most of
+/// the operations under test). Divide deltas by [`counter_frequency`] for time.
+pub fn counter() -> u64 {
+    let value: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntpct_el0", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    value
+}
+
+/// Returns the counter rate in Hz (`CNTFRQ_EL0`). Readable at EL0; falls back to
+/// 62.5 MHz (QEMU `virt`) only if firmware left it zero, which never happens on
+/// a platform that reached EL0 in the first place.
+pub fn counter_frequency() -> u64 {
+    let value: u64;
+    unsafe {
+        core::arch::asm!("mrs {}, cntfrq_el0", out(reg) value, options(nomem, nostack, preserves_flags));
+    }
+    if value == 0 {
+        62_500_000
+    } else {
+        value
+    }
 }
 
 /// Fills `buffer` from the kernel CSPRNG. Returns `false` when the kernel
@@ -507,6 +538,31 @@ pub fn spawn_with_args(program: u64, argument: u64, arguments: &str) -> Option<u
     let cap_id = unsafe {
         syscall4(
             SYS_SPAWN_ARGS,
+            program,
+            argument,
+            arguments.as_ptr() as u64,
+            arguments.len() as u64,
+        )
+    };
+    optional_id(cap_id)
+}
+
+/// Spawns an embedded program and makes it the console owner before it can run.
+///
+/// Preferable to `spawn_with_args` + `console_set` for foreground commands: the
+/// child is Ready as soon as the spawn returns, so a timer tick before the
+/// handoff can let a fast command finish with its output discarded.
+pub fn spawn_with_args_console(
+    program: u64,
+    argument: u64,
+    arguments: &str,
+) -> Option<u64> {
+    if arguments.len() > 192 {
+        return None;
+    }
+    let cap_id = unsafe {
+        syscall4(
+            SYS_SPAWN_ARGS_CONSOLE,
             program,
             argument,
             arguments.as_ptr() as u64,

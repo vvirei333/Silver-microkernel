@@ -34,6 +34,7 @@ pub fn cpu_ticks(cpu: usize) -> u64 {
 }
 
 pub fn init() {
+    enable_el0_counter();
     let mut frequency = counter_frequency();
     if frequency == 0 {
         // CNTFRQ_EL0 is architecturally required to be programmed by the
@@ -66,6 +67,44 @@ pub fn init() {
     set_control(1);
 }
 
+/// Grants EL0 read access to the always-on system counters through
+/// `CNTKCTL_EL1.EL0{PCT,VC}TEN`.
+///
+/// Unprivileged timing is deliberate, not an oversight: it is the only way a
+/// user-space component can time its own fast paths (the `bench` shell command
+/// walks a syscall/IPC/filesystem loop and reads `CNTPCT_EL0` around it) without
+/// putting a syscall inside the measured loop, and it is the facility a future
+/// vDSO-style clock needs instead of `SYS_UPTIME` at 10 ms granularity.
+///
+/// Security trade-off: this exposes a free-running counter, not kernel state.
+/// The same timing information already leaks through `SYS_UPTIME`; the price is
+/// a finer-grained timing side channel inside processes that are, today, all in
+/// the same trust domain (console services spawned by `silverd`). Revisit if a
+/// sandboxed/untrusted EL0 component ever shares an address-space generation
+/// with secrets it must not be timed against.
+///
+/// Per-PE register: every CPU (boot CPU in [`init`], APs in [`cpu_init`]) sets
+/// its own copy before user threads can run on it.
+pub fn enable_el0_counter() {
+    let mut control: u64;
+    unsafe {
+        core::arch::asm!(
+            "mrs {}, cntkctl_el1",
+            out(reg) control,
+            options(nomem, nostack, preserves_flags)
+        );
+        control |= 1 << 0; // EL0PCTEN: allow CNTPCT_EL0 at EL0.
+        control |= 1 << 1; // EL0VCTEN: allow CNTVCT_EL0 at EL0.
+        core::arch::asm!(
+            "msr cntkctl_el1, {}",
+            in(reg) control,
+            options(nomem, nostack, preserves_flags)
+        );
+        // The new permission must be visible to the next EL0 entry on this PE.
+        core::arch::asm!("isb", options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Whether timer interrupts can actually be delivered on this platform.
 pub fn available() -> bool {
     crate::gic::timer_available()
@@ -75,6 +114,7 @@ pub fn available() -> bool {
 /// CPU in `init`); each AP arms its own physical timer and enables it so its
 /// preemption tick runs. An AP without a confirmed redistributor stays off.
 pub fn cpu_init() {
+    enable_el0_counter();
     if !available() {
         return;
     }
