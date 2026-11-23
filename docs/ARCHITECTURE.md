@@ -113,8 +113,10 @@ QEMU -machine virt -cpu cortex-a72 -smp N
 | Path | Contents |
 |---|---|
 | `src/` | The kernel crate (single binary, feature-gated layers) |
+| `src/scheduler/` | Scheduler module: `mod.rs` (queues, spawn/wait/exit, switch) and `selftest.rs` (boot probes) |
 | `userspace/` | Native userspace crate (silverd, Howl, net_server, tools, ELF engine) |
 | `tests/linux/` | Freestanding Linux-ABI test programs (glibc-free probes) |
 | `tools/` | Image builders (Alpine edge + Debian trixie staging), boot/dump scripts |
-| `scripts/` | SFS image creation/injection/fsck tooling |
-| `docs/` | This documentation set |
+| `scripts/` | SFS image creation/injection/fsck tooling, release bundle (`make_release.sh`), release gate (`release_smoke.py`) |
+| `docs/` | This documentation set; start at [README.md](README.md), modularisation in [REFACTOR.md](REFACTOR.md) |
+| `docs/archive/` | Superseded documents, kept for provenance only |

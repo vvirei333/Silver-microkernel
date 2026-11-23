@@ -53,6 +53,14 @@ loader.
 ## virtio-blk — IMPLEMENTED (device side)
 
 The kernel probes virtio-blk via FDT and registers the disk image as the SFS
-backing store. No partitioning, no write-back to the host image (the guest
-image is immutable; writes go to scratch). A persistent writable SFS is
-PLANNED.
+backing store. No partitioning. Writes are **write-through**: the block cache
+updates the image through the device on every create/write/remove, so a file
+written at the shell survives a reboot (verified: `echo … > /sfs/keep.txt`,
+reboot, `cat`, then `scripts/sfs_fsck.py` reports no cross-links and a
+consistent bitmap). The image is the source of truth, not RAM.
+
+What is still missing is **crash consistency**: bitmap, inode table and
+directory blocks are read-modify-written in place without a journal, so an
+interrupted multi-block operation (power loss mid-write) can leave an
+inconsistent image. `scripts/sfs_fsck.py` is the offline check; a journal (or
+copy-on-write block tree) is PLANNED.

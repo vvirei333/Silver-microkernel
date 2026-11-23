@@ -42,11 +42,23 @@ answering "no systemd available", and NOPs the two equivalent asserts
 baked into Debian's libudev. Owner decision: cut systemd off instead of
 emulating it ("systemd слишком много хавать" — OpenRC stays).
 
-## D6 — SFS images are immutable in the guest; writes go to scratch
+## D6 — SFS is persistent, write-through, and not yet crash-consistent
 
-Simplicity and crash safety: the kernel serves `/tmp` writes from in-kernel
-buffers and never mutates the image. A persistent writable SFS is a
-roadmap item and will arrive with journaling considerations, not before.
+*Superseded decision (2026-11): the image used to be treated as immutable and
+`/tmp` was the only writable place. That is no longer true.*
+
+The streaming reader became a write-through block cache, so create, truncate,
+write, mkdir and remove all reach the image (SFS keeps `/tmp` on RamFs for
+scratch). Persistence is verified end to end: write under `/sfs`, reboot on the
+same image, read the file back, and `scripts/sfs_fsck.py` still reports a
+consistent bitmap and no cross-links.
+
+The trade-off that replaced "writes go to RAM" is crash consistency: bitmap,
+inode table and directory blocks are read-modify-written in place, so a power
+loss in the middle of a multi-block operation can leave a damaged image. Two
+ways out, both bigger than this release: a journal (redo log + replay on
+mount) or a copy-on-write block tree. Until one lands, the honest statement is
+"writes survive an orderly reboot, not a power cut".
 
 ## D7 — Software rendering first
 

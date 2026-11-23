@@ -25,6 +25,7 @@ frame by frame.
 | Document | Contents |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | Install and quickstart: QEMU today, board status and port checklist |
+| [docs/README.md](docs/README.md) | Documentation index: what to read, status legend, how to reproduce every claim |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture, layers, boot chain |
 | [docs/KERNEL.md](docs/KERNEL.md) | Silver microkernel internals (memory, scheduler, IPC, drivers) |
 | [docs/USERSPACE.md](docs/USERSPACE.md) | Native userspace: silverd, Howl, net_server, toolbox |
@@ -36,6 +37,7 @@ frame by frame.
 | [docs/DRIVER_MODEL.md](docs/DRIVER_MODEL.md) | Driver/device model and deviations |
 | [docs/DESIGN_DECISIONS.md](docs/DESIGN_DECISIONS.md) | Decisions with reasons, BSD-idea analysis |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Phases against the real code |
+| [docs/REFACTOR.md](docs/REFACTOR.md) | Modularisation plan: rules, done, next steps |
 | [docs/STATUS.md](docs/STATUS.md) | Implementation status with verification markers |
 
 ## Project direction
@@ -1252,7 +1254,8 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `src/timer.rs` | ARM Generic Timer, tick counter |
 | `src/interrupts.rs` | IRQ control: masking/restoring DAIF |
 | `src/capability.rs` | Capability tables, rights, delegation and revocation |
-| `src/scheduler.rs` | Tasks, capabilities, DMA ownership, console control and reaping |
+| `src/scheduler/mod.rs` | Task table, ready queues, spawn/wait/exit, context switch, DMA ownership, console control and reaping |
+| `src/scheduler/selftest.rs` | Scheduler boot probes and stress harnesses (child module: reads private state without widening it) |
 | `src/mutex.rs` | Blocking mutex with FIFO waiters and ownership tracking |
 | `src/wait_queue.rs` | Shared FIFO queue with dead-waiter removal |
 | `src/ipc.rs` | Bounded mailboxes, backpressure, timed/selective receive and cleanup |
@@ -1283,6 +1286,9 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `redmi10c_poc/test_fog_qemu.sh` | Fog QEMU relocation/at-link/fail-closed regression |
 | `redmi10c_poc/build_boot_image.sh` | RAM-only Android boot image v3 builder (no device operation) |
 | `scripts/sign_bundle.py` | Ed25519 key generation, manifest signing and verification |
+| `scripts/make_release.sh` | ConsoleOS release bundle: kernel + image + `MANIFEST`/`SHA256SUMS` + tarball |
+| `scripts/release_smoke.py` | Release gate: boots the packaged artifacts and checks 8 behaviours |
+| `docs/INSTALL.md` | Install/quickstart guide, board status and port checklist |
 | `.cargo/config.toml` | Target, rust-lld linker, `-Tlinker.ld` flag |
 
 ## Memory model

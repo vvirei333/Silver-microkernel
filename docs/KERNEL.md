@@ -29,8 +29,11 @@ same kernel through a platform abstraction (`platform.rs`).
 
 ## 2. Scheduler and SMP — IMPLEMENTED
 
-- Per-CPU run queues with work stealing (`scheduler.rs`, `smp.rs`),
-  up to 8 PEs, GICv3 SGIs for IPI reschedule.
+- Per-CPU run queues with work stealing (`scheduler/`, `smp.rs`),
+  up to 8 PEs, GICv3 SGIs for IPI reschedule. The scheduler is a module
+  directory: `scheduler/mod.rs` (task table, queues, spawn/wait/exit, context
+  switch) and `scheduler/selftest.rs` (boot probes and stress harnesses, which
+  are a child module so they can inspect private state without widening it).
 - Cooperative syscall-driven scheduling plus timer preemption; per-CPU
   idle + tick handling (`timer.rs`).
 - Policy layer (`sched_policy.rs`): fail-closed scheduling decisions,
@@ -86,7 +89,8 @@ UAPI. Gated behind the `linux-abi` cargo feature.
 
 - Boot self-tests, fail closed on mismatch: MMU/ASID, SMP churn, TLB
   cross-PE probe, DMA zeroing/leases, IRQ, VFS, timer, frame-reserve
-  (`main.rs` test section).
+  (`main.rs` test section; scheduler-owned probes live in
+  `src/scheduler/selftest.rs`).
 - `no_mangle` diagnostic rings (TRACE_RING syscall history, LAZY_FAIL/OK,
   DUMP_RING) for guest debugging; pmemsave-based post-mortem tooling in
   `tools/boot_dump.py`.

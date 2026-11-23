@@ -358,6 +358,10 @@ contains the current test image.
 
 ## Next
 
+0. **Modularisation** (see [REFACTOR.md](REFACTOR.md)): the scheduler is now a
+   module directory; `task.rs`, `wait.rs`, `spawn.rs`, `switch.rs`, then
+   `main.rs`/`linux_abi.rs`/`silvershell.rs` follow, one pure-move commit at a
+   time, each gated by the release smoke test and the SMP self-tests.
 1. Several clients with **per-surface focus** (keyboard/pointer enter/leave
    driven by surface commits) and a small animation loop in the compositor.
 2. **Streaming SFS** (read blocks on demand instead of loading the whole
