@@ -100,6 +100,101 @@ pub fn init() {
     }
 }
 
+/// One console line assembled in a stack buffer.
+///
+/// Every `console::write_*` call takes the writer lock separately, so a line
+/// built from several calls can be cut in half by another CPU (the task-exit
+/// trace is the visible case: a user task printing on CPU1 lands inside it).
+/// Building the line first and emitting it with one [`Line::emit`] call makes
+/// the whole line atomic without widening the writer lock around kernel code.
+pub struct Line {
+    buffer: [u8; Line::CAPACITY],
+    len: usize,
+}
+
+impl Line {
+    pub const CAPACITY: usize = 128;
+
+    pub const fn new() -> Self {
+        Self {
+            buffer: [0; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    pub fn str(&mut self, text: &str) -> &mut Self {
+        let room = Self::CAPACITY - self.len;
+        let take = text.len().min(room);
+        self.buffer[self.len..self.len + take].copy_from_slice(&text.as_bytes()[..take]);
+        self.len += take;
+        self
+    }
+
+    pub fn byte(&mut self, byte: u8) -> &mut Self {
+        if self.len < Self::CAPACITY {
+            self.buffer[self.len] = byte;
+            self.len += 1;
+        }
+        self
+    }
+
+    /// Appends `value` in decimal. A value that does not fit is dropped rather
+    /// than printed truncated: a wrong number is worse than a short line.
+    pub fn dec(&mut self, value: u64) -> &mut Self {
+        let mut digits = [0_u8; 20];
+        let mut count = 0;
+        let mut remaining = value;
+        loop {
+            digits[count] = b'0' + (remaining % 10) as u8;
+            count += 1;
+            remaining /= 10;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if Self::CAPACITY - self.len >= count {
+            for index in 0..count {
+                self.buffer[self.len + index] = digits[count - 1 - index];
+            }
+            self.len += count;
+        }
+        self
+    }
+
+    /// Appends `value` as 16 zero-padded hex digits.
+    pub fn hex_u64(&mut self, value: u64) -> &mut Self {
+        const HEX: &[u8; 16] = b"0123456789ABCDEF";
+        if Self::CAPACITY - self.len >= 16 {
+            for index in 0..16 {
+                self.buffer[self.len + index] = HEX[((value >> (60 - index * 4)) & 0xF) as usize];
+            }
+            self.len += 16;
+        }
+        self
+    }
+
+    pub fn bytes(&mut self, bytes: &[u8]) -> &mut Self {
+        let room = Self::CAPACITY - self.len;
+        let take = bytes.len().min(room);
+        self.buffer[self.len..self.len + take].copy_from_slice(&bytes[..take]);
+        self.len += take;
+        self
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.buffer[..self.len]
+    }
+
+    /// Writes the assembled line in one call (one writer-lock acquisition).
+    pub fn emit(&self) -> usize {
+        if self.len == 0 {
+            return 0;
+        }
+        write_bytes(self.data());
+        self.len
+    }
+}
+
 pub fn write_byte(byte: u8) {
     let _writer = WriterGuard::acquire();
     match active() {

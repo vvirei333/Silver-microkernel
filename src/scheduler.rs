@@ -2108,17 +2108,17 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
     // Kernel tasks (program == u64::MAX) are internal probes; their exit is
     // not user-visible evidence and would only flood the console.
     if program != u64::MAX {
-        console::write_str("EXIT: task=");
-        console::write_dec_u64(id);
-        console::write_str(" program=");
-        console::write_dec_u64(program);
-        console::write_str(" status=");
-        console::write_dec_u64(status);
+        // Assembled into one line and emitted once: the trace used to be seven
+        // console calls, so a task printing on another CPU could land in the
+        // middle of it.
+        let mut line = console::Line::new();
+        line.str("EXIT: task=").dec(id);
+        line.str(" program=").dec(program);
+        line.str(" status=").dec(status);
         // Packed reports (see the filesystem server's mount failure) are
         // unreadable in decimal, so the same value is repeated in hex.
-        console::write_str(" (0x");
-        console::write_hex_u64(status);
-        console::write_str(")\r\n");
+        line.str(" (0x").hex_u64(status).str(")\r\n");
+        line.emit();
     }
     #[cfg(feature = "linux-abi")]
     if let Some(pointer) = clear_tid {

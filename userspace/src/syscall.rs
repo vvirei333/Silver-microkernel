@@ -374,6 +374,64 @@ pub unsafe fn receive_raw(buffer: *mut ipc::Message) -> bool {
     unsafe { syscall2(SYS_RECEIVE, buffer as u64, u64::MAX) == 0 }
 }
 
+/// One console line assembled in a stack buffer.
+///
+/// `SYS_PRINT` is atomic per call, but a line built from several calls is not:
+/// a kernel trace from another CPU can be spliced between "Spawned task ID="
+/// and the number. Build the line, then emit it once.
+pub struct Line {
+    buffer: [u8; Line::CAPACITY],
+    len: usize,
+}
+
+impl Line {
+    pub const CAPACITY: usize = 128;
+
+    pub const fn new() -> Self {
+        Self {
+            buffer: [0; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    pub fn str(&mut self, text: &str) -> &mut Self {
+        let room = Self::CAPACITY - self.len;
+        let take = text.len().min(room);
+        self.buffer[self.len..self.len + take].copy_from_slice(&text.as_bytes()[..take]);
+        self.len += take;
+        self
+    }
+
+    /// Appends `value` in decimal. A value that does not fit is dropped rather
+    /// than printed truncated.
+    pub fn dec(&mut self, value: u64) -> &mut Self {
+        let mut digits = [0_u8; 20];
+        let mut count = 0;
+        let mut remaining = value;
+        loop {
+            digits[count] = b'0' + (remaining % 10) as u8;
+            count += 1;
+            remaining /= 10;
+            if remaining == 0 {
+                break;
+            }
+        }
+        if Self::CAPACITY - self.len >= count {
+            for index in 0..count {
+                self.buffer[self.len + index] = digits[count - 1 - index];
+            }
+            self.len += count;
+        }
+        self
+    }
+
+    pub fn emit(&self) {
+        if self.len != 0 {
+            print_bytes(&self.buffer[..self.len]);
+        }
+    }
+}
+
 pub fn print(text: &str) {
     print_bytes(text.as_bytes());
 }

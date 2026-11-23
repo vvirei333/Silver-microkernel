@@ -68,6 +68,9 @@ pub extern "C" fn _start(howler_id: u64) -> ! {
     let mut howler = HowlerLink::new(howler_id);
     loop {
         let Some(byte) = read_input(&mut howler) else {
+            // Only reached on a mailbox timeout or without a UART driver:
+            // `read_input` blocks on the mailbox, so this is not the input poll
+            // path and the tick spent here is immaterial.
             syscall::sleep(1);
             continue;
         };
@@ -146,6 +149,15 @@ impl HowlerLink {
     }
 }
 
+/// How long the shell parks on its mailbox before looking around again.
+///
+/// Input used to be polled: `receive_timeout(.., 0)` in a loop with
+/// `sleep(1)` between attempts, i.e. a wakeup every tick and up to 10 ms of
+/// typing latency. A blocking receive with a long timeout is woken by the
+/// UART driver's first byte (near-zero latency) and costs nothing while idle;
+/// the timeout only decides how often the shell re-resolves a restarted Howler.
+const INPUT_WAIT_TICKS: u64 = 100;
+
 fn read_input(howler: &mut HowlerLink) -> Option<u8> {
     let Some(howler_id) = howler.resolve() else {
         // No userspace UART driver (for example the first Redmi 10C boot,
@@ -154,8 +166,13 @@ fn read_input(howler: &mut HowlerLink) -> Option<u8> {
         return syscall::read();
     };
 
-    let mut message = ipc::Message::new(0, &[]);
-    while syscall::receive_timeout(&mut message, 0).is_ok() {
+    loop {
+        let mut message = ipc::Message::new(0, &[]);
+        // Blocking receive. Timeout or a vanished sender ends this attempt so
+        // the caller can re-resolve Howler after a supervisor restart.
+        if syscall::receive_timeout(&mut message, INPUT_WAIT_TICKS).is_err() {
+            return None;
+        }
         if message.sender == howler_id && message.payload[0] == 0 {
             return Some(message.payload[1]);
         }
@@ -163,7 +180,6 @@ fn read_input(howler: &mut HowlerLink) -> Option<u8> {
             report_gui_press(&message.payload[1..]);
         }
     }
-    None
 }
 
 /// Prints a button-press notification received from `gpu_driver`. This is what
@@ -1902,11 +1918,10 @@ fn spawn_program(program: Option<&str>, argument: Option<&str>, background: bool
         if let Some(id) = syscall::cap_get_task_id(cap_id) {
             grant_device_rights(cap_id, id, program);
             remember_unreaped(cap_id);
-            syscall::print("Spawned task ID=");
-            syscall::print_dec_u64(id);
-            syscall::print(" CapId=");
-            syscall::print_dec_u64(cap_id);
-            syscall::print("\r\n");
+            let mut line = syscall::Line::new();
+            line.str("Spawned task ID=").dec(id);
+            line.str(" CapId=").dec(cap_id).str("\r\n");
+            line.emit();
         } else {
             syscall::print("Spawned, but could not resolve CapId.\r\n");
         }
