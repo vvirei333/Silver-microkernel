@@ -82,6 +82,12 @@ fn active() -> Active {
                 UartKind::Pl011 => Active::None,
             }
         }
+        // Pi 5: the debug UART is a PL011, but its base must come from the
+        // device tree and `pl011.rs` still drives QEMU's fixed address. P0 of
+        // `docs/PI5.md` is exactly this: a PL011 whose base is passed in. Until
+        // then, silence — writing to an unproven MMIO address is a bus abort,
+        // not a diagnostic.
+        Kind::Bcm2712 => Active::None,
         Kind::Unknown => Active::None,
     }
 }

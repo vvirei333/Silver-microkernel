@@ -9,6 +9,7 @@ disagrees with a boot log is a bug in the document.
 | If you want to… | Read |
 |---|---|
 | install and run it | [INSTALL.md](INSTALL.md) — QEMU quickstart, checksums, board status |
+| bring it up on a real board | [PI5.md](PI5.md) — Raspberry Pi 5 (BCM2712) plan, milestones, what a board owner can contribute |
 | see what is actually done | [STATUS.md](STATUS.md) — capabilities, limits, test matrix, measured numbers |
 | understand the shape of the system | [ARCHITECTURE.md](ARCHITECTURE.md) — layers, boot chain, repository layout |
 | work on the kernel | [KERNEL.md](KERNEL.md) — memory, scheduler, IPC, drivers |

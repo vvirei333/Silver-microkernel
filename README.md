@@ -25,6 +25,7 @@ frame by frame.
 | Document | Contents |
 |---|---|
 | [docs/INSTALL.md](docs/INSTALL.md) | Install and quickstart: QEMU today, board status and port checklist |
+| [docs/PI5.md](docs/PI5.md) | First physical board target: Raspberry Pi 5 (BCM2712) milestones and port plan |
 | [docs/README.md](docs/README.md) | Documentation index: what to read, status legend, how to reproduce every claim |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | System architecture, layers, boot chain |
 | [docs/KERNEL.md](docs/KERNEL.md) | Silver microkernel internals (memory, scheduler, IPC, drivers) |

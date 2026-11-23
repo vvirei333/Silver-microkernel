@@ -131,9 +131,16 @@ Status of the candidate boards:
 | Board | SoC | Status | Blocking work |
 |---|---|---|---|
 | QEMU `virt` | — | **Supported** | — |
-| Raspberry Pi 4 Model B | BCM2711 (Cortex-A72) | Not supported | SD/eMMC block driver, board platform + linker base, GIC-400 base from FDT, firmware boot chain |
-| Raspberry Pi 5 | BCM2712 (Cortex-A76) | Not supported | Same as Pi 4, plus the Pi 5 UART/GPIO layout and PCIe-attached peripherals |
+| Raspberry Pi 5 | BCM2712 (Cortex-A76) | **Target**, not supported | Platform + linker base, UART/GIC/timer bases from the DTB, PSCI SMP, storage behind the RP1 southbridge/PCIe. Plan and milestone ladder: [PI5.md](PI5.md) |
+| Raspberry Pi 4 Model B | BCM2711 (Cortex-A72) | Not supported | Same plan one SoC earlier; simpler storage path |
 | Redmi 10C (`fog`) | SM6225 | Parked port | `fog.rs`/`platform.rs`/GENI UART merged behind feature flags; not bootable to userspace yet |
+
+The first physical board this project aims at is a **Raspberry Pi 5**: a
+console image needs only a UART, which keeps the bring-up small, and the board
+is common enough that porting work can be verified by more than one person.
+[PI5.md](PI5.md) lists what is known, what must be confirmed from the live
+device tree, and the milestones (console log → timer/GIC → userspace from RAM →
+storage → power).
 
 What a Raspberry Pi port actually requires (this is the checklist, not a
 promise of dates):

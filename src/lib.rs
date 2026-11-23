@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+pub mod board;
 pub mod bundle;
 pub mod bundle_sig;
 pub mod cache_policy;

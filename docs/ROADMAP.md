@@ -79,6 +79,10 @@ Current: first rendered desktop frame. Split work:
 
 - Persistent writable SFS, devfs-style enumeration.
 - Driver-process split for gpu/blk.
+- First physical board target: **Raspberry Pi 5 (BCM2712)** — a console image
+  needs only the debug UART, so the ladder is P0 boot log → P1 timer/GIC →
+  P2 console userspace from RAM → P3 root filesystem on the board → P4 power.
+  See [PI5.md](PI5.md); nothing on that list is claimed as done yet.
 - Hardware bring-up resumes after the QEMU desktop milestone: the Redmi 10C
   (`fog`, SM6225) port is PARKED, its kernel-side platform support
   (`platform.rs`, `fog.rs`, GENI UART, simplefb) already merged behind
