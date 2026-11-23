@@ -139,6 +139,18 @@ pub struct DirEntry {
     pub kind: u64,
 }
 
+/// What `open` needs to know about a path: kind and size.
+///
+/// It exists so one backend lookup can answer both questions. Asking
+/// `is_directory` and then `len` walks the path twice, which on SFS means
+/// re-reading the same directory blocks (measured: the largest single part of
+/// `fs open+close` after the cache fix).
+#[derive(Copy, Clone, Default)]
+pub struct Metadata {
+    pub directory: bool,
+    pub size: usize,
+}
+
 /// A filesystem backend. Every path is normalized and **relative to this
 /// backend's root** (`""` is the root itself); the VFS mount layer has already
 /// stripped the mount-point prefix. Implementations never see the mount table.
@@ -154,6 +166,15 @@ pub trait FileSystem {
         Err(())
     }
     fn is_directory(&self, path: &str) -> Result<bool, ()>;
+    /// Kind and size of `path` in one lookup. The default keeps every backend
+    /// correct (two calls); backends that resolve a path in one walk override
+    /// it so `open` pays one walk instead of two.
+    fn metadata(&self, path: &str) -> Result<Metadata, ()> {
+        Ok(Metadata {
+            directory: self.is_directory(path)?,
+            size: self.len(path)?,
+        })
+    }
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, ()>;
     /// Reads at most `limit` bytes starting at `offset` (clamped to EOF).
     fn read_at(&self, path: &str, offset: usize, limit: usize) -> Result<Vec<u8>, ()>;
@@ -449,6 +470,20 @@ impl FileSystem for RamFs {
         match &find_node(&self.root, &components).ok_or(())?.kind {
             NodeKind::Directory(_) => Ok(true),
             NodeKind::File(_) => Ok(false),
+        }
+    }
+
+    fn metadata(&self, path: &str) -> Result<Metadata, ()> {
+        let components = rel_components(path)?;
+        match &find_node(&self.root, &components).ok_or(())?.kind {
+            NodeKind::Directory(_) => Ok(Metadata {
+                directory: true,
+                size: 0,
+            }),
+            NodeKind::File(data) => Ok(Metadata {
+                directory: false,
+                size: data.len(),
+            }),
         }
     }
 
@@ -818,13 +853,14 @@ impl Vfs {
         }
         let resolved = resolve_path(cwd, path)?;
         let (mount, relative) = self.resolve(&resolved);
-        if self.mounts[mount].fs.is_directory(&relative)? {
+        // Kind and size in one backend walk. Opening a path that does not exist
+        // must fail here: the metadata probe is what distinguishes ENOENT from
+        // a bookkeeping entry that only fails on the first read (EBADF).
+        let metadata = self.mounts[mount].fs.metadata(&relative)?;
+        if metadata.directory {
             return Err(());
         }
-        // Opening a path that does not exist must fail here. Without this
-        // probe the old code recorded an OpenFile for any non-directory name
-        // and only failed on the first read, as EBADF instead of ENOENT.
-        let length = self.mounts[mount].fs.len(&relative)?;
+        let length = metadata.size;
         let append = flags & OPEN_APPEND != 0;
         let offset = if append { length } else { 0 };
 

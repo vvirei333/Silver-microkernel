@@ -16,7 +16,7 @@ use alloc::{string::String, vec::Vec};
 use crate::console;
 use crate::mutex::Mutex;
 use crate::sfs_format::{BLOCK_SIZE, DIRECT_BLOCKS, INDIRECT_POINTERS, INODE_SIZE};
-use crate::vfs::{DirEntry, FileSystem, FsUsage, MAX_NAME_LEN};
+use crate::vfs::{DirEntry, FileSystem, FsUsage, Metadata, MAX_NAME_LEN};
 use crate::virtio_blk;
 
 const MAGIC: u32 = 0x5346_5321;
@@ -1822,6 +1822,19 @@ impl FileSystem for Sfs {
     fn is_directory(&self, path: &str) -> Result<bool, ()> {
         let reader = reader().ok_or(())?;
         Ok(reader.is_directory(path))
+    }
+
+    /// One path walk and one inode read for both answers. `open` used to ask
+    /// `is_directory` and then `len`, i.e. two walks over the directory blocks
+    /// (the SFS block cache made each walk cheap, not free).
+    fn metadata(&self, path: &str) -> Result<Metadata, ()> {
+        let reader = reader().ok_or(())?;
+        let index = reader.resolve(path).ok_or(())?;
+        let inode = reader.inode(index).ok_or(())?;
+        Ok(Metadata {
+            directory: inode.is_dir(),
+            size: inode.size as usize,
+        })
     }
 
     fn read_dir(&self, path: &str) -> Result<Vec<DirEntry>, ()> {
