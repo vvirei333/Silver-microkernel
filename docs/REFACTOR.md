@@ -28,6 +28,7 @@ is its own commit so a regression can be bisected to a move.
 | Step | Result |
 |---|---|
 | `src/scheduler.rs` → module directory | `scheduler/mod.rs` + `scheduler/selftest.rs` (849 lines). Moved the 11 `run_*` boot probes, their probe task entries and the churn stress state; re-exported so callers are untouched. |
+| `scheduler/switch.rs` | `start`, `schedule_released`, `schedule`, plus the ready-queue engine (`ready_for_queue`, `enqueue_ready`, `dequeue_ready`, `pop_best`, `rebuild_ready_queues`, `cpu_is_idle`, `push_migrate*`, `find_next_task`) — 553 moved lines. `mod.rs` 4 945 → 4 398. Queue helpers are `pub(super)`; `spawn` imports `enqueue_ready` from the sibling module explicitly. Verified: 244 tests, smoke 8/8, `smp-selftest` 10/10 on `-smp 4`. |
 | `scheduler/task.rs` | `Task`, `TaskState`, `TaskContext`, `TaskInfo`, `Personality`, `MmapRegion`, `SharedMapping` and the whole `impl Task` block (`brk`/`mmap`/region bookkeeping, ~1 730 lines) — 1 966 moved lines. `mod.rs` 7 939 → 5 975. Fields the parent still reads are `pub(super)`; nothing left the module. Verified: 229 tests, smoke 8/8, `smp-selftest` 9/9, `bench` unchanged (yield 6.0 µs, SFS open 21.6 µs). |
 | `scheduler/spawn.rs` | Task creation: `spawn_kernel`, `spawn_idle`, `spawn_user*`, `spawn_elf*`, `spawn_linux_elf_with_args`, `spawn_thread`, `spawn_elf_task`, `spawn_inner`, `initial_self_rights` — 571 moved lines. `mod.rs` 5 510 → 4 945. Boot-only helpers became `pub(super)`; the entry points other subsystems call are `pub` and re-exported. `current_task_pid` stayed (fork/exec uses it too). Verified: 240 tests, smoke 8/8, `smp-selftest` 10/10 on `-smp 4`, health 0 zombie. |
 | `scheduler/wait.rs` | Task death and waiting: `exit_current*`, `kill_task`, `recover_console`, `wait_for_task*`, `wait_status_for_pid`, `consume_zombie`, `wait_inner`, `take_zombie`, `reparent_children`, `reaper_pid`, `exit_group`, `WaitEvent` — 452 moved lines. `mod.rs` 5 975 → 5 510. The public entry points stay `pub` and are re-exported (`pub use wait::*`), so `scheduler::exit_current()` and friends are unchanged outside; parent-only helpers (`take_zombie`, `recover_console`, `has_task_capacity`) are `pub(super)`. Two mmap quota constants that sat in the middle of the block went to `task.rs`, where every use lives. Verified: 240 tests, smoke 8/8 (includes the Linux ELF exit-42 wait path), `smp-selftest` 10/10 PASS on `-smp 4`, health 0 zombie. |
@@ -36,10 +37,9 @@ is its own commit so a regression can be bisected to a move.
 
 | # | Step | Target | Why this order |
 |---|---|---|---|
-| 1 | `scheduler/switch.rs` | `schedule`, `schedule_released`, `find_next_task`, ready queues, context-switch asm | The core gets the smallest, easiest-to-review file once the rest is out |
-| 2 | `main.rs` → `boot/` | boot milestones into `boot/console.rs` / `boot/mem.rs` / `boot/selftest.rs` | Boot order is linear; split by milestone group, not by line count |
-| 3 | `silvershell.rs` → `shell/` | `shell/commands.rs`, `shell/files.rs`, `shell/net.rs`, `shell/proc.rs`, `shell/bench.rs`, keeping `_start`/loop in the bin | The shell is the console product's front door; splitting it makes command work reviewable |
-| 4 | `linux_abi.rs` → `linux_abi/` | `dispatch.rs`, `process.rs`, `memory.rs`, `fs.rs`, `ipc.rs` | Largest remaining file after the scheduler; the ABI groups are already visible in the dispatch table |
+| 1 | `main.rs` → `boot/` | boot milestones into `boot/console.rs` / `boot/mem.rs` / `boot/selftest.rs` | Boot order is linear; split by milestone group, not by line count |
+| 2 | `silvershell.rs` → `shell/` | `shell/commands.rs`, `shell/files.rs`, `shell/net.rs`, `shell/proc.rs`, `shell/bench.rs`, keeping `_start`/loop in the bin | The shell is the console product's front door; splitting it makes command work reviewable |
+| 3 | `linux_abi.rs` → `linux_abi/` | `dispatch.rs`, `process.rs`, `memory.rs`, `fs.rs`, `ipc.rs` | Largest remaining file after the scheduler; the ABI groups are already visible in the dispatch table |
 
 Sizes are estimates from the current line counts; each step is expected to be
 200–900 moved lines with no logic edits.

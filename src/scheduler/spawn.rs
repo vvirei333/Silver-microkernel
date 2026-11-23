@@ -8,6 +8,7 @@
 //! boot-only helpers (`spawn_kernel`, `spawn_idle`) are `pub(super)`.
 
 use super::*;
+use super::switch::enqueue_ready;
 pub(super) fn spawn_kernel(entry: extern "C" fn() -> !) -> Option<u64> {
     spawn_inner(Some(entry), None, Vec::new(), Vec::new(), Vec::new(), false)
 }
