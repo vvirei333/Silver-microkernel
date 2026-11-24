@@ -2200,6 +2200,32 @@ fn memfd_read(
     Ok(take as u64)
 }
 
+/// Copies a memfd's contents out for `execveat(AT_EMPTY_PATH)`. The caller
+/// supplies the exec limit; anonymous files can otherwise be huge.
+pub fn memfd_bytes(task: u64, fd: u64, limit: usize) -> Result<Vec<u8>, u64> {
+    let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_READ)?;
+    let target = lookup(task, fd).ok_or(EBADF)?;
+    let Target::MemFd(state) = target else {
+        return Err(EINVAL);
+    };
+    let file = state.lock();
+    let length = file.len();
+    if length > limit {
+        return Err(EFBIG);
+    }
+    let mut bytes = alloc::vec![0_u8; length];
+    if let Some(frames) = &file.frames {
+        let source = crate::memory::phys_to_virt(frames.physical_start);
+        unsafe {
+            core::ptr::copy_nonoverlapping(source as *const u8, bytes.as_mut_ptr(), length);
+        }
+    } else {
+        bytes.copy_from_slice(&file.data[..length]);
+    }
+    Ok(bytes)
+}
+
 fn memfd_write(
     state: &Arc<Mutex<MemFdState>>,
     buffer: u64,

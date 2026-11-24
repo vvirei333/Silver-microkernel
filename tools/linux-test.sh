@@ -23,6 +23,7 @@
 #   linuxrun /sfs/linux-scope     # only /sfs is readable, prints 'scope ok'
 #   linuxrun /sfs/linux-capmode   # Capsicum-lite fd rights + cap mode, prints 'capmode ok'
 #   linuxrun /sfs/linux-fexec     # execveat(AT_EMPTY_PATH) after cap_enter, execs hello
+#   linuxrun /sfs/linux-fexec-memfd # the same through an anonymous memfd
 #   linuxrun /sfs/linux-threads   # CLONE_VM + TLS + futex, prints 'threads ok'
 #   linuxrun /sfs/linux-unixsock  # AF_UNIX + SCM_RIGHTS + EOF, prints 'unix socket ok'
 #   linuxrun /sfs/linux-dyn     # real ld.so + dynamic libc, prints 'dynamic hello'
@@ -89,6 +90,7 @@ build cowfork
 build scope
 build capmode
 build fexec
+build fexec-memfd
 build threads
 build unixsock
 build namedsock
@@ -154,6 +156,7 @@ python3 scripts/sfs_inject.py "$IMAGE" build/cowfork.elf linux-cowfork
 python3 scripts/sfs_inject.py "$IMAGE" build/scope.elf linux-scope
 python3 scripts/sfs_inject.py "$IMAGE" build/capmode.elf linux-capmode
 python3 scripts/sfs_inject.py "$IMAGE" build/fexec.elf linux-fexec
+python3 scripts/sfs_inject.py "$IMAGE" build/fexec-memfd.elf linux-fexec-memfd
 python3 scripts/sfs_inject.py "$IMAGE" build/threads.elf linux-threads
 python3 scripts/sfs_inject.py "$IMAGE" build/unixsock.elf linux-unixsock
 python3 scripts/sfs_inject.py "$IMAGE" build/namedsock.elf linux-namedsock

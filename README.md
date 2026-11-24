@@ -129,7 +129,7 @@ Release notes for this version: [`RELEASE.md`](RELEASE.md). Contributions:
 - [x] ANSI clear/home and a bold cyan `howl>` prompt
 - [x] RAM-VFS: `/bin`, `/etc`, `/tmp`, files/directories and per-task descriptors
 - [x] Per-task cwd inherited on spawn, absolute handles and `chdir`/`getcwd` syscalls
-- [x] Capsicum-style capability mode: `SYS_CAP_ENTER`, monotonic per-fd `SYS_CAP_RIGHTS_LIMIT`/`SYS_CAP_RIGHTS_GET`; once confined, every path-based syscall fails and only already-open descriptors remain. Linux descriptors follow the same model through the private `SYS_SILVER_CAP` multiplexer, including rights-preserving `dup`, `fork`, and `SCM_RIGHTS`; `execveat(AT_EMPTY_PATH)` keeps `fexecve` available after confinement
+- [x] Capsicum-style capability mode: `SYS_CAP_ENTER`, monotonic per-fd `SYS_CAP_RIGHTS_LIMIT`/`SYS_CAP_RIGHTS_GET`; once confined, every path-based syscall fails and only already-open descriptors remain. Linux descriptors follow the same model through the private `SYS_SILVER_CAP` multiplexer, including rights-preserving `dup`, `fork`, and `SCM_RIGHTS`; `execveat(AT_EMPTY_PATH)` keeps `fexecve` available after confinement for both VFS and memfd descriptors
 - [x] File syscalls: `open`, `read`, `write`, `create`, `close`, `read_dir`, `mkdir`, `unlink`, `rmdir`, `rename`
 - [x] Shell syscalls: console ownership, resume, stopped-aware wait, uptime, memory and task info
 - [x] Per-task TTBR0 spaces: independent ELF image, fixed-VA stack and private page

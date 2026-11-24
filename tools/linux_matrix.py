@@ -31,6 +31,7 @@ RELEASE_VERSION = re.search(
 CAPABILITY_CASES = [
     ("linuxrun /sfs/linux-capmode", b"capmode ok"),
     ("linuxrun /sfs/linux-fexec", b"status=42"),
+    ("linuxrun /sfs/linux-fexec-memfd", b"status=42"),
 ]
 
 CASES = [

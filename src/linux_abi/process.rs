@@ -82,10 +82,15 @@ pub(super) fn linux_execveat(
         {
             return errno(code);
         }
-        let Some(resolved) = linux_fd::vfs_path(task, dirfd) else {
-            return errno(ENOENT);
+        if let Some(resolved) = linux_fd::vfs_path(task, dirfd) {
+            return exec_path(frame, "/", resolved, argv, envp);
+        }
+        // Anonymous files have no path, so read the image out of the memfd.
+        let bytes = match linux_fd::memfd_bytes(task, dirfd, 32 * 1024 * 1024) {
+            Ok(bytes) => bytes,
+            Err(code) => return errno(code),
         };
-        return exec_path(frame, "/", resolved, argv, envp);
+        return exec_bytes(frame, bytes, argv, envp);
     }
     let cwd = match dirfd_cwd(dirfd) {
         Ok(cwd) => cwd,
@@ -162,6 +167,17 @@ fn exec_path(
     let Ok(image) = crate::linux_elf::load_linux_program_path(cwd, &resolved, EXEC_LIMIT) else {
         return errno(ENOEXEC);
     };
+    replace_image(frame, image, arguments, envp)
+}
+
+/// Commits a loaded image to the current task. Kept separate so both the
+/// path loader and the descriptor loader end at exactly one place.
+fn replace_image(
+    frame: &mut [u64; crate::syscall::FRAME_QUADWORDS],
+    image: crate::linux_elf::LinuxImage,
+    arguments: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> u64 {
     let Some(result) = scheduler::exec_linux_current(image, arguments, envp) else {
         return errno(ENOMEM);
     };
@@ -176,6 +192,33 @@ fn exec_path(
         core::arch::asm!("msr sp_el0, {}", in(reg) result.stack_pointer);
     }
     0
+}
+
+/// Executes an ELF (or a `#!` script) already read from a descriptor.
+fn exec_bytes(
+    frame: &mut [u64; crate::syscall::FRAME_QUADWORDS],
+    bytes: Vec<u8>,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> u64 {
+    const EXEC_LIMIT: usize = 32 * 1024 * 1024;
+    if bytes.starts_with(b"#!") {
+        let header = &bytes[..bytes.len().min(256)];
+        let Some((interpreter, argument)) = parse_shebang(&header[2..]) else {
+            return errno(ENOEXEC);
+        };
+        let mut arguments = Vec::with_capacity(argv.len() + 2);
+        arguments.push(interpreter.clone().into_bytes());
+        if let Some(argument) = argument {
+            arguments.push(argument.into_bytes());
+        }
+        arguments.extend(argv);
+        return exec_path(frame, "/", interpreter, arguments, envp);
+    }
+    let Ok(image) = crate::linux_elf::load_linux_program("/", &bytes, EXEC_LIMIT) else {
+        return errno(ENOEXEC);
+    };
+    replace_image(frame, image, argv, envp)
 }
 
 /// Parses the rest of a `#!` line: the interpreter path and at most one
