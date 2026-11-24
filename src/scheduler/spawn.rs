@@ -209,6 +209,7 @@ pub fn spawn_thread(
         read_prefix,
         quota,
         priority,
+        cap_mode,
         fp,
     ) = {
         let parent = manager.tasks.get(smp::current_index())?;
@@ -226,6 +227,7 @@ pub fn spawn_thread(
             parent.read_prefix.clone(),
             parent.fs_quota,
             parent.priority,
+            parent.cap_mode,
             unsafe { *smp::this_cpu().fp.get() },
         )
     };
@@ -264,6 +266,7 @@ pub fn spawn_thread(
         program: user_program::PROGRAM_DYNAMIC,
         argument: 0,
         personality: Personality::Linux,
+        cap_mode,
         cap_table: capability::CapTable::new(),
         bound_irq: None,
         irq_pending: false,
@@ -367,6 +370,7 @@ fn spawn_elf_task(
         }
     };
     task.cwd = cwd;
+    task.cap_mode = super::current_task_capability_mode();
     manager.tasks.push(task);
     manager.next_id += 1;
     // A freshly spawned task starts Ready: queue it on the spawning CPU.
@@ -506,6 +510,7 @@ fn spawn_inner(
         Personality::Native,
     )?;
     task.cwd = cwd;
+    task.cap_mode = super::current_task_capability_mode();
 
     manager.tasks.push(task);
     manager.next_id += 1;

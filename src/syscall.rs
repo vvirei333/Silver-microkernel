@@ -88,6 +88,15 @@ pub const SYS_DRIVER_BOUND: u64 = 104;
 /// dispatched: no window in which a fast child can run (and lose its output)
 /// before the parent hands it the console.
 pub const SYS_SPAWN_ARGS_CONSOLE: u64 = 105;
+/// Irreversibly enter Capsicum-style capability mode. Path-based operations
+/// are refused from then on; already-open descriptors stay usable under their
+/// own rights. Returns 0 on success, `SYSCALL_ERROR` when no task is current.
+pub const SYS_CAP_ENTER: u64 = 106;
+/// `cap_rights_limit(fd, mask)`: clears every fd right not in `mask`. The mask
+/// may only narrow; unknown bits fail the call instead of being ignored.
+pub const SYS_CAP_RIGHTS_LIMIT: u64 = 107;
+/// `cap_rights_get(fd)`: returns the descriptor's current rights mask.
+pub const SYS_CAP_RIGHTS_GET: u64 = 108;
 /// Spawns a dynamically loaded ELF with the AArch64 **Linux** syscall
 /// personality (`x8` = Linux syscall number) instead of the Silver table.
 pub const SYS_SPAWN_LINUX_PATH: u64 = 98;
@@ -426,6 +435,15 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
         SYS_FS_USAGE => sys_fs_usage(frame[0], frame[1]),
         SYS_CAP_GET_TASK_ID => scheduler::capability_task_id(frame[0]).unwrap_or(SYSCALL_ERROR),
         SYS_CAP_FIND => scheduler::cap_find_for_target(frame[0], frame[1] as u32),
+        SYS_CAP_ENTER => {
+            if scheduler::enter_current_task_capability_mode() {
+                0
+            } else {
+                SYSCALL_ERROR
+            }
+        }
+        SYS_CAP_RIGHTS_LIMIT => sys_cap_rights_limit(frame[0], frame[1] as u32),
+        SYS_CAP_RIGHTS_GET => sys_cap_rights_get(frame[0]),
         SYS_DMA_GRANT_SELF => {
             if scheduler::dma_grant_self(frame[0], frame[1] as usize, frame[2] as usize) {
                 0
@@ -516,6 +534,27 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
         SYS_SPAWN_ARGSV => sys_spawn_with_argsv(frame[0], frame[1], frame[2], frame[3]),
         _ => SYSCALL_ERROR,
     }
+}
+
+/// True once the caller has opted into capability mode. Every path-based
+/// operation uses this as its first gate; descriptor operations are checked
+/// by the VFS against the descriptor's own rights instead.
+fn path_calls_denied() -> bool {
+    scheduler::current_task_capability_mode()
+}
+
+fn sys_cap_rights_limit(fd: u64, mask: u32) -> u64 {
+    if vfs::limit_fd_rights(scheduler::current_task_id(), fd, mask).is_ok() {
+        0
+    } else {
+        SYSCALL_ERROR
+    }
+}
+
+fn sys_cap_rights_get(fd: u64) -> u64 {
+    vfs::fd_rights(scheduler::current_task_id(), fd)
+        .map(u64::from)
+        .unwrap_or(SYSCALL_ERROR)
 }
 
 fn sys_map_phys(phys_addr: u64, size: u64) -> u64 {
@@ -686,6 +725,9 @@ fn bundle_write_scope(cwd: &str, elf_path: &str) -> silver_microkernel::bundle::
 }
 
 fn sys_spawn_path(path_ptr: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         // Length first: `read_file` would otherwise allocate the whole blob
@@ -725,6 +767,9 @@ fn sys_spawn_path(path_ptr: u64) -> u64 {
 /// Loads and runs a foreign (Linux ABI) ELF from the filesystem.
 #[cfg(feature = "linux-abi")]
 fn sys_spawn_linux_path(path_ptr: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         let length = match vfs::file_len(&cwd, path) {
@@ -843,6 +888,9 @@ fn sys_arguments(buffer_ptr: u64, capacity: u64) -> u64 {
 }
 
 fn sys_fs_open(path_ptr: u64, flags: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         // Opening for write is the consent point for later `SYS_FS_WRITE` on
@@ -867,6 +915,9 @@ fn write_path_allowed(cwd: &str, path: &str) -> bool {
 }
 
 fn sys_fs_create(path_ptr: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         if !write_path_allowed(&cwd, path) {
@@ -888,6 +939,9 @@ fn sys_fs_create(path_ptr: u64) -> u64 {
 }
 
 fn sys_fs_mkdir(path_ptr: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         if !write_path_allowed(&cwd, path) {
@@ -906,6 +960,9 @@ fn sys_fs_mkdir(path_ptr: u64) -> u64 {
 }
 
 fn sys_fs_unlink(path_ptr: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         if !write_path_allowed(&cwd, path) {
@@ -920,6 +977,9 @@ fn sys_fs_unlink(path_ptr: u64) -> u64 {
 }
 
 fn sys_fs_rmdir(path_ptr: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         if !write_path_allowed(&cwd, path) {
@@ -934,6 +994,9 @@ fn sys_fs_rmdir(path_ptr: u64) -> u64 {
 }
 
 fn sys_fs_rename(source_ptr: u64, destination_ptr: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(source_ptr, |source| {
         with_path(destination_ptr, |destination| {
@@ -952,6 +1015,9 @@ fn sys_fs_rename(source_ptr: u64, destination_ptr: u64) -> u64 {
 }
 
 fn sys_fs_usage(path_ptr: u64, out_ptr: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         let Some(usage) = vfs::usage(&cwd, path) else {
@@ -978,6 +1044,9 @@ fn sys_fs_usage(path_ptr: u64, out_ptr: u64) -> u64 {
 }
 
 fn sys_fs_replace(source_ptr: u64, destination_ptr: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(source_ptr, |source| {
         with_path(destination_ptr, |destination| {
@@ -999,7 +1068,7 @@ fn sys_fs_replace(source_ptr: u64, destination_ptr: u64) -> u64 {
 /// backend at `target`. The point must already be a directory and must not
 /// already carry a mount. The ABI is additive; old call numbers are untouched.
 fn sys_fs_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64) -> u64 {
-    if !scheduler::current_task_has_rights(capability::CAP_MOUNT) {
+    if path_calls_denied() || !scheduler::current_task_has_rights(capability::CAP_MOUNT) {
         return SYSCALL_ERROR;
     }
     let cwd = scheduler::current_task_cwd();
@@ -1019,7 +1088,7 @@ fn sys_fs_mount(source_ptr: u64, target_ptr: u64, fstype_ptr: u64, flags: u64) -
 /// `SYS_UMOUNT(target, flags)`: refuses while the mount has child mounts,
 /// open files or a task cwd underneath it.
 fn sys_fs_umount(target_ptr: u64, flags: u64) -> u64 {
-    if !scheduler::current_task_has_rights(capability::CAP_MOUNT) {
+    if path_calls_denied() || !scheduler::current_task_has_rights(capability::CAP_MOUNT) {
         return SYSCALL_ERROR;
     }
     if flags != 0 {
@@ -1036,6 +1105,9 @@ fn sys_fs_umount(target_ptr: u64, flags: u64) -> u64 {
 }
 
 fn sys_chdir(path_ptr: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         let Ok(resolved) = vfs::resolve_directory(&cwd, path) else {
@@ -1119,6 +1191,9 @@ fn sys_fs_write(fd: u64, buffer_ptr: u64, len: u64) -> u64 {
 }
 
 fn sys_fs_read_dir(path_ptr: u64, buffer_ptr: u64, capacity: u64) -> u64 {
+    if path_calls_denied() {
+        return SYSCALL_ERROR;
+    }
     let cwd = scheduler::current_task_cwd();
     with_path(path_ptr, |path| {
         let Ok(entries) = vfs::read_dir(&cwd, path) else {

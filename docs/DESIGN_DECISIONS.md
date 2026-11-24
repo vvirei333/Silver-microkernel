@@ -92,7 +92,7 @@ without a license check. Current evaluation table:
 
 | FreeBSD concept | What it is / solves | Adaptation to Silver | Status |
 |---|---|---|---|
-| Capsicum | Capability sandboxing of fds | Silver already has kernel-wide capabilities; Capsicum-style per-fd *capability mode* for Linux tasks is a natural extension | ANALYSIS (PLANNED) |
+| Capsicum | Capability sandboxing of fds | Silver already has kernel-wide capabilities; the native ABI now has per-fd rights, monotonic `cap_rights_limit`, and an irreversible `cap_enter` that closes every path-based syscall. Linux-ABI descriptors and `*at` enforcement are the next slice. | PARTIAL (native fd rights + capability mode) |
 | Jails | OS-level environment isolation | Silver's isolation is task-granular; a jail-like grouping would need namespace-ish scoping of VFS + IPC names | ANALYSIS (not scheduled) |
 | VFS/vnode | Uniform filesystem abstraction | Silver's VFS is smaller but follows the same shape (mounts over SFS + synthetic trees); vnode ops split is already implicit | IMPLEMENTED (own design, similar shape) |
 | GEOM | Layered block storage | SFS-on-virtio-blk is flat today; aGeom-like layering matters only when real storage arrives | ANALYSIS (parked) |

@@ -182,6 +182,9 @@ pub struct Task {
     pub argument: u64,
     /// Syscall ABI this task entered userspace on.
     pub(super) personality: Personality,
+    /// Capsicum-style capability mode. Once set, path-based syscalls are
+    /// refused; only already-open descriptors and their rights remain.
+    pub(super) cap_mode: bool,
     pub cap_table: capability::CapTable,
     /// Path prefix this task may write under, taken from the bundle manifest.
     /// Only meaningful when the task has no global `CAP_FS_WRITE`.
@@ -553,6 +556,7 @@ impl Task {
             program: user.map_or(u64::MAX, |(program, _)| program),
             argument: user.map_or(0, |(_, argument)| argument),
             personality,
+            cap_mode: false,
             cap_table,
             bound_irq: None,
             irq_pending: false,

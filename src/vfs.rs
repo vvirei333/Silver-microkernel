@@ -23,6 +23,37 @@ pub const MAX_NAME_LEN: usize = 256;
 pub const MAX_PATH_LEN: usize = 191;
 pub const OPEN_WRITE: u64 = 1;
 pub const OPEN_APPEND: u64 = 2;
+
+/// Per-descriptor rights, Capsicum-style: an open starts with the rights its
+/// access mode implies, and SYS_CAP_RIGHTS_LIMIT may only clear bits. Every
+/// fd operation checks the mask, so a task in capability mode cannot turn an
+/// already-open descriptor into a different capability.
+pub const FD_READ: u32 = 1 << 0;
+pub const FD_WRITE: u32 = 1 << 1;
+pub const FD_SEEK: u32 = 1 << 2;
+pub const FD_FSTAT: u32 = 1 << 3;
+pub const FD_READDIR: u32 = 1 << 4;
+/// May be used as the directory base of a future *at call. Kept on directory
+/// descriptors even though the native ABI has no openat yet.
+pub const FD_LOOKUP: u32 = 1 << 5;
+pub const FD_TRUNCATE: u32 = 1 << 6;
+pub const FD_ALL: u32 =
+    FD_READ | FD_WRITE | FD_SEEK | FD_FSTAT | FD_READDIR | FD_LOOKUP | FD_TRUNCATE;
+
+fn file_rights(writable: bool) -> u32 {
+    FD_READ
+        | FD_SEEK
+        | FD_FSTAT
+        | if writable {
+            FD_WRITE | FD_TRUNCATE
+        } else {
+            0
+        }
+}
+
+const fn dir_rights() -> u32 {
+    FD_READDIR | FD_LOOKUP | FD_FSTAT
+}
 /// `DirEntry::kind` and `vfs::fd_kind` values (shared with the on-disk SFS).
 pub const FD_KIND_FILE: u64 = 1;
 pub const FD_KIND_DIR: u64 = 2;
@@ -666,6 +697,8 @@ struct OpenFile {
     offset: usize,
     writable: bool,
     append: bool,
+    /// Capsicum-style rights for this descriptor. Only ever cleared after open.
+    rights: u32,
     /// Opened with `open_dir`: `read`/`write` are refused, `getdents` walks it.
     directory: bool,
 }
@@ -679,6 +712,7 @@ impl Clone for OpenFile {
             offset: self.offset,
             writable: self.writable,
             append: self.append,
+            rights: self.rights,
             directory: self.directory,
         }
     }
@@ -890,6 +924,7 @@ impl Vfs {
             offset,
             writable: flags & OPEN_WRITE != 0,
             append,
+            rights: file_rights(flags & OPEN_WRITE != 0),
             directory: false,
         });
         Ok(fd)
@@ -928,6 +963,7 @@ impl Vfs {
             offset: 0,
             writable: false,
             append: false,
+            rights: dir_rights(),
             directory: true,
         });
         Ok(fd)
@@ -995,11 +1031,7 @@ impl Vfs {
     where
         F: FnOnce(&[u8]) -> Result<(), ()>,
     {
-        let index = self
-            .open_files
-            .iter()
-            .position(|file| file.owner == owner && file.fd == fd)
-            .ok_or(())?;
+        let index = self.require_right(owner, fd, FD_READ)?;
         if self.open_files[index].directory {
             return Err(());
         }
@@ -1029,11 +1061,7 @@ impl Vfs {
     where
         F: FnOnce(&[u8]) -> Result<(), ()>,
     {
-        let index = self
-            .open_files
-            .iter()
-            .position(|file| file.owner == owner && file.fd == fd)
-            .ok_or(())?;
+        let index = self.require_right(owner, fd, FD_READ | FD_SEEK)?;
         if self.open_files[index].directory {
             return Err(());
         }
@@ -1053,11 +1081,7 @@ impl Vfs {
     }
 
     fn write(&mut self, owner: u64, fd: u64, bytes: &[u8]) -> Result<usize, ()> {
-        let index = self
-            .open_files
-            .iter()
-            .position(|file| file.owner == owner && file.fd == fd)
-            .ok_or(())?;
+        let index = self.require_right(owner, fd, FD_WRITE)?;
         if !self.open_files[index].writable {
             return Err(());
         }
@@ -1074,11 +1098,11 @@ impl Vfs {
 
     /// Truncate an existing writable file without changing its open offset.
     fn truncate_zero(&mut self, owner: u64, fd: u64) -> Result<(), ()> {
-        let file = self.open_files.iter().find(|file| file.owner == owner && file.fd == fd).ok_or(())?;
-        if !file.writable || file.directory {
+        let index = self.require_right(owner, fd, FD_WRITE | FD_TRUNCATE)?;
+        if !self.open_files[index].writable || self.open_files[index].directory {
             return Err(());
         }
-        let path = file.path.clone();
+        let path = self.open_files[index].path.clone();
         let (mount, relative) = self.resolve(&path);
         self.mounts[mount].fs.create_file(&relative)
     }
@@ -1087,11 +1111,7 @@ impl Vfs {
     /// descriptor's offset. Offsets past EOF extend the file with zeros, which
     /// is what dconf's one-byte `pwrite` into a fresh file needs.
     fn pwrite(&mut self, owner: u64, fd: u64, offset: u64, bytes: &[u8]) -> Result<usize, ()> {
-        let index = self
-            .open_files
-            .iter()
-            .position(|file| file.owner == owner && file.fd == fd)
-            .ok_or(())?;
+        let index = self.require_right(owner, fd, FD_WRITE | FD_SEEK)?;
         if !self.open_files[index].writable {
             return Err(());
         }
@@ -1106,11 +1126,7 @@ impl Vfs {
 
     /// `lseek(2)` on a plain file. Directories are not seekable in this VFS.
     fn lseek(&mut self, owner: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, ()> {
-        let index = self
-            .open_files
-            .iter()
-            .position(|file| file.owner == owner && file.fd == fd)
-            .ok_or(())?;
+        let index = self.require_right(owner, fd, FD_SEEK)?;
         if self.open_files[index].directory {
             return Err(());
         }
@@ -1139,9 +1155,33 @@ impl Vfs {
             .ok_or(())
     }
 
+    /// Finds a descriptor and proves it carries every right in `need`.
+    fn require_right(&self, owner: u64, fd: u64, need: u32) -> Result<usize, ()> {
+        let index = self.fd_index(owner, fd)?;
+        if self.open_files[index].rights & need != need {
+            return Err(());
+        }
+        Ok(index)
+    }
+
+    fn fd_rights(&self, owner: u64, fd: u64) -> Option<u32> {
+        let index = self.fd_index(owner, fd).ok()?;
+        Some(self.open_files[index].rights)
+    }
+
+    /// Capsicum-style reduction: the mask can only clear bits, never set one.
+    fn limit_fd_rights(&mut self, owner: u64, fd: u64, mask: u32) -> Result<u32, ()> {
+        if mask & !FD_ALL != 0 {
+            return Err(());
+        }
+        let index = self.fd_index(owner, fd)?;
+        self.open_files[index].rights &= mask;
+        Ok(self.open_files[index].rights)
+    }
+
     /// Size of an open file, or `0` for a directory.
     fn fd_len(&self, owner: u64, fd: u64) -> Result<usize, ()> {
-        let index = self.fd_index(owner, fd)?;
+        let index = self.require_right(owner, fd, FD_FSTAT)?;
         if self.open_files[index].directory {
             return Ok(0);
         }
@@ -1152,6 +1192,9 @@ impl Vfs {
 
     fn fd_kind(&self, owner: u64, fd: u64) -> Option<u64> {
         let index = self.fd_index(owner, fd).ok()?;
+        if self.open_files[index].rights & FD_FSTAT == 0 {
+            return None;
+        }
         Some(if self.open_files[index].directory {
             FD_KIND_DIR
         } else {
@@ -1161,6 +1204,9 @@ impl Vfs {
 
     fn fd_path(&self, owner: u64, fd: u64) -> Option<String> {
         let index = self.fd_index(owner, fd).ok()?;
+        if self.open_files[index].rights & FD_FSTAT == 0 {
+            return None;
+        }
         Some(self.open_files[index].path.clone())
     }
 
@@ -1173,7 +1219,7 @@ impl Vfs {
         fd: u64,
         max: usize,
     ) -> Result<(Vec<DirEntry>, usize), ()> {
-        let index = self.fd_index(owner, fd)?;
+        let index = self.require_right(owner, fd, FD_READDIR)?;
         if !self.open_files[index].directory {
             return Err(());
         }
@@ -1186,7 +1232,7 @@ impl Vfs {
     }
 
     fn advance_dir_fd(&mut self, owner: u64, fd: u64, count: usize) -> Result<(), ()> {
-        let index = self.fd_index(owner, fd)?;
+        let index = self.require_right(owner, fd, FD_READDIR)?;
         let new_offset = self.open_files[index]
             .offset
             .checked_add(count)
@@ -1421,6 +1467,16 @@ pub fn close_task(owner: u64) {
         vfs.close_task(owner);
     }
     interrupts::restore_irq(saved);
+}
+
+pub fn fd_rights(owner: u64, fd: u64) -> Option<u32> {
+    with_vfs(|vfs| vfs.fd_rights(owner, fd))
+}
+
+/// Clears every right not in `mask`; returns the resulting mask. Unknown bits
+/// in the request are refused rather than silently ignored.
+pub fn limit_fd_rights(owner: u64, fd: u64, mask: u32) -> Result<u32, ()> {
+    with_vfs(|vfs| vfs.limit_fd_rights(owner, fd, mask))
 }
 
 pub fn open_count(owner: u64) -> usize {
@@ -1823,6 +1879,62 @@ fn self_test_inner(stage: &mut u32) -> bool {
     match read_file("/", "/tmp/vfs_selftest/file") {
         Ok(data) if data == b"hello".to_vec() => {}
         _ => return false,
+    }
+    *stage = 61;
+    // Capsicum-lite: a read-only descriptor starts with read/seek/stat and
+    // no write or truncate, can only be narrowed, and the narrowed mask is
+    // enforced by every fd operation. Widening is refused, unknown bits are
+    // refused, and the descriptor still works for the rights it kept.
+    let capsicum_fd = match open(0, "/", "/tmp/vfs_selftest/file", 0) {
+        Ok(fd) => fd,
+        Err(_) => return false,
+    };
+    *stage = 62;
+    let initial = match fd_rights(0, capsicum_fd) {
+        Some(rights) => rights,
+        None => return false,
+    };
+    if initial & (FD_READ | FD_SEEK | FD_FSTAT) != (FD_READ | FD_SEEK | FD_FSTAT)
+        || initial & (FD_WRITE | FD_TRUNCATE) != 0
+    {
+        return false;
+    }
+    *stage = 63;
+    let kept = FD_READ | FD_FSTAT;
+    if limit_fd_rights(0, capsicum_fd, kept).ok() != Some(kept) {
+        return false;
+    }
+    *stage = 64;
+    if write(0, capsicum_fd, b"x").is_ok() {
+        return false;
+    }
+    *stage = 65;
+    if lseek(0, capsicum_fd, 0, 0).is_ok() {
+        return false;
+    }
+    *stage = 66;
+    if truncate_zero(0, capsicum_fd).is_ok() {
+        return false;
+    }
+    *stage = 67;
+    if fd_len(0, capsicum_fd).is_err() {
+        return false;
+    }
+    *stage = 68;
+    if read_with(0, capsicum_fd, 8, |_| Ok(())).is_err() {
+        return false;
+    }
+    *stage = 69;
+    if limit_fd_rights(0, capsicum_fd, FD_ALL).ok() != Some(kept)
+        || fd_rights(0, capsicum_fd) != Some(kept)
+    {
+        return false;
+    }
+    *stage = 70;
+    if limit_fd_rights(0, capsicum_fd, 0x8000_0000).is_ok()
+        || close(0, capsicum_fd).is_err()
+    {
+        return false;
     }
     *stage = 7;
     // Per-task handle quota: one owner may hold at most 32 descriptors, but

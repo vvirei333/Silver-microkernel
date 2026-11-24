@@ -2671,6 +2671,7 @@ pub fn fork_current_with_sp(
         parent_tls,
         parent_quota,
         parent_priority,
+        parent_cap_mode,
         parent_fp,
     ) = {
         let parent = manager.tasks.get(parent_index)?;
@@ -2700,6 +2701,7 @@ pub fn fork_current_with_sp(
             current_user_tls(),
             parent.fs_quota,
             parent.priority,
+            parent.cap_mode,
             // The caller is inside its own syscall, so the live file is the
             // parent's state at the `clone` call, not the older copy parked
             // in the task record.
@@ -3056,6 +3058,7 @@ pub fn fork_current_with_sp(
         program: user_program::PROGRAM_DYNAMIC,
         argument: 0,
         personality: Personality::Linux,
+        cap_mode: parent_cap_mode,
         cap_table: capability::CapTable::new(),
         bound_irq: None,
         irq_pending: false,
@@ -3389,6 +3392,21 @@ pub fn current_task_can_lend_console() -> bool {
         let id = task.id;
         task.owns_console || task.cap_table.has_self_rights(id, capability::CAP_CONSOLE_GRANT)
     })
+}
+
+/// True once the current task has entered Capsicum-style capability mode.
+pub fn current_task_capability_mode() -> bool {
+    current_task_mut().map_or(false, |task| task.cap_mode)
+}
+
+/// Irreversible entry into capability mode. Returns false only when no task is
+/// current (early boot), where there is nothing to confine.
+pub fn enter_current_task_capability_mode() -> bool {
+    current_task_mut()
+        .map(|task| {
+            task.cap_mode = true;
+        })
+        .is_some()
 }
 
 pub fn current_task_has_rights(rights: u32) -> bool {
