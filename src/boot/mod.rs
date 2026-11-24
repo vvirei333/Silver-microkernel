@@ -226,3 +226,11 @@ pub fn get() -> Option<BootParams> {
 /// Boot-time assembly: entry stub and exception vectors.
 #[cfg(target_arch = "aarch64")]
 mod asm;
+
+// The milestones `kernel_main` drives, in boot order. Each owns one stage and
+// the invariants it has to prove before the next stage may start.
+pub(super) mod console;
+pub(super) mod interrupts;
+pub(super) mod mem;
+pub(super) mod selftest;
+pub(super) mod start;

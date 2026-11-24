@@ -148,75 +148,6 @@ compile_error!("Features 'std' and 'no_std' are mutually exclusive");
 compile_error!("The bare-metal kernel currently supports only AArch64");
 
 
-/// The newer MMU/ASID/DMA boot proofs run on QEMU and on any non-fog build.
-/// A fog hardware image skips them unless `fog-hw-selftests` is requested:
-/// the TLB proof was observed to wedge a `rain` unit before userspace.
-#[cfg(all(feature = "fog", not(feature = "fog-hw-selftests")))]
-const DEEP_BOOT_SELFTESTS: bool = false;
-#[cfg(any(not(feature = "fog"), feature = "fog-hw-selftests"))]
-const DEEP_BOOT_SELFTESTS: bool = true;
-
-/// Minimal boot framebuffer proof. On the phone the Redmi `cont_splash`
-/// region is painted directly; on QEMU (and any non-fog profile) a small
-/// frame-allocator surface validates the writer without a display.
-fn simplefb_boot() {
-    #[cfg(feature = "fog")]
-    {
-        let info = silver_microkernel::simplefb::FOG_PANEL;
-        let Some(bytes) = info.bytes() else {
-            return;
-        };
-        let pointer = memory::phys_to_virt(info.base as usize) as *mut u32;
-        let pixels = unsafe { core::slice::from_raw_parts_mut(pointer, bytes / 4) };
-        let Some(mut canvas) = silver_microkernel::simplefb::Canvas::new(
-            pixels, info.width, info.height, info.stride,
-        ) else {
-            return;
-        };
-        canvas.paint_boot();
-        console::write_str("SIMPLEFB: FOG base=0x");
-        console::write_hex_u64(info.base);
-        console::write_str(" 720x1650 stride=720\r\n");
-        ram_log::log("SIMPLEFB FOG PANEL");
-    }
-
-    #[cfg(not(feature = "fog"))]
-    {
-        const WIDTH: usize = 128;
-        const HEIGHT: usize = 96;
-        const STRIDE: usize = 128;
-        let pages = (WIDTH * HEIGHT * 4).div_ceil(memory::PAGE_SIZE);
-        let Some((physical, generation)) =
-            frame_allocator::alloc_contiguous_pages_tagged(pages)
-        else {
-            console::write_str("SIMPLEFB TEST: NO FRAMES\r\n");
-            return;
-        };
-        let pointer = memory::phys_to_virt(physical) as *mut u32;
-        let pixels = unsafe {
-            core::slice::from_raw_parts_mut(pointer, STRIDE * HEIGHT)
-        };
-        let mut ok = false;
-        let mut painted = false;
-        if let Some(mut canvas) = silver_microkernel::simplefb::Canvas::new(
-            pixels, WIDTH, HEIGHT, STRIDE,
-        ) {
-            canvas.paint_boot();
-            painted = true;
-        }
-        if painted {
-            ok = pixels[0] != 0
-                && pixels[STRIDE * (HEIGHT / 3) + WIDTH / 2] == 0xFF39_D2FF;
-        }
-        frame_allocator::free_contiguous_pages_tagged(physical, pages, generation);
-        if ok {
-            console::write_str("SIMPLEFB TEST PASS 128x96\r\n");
-        } else {
-            console::write_str("SIMPLEFB TEST FAIL\r\n");
-        }
-    }
-}
-
 #[cfg(not(feature = "std"))]
 #[no_mangle]
 pub extern "C" fn kernel_main() -> ! {
@@ -259,94 +190,7 @@ pub extern "C" fn kernel_main() -> ! {
     // needs the MMU (it reads through `phys_to_virt`), hence the order.
     // QEMU without a DTB keeps the fixed PL011/PCI table; fog gets the UART
     // base/size/INTID from its node. A missing/disabled node binds nothing.
-    {
-        let params = boot::get();
-        let dtb = params.as_ref().and_then(fog::dtb_slice);
-        crate::driver_resources::init(dtb);
-        #[cfg(feature = "gdb-stub")]
-        crate::gdb::probe_transport(dtb);
-    }
-
-    // Console first after that: a bad memory map must be *reported* before the
-    // allocator asserts on an empty window.
-    console::init();
-    // Cache state is reported on every console-capable profile. The boot
-    // self-test below re-checks the same bits on the APs, whose values are
-    // recorded per CPU rather than inferred from this line.
-    #[cfg(not(feature = "tablet"))]
-    {
-        console::write_str("CACHE=");
-        if cache::caches_on(cache::read_sctlr()) {
-            console::write_str("ON line=");
-            console::write_dec_u64(cache::line_bytes() as u64);
-        } else {
-            console::write_str("OFF");
-        }
-        console::write_str("\r\n");
-    }
-    #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
-    {
-        console::write_str("PLATFORM=QEMU\r\n");
-        console::write_str("MMU=OK\r\n");
-        boot_metrics::log_milestone("MMU init");
-    }
-
-    // Size AP bring-up from the live tree instead of assuming MAX_CPUS. QEMU
-    // passes a DTB even with `-kernel`; fog/tablet stay single-core by policy
-    // and a missing tree leaves the old default in place.
-    #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
-    {
-        let params = boot::get();
-        let dtb = params.as_ref().and_then(fog::dtb_slice);
-        let mut parsed = 0usize;
-        if let Some(data) = dtb {
-            if let Some(tree) = fdt::Fdt::new(data) {
-                parsed = tree.cpu_count(smp::MAX_CPUS);
-                smp::set_possible_cpus(parsed);
-            }
-        }
-        // QEMU `-kernel` passes no DTB, so this is evidence only when a
-        // bootloader did hand one over (and the count is non-zero).
-        if parsed > 0 && cfg!(feature = "smp-selftest") {
-            console::write_str("SMP: fdt cpus=");
-            console::write_dec_u64(parsed as u64);
-            console::write_str("\r\n");
-        }
-    }
-
-    // Evidence that the live tree, not the static fallback, supplied the
-    // console UART. Printed only when a DTB was handed over.
-    if let Some((range, irq)) = crate::driver_resources::dtb_uart() {
-        console::write_str("DRIVER UART=DT base=0x");
-        console::write_hex_u64(range.base);
-        console::write_str(" size=0x");
-        console::write_hex_u64(range.size);
-        if let Some(intid) = irq {
-            console::write_str(" irq=");
-            console::write_dec_u64(u64::from(intid));
-        }
-        if let Some(hz) = crate::driver_resources::uart_clock() {
-            console::write_str(" clk=");
-            console::write_dec_u64(u64::from(hz));
-        }
-        console::write_str("\r\n");
-    }
-    // Evidence that the interrupt controller, like the console, came from the
-    // tree description rather than from a built-in table.
-    if crate::driver_resources::gic_bound_from_tree() {
-        if let Some((distributor, cpu_interface)) = crate::driver_resources::gic_bases() {
-            console::write_str("DRIVER GIC=DT dist=0x");
-            console::write_hex_u64(distributor);
-            console::write_str(" cpu=0x");
-            console::write_hex_u64(cpu_interface);
-            console::write_str("\r\n");
-        }
-    }
-    if let Some(intid) = crate::driver_resources::timer_intid() {
-        console::write_str("DRIVER TIMER=DT intid=");
-        console::write_dec_u64(u64::from(intid));
-        console::write_str("\r\n");
-    }
+    boot::console::init();
 
     #[cfg(feature = "fog")]
     {
@@ -361,42 +205,10 @@ pub extern "C" fn kernel_main() -> ! {
     }
     ram_log::log("MMU OK");
 
-    let memory_map = memory::current();
-    if !memory_map.is_valid() || memory_map.available.is_empty() {
-        #[cfg(feature = "fog")]
-        console::write_str("SILVER FOG HALT: invalid memory map\r\n");
-        exceptions::silver_handle_exception(6, 0, 0, 0);
-    }
-    let available_pages = frame_allocator::init(memory_map.available);
-
-    if !memory_map.is_valid() || available_pages == 0 || !frame_allocator::run_self_test() {
-        exceptions::silver_handle_exception(6, 0, 0, 0);
-    }
-    ram_log::log("FRAME ALLOC OK");
-    simplefb_boot();
-
-    // The heap comes before the filesystem: mounting validates the image with
-    // `sfs_format::fsck`, which now tracks one bit per data block (a 16 MiB
-    // rootfs has more blocks than a single file's `MAX_FILE_BLOCKS` window and
-    // no longer fits a fixed stack array).
-    let Some(heap_base) = allocator::init() else {
-        exceptions::silver_handle_exception(7, 0, 0, 0);
-    };
-
-    let value = alloc::boxed::Box::new(42_u64);
-        #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
-    {
-        let value_address = (&*value as *const u64) as usize;
-        console::write_str("HEAP=OK BASE=");
-        console::write_hex_u64(heap_base as u64);
-        console::write_str(" VALUE=");
-        console::write_hex_u64(*value);
-        console::write_str(" ADDR=");
-        console::write_hex_u64(value_address as u64);
-        console::write_str("\r\n");
-        boot_metrics::log_milestone("Heap init");
-    }
-    ram_log::log("HEAP OK");
+    // Only the fog banner prints the heap base after the self-tests; the QEMU
+    // path reports it at allocation time inside `boot::mem`.
+    #[allow(unused_variables)]
+    let (heap_base, heap_probe) = boot::mem::init();
 
     // Mount the on-disk SFS in streaming mode: the kernel owns virtio-blk and
     // reads 512-byte blocks on demand through a bounded cache instead of
@@ -407,117 +219,9 @@ pub extern "C" fn kernel_main() -> ! {
         ram_log::log("KSFS loaded");
     }
 
-    // User-visible memory (mmap, brk, DMA, ELF images, task stacks) may not
-    // eat the frames the kernel and its devices still need. The gate is a
-    // free-count policy; prove here that it refuses one-sidedly and that the
-    // raw kernel allocator is unaffected.
-    if !frame_allocator::run_user_reserve_selftest() {
-        exceptions::silver_handle_exception(6, 0, 0, 0);
-    }
-        ram_log::log("MEM RESERVE OK");
+    boot::selftest::run();
 
-    // One 2 MiB-aligned arena, split into 4 KiB pages with one unmapped
-    // guard page below every task stack. A failure here would make task
-    // spawns silently unsafe, so it stops the boot.
-    if !kernel_stack::init() || !kernel_stack::run_self_test() {
-        exceptions::silver_handle_exception(6, 0, 0, 0);
-    }
-        ram_log::log("KERNEL STACK OK");
-
-    // Address-space reclamation invariants: partial unmap is refused without
-    // touching the mapped page, teardown retires the root token once, and a
-    // second teardown with the same token is refused.
-    if !mmu::run_self_test() {
-        exceptions::silver_handle_exception(9, 0, 0, 0);
-    }
-        ram_log::log("MMU RECLAIM OK");
-
-    // Enlarged DMA window: a first-fit run must cross a 2 MiB group boundary
-    // and an oversized request must be refused. The display path depends on
-    // this window holding two full-size surfaces.
-    if !mmu::run_dma_window_self_test() {
-        exceptions::silver_handle_exception(9, 0, 0, 0);
-    }
-        console::write_str("DMA WINDOW OK\r\n");
-    ram_log::log("DMA WINDOW OK");
-
-    // The newer MMU/ASID/DMA boot proofs are QEMU-proven but have not yet
-    // completed on the phone: the TLB proof wedges a `rain` unit before
-    // userspace, so a fog hardware boot skips the block by default and says so.
-    // `fog-hw-selftests` opts back in for a dedicated debugging image.
-    #[cfg(all(feature = "fog", not(feature = "fog-hw-selftests")))]
-    console::write_str("SILVER DEEP SELFTESTS SKIPPED (fog hardware profile)\r\n");
-
-    if DEEP_BOOT_SELFTESTS {
-        // TLB proof: read through TTBR0, remap the same VA to another frame and
-        // read again. Fails closed if the flush did not change the translation.
-        if !mmu::run_tlb_self_test() {
-            exceptions::silver_handle_exception(9, 0, 0, 0);
-        }
-                ram_log::log("MMU TLB OK");
-
-        // ASID isolation: two spaces map the same VA to different frames; two
-        // switches without any flush must still return each space's own value.
-        if !mmu::run_asid_self_test() {
-            exceptions::silver_handle_exception(9, 0, 0, 0);
-        }
-                console::write_str("MMU ASID OK\r\n");
-        ram_log::log("MMU ASID OK");
-
-        // Heap-L3 persistence: emptying the heap through the generic unmap must
-        // not free the table, and the next heap map must land in the same slot
-        // instead of writing through a zero descriptor.
-        if !mmu::run_heap_table_self_test() {
-            exceptions::silver_handle_exception(9, 0, 0, 0);
-        }
-                console::write_str("MMU HEAP OK\r\n");
-        ram_log::log("MMU HEAP OK");
-
-        // Recycled DMA frames must be zero before EL0 can read them.
-        if !mmu::run_dma_zero_self_test() {
-            exceptions::silver_handle_exception(9, 0, 0, 0);
-        }
-                console::write_str("DMA ZERO OK\r\n");
-        ram_log::log("DMA ZERO OK");
-        }
-
-    // RX ring arithmetic under head/tail wraparound (the cross-CPU exclusion
-    // is the lock around push/pop; this proves the indices themselves).
-    #[cfg(all(feature = "smp", feature = "smp-selftest"))]
-    {
-        if !pl011::run_ring_self_test() {
-            exceptions::silver_handle_exception(9, 0, 0, 0);
-        }
-        console::write_str("UART RING OK\r\n");
-        ram_log::log("UART RING OK");
-
-        // SYS_STOP_CONSOLE requires CAP_CONSOLE_GRANT: the owner has it, a
-        // plain driver does not.
-        if !scheduler::run_console_cap_selftest() {
-            exceptions::silver_handle_exception(9, 0, 0, 0);
-        }
-        console::write_str("CONSOLE CAP OK\r\n");
-        ram_log::log("CONSOLE CAP OK");
-        }
-
-    if DEEP_BOOT_SELFTESTS {
-        // DMA quarantine window: a released run must survive the grace passes
-        // and then return to the frame allocator.
-        if !scheduler::run_dma_quarantine_self_test() {
-            exceptions::silver_handle_exception(9, 0, 0, 0);
-        }
-                ram_log::log("DMA QUARANTINE OK");
-
-        // In-flight DMA lease gate: an armed device range must block reuse until
-        // the driver drops the lease.
-        if !scheduler::run_dma_lease_self_test() {
-            exceptions::silver_handle_exception(9, 0, 0, 0);
-        }
-                console::write_str("DMA LEASE OK\r\n");
-        ram_log::log("DMA LEASE OK");
-        }
-
-    drop(value);
+    drop(heap_probe);
     #[cfg(feature = "fog")]
     {
         console::write_str("SILVER FRAME ALLOCATOR OK\r\nSILVER HEAP OK base=0x");
@@ -525,54 +229,7 @@ pub extern "C" fn kernel_main() -> ! {
         console::write_str("\r\n");
     }
 
-    // The tablet/fog path shares the QEMU boot sequence from here on: gic::init
-    // dispatches to gicv3, and the timer PPI is selected per platform (INTID
-    // 30 on SM8650, 18 on SM6225/khaje).
-    // The interrupt controller is bound from the same device map as the
-    // console: a GICv2 gets the distributor and CPU-interface bases the tree
-    // describes (they are not at a fixed offset from each other on real
-    // controllers), a GICv3 keeps its system-register path.
-    if let Some(intid) = crate::driver_resources::timer_intid() {
-        gic::set_timer_irq(intid);
-    }
-    match crate::driver_resources::gic_bases() {
-        Some((distributor, cpu_interface)) => gic::init_at(distributor, cpu_interface),
-        None => gic::init(),
-    }
-    timer::init();
-    #[cfg(feature = "fog-auto-reset")]
-    fog::arm_auto_reset(30);
-    // BISECT: isolated timer test — unmask IRQs in kernel context, wait for
-    // ticks only when a redistributor was confirmed. Without one, spinning
-    // for an interrupt that cannot be delivered would just hide the failure.
-    #[cfg(any(not(feature = "fog"), feature = "fog-timer-test"))]
-    {
-        if timer::available() {
-            let saved = interrupts::save_and_disable_irq();
-            interrupts::enable_irq();
-            let mut spin: u32 = 0;
-            while timer::ticks() < 30 && spin < 800_000_000 {
-                spin += 1;
-                core::hint::spin_loop();
-            }
-            interrupts::restore_irq(saved);
-            console::write_str("TIMER TEST: ticks=");
-            console::write_dec_u64(timer::ticks());
-            console::write_str(" spins=");
-            console::write_dec_u64(spin as u64);
-            console::write_str("\r\n");
-        } else {
-            console::write_str("TIMER TEST: SKIP (no confirmed GICv3 timer PPI)\r\n");
-        }
-    }
-    #[cfg(all(feature = "fog", not(feature = "fog-timer-test")))]
-    {
-        // The first hardware boot must not deliver a timer IRQ before
-        // scheduler::init_fog(): gicv3::handle_irq calls schedule() on every
-        // tick, and the scheduler state is not ready yet.
-        console::write_str("TIMER TEST: SKIP (fog hardware default)\r\n");
-    }
-    ram_log::log("GICv3+TIMER OK");
+    boot::interrupts::init();
     vfs::init();
     seed::seed();
     // The kernel streams SFS reads from virtio-blk. Mutations are disabled in
@@ -608,29 +265,7 @@ pub extern "C" fn kernel_main() -> ! {
         console::write_str("BUNDLE SIGNATURES: none (integrity only)\r\n");
     }
 
-    #[cfg(feature = "fog")]
-    {
-        console::write_str("SILVER PLATFORM READY\r\n");
-        scheduler::init_fog();
-        console::write_str("SILVER SCHEDULER START\r\n");
-        scheduler::start();
-    }
-    #[cfg(not(feature = "fog"))]
-    {
-        scheduler::init();
-
-        #[cfg(not(feature = "tablet"))]
-        {
-            console::write_str("IRQ READY\r\n");
-            for &byte in b"HELLO, WORLD!\r\n" {
-                console::write_byte(byte);
-            }
-            boot_metrics::log_milestone("Scheduler start");
-            console::write_str("SCHEDULER START\r\n");
-        }
-        ram_log::log("SCHEDULER START - BOOT COMPLETE");
-        scheduler::start();
-    }
+    boot::start::run()
 }
 
 #[cfg(not(feature = "std"))]
