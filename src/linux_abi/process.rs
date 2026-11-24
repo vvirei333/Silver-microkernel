@@ -27,6 +27,11 @@ pub(super) fn linux_execve(
     envp_pointer: u64,
 ) -> u64 {
     const EXEC_LIMIT: usize = 32 * 1024 * 1024;
+    // There is no `fexecve` yet: after `cap_enter` a path-based exec would
+    // reopen exactly the namespace capability mode is meant to remove.
+    if scheduler::current_task_capability_mode() {
+        return errno(EPERM);
+    }
     // `execve` from a `CLONE_VM` sibling would build a new address space and
     // then release the leader's, pulling the tables out from under every
     // running thread. Until a thread takes over the whole group, refuse

@@ -1,9 +1,13 @@
 use super::*;
+use super::cap::{cap_denies_cwd, silver_cap};
 use super::fs::*;
 use super::ipc::*;
 use super::memory::*;
 use super::process::*;
 
+/// Private Silver extension: op 0 enter capability mode, 1 limit fd rights,
+/// 2 read fd rights. Not part of the Linux ABI.
+const SYS_SILVER_CAP: u64 = 0x534c_5601;
 const SYS_DUP: u64 = 23;
 const SYS_DUP3: u64 = 24;
 const SYS_EVENTFD2: u64 = 19;
@@ -277,6 +281,7 @@ fn dispatch_inner(
             args[1] as i64,
             args[2],
         )),
+        SYS_SILVER_CAP => silver_cap(args[0], args[1], args[2]),
         SYS_DUP => finish(linux_fd::dup(scheduler::current_task_id(), args[0])),
         SYS_DUP3 => finish(linux_fd::dup2(
             scheduler::current_task_id(),
@@ -301,7 +306,9 @@ fn dispatch_inner(
         SYS_UMOUNT2 => linux_umount(args[0], args[1]),
         // The Linux root already is the SFS mount; a chroot cannot narrow it
         // further because every path is mapped onto `/sfs`.
-        SYS_CHROOT => 0,
+        SYS_CHROOT => {
+            if cap_denies_cwd() { errno(EPERM) } else { 0 }
+        }
         SYS_PIVOT_ROOT => errno(ENOSYS),
         SYS_SETSID => scheduler::current_tgid(),
         SYS_SETPGID | SYS_SETHOSTNAME => 0,
@@ -309,9 +316,23 @@ fn dispatch_inner(
         SYS_UMASK => 0o22,
         SYS_GETRUSAGE => linux_zero_struct(args[1], 144),
         SYS_SYSINFO => linux_zero_struct(args[0], 112),
-        SYS_STATFS => linux_zero_struct(args[1], 120),
-        SYS_FSTATFS => linux_zero_struct(args[2], 120),
-        SYS_UTIMENSAT => 0,
+        SYS_STATFS => {
+            if cap_denies_cwd() {
+                errno(EPERM)
+            } else {
+                linux_zero_struct(args[1], 120)
+            }
+        }
+        SYS_FSTATFS => {
+            let task = scheduler::current_task_id();
+            if let Err(code) = linux_fd::require_right(task, args[0], linux_fd::FD_FSTAT) {
+                return errno(code);
+            }
+            linux_zero_struct(args[2], 120)
+        }
+        SYS_UTIMENSAT => {
+            if cap_denies_cwd() { errno(EPERM) } else { 0 }
+        }
         SYS_FACCESSAT2 => linux_faccessat(args[0], args[1], args[2]),
         SYS_FACCESSAT => linux_faccessat(args[0], args[1], args[2]),
         SYS_GETDENTS64 => finish(linux_fd::getdents64(
@@ -362,6 +383,9 @@ fn dispatch_inner(
             args[0] & 0x800 != 0,
         )),
         SYS_INOTIFY_ADD_WATCH => {
+            if cap_denies_cwd() {
+                return errno(EPERM);
+            }
             if !linux_fd::is_inotify(scheduler::current_task_id(), args[0]) {
                 errno(EBADF)
             } else {

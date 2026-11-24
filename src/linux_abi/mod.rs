@@ -24,6 +24,7 @@ pub(super) use crate::{linux_fd, scheduler, timer, user_memory};
 pub(super) use alloc::string::String;
 pub(super) use alloc::vec::Vec;
 
+mod cap;
 mod dispatch;
 mod fs;
 mod ipc;

@@ -194,6 +194,14 @@ pub(super) fn linux_mmap(
         return placed.map(|placed| placed as u64).unwrap_or(errno(ENOMEM));
     }
 
+    // File-backed mapping needs a descriptor that still grants mmap.
+    if let Err(code) = linux_fd::require_right(
+        scheduler::current_task_id(),
+        fd,
+        linux_fd::FD_MMAP,
+    ) {
+        return errno(code);
+    }
     // File-backed mapping. Linux requires a page-aligned file offset.
     if offset % PAGE_SIZE != 0 {
         return errno(EINVAL);

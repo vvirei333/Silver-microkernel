@@ -177,7 +177,8 @@ impl Drop for MappedFile {
 /// receiver consumes the message, exactly like Linux.
 struct SocketMessage {
     data: VecDeque<u8>,
-    fds: Vec<Target>,
+    /// Carried descriptors keep the sender's rights, like `dup`.
+    fds: Vec<(Target, u32)>,
 }
 
 /// One end of a connected `AF_UNIX` stream pair.
@@ -310,6 +311,46 @@ struct SignalFdState {
     queued: Vec<u32>,
 }
 
+/// Capsicum-style rights for Linux descriptors. The common bits match the
+/// native VFS masks; the upper bits cover operations only the Linux ABI
+/// exposes.
+pub const FD_READ: u32 = vfs::FD_READ;
+pub const FD_WRITE: u32 = vfs::FD_WRITE;
+pub const FD_SEEK: u32 = vfs::FD_SEEK;
+pub const FD_FSTAT: u32 = vfs::FD_FSTAT;
+pub const FD_READDIR: u32 = vfs::FD_READDIR;
+pub const FD_LOOKUP: u32 = vfs::FD_LOOKUP;
+pub const FD_TRUNCATE: u32 = vfs::FD_TRUNCATE;
+pub const FD_IOCTL: u32 = 1 << 7;
+pub const FD_MMAP: u32 = 1 << 8;
+pub const FD_POLL: u32 = 1 << 9;
+pub const FD_EVENT: u32 = 1 << 10;
+pub const FD_ACCEPT: u32 = 1 << 11;
+pub const FD_CONNECT: u32 = 1 << 12;
+pub const FD_BIND: u32 = 1 << 13;
+pub const FD_LISTEN: u32 = 1 << 14;
+pub const FD_SEND: u32 = 1 << 15;
+pub const FD_RECV: u32 = 1 << 16;
+pub const FD_SHUTDOWN: u32 = 1 << 17;
+pub const FD_ALL: u32 = FD_READ
+    | FD_WRITE
+    | FD_SEEK
+    | FD_FSTAT
+    | FD_READDIR
+    | FD_LOOKUP
+    | FD_TRUNCATE
+    | FD_IOCTL
+    | FD_MMAP
+    | FD_POLL
+    | FD_EVENT
+    | FD_ACCEPT
+    | FD_CONNECT
+    | FD_BIND
+    | FD_LISTEN
+    | FD_SEND
+    | FD_RECV
+    | FD_SHUTDOWN;
+
 struct Table {
     task: u64,
     slots: Vec<Option<Target>>,
@@ -317,6 +358,8 @@ struct Table {
     /// friends cross-check the requested mode against `fcntl(F_GETFL)`, and a
     /// hardcoded `O_RDONLY` made every write stream fail with `EINVAL`.
     access: Vec<u64>,
+    /// Capsicum-style rights for each slot. Only ever cleared after insert.
+    rights: Vec<u32>,
     /// Descriptor numbers carrying `FD_CLOEXEC`. `execve` closes exactly
     /// these, which is how Rust's `Command` learns that `execvp` succeeded
     /// (the parent reads EOF from the exec-error socketpair).
@@ -341,6 +384,7 @@ fn with_table<R>(task: u64, action: impl FnOnce(&mut Table) -> R) -> R {
                 task,
                 slots,
                 access: alloc::vec![O_RDWR; 3],
+                rights: alloc::vec![FD_ALL; 3],
                 cloexec: Vec::new(),
             });
             tables.len() - 1
@@ -364,6 +408,10 @@ pub fn shm_open(
     exclusive: bool,
     truncate: bool,
 ) -> Result<u64, u64> {
+    // POSIX shm names are a global namespace, like pathname sockets.
+    if scheduler::current_task_capability_mode() {
+        return Err(EPERM);
+    }
     let state = {
         let mut files = SHM_FILES.lock();
         let existing = files
@@ -405,6 +453,9 @@ pub fn shm_open(
 
 /// `shm_unlink`: forget a name. Open descriptors keep the object alive.
 pub fn shm_unlink(name: &str) -> Result<(), u64> {
+    if scheduler::current_task_capability_mode() {
+        return Err(EPERM);
+    }
     let mut files = SHM_FILES.lock();
     let Some(index) = files.iter().position(|(stored, _)| stored == name) else {
         return Err(ENOENT);
@@ -437,7 +488,7 @@ fn release_socket_end(state: &Arc<Mutex<SocketState>>, end: u8) {
         socket.ends[end].incoming.drain(..).collect::<Vec<_>>()
     };
     for message in dropped {
-        for target in message.fds {
+        for (target, _) in message.fds {
             target.release_endpoint();
         }
     }
@@ -521,11 +572,94 @@ fn access_at(table: &Table, fd: u64) -> u64 {
     table.access.get(fd as usize).copied().unwrap_or(O_RDWR)
 }
 
+fn set_rights(table: &mut Table, fd: u64, rights: u32) {
+    while table.rights.len() <= fd as usize {
+        table.rights.push(FD_ALL);
+    }
+    table.rights[fd as usize] = rights;
+}
+
+fn rights_at(table: &Table, fd: u64) -> u32 {
+    table.rights.get(fd as usize).copied().unwrap_or(FD_ALL)
+}
+
+/// Rights granted by opening a target. The access mode narrows these in
+/// `insert_access`; targets installed by `socket`, `pipe` or `memfd` get the
+/// full set their kind can use.
+fn default_rights(target: &Target) -> u32 {
+    match target {
+        Target::Vfs(_) => {
+            FD_READ
+                | FD_WRITE
+                | FD_SEEK
+                | FD_FSTAT
+                | FD_READDIR
+                | FD_LOOKUP
+                | FD_TRUNCATE
+                | FD_IOCTL
+                | FD_MMAP
+                | FD_POLL
+        }
+        Target::DirList { .. } => FD_READDIR | FD_LOOKUP | FD_FSTAT | FD_SEEK | FD_POLL,
+        Target::Sysfs(..) | Target::Proc(..) => {
+            FD_READ | FD_SEEK | FD_FSTAT | FD_IOCTL | FD_POLL
+        }
+        Target::Drm { .. } | Target::Prime { .. } | Target::GpuFb | Target::Ivshmem => {
+            FD_READ | FD_WRITE | FD_FSTAT | FD_IOCTL | FD_MMAP | FD_POLL
+        }
+        Target::Socket { .. } | Target::Unbound { .. } | Target::Listener { .. } => {
+            FD_READ
+                | FD_WRITE
+                | FD_FSTAT
+                | FD_IOCTL
+                | FD_POLL
+                | FD_ACCEPT
+                | FD_CONNECT
+                | FD_BIND
+                | FD_LISTEN
+                | FD_SEND
+                | FD_RECV
+                | FD_SHUTDOWN
+        }
+        Target::Console => FD_READ | FD_WRITE | FD_FSTAT | FD_IOCTL | FD_POLL,
+        Target::MemFd(_) => {
+            FD_READ
+                | FD_WRITE
+                | FD_SEEK
+                | FD_FSTAT
+                | FD_TRUNCATE
+                | FD_IOCTL
+                | FD_MMAP
+                | FD_POLL
+        }
+        Target::Pipe { .. }
+        | Target::EventFd { .. }
+        | Target::SignalFd(_)
+        | Target::TimerFd { .. }
+        | Target::Netlink { .. }
+        | Target::Inotify { .. } => FD_READ | FD_WRITE | FD_FSTAT | FD_IOCTL | FD_POLL,
+        Target::Epoll(_) => FD_READ | FD_WRITE | FD_FSTAT | FD_IOCTL | FD_POLL | FD_EVENT,
+        _ => FD_READ | FD_WRITE | FD_FSTAT | FD_IOCTL | FD_POLL,
+    }
+}
+
+fn narrow_for_access(table: &mut Table, fd: u64, access: u64) {
+    let mut rights = rights_at(table, fd);
+    match access & 3 {
+        0 => rights &= !(FD_WRITE | FD_TRUNCATE),
+        1 => rights &= !FD_READ,
+        _ => {}
+    }
+    set_rights(table, fd, rights);
+}
+
 fn insert_in(table: &mut Table, target: Target) -> Option<u64> {
+    let rights = default_rights(&target);
     for (index, slot) in table.slots.iter_mut().enumerate() {
         if slot.is_none() {
             *slot = Some(target);
             set_access(table, index as u64, O_RDWR);
+            set_rights(table, index as u64, rights);
             return Some(index as u64);
         }
     }
@@ -534,6 +668,7 @@ fn insert_in(table: &mut Table, target: Target) -> Option<u64> {
     }
     table.slots.push(Some(target));
     set_access(table, (table.slots.len() - 1) as u64, O_RDWR);
+    set_rights(table, (table.slots.len() - 1) as u64, rights);
     Some((table.slots.len() - 1) as u64)
 }
 
@@ -547,16 +682,19 @@ fn insert_access(task: u64, target: Target, access: u64) -> Option<u64> {
     with_table(task, |table| {
         let fd = insert_in(table, target)?;
         set_access(table, fd, access);
+        narrow_for_access(table, fd, access);
         Some(fd)
     })
 }
 
 fn insert_from_in(table: &mut Table, target: Target, minimum: u64) -> Option<u64> {
+    let rights = default_rights(&target);
     let mut index = minimum as usize;
     while index < table.slots.len() {
         if table.slots[index].is_none() {
             table.slots[index] = Some(target);
             set_access(table, index as u64, O_RDWR);
+            set_rights(table, index as u64, rights);
             return Some(index as u64);
         }
         index += 1;
@@ -572,7 +710,44 @@ fn insert_from_in(table: &mut Table, target: Target, minimum: u64) -> Option<u64
     }
     table.slots.push(Some(target));
     set_access(table, (table.slots.len() - 1) as u64, O_RDWR);
+    set_rights(table, (table.slots.len() - 1) as u64, rights);
     Some((table.slots.len() - 1) as u64)
+}
+
+/// Current rights of `fd`; `EBADF` when the descriptor is not open.
+pub fn rights(task: u64, fd: u64) -> Result<u32, u64> {
+    with_table(task, |table| {
+        if table.slots.get(fd as usize).and_then(|slot| slot.as_ref()).is_none() {
+            return Err(EBADF);
+        }
+        Ok(rights_at(table, fd))
+    })
+}
+
+/// Clears every right not in `mask`. Widening is impossible by construction;
+/// unknown bits are rejected so a future right cannot be silently ignored.
+pub fn limit_rights(task: u64, fd: u64, mask: u32) -> Result<u32, u64> {
+    if mask & !FD_ALL != 0 {
+        return Err(EINVAL);
+    }
+    with_table(task, |table| {
+        if table.slots.get(fd as usize).and_then(|slot| slot.as_ref()).is_none() {
+            return Err(EBADF);
+        }
+        let rights = rights_at(table, fd) & mask;
+        set_rights(table, fd, rights);
+        Ok(rights)
+    })
+}
+
+/// Fails with `EPERM` when `need` is not a subset of the descriptor's rights.
+pub fn require_right(task: u64, fd: u64, need: u32) -> Result<(), u64> {
+    let rights = rights(task, fd)?;
+    if rights & need == need {
+        Ok(())
+    } else {
+        Err(EPERM)
+    }
 }
 
 /// Nodes listed by the synthetic `/dev/dri` directory.
@@ -873,8 +1048,10 @@ pub fn dup(task: u64, fd: u64) -> Result<u64, u64> {
             .and_then(|slot| slot.clone())
             .ok_or(EBADF)?;
         let access = access_at(table, fd);
+        let rights = rights_at(table, fd);
         let new_fd = insert_in(table, target.clone()).ok_or(EMFILE)?;
         set_access(table, new_fd, access);
+        set_rights(table, new_fd, rights);
         target.retain_endpoint();
         Ok(new_fd)
     })
@@ -888,8 +1065,10 @@ pub fn dup_from(task: u64, fd: u64, minimum: u64, cloexec: bool) -> Result<u64, 
             .and_then(|slot| slot.clone())
             .ok_or(EBADF)?;
         let access = access_at(table, fd);
+        let rights = rights_at(table, fd);
         let new_fd = insert_from_in(table, target.clone(), minimum).ok_or(EMFILE)?;
         set_access(table, new_fd, access);
+        set_rights(table, new_fd, rights);
         target.retain_endpoint();
         Ok::<u64, u64>(new_fd)
     })?;
@@ -970,11 +1149,12 @@ pub fn dup2(task: u64, oldfd: u64, newfd: u64) -> Result<u64, u64> {
             close_vfs_if_last(task, vfs_fd);
         }
     }
-    let access = with_table(task, |table| access_at(table, oldfd));
+    let (access, rights) = with_table(task, |table| (access_at(table, oldfd), rights_at(table, oldfd)));
     target.retain_endpoint();
     with_table(task, |table| {
         table.slots[newfd as usize] = Some(target);
         set_access(table, newfd, access);
+        set_rights(table, newfd, rights);
         table.cloexec.retain(|&marked| marked != newfd);
     });
     Ok(newfd)
@@ -982,6 +1162,7 @@ pub fn dup2(task: u64, oldfd: u64, newfd: u64) -> Result<u64, u64> {
 
 pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
     let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_READ)?;
     if count == 0 {
         return Ok(0);
     }
@@ -1074,8 +1255,8 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         Target::Socket { state, end, nonblock } => {
             let mut chunk = alloc::vec![0_u8; (count as usize).min(64 * 1024)];
             let (read, fds) = socket_recv_message(&state, end, nonblock, &mut chunk)?;
-            for target in fds {
-                let _ = insert_transferred(task, target);
+            for (target, rights) in fds {
+                let _ = insert_transferred(task, target, rights);
             }
             user_memory::copy_to_user(&chunk[..read], buffer).map_err(|_| EFAULT)?;
             Ok(read as u64)
@@ -1095,6 +1276,7 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
 /// keeps the same RamFs quota check as the userspace `write` path.
 pub fn write_kernel(task: u64, fd: u64, bytes: &[u8]) -> Result<usize, u64> {
     let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_WRITE)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     match target {
         Target::Vfs(vfs_fd) => {
@@ -1112,6 +1294,7 @@ pub fn write_kernel(task: u64, fd: u64, bytes: &[u8]) -> Result<usize, u64> {
 /// Positional read used by file-backed `mmap`. Does not move the fd offset.
 pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize, u64> {
     let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_READ | FD_SEEK)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     match target {
         Target::Vfs(vfs_fd) => {
@@ -1160,6 +1343,7 @@ pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize
 
 pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
     let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_WRITE)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     match target {
         Target::Console => {
@@ -1221,6 +1405,7 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
 
 pub fn lseek(task: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, u64> {
     let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_SEEK)?;
     match lookup(task, fd).ok_or(EBADF)? {
         Target::Vfs(vfs_fd) => vfs::lseek(task, vfs_fd, offset, whence).map_err(|_| EINVAL),
         Target::DirList { .. } => {
@@ -1260,6 +1445,8 @@ pub fn lseek(task: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, u64> {
 /// Positional write used by `pwrite64`. Grows a memfd like `write` does and
 /// does not move the descriptor offset.
 pub fn pwrite(task: u64, fd: u64, offset: u64, bytes: &[u8]) -> Result<usize, u64> {
+    let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_WRITE | FD_SEEK)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     if let Target::Vfs(vfs_fd) = target {
         return vfs::pwrite(task, vfs_fd, offset, bytes).map_err(|_| EINVAL);
@@ -1327,6 +1514,7 @@ pub fn stat_fields(
     fd: u64,
 ) -> Result<(u32, u64, u64, Option<u64>), u64> {
     let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_FSTAT)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     Ok(match target {
         Target::Console => (S_IFCHR | 0o620, 0, fd.max(1), None),
@@ -1396,6 +1584,7 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
 
 /// Path of an open directory descriptor, for `*at` calls.
 pub fn directory_path(task: u64, fd: u64) -> Option<String> {
+    require_right(task, fd, FD_LOOKUP).ok()?;
     match lookup(task, fd)? {
         Target::Vfs(vfs_fd) if vfs::fd_kind(task, vfs_fd) == Some(vfs::FD_KIND_DIR) => {
             vfs::fd_path(task, vfs_fd)
@@ -1406,6 +1595,7 @@ pub fn directory_path(task: u64, fd: u64) -> Option<String> {
 
 pub fn getdents64(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
     let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_READDIR)?;
     const HEADER: usize = 19; // d_ino(8) + d_off(8) + d_reclen(2) + d_type(1)
     let target = lookup(task, fd).ok_or(EBADF)?;
     if let Target::DirList { entries, offset } = target {
@@ -1677,6 +1867,8 @@ pub fn is_memfd(task: u64, fd: u64) -> bool {
 /// descriptors reference the same `MemFdState`, so mmaps, reads and writes
 /// stay in sync.
 pub fn udmabuf_create(task: u64, memfd: u64, _offset: u64, size: u64) -> Result<u64, u64> {
+    let rights = rights(task, memfd)?;
+    require_right(task, memfd, FD_MMAP | FD_READ)?;
     let target = lookup(task, memfd).ok_or(EBADF)?;
     let Target::MemFd(state) = target else {
         return Err(EINVAL);
@@ -1684,7 +1876,9 @@ pub fn udmabuf_create(task: u64, memfd: u64, _offset: u64, size: u64) -> Result<
     if state.lock().len() < size as usize {
         return Err(EINVAL);
     }
-    insert(task, Target::MemFd(state)).ok_or(EMFILE)
+    let fd = insert(task, Target::MemFd(state)).ok_or(EMFILE)?;
+    with_table(task, |table| set_rights(table, fd, rights));
+    Ok(fd)
 }
 
 /// Creates an anonymous in-memory file (`memfd_create`). File-backed `mmap`
@@ -1724,6 +1918,8 @@ pub fn epoll_ctl(
     events: u32,
     data: u64,
 ) -> Result<(), u64> {
+    require_right(task, epfd, FD_EVENT)?;
+    require_right(task, fd, FD_POLL)?;
     let target = lookup(task, epfd).ok_or(EBADF)?;
     let Target::Epoll(state) = target else {
         return Err(EINVAL);
@@ -1776,6 +1972,9 @@ fn epoll_ready_mask(task: u64, fd: u64, requested: u32) -> u32 {
 }
 
 fn epoll_ready_mask_at(task: u64, fd: u64, requested: u32, depth: u8) -> u32 {
+    if require_right(task, fd, FD_POLL).is_err() {
+        return 0;
+    }
     const EPOLLIN: u32 = 0x001;
     const EPOLLOUT: u32 = 0x004;
     const EPOLLERR: u32 = 0x008;
@@ -1808,6 +2007,7 @@ pub fn epoll_wait(
     max_events: usize,
     timeout_ms: i64,
 ) -> Result<Vec<(u32, u64)>, u64> {
+    require_right(task, epfd, FD_EVENT)?;
     let target = lookup(task, epfd).ok_or(EBADF)?;
     let Target::Epoll(state) = target else {
         return Err(EINVAL);
@@ -2053,6 +2253,7 @@ fn memfd_write(
 /// currently support only truncation to zero; other lengths fail explicitly.
 pub fn truncate(task: u64, fd: u64, length: u64) -> Result<(), u64> {
     let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_WRITE | FD_TRUNCATE)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     if (length as i64) < 0 { return Err(EINVAL); }
     match target {
@@ -2069,6 +2270,7 @@ pub fn truncate(task: u64, fd: u64, length: u64) -> Result<(), u64> {
 /// `ftruncate(2)` / `fallocate(2)` on a memfd. The file is backed lazily; a
 /// resize is refused while a shared mapping pins the current run.
 pub fn memfd_truncate(task: u64, fd: u64, length: usize) -> Result<(), u64> {
+    require_right(task, fd, FD_WRITE | FD_TRUNCATE)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::MemFd(state) = target else {
         return Err(EINVAL);
@@ -2098,6 +2300,7 @@ pub fn memfd_truncate(task: u64, fd: u64, length: usize) -> Result<(), u64> {
 
 /// `fcntl(F_ADD_SEALS)` on a memfd.
 pub fn memfd_add_seals(task: u64, fd: u64, seals: u32) -> Result<(), u64> {
+    require_right(task, fd, FD_WRITE)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::MemFd(state) = target else {
         return Err(EINVAL);
@@ -2113,6 +2316,7 @@ pub fn memfd_add_seals(task: u64, fd: u64, seals: u32) -> Result<(), u64> {
 
 /// `fcntl(F_GET_SEALS)` on a memfd.
 pub fn memfd_get_seals(task: u64, fd: u64) -> Result<u32, u64> {
+    require_right(task, fd, FD_FSTAT)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::MemFd(state) = target else {
         return Err(EINVAL);
@@ -2123,6 +2327,7 @@ pub fn memfd_get_seals(task: u64, fd: u64) -> Result<u32, u64> {
 
 /// `fallocate(2)` with mode 0: grow the file if `offset + length` exceeds it.
 pub fn memfd_fallocate(task: u64, fd: u64, offset: usize, length: usize) -> Result<(), u64> {
+    require_right(task, fd, FD_WRITE)?;
     let needed = offset.checked_add(length).ok_or(EINVAL)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::MemFd(state) = target else {
@@ -2143,6 +2348,7 @@ pub fn memfd_shared(
     offset: usize,
     length: usize,
 ) -> Result<(usize, MappedFile), u64> {
+    require_right(task, fd, FD_MMAP | FD_READ)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::MemFd(state) = target else {
         return Err(EINVAL);
@@ -2210,9 +2416,10 @@ fn pipe_write(state: &Arc<Mutex<PipeState>>, buffer: u64, count: u64) -> Result<
 /// caller passes a target that already owns one reference (the message
 /// queue); on success the table owns it, on failure that reference is
 /// released.
-fn insert_transferred(task: u64, target: Target) -> Option<u64> {
+fn insert_transferred(task: u64, target: Target, rights: u32) -> Option<u64> {
     match insert(task, target.clone()) {
         Some(fd) => {
+            with_table(task, |table| set_rights(table, fd, rights));
             // The table's copy becomes a counted endpoint, then the queue's
             // reference is released: exactly one owner remains.
             target.retain_endpoint();
@@ -2304,8 +2511,14 @@ pub fn listener_unlink(path: &[u8]) -> bool {
 }
 
 pub fn bind(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
+    require_right(task, fd, FD_BIND)?;
     if path.is_empty() {
         return Err(EINVAL);
+    }
+    // A pathname bind publishes a name in the global namespace; abstract
+    // names are the only ones that stay inside the already-held context.
+    if path[0] != 0 && scheduler::current_task_capability_mode() {
+        return Err(EPERM);
     }
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::Unbound { nonblock } = target else {
@@ -2346,6 +2559,7 @@ pub fn bind(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
 
 /// `listen(2)`: marks a bound socket as accepting connections.
 pub fn listen(task: u64, fd: u64, backlog: u64) -> Result<(), u64> {
+    require_right(task, fd, FD_LISTEN)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::Listener { state, .. } = target else {
         return Err(EINVAL);
@@ -2359,8 +2573,12 @@ pub fn listen(task: u64, fd: u64, backlog: u64) -> Result<(), u64> {
 /// `connect(2)`: joins a bound listener and turns the calling descriptor into
 /// the client end of a connected pair.
 pub fn connect(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
+    require_right(task, fd, FD_CONNECT)?;
     if path.is_empty() {
         return Err(EINVAL);
+    }
+    if path[0] != 0 && scheduler::current_task_capability_mode() {
+        return Err(EPERM);
     }
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::Unbound { nonblock } = target else {
@@ -2423,6 +2641,7 @@ pub fn connect(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
 /// `accept(2)`/`accept4(2)`: pops one pending connection. Returns the new
 /// descriptor; the caller writes the (unnamed) peer address.
 pub fn accept(task: u64, fd: u64, nonblock_flag: bool) -> Result<u64, u64> {
+    require_right(task, fd, FD_ACCEPT)?;
     crate::console::write_str("SOCKDBG accept task=");
     crate::console::write_dec_u64(task);
     crate::console::write_str("
@@ -2483,14 +2702,14 @@ fn socket_send_locked(
     state: &Arc<Mutex<SocketState>>,
     end: u8,
     bytes: &[u8],
-    fds: Vec<Target>,
+    fds: Vec<(Target, u32)>,
 ) -> Result<u64, u64> {
     let end = end as usize;
     let peer = 1 - end;
     let mut socket = state.lock();
     if socket.ends[end].write_closed || socket.ends[peer].read_closed {
         drop(socket);
-        for target in &fds {
+        for (target, _) in &fds {
             target.release_endpoint();
         }
         return Err(EPIPE);
@@ -2514,20 +2733,27 @@ pub fn socket_send(
     pass: &[u64],
     _nonblock: bool,
 ) -> Result<u64, u64> {
+    require_right(task, fd, FD_SEND)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::Socket { state, end, .. } = target else {
         return Err(ENOTSOCK);
     };
-    let mut passed: Vec<Target> = Vec::new();
+    let mut passed: Vec<(Target, u32)> = Vec::new();
     for &passed_fd in pass {
         let Some(passed_target) = lookup(task, passed_fd) else {
-            for target in &passed {
+            for (target, _) in &passed {
+                target.release_endpoint();
+            }
+            return Err(EBADF);
+        };
+        let Ok(passed_rights) = rights(task, passed_fd) else {
+            for (target, _) in &passed {
                 target.release_endpoint();
             }
             return Err(EBADF);
         };
         passed_target.retain_endpoint();
-        passed.push(passed_target);
+        passed.push((passed_target, passed_rights));
     }
     socket_send_locked(&state, end, bytes, passed)
 }
@@ -2540,7 +2766,7 @@ fn socket_recv_message(
     end: u8,
     nonblock: bool,
     buffer: &mut [u8],
-) -> Result<(usize, Vec<Target>), u64> {
+) -> Result<(usize, Vec<(Target, u32)>), u64> {
     let end = end as usize;
     let peer = 1 - end;
     loop {
@@ -2590,6 +2816,7 @@ fn socket_recv_message(
 /// descriptors (memfd, pipes, devices) have no path and return `None`.
 pub fn vfs_path(task: u64, fd: u64) -> Option<alloc::string::String> {
     let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_FSTAT).ok()?;
     match lookup(task, fd)? {
         Target::Vfs(vfs_fd) => crate::vfs::fd_path(task, vfs_fd),
         _ => None,
@@ -2604,6 +2831,7 @@ pub fn socket_recv(
     buffer: &mut [u8],
     nonblock_hint: bool,
 ) -> Result<(usize, Vec<u64>), u64> {
+    require_right(task, fd, FD_RECV)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::Socket {
         state,
@@ -2624,8 +2852,8 @@ pub fn socket_recv(
     crate::console::write_str("
 ");
     let mut numbers = Vec::new();
-    for target in fds {
-        if let Some(number) = insert_transferred(task, target) {
+    for (target, rights) in fds {
+        if let Some(number) = insert_transferred(task, target, rights) {
             numbers.push(number);
         }
     }
@@ -2634,6 +2862,7 @@ pub fn socket_recv(
 
 /// `shutdown(2)`. `how`: 0 read, 1 write, 2 both.
 pub fn socket_shutdown(task: u64, fd: u64, how: u64) -> Result<(), u64> {
+    require_right(task, fd, FD_SHUTDOWN)?;
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::Socket { state, end, .. } = target else {
         return Err(ENOTSOCK);
@@ -2658,7 +2887,7 @@ pub fn socket_shutdown(task: u64, fd: u64, how: u64) -> Result<(), u64> {
     };
     drop(socket);
     for message in dropped {
-        for target in message.fds {
+        for (target, _) in message.fds {
             target.release_endpoint();
         }
     }
@@ -2734,6 +2963,7 @@ pub fn set_nonblock(task: u64, fd: u64, nonblock: bool) -> Result<(), u64> {
 
 /// Readiness bits for `ppoll`. `None` means the descriptor is not open.
 pub fn poll_ready(task: u64, fd: u64) -> Option<i16> {
+    require_right(task, fd, FD_POLL).ok()?;
     poll_ready_at(task, fd, 0)
 }
 
@@ -2904,11 +3134,13 @@ pub fn fork_table(parent: u64, child: u64) {
     }
     let cloexec = source.cloexec.clone();
     let access = source.access.clone();
+    let rights = source.rights.clone();
     tables.retain(|table| table.task != child);
     tables.push(Table {
         task: child,
         slots,
         access,
+        rights,
         cloexec,
     });
 }

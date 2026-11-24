@@ -351,6 +351,13 @@ pub(super) fn linux_readv(fd: u64, iovec: u64, count: u64) -> u64 {
 /// `ioctl(2)`: only the terminal size query is meaningful while stdout is the
 /// console. Everything else reports "not a tty".
 pub(super) fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
+    if let Err(code) = linux_fd::require_right(
+        scheduler::current_task_id(),
+        fd,
+        linux_fd::FD_IOCTL,
+    ) {
+        return errno(code);
+    }
     const TIOCGWINSZ: u64 = 0x5413;
     const TCGETS: u64 = 0x5401;
     const FIONBIO: u64 = 0x5421;
@@ -881,7 +888,9 @@ pub(super) fn scratch_resolved(dirfd: u64, path_pointer: u64) -> Result<(String,
     if path.is_empty() {
         return Err(ENOENT);
     }
-    let cwd = dirfd_cwd(dirfd)?;
+    // `scratch_resolved` carries positive errno values to its callers, while
+    // `dirfd_cwd` returns the syscall-style negative form.
+    let cwd = dirfd_cwd(dirfd).map_err(|code| (code as i64).wrapping_neg() as u64)?;
     let resolved = resolve(&cwd, &path).map_err(|_| ENOENT)?;
     if !crate::scheduler::linux_write_allowed(&resolved) {
         return Err(EROFS);
@@ -992,6 +1001,9 @@ pub(super) fn linux_renameat(
 }
 
 pub(super) fn linux_chdir(path_ptr: u64) -> u64 {
+    if scheduler::current_task_capability_mode() {
+        return errno(EPERM);
+    }
     let Some(path) = user_string(path_ptr) else {
         return errno(EFAULT);
     };
@@ -1013,6 +1025,9 @@ pub(super) fn linux_chdir(path_ptr: u64) -> u64 {
 /// a directory descriptor uses its own path, anything else is `EBADF`.
 pub(super) fn dirfd_cwd(dirfd: u64) -> Result<alloc::string::String, u64> {
     if dirfd as i64 == AT_FDCWD {
+        if scheduler::current_task_capability_mode() {
+            return Err(errno(EPERM));
+        }
         return Ok(scheduler::current_task_cwd());
     }
     linux_fd::directory_path(scheduler::current_task_id(), dirfd).ok_or_else(|| errno(EBADF))
@@ -1097,6 +1112,9 @@ pub(super) fn linux_pwrite(fd: u64, buffer: u64, count: u64, offset: u64) -> u64
 /// the kernel tables, and `tmpfs` becomes a `ramfs` backend inside the
 /// writable service subtrees. Flags are accepted and ignored.
 pub(super) fn linux_mount(source: u64, target: u64, filesystem: u64, _flags: u64) -> u64 {
+    if scheduler::current_task_capability_mode() {
+        return errno(EPERM);
+    }
     let _ = source;
     let Some(target) = user_string(target) else {
         return errno(EFAULT);
@@ -1136,6 +1154,9 @@ pub(super) fn linux_mount(source: u64, target: u64, filesystem: u64, _flags: u64
 /// Linux task to detach the root, so this is an idempotent success for a path
 /// that resolves and `ENOENT` otherwise.
 pub(super) fn linux_umount(target: u64, _flags: u64) -> u64 {
+    if scheduler::current_task_capability_mode() {
+        return errno(EPERM);
+    }
     let Some(target) = user_string(target) else {
         return errno(EFAULT);
     };
