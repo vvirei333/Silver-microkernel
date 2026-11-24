@@ -10,6 +10,30 @@ use super::proc::*;
 use super::*;
 use crate::syscall;
 
+/// Names offered by Tab completion. Keep this in step with the `execute`
+/// arms below; aliases are listed because they are valid first words too.
+const COMMANDS: &[&str] = &[
+    "help", "fastfetch", "sfsinfo", "memtest", "bench", "ping", "ip",
+    "ifconfig", "dns", "wget", "wolfser", "browser", "ls", "bigdir",
+    "bigfile", "cat", "touch", "run", "sl", "mkdir", "rm", "rmdir",
+    "mv", "replace", "cd", "pwd", "clear", "uname", "health", "watch",
+    "unwatch", "du", "ps", "spawn", "bg", "secprobe", "fg", "kill",
+    "wait", "svc", "poweroff", "reboot", "grep", "wc", "head", "tail",
+    "cp", "find", "seq", "basename", "dirname", "true", "false", "sleep",
+    "echo", "say",
+    #[cfg(feature = "linux-abi")]
+    "linuxrun",
+    #[cfg(feature = "linux-abi")]
+    "linuxstart",
+    #[cfg(feature = "linux-abi")]
+    "phosh",
+];
+
+/// Command names for the input loop's Tab completion.
+pub fn names() -> &'static [&'static str] {
+    COMMANDS
+}
+
 pub fn execute(command: &str) {
     let command = command.trim();
     // Reap finished `spawn`/`bg` children before doing anything else, so `ps`
@@ -43,6 +67,7 @@ pub fn execute(command: &str) {
         None => {}
         Some("help") => {
             syscall::print("howl commands:\r\n");
+            syscall::print("  Tab        Complete a command name; Up/Down recall history\r\n");
             syscall::print("  help       Show this command list\r\n");
             syscall::print("  fastfetch  Show the aligned system summary\r\n");
             syscall::print("  sfsinfo    Show the mounted SFS superblock\r\n");

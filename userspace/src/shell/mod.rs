@@ -10,7 +10,7 @@ pub mod files;
 pub mod net;
 pub mod proc;
 
-pub use commands::{execute, fastfetch};
+pub use commands::{execute, fastfetch, names};
 pub use proc::{find_task_id, find_task_id_preferring};
 
 use crate::syscall;

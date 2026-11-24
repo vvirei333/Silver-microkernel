@@ -18,7 +18,7 @@ mod shell;
 
 use core::panic::PanicInfo;
 
-use shell::{echo, execute, fastfetch, find_task_id, find_task_id_preferring, prompt, TICKS_PER_SECOND};
+use shell::{echo, execute, fastfetch, find_task_id, find_task_id_preferring, names, prompt, TICKS_PER_SECOND};
 
 /// One command line. 256 bytes are needed for `echo sig=<128 hex> >> <path>`;
 /// the older 96-byte limit silently truncated signing commands.
@@ -156,6 +156,11 @@ pub extern "C" fn _start(howler_id: u64) -> ! {
                 length = 0;
                 prompt();
             }
+            b'\t' => {
+                if let Some(completed) = complete(&mut line, length) {
+                    length = completed;
+                }
+            }
             0x1B => {
                 let recalled = match read_escape(&mut howler) {
                     Some(b'A') => history.older(&mut line, length),
@@ -249,6 +254,56 @@ fn read_escape(howler: &mut HowlerLink) -> Option<u8> {
         return None;
     }
     read_input(howler)
+}
+
+/// Completes a unique command-name prefix and appends a space. An ambiguous
+/// prefix prints the candidates and repeats the current line; a completed
+/// command plus arguments is left alone.
+fn complete(line: &mut [u8], length: usize) -> Option<usize> {
+    if length == 0 || line[..length].iter().any(|byte| *byte == b' ') {
+        return None;
+    }
+    let prefix = core::str::from_utf8(&line[..length]).ok()?;
+    let mut matched = None;
+    let mut count = 0_usize;
+    for name in names() {
+        if name.starts_with(prefix) {
+            count += 1;
+            matched = Some(*name);
+        }
+    }
+    if count == 1 {
+        let name = matched?;
+        let end = name.len();
+        if end > LINE_CAPACITY {
+            return None;
+        }
+        line[length..end].copy_from_slice(&name.as_bytes()[length..]);
+        for &byte in &name.as_bytes()[length..] {
+            echo(byte);
+        }
+        if end < LINE_CAPACITY {
+            line[end] = b' ';
+            echo(b' ');
+            return Some(end + 1);
+        }
+        return Some(end);
+    }
+    if count > 1 {
+        syscall::print("\r\n");
+        for name in names() {
+            if name.starts_with(prefix) {
+                syscall::print(name);
+                syscall::print("  ");
+            }
+        }
+        syscall::print("\r\n");
+        prompt();
+        for &byte in &line[..length] {
+            echo(byte);
+        }
+    }
+    None
 }
 
 /// Replaces the visible input line after a history recall.
