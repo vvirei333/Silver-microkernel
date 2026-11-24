@@ -131,7 +131,7 @@ Status of the candidate boards:
 | Board | SoC | Status | Blocking work |
 |---|---|---|---|
 | QEMU `virt` | — | **Supported** | — |
-| Raspberry Pi 5 | BCM2712 (Cortex-A76) | **Target**, not supported | Platform + linker base, UART/GIC/timer bases from the DTB, PSCI SMP, storage behind the RP1 southbridge/PCIe. Plan and milestone ladder: [PI5.md](PI5.md) |
+| Raspberry Pi 5 | BCM2712 (Cortex-A76) | **Target**, not supported | Platform + linker base, UART/GIC/timer bases from the DTB, PSCI SMP, a hardware boot log, and an on-card test of the BCM2712 SDHCI path. The SD card is BCM2712 `sdio1`, not RP1; RP1 remains the USB/Ethernet path. Plan: [PI5.md](PI5.md) |
 | Raspberry Pi 4 Model B | BCM2711 (Cortex-A72) | Not supported | Same plan one SoC earlier; simpler storage path |
 | Redmi 10C (`fog`) | SM6225 | Parked port | `fog.rs`/`platform.rs`/GENI UART merged behind feature flags; not bootable to userspace yet |
 
@@ -160,9 +160,10 @@ promise of dates):
 4. **Interrupt controller.** Pi 4 uses a GIC-400 at `0xFF84_1000`. GICv2
    dispatch exists (`gic.rs`), again with QEMU's base hardcoded.
 5. **Storage.** The SFS root lives on a block device. Pi 4/5 boot from SD/eMMC
-   through an Arasan SDHCI controller — there is no driver for it yet, and
-   without one there is no root filesystem, so this is the first real blocker
-   after the console lights up.
+   through SDHCI; the kernel now has a small block layer and a polled SDHCI
+   core (Pi 5: `brcm,bcm2712-sdhci`, 4-bit at 25 MHz). Neither has run on a
+   board yet, so there is still no supported root filesystem; QEMU keeps
+   using virtio-blk.
 6. **Power and time.** `poweroff`/`reboot` on a Pi go through the firmware
    mailbox (`0xFE00_B880`), not PSCI `SYSTEM_OFF`; the ARM generic timer works
    if `CNTFRQ_EL0` and the PPI are taken from the FDT.

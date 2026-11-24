@@ -50,10 +50,12 @@ staged into one SFS image by `tools/build_glibc_denial.py`; the layout is a
 normal Linux rootfs with `/lib/ld-linux-aarch64.so.1` wired to the Debian
 loader.
 
-## virtio-blk — IMPLEMENTED (device side)
+## block devices — IMPLEMENTED (device side)
 
-The kernel probes virtio-blk via FDT and registers the disk image as the SFS
-backing store. No partitioning. Writes are **write-through**: the block cache
+`block` owns one synchronous 512-byte device and SFS sits above it. `init`
+prefers a polled SDHCI card and falls back to virtio-blk when the tree has an
+ECAM host; QEMU therefore keeps using virtio-blk. The SDHCI path has not run
+on a Pi 5. No partitioning. Writes are **write-through**: the block cache
 updates the image through the device on every create/write/remove, so a file
 written at the shell survives a reboot (verified: `echo … > /sfs/keep.txt`,
 reboot, `cat`, then `scripts/sfs_fsck.py` reports no cross-links and a

@@ -17,6 +17,8 @@ mod block;
 #[cfg(not(feature = "std"))]
 mod capability;
 #[cfg(not(feature = "std"))]
+mod sdhci;
+#[cfg(not(feature = "std"))]
 mod channel;
 #[cfg(not(feature = "std"))]
 mod condvar;

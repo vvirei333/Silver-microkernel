@@ -19,7 +19,7 @@ the same plan applies one step earlier in the SoC family.
 | Console | PL011 debug UART (uart10 on a Pi 5) at 115200 8N1 on the header | known shape; base, INTID and reference clock are read from the node, including the Pi's `clocks = <&clk_uart>` phandle form |
 | Interrupts | GIC-400, ARM generic timer PPI | known shape; distributor and CPU-interface bases and the timer PPI INTID are all read from the tree (verified on QEMU's tree) |
 | Secondary cores / power | PSCI via firmware | expected, to be confirmed |
-| Storage | most I/O on Pi 5 sits behind the **RP1 southbridge over PCIe**; the SD/eMMC path must be confirmed from the live DTB (`lspci` on a running Linux shows the RP1) | **unknown — the main risk** |
+| Storage | the Pi 5 microSD slot is the BCM2712 `sdio1` controller (`brcm,bcm2712-sdhci`, `reg = <0x10 0x00fff000 ...>`, IRQ 273). RP1 contains `rp1_mmc0`/`rp1_mmc1`, but both are `disabled` in the Pi 5 tree. RP1 is still needed for USB and Ethernet, not for the SD card. | controller and tree shape known; no hardware log yet |
 | Firmware services | mailbox for poweroff/reboot, framebuffer (not needed for a console image) | known shape, to be implemented |
 
 Two rules follow from the right-hand column:
@@ -37,7 +37,7 @@ Two rules follow from the right-hand column:
 | P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base and reference clock from the DTB~~ (done), ~~link base as a build parameter~~ (done), remaining: confirm the firmware's `kernel_address`/armstub handoff and capture the first serial log; the stub already drops EL2 → EL1 when the firmware enters there |
 | P1 | Interrupts and time | timer tick, GIC init, `health`/`uptime` advancing, no fault | ~~GIC-400 base from the DTB~~ (done), ~~timer PPI selection~~ (done), ~~PSCI conduit and per-CPU MPIDR from the tree~~ (done), remaining: a hardware run |
 | P2 | Console userspace from RAM | `howl>` prompt and `help` **with no storage at all** | already reachable on QEMU with no disk: the shell and its commands are embedded in the kernel; remaining: one Pi 5 serial log |
-| P3 | Root filesystem on the board | `ls /sfs` reads the real image; `cat`, `spawn`, `bench fs` work | ~~PCIe host discovery and RP1 identification~~ (done in software: QEMU ECAM and the BCM2712 index/data back end); remaining: RP1 BAR/driver bring-up and an SD/eMMC or USB block path — this is still the main missing subsystem |
+| P3 | Root filesystem on the board | `ls /sfs` reads the real image; `cat`, `spawn`, `bench fs` work | ~~PCIe host discovery and RP1 identification~~ (software); ~~block-device layer and polled SDHCI core, including the BCM2712 `sdio1` pin mux and 4-bit/25 MHz bring-up~~ (software, not hardware-verified); remaining: one Pi 5 serial log with an actual card, and RP1 USB/Ethernet if SD is unavailable |
 | P4 | Power control | `poweroff`/`reboot` from the shell | ~~PSCI conduit from the tree~~ (done); remaining: confirm `SYSTEM_OFF`/`SYSTEM_RESET` over SMC on the board (use the mailbox only if firmware lacks PSCI power calls) |
 | P5 | Network (optional) | `ping`/`wget` over the on-board Ethernet | RP1 Ethernet + the existing virtio-free userspace stack |
 
@@ -50,10 +50,13 @@ without waiting for the storage stack, which is the riskiest part of the board.
    boot it, and attach the serial log. The tree-first console, GIC, timer, PSCI
    conduit selection and AP MPIDR mapping are in the kernel now, but none of
    them has been observed on a Pi 5.
-2. P3 storage: PCIe host discovery now exists (QEMU ECAM and the BCM2712
-   index/data back end), and RP1 is recognized by `1de4:0001`. There is still
-   no RP1 driver or SD/eMMC block path; that remains the large missing
-   subsystem, not a board constant.
+2. P3 storage: PCIe host discovery exists (QEMU ECAM and the BCM2712
+   index/data back end), RP1 is recognized by `1de4:0001`, and SFS now sits on
+   a small block layer with a polled SDHCI back end. The Pi 5 path is BCM2712
+   `sdio1`, not RP1: the driver selects an enabled `brcm,bcm2712-sdhci` node,
+   applies the SD pin mux and brings the card up at 400 kHz, then 4-bit at
+   25 MHz. QEMU still uses virtio-blk. What is missing is hardware evidence
+   with a real card, plus RP1 USB/Ethernet for the other I/O.
 3. P4: check whether the Pi firmware implements PSCI `SYSTEM_OFF` and
    `SYSTEM_RESET`; only add mailbox power control if it does not.
 
@@ -192,6 +195,7 @@ The most useful contributions are *data from real hardware*, not patches:
 
 | Date | Change | Evidence |
 |---|---|---|
+| 2026-11-25 | SFS is no longer welded to virtio-blk. `block` owns one synchronous 512-byte device and `init` picks SDHCI first, then virtio-blk only when the tree has an ECAM host (or no tree). The polled SDHCI core is generic; `brcm,bcm2712-sdhci` adds the BCM2712 SD pin mux and 200 MHz base-clock fallback. Pi 5 microSD is BCM2712 `sdio1`, not RP1; the RP1 MMC nodes are disabled. The BCM peripheral mapping grows from 2 MiB to 16 MiB so `0x10_00fff000` is reachable. | 268 host tests; no_std and QEMU boots with and without a DTB still select `virtio-blk`; SDHCI command/card path is software-only, no Pi 5 log |
 | 2026-11-24 | PCIe discovery is tree-driven. `pci` parses `pci-host-ecam-generic` and `brcm,bcm2712-pcie`, and an MMIO backend reads either ECAM or the BCM2712 index (`0x9000`) / data (`0x8000`) registers. Enumeration records vendor/device/class, skips disabled hosts, and recognizes RP1 as `1de4:0001` at `01:00.0`. The BCM controller block is mapped as Device memory in the kernel page tables. | 261 host tests; `no_std` build; flat-Image QEMU boot with a real DTB logs `PCI: host=ECAM`, four functions and the shell still runs; BCM/RP1 path is covered by parser and scanner tests, not hardware |
 | 2026-11-24 | PSCI conduit and AP MPIDRs come from the live tree instead of the board name and CPU index. `fdt` reads `/psci/method` (`hvc`/`smc`) and each `/cpus/cpu*` `reg`; `power` caches the conduit and issues both power and `CPU_ON` through it. This is what the Pi 5 needs (`smc`, clustered affinity); QEMU keeps `hvc` and the index fallback. Also confirmed the no-storage console path already works: QEMU without any disk reaches `howl>`, `help` and `health`. | 254 host tests; no_std and `smp-selftest` builds; `-smp 4` boot 11/11 self-tests; no-disk serial log shows `howl>` + `help` + `health` |
 | 2026-11-23 | Timer PPI from the tree: INTID bound from `arm,armv8-timer` (`gic::set_timer_irq`), platform constant only as a no-tree fallback; fixed the same property-order bug in `TimerFinder` (QEMU writes `interrupts` first). | regression test with the real cell layout; 249 host tests; smoke 8/8; `smp-selftest` 10/10; boot log `DRIVER TIMER=DT intid=30` |

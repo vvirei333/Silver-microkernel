@@ -19,12 +19,21 @@ pub struct Device {
 
 static mut ACTIVE: Option<Device> = None;
 
-/// Tries the available backend and installs the survivor.
+/// Tries SDHCI first, then virtio-blk, and installs the survivor.
 ///
 /// virtio-blk is only tried when the tree has an ECAM host, or when there is
 /// no tree at all (the QEMU `-kernel`/ELF path). On a Pi 5 tree there is no
 /// ECAM, so the kernel never touches QEMU's fixed ECAM address there.
 pub fn init(dtb: Option<&[u8]>) -> bool {
+    if crate::sdhci::init(dtb) {
+        install(Device {
+            name: "sdhci",
+            sector_count: crate::sdhci::sector_count,
+            read_sector: crate::sdhci::read_sector,
+            write_sector: crate::sdhci::write_sector,
+        });
+        return true;
+    }
     if ecam_available(dtb) && crate::virtio_blk::init() {
         install(Device {
             name: "virtio-blk",

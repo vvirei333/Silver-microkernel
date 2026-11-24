@@ -24,10 +24,11 @@
 |---|---|---|
 | Network (virtio-net + smoltcp) | net_driver device task + net_server userspace stack | IMPLEMENTED |
 | Console UART (PL011, GENI) | polled in-kernel (console only) | IMPLEMENTED (deviation: in-kernel, by design — console must survive userspace loss) |
-| virtio-blk | in-kernel device side, SFS above | IMPLEMENTED (deviation) |
+| block devices | in-kernel `block` registry; virtio-blk and a polled SDHCI core below SFS | IMPLEMENTED (deviation) |
 | virtio-gpu | in-kernel DRM/KMS implementation (drm.rs) exposing the Linux UAPI | IMPLEMENTED (deviation) |
 | Input (evdev) | absent; `/dev/input` is an empty dir | PLANNED |
-| Audio / USB / SDHCI / eMMC | absent | PLANNED |
+| Audio / USB / RP1 | absent | PLANNED |
+| SDHCI | polled in-kernel, generic core with a BCM2712 quirk | SOFTWARE PATH, no board run |
 
 ## Deviations, and why
 

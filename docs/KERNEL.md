@@ -100,5 +100,6 @@ UAPI. Gated behind the `linux-abi` cargo feature.
 
 - No POSIX userspace of our own beyond the native toolbox; no journaling
   filesystem; no swap; no cgroups/containers; no network in-kernel stack
-  (by design — userspace); no audio/USB/SDHCI drivers; no hardware
-  performance figures of any kind are claimed.
+  (by design — userspace); no audio/USB drivers; SDHCI is a polled block
+  back end that has not run on a board; no hardware performance figures of
+  any kind are claimed.

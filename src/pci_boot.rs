@@ -89,10 +89,10 @@ fn mapped_base(host: PciHost) -> Option<usize> {
             (size <= mmu::PCI_ECAM_SIZE).then(|| phys_to_virt(base))
         }
         PciHostKind::Bcm2712
-            if base >= mmu::PCIE_BCM_BASE
+            if base >= mmu::BCM_PERIPH_BASE
                 && base
                     .checked_add(size)
-                    .is_some_and(|end| end <= mmu::PCIE_BCM_BASE + mmu::PCIE_BCM_SIZE) =>
+                    .is_some_and(|end| end <= mmu::BCM_PERIPH_BASE + mmu::BCM_PERIPH_SIZE) =>
         {
             Some(phys_to_virt(base))
         }

@@ -21,7 +21,7 @@ pub fn init() {
         let mmio = &mut *base.add(INDEX_LEVEL2_MMIO);
         let dram = &mut *base.add(INDEX_LEVEL2_DRAM);
         let pci = &mut *base.add(INDEX_LEVEL2_PCI);
-        let pcie = &mut *base.add(INDEX_LEVEL2_PCIE);
+        let bcm = &mut *base.add(INDEX_LEVEL2_BCM);
 
         // We execute through TTBR1 now; the low identity alias is no longer
         // needed by the kernel. User TTBR0s are installed by the scheduler.
@@ -30,7 +30,7 @@ pub fn init() {
         level1.entries[0] = table_descriptor(mmio);
         level1.entries[DRAM_L1_INDEX] = table_descriptor(dram);
         level1.entries[PCI_ECAM_L1_INDEX] = table_descriptor(pci);
-        level1.entries[PCIE_BCM_L1_INDEX] = table_descriptor(pcie);
+        level1.entries[BCM_PERIPH_L1_INDEX] = table_descriptor(bcm);
 
         for index in 0..ENTRIES {
             mmio.entries[index] = block_descriptor(index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
@@ -56,12 +56,12 @@ pub fn init() {
             pci.entries[PCI_ECAM_L2_INDEX + index] =
                 block_descriptor(PCI_ECAM_BASE + index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
         }
-        // The BCM2712 root complexes sit at 0x10_0010_0000, 0x10_0011_0000
-        // and 0x10_0012_0000, all inside one 2 MiB block. Mapping the block
-        // is what makes the index/data registers reachable; it is not ECAM.
-        for index in 0..PCIE_BCM_L2_BLOCKS {
-            pcie.entries[PCIE_BCM_L2_INDEX + index] =
-                block_descriptor(PCIE_BCM_BASE + index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
+        // The BCM2712 PCIe controllers and the Pi 5 SDHCI host live in this
+        // 16 MiB Device window. PCIe is not ECAM here; the mapping is what
+        // makes its index/data registers and the SDHCI registers reachable.
+        for index in 0..BCM_PERIPH_L2_BLOCKS {
+            bcm.entries[BCM_PERIPH_L2_INDEX + index] =
+                block_descriptor(BCM_PERIPH_BASE + index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
         }
     }
 
