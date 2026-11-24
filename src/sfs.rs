@@ -1,6 +1,6 @@
 //! Kernel SFS: a streaming, read-write VFS backend.
 //!
-//! The kernel owns the virtio-blk device and reads 512-byte blocks on demand
+//! The kernel owns one block device and reads 512-byte blocks on demand
 //! through a small write-through cache; the whole image is never loaded into
 //! RAM. Metadata (superblock, inodes, directories, indirect tables) and file
 //! data all come from the same block cache, so the RAM footprint is bounded by
@@ -13,11 +13,11 @@
 
 use alloc::{string::String, vec::Vec};
 
+use crate::block;
 use crate::console;
 use crate::mutex::Mutex;
 use crate::sfs_format::{BLOCK_SIZE, DIRECT_BLOCKS, INDIRECT_POINTERS, INODE_SIZE};
 use crate::vfs::{DirEntry, FileSystem, FsUsage, Metadata, MAX_NAME_LEN};
-use crate::virtio_blk;
 
 const MAGIC: u32 = 0x5346_5321;
 const INODE_KIND_FREE: u32 = 0;
@@ -179,7 +179,7 @@ fn read_block(block: u32, out: &mut [u8; BLOCK_SIZE]) -> bool {
             return true;
         }
     }
-    if !virtio_blk::read_sector(block as u64, out) {
+    if !block::read_sector(block as u64, out) {
         return false;
     }
     let mut cache = CACHE.lock();
@@ -236,7 +236,7 @@ fn parse_superblock(block: &[u8; BLOCK_SIZE], device_blocks: u32) -> Option<Supe
 
 /// Writes one block through to the device and updates the cache.
 fn write_block(block: u32, data: &[u8; BLOCK_SIZE]) -> bool {
-    if !virtio_blk::write_sector(block as u64, data) {
+    if !block::write_sector(block as u64, data) {
         return false;
     }
     let slot = block as usize % CACHE_BLOCKS;
@@ -1723,17 +1723,19 @@ fn verify_image(reader: &Reader) -> bool {
 /// Mounts the on-disk SFS in streaming mode. Only block 0 and the root inode
 /// are touched up front; everything else is read on demand.
 pub fn load() -> bool {
-    if !virtio_blk::init() {
+    let params = crate::boot::get();
+    let dtb = params.as_ref().and_then(crate::fog::dtb_slice);
+    if !block::init(dtb) {
         console::write_str("KSFS: no block device\r\n");
         return false;
     }
-    let device_blocks = virtio_blk::sector_count();
+    let device_blocks = block::sector_count();
     if device_blocks == 0 || device_blocks > u32::MAX as u64 {
         console::write_str("KSFS: bad device size\r\n");
         return false;
     }
     let mut superblock_bytes = [0_u8; BLOCK_SIZE];
-    if !virtio_blk::read_sector(0, &mut superblock_bytes) {
+    if !block::read_sector(0, &mut superblock_bytes) {
         console::write_str("KSFS: superblock read failed\r\n");
         return false;
     }
