@@ -1,8 +1,8 @@
 //! Pure SDHCI arithmetic shared by the kernel driver and host tests.
 //!
-//! The register protocol itself is hardware-facing; these are the two pieces
-//! worth testing without a controller: the clock divisor and the capacity
-//! decode from the four CSD response words.
+//! The register protocol itself is hardware-facing; these are the pieces
+//! worth testing without a controller: the clock divisor, the R2 response
+//! alignment, and the capacity decode from the aligned CSD words.
 
 /// Returns the SDHCI 8-bit divisor for `base_hz` and a target `clock_hz`.
 ///
@@ -35,9 +35,10 @@ pub fn csd_from_response(response: [u32; 4]) -> [u32; 4] {
 
 /// Decodes card capacity in 512-byte sectors from CSD words.
 ///
-/// `csd[0]` is the low response word and `csd[3]` the high one, matching the
-/// SDHCI `RESPONSE+0`..`RESPONSE+12` order. CSD v1 (SDSC) and v2 (SDHC/SDXC)
-/// are supported; unknown structures and zero capacity fail closed.
+/// `csd[0]` is the low payload word and `csd[3]` the high one, after
+/// [`csd_from_response`] has realigned the raw `RESPONSE+0`..`RESPONSE+12`
+/// registers. CSD v1 (SDSC) and v2 (SDHC/SDXC) are supported; unknown
+/// structures and zero capacity fail closed.
 pub fn capacity_sectors(csd: [u32; 4]) -> Option<u64> {
     let structure = (csd[3] >> 30) & 0x3;
     let sectors = match structure {
