@@ -34,15 +34,26 @@ Two rules follow from the right-hand column:
 
 | # | Milestone | Acceptance | Blocking work |
 |---|---|---|---|
-| P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base and reference clock from the DTB~~ (done), ~~link base as a build parameter~~ (done), remaining: the Pi firmware's entry contract (EL2/armstub, secondary-core release) and confirming its `kernel_address` |
-| P1 | Interrupts and time | timer tick, GIC init, `health`/`uptime` advancing, no fault | GIC-400 base from the DTB, timer PPI selection, PSCI SMP bring-up |
-| P2 | Console userspace from RAM | `howl>` prompt and `help` **with no storage at all** (SFS image embedded or seeded into RamFs) | embedding a minimal SFS into the kernel image, platform-independent VFS init |
-| P3 | Root filesystem on the board | `ls /sfs` reads the real image; `cat`, `spawn`, `bench fs` work | storage path: RP1/PCIe + SD, or USB mass storage — whichever the DTB shows |
-| P4 | Power control | `poweroff`/`reboot` from the shell | firmware mailbox driver |
+| P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base and reference clock from the DTB~~ (done), ~~link base as a build parameter~~ (done), remaining: confirm the firmware's `kernel_address`/armstub handoff and capture the first serial log; the stub already drops EL2 → EL1 when the firmware enters there |
+| P1 | Interrupts and time | timer tick, GIC init, `health`/`uptime` advancing, no fault | ~~GIC-400 base from the DTB~~ (done), ~~timer PPI selection~~ (done), ~~PSCI conduit and per-CPU MPIDR from the tree~~ (done), remaining: a hardware run |
+| P2 | Console userspace from RAM | `howl>` prompt and `help` **with no storage at all** | already reachable on QEMU with no disk: the shell and its commands are embedded in the kernel; remaining: one Pi 5 serial log |
+| P3 | Root filesystem on the board | `ls /sfs` reads the real image; `cat`, `spawn`, `bench fs` work | storage path: RP1/PCIe + SD, or USB mass storage — whichever the DTB shows; this is the main missing subsystem |
+| P4 | Power control | `poweroff`/`reboot` from the shell | ~~PSCI conduit from the tree~~ (done); remaining: confirm `SYSTEM_OFF`/`SYSTEM_RESET` over SMC on the board (use the mailbox only if firmware lacks PSCI power calls) |
 | P5 | Network (optional) | `ping`/`wget` over the on-board Ethernet | RP1 Ethernet + the existing virtio-free userspace stack |
 
 P2 is deliberately before P3: it proves the console product on real hardware
 without waiting for the storage stack, which is the riskiest part of the board.
+
+## What is actually left, in order
+
+1. P0/P1 hardware evidence: build the image for the firmware's `kernel_address`,
+   boot it, and attach the serial log. The tree-first console, GIC, timer, PSCI
+   conduit selection and AP MPIDR mapping are in the kernel now, but none of
+   them has been observed on a Pi 5.
+2. P3 storage: RP1 sits behind PCIe, and the kernel has no PCIe host or RP1
+   driver. This is the large missing subsystem, not a board constant.
+3. P4: check whether the Pi firmware implements PSCI `SYSTEM_OFF` and
+   `SYSTEM_RESET`; only add mailbox power control if it does not.
 
 ## The tree-first path is verified, not assumed
 
@@ -179,6 +190,7 @@ The most useful contributions are *data from real hardware*, not patches:
 
 | Date | Change | Evidence |
 |---|---|---|
+| 2026-11-24 | PSCI conduit and AP MPIDRs come from the live tree instead of the board name and CPU index. `fdt` reads `/psci/method` (`hvc`/`smc`) and each `/cpus/cpu*` `reg`; `power` caches the conduit and issues both power and `CPU_ON` through it. This is what the Pi 5 needs (`smc`, clustered affinity); QEMU keeps `hvc` and the index fallback. Also confirmed the no-storage console path already works: QEMU without any disk reaches `howl>`, `help` and `health`. | 254 host tests; no_std and `smp-selftest` builds; `-smp 4` boot 11/11 self-tests; no-disk serial log shows `howl>` + `help` + `health` |
 | 2026-11-23 | Timer PPI from the tree: INTID bound from `arm,armv8-timer` (`gic::set_timer_irq`), platform constant only as a no-tree fallback; fixed the same property-order bug in `TimerFinder` (QEMU writes `interrupts` first). | regression test with the real cell layout; 249 host tests; smoke 8/8; `smp-selftest` 10/10; boot log `DRIVER TIMER=DT intid=30` |
 | 2026-11-23 | Interrupt controller from the tree: GIC distributor and CPU-interface bases bound from the node (`gic::init_at`), no fixed offset assumed. Found and fixed a real visitor bug (property order `reg` before `compatible`, and children resetting the parent's captured state) — the GIC was silently ignored on any real tree. | 2 regression tests (real property order, matching node with a child); 248 host tests; smoke 8/8; `smp-selftest` 10/10 on `-smp 4`; boot log shows `DRIVER GIC=DT` |
 | 2026-11-23 | UART clock phandle resolution: `clocks = <&clk_uart>` is followed to the provider node and its rate read, so the Pi's own spelling works without vendor-specific code. Verified on QEMU's stock device tree (`clk=24000000` from `apb-pclk`, reached only through the phandle) with the shell still running. | 2 new `fdt` tests (phandle resolution incl. unknown phandle, direct value wins); 246 host tests; smoke 8/8 |

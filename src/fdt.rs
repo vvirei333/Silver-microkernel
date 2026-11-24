@@ -139,6 +139,18 @@ pub enum GicKind {
     V3,
 }
 
+/// PSCI conduit declared by the `/psci` node.
+///
+/// The conduit is a property of the firmware, not of the CPU vendor: QEMU
+/// `virt` exposes PSCI over `hvc`, while the Raspberry Pi firmware uses the
+/// secure monitor (`smc`). Guessing from the board name works until the first
+/// board whose firmware differs from its SoC family.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PsciMethod {
+    Hvc,
+    Smc,
+}
+
 /// The register bases needed to bring up the interrupt controller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GicInfo {
@@ -393,6 +405,26 @@ impl<'a> Fdt<'a> {
             return 0;
         }
         counter.count
+    }
+
+    /// PSCI conduit declared by the root `/psci` node, if the tree has one.
+    pub fn psci_method(&self) -> Option<PsciMethod> {
+        let mut finder = PsciFinder { method: None };
+        self.walk(&mut finder)?;
+        finder.method
+    }
+
+    /// Copies the `reg` values of direct `/cpus/cpu*` children into `out`
+    /// and returns how many CPU nodes were seen (clamped to `out.len()`).
+    ///
+    /// A CPU node's `reg` is its MPIDR, not its index: on a clustered SoC the
+    /// second core may be affinity `0x100`, so passing the loop index to PSCI
+    /// would power on a nonexistent PE. A node without a usable `reg` leaves
+    /// the caller's sentinel in place.
+    pub fn cpu_mpidrs(&self, out: &mut [u64]) -> usize {
+        let mut finder = CpuMpidrs { out, seen: 0 };
+        let _ = self.walk(&mut finder);
+        finder.seen.min(finder.out.len())
     }
 
     /// Finds the best GENI UART node: a `qcom,geni-debug-uart` wins over a
@@ -833,6 +865,71 @@ impl<'a> Visitor<'a> for CpuCounter {
         }
     }
     fn property(&mut self, _path: &str, _name: &str, _value: &'a [u8]) {}
+    fn end(&mut self, _path: &str) {}
+}
+
+/// Reads `/psci/method`; unknown or absent values stay `None` so the caller
+/// keeps the platform fallback rather than issuing a trapping conduit.
+struct PsciFinder {
+    method: Option<PsciMethod>,
+}
+
+impl<'a> Visitor<'a> for PsciFinder {
+    fn begin(&mut self, _path: &str, _name: &str) {}
+    fn property(&mut self, path: &str, name: &str, value: &'a [u8]) {
+        if path != "/psci" || name != "method" || self.method.is_some() {
+            return;
+        }
+        let text = value.split(|byte| *byte == 0).next().unwrap_or(value);
+        self.method = match text {
+            b"hvc" => Some(PsciMethod::Hvc),
+            b"smc" => Some(PsciMethod::Smc),
+            _ => None,
+        };
+    }
+    fn end(&mut self, _path: &str) {}
+}
+
+/// Copies direct `/cpus/cpu*` `reg` values, treating a 64-bit `reg` as one
+/// MPIDR cell pair and a 32-bit one as the low affinity word.
+struct CpuMpidrs<'o> {
+    out: &'o mut [u64],
+    seen: usize,
+}
+
+impl<'a, 'o> Visitor<'a> for CpuMpidrs<'o> {
+    fn begin(&mut self, path: &str, _name: &str) {
+        let Some(rest) = path.strip_prefix("/cpus/") else {
+            return;
+        };
+        if rest.contains('/') || (rest != "cpu" && !rest.starts_with("cpu@")) {
+            return;
+        }
+        self.seen = self.seen.saturating_add(1);
+    }
+    fn property(&mut self, path: &str, name: &str, value: &'a [u8]) {
+        if name != "reg" || self.seen == 0 {
+            return;
+        }
+        let Some(rest) = path.strip_prefix("/cpus/") else {
+            return;
+        };
+        if rest.contains('/') || (rest != "cpu" && !rest.starts_with("cpu@")) {
+            return;
+        }
+        let index = self.seen - 1;
+        if index >= self.out.len() {
+            return;
+        }
+        let mpidr = if value.len() >= 8 {
+            read_be64(value, 0)
+        } else {
+            read_be32(value, 0).map(u64::from)
+        };
+        if let Some(mpidr) = mpidr {
+            self.out[index] = mpidr;
+        }
+    }
     fn end(&mut self, _path: &str) {}
 }
 
@@ -1706,8 +1803,8 @@ const fn align_down_u64(value: u64, alignment: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_regions, select_allocator_window, DriverKind, DriverNode, Fdt, GicKind, Region,
-        UartKind, FDT_MAGIC,
+        parse_regions, select_allocator_window, DriverKind, DriverNode, Fdt, GicKind, PsciMethod,
+        Region, UartKind, FDT_MAGIC,
     };
 
     // --- a tiny DTB writer used only by the tests -------------------------
@@ -2510,6 +2607,119 @@ mod tests {
             select_allocator_window(&memory, &mut excluded, PAGE, 1),
             None
         );
+    }
+
+    #[test]
+    fn psci_method_follows_the_tree() {
+        for (text, expected) in [
+            ("hvc", PsciMethod::Hvc),
+            ("smc", PsciMethod::Smc),
+        ] {
+            let mut dtb = Dtb::new();
+            dtb.begin("");
+            dtb.begin("psci");
+            dtb.prop_str("compatible", "arm,psci-1.0");
+            dtb.prop_str("method", text);
+            dtb.end();
+            dtb.end();
+            let blob = dtb.build();
+            let tree = Fdt::new(&blob).expect("valid tree");
+            assert_eq!(tree.psci_method(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn psci_method_rejects_unknown_or_missing() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.begin("psci");
+        dtb.prop_str("method", "hvc-and-a-half");
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let tree = Fdt::new(&blob).expect("valid tree");
+        assert_eq!(tree.psci_method(), None);
+
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.end();
+        let blob = dtb.build();
+        let tree = Fdt::new(&blob).expect("valid tree");
+        assert_eq!(tree.psci_method(), None);
+    }
+
+    #[test]
+    fn cpu_mpidrs_are_read_not_inferred_from_the_index() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.begin("cpus");
+        dtb.prop_u32("#address-cells", 1);
+        dtb.begin("cpu@0");
+        dtb.prop_u32("reg", 0);
+        dtb.end();
+        dtb.begin("cpu@1");
+        dtb.prop_u32("reg", 0x100);
+        dtb.end();
+        // A 64-bit `reg` is the MPIDR cell pair.
+        let mp = 0x0000_0000_0000_0101_u64;
+        dtb.begin("cpu@101");
+        dtb.prop("reg", &mp.to_be_bytes());
+        dtb.end();
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let tree = Fdt::new(&blob).expect("valid tree");
+
+        let mut mpidrs = [u64::MAX; 4];
+        let seen = tree.cpu_mpidrs(&mut mpidrs);
+        assert_eq!(seen, 3);
+        assert_eq!(mpidrs[..3], [0, 0x100, 0x101]);
+        assert_eq!(mpidrs[3], u64::MAX);
+    }
+
+    #[test]
+    fn cpu_mpidrs_clamp_without_overwriting_the_last_slot() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.begin("cpus");
+        dtb.begin("cpu@0");
+        dtb.prop_u32("reg", 0);
+        dtb.end();
+        dtb.begin("cpu@1");
+        dtb.prop_u32("reg", 0x100);
+        dtb.end();
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let tree = Fdt::new(&blob).expect("valid tree");
+
+        let mut mpidrs = [u64::MAX; 1];
+        assert_eq!(tree.cpu_mpidrs(&mut mpidrs), 1);
+        assert_eq!(mpidrs, [0]);
+    }
+
+    #[test]
+    fn cpu_mpidrs_ignore_nested_nodes_and_keep_the_sentinel() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.begin("cpus");
+        dtb.begin("cpu@0");
+        dtb.prop_u32("reg", 0);
+        dtb.begin("l2-cache");
+        dtb.prop_u32("reg", 0x7fff);
+        dtb.end();
+        dtb.end();
+        dtb.begin("cpu@1");
+        dtb.end();
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let tree = Fdt::new(&blob).expect("valid tree");
+
+        let mut mpidrs = [u64::MAX; 4];
+        assert_eq!(tree.cpu_mpidrs(&mut mpidrs), 2);
+        assert_eq!(mpidrs[0], 0);
+        assert_eq!(mpidrs[1], u64::MAX);
     }
 
     #[test]

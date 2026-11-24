@@ -1165,6 +1165,11 @@ pub fn boot_secondary_cpus() {
     }
     crate::console::write_str("SMP: powering on secondary CPUs\r\n");
     EXPECTED_CPUS.store(1, Ordering::Release);
+    // PSCI addresses a PE by MPIDR, not by its position in `/cpus`. Read the
+    // affinity value from each node so a clustered SoC (e.g. BCM2712) powers
+    // on the core the tree actually describes.
+    let mut mpidrs = [u64::MAX; MAX_CPUS];
+    read_cpu_mpidrs(&mut mpidrs);
     for cpu in 1..cpu_count() {
         let Some((stack, stack_generation)) =
             crate::frame_allocator::alloc_contiguous_pages_tagged(2)
@@ -1255,8 +1260,14 @@ pub fn boot_secondary_cpus() {
             crate::memory::PAGE_SIZE,
         );
 
-        // QEMU virt numbers CPUs by Aff0: cpu index == affinity value.
-        let target_mpidr = cpu as u64;
+        // A CPU node without a usable `reg` keeps the old index fallback,
+        // which is correct for QEMU virt and fails closed (PSCI rejects it)
+        // on a tree that cannot name its cores.
+        let target_mpidr = if mpidrs[cpu] == u64::MAX {
+            cpu as u64
+        } else {
+            mpidrs[cpu]
+        };
         let entry_physical = crate::memory::virt_to_phys(ap_entry as *const () as usize);
         let result = psci_cpu_on(target_mpidr, entry_physical, params_pa);
         crate::console::write_str("SMP: CPU_ON cpu=");
@@ -1829,23 +1840,32 @@ fn run_quiesce_selftest() {
     crate::console::write_str(" peer CPU(s))\r\n");
 }
 
-/// PSCI CPU_ON (SMC64 function id 0xC4000003) over QEMU `virt`'s HVC
-/// conduit. Returns the PSCI status: 0 = SUCCESS. `context_id` is delivered
-/// to the entry point in x0.
+/// Reads direct `/cpus/cpu*` MPIDRs from the live tree. A missing tree or
+/// malformed node leaves the `u64::MAX` sentinel in place.
+#[cfg(feature = "smp")]
+fn read_cpu_mpidrs(out: &mut [u64]) {
+    let Some(params) = crate::boot::get() else {
+        return;
+    };
+    let Some(dtb) = crate::fog::dtb_slice(&params) else {
+        return;
+    };
+    let Some(tree) = crate::fdt::Fdt::new(dtb) else {
+        return;
+    };
+    tree.cpu_mpidrs(out);
+}
+
+/// PSCI CPU_ON through the firmware's conduit (HVC or SMC). Returns the PSCI
+/// status: 0 = SUCCESS. `context_id` is delivered to the entry point in x0.
 #[cfg(feature = "smp")]
 fn psci_cpu_on(target_mpidr: u64, entry_physical: usize, context_id: usize) -> u64 {
-    let ret: u64;
-    unsafe {
-        core::arch::asm!(
-            "hvc #0",
-            inlateout("x0") 0xC400_0003_u64 => ret,
-            in("x1") target_mpidr,
-            in("x2") entry_physical as u64,
-            in("x3") context_id as u64,
-            options(nostack),
-        );
-    }
-    ret
+    crate::power::call(
+        crate::power::PSCI_CPU_ON,
+        target_mpidr,
+        entry_physical as u64,
+        context_id as u64,
+    )
 }
 
 /// Byte offset of [`PerCpu::fp`] inside the per-CPU block. The exception

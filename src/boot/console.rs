@@ -19,6 +19,11 @@ use crate::{console, driver_resources, fog};
 pub fn init() {
     let params = boot::get();
     let dtb = params.as_ref().and_then(fog::dtb_slice);
+    // The PSCI conduit belongs to the firmware, so read it from the same tree
+    // that names the UART before any power or AP bring-up can issue a call.
+    if let Some(dtb) = dtb {
+        crate::power::init(dtb);
+    }
     driver_resources::init(dtb);
     #[cfg(feature = "gdb-stub")]
     gdb::probe_transport(dtb);
