@@ -20,6 +20,7 @@ pub mod irq_policy;
 pub mod mem_policy;
 pub mod pci;
 pub mod phys_range;
+pub mod sdhci_protocol;
 // The synthetic procfs lives in the bin crate; compile its pure path resolver
 // here only for host tests so `/proc/self/fd` regressions are caught.
 #[cfg(test)]
