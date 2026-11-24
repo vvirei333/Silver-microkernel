@@ -68,6 +68,8 @@ pub fn execute(command: &str) {
         Some("help") => {
             syscall::print("howl commands:\r\n");
             syscall::print("  Tab        Complete a command name; Up/Down recall history\r\n");
+            syscall::print("  Ctrl-A/E   Move to the start/end of the line\r\n");
+            syscall::print("  Ctrl-U/K/W Erase before, after, or one word before the cursor\r\n");
             syscall::print("  help       Show this command list\r\n");
             syscall::print("  fastfetch  Show the aligned system summary\r\n");
             syscall::print("  sfsinfo    Show the mounted SFS superblock\r\n");

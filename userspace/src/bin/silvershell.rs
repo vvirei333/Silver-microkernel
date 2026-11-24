@@ -136,6 +136,7 @@ pub extern "C" fn _start(howler_id: u64) -> ! {
 
     let mut line = [0_u8; LINE_CAPACITY];
     let mut length = 0_usize;
+    let mut cursor = 0_usize;
     let mut history = History::new();
     let mut howler = HowlerLink::new(howler_id);
     loop {
@@ -154,35 +155,104 @@ pub extern "C" fn _start(howler_id: u64) -> ! {
                     execute(command);
                 }
                 length = 0;
+                cursor = 0;
                 prompt();
             }
-            b'\t' => {
+            b'\t' if cursor == length => {
                 if let Some(completed) = complete(&mut line, length) {
                     length = completed;
+                    cursor = length;
                 }
             }
             0x1B => {
-                let recalled = match read_escape(&mut howler) {
-                    Some(b'A') => history.older(&mut line, length),
-                    Some(b'B') => history.newer(&mut line),
-                    _ => None,
-                };
-                if let Some(recalled) = recalled {
-                    length = recalled;
-                    redraw(&line[..length]);
+                match read_escape(&mut howler) {
+                    Some(b'A') => {
+                        if let Some(recalled) = history.older(&mut line, length) {
+                            length = recalled;
+                            cursor = length;
+                            redraw(&line[..length], cursor);
+                        }
+                    }
+                    Some(b'B') => {
+                        if let Some(recalled) = history.newer(&mut line) {
+                            length = recalled;
+                            cursor = length;
+                            redraw(&line[..length], cursor);
+                        }
+                    }
+                    Some(b'C') if cursor < length => {
+                        cursor += 1;
+                        syscall::print("\x1b[C");
+                    }
+                    Some(b'D') if cursor > 0 => {
+                        cursor -= 1;
+                        syscall::print("\x1b[D");
+                    }
+                    Some(b'H') => {
+                        cursor = 0;
+                        redraw(&line[..length], cursor);
+                    }
+                    Some(b'F') => {
+                        cursor = length;
+                        redraw(&line[..length], cursor);
+                    }
+                    _ => {}
                 }
             }
             0x08 | 0x7F => {
-                if length > 0 {
+                if cursor > 0 {
+                    line.copy_within(cursor..length, cursor - 1);
                     length -= 1;
-                    syscall::print("\x08 \x08");
+                    cursor -= 1;
+                    redraw(&line[..length], cursor);
+                }
+            }
+            0x01 => {
+                cursor = 0;
+                redraw(&line[..length], cursor);
+            }
+            0x05 => {
+                cursor = length;
+                redraw(&line[..length], cursor);
+            }
+            0x0B => {
+                length = cursor;
+                redraw(&line[..length], cursor);
+            }
+            0x15 => {
+                if cursor > 0 {
+                    line.copy_within(cursor..length, 0);
+                    length -= cursor;
+                    cursor = 0;
+                    redraw(&line[..length], cursor);
+                }
+            }
+            0x17 => {
+                let mut start = cursor;
+                while start > 0 && line[start - 1] == b' ' {
+                    start -= 1;
+                }
+                while start > 0 && line[start - 1] != b' ' {
+                    start -= 1;
+                }
+                if start < cursor {
+                    line.copy_within(cursor..length, start);
+                    length -= cursor - start;
+                    cursor = start;
+                    redraw(&line[..length], cursor);
                 }
             }
             0x20..=0x7E => {
                 if length < LINE_CAPACITY {
-                    line[length] = byte;
+                    line.copy_within(cursor..length, cursor + 1);
+                    line[cursor] = byte;
                     length += 1;
-                    echo(byte);
+                    cursor += 1;
+                    if cursor == length {
+                        echo(byte);
+                    } else {
+                        redraw(&line[..length], cursor);
+                    }
                 }
             }
             _ => {}
@@ -306,12 +376,19 @@ fn complete(line: &mut [u8], length: usize) -> Option<usize> {
     None
 }
 
-/// Replaces the visible input line after a history recall.
-fn redraw(line: &[u8]) {
+/// Replaces the visible input line and leaves the terminal cursor at
+/// `cursor`, so mid-line edits show the caret in the right place.
+fn redraw(line: &[u8], cursor: usize) {
     syscall::print("\r\x1b[2K");
     prompt();
     for &byte in line {
         echo(byte);
+    }
+    let tail = line.len().saturating_sub(cursor);
+    if tail > 0 {
+        syscall::print("\x1b[");
+        syscall::print_dec_u64(tail as u64);
+        syscall::print("D");
     }
 }
 
