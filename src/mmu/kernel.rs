@@ -21,6 +21,7 @@ pub fn init() {
         let mmio = &mut *base.add(INDEX_LEVEL2_MMIO);
         let dram = &mut *base.add(INDEX_LEVEL2_DRAM);
         let pci = &mut *base.add(INDEX_LEVEL2_PCI);
+        let pcie = &mut *base.add(INDEX_LEVEL2_PCIE);
 
         // We execute through TTBR1 now; the low identity alias is no longer
         // needed by the kernel. User TTBR0s are installed by the scheduler.
@@ -29,6 +30,7 @@ pub fn init() {
         level1.entries[0] = table_descriptor(mmio);
         level1.entries[DRAM_L1_INDEX] = table_descriptor(dram);
         level1.entries[PCI_ECAM_L1_INDEX] = table_descriptor(pci);
+        level1.entries[PCIE_BCM_L1_INDEX] = table_descriptor(pcie);
 
         for index in 0..ENTRIES {
             mmio.entries[index] = block_descriptor(index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
@@ -53,6 +55,13 @@ pub fn init() {
         for index in 0..PCI_ECAM_L2_BLOCKS {
             pci.entries[PCI_ECAM_L2_INDEX + index] =
                 block_descriptor(PCI_ECAM_BASE + index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
+        }
+        // The BCM2712 root complexes sit at 0x10_0010_0000, 0x10_0011_0000
+        // and 0x10_0012_0000, all inside one 2 MiB block. Mapping the block
+        // is what makes the index/data registers reachable; it is not ECAM.
+        for index in 0..PCIE_BCM_L2_BLOCKS {
+            pcie.entries[PCIE_BCM_L2_INDEX + index] =
+                block_descriptor(PCIE_BCM_BASE + index * BLOCK_2M, ATTR_DEVICE, SH_NONE);
         }
     }
 

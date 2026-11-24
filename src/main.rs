@@ -81,6 +81,7 @@ mod gdb;
 mod debug;
 #[cfg(not(feature = "std"))]
 mod platform;
+mod pci_boot;
 mod power;
 mod ram_log;
 // The boot stub mirrors this policy in assembly; the Rust copy exists for
@@ -191,6 +192,16 @@ pub extern "C" fn kernel_main() -> ! {
     // QEMU without a DTB keeps the fixed PL011/PCI table; fog gets the UART
     // base/size/INTID from its node. A missing/disabled node binds nothing.
     boot::console::init();
+
+    // PCIe is described by the tree, never guessed from the board. This runs
+    // before storage so the first hardware log names the host bridge and any
+    // endpoint (notably RP1) that the kernel can see.
+    #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
+    {
+        let params = boot::get();
+        let dtb = params.as_ref().and_then(fog::dtb_slice);
+        pci_boot::init(dtb);
+    }
 
     #[cfg(feature = "fog")]
     {

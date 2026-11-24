@@ -22,6 +22,8 @@
 
 use core::str;
 
+use crate::pci::{PciHost, PciHostKind};
+
 /// FDT magic, big-endian in the blob.
 pub const FDT_MAGIC: u32 = 0xd00d_feed;
 const HEADER_SIZE: usize = 40;
@@ -412,6 +414,24 @@ impl<'a> Fdt<'a> {
         let mut finder = PsciFinder { method: None };
         self.walk(&mut finder)?;
         finder.method
+    }
+
+    /// PCI host bridges the tree enables, in tree order.
+    ///
+    /// An ECAM host (`pci-host-ecam-generic`) is described by its `reg`
+    /// window and `bus-range`. The BCM2712 host uses index/data registers
+    /// instead of ECAM, so its `reg` is the controller register block and its
+    /// endpoint bus defaults to 1..=2 (`00:00.0` is the root bridge, RP1 is
+    /// `01:00.0`). Disabled nodes are never returned.
+    pub fn pci_hosts(&self, out: &mut [PciHost]) -> usize {
+        let mut finder = PciFinder {
+            out,
+            count: 0,
+            depth: 0,
+            nodes: [PciState::default(); MAX_DEPTH],
+        };
+        let _ = self.walk(&mut finder);
+        finder.count
     }
 
     /// Copies the `reg` values of direct `/cpus/cpu*` children into `out`
@@ -888,6 +908,103 @@ impl<'a> Visitor<'a> for PsciFinder {
         };
     }
     fn end(&mut self, _path: &str) {}
+}
+
+/// Per-node state of the PCI host finder.
+#[derive(Clone, Copy, Default)]
+struct PciState {
+    kind: Option<PciHostKind>,
+    reg: Option<Region>,
+    bus: Option<(u8, u8)>,
+    disabled: bool,
+}
+
+struct PciFinder<'o> {
+    out: &'o mut [PciHost],
+    count: usize,
+    depth: usize,
+    nodes: [PciState; MAX_DEPTH],
+}
+
+impl<'a, 'o> Visitor<'a> for PciFinder<'o> {
+    fn begin(&mut self, _path: &str, _name: &str) {
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.nodes[self.depth] = PciState::default();
+        self.depth += 1;
+    }
+
+    fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        let Some(state) = self.nodes.get_mut(index) else {
+            return;
+        };
+        match name {
+            "compatible" => {
+                let mut rest = value;
+                while let Some(text) = next_string(&mut rest) {
+                    if text == "pci-host-ecam-generic" {
+                        state.kind = Some(PciHostKind::Ecam);
+                    } else if text == "brcm,bcm2712-pcie" {
+                        state.kind = Some(PciHostKind::Bcm2712);
+                    }
+                }
+            }
+            "reg" if state.reg.is_none() => {
+                state.reg = parse_reg_range(value);
+            }
+            "bus-range" => {
+                if let (Some(start), Some(end)) = (read_be32(value, 0), read_be32(value, 4)) {
+                    if start <= end && end <= 255 {
+                        state.bus = Some((start as u8, end as u8));
+                    }
+                }
+            }
+            "status" => {
+                if let Some(text) = first_string(value) {
+                    if text == "disabled" {
+                        state.disabled = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, _path: &str) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        self.depth -= 1;
+        let state = self.nodes[index];
+        let (Some(kind), Some(reg)) = (state.kind, state.reg) else {
+            return;
+        };
+        if state.disabled || reg.is_empty() || self.count >= self.out.len() {
+            return;
+        }
+        let (bus_start, mut bus_end) = state.bus.unwrap_or(match kind {
+            PciHostKind::Ecam => (0, 255),
+            PciHostKind::Bcm2712 => (1, 2),
+        });
+        if kind == PciHostKind::Ecam {
+            // One megabyte of ECAM describes one bus.
+            let buses = reg.size() / 0x10_0000;
+            if buses == 0 {
+                return;
+            }
+            let last = buses.saturating_sub(1).min(255) as u8;
+            bus_end = bus_end.min(last.saturating_add(bus_start));
+        }
+        if bus_start > bus_end {
+            return;
+        }
+        self.out[self.count] = PciHost::new(kind, reg.start, reg.size(), bus_start, bus_end);
+        self.count += 1;
+    }
 }
 
 /// Copies direct `/cpus/cpu*` `reg` values, treating a 64-bit `reg` as one
@@ -2646,6 +2763,94 @@ mod tests {
         let blob = dtb.build();
         let tree = Fdt::new(&blob).expect("valid tree");
         assert_eq!(tree.psci_method(), None);
+    }
+
+    #[test]
+    fn pci_host_reads_ecam_window_and_bus_range() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.begin("pci@40000000");
+        dtb.prop_str("compatible", "pci-host-ecam-generic");
+        dtb.prop_reg2("reg", 0x40_1000_0000, 0x1000_0000);
+        dtb.prop_u32_array("bus-range", &[0, 255]);
+        dtb.prop_str("status", "okay");
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let tree = Fdt::new(&blob).expect("valid tree");
+
+        let mut hosts = [crate::pci::PciHost::new(
+            crate::pci::PciHostKind::Bcm2712,
+            0,
+            0,
+            0,
+            0,
+        ); 2];
+        let count = tree.pci_hosts(&mut hosts);
+        assert_eq!(count, 1);
+        assert_eq!(hosts[0].kind, crate::pci::PciHostKind::Ecam);
+        assert_eq!(hosts[0].base, 0x40_1000_0000);
+        assert_eq!(hosts[0].bus_start, 0);
+        assert_eq!(hosts[0].bus_end, 255);
+    }
+
+    #[test]
+    fn pci_host_reads_bcm2712_and_skips_disabled_nodes() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.begin("axi");
+        dtb.begin("pcie@1000100000");
+        dtb.prop_str("compatible", "brcm,bcm2712-pcie");
+        dtb.prop_reg2("reg", 0x10_0010_0000, 0x9310);
+        dtb.prop_str("status", "disabled");
+        dtb.end();
+        dtb.begin("pcie@1000120000");
+        dtb.prop_str("compatible", "brcm,bcm2712-pcie");
+        dtb.prop_reg2("reg", 0x10_0012_0000, 0x9310);
+        dtb.prop_str("status", "okay");
+        dtb.end();
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let tree = Fdt::new(&blob).expect("valid tree");
+
+        let mut hosts = [crate::pci::PciHost::new(
+            crate::pci::PciHostKind::Ecam,
+            0,
+            0,
+            0,
+            0,
+        ); 2];
+        let count = tree.pci_hosts(&mut hosts);
+        assert_eq!(count, 1);
+        assert_eq!(hosts[0].kind, crate::pci::PciHostKind::Bcm2712);
+        assert_eq!(hosts[0].base, 0x10_0012_0000);
+        assert_eq!(hosts[0].bus_start, 1);
+        assert_eq!(hosts[0].bus_end, 2);
+    }
+
+    #[test]
+    fn ecam_bus_range_cannot_exceed_the_window() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.begin("pci@0");
+        dtb.prop_str("compatible", "pci-host-ecam-generic");
+        dtb.prop_reg2("reg", 0x40_1000_0000, 0x20_0000);
+        dtb.prop_u32_array("bus-range", &[0, 255]);
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let tree = Fdt::new(&blob).expect("valid tree");
+
+        let mut hosts = [crate::pci::PciHost::new(
+            crate::pci::PciHostKind::Ecam,
+            0,
+            0,
+            0,
+            0,
+        ); 1];
+        assert_eq!(tree.pci_hosts(&mut hosts), 1);
+        assert_eq!(hosts[0].bus_end, 1);
     }
 
     #[test]

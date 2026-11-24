@@ -18,6 +18,7 @@ pub mod fog_validate;
 pub mod gicv3_policy;
 pub mod irq_policy;
 pub mod mem_policy;
+pub mod pci;
 pub mod phys_range;
 // The synthetic procfs lives in the bin crate; compile its pure path resolver
 // here only for host tests so `/proc/self/fd` regressions are caught.

@@ -188,6 +188,16 @@ const PCI_ECAM_L1_INDEX: usize = (PCI_ECAM_BASE >> 30) & 0x1FF;
 const PCI_ECAM_L2_INDEX: usize = ((PCI_ECAM_BASE >> 21) & 0x1FF) as usize;
 const PCI_ECAM_L2_BLOCKS: usize = PCI_ECAM_SIZE / BLOCK_2M;
 
+/// BCM2712 PCIe controller registers (all three root complexes). This is a
+/// fixed 2 MiB block at 0x10_0000_0000; the BCM2712 host bridge is not ECAM,
+/// so it is reached through its own index/data registers at `+0x9000` and
+/// `+0x8000`, not through [`PCI_ECAM_BASE`].
+pub const PCIE_BCM_BASE: usize = 0x0000_0010_0000_0000;
+pub const PCIE_BCM_SIZE: usize = 0x20_0000;
+const PCIE_BCM_L1_INDEX: usize = (PCIE_BCM_BASE >> 30) & 0x1FF;
+const PCIE_BCM_L2_INDEX: usize = ((PCIE_BCM_BASE >> 21) & 0x1FF) as usize;
+const PCIE_BCM_L2_BLOCKS: usize = PCIE_BCM_SIZE / BLOCK_2M;
+
 /// Anonymous `mmap` region: a large window between the sparse heap and the user
 /// stack where `SYS_MMAP` places kernel-chosen mappings. It spans the free
 /// `l2_user` slots, so page tables are only allocated once a mapping is placed.
@@ -282,16 +292,18 @@ struct Table {
 
 /// QEMU maps one DRAM gigabyte; the tablet needs two (0x8000_0000..0x1_0000_0000).
 #[cfg(feature = "tablet")]
-const TABLE_COUNT: usize = 7;
+const TABLE_COUNT: usize = 8;
 #[cfg(not(feature = "tablet"))]
-const TABLE_COUNT: usize = 6;
+const TABLE_COUNT: usize = 7;
 const EMPTY_TABLE: Table = Table {
     entries: [0; ENTRIES],
 };
 
 /// The assembly boot stub fills the first five tables before enabling the MMU.
-/// The sixth is zeroed with .bss and populated for PCI ECAM in `init`; on the
-/// tablet the seventh holds the second DRAM gigabyte, also populated in `init`.
+/// The sixth is zeroed with .bss and populated for PCI ECAM in `init`; the
+/// seventh maps the BCM2712 PCIe controller block. On the tablet the second
+/// DRAM gigabyte keeps its table at index six and the BCM window moves to the
+/// last slot.
 #[no_mangle]
 static mut TABLES: [Table; TABLE_COUNT] = [EMPTY_TABLE; TABLE_COUNT];
 
@@ -303,6 +315,10 @@ const INDEX_LEVEL2_DRAM: usize = 4;
 const INDEX_LEVEL2_PCI: usize = 5;
 #[cfg(feature = "tablet")]
 const INDEX_LEVEL2_DRAM_HIGH: usize = 6;
+#[cfg(feature = "tablet")]
+const INDEX_LEVEL2_PCIE: usize = 7;
+#[cfg(not(feature = "tablet"))]
+const INDEX_LEVEL2_PCIE: usize = 6;
 
 /// Installs empty-low/high-kernel TTBRs. The boot stub has already enabled
 /// translation, so this runs entirely through the high alias.
