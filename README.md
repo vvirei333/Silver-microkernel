@@ -344,8 +344,8 @@ touching the rest of the system.
 
 With the feature on, `linuxrun <path>` loads the same way but spawns the task
 with the **AArch64 Linux** syscall personality: `x8` carries a Linux syscall
-number and `src/linux_abi.rs` translates it. The initial stack is the Linux
-layout (`argc/argv/envp/auxv`, including `AT_PAGESZ`, `AT_ENTRY`, `AT_PHDR`,
+number and the `src/linux_abi/` modules translate it. The initial stack is the
+Linux layout (`argc/argv/envp/auxv`, including `AT_PAGESZ`, `AT_ENTRY`, `AT_PHDR`,
 `AT_RANDOM`). Implemented so far: `write` (stdout/stderr), `read` (fd 0 as
 EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 `clock_gettime`, `rt_sigprocmask`, `uname`, `getpid`/`getppid`/`gettid`,

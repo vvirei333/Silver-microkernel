@@ -341,7 +341,7 @@ contains the current test image.
 ## Repository map
 
 - `src/` — kernel: scheduler, MMU, VFS/SFS, drivers, net, Linux ABI.
-- `src/linux_abi.rs`, `src/linux_fd.rs`, `src/linux_signal.rs`,
+- `src/linux_abi/`, `src/linux_fd.rs`, `src/linux_signal.rs`,
   `src/linux_elf.rs` — the optional Linux personality.
 - `userspace/` — native programs, including the Howl shell.
 - `tests/linux/` — freestanding and glibc Linux ABI tests.
