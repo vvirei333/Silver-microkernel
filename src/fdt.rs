@@ -416,6 +416,23 @@ impl<'a> Fdt<'a> {
         finder.method
     }
 
+    /// First enabled node whose `compatible` list contains `compatible`,
+    /// returning its first `reg` range.
+    ///
+    /// This is for platform devices with a simple MMIO window. It does not
+    /// translate `ranges`; callers must only use nodes whose `reg` is already
+    /// a CPU physical address (the BCM2712 SDHCI node is one).
+    pub fn first_enabled_reg(&self, compatible: &str) -> Option<Region> {
+        let mut finder = EnabledRegFinder {
+            wanted: compatible,
+            found: None,
+            depth: 0,
+            nodes: [CompatibleState::default(); MAX_DEPTH],
+        };
+        let _ = self.walk(&mut finder);
+        finder.found
+    }
+
     /// PCI host bridges the tree enables, in tree order.
     ///
     /// An ECAM host (`pci-host-ecam-generic`) is described by its `reg`
@@ -908,6 +925,75 @@ impl<'a> Visitor<'a> for PsciFinder {
         };
     }
     fn end(&mut self, _path: &str) {}
+}
+
+#[derive(Clone, Copy, Default)]
+struct CompatibleState {
+    matched: bool,
+    disabled: bool,
+    reg: Option<Region>,
+}
+
+struct EnabledRegFinder<'a> {
+    wanted: &'a str,
+    found: Option<Region>,
+    depth: usize,
+    nodes: [CompatibleState; MAX_DEPTH],
+}
+
+impl<'a, 't> Visitor<'a> for EnabledRegFinder<'t> {
+    fn begin(&mut self, _path: &str, _name: &str) {
+        if self.depth >= MAX_DEPTH {
+            return;
+        }
+        self.nodes[self.depth] = CompatibleState::default();
+        self.depth += 1;
+    }
+
+    fn property(&mut self, _path: &str, name: &str, value: &'a [u8]) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        let Some(state) = self.nodes.get_mut(index) else {
+            return;
+        };
+        match name {
+            "compatible" => {
+                let mut rest = value;
+                while let Some(text) = next_string(&mut rest) {
+                    if text == self.wanted {
+                        state.matched = true;
+                    }
+                }
+            }
+            "reg" if state.reg.is_none() => {
+                state.reg = parse_reg_range(value);
+            }
+            "status" => {
+                if let Some(text) = first_string(value) {
+                    if text == "disabled" {
+                        state.disabled = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn end(&mut self, _path: &str) {
+        let Some(index) = self.depth.checked_sub(1) else {
+            return;
+        };
+        self.depth -= 1;
+        let state = self.nodes[index];
+        if self.found.is_none() && state.matched && !state.disabled {
+            if let Some(reg) = state.reg {
+                if !reg.is_empty() {
+                    self.found = Some(reg);
+                }
+            }
+        }
+    }
 }
 
 /// Per-node state of the PCI host finder.
@@ -2851,6 +2937,44 @@ mod tests {
         ); 1];
         assert_eq!(tree.pci_hosts(&mut hosts), 1);
         assert_eq!(hosts[0].bus_end, 1);
+    }
+
+    #[test]
+    fn first_enabled_reg_skips_disabled_and_keeps_the_first_window() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.begin("mmc@fff000");
+        dtb.prop_str("compatible", "brcm,bcm2712-sdhci");
+        dtb.prop_reg2("reg", 0x10_00ff_f000, 0x260);
+        dtb.end();
+        dtb.begin("mmc@1100000");
+        dtb.prop_str("compatible", "brcm,bcm2712-sdhci");
+        dtb.prop_str("status", "disabled");
+        dtb.prop_reg2("reg", 0x10_0110_0000, 0x260);
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let tree = Fdt::new(&blob).expect("valid tree");
+
+        let reg = tree
+            .first_enabled_reg("brcm,bcm2712-sdhci")
+            .expect("enabled node");
+        assert_eq!(reg, Region::new(0x10_00ff_f000, 0x10_00ff_f260));
+    }
+
+    #[test]
+    fn first_enabled_reg_ignores_a_disabled_only_match() {
+        let mut dtb = Dtb::new();
+        dtb.begin("");
+        dtb.begin("mmc@fff000");
+        dtb.prop_str("compatible", "brcm,bcm2712-sdhci");
+        dtb.prop_str("status", "disabled");
+        dtb.prop_reg2("reg", 0x10_00ff_f000, 0x260);
+        dtb.end();
+        dtb.end();
+        let blob = dtb.build();
+        let tree = Fdt::new(&blob).expect("valid tree");
+        assert_eq!(tree.first_enabled_reg("brcm,bcm2712-sdhci"), None);
     }
 
     #[test]
