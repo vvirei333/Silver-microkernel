@@ -1268,7 +1268,7 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `src/condvar.rs` | Condition variable: timed/infinite wait and targeted wakeups |
 | `src/semaphore.rs` | Counting semaphore on mutex + condvar |
 | `src/channel.rs` | Bounded channel: two semaphores + a mutex (backpressure) |
-| `src/mmu.rs` | TTBR1 kernel map, per-task TTBR0 maps, permission validation |
+| `src/mmu/` | TTBR1 kernel map, per-task TTBR0 maps, permission validation |
 | `src/elf_loader.rs` | Thin shim over `elf::load_elf` for embedded images |
 | `src/elf.rs` | Dynamic ELF64/AArch64 `PT_LOAD` loader, `LoadedImage`, `PageKind`, `ElfError` |
 | `src/user_program.rs` | Program IDs and embedded userspace ELF selection |
