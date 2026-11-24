@@ -351,11 +351,7 @@ pub(super) fn linux_readv(fd: u64, iovec: u64, count: u64) -> u64 {
 /// `ioctl(2)`: only the terminal size query is meaningful while stdout is the
 /// console. Everything else reports "not a tty".
 pub(super) fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
-    if let Err(code) = linux_fd::require_right(
-        scheduler::current_task_id(),
-        fd,
-        linux_fd::FD_IOCTL,
-    ) {
+    if let Err(code) = linux_fd::ioctl_allowed(scheduler::current_task_id(), fd, request) {
         return errno(code);
     }
     const TIOCGWINSZ: u64 = 0x5413;

@@ -282,7 +282,7 @@ fn dispatch_inner(
             args[1] as i64,
             args[2],
         )),
-        SYS_SILVER_CAP => silver_cap(args[0], args[1], args[2]),
+        SYS_SILVER_CAP => silver_cap(args[0], args[1], args[2], args[3]),
         SYS_DUP => finish(linux_fd::dup(scheduler::current_task_id(), args[0])),
         SYS_DUP3 => finish(linux_fd::dup2(
             scheduler::current_task_id(),

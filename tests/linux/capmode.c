@@ -28,6 +28,7 @@ static long sys1(long n, long a) { return sys5(n,a,0,0,0,0); }
 #define SYS_DUP 23
 #define SYS_LSEEK 62
 #define SYS_FSTAT 80
+#define SYS_IOCTL 29
 #define SYS_OPENAT 56
 #define SYS_MKDIRAT 34
 #define SYS_CHDIR 49
@@ -77,6 +78,28 @@ void _start(void) {
     sys1(SYS_CLOSE, dupfd);
     if (sys3(SYS_SILVER_CAP, 1, fd, 0x80000000L) != -EINVAL)
         fail("capmode: unknown bits accepted\n", 33);
+
+    // The console's only ioctl is TIOCGWINSZ. Narrow it to exactly that
+    // command, prove everything else is denied, then deny even the listed
+    // command with an empty allowlist.
+    const long TIOCGWINSZ = 0x5413;
+    char winsize[8];
+    if (sys3(SYS_IOCTL, 1, TIOCGWINSZ, (long)winsize) != 0)
+        fail("capmode: winsize failed\n", 24);
+    unsigned int allow[1] = { TIOCGWINSZ };
+    if (sys4(SYS_SILVER_CAP, 3, 1, (long)allow, 1) != 0)
+        fail("capmode: ioctl limit failed\n", 28);
+    if (sys3(SYS_IOCTL, 1, TIOCGWINSZ, (long)winsize) != 0)
+        fail("capmode: allowed ioctl failed\n", 30);
+    if (sys3(SYS_IOCTL, 1, 0x1234, 0) != -EPERM)
+        fail("capmode: other ioctl allowed\n", 29);
+    allow[0] = 0x1234;
+    if (sys4(SYS_SILVER_CAP, 3, 1, (long)allow, 1) != -EPERM)
+        fail("capmode: ioctl widen allowed\n", 29);
+    if (sys4(SYS_SILVER_CAP, 3, 1, (long)allow, 0) != 0)
+        fail("capmode: empty limit failed\n", 28);
+    if (sys3(SYS_IOCTL, 1, TIOCGWINSZ, (long)winsize) != -EPERM)
+        fail("capmode: ioctl clear failed\n", 28);
 
     long dir = sys4(SYS_OPENAT, AT_FDCWD, (long)"/sfs", O_DIRECTORY, 0);
     if (dir < 0) fail("capmode: dir open failed\n", 29);

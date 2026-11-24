@@ -175,10 +175,13 @@ impl Drop for MappedFile {
 /// One queued datagram/message on a Unix socket, with the descriptors that
 /// travelled with it. Ancillary descriptors stay in the queue until the
 /// receiver consumes the message, exactly like Linux.
+/// A descriptor travelling through `SCM_RIGHTS`: the target plus the
+/// sender's rights and ioctl allowlist, which must survive the transfer.
+type PassedFd = (Target, u32, Option<Vec<u32>>);
+
 struct SocketMessage {
     data: VecDeque<u8>,
-    /// Carried descriptors keep the sender's rights, like `dup`.
-    fds: Vec<(Target, u32)>,
+    fds: Vec<PassedFd>,
 }
 
 /// One end of a connected `AF_UNIX` stream pair.
@@ -360,6 +363,9 @@ struct Table {
     access: Vec<u64>,
     /// Capsicum-style rights for each slot. Only ever cleared after insert.
     rights: Vec<u32>,
+    /// Per-descriptor ioctl allowlists; `None` means every command the
+    /// driver accepts. A `Some` list can only shrink.
+    ioctls: Vec<Option<Vec<u32>>>,
     /// Descriptor numbers carrying `FD_CLOEXEC`. `execve` closes exactly
     /// these, which is how Rust's `Command` learns that `execvp` succeeded
     /// (the parent reads EOF from the exec-error socketpair).
@@ -385,6 +391,7 @@ fn with_table<R>(task: u64, action: impl FnOnce(&mut Table) -> R) -> R {
                 slots,
                 access: alloc::vec![O_RDWR; 3],
                 rights: alloc::vec![FD_ALL; 3],
+                ioctls: alloc::vec![None; 3],
                 cloexec: Vec::new(),
             });
             tables.len() - 1
@@ -488,7 +495,7 @@ fn release_socket_end(state: &Arc<Mutex<SocketState>>, end: u8) {
         socket.ends[end].incoming.drain(..).collect::<Vec<_>>()
     };
     for message in dropped {
-        for (target, _) in message.fds {
+        for (target, _, _) in message.fds {
             target.release_endpoint();
         }
     }
@@ -583,6 +590,17 @@ fn rights_at(table: &Table, fd: u64) -> u32 {
     table.rights.get(fd as usize).copied().unwrap_or(FD_ALL)
 }
 
+fn set_ioctls(table: &mut Table, fd: u64, list: Option<Vec<u32>>) {
+    while table.ioctls.len() <= fd as usize {
+        table.ioctls.push(None);
+    }
+    table.ioctls[fd as usize] = list;
+}
+
+fn ioctls_at(table: &Table, fd: u64) -> Option<Vec<u32>> {
+    table.ioctls.get(fd as usize).cloned().unwrap_or(None)
+}
+
 /// Rights granted by opening a target. The access mode narrows these in
 /// `insert_access`; targets installed by `socket`, `pipe` or `memfd` get the
 /// full set their kind can use.
@@ -660,6 +678,7 @@ fn insert_in(table: &mut Table, target: Target) -> Option<u64> {
             *slot = Some(target);
             set_access(table, index as u64, O_RDWR);
             set_rights(table, index as u64, rights);
+            set_ioctls(table, index as u64, None);
             return Some(index as u64);
         }
     }
@@ -669,6 +688,7 @@ fn insert_in(table: &mut Table, target: Target) -> Option<u64> {
     table.slots.push(Some(target));
     set_access(table, (table.slots.len() - 1) as u64, O_RDWR);
     set_rights(table, (table.slots.len() - 1) as u64, rights);
+    set_ioctls(table, (table.slots.len() - 1) as u64, None);
     Some((table.slots.len() - 1) as u64)
 }
 
@@ -695,6 +715,7 @@ fn insert_from_in(table: &mut Table, target: Target, minimum: u64) -> Option<u64
             table.slots[index] = Some(target);
             set_access(table, index as u64, O_RDWR);
             set_rights(table, index as u64, rights);
+            set_ioctls(table, index as u64, None);
             return Some(index as u64);
         }
         index += 1;
@@ -711,6 +732,7 @@ fn insert_from_in(table: &mut Table, target: Target, minimum: u64) -> Option<u64
     table.slots.push(Some(target));
     set_access(table, (table.slots.len() - 1) as u64, O_RDWR);
     set_rights(table, (table.slots.len() - 1) as u64, rights);
+    set_ioctls(table, (table.slots.len() - 1) as u64, None);
     Some((table.slots.len() - 1) as u64)
 }
 
@@ -737,6 +759,47 @@ pub fn limit_rights(task: u64, fd: u64, mask: u32) -> Result<u32, u64> {
         let rights = rights_at(table, fd) & mask;
         set_rights(table, fd, rights);
         Ok(rights)
+    })
+}
+
+/// Maximum entries in one per-descriptor ioctl allowlist.
+const MAX_IOCTLS: usize = 256;
+
+/// Replaces `fd`'s ioctl allowlist. The new list must be a subset of the
+/// current one, so a capability can only narrow; `None` is the initial
+/// unrestricted state.
+pub fn limit_ioctls(task: u64, fd: u64, commands: &[u32]) -> Result<(), u64> {
+    if commands.len() > MAX_IOCTLS {
+        return Err(EINVAL);
+    }
+    with_table(task, |table| {
+        if table.slots.get(fd as usize).and_then(|slot| slot.as_ref()).is_none() {
+            return Err(EBADF);
+        }
+        if let Some(current) = table.ioctls.get(fd as usize).and_then(|list| list.as_ref()) {
+            if commands.iter().any(|command| !current.contains(command)) {
+                return Err(EPERM);
+            }
+        }
+        set_ioctls(table, fd, Some(commands.to_vec()));
+        Ok(())
+    })
+}
+
+/// Requires `FD_IOCTL` and, when the descriptor has an allowlist, one of
+/// its commands. The driver still validates the command it receives.
+pub fn ioctl_allowed(task: u64, fd: u64, request: u64) -> Result<(), u64> {
+    let task = crate::scheduler::fd_table_owner(task);
+    require_right(task, fd, FD_IOCTL)?;
+    with_table(task, |table| {
+        if table.slots.get(fd as usize).and_then(|slot| slot.as_ref()).is_none() {
+            return Err(EBADF);
+        }
+        match table.ioctls.get(fd as usize).and_then(|list| list.as_ref()) {
+            None => Ok(()),
+            Some(commands) if commands.contains(&(request as u32)) => Ok(()),
+            Some(_) => Err(EPERM),
+        }
     })
 }
 
@@ -1005,6 +1068,7 @@ pub fn close(task: u64, fd: u64) -> Result<(), u64> {
         let slot = table.slots.get_mut(fd as usize)?.take();
         if slot.is_some() {
             table.cloexec.retain(|&marked| marked != fd);
+            set_ioctls(table, fd, None);
         }
         slot
     })
@@ -1049,9 +1113,11 @@ pub fn dup(task: u64, fd: u64) -> Result<u64, u64> {
             .ok_or(EBADF)?;
         let access = access_at(table, fd);
         let rights = rights_at(table, fd);
+        let ioctls = ioctls_at(table, fd);
         let new_fd = insert_in(table, target.clone()).ok_or(EMFILE)?;
         set_access(table, new_fd, access);
         set_rights(table, new_fd, rights);
+        set_ioctls(table, new_fd, ioctls);
         target.retain_endpoint();
         Ok(new_fd)
     })
@@ -1066,9 +1132,11 @@ pub fn dup_from(task: u64, fd: u64, minimum: u64, cloexec: bool) -> Result<u64, 
             .ok_or(EBADF)?;
         let access = access_at(table, fd);
         let rights = rights_at(table, fd);
+        let ioctls = ioctls_at(table, fd);
         let new_fd = insert_from_in(table, target.clone(), minimum).ok_or(EMFILE)?;
         set_access(table, new_fd, access);
         set_rights(table, new_fd, rights);
+        set_ioctls(table, new_fd, ioctls);
         target.retain_endpoint();
         Ok::<u64, u64>(new_fd)
     })?;
@@ -1149,12 +1217,15 @@ pub fn dup2(task: u64, oldfd: u64, newfd: u64) -> Result<u64, u64> {
             close_vfs_if_last(task, vfs_fd);
         }
     }
-    let (access, rights) = with_table(task, |table| (access_at(table, oldfd), rights_at(table, oldfd)));
+    let (access, rights, ioctls) = with_table(task, |table| {
+        (access_at(table, oldfd), rights_at(table, oldfd), ioctls_at(table, oldfd))
+    });
     target.retain_endpoint();
     with_table(task, |table| {
         table.slots[newfd as usize] = Some(target);
         set_access(table, newfd, access);
         set_rights(table, newfd, rights);
+        set_ioctls(table, newfd, ioctls);
         table.cloexec.retain(|&marked| marked != newfd);
     });
     Ok(newfd)
@@ -1255,8 +1326,8 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         Target::Socket { state, end, nonblock } => {
             let mut chunk = alloc::vec![0_u8; (count as usize).min(64 * 1024)];
             let (read, fds) = socket_recv_message(&state, end, nonblock, &mut chunk)?;
-            for (target, rights) in fds {
-                let _ = insert_transferred(task, target, rights);
+            for (target, rights, ioctls) in fds {
+                let _ = insert_transferred(task, target, rights, ioctls);
             }
             user_memory::copy_to_user(&chunk[..read], buffer).map_err(|_| EFAULT)?;
             Ok(read as u64)
@@ -2442,10 +2513,18 @@ fn pipe_write(state: &Arc<Mutex<PipeState>>, buffer: u64, count: u64) -> Result<
 /// caller passes a target that already owns one reference (the message
 /// queue); on success the table owns it, on failure that reference is
 /// released.
-fn insert_transferred(task: u64, target: Target, rights: u32) -> Option<u64> {
+fn insert_transferred(
+    task: u64,
+    target: Target,
+    rights: u32,
+    ioctls: Option<Vec<u32>>,
+) -> Option<u64> {
     match insert(task, target.clone()) {
         Some(fd) => {
-            with_table(task, |table| set_rights(table, fd, rights));
+            with_table(task, |table| {
+                set_rights(table, fd, rights);
+                set_ioctls(table, fd, ioctls);
+            });
             // The table's copy becomes a counted endpoint, then the queue's
             // reference is released: exactly one owner remains.
             target.retain_endpoint();
@@ -2728,14 +2807,14 @@ fn socket_send_locked(
     state: &Arc<Mutex<SocketState>>,
     end: u8,
     bytes: &[u8],
-    fds: Vec<(Target, u32)>,
+    fds: Vec<PassedFd>,
 ) -> Result<u64, u64> {
     let end = end as usize;
     let peer = 1 - end;
     let mut socket = state.lock();
     if socket.ends[end].write_closed || socket.ends[peer].read_closed {
         drop(socket);
-        for (target, _) in &fds {
+        for (target, _, _) in &fds {
             target.release_endpoint();
         }
         return Err(EPIPE);
@@ -2764,22 +2843,23 @@ pub fn socket_send(
     let Target::Socket { state, end, .. } = target else {
         return Err(ENOTSOCK);
     };
-    let mut passed: Vec<(Target, u32)> = Vec::new();
+    let mut passed: Vec<PassedFd> = Vec::new();
     for &passed_fd in pass {
         let Some(passed_target) = lookup(task, passed_fd) else {
-            for (target, _) in &passed {
+            for (target, _, _) in &passed {
                 target.release_endpoint();
             }
             return Err(EBADF);
         };
         let Ok(passed_rights) = rights(task, passed_fd) else {
-            for (target, _) in &passed {
+            for (target, _, _) in &passed {
                 target.release_endpoint();
             }
             return Err(EBADF);
         };
+        let passed_ioctls = with_table(task, |table| ioctls_at(table, passed_fd));
         passed_target.retain_endpoint();
-        passed.push((passed_target, passed_rights));
+        passed.push((passed_target, passed_rights, passed_ioctls));
     }
     socket_send_locked(&state, end, bytes, passed)
 }
@@ -2792,7 +2872,7 @@ fn socket_recv_message(
     end: u8,
     nonblock: bool,
     buffer: &mut [u8],
-) -> Result<(usize, Vec<(Target, u32)>), u64> {
+) -> Result<(usize, Vec<PassedFd>), u64> {
     let end = end as usize;
     let peer = 1 - end;
     loop {
@@ -2878,8 +2958,8 @@ pub fn socket_recv(
     crate::console::write_str("
 ");
     let mut numbers = Vec::new();
-    for (target, rights) in fds {
-        if let Some(number) = insert_transferred(task, target, rights) {
+    for (target, rights, ioctls) in fds {
+        if let Some(number) = insert_transferred(task, target, rights, ioctls) {
             numbers.push(number);
         }
     }
@@ -2913,7 +2993,7 @@ pub fn socket_shutdown(task: u64, fd: u64, how: u64) -> Result<(), u64> {
     };
     drop(socket);
     for message in dropped {
-        for (target, _) in message.fds {
+        for (target, _, _) in message.fds {
             target.release_endpoint();
         }
     }
@@ -3161,12 +3241,14 @@ pub fn fork_table(parent: u64, child: u64) {
     let cloexec = source.cloexec.clone();
     let access = source.access.clone();
     let rights = source.rights.clone();
+    let ioctls = source.ioctls.clone();
     tables.retain(|table| table.task != child);
     tables.push(Table {
         task: child,
         slots,
         access,
         rights,
+        ioctls,
         cloexec,
     });
 }
