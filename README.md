@@ -1275,7 +1275,8 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `src/vfs.rs` | RAM file tree, normalized paths and per-task file descriptors |
 | `src/seed.rs` | Boot-time VFS seeding of apps, probes and `/bin/hello` |
 | `userspace/src/allocator.rs` | Per-task first-fit `malloc/free` over `SYS_BRK` |
-| `userspace/src/bin/silvershell.rs` | Interactive shell and `logo.txt` fastfetch screen |
+| `userspace/src/bin/silvershell.rs` | Shell entry point, input loop and UART driver link |
+| `userspace/src/shell/` | Command families (`commands`, `files`, `net`, `proc`, `bench`) and shared helpers |
 | `userspace/src/bin/net_driver.rs` | VirtIO-Net driver, split virtqueues and frame mailbox |
 | `userspace/src/bin/net_server.rs` | `smoltcp` TCP/IP stack and ICMP echo |
 | `userspace/src/net_ipc.rs` | Shared-memory frame protocol used by both network tasks |
