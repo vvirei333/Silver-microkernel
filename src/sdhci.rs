@@ -335,12 +335,15 @@ impl Host {
         let r6 = self.command(3, 0, RESPONSE_48 | COMMAND_CRC | COMMAND_INDEX)?;
         let rca = (r6 >> 16) & 0xffff;
 
-        // CMD9: CSD, used for capacity. Keep RESP1 and RESP3 before the next
-        // command overwrites the response registers.
+        // CMD9: CSD, used for capacity. Keep all four response words before
+        // the next command overwrites them; R2 is shifted by one byte.
         self.command(9, rca << 16, RESPONSE_136 | COMMAND_CRC | COMMAND_INDEX)?;
-        let csd1 = self.response(1);
-        let csd2 = self.response(2);
-        let csd3 = self.response(3);
+        let response = [
+            self.response(0),
+            self.response(1),
+            self.response(2),
+            self.response(3),
+        ];
 
         self.command(7, rca << 16, RESPONSE_48_BUSY | COMMAND_CRC | COMMAND_INDEX)?;
         self.command(16, 512, RESPONSE_48 | COMMAND_CRC | COMMAND_INDEX)?;
@@ -358,7 +361,8 @@ impl Host {
         }
         self.set_clock(25_000_000);
 
-        let sectors = sdhci_protocol::capacity_sectors([0, csd1, csd2, csd3])?;
+        let csd = sdhci_protocol::csd_from_response(response);
+        let sectors = sdhci_protocol::capacity_sectors(csd)?;
         Some(Card {
             sectors,
             high_capacity: ocr & 0x4000_0000 != 0,

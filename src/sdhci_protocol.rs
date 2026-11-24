@@ -19,6 +19,20 @@ pub fn clock_divisor(base_hz: u32, clock_hz: u32) -> u16 {
     divisor as u16
 }
 
+/// Realigns the four raw SDHCI response words into CSD/CID payload words.
+///
+/// A 136-bit R2 response carries CSD/CID[127:8]; SDHCI stores it shifted
+/// right by one byte, so the payload starts eight bits into the word stream.
+/// This is the same alignment Linux does before decoding CSD fields.
+pub fn csd_from_response(response: [u32; 4]) -> [u32; 4] {
+    [
+        response[0] << 8,
+        (response[1] << 8) | (response[0] >> 24),
+        (response[2] << 8) | (response[1] >> 24),
+        (response[3] << 8) | (response[2] >> 24),
+    ]
+}
+
 /// Decodes card capacity in 512-byte sectors from CSD words.
 ///
 /// `csd[0]` is the low response word and `csd[3]` the high one, matching the
@@ -47,7 +61,7 @@ pub fn capacity_sectors(csd: [u32; 4]) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::{capacity_sectors, clock_divisor};
+    use super::{capacity_sectors, clock_divisor, csd_from_response};
 
     #[test]
     fn clock_divisor_matches_the_200_mhz_base() {
@@ -62,6 +76,28 @@ mod tests {
         assert_eq!(clock_divisor(0, 400_000), 1);
     }
 
+    #[test]
+    fn realigns_a_136_bit_response_before_decoding() {
+        // SDHCI returns the 136-bit R2 payload shifted right by one byte;
+        // the low byte is not carried because it is behind the CRC.
+        let csd = [0x0a40_0000, 0xedc8_7f80, 0x5b59_0000, 0x400e_0032];
+        let raw = [
+            (csd[0] >> 8) | (csd[1] << 24),
+            (csd[1] >> 8) | (csd[2] << 24),
+            (csd[2] >> 8) | (csd[3] << 24),
+            csd[3] >> 8,
+        ];
+        assert_eq!(csd_from_response(raw), csd);
+        assert_eq!(
+            capacity_sectors(csd_from_response(raw)),
+            Some(60_873 * 1024)
+        );
+    }
+
+    #[test]
+    fn realigns_an_all_zero_response() {
+        assert_eq!(csd_from_response([0; 4]), [0; 4]);
+    }
     #[test]
     fn decodes_a_32_gib_sdhc_csd() {
         // SanDisk 32 GB SDHC, CSD = 400e00325b590000edc87f800a400000.
