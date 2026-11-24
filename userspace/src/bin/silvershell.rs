@@ -29,6 +29,98 @@ const LINE_CAPACITY: usize = 256;
 /// `gpu_driver.rs`.
 const GUI_BUTTON_PRESSED: u8 = 2;
 
+/// Number of command lines kept for Up/Down recall. Eight is enough to fix a
+/// typo without spending shell stack on a full readline history.
+const HISTORY_CAPACITY: usize = 8;
+
+/// Command history, including the draft line saved when recall starts.
+struct History {
+    entries: [[u8; LINE_CAPACITY]; HISTORY_CAPACITY],
+    lengths: [usize; HISTORY_CAPACITY],
+    count: usize,
+    next: usize,
+    browse: Option<usize>,
+    draft: [u8; LINE_CAPACITY],
+    draft_len: usize,
+}
+
+impl History {
+    const fn new() -> Self {
+        Self {
+            entries: [[0; LINE_CAPACITY]; HISTORY_CAPACITY],
+            lengths: [0; HISTORY_CAPACITY],
+            count: 0,
+            next: 0,
+            browse: None,
+            draft: [0; LINE_CAPACITY],
+            draft_len: 0,
+        }
+    }
+
+    fn record(&mut self, line: &[u8]) {
+        self.browse = None;
+        if line.is_empty() {
+            return;
+        }
+        if self.count > 0 {
+            let last = (self.next + HISTORY_CAPACITY - 1) % HISTORY_CAPACITY;
+            if self.lengths[last] == line.len() && self.entries[last][..line.len()] == *line {
+                return;
+            }
+        }
+        self.entries[self.next][..line.len()].copy_from_slice(line);
+        self.lengths[self.next] = line.len();
+        self.next = (self.next + 1) % HISTORY_CAPACITY;
+        if self.count < HISTORY_CAPACITY {
+            self.count += 1;
+        }
+    }
+
+    fn entry(&self, back: usize, line: &mut [u8]) -> Option<usize> {
+        if back >= self.count {
+            return None;
+        }
+        let index = (self.next + HISTORY_CAPACITY - 1 - back) % HISTORY_CAPACITY;
+        let length = self.lengths[index];
+        line[..length].copy_from_slice(&self.entries[index][..length]);
+        Some(length)
+    }
+
+    /// Recalls one line older than the current position and returns its length.
+    fn older(&mut self, line: &mut [u8], current_len: usize) -> Option<usize> {
+        if self.count == 0 {
+            return None;
+        }
+        let back = match self.browse {
+            None => {
+                self.draft[..current_len].copy_from_slice(&line[..current_len]);
+                self.draft_len = current_len;
+                0
+            }
+            Some(back) => (back + 1).min(self.count - 1),
+        };
+        self.browse = Some(back);
+        self.entry(back, line)
+    }
+
+    /// Moves toward the draft; at the newest entry it restores the draft.
+    fn newer(&mut self, line: &mut [u8]) -> Option<usize> {
+        match self.browse {
+            None => None,
+            Some(0) => {
+                self.browse = None;
+                let length = self.draft_len;
+                line[..length].copy_from_slice(&self.draft[..length]);
+                Some(length)
+            }
+            Some(back) => {
+                self.browse = Some(back - 1);
+                self.entry(back - 1, line)
+            }
+        }
+    }
+}
+
 /// Re-resolves Howler once a second so a respawned driver is picked up and a
 /// dead one is noticed without polling the task table on every keystroke.
 const HOWLER_REFRESH_TICKS: u64 = TICKS_PER_SECOND;
@@ -44,6 +136,7 @@ pub extern "C" fn _start(howler_id: u64) -> ! {
 
     let mut line = [0_u8; LINE_CAPACITY];
     let mut length = 0_usize;
+    let mut history = History::new();
     let mut howler = HowlerLink::new(howler_id);
     loop {
         let Some(byte) = read_input(&mut howler) else {
@@ -57,10 +150,22 @@ pub extern "C" fn _start(howler_id: u64) -> ! {
             b'\r' | b'\n' => {
                 syscall::print("\r\n");
                 if let Ok(command) = core::str::from_utf8(&line[..length]) {
+                    history.record(&line[..length]);
                     execute(command);
                 }
                 length = 0;
                 prompt();
+            }
+            0x1B => {
+                let recalled = match read_escape(&mut howler) {
+                    Some(b'A') => history.older(&mut line, length),
+                    Some(b'B') => history.newer(&mut line),
+                    _ => None,
+                };
+                if let Some(recalled) = recalled {
+                    length = recalled;
+                    redraw(&line[..length]);
+                }
             }
             0x08 | 0x7F => {
                 if length > 0 {
@@ -136,6 +241,24 @@ impl HowlerLink {
 /// UART driver's first byte (near-zero latency) and costs nothing while idle;
 /// the timeout only decides how often the shell re-resolves a restarted Howler.
 const INPUT_WAIT_TICKS: u64 = 100;
+
+/// Reads the byte after `ESC [` from the same input source; `None` for a
+/// bare Escape or an unknown sequence, which is then ignored.
+fn read_escape(howler: &mut HowlerLink) -> Option<u8> {
+    if read_input(howler)? != b'[' {
+        return None;
+    }
+    read_input(howler)
+}
+
+/// Replaces the visible input line after a history recall.
+fn redraw(line: &[u8]) {
+    syscall::print("\r\x1b[2K");
+    prompt();
+    for &byte in line {
+        echo(byte);
+    }
+}
 
 fn read_input(howler: &mut HowlerLink) -> Option<u8> {
     let Some(howler_id) = howler.resolve() else {

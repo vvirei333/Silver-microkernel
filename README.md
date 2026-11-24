@@ -198,7 +198,7 @@ win. No XNU or Redox code is copied.
 
 - **WerewolfOS** — the complete operating system and userspace platform.
 - **Silver Kernel** — the Rust microkernel.
-- **Howl** — the interactive shell and console-facing userspace.
+- **Howl** — the interactive shell and console-facing userspace; Up/Down recall the last eight command lines and restore the line being edited.
 - **silverd** — the service manager.
 - **gpu_driver**, **input_driver**, **net_driver**, **net_server** — isolated
   wolf-themed system components; they communicate through IPC and capabilities.
