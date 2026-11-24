@@ -59,6 +59,7 @@ const SYS_EXIT: u64 = 93;
 const SYS_CLONE: u64 = 220;
 const SYS_WAIT4: u64 = 260;
 const SYS_EXECVE: u64 = 221;
+const SYS_EXECVEAT: u64 = 281;
 const SYS_EXIT_GROUP: u64 = 94;
 const SYS_SET_TID_ADDRESS: u64 = 96;
 const SYS_SET_ROBUST_LIST: u64 = 99;
@@ -353,6 +354,7 @@ fn dispatch_inner(
         SYS_EXIT => scheduler::exit_current_with_status(args[0]),
         SYS_EXIT_GROUP => scheduler::exit_group(args[0]),
         SYS_EXECVE => linux_execve(frame, args[0], args[1], args[2]),
+        SYS_EXECVEAT => linux_execveat(frame, args[0], args[1], args[2], args[3], args[4]),
         SYS_CLONE => linux_clone(frame, args[0], args[1], args[2], args[3], args[4]),
         SYS_WAIT4 => finish(linux_wait4(args[0] as i64, args[1], args[2])),
         SYS_SET_TID_ADDRESS => scheduler::current_task_id(),

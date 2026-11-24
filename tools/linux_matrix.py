@@ -26,6 +26,13 @@ RELEASE_VERSION = re.search(
     r'^version = "(.+)"$', (ROOT / "Cargo.toml").read_text(), re.MULTILINE
 ).group(1)
 
+# Installed by tools/linux-test.sh, so they are opt-in: the tracked image
+# only carries the cases above.
+CAPABILITY_CASES = [
+    ("linuxrun /sfs/linux-capmode", b"capmode ok"),
+    ("linuxrun /sfs/linux-fexec", b"status=42"),
+]
+
 CASES = [
     ("linuxrun /sfs/linux-hello", b"hello from linux abi"),
     ("linuxrun /sfs/linux-rw", b"data+bss ok"),
@@ -63,7 +70,10 @@ CASES = [
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--image", default=str(ROOT / "disk.img"))
+    parser.add_argument("--capability", action="store_true",
+                        help="also run the capmode/fexec probes from linux-test.sh")
     args = parser.parse_args()
+    cases = CASES + (CAPABILITY_CASES if args.capability else [])
 
     if not KERNEL.exists():
         sys.exit("build first: ./build_and_qemu.sh release --no-run")
@@ -115,7 +125,7 @@ def main():
             print("BOOT FAILED")
             return 1
         failed = []
-        for command, marker in CASES:
+        for command, marker in cases:
             log.clear()
             sock.sendall((command + "\n").encode())
             ok = wait(marker, 90)
@@ -125,7 +135,7 @@ def main():
                 sys.stderr.write(
                     bytes(log)[-2000:].decode("utf-8", "replace") + "\n"
                 )
-        print(f"\n{len(CASES) - len(failed)}/{len(CASES)} passed")
+        print(f"\n{len(cases) - len(failed)}/{len(cases)} passed")
         return 1 if failed else 0
     finally:
         proc.terminate()

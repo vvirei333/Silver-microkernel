@@ -1,5 +1,5 @@
 use super::*;
-use super::fs::{resolve, user_string, user_string_array};
+use super::fs::{dirfd_cwd, resolve, user_string, user_string_array};
 
 /// `sched_getattr(2)`: SCHED_OTHER, no runtime constraints. The caller's
 /// size field is untrusted - a kernel Vec with a user capacity would panic
@@ -26,18 +26,10 @@ pub(super) fn linux_execve(
     argv_pointer: u64,
     envp_pointer: u64,
 ) -> u64 {
-    const EXEC_LIMIT: usize = 32 * 1024 * 1024;
-    // There is no `fexecve` yet: after `cap_enter` a path-based exec would
-    // reopen exactly the namespace capability mode is meant to remove.
+    // Path-based exec would reopen exactly the namespace capability mode is
+    // meant to remove; `execveat(fd, "", ..., AT_EMPTY_PATH)` is the escape.
     if scheduler::current_task_capability_mode() {
         return errno(EPERM);
-    }
-    // `execve` from a `CLONE_VM` sibling would build a new address space and
-    // then release the leader's, pulling the tables out from under every
-    // running thread. Until a thread takes over the whole group, refuse
-    // instead of corrupting the process.
-    if scheduler::current_is_thread() {
-        return errno(EINVAL);
     }
     let Some(path) = user_string(path_pointer) else {
         return errno(EFAULT);
@@ -45,8 +37,6 @@ pub(super) fn linux_execve(
     if path.is_empty() {
         return errno(ENOENT);
     }
-    crate::console::write_str(&path);
-    crate::console::write_str("\r\n");
     let Some(argv) = user_string_array(argv_pointer) else {
         return errno(EFAULT);
     };
@@ -54,11 +44,78 @@ pub(super) fn linux_execve(
         return errno(EFAULT);
     };
     let cwd = scheduler::current_task_cwd();
+    exec_path(frame, &cwd, path, argv, envp)
+}
+
+/// `execveat(2)`: the fd-relative form, and the only way to exec after
+/// entering capability mode. A non-empty path still needs `dirfd` lookup
+/// rights; an empty path with `AT_EMPTY_PATH` uses the descriptor itself.
+pub(super) fn linux_execveat(
+    frame: &mut [u64; crate::syscall::FRAME_QUADWORDS],
+    dirfd: u64,
+    path_pointer: u64,
+    argv_pointer: u64,
+    envp_pointer: u64,
+    flags: u64,
+) -> u64 {
+    const AT_SYMLINK_NOFOLLOW: u64 = 0x100;
+    const AT_EMPTY_PATH: u64 = 0x1000;
+    if flags & !(AT_SYMLINK_NOFOLLOW | AT_EMPTY_PATH) != 0 {
+        return errno(EINVAL);
+    }
+    let Some(path) = user_string(path_pointer) else {
+        return errno(EFAULT);
+    };
+    let Some(argv) = user_string_array(argv_pointer) else {
+        return errno(EFAULT);
+    };
+    let Some(envp) = user_string_array(envp_pointer) else {
+        return errno(EFAULT);
+    };
+    if path.is_empty() {
+        if flags & AT_EMPTY_PATH == 0 {
+            return errno(ENOENT);
+        }
+        let task = scheduler::current_task_id();
+        if let Err(code) =
+            linux_fd::require_right(task, dirfd, linux_fd::FD_READ | linux_fd::FD_FSTAT)
+        {
+            return errno(code);
+        }
+        let Some(resolved) = linux_fd::vfs_path(task, dirfd) else {
+            return errno(ENOENT);
+        };
+        return exec_path(frame, "/", resolved, argv, envp);
+    }
+    let cwd = match dirfd_cwd(dirfd) {
+        Ok(cwd) => cwd,
+        Err(code) => return code,
+    };
+    exec_path(frame, &cwd, path, argv, envp)
+}
+
+fn exec_path(
+    frame: &mut [u64; crate::syscall::FRAME_QUADWORDS],
+    cwd: &str,
+    path: alloc::string::String,
+    argv: Vec<Vec<u8>>,
+    envp: Vec<Vec<u8>>,
+) -> u64 {
+    const EXEC_LIMIT: usize = 32 * 1024 * 1024;
+    // `execve` from a `CLONE_VM` sibling would build a new address space and
+    // then release the leader's, pulling the tables out from under every
+    // running thread. Until a thread takes over the whole group, refuse
+    // instead of corrupting the process.
+    if scheduler::current_is_thread() {
+        return errno(EINVAL);
+    }
+    crate::console::write_str(&path);
+    crate::console::write_str("\r\n");
     let mut target = path;
     let mut arguments = argv;
     let mut depth = 0u32;
     let resolved = loop {
-        let Ok(resolved) = resolve(&cwd, &target) else {
+        let Ok(resolved) = resolve(cwd, &target) else {
             crate::console::write_str("EXECFAIL resolve ");
             crate::console::write_str(&target);
             crate::console::write_str("\r\n");
@@ -67,7 +124,7 @@ pub(super) fn linux_execve(
         if !scheduler::current_read_path_allowed(&resolved) {
             return errno(EACCES);
         }
-        match crate::vfs::file_len(&cwd, &resolved) {
+        match crate::vfs::file_len(cwd, &resolved) {
             Ok(length) if length <= EXEC_LIMIT => {}
             _ => {
                 crate::console::write_str("EXECFAIL len ");
@@ -78,7 +135,7 @@ pub(super) fn linux_execve(
         }
         // A `#!` script is executed through its interpreter, like Linux: the
         // kernel never tries to load shell text as an ELF.
-        let header = crate::vfs::read_at(&cwd, &resolved, 0, 256).unwrap_or_default();
+        let header = crate::vfs::read_at(cwd, &resolved, 0, 256).unwrap_or_default();
         if header.starts_with(b"#!") {
             depth += 1;
             if depth > 4 {
@@ -102,7 +159,7 @@ pub(super) fn linux_execve(
         }
         break resolved;
     };
-    let Ok(image) = crate::linux_elf::load_linux_program_path(&cwd, &resolved, EXEC_LIMIT) else {
+    let Ok(image) = crate::linux_elf::load_linux_program_path(cwd, &resolved, EXEC_LIMIT) else {
         return errno(ENOEXEC);
     };
     let Some(result) = scheduler::exec_linux_current(image, arguments, envp) else {
