@@ -335,12 +335,19 @@ unsafe fn load_caps(device: &mut Device, index: usize) {
         device.ev_size[kind as usize] = size as u8;
     }
 
-    // virtio-input does not enumerate EV_SYN: every evdev node can report
-    // SYN_REPORT and SYN_DROPPED, and Linux userspace expects those bits.
-    if !device.has_event(EV_SYN) {
-        device.ev[EV_SYN as usize][0] = 0x09;
-        device.ev_size[EV_SYN as usize] = 1;
+    // Selector 0 of VIRTIO_INPUT_CFG_EV_BITS reports the EV_SYN codes, but
+    // EVIOCGBIT(0) must answer with the supported event *types*. Build that
+    // set from the per-type bitmaps instead of copying the SYN codes into it;
+    // libevdev otherwise concludes the device has no EV_KEY at all.
+    let mut types = [0u8; EV_BITS_BYTES];
+    types[0] = 0x01; // Every evdev node supports EV_SYN itself.
+    for kind in 1..EV_TYPE_COUNT {
+        if device.ev[kind].iter().any(|&byte| byte != 0) {
+            types[kind / 8] |= 1 << (kind % 8);
+        }
     }
+    device.ev[EV_SYN as usize] = types;
+    device.ev_size[EV_SYN as usize] = 1;
 
     if device.has_event(EV_ABS) {
         for code in 0..ABS_COUNT as u16 {
@@ -760,14 +767,15 @@ pub fn available(index: usize) -> usize {
 /// Returns the byte count; zero means "no event right now".
 pub fn read_events(index: usize, buffer: &mut [u8]) -> usize {
     let mut written = 0;
-    let ticks = crate::timer::ticks();
+    let millis = crate::timer::ticks() * crate::timer::TICK_INTERVAL_MS;
+    let seconds = millis / 1000;
+    let usec = (millis % 1000) * 1000;
     while written + INPUT_EVENT_SIZE <= buffer.len() {
         let Some((kind, code, value)) = take_event(index) else {
             break;
         };
         let record = &mut buffer[written..written + INPUT_EVENT_SIZE];
-        record[0..8].copy_from_slice(&0_u64.to_le_bytes());
-        let usec = (ticks % 100) * 10_000;
+        record[0..8].copy_from_slice(&seconds.to_le_bytes());
         record[8..16].copy_from_slice(&usec.to_le_bytes());
         record[16..18].copy_from_slice(&kind.to_le_bytes());
         record[18..20].copy_from_slice(&code.to_le_bytes());

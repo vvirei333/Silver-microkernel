@@ -8289,3 +8289,36 @@ Night session results, in order:
   which is tuning data, not an enumeration failure.
 - Open: route `libinput_dispatch()` events into the compositor seat, stage
   the quirks data, and keep more than two input devices out of scope.
+
+### 2026-11-26 (later) — libinput delivers real key events
+
+- Extended `tests/linux/libinput.c` from enumeration to delivery: after the
+  two `DEVICE_ADDED` events it polls the libinput fd, dispatches, and requires
+  a pressed `LIBINPUT_EVENT_KEYBOARD_KEY` with key `KEY_A` (30). The host
+  injects `a` through the QEMU monitor after the `devices=2` marker;
+  `tools/input_probe.py` gained `--keys` and `--marker` for that.
+- The probe printed `key=0` even though the kernel was reading key records.
+  Diagnosed with a direct libevdev session and by disassembling
+  `libevdev_next_event`: this libevdev only reads in
+  `LIBEVDEV_READ_FLAG_NORMAL` (2), and it was dropping every `EV_KEY` record
+  because `libevdev_has_event_code(dev, EV_KEY, KEY_A)` returned 0. Root
+  cause: `EVIOCGBIT(0)` copied `VIRTIO_INPUT_CFG_EV_BITS` selector 0, which
+  is the EV_SYN code bitmap, not the event-type set Linux expects. Rebuild
+  selector 0 from the per-type bitmaps (bit 0 = EV_SYN) in `load_caps()`.
+- Two supporting fixes from the same investigation: an empty non-blocking
+  evdev read now returns `EAGAIN` instead of 0 (0 looks like end-of-device),
+  and `struct input_event` timestamps now use the monotonic tick counter
+  (`tv_sec` was always 0).
+- Debugging trap: guest stdout is block-buffered, so a marker only reaches
+  the host at exit; all probes that synchronise with the monitor must call
+  `setvbuf(stdout, NULL, _IONBF, 0)`. Without it the keys arrived after the
+  program had already exited.
+- Evidence (QEMU virt, `build/sysfs-test.img`): `device added` for both
+  devices, `devices=2 keyboard=1 pointer=1`, `key event code=30 state=1`,
+  `key=30`, `libinput ok`, exit status 0. Regressions: `linux-sysfs`
+  (`sysfs ok`), `udev-test` (`udev ok`), `linux-input` (`input ok`),
+  `cargo test --lib` 272 passed, console `health` 7 live / 0 zombie / 0 open /
+  0 leaked, `svc` 5 running.
+- Open: feed `libinput_dispatch()` events into the compositor seat and stage
+  `/usr/share/libinput` quirks; more than two input devices stays out of
+  scope.

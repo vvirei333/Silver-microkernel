@@ -27,7 +27,7 @@ replacing the parked phosh/phoc stack. See [ARCHITECTURE.md](ARCHITECTURE.md),
 | First rendered desktop frame | IN PROGRESS — current stop | scanout buffers verified black; no post-engine atomic commits |
 | Block storage (SDHCI + virtio-blk) | IMPLEMENTED (QEMU) | SFS mounts over DTB/PCI SDHCI; CSD v1/v2, CMD17/24 and a write surviving reboot; no Pi 5 board log |
 | Raspberry Pi 5 (BCM2712) | PLANNED (hardware log) | platform/UART/GIC/timer/PSCI/SDHCI software paths are in the tree; no serial log from a board |
-| evdev input (`/dev/input/event0..1`) | IMPLEMENTED (keyboard + absolute pointer) | two virtio-input devices, evdev ioctls (`EVIOCGVERSION/GID/GNAME/GBIT/GPROP/GKEY/GABS`) and `/dev/input` listing verified in QEMU; the real systemd 257 `libudev` enumerates both devices from `/sys/class/input` + `uevent` with `ID_INPUT=1` / `ID_SEAT=seat0` (`linuxrun /sfs/udev-test`); real libinput 1.28 with its udev backend adds a keyboard and a pointer (`linuxrun /sfs/libinput-test`) |
+| evdev input (`/dev/input/event0..1`) | IMPLEMENTED (keyboard + absolute pointer) | two virtio-input devices, evdev ioctls (`EVIOCGVERSION/GID/GNAME/GBIT/GPROP/GKEY/GABS`) and `/dev/input` listing verified in QEMU; the real systemd 257 `libudev` enumerates both devices from `/sys/class/input` + `uevent` with `ID_INPUT=1` / `ID_SEAT=seat0` (`linuxrun /sfs/udev-test`); real libinput 1.28 with its udev backend adds a keyboard and a pointer and delivers a `KEY_A` press as `LIBINPUT_EVENT_KEYBOARD_KEY` (`linuxrun /sfs/libinput-test`) |
 | Package manager (in-OS) | PLANNED | host-side builders only |
 | Persistent writable SFS | IMPLEMENTED | writes survive reboot; `sfs_fsck` clean |
 | SFS journaling / crash consistency | PLANNED | no journal; an interrupted write can leave stale metadata |
@@ -175,15 +175,25 @@ Console-image fixes in the same pass:
 - **libinput 1.28 udev backend**: `tests/linux/libinput.c` creates a
   `libinput_udev` context, assigns `seat0` and dispatches the real library.
   Both devices are added: `QEMU Virtio Keyboard` (keyboard capability) and
-  `QEMU Virtio Tablet` (pointer capability). Three gaps had to close first:
+  `QEMU Virtio Tablet` (pointer capability), and a monitor-injected `a`
+  arrives as `LIBINPUT_EVENT_KEYBOARD_KEY` with key `30` (KEY_A), pressed.
+  Three enumeration gaps had to close first:
   `/sys/dev/char/13:64` is now a symlink to `/sys/class/input/event0` (and
   `13:65` to `event1`) so `udev_device_new_from_devnum()` can match the
   enumerated syspath; the udev database carries `ID_INPUT_KEYBOARD=1` for
   the keyboard and `ID_INPUT_MOUSE=1` for the absolute tablet (same tags
   udev's `input_id` derives from the capabilities); and reopening `/` now
   passes the read-policy check even though the SFS mount is internally
-  `/sfs`. libinput still reports missing `/usr/share/libinput` quirks
-  (no data files are staged), which only affects behaviour tuning.
+  `/sfs`.
+  Delivering events then exposed three kernel bugs: `EVIOCGBIT(0)` returned
+  virtio selector 0 (the EV_SYN codes) instead of the supported event-type
+  set, so libevdev concluded there was no `EV_KEY` and silently dropped every
+  key; an empty non-blocking evdev `read` returned 0 instead of `EAGAIN`, so
+  libevdev saw end-of-device; and event timestamps always had `tv_sec = 0`.
+  The type set is now rebuilt from the per-type bitmaps, empty reads return
+  `EAGAIN`, and timestamps come from the monotonic tick counter. libinput
+  still reports missing `/usr/share/libinput` quirks (no data files are
+  staged), which only affects behaviour tuning.
 
 ### Wayland
 - Hand-written mini compositor plus a **real `libwayland-client`**:

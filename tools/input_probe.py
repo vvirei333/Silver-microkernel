@@ -48,6 +48,10 @@ def main() -> int:
     parser.add_argument("--monitor-port", type=int, default=4561)
     parser.add_argument("--qmp-port", type=int, default=4563)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--marker", default="devices=2",
+                        help="log marker to wait for before injecting keys")
+    parser.add_argument("--keys", action="store_true",
+                        help="with a custom probe, send key a when it reports added=2")
     parser.add_argument("--command", default="linuxrun /sfs/linux-input")
     parser.add_argument("--expect", default="input ok")
     args = parser.parse_args()
@@ -91,6 +95,16 @@ def main() -> int:
         log.clear()
         serial.sendall(args.command.encode() + b"\n")
         if args.command.strip() != "linuxrun /sfs/linux-input":
+            if args.keys:
+                deadline = time.time() + 20
+                while time.time() < deadline and args.marker.encode() not in log:
+                    pump(0.5)
+                monitor = connect(args.monitor_port)
+                time.sleep(2.0)
+                for key in (b"a", b"b", b"c"):
+                    monitor.sendall(b"sendkey " + key + b"\n")
+                    time.sleep(0.4)
+                pump(0.5)
             deadline = time.time() + args.timeout
             failed = args.expect.replace(" ok", " FAILED")
             while time.time() < deadline and args.expect.encode() not in log and failed.encode() not in log:

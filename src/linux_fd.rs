@@ -1332,8 +1332,9 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             let mut records = alloc::vec![0_u8; length];
             let filled = crate::virtio_input::read_events(index, &mut records);
             if filled == 0 {
-                // The caller polls before reading; an empty queue is not an error.
-                return Ok(0);
+                // libinput opens evdev non-blocking and relies on EAGAIN to
+                // stop draining; zero would look like end-of-device.
+                return Err(EAGAIN);
             }
             user_memory::copy_to_user(&records[..filled], buffer).map_err(|_| EFAULT)?;
             Ok(filled as u64)
