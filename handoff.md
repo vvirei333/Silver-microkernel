@@ -8111,7 +8111,8 @@ Night session results, in order:
   kms_frame_clock wake path.
 - Kernel TODO: ftruncate should return 0 like Linux (session-lock loop).
 - Stage 3: evdev /dev/input + udev /sys/class/input glue for libinput.
-- Cleanup: SOCKDBG prints, VFSDBG, OPENFAIL/EXECFAIL, UDMABUF prints,
+- Cleanup: SOCKDBG/SOCKCL/SOCKEOF/SOCKRD, OPENFAIL/EXECFAIL and UDMABUF
+  debug prints were removed (2026-11-25); VFSDBG was already gone.
   FAIL_RING/TRACE_RING scaffolding, futex filter is OFF in TRACE_RING.
 
 ### 2026-11-22 (day) — wayland client handshake works; dispatch livelock found

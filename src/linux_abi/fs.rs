@@ -448,9 +448,6 @@ pub(super) fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
         }
     }
     if linux_fd::is_udmabuf(task, fd) {
-        crate::console::write_str("UDMABUF-IOCTL req=0x");
-        crate::console::write_hex_u64(request);
-        crate::console::write_str("\r\n");
     }
     if request == UDMABUF_CREATE && linux_fd::is_udmabuf(task, fd) {
         // struct udmabuf_create { u32 memfd, u32 flags, u64 offset, u64 size }
@@ -471,11 +468,6 @@ pub(super) fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
             | u64::from(raw[22]) << 48
             | u64::from(raw[23]) << 56;
         let result = linux_fd::udmabuf_create(task, memfd, 0, size);
-        crate::console::write_str("UDMABUF-CREATE memfd=");
-        crate::console::write_dec_u64(memfd);
-        crate::console::write_str(" size=");
-        crate::console::write_dec_u64(size);
-        crate::console::write_str(" -> ");
         match &result {
             Ok(fd) => crate::console::write_dec_u64(*fd),
             Err(code) => crate::console::write_dec_u64(*code),

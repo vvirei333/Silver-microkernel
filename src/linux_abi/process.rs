@@ -121,9 +121,6 @@ fn exec_path(
     let mut depth = 0u32;
     let resolved = loop {
         let Ok(resolved) = resolve(cwd, &target) else {
-            crate::console::write_str("EXECFAIL resolve ");
-            crate::console::write_str(&target);
-            crate::console::write_str("\r\n");
             return errno(ENOENT);
         };
         if !scheduler::current_read_path_allowed(&resolved) {
@@ -132,9 +129,6 @@ fn exec_path(
         match crate::vfs::file_len(cwd, &resolved) {
             Ok(length) if length <= EXEC_LIMIT => {}
             _ => {
-                crate::console::write_str("EXECFAIL len ");
-                crate::console::write_str(&resolved);
-                crate::console::write_str("\r\n");
                 return errno(ENOENT);
             }
         }

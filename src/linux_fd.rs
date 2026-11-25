@@ -19,7 +19,6 @@ use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::Ordering;
 
 use crate::{mutex::Mutex, scheduler, user_memory, vfs};
 
@@ -838,9 +837,6 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     let resolved = match crate::linux_abi::resolve(cwd, path) {
         Ok(resolved) => resolved,
         Err(()) => {
-            crate::console::write_str("OPENFAIL resolve ");
-            crate::console::write_str(path);
-            crate::console::write_str("\r\n");
             return Err(ENOENT);
         }
     };
@@ -971,11 +967,7 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         "/dev/ivshmem" => Some(Target::Ivshmem),
         // The udmabuf controller: llvmpipe opens it to turn memfds into
         // dmabuf fds, which is how it builds its native fence support.
-        "/dev/udmabuf" => {
-            crate::console::write_str("UDMABUF-OPEN
-");
-            Some(Target::Udmabuf)
-        }
+        "/dev/udmabuf" => Some(Target::Udmabuf),
         // Only present when the machine has a virtio-gpu the driver brought
         // up; the compositor then presents through the GPU as well.
         "/dev/gpufb" if crate::virtio_gpu::size().is_some() => Some(Target::GpuFb),
@@ -1046,9 +1038,6 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         Err(_) => match vfs::open_dir(task, "/", &resolved) {
             Ok(fd) => fd,
             Err(()) => {
-                crate::console::write_str("OPENFAIL vfs ");
-                crate::console::write_str(&resolved);
-                crate::console::write_str("\r\n");
                 return Err(ENOENT);
             }
         },
@@ -1076,11 +1065,6 @@ pub fn close(task: u64, fd: u64) -> Result<(), u64> {
     // Temporary: socket teardown forensics — pairs a client EOF with the
     // closer's task and fd.
     if matches!(target, Target::Socket { .. }) {
-        crate::console::write_str("SOCKCL task=");
-        crate::console::write_dec_u64(task);
-        crate::console::write_str(" fd=");
-        crate::console::write_dec_u64(fd);
-        crate::console::write_str("\r\n");
     }
     target.release_endpoint();
     if let Target::Vfs(vfs_fd) = target {
@@ -2712,13 +2696,6 @@ pub fn connect(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
         // The queue takes ownership of the server end's reference.
         state.pending.push_back(pair.clone());
     }
-    crate::console::write_str("SOCKDBG connect task=");
-    crate::console::write_dec_u64(task);
-    crate::console::write_str(" path=");
-    crate::console::write_str(core::str::from_utf8(&path).unwrap_or("?"));
-    crate::console::write_str("
-
-");
     if replace_unbound(
         task,
         fd,
@@ -2747,11 +2724,6 @@ pub fn connect(task: u64, fd: u64, path: Vec<u8>) -> Result<(), u64> {
 /// descriptor; the caller writes the (unnamed) peer address.
 pub fn accept(task: u64, fd: u64, nonblock_flag: bool) -> Result<u64, u64> {
     require_right(task, fd, FD_ACCEPT)?;
-    crate::console::write_str("SOCKDBG accept task=");
-    crate::console::write_dec_u64(task);
-    crate::console::write_str("
-
-");
     let target = lookup(task, fd).ok_or(EBADF)?;
     let Target::Listener { state, nonblock } = target else {
         return Err(EINVAL);
@@ -2878,11 +2850,6 @@ fn socket_recv_message(
     loop {
         let mut socket = state.lock();
         if socket.ends[end].read_closed {
-            crate::console::write_str("SOCKEOF own task=");
-            crate::console::write_dec_u64(crate::scheduler::current_task_id());
-            crate::console::write_str(" end=");
-            crate::console::write_dec_u64(end as u64);
-            crate::console::write_str("\r\n");
             return Ok((0, Vec::new()));
         }
         if let Some(message) = socket.ends[end].incoming.front_mut() {
@@ -2901,13 +2868,6 @@ fn socket_recv_message(
             return Ok((take, fds));
         }
         if socket.ends[peer].write_closed {
-            crate::console::write_str("SOCKEOF peer task=");
-            crate::console::write_dec_u64(crate::scheduler::current_task_id());
-            crate::console::write_str(" end=");
-            crate::console::write_dec_u64(end as u64);
-            crate::console::write_str(" pending_in=");
-            crate::console::write_dec_u64(socket.ends[end].incoming.len() as u64);
-            crate::console::write_str("\r\n");
             return Ok((0, Vec::new()));
         }
         drop(socket);
@@ -2948,15 +2908,6 @@ pub fn socket_recv(
         return Err(ENOTSOCK);
     };
     let (read, fds) = socket_recv_message(&state, end, nonblock || nonblock_hint, buffer)?;
-    // Temporary: pairs server-side socket reads with the wayland client flow.
-    crate::console::write_str("SOCKRD task=");
-    crate::console::write_dec_u64(task);
-    crate::console::write_str(" fd=");
-    crate::console::write_dec_u64(fd);
-    crate::console::write_str(" ret=");
-    crate::console::write_dec_u64(read as u64);
-    crate::console::write_str("
-");
     let mut numbers = Vec::new();
     for (target, rights, ioctls) in fds {
         if let Some(number) = insert_transferred(task, target, rights, ioctls) {
@@ -3161,21 +3112,7 @@ fn poll_ready_at(task: u64, fd: u64, depth: u8) -> Option<i16> {
             let pending = state.lock().pending.len();
             static LAST: core::sync::atomic::AtomicUsize =
                 core::sync::atomic::AtomicUsize::new(0);
-            let previous = LAST.swap(pending, Ordering::SeqCst);
-            if pending != previous {
-                crate::console::write_str("SOCKDBG listener pending=");
-                crate::console::write_dec_u64(pending as u64);
-                crate::console::write_str("
-
-");
-            }
-            if pending > 0 {
-                crate::console::write_str("SOCKDBG listener ready task=");
-                crate::console::write_dec_u64(task);
-                crate::console::write_str("
-
-");
-            }
+            let _previous = pending;
             if pending == 0 {
                 0
             } else {
