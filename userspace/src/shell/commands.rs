@@ -126,9 +126,9 @@ pub fn execute(command: &str) {
             syscall::print("  Ctrl-Z     Stop the foreground task and return to shell\r\n");
             syscall::print("  kill <cap> Kill a task\r\n");
             syscall::print("  wait <cap> Wait for a task and print its exit status\r\n");
-            syscall::print("  svc restart <name>\r\n");
-            syscall::print("             Restart a supervised service (scout, net_driver,\r\n");
-            syscall::print("             net_server, howl, howler); it also auto-restarts\r\n");
+            syscall::print("  svc [ | restart <name>]\r\n");
+            syscall::print("             Service status; restart a supervised service (scout,\r\n");
+            syscall::print("             net_driver, net_server, howl, howler); auto-restarts too\r\n");
             syscall::print("  reboot     Reset the machine through PSCI\r\n");
             syscall::print("  grep <pattern> <file> | wc <file> | head/tail [n] <file>\r\n");
             syscall::print("  cp <src> <dst> | find [path] | seq N | basename/dirname <path>\r\n");

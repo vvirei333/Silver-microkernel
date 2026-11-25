@@ -24,6 +24,9 @@ const HOWLER: usize = 4;
 const SERVICE_COUNT: usize = 5;
 
 const SVC_RESTART: u8 = 0xF1;
+/// Status request from the shell; the reply carries one running flag and one
+/// restart counter per service, in table order.
+const SVC_STATUS: u8 = 0xF2;
 const TICKS_PER_SECOND: u64 = 100;
 const SUPERVISOR_POLL_MS: u64 = 1_000;
 const MAX_BACKOFF_MS: u64 = 30_000;
@@ -235,6 +238,10 @@ fn drain_requests(services: &mut [Service; SERVICE_COUNT]) {
             syscall::print("SILVERD GOT SFS ERROR!\r\n");
             continue;
         }
+        if text.first() == Some(&SVC_STATUS) {
+            reply_status(message.sender, services);
+            continue;
+        }
         if text.first() != Some(&SVC_RESTART) {
             continue;
         }
@@ -247,6 +254,16 @@ fn drain_requests(services: &mut [Service; SERVICE_COUNT]) {
         };
         restart(index, services);
     }
+}
+
+fn reply_status(requester: u64, services: &[Service; SERVICE_COUNT]) {
+    let mut payload = [0_u8; ipc::PAYLOAD_SIZE];
+    payload[0] = SVC_STATUS;
+    for (index, service) in services.iter().enumerate() {
+        payload[1 + index] = if service.task != 0 { 1 } else { 0 };
+        payload[1 + SERVICE_COUNT + index] = service.restarts.min(255) as u8;
+    }
+    let _ = syscall::send(requester, &ipc::Message::new(0, &payload));
 }
 
 fn restart(index: usize, services: &mut [Service; SERVICE_COUNT]) {

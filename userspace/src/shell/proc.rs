@@ -271,6 +271,10 @@ pub(super) fn kill_task(cap_id: Option<&str>) {
 /// The supervisor owns the child capabilities, so the shell cannot kill and
 /// respawn a service without bypassing the restart policy.
 pub(super) fn svc_command(action: Option<&str>, name: Option<&str>) {
+    if action.is_none() {
+        svc_status();
+        return;
+    }
     if action != Some("restart") {
         syscall::print("usage: svc restart <scout|net_driver|net_server|howl|howler>\r\n");
         return;
@@ -305,6 +309,59 @@ pub(super) fn svc_command(action: Option<&str>, name: Option<&str>) {
         syscall::print("' requested; run 'ps' in a second\r\n");
     } else {
         syscall::print("svc: supervisor mailbox is unavailable\r\n");
+    }
+}
+
+/// `svc`: prints the supervisor's own view of its services. The supervisor is
+/// the authority: `ps` shows scheduler states, this shows supervised liveness
+/// and how often each service was restarted.
+fn svc_status() {
+    let Some(supervisor) = find_task_id(syscall::PROGRAM_SILVERD) else {
+        syscall::print("svc: silverd is not running\r\n");
+        return;
+    };
+    const SVC_STATUS: u8 = 0xF2;
+    let mut request = [0_u8; ipc::PAYLOAD_SIZE];
+    request[0] = SVC_STATUS;
+    if !syscall::send(supervisor, &ipc::Message::new(0, &request)) {
+        syscall::print("svc: supervisor mailbox is unavailable\r\n");
+        return;
+    }
+    // Same bounded-wait pattern as the other driver replies: discard unrelated
+    // traffic, give up when the deadline expires.
+    let deadline = syscall::uptime_ticks().saturating_add(RESPONSE_TIMEOUT_TICKS);
+    let mut reply = ipc::Message::new(0, &[]);
+    let payload = loop {
+        if !syscall::task_alive(supervisor) {
+            syscall::print("svc: supervisor exited\r\n");
+            return;
+        }
+        match syscall::receive_timeout(&mut reply, RESPONSE_POLL_TICKS) {
+            Ok(()) if reply.sender == supervisor && reply.payload[0] == SVC_STATUS => {
+                break reply.payload
+            }
+            Err(_) if syscall::uptime_ticks() >= deadline => {
+                syscall::print("svc: no supervisor reply\r\n");
+                return;
+            }
+            _ => {}
+        }
+    };
+    const NAMES: [&str; 5] = ["scout", "net_driver", "net_server", "howl", "howler"];
+    for (index, name) in NAMES.iter().enumerate() {
+        let running = payload[1 + index] != 0;
+        let restarts = payload[1 + 5 + index];
+        syscall::print(name);
+        for _ in 0..(11usize.saturating_sub(name.len())) {
+            syscall::print(" ");
+        }
+        if running {
+            syscall::print("running  restarts ");
+        } else {
+            syscall::print("down     restarts ");
+        }
+        syscall::print_dec_u64(u64::from(restarts));
+        syscall::print("\r\n");
     }
 }
 
