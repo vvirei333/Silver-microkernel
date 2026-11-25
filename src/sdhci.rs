@@ -407,7 +407,7 @@ pub fn init(dtb: Option<&[u8]>) -> bool {
 }
 
 /// Binds a controller at a known physical base. The DTB path sizes the
-/// window from `reg`; a PCI function passes the BAR size it decoded.
+/// window from `reg`; a PCI caller passes the window it can safely probe.
 pub(crate) fn init_at(start: usize, size: usize, variant: Variant) -> bool {
     // BCM2712 keeps the SD pin mux in a separate cfg window at +0x400;
     // require that too. Generic hosts only need their own reg window.
