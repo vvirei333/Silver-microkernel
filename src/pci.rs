@@ -137,6 +137,30 @@ pub fn scan<C: ConfigSpace>(config: &mut C, host: PciHost, out: &mut [PciDevice]
     count
 }
 
+/// True for an SD host controller (base class 0x08, subclass 0x05).
+/// The programming interface is not part of the match: standard SDHCI is
+/// 0x01, but some firmware reports 0x00.
+pub fn is_sdhci(class: u32) -> bool {
+    class & 0xffff_0000 == 0x0805_0000
+}
+
+/// Decodes a memory BAR into a 32-bit address the low Device map can reach.
+///
+/// I/O BARs, reserved BAR types and 64-bit BARs above 4 GiB return `None`.
+/// A zero address is returned as zero; the caller decides whether to assign
+/// a firmware-free test window.
+pub fn memory_bar_address(low: u32, high: u32) -> Option<u32> {
+    if low & 1 != 0 {
+        return None;
+    }
+    match (low >> 1) & 0x3 {
+        0 => Some(low & !0xf),
+        1 => None,
+        2 if high == 0 => Some(low & !0xf),
+        _ => None,
+    }
+}
+
 /// First RP1 in a device list, if any.
 pub fn find_rp1(devices: &[PciDevice]) -> Option<&PciDevice> {
     devices.iter().find(|device| device.is_rp1())
@@ -266,5 +290,24 @@ mod tests {
 
         let mut out = [];
         assert_eq!(scan(&mut fake, host(), &mut out), 0);
+    }
+
+    #[test]
+    fn sdhci_matches_base_class_and_subclass() {
+        assert!(is_sdhci(0x0805_0100));
+        assert!(is_sdhci(0x0805_0000));
+        assert!(!is_sdhci(0x0804_0000));
+        assert!(!is_sdhci(0x0200_0000));
+    }
+
+    #[test]
+    fn memory_bar_decodes_32_and_64_bit_windows() {
+        assert_eq!(memory_bar_address(0x1030_0000, 0), Some(0x1030_0000));
+        assert_eq!(memory_bar_address(0x1030_0001, 0), None);
+        assert_eq!(memory_bar_address(0x0000_0002, 0), None);
+        assert_eq!(memory_bar_address(0, 0), Some(0));
+        assert_eq!(memory_bar_address(0x1030_0004, 0), Some(0x1030_0000));
+        assert_eq!(memory_bar_address(0x1030_0002, 0), None);
+        assert_eq!(memory_bar_address(0x1030_0004, 1), None);
     }
 }

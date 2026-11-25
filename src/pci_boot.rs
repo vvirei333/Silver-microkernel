@@ -11,6 +11,7 @@ use crate::console;
 use crate::fdt::Fdt;
 use crate::memory::phys_to_virt;
 use crate::mmu;
+use crate::platform;
 
 const MAX_HOSTS: usize = 4;
 const MAX_DEVICES: usize = 16;
@@ -26,6 +27,51 @@ impl MmioConfig {
         // PCIE_MISC_PCIE_STATUS: DL active (bit 5) and PHY link up (bit 4).
         let status = unsafe { read32(self.base + 0x4068) };
         status & 0x30 == 0x30
+    }
+}
+
+impl MmioConfig {
+    /// Writes one 32-bit configuration word. Only the SDHCI BAR/command
+    /// setup uses this; the enumeration itself stays read-only.
+    fn write32(&mut self, bus: u8, device: u8, function: u8, offset: usize, value: u32) -> bool {
+        let offset = offset & 0xffc;
+        match self.host.kind {
+            PciHostKind::Ecam => {
+                if !self.host.contains_bus(bus) {
+                    return false;
+                }
+                let relative = (usize::from(bus - self.host.bus_start) << 20)
+                    | (usize::from(device) << 15)
+                    | (usize::from(function) << 12)
+                    | offset;
+                if relative >= self.host.size as usize {
+                    return false;
+                }
+                unsafe { write32(self.base + relative, value) };
+                true
+            }
+            PciHostKind::Bcm2712 => {
+                if bus == 0 {
+                    if device == 0 && function == 0 {
+                        unsafe { write32(self.base + offset, value) };
+                        return true;
+                    }
+                    return false;
+                }
+                if !self.bcm_link_up() {
+                    return false;
+                }
+                let index = (u32::from(bus) << 20)
+                    | (u32::from(device) << 15)
+                    | (u32::from(function) << 12);
+                unsafe {
+                    write32(self.base + 0x9000, index);
+                    core::arch::asm!("dsb sy", options(nostack, preserves_flags));
+                    write32(self.base + 0x8000 + offset, value);
+                }
+                true
+            }
+        }
     }
 }
 
@@ -78,6 +124,60 @@ unsafe fn read32(address: usize) -> u32 {
 
 unsafe fn write32(address: usize, value: u32) {
     core::ptr::write_volatile(address as *mut u32, value);
+}
+
+/// QEMU's `sdhci-pci` function, if one was found and its BAR made usable.
+static mut SDHCI_BAR: Option<usize> = None;
+
+/// Fixed test-only BAR for QEMU direct-kernel boots, where no firmware has
+/// assigned PCI BARs. It sits between the virtio-blk and virtio-gpu windows
+/// and inside the low 1 GiB Device map.
+const SDHCI_TEST_BAR: u32 = 0x1030_0000;
+
+/// BAR selected for a PCI SD host controller during `init`, if any.
+pub fn sdhci_base() -> Option<usize> {
+    unsafe { core::ptr::addr_of!(SDHCI_BAR).read() }
+}
+
+/// Programs a usable memory BAR for an SD host controller.
+///
+/// A real firmware has already assigned the BAR; QEMU's direct `-kernel`
+/// path has not, so only on QEMU do we place it at a known free window.
+fn bind_sdhci(config: &mut MmioConfig, device: &PciDevice) -> Option<usize> {
+    if !pci::is_sdhci(device.class) {
+        return None;
+    }
+    let bar = config.read32(device.bus, device.device, device.function, 0x10);
+    let high = if (bar >> 1) & 0x3 == 2 {
+        config.read32(device.bus, device.device, device.function, 0x14)
+    } else {
+        0
+    };
+    let mut address = pci::memory_bar_address(bar, high)?;
+    if address == 0 {
+        if platform::detect() != platform::Kind::Qemu {
+            return None;
+        }
+        address = SDHCI_TEST_BAR;
+        if !config.write32(device.bus, device.device, device.function, 0x10, address) {
+            return None;
+        }
+        if config.read32(device.bus, device.device, device.function, 0x10) & !0xf != address {
+            return None;
+        }
+    }
+    let command = config.read32(device.bus, device.device, device.function, 0x04);
+    if !config.write32(
+        device.bus,
+        device.device,
+        device.function,
+        0x04,
+        command | 0x2,
+    ) || config.read32(device.bus, device.device, device.function, 0x04) & 0x2 == 0
+    {
+        return None;
+    }
+    Some(address as usize)
 }
 
 /// Maps a host's register window into the kernel's high-half alias.
@@ -180,6 +280,14 @@ pub fn init(dtb: Option<&[u8]>) {
         console::write_str("\r\n");
         for device in &devices[..count] {
             log_device(device);
+            if sdhci_base().is_none() {
+                if let Some(base) = bind_sdhci(&mut config, device) {
+                    unsafe { *core::ptr::addr_of_mut!(SDHCI_BAR) = Some(base) };
+                    console::write_str("PCI: SDHCI bar=0x");
+                    write_hex(base as u64, 10);
+                    console::write_str("\r\n");
+                }
+            }
         }
         if let Some(rp1) = pci::find_rp1(&devices[..count]) {
             console::write_str("PCI: RP1 at ");
