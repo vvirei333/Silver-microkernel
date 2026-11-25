@@ -679,8 +679,6 @@ pub(super) fn linux_nanosleep(request: u64, remaining: u64) -> u64 {
         .saturating_mul(1000)
         .saturating_add(nanoseconds / 1_000_000)
         .min(60_000);
-    crate::console::write_dec_u64(millis);
-    crate::console::write_str("\r\n");
     if millis != 0 {
         scheduler::sleep(millis);
     } else {

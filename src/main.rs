@@ -119,6 +119,7 @@ mod user_program;
 mod drm;
 mod sysfs;
 mod virtio_blk;
+mod virtio_input;
 mod virtio_gpu;
 #[cfg(all(not(feature = "std"), feature = "smp"))]
 mod watchdog;
@@ -265,6 +266,9 @@ pub extern "C" fn kernel_main() -> ! {
             seed::seed_apps();
             // `--gpu` attaches a virtio-gpu; the driver sets up a 2D scanout
             // and draws a test pattern when the device is present.
+            // `--device virtio-keyboard-pci` (or tablet) feeds
+            // /dev/input/event0; a missing device changes nothing.
+            virtio_input::init();
             if virtio_gpu::init() {
                 #[cfg(feature = "linux-abi")]
                 drm::report();

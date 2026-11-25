@@ -257,6 +257,9 @@ enum Target {
     Sysfs(&'static [u8], usize),
     /// A file in the synthetic procfs tree (read-only, process must be init).
     Proc(&'static [u8], usize),
+    /// The evdev-compatible event device (`/dev/input/event0`), backed by
+    /// the kernel's virtio-input driver.
+    Input,
     /// A synthetic directory listing (`/dev/dri`), with the next entry index.
     DirList {
         entries: &'static [&'static str],
@@ -820,7 +823,7 @@ const DRM_NODES: &[&str] = &["card0", "renderD128"];
 const DEV_NODES: &[&str] = &[
     "dri", "input", "shm", "null", "zero", "full", "urandom", "random", "console", "tty0", "tty1",
 ];
-const INPUT_NODES: &[&str] = &[];
+const INPUT_NODES: &[&str] = &["event0"];
 
 /// `openat(2)`. Write flags are rejected for real files (the VFS view is
 /// read-only), but synthetic devices accept writes.
@@ -840,11 +843,6 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
             return Err(ENOENT);
         }
     };
-    if resolved.starts_with("/dev/") {
-        crate::console::write_str(&resolved);
-        crate::console::write_hex_u64(flags);
-        crate::console::write_str("\r\n");
-    }
     // Per-fd fdinfo: systemd's fds_are_same_mount() reads
     // /proc/<pid>/fdinfo/<fd> for the "mnt_id" line and asserts on failure.
     // The content is dynamic (per fd), so it is served through a memfd.
@@ -975,10 +973,11 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
             entries: DEV_NODES,
             offset: 0,
         }),
-        "/dev/input" => Some(Target::DirList {
+        "/dev/input" if crate::virtio_input::present() => Some(Target::DirList {
             entries: INPUT_NODES,
             offset: 0,
         }),
+        "/dev/input/event0" if crate::virtio_input::present() => Some(Target::Input),
         "/dev/dri" if crate::virtio_gpu::size().is_some() => Some(Target::DirList {
             entries: DRM_NODES,
             offset: 0,
@@ -1271,6 +1270,18 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             // The caller polls before reading; an empty queue is not an error.
             None => Ok(0),
         },
+        Target::Input => {
+            crate::virtio_input::pump();
+            let length = (count as usize).min(64 * 1024);
+            let mut records = alloc::vec![0_u8; length];
+            let filled = crate::virtio_input::read_events(&mut records);
+            if filled == 0 {
+                // The caller polls before reading; an empty queue is not an error.
+                return Ok(0);
+            }
+            user_memory::copy_to_user(&records[..filled], buffer).map_err(|_| EFAULT)?;
+            Ok(filled as u64)
+        }
         Target::Null | Target::Full | Target::Ivshmem | Target::GpuFb => Ok(0),
         Target::Zero => {
             let chunk = alloc::vec![0_u8; (count as usize).min(64 * 1024)];
@@ -1391,6 +1402,15 @@ pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize
             buffer.fill(0);
             Ok(count)
         }
+        Target::Input => {
+            crate::virtio_input::pump();
+            let count = crate::virtio_input::read_events(buffer);
+            if count == 0 {
+                Err(EAGAIN)
+            } else {
+                Ok(count)
+            }
+        }
         Target::Null => Ok(0),
         _ => Err(ENODEV),
     }
@@ -1410,7 +1430,8 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
                 Ok(count)
             }
         }
-        Target::Null
+        Target::Input
+        | Target::Null
         | Target::Zero
         | Target::Random
         | Target::Ivshmem
@@ -1578,6 +1599,7 @@ pub fn stat_fields(
         | Target::Full
         | Target::Random
         | Target::Ivshmem
+        | Target::Input
         | Target::GpuFb => (S_IFCHR | 0o666, 0, fd.max(1), None),
         Target::Drm { render } => (
             S_IFCHR | 0o666,
@@ -2982,6 +3004,7 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::Prime { .. }
         | Target::MemFd(_)
         | Target::Udmabuf
+        | Target::Input
         | Target::Epoll(_) => (O_RDWR, false),
     };
     Some(access | if nonblock { O_NONBLOCK } else { 0 })
@@ -3033,6 +3056,14 @@ fn poll_ready_at(task: u64, fd: u64, depth: u8) -> Option<i16> {
     Some(match target {
         Target::Console | Target::Null => POLLIN | POLLOUT,
         Target::Zero | Target::Random => POLLIN,
+        Target::Input => {
+            crate::virtio_input::pump();
+            if crate::virtio_input::available() > 0 {
+                POLLIN
+            } else {
+                0
+            }
+        }
         Target::Ivshmem | Target::GpuFb => POLLIN | POLLOUT,
         Target::Sysfs(_, _) | Target::Proc(_, _) | Target::DirList { .. } => POLLIN | POLLOUT,
         Target::Prime { .. } => POLLOUT,

@@ -121,6 +121,13 @@ if [ -f "$GLIB/lib/libglib-2.0.so.0" ] && [ -f "$GLIB/lib/libgobject-2.0.so.0" ]
         --set-rpath '$ORIGIN' build/giotest
 fi
 
+# Evdev probe (freestanding Rust; rustc is already part of the toolchain).
+# Needs `-device virtio-keyboard-pci` and prints `ev t=.. c=.. v=..` per event.
+rustc --edition 2021 --target aarch64-unknown-none -O tests/linux/input.rs \
+    -o build/linux-input.elf \
+    -C link-arg=-Ttests/linux/input.ld -C link-arg=--build-id=none -C panic=abort
+python3 scripts/sfs_inject.py "$IMAGE" build/linux-input.elf linux-input
+
 # ET_DYN main + custom interpreter (no libc needed).
 "$CC" -nostdlib -fPIE -pie -Wl,-e,_start \
     -Wl,--dynamic-linker=/sfs/ld-test -Wl,-z,max-page-size=4096 \
