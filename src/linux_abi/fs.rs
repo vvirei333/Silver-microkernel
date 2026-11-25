@@ -43,7 +43,7 @@ pub fn resolve_directory(cwd: &str, path: &str) -> Result<String, ()> {
 }
 
 /// The reverse mapping for `getcwd`: hide the `/sfs` mount point.
-pub fn display_path(path: &str) -> String {
+pub(crate) fn display_path(path: &str) -> String {
     if path == "/sfs" {
         return String::from("/");
     }
@@ -822,6 +822,65 @@ pub(super) fn stat_resolved(
     Err(ENOENT)
 }
 
+const SYSFS_MAGIC: i64 = 0x6265_6572;
+const PROC_SUPER_MAGIC: i64 = 0x0000_9fa0;
+const SFS_MAGIC: i64 = 0x5346_5331;
+const TMPFS_MAGIC: i64 = 0x0102_1994;
+
+/// Writes a 120-byte AArch64 struct statfs. Only the filesystem type is
+/// consulted by systemd/libudev; the rest keeps statfs(1) and df sane.
+fn write_statfs(buffer: u64, magic: i64) -> u64 {
+    let mut raw = [0_u8; 120];
+    raw[0..8].copy_from_slice(&magic.to_le_bytes());
+    raw[8..16].copy_from_slice(&4096_i64.to_le_bytes());
+    raw[16..24].copy_from_slice(&1024_i64.to_le_bytes());
+    raw[64..72].copy_from_slice(&255_i64.to_le_bytes());
+    raw[72..80].copy_from_slice(&4096_i64.to_le_bytes());
+    match user_memory::copy_to_user(&raw, buffer) {
+        Ok(()) => 0,
+        Err(_) => errno(EFAULT),
+    }
+}
+
+/// statfs(2). libudev checks that a syspath is backed by SYSFS_MAGIC before
+/// accepting it as a device, so the synthetic tree must answer for itself.
+pub(super) fn linux_statfs(path_ptr: u64, buffer: u64) -> u64 {
+    let Some(path) = user_string(path_ptr) else {
+        return errno(EFAULT);
+    };
+    let cwd = match dirfd_cwd(AT_FDCWD as u64) {
+        Ok(cwd) => cwd,
+        Err(code) => return code,
+    };
+    let Ok(resolved) = resolve(&cwd, &path) else {
+        return errno(ENOENT);
+    };
+    let magic = if crate::sysfs::lookup(&resolved).is_some() {
+        SYSFS_MAGIC
+    } else if crate::procfs::lookup(&resolved).is_some() {
+        PROC_SUPER_MAGIC
+    } else if resolved == "/dev" || resolved.starts_with("/dev/") || resolved == "/tmp"
+        || resolved.starts_with("/tmp/")
+    {
+        TMPFS_MAGIC
+    } else {
+        SFS_MAGIC
+    };
+    write_statfs(buffer, magic)
+}
+
+/// fstatfs(2): same magic, chosen from the descriptor target.
+pub(super) fn linux_fstatfs(fd: u64, buffer: u64) -> u64 {
+    let task = scheduler::current_task_id();
+    if let Err(code) = linux_fd::require_right(task, fd, linux_fd::FD_FSTAT) {
+        return errno(code);
+    }
+    match linux_fd::fs_magic(task, fd) {
+        Some(magic) => write_statfs(buffer, magic),
+        None => errno(EBADF),
+    }
+}
+
 /// `statx(2)`: glib and wlroots probe it first; without it they fall back to
 /// repeated retry loops. Writes the fixed 256-byte `struct statx`.
 pub(super) fn linux_statx(dirfd: u64, path_ptr: u64, flags: u64, _mask: u64, buffer: u64) -> u64 {
@@ -865,9 +924,10 @@ pub(super) fn write_statx(
 ) -> Result<(), u64> {
     const STATX_BASIC_STATS: u32 = 0x7ff;
     // systemd's fds_are_same_mount() statx's fds with STATX_MNT_ID and
-    // asserts the result: without the bit the mount id reads as an error and
-    // the assert aborts the process.
-    const STATX_MNT_ID: u32 = 0x8000;
+    // reads the fallback path when the mask bit is missing; that fallback
+    // asserts on this kernel. STATX_MNT_ID is bit 12 (0x1000), not the
+    // neighbouring STATX_SUBVOL bit.
+    const STATX_MNT_ID: u32 = 0x1000;
     let mut raw = [0_u8; 256];
     raw[0..4].copy_from_slice(&(STATX_BASIC_STATS | STATX_MNT_ID).to_le_bytes());
     raw[4..8].copy_from_slice(&4096_u32.to_le_bytes());
@@ -911,6 +971,22 @@ pub(super) fn linux_readlinkat(dirfd: u64, path_ptr: u64, buffer: u64, size: u64
     let Some(path) = user_string(path_ptr) else {
         return errno(EFAULT);
     };
+    // readlinkat(fd, "") reads the link an O_PATH descriptor points at.
+    if path.is_empty() {
+        let dirfd = normalized_dirfd(dirfd);
+        if dirfd == AT_FDCWD {
+            return errno(ENOENT);
+        }
+        let Some(target) = linux_fd::symlink_target(scheduler::current_task_id(), dirfd as u64) else {
+            return errno(EINVAL);
+        };
+        let bytes = target.as_bytes();
+        let take = bytes.len().min(size as usize);
+        if user_memory::copy_to_user(&bytes[..take], buffer).is_err() {
+            return errno(EFAULT);
+        }
+        return take as u64;
+    }
     let cwd = match dirfd_cwd(dirfd) {
         Ok(cwd) => cwd,
         Err(code) => return code,
@@ -918,15 +994,28 @@ pub(super) fn linux_readlinkat(dirfd: u64, path_ptr: u64, buffer: u64, size: u64
     let Ok(resolved) = resolve(&cwd, &path) else {
         return errno(ENOENT);
     };
-    let target = match crate::sysfs::symlink(&resolved) {
-        Some(target) => String::from(target),
-        None => match crate::procfs::lookup(&resolved) {
-            Some(crate::procfs::Node::Symlink(target)) => String::from(target),
-            _ => match crate::vfs::read_link("/", &resolved) {
-                Ok(target) => target,
-                Err(()) => return errno(EINVAL),
-            },
-        },
+    let target = if let Some(node) = crate::sysfs::lookup(&resolved) {
+        match node {
+            crate::sysfs::Node::Symlink(target) => String::from(target),
+            _ => return errno(EINVAL),
+        }
+    } else if let Some(node) = crate::procfs::lookup(&resolved) {
+        match node {
+            crate::procfs::Node::Symlink(target) => String::from(target),
+            _ => return errno(EINVAL),
+        }
+    } else {
+        match crate::vfs::read_link("/", &resolved) {
+            Ok(target) => target,
+            Err(()) => {
+                // A missing path is ENOENT on Linux; EINVAL is reserved for
+                // an existing node that is not a symlink. libudev probes
+                // optional class links such as /sys/class/input/subsystem.
+                let exists = crate::vfs::read_dir("/", &resolved).is_ok()
+                    || crate::vfs::file_len("/", &resolved).is_ok();
+                return errno(if exists { EINVAL } else { ENOENT });
+            }
+        }
     };
     let bytes = target.as_bytes();
     let take = bytes.len().min(size as usize);
@@ -1138,16 +1227,25 @@ pub(super) fn linux_chdir(path_ptr: u64) -> u64 {
     }
 }
 
+/// glibc wrappers that take an `int` dirfd pass a zero-extended 32-bit
+/// value, while direct syscalls sign-extend it: normalize both spellings
+/// before comparing with AT_FDCWD.
+fn normalized_dirfd(dirfd: u64) -> i64 {
+    (dirfd as u32 as i32) as i64
+}
+
 /// Resolves `dirfd` to a working directory: `AT_FDCWD` uses the process cwd,
 /// a directory descriptor uses its own path, anything else is `EBADF`.
 pub(super) fn dirfd_cwd(dirfd: u64) -> Result<alloc::string::String, u64> {
-    if dirfd as i64 == AT_FDCWD {
+    let dirfd = normalized_dirfd(dirfd);
+    if dirfd == AT_FDCWD {
         if scheduler::current_task_capability_mode() {
             return Err(errno(EPERM));
         }
         return Ok(scheduler::current_task_cwd());
     }
-    linux_fd::directory_path(scheduler::current_task_id(), dirfd).ok_or_else(|| errno(EBADF))
+    linux_fd::directory_path(scheduler::current_task_id(), dirfd as u64)
+        .ok_or_else(|| errno(EBADF))
 }
 
 /// Copies a NUL-terminated user string (bounded to 255 bytes).

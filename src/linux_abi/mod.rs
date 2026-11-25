@@ -26,7 +26,7 @@ pub(super) use alloc::vec::Vec;
 
 mod cap;
 mod dispatch;
-mod fs;
+pub(crate) mod fs;
 mod ipc;
 mod memory;
 mod process;

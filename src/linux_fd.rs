@@ -265,6 +265,16 @@ enum Target {
         entries: &'static [&'static str],
         offset: usize,
     },
+    /// A sysfs symlink opened with O_NOFOLLOW. readlinkat(fd, "") returns
+    /// the target, which is how systemd reads subsystem/device links.
+    SysfsLink(&'static str),
+    /// A synthetic sysfs directory with typed entries. The path is kept so
+    /// openat/readlinkat with this directory as dirfd can resolve children.
+    SysfsDir {
+        entries: &'static [crate::sysfs::Entry],
+        path: String,
+        offset: usize,
+    },
     /// A buffer exported through PRIME (`/dev/dri` handle -> fd). Carries the
     /// physical range so any task that receives the fd can map the pixels.
     Prime { pa: usize, size: usize },
@@ -620,10 +630,13 @@ fn default_rights(target: &Target) -> u32 {
                 | FD_MMAP
                 | FD_POLL
         }
-        Target::DirList { .. } => FD_READDIR | FD_LOOKUP | FD_FSTAT | FD_SEEK | FD_POLL,
+        Target::DirList { .. } | Target::SysfsDir { .. } => {
+            FD_READDIR | FD_LOOKUP | FD_FSTAT | FD_SEEK | FD_POLL
+        }
         Target::Sysfs(..) | Target::Proc(..) => {
             FD_READ | FD_SEEK | FD_FSTAT | FD_IOCTL | FD_POLL
         }
+        Target::SysfsLink(_) => FD_LOOKUP | FD_FSTAT | FD_POLL,
         Target::Drm { .. } | Target::Prime { .. } | Target::GpuFb | Target::Ivshmem => {
             FD_READ | FD_WRITE | FD_FSTAT | FD_IOCTL | FD_MMAP | FD_POLL
         }
@@ -849,6 +862,23 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
             return Err(ENOENT);
         }
     };
+    // /proc/self/fd/N is a magic link. systemd's fd_reopen() opens it to
+    // duplicate an O_PATH directory descriptor; path-based reopening covers
+    // the VFS and sysfs targets that the udev device walk uses.
+    if let Some(rest) = resolved.strip_prefix("/proc/self/fd/") {
+        if let Ok(number) = rest.parse::<u64>() {
+            let reopen = match lookup(task, number) {
+                Some(Target::Vfs(vfs_fd)) => vfs::fd_path(task, vfs_fd)
+                    .map(|path| crate::linux_abi::fs::display_path(&path)),
+                Some(Target::SysfsDir { path, .. }) => Some(path),
+                _ => None,
+            };
+            if let Some(path) = reopen {
+                return open(task, &path, ".", flags);
+            }
+            return Err(ENOENT);
+        }
+    }
     // Per-fd fdinfo: systemd's fds_are_same_mount() reads
     // /proc/<pid>/fdinfo/<fd> for the "mnt_id" line and asserts on failure.
     // The content is dynamic (per fd), so it is served through a memfd.
@@ -904,8 +934,26 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
             crate::sysfs::Node::File(data) => {
                 insert_access(task, Target::Sysfs(data, 0), 0).ok_or(EMFILE)
             }
-            crate::sysfs::Node::Dir => Err(EISDIR),
-            crate::sysfs::Node::Symlink(_) => Err(EINVAL),
+            crate::sysfs::Node::Dir => insert_access(
+                task,
+                Target::SysfsDir {
+                    entries: crate::sysfs::entries(&resolved),
+                    path: resolved.clone(),
+                    offset: 0,
+                },
+                0,
+            )
+            .ok_or(EMFILE),
+            crate::sysfs::Node::Symlink(target) => {
+                // openat(..., O_PATH|O_NOFOLLOW) must yield the link itself;
+                // a plain open follows it like the kernel would.
+                const O_NOFOLLOW: u64 = 0o100000;
+                if flags & O_NOFOLLOW != 0 {
+                    insert_access(task, Target::SysfsLink(target), 0).ok_or(EMFILE)
+                } else {
+                    open(task, target, ".", flags)
+                }
+            }
         };
     }
     // Anything else under the synthetic /proc and /sys trees does not exist:
@@ -1230,7 +1278,8 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         // stdin is not wired to the console yet; report EOF so a reader does
         // not spin.
         Target::Console => Ok(0),
-        Target::DirList { .. } => Err(EISDIR),
+        Target::DirList { .. } | Target::SysfsDir { .. } => Err(EISDIR),
+        Target::SysfsLink(_) => Err(EINVAL),
         Target::Prime { .. } => Err(EINVAL),
         // The controller fd carries no data; the dmabuf form is a MemFd.
         Target::Udmabuf => Err(EINVAL),
@@ -1445,6 +1494,8 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
         | Target::Sysfs(_, _)
         | Target::Proc(_, _)
         | Target::DirList { .. }
+        | Target::SysfsDir { .. }
+        | Target::SysfsLink(_)
         | Target::Prime { .. } => Ok(count),
         Target::Full => Err(ENOSPC),
         Target::Vfs(vfs_fd) => {
@@ -1489,14 +1540,19 @@ pub fn lseek(task: u64, fd: u64, offset: i64, whence: u64) -> Result<u64, u64> {
     require_right(task, fd, FD_SEEK)?;
     match lookup(task, fd).ok_or(EBADF)? {
         Target::Vfs(vfs_fd) => vfs::lseek(task, vfs_fd, offset, whence).map_err(|_| EINVAL),
-        Target::DirList { .. } => {
+        Target::DirList { .. } | Target::SysfsDir { .. } => {
             // `rewinddir` only needs SEEK_SET 0.
             if whence == 0 && offset == 0 {
                 let _ = with_table(task, |table| {
-                    if let Some(Target::DirList { offset, .. }) =
+                    if let Some(slot) =
                         table.slots.get_mut(fd as usize).and_then(|slot| slot.as_mut())
                     {
-                        *offset = 0;
+                        match slot {
+                            Target::DirList { offset, .. } | Target::SysfsDir { offset, .. } => {
+                                *offset = 0;
+                            }
+                            _ => {}
+                        }
                     }
                 });
                 Ok(0)
@@ -1628,8 +1684,11 @@ pub fn stat_fields(
             )),
         ),
         Target::Sysfs(data, _) => (S_IFREG | 0o444, data.len() as u64, fd.max(1), None),
+        Target::SysfsLink(target) => (S_IFLNK | 0o777, target.len() as u64, fd.max(1), None),
         Target::Proc(data, _) => (S_IFREG | 0o444, data.len() as u64, fd.max(1), None),
-        Target::DirList { .. } => (S_IFDIR | 0o555, 0, fd.max(1), None),
+        Target::DirList { .. } | Target::SysfsDir { .. } => {
+            (S_IFDIR | 0o555, 0, fd.max(1), None)
+        }
         Target::Prime { size, .. } => (S_IFREG | 0o600, size as u64, fd.max(1), None),
         Target::Vfs(vfs_fd) => {
             let size = vfs::fd_len(task, vfs_fd).map_err(|_| EBADF)?;
@@ -1663,6 +1722,18 @@ pub fn stat_fields(
     })
 }
 
+/// Filesystem magic for `fstatfs`, so systemd's `fd_is_fs_type(fd,
+/// SYSFS_MAGIC)` accepts the synthetic sysfs tree instead of rejecting the
+/// device as outside of sysfs.
+pub fn fs_magic(task: u64, fd: u64) -> Option<i64> {
+    Some(match lookup(task, fd)? {
+        Target::Sysfs(..) | Target::SysfsDir { .. } | Target::SysfsLink(_) => 0x6265_6572, // SYSFS_MAGIC
+        Target::Proc(..) => 0x0000_9fa0,                           // PROC_SUPER_MAGIC
+        Target::DirList { .. } => 0x0102_1994,                     // TMPFS_MAGIC
+        _ => 0x5346_5331,                                          // SFS
+    })
+}
+
 pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
     let task = crate::scheduler::fd_table_owner(task);
     let (mode, size, ino, rdev) = stat_fields(task, fd)?;
@@ -1672,13 +1743,29 @@ pub fn fstat(task: u64, fd: u64, buffer: u64) -> Result<(), u64> {
     }
 }
 
+/// Target of a descriptor opened on a sysfs symlink with O_NOFOLLOW. This
+/// backs readlinkat(fd, ""), which systemd uses to read subsystem links.
+pub fn symlink_target(task: u64, fd: u64) -> Option<&'static str> {
+    match lookup(task, fd)? {
+        Target::SysfsLink(target) => Some(target),
+        _ => None,
+    }
+}
+
 /// Path of an open directory descriptor, for `*at` calls.
 pub fn directory_path(task: u64, fd: u64) -> Option<String> {
     require_right(task, fd, FD_LOOKUP).ok()?;
     match lookup(task, fd)? {
-        Target::Vfs(vfs_fd) if vfs::fd_kind(task, vfs_fd) == Some(vfs::FD_KIND_DIR) => {
-            vfs::fd_path(task, vfs_fd)
-        }
+        Target::Vfs(vfs_fd) if vfs::fd_kind(task, vfs_fd) == Some(vfs::FD_KIND_DIR) => vfs::fd_path(
+            task, vfs_fd,
+        )
+        // VFS paths carry the /sfs mount prefix; dirfd-relative lookups need
+        // the Linux-visible spelling, otherwise openat(root_fd, "sys") would
+        // resolve to /sfs/sys instead of /sys.
+        .map(|path| crate::linux_abi::fs::display_path(&path)),
+        // libudev opens a sysfs device directory and then resolves "uevent",
+        // "subsystem" and "device" relative to that descriptor.
+        Target::SysfsDir { path, .. } => Some(path),
         _ => None,
     }
 }
@@ -1718,6 +1805,43 @@ pub fn getdents64(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u6
         user_memory::copy_to_user(&output[..used], buffer).map_err(|_| EFAULT)?;
         let _ = with_table(task, |table| {
             if let Some(Target::DirList { offset, .. }) =
+                table.slots.get_mut(fd as usize).and_then(|slot| slot.as_mut())
+            {
+                *offset += serialized;
+            }
+        });
+        return Ok(used as u64);
+    }
+    if let Target::SysfsDir { entries, offset, .. } = target {
+        if count == 0 {
+            return Ok(0);
+        }
+        let limit = (count as usize).min(64 * 1024);
+        let mut output = alloc::vec![0_u8; limit];
+        let mut used = 0usize;
+        let mut serialized = 0usize;
+        for (index, entry) in entries.iter().enumerate().skip(offset) {
+            let name_len = entry.name.len();
+            let record = (HEADER + name_len + 1 + 7) & !7;
+            if used + record > limit {
+                break;
+            }
+            let ino = (index + 1) as u64;
+            output[used..used + 8].copy_from_slice(&ino.to_le_bytes());
+            output[used + 8..used + 16].copy_from_slice(&(ino as i64).to_le_bytes());
+            output[used + 16..used + 18].copy_from_slice(&(record as u16).to_le_bytes());
+            output[used + 18] = entry.kind;
+            output[used + HEADER..used + HEADER + name_len]
+                .copy_from_slice(entry.name.as_bytes());
+            used += record;
+            serialized += 1;
+        }
+        if serialized == 0 {
+            return Ok(0);
+        }
+        user_memory::copy_to_user(&output[..used], buffer).map_err(|_| EFAULT)?;
+        let _ = with_table(task, |table| {
+            if let Some(Target::SysfsDir { offset, .. }) =
                 table.slots.get_mut(fd as usize).and_then(|slot| slot.as_mut())
             {
                 *offset += serialized;
@@ -3014,6 +3138,8 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::Sysfs(_, _)
         | Target::Proc(_, _)
         | Target::DirList { .. }
+        | Target::SysfsDir { .. }
+        | Target::SysfsLink(_)
         | Target::Prime { .. }
         | Target::MemFd(_)
         | Target::Udmabuf
@@ -3078,7 +3204,11 @@ fn poll_ready_at(task: u64, fd: u64, depth: u8) -> Option<i16> {
             }
         }
         Target::Ivshmem | Target::GpuFb => POLLIN | POLLOUT,
-        Target::Sysfs(_, _) | Target::Proc(_, _) | Target::DirList { .. } => POLLIN | POLLOUT,
+        Target::Sysfs(_, _)
+        | Target::Proc(_, _)
+        | Target::DirList { .. }
+        | Target::SysfsDir { .. }
+        | Target::SysfsLink(_) => POLLIN | POLLOUT,
         Target::Prime { .. } => POLLOUT,
         Target::Drm { .. } => {
             if crate::drm::event_pending() {
@@ -3389,6 +3519,7 @@ const S_IFCHR: u32 = 0o020000;
 const S_IFIFO: u32 = 0o010000;
 const S_IFDIR: u32 = 0o040000;
 const S_IFREG: u32 = 0o100000;
+const S_IFLNK: u32 = 0o120000;
 
 /// Current task id helper used by `linux_abi`.
 /// True when `fd` names the host-shared ivshmem window.

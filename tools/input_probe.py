@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Drive the evdev probe (tests/linux/input.rs) in QEMU.
+"""Drive a freestanding Linux probe (tests/linux/input.rs by default) in QEMU.
 
-Boots the kernel with a virtio keyboard and tablet, runs
-`linuxrun /sfs/linux-input`, injects key presses through the HMP monitor and
-ABS_X/ABS_Y through QMP, then prints the guest output. It also runs `health`
-and `svc` afterwards so a session shows the kernel stays clean.
+Boots the kernel with a virtio keyboard and tablet and runs the command. For
+the evdev probe it injects key presses through the HMP monitor and
+ABS_X/ABS_Y through QMP. With --command/--expect it runs another probe (for
+example the sysfs one) and only checks the expected success line. It also
+runs `health` and `svc` afterwards so a session shows the kernel stays clean.
 
 The binary must already be in the image as `/sfs/linux-input`; run
 `tools/linux-test.sh` first (or inject with `scripts/sfs_inject.py`).
@@ -47,6 +48,8 @@ def main() -> int:
     parser.add_argument("--monitor-port", type=int, default=4561)
     parser.add_argument("--qmp-port", type=int, default=4563)
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--command", default="linuxrun /sfs/linux-input")
+    parser.add_argument("--expect", default="input ok")
     args = parser.parse_args()
 
     command = [
@@ -86,7 +89,16 @@ def main() -> int:
             return 1
 
         log.clear()
-        serial.sendall(b"linuxrun /sfs/linux-input\n")
+        serial.sendall(args.command.encode() + b"\n")
+        if args.command.strip() != "linuxrun /sfs/linux-input":
+            deadline = time.time() + args.timeout
+            failed = args.expect.replace(" ok", " FAILED")
+            while time.time() < deadline and args.expect.encode() not in log and failed.encode() not in log:
+                pump(0.5)
+            pump(1.0)
+            text = log.decode("utf-8", "replace")
+            print(text[-6000:])
+            return 0 if args.expect in text else 1
         monitor = connect(args.monitor_port)
         qmp = connect(args.qmp_port)
         qmp.settimeout(2)

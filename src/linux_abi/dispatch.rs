@@ -321,16 +321,10 @@ fn dispatch_inner(
             if cap_denies_cwd() {
                 errno(EPERM)
             } else {
-                linux_zero_struct(args[1], 120)
+                linux_statfs(args[0], args[1])
             }
         }
-        SYS_FSTATFS => {
-            let task = scheduler::current_task_id();
-            if let Err(code) = linux_fd::require_right(task, args[0], linux_fd::FD_FSTAT) {
-                return errno(code);
-            }
-            linux_zero_struct(args[2], 120)
-        }
+        SYS_FSTATFS => linux_fstatfs(args[0], args[1]),
         SYS_UTIMENSAT => {
             if cap_denies_cwd() { errno(EPERM) } else { 0 }
         }

@@ -8199,3 +8199,50 @@ Night session results, in order:
   0 DMA leaks; svc 5 services running; `cargo test --lib` 272 passed.
 - Open: `/sys/class/input` and `uevent` files (libudev/libinput
   enumeration), readdir; more than two input devices is out of scope.
+
+### 2026-11-26 — sysfs/udev: real libudev enumerates both evdev nodes
+
+- `src/sysfs.rs` grew the input class: `/sys/class/input` now uses typed
+  `getdents` entries (`DT_DIR`/`DT_REG`), `/sys/class/input/eventN` serves
+  `dev`, `name`, `uevent`, `subsystem` and `device`, `/sys/dev/char/13:64..`
+  resolves through `device`, and `/run/udev/data/c13:*` (aliased from
+  `/sfs/run`) carries `E:ID_INPUT=1`, `E:ID_SEAT=seat0`, because no udevd
+  runs in the guest.
+- `src/virtio_input.rs` builds the per-device `name` and `uevent` blobs
+  (`MAJOR=13`, `MINOR=64+i`, `DEVNAME=input/eventN`,
+  `PRODUCT=6/1af4/1052/1`), so the kernel's own capability read drives the
+  sysfs contents instead of duplicated constants.
+- `tests/linux/sysfs.rs` is a freestanding probe for the tree; the real
+  check is `tests/linux/udev.c` against the actual systemd 257
+  `libudev.so.1`.
+- libudev failed in five different places before the test passed:
+  1. `statx` claimed `STATX_SUBVOL` (`0x8000`) instead of `STATX_MNT_ID`
+     (`0x1000`); libudev asserts `stx_mnt_id >= 0`. Fixed in
+     `linux_statx`.
+  2. `statfs`/`fstatfs` were unimplemented, so
+     `fd_is_fs_type(fd, SYSFS_MAGIC)` failed. `linux_statfs` now writes the
+     AArch64 120-byte layout and `fs_magic()` picks SYSFS (`0x62656572`),
+     procfs (`0x9fa0`), tmpfs (`0x01021994`) or SFS.
+  3. A directory fd opened on sysfs lost its path, so
+     `openat(dirfd, "uevent")` was EBADF. `Target::SysfsDir` keeps the
+     resolved path and `directory_path` maps VFS `/sfs` to `/`.
+  4. systemd's `fd_reopen()` opens `/proc/self/fd/N`; the path did not exist
+     and `proc_fd_enoent_errno()` turned that into ENOSYS. `linux_fd::open`
+     now reopens VFS/sysfs targets through that magic link.
+  5. `readlinkat` with an `int` dirfd from glibc arrives zero-extended
+     (`4294967196` for AT_FDCWD), so `dirfd_cwd` misunderstood it; normalize
+     to 32-bit before comparing. Also added `Target::SysfsLink`:
+     `openat(..., O_PATH|O_NOFOLLOW)` on a sysfs symlink succeeds and
+     `readlinkat(fd, "")` returns its target, which is how systemd reads
+     `subsystem`. Missing links now return ENOENT (not EINVAL), matching the
+     kernel on the optional `/sys/class/input/subsystem` probe.
+- Evidence (QEMU virt, `build/sysfs-test.img`, 2026-11-26):
+  `explicit event0=0x40800640 errno=0`, `subsystem=input
+  devnode=/dev/input/event0 ID_INPUT=1`; `scan_devices=0`;
+  `enumerated=2 event0=1 event1=1` with
+  `/sys/class/input/event0 name=event0 subsystem=input
+  devnode=/dev/input/event0 ID_INPUT=1 ID_SEAT=seat0` and the same for
+  event1; `udev ok`, exit status 0. Both builds green, `cargo test --lib`
+  272 passed.
+- Open: libinput 1.28 itself has not been run against this backend yet;
+  more than two input devices remains out of scope.

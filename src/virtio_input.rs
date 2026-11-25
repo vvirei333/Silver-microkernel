@@ -111,6 +111,12 @@ struct Device {
     abs: [AbsInfo; ABS_COUNT],
     /// Current key state for `EVIOCGKEY`.
     keys: [u8; KEY_BITS_BYTES],
+    /// The sysfs name file for this event node, newline-terminated.
+    sysfs_name: [u8; 66],
+    sysfs_name_len: u8,
+    /// Identity lines for the sysfs uevent file.
+    uevent: [u8; 256],
+    uevent_len: u16,
 }
 
 impl Device {
@@ -134,6 +140,10 @@ impl Device {
                 ABS_COUNT
             ],
             keys: [0; KEY_BITS_BYTES],
+            sysfs_name: [0; 66],
+            sysfs_name_len: 0,
+            uevent: [0; 256],
+            uevent_len: 0,
         }
     }
 
@@ -260,12 +270,59 @@ unsafe fn config(bar: usize, select: u8, subsel: u8, out: &mut [u8]) -> usize {
     size
 }
 
-unsafe fn load_caps(device: &mut Device) {
+fn push_bytes(out: &mut [u8], length: &mut usize, bytes: &[u8]) {
+    if *length + bytes.len() <= out.len() {
+        out[*length..*length + bytes.len()].copy_from_slice(bytes);
+        *length += bytes.len();
+    }
+}
+
+fn push_decimal(out: &mut [u8], length: &mut usize, mut value: u64) {
+    if value == 0 {
+        push_bytes(out, length, b"0");
+        return;
+    }
+    let mut digits = [0u8; 20];
+    let mut count = 0;
+    while value > 0 {
+        digits[count] = b'0' + (value % 10) as u8;
+        count += 1;
+        value /= 10;
+    }
+    while count > 0 {
+        count -= 1;
+        push_bytes(out, length, &digits[count..count + 1]);
+    }
+}
+
+unsafe fn load_caps(device: &mut Device, index: usize) {
     let bar = device.queue.bar;
     let mut scratch = [0u8; EV_BITS_BYTES];
     let name_len = config(bar, CFG_ID_NAME, 0, &mut scratch).min(device.name.len());
     device.name[..name_len].copy_from_slice(&scratch[..name_len]);
     device.name_len = name_len as u8;
+
+    // The sysfs name file is the same string plus a newline.
+    device.sysfs_name[..name_len].copy_from_slice(&scratch[..name_len]);
+    device.sysfs_name[name_len] = b'\n';
+    device.sysfs_name_len = (name_len + 1) as u8;
+
+    // Identity lines for the sysfs uevent files. libudev turns them into
+    // device properties (DEVNAME is how the devnode is found); capabilities
+    // are read from the evdev fd, not from here.
+    let mut length = 0usize;
+    push_bytes(&mut device.uevent, &mut length, b"MAJOR=13\nMINOR=");
+    push_decimal(
+        &mut device.uevent,
+        &mut length,
+        (EVDEV_MINOR_BASE + index as u32) as u64,
+    );
+    push_bytes(&mut device.uevent, &mut length, b"\nDEVNAME=input/event");
+    push_decimal(&mut device.uevent, &mut length, index as u64);
+    push_bytes(&mut device.uevent, &mut length, b"\nPRODUCT=6/1af4/1052/1\nNAME=\"");
+    push_bytes(&mut device.uevent, &mut length, &device.name[..name_len]);
+    push_bytes(&mut device.uevent, &mut length, b"\"\n");
+    device.uevent_len = length as u16;
 
     let mut props = [0u8; 32];
     let props_len = config(bar, CFG_ID_PROPS, 0, &mut props).min(props.len());
@@ -471,7 +528,7 @@ pub fn init() -> bool {
                 unsafe {
                     publish_buffers(&mut queue, QUEUE_SIZE);
                     let mut entry = Device::new(queue);
-                    load_caps(&mut entry);
+                    load_caps(&mut entry, found);
                     let devices = core::ptr::addr_of_mut!(DEVICES);
                     (*devices)[found] = Some(entry);
                 }
@@ -502,6 +559,26 @@ pub fn name(index: usize) -> &'static [u8] {
     unsafe {
         match device(index) {
             Some(device) => &device.name[..device.name_len as usize],
+            None => &[],
+        }
+    }
+}
+
+/// The device name as the sysfs `name` file spells it (newline included).
+pub fn sysfs_name(index: usize) -> &'static [u8] {
+    unsafe {
+        match device(index) {
+            Some(device) => &device.sysfs_name[..device.sysfs_name_len as usize],
+            None => &[],
+        }
+    }
+}
+
+/// The device identity lines libudev reads from a sysfs `uevent` file.
+pub fn sysfs_uevent(index: usize) -> &'static [u8] {
+    unsafe {
+        match device(index) {
+            Some(device) => &device.uevent[..device.uevent_len as usize],
             None => &[],
         }
     }
