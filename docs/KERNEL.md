@@ -5,9 +5,10 @@
 > Primary source of truth: `src/` (single kernel crate, ~70 modules).
 
 Silver is a no_std Rust microkernel for AArch64. Everything runs in EL0 tasks;
-the kernel is the only EL1 code. Target boards: QEMU `virt` (Cortex-A72,
-GICv3) and the parked Redmi 10C (`fog`, SM6225) bring-up, which shares the
-same kernel through a platform abstraction (`platform.rs`).
+the kernel is the only EL1 code. The development target is QEMU `virt`
+(Cortex-A72, GICv3); Raspberry Pi 5 (`Bcm2712`) is the intended first physical
+board but has no hardware log yet. The parked Redmi 10C (`fog`, SM6225)
+bring-up shares the same kernel through `platform.rs`.
 
 ## 1. Memory management — IMPLEMENTED
 
@@ -68,9 +69,11 @@ same kernel through a platform abstraction (`platform.rs`).
 
 ## 5. Device model and drivers — PARTIALLY IMPLEMENTED (see DRIVER_MODEL.md)
 
-- In-kernel minimal virtio drivers: gpu (DRM/KMS surface + atomic UAPI),
-  blk, net (device side). The network *stack* is a userspace process
-  (net_server + smoltcp), isolated by capability.
+- In-kernel minimal device drivers: virtio-gpu (DRM/KMS surface + atomic
+  UAPI), plus a synchronous 512-byte block layer that prefers DTB/PCI SDHCI
+  and falls back to virtio-blk. The network device is a `net_driver` EL0 task
+  and the network *stack* is a userspace process (net_server + smoltcp),
+  isolated by capability.
 - UART: PL011 (QEMU), GENI (fog) — console only, polled.
 - Interrupts: GICv3/v2 with per-line policy checks (`irq_policy.rs`,
   `gicv3_policy.rs`).
@@ -79,7 +82,7 @@ same kernel through a platform abstraction (`platform.rs`).
 
 ## 6. Linux ABI — a kernel feature (see LINUX_ABI.md)
 
-`linux_abi.rs` + `linux_fd.rs` + `linux_signal.rs` + `linux_elf.rs`
+`linux_abi/` + `linux_fd.rs` + `linux_signal.rs` + `linux_elf.rs`
 implement the Linux syscall personality: ELF loading with shebang, fd
 tables, epoll/poll/timerfd/eventfd, futex, signals incl. signalfd,
 AF_UNIX with SCM_RIGHTS, synthetic procfs/sysfs, DRM atomic+syncobj+udmabuf
@@ -89,7 +92,7 @@ UAPI. Gated behind the `linux-abi` cargo feature.
 
 - Boot self-tests, fail closed on mismatch: MMU/ASID, SMP churn, TLB
   cross-PE probe, DMA zeroing/leases, IRQ, VFS, timer, frame-reserve
-  (`main.rs` test section; scheduler-owned probes live in
+  (`src/boot/selftest.rs`; scheduler-owned probes live in
   `src/scheduler/selftest.rs`).
 - `no_mangle` diagnostic rings (TRACE_RING syscall history, LAZY_FAIL/OK,
   DUMP_RING) for guest debugging; pmemsave-based post-mortem tooling in

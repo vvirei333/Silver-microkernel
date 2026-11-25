@@ -12,7 +12,7 @@ and each step is its own commit so a regression can be bisected to a move.
    together; if a move reveals a bug, the bug gets the next commit.
 2. **Same verification as a release.** `cargo test --lib`, `cargo build` for
    `no_std` and `no_std,linux-abi`, `scripts/release_smoke.py` (8/8), and the
-   `smp-selftest` boot on `-smp 4` (9/9) when the scheduler is touched.
+   `smp-selftest` boot on `-smp 4` (16/16) when the scheduler is touched.
 3. **Widen visibility only as far as the move forces, and never past the
    module.** Code that *reads* parent state moves as a child module and needs no
    widening at all (a descendant may read its parent's private items). Moving

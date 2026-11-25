@@ -12,7 +12,7 @@ this document disagree, the code is the bug until proven otherwise.
 | Kernel (scheduler, MMU, IPC, VFS/SFS, drivers) | Trusted computing base |
 | Native drivers with `CAP_MMIO`/`CAP_IRQ`/`CAP_PCI` | Part of the TCB by capability, still one fault domain each |
 | `silverd`, Scout, Howl | Privileged native tasks; the kernel does not trust their *input* |
-| Linux ABI tasks (Phosh, GTK apps, test binaries) | Untrusted |
+| Linux ABI tasks (Denial, GTK apps, test binaries) | Untrusted |
 | Network and on-disk images | Untrusted |
 | Physical access, microarchitecture (Spectre-class) | Out of scope for M2 |
 

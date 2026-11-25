@@ -1,7 +1,7 @@
 # WerewolfOS System Architecture
 
-> Status: living document, English edition 2026-11-22. The superseded Russian
-> console-era draft is kept at [ARCHITECTURE.ru-2026-11-20.md](ARCHITECTURE.ru-2026-11-20.md).
+> Status: living document, English edition 2026-11-25. The superseded Russian
+> console-era draft is kept at [ARCHITECTURE.ru-2026-11-20.md](archive/ARCHITECTURE.ru-2026-11-20.md).
 > Implementation status markers follow [STATUS.md](STATUS.md): **IMPLEMENTED**,
 > **PARTIALLY IMPLEMENTED**, **EXPERIMENTAL**, **PLANNED**.
 
@@ -47,7 +47,7 @@ graph TB
         K5["IRQ + timer + watchdog"]
     end
     subgraph L0["Hardware (QEMU virt, Cortex-A72)"]
-        H1["virtio-gpu / virtio-blk / virtio-net"]
+        H1["virtio-gpu / virtio-blk / virtio-net / SDHCI"]
         H2["PL011 UART, GICv3, ARM timer"]
     end
     N1 --> K3
@@ -86,10 +86,10 @@ cargo feature disabled, none of it is linked and the image is purely native.
 QEMU -machine virt -cpu cortex-a72 -smp N
   └─ Silver kernel image (relocatable, linked per platform)
        ├─ early UART console (PL011)
-       ├─ FDT parsing (memory, virtio, GIC)
+       ├─ FDT parsing (memory, PCIe, SDHCI, GIC)
        ├─ frame allocator + mem reserve pass
        ├─ MMU/ASID/SMP self-tests (fail closed on mismatch)
-       ├─ virtio probes: gpu, blk, net
+       ├─ block probe: DTB/PCI SDHCI, then virtio-blk; virtio gpu/net
        └─ silverd (native init) spawns:
              ├─ net_server (smoltcp: DHCP/DNS/TCP/TLS)
              ├─ nameserver (Scout IPC name resolution)
@@ -103,10 +103,10 @@ QEMU -machine virt -cpu cortex-a72 -smp N
 | Boundary | Mechanism | Notes |
 |---|---|---|
 | Kernel ↔ native task | Syscall ABI (EL0 SVC), IPC channels | Channel-based, capability-checked |
-| Kernel ↔ Linux task | Linux syscall personality (`linux_abi.rs`) | Same kernel services, translated |
+| Kernel ↔ Linux task | Linux syscall personality (`linux_abi/`) | Same kernel services, translated |
 | Task ↔ task | IPC channels over named endpoints (Scout) | Owned capabilities |
 | Task ↔ device | Device fds (`Target::*` in `linux_fd.rs`) / native caps | DRM, udmabuf, input planned |
-| Kernel ↔ block/net HW | virtio-mmio in-kernel + userspace stack process | Partitioned per device |
+| Kernel ↔ block/net HW | SDHCI or virtio-pci block in-kernel; virtio-net in a driver task plus userspace stack process | Partitioned per device |
 
 ## 6. Where the code lives
 

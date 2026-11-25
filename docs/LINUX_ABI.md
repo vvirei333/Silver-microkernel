@@ -57,9 +57,10 @@ Full matrix lives in [STATUS.md](STATUS.md); the groups:
 
 - evdev input (`/dev/input`) is an empty directory today; libinput wiring is
   the next stage (see ROADMAP.md Phase 4).
-- ftruncate returns EINVAL where Linux returns 0 (session-lock lockfile
-  retries as a result).
-- The lazy-mapping failure path under heavy region churn still kills the
-  faulting task (root-caused, fix in progress — STATUS.md).
+- Ordinary-file `ftruncate` supports only length 0; any other length returns
+  EINVAL. memfd truncation is implemented.
+- deniald's external Wayland client gets the registry globals, then deniald
+  stops dispatching it. The kernel's level-triggered epoll/eventfd wake
+  semantics are under investigation; this is not a missing syscall.
 - `io_uring`, namespaces/cgroups, and multi-mount semantics are not
   implemented.

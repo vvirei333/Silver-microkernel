@@ -9,9 +9,10 @@ SFS is the native, deliberately simple filesystem of the kernel.
 - **Format** (`sfs.rs`, `sfs_format.rs`): superblock, inode/bitmap/data
   regions, fixed 512-byte block addressing, single/double/triple indirect
   blocks, symlinks and hardlink-style duplicates supported by the injector.
-- **Kernel side**: read-only image mount at boot (QEMU disk or memory), a
-  bounded read cache (`cache.rs`, `cache_policy.rs`), file creates/writes
-  allowed only in designated scratch subtrees.
+- **Kernel side**: streaming read-write mount at boot from the selected block
+  device, a bounded read cache (`cache.rs`, `cache_policy.rs`), and in-place
+  metadata updates through the same cache. A block backend is required for
+  writes; `/tmp` is a separate writable scratch tree.
 - **Host side** (`scripts/`): `make_sfs.py` creates images;
   `sfs_inject.py` writes/unpacks trees into images (used by every image
   builder); `sfs_fsck.py` validates structure; `sfs_resize.py` grows

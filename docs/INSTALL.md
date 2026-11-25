@@ -7,8 +7,10 @@ guide. It states plainly what runs today and what does not — an install guide
 that lies about hardware support is worse than none.
 
 - Supported today: **QEMU `virt`** (AArch64, Cortex-A72).
-- Not supported yet: any physical board, including Raspberry Pi 4/5. See
-  [Hardware boards](#hardware-boards) for the exact gap list.
+- Not supported yet: any physical board, including Raspberry Pi 4/5. The Pi 5
+  software paths (platform, tree-derived UART/GIC/timer, PSCI, SDHCI) are in
+  the tree, but no board serial log exists. See
+  [Hardware boards](#hardware-boards).
 
 ## 1. What you need
 
@@ -123,16 +125,16 @@ with an SFS fsck after the write: `python3 scripts/sfs_fsck.py disk.img`).
 ## 6. Hardware boards
 
 **No physical board is supported by this release.** There is no downloadable
-SD-card image and no board install procedure, because the drivers a board needs
-do not exist yet. The console configuration boots on QEMU `virt` only.
+SD-card image and no board install procedure, because no board path has a
+hardware log yet. The console configuration boots on QEMU `virt` only.
 
 Status of the candidate boards:
 
 | Board | SoC | Status | Blocking work |
 |---|---|---|---|
 | QEMU `virt` | — | **Supported** | — |
-| Raspberry Pi 5 | BCM2712 (Cortex-A76) | **Target**, not supported | Platform + linker base, UART/GIC/timer bases from the DTB, PSCI SMP, a hardware boot log, and an on-card test of the BCM2712 SDHCI path. The SD card is BCM2712 `sdio1`, not RP1; RP1 remains the USB/Ethernet path. Plan: [PI5.md](PI5.md) |
-| Raspberry Pi 4 Model B | BCM2711 (Cortex-A72) | Not supported | Same plan one SoC earlier; simpler storage path |
+| Raspberry Pi 5 | BCM2712 (Cortex-A76) | **Target**, not supported | One board serial log; an on-card test of the BCM2712 SDHCI path (controller, pin mux and card power); RP1 USB/Ethernet is optional. `Kind::Bcm2712`, link-base overrides, tree-derived UART/GIC/timer, PSCI and the generic SDHCI core are in software only. The SD card is BCM2712 `sdio1`, not RP1. Plan: [PI5.md](PI5.md) |
+| Raspberry Pi 4 Model B | BCM2711 (Cortex-A72) | Not supported | Same plan one SoC earlier; no BCM2711 platform kind or SDHCI quirk yet |
 | Redmi 10C (`fog`) | SM6225 | Parked port | `fog.rs`/`platform.rs`/GENI UART merged behind feature flags; not bootable to userspace yet |
 
 The first physical board this project aims at is a **Raspberry Pi 5**: a
@@ -147,27 +149,32 @@ promise of dates):
 
 1. **Boot chain.** Pi 4/5 start the VideoCore firmware from EEPROM, which loads
    `start4.elf` + `config.txt` + our kernel. The kernel must be entered at EL1
-   with the MMU off and be relocatable to the address the firmware chose; today
-   `linker.ld` hardcodes DRAM at `0x4000_0000` (QEMU `virt`) and `linker_fog.ld`
-   / `linker_tablet.ld` cover the parked ports. A Pi image needs its own linker
-   script and either the firmware's `armstub` path or a U-Boot chainload.
-2. **Platform detection.** `platform::detect()` recognises QEMU, SM8650 and
-   SM6225 from the live device tree; a Pi would be a fourth `Kind`, with its
-   peripheral bases taken from the DTB (`src/fdt.rs` already parses one).
-3. **UART.** Pi 4 exposes a PL011 at `0xFE20_1000` (the mini-UART is at
-   `0xFE21_5040`). `pl011.rs` drives a PL011, but at QEMU's fixed base; the base
-   must come from the FDT.
-4. **Interrupt controller.** Pi 4 uses a GIC-400 at `0xFF84_1000`. GICv2
-   dispatch exists (`gic.rs`), again with QEMU's base hardcoded.
-5. **Storage.** The SFS root lives on a block device. Pi 4/5 boot from SD/eMMC
-   through SDHCI; the kernel has a small block layer and a polled SDHCI core
-   (Pi 5: `brcm,bcm2712-sdhci`, 4-bit at 25 MHz). The SDHCI core has been
-   exercised in QEMU with `-device sdhci-pci` and a card, including a
-   write that survived reboot, but not on a BCM2712 board. QEMU's default
-   boot remains virtio-blk.
-6. **Power and time.** `poweroff`/`reboot` on a Pi go through the firmware
-   mailbox (`0xFE00_B880`), not PSCI `SYSTEM_OFF`; the ARM generic timer works
-   if `CNTFRQ_EL0` and the PPI are taken from the FDT.
+   with the MMU off at the address the firmware chose. `linker.ld` defaults to
+   QEMU but accepts `SILVER_LINK_PA` and `SILVER_DRAM_BASE` as build parameters,
+   and the entry stub drops EL2 → EL1 when the firmware enters there. The exact
+   Pi 5 `kernel_address`/armstub handoff still needs one board log; no Pi-specific
+   linker script is required.
+2. **Platform detection.** `Kind::Bcm2712` is proved from the live DT root
+   compatible (`brcm,bcm2712`, `raspberrypi,5-*`), and a BCM2712 boot fails
+   closed instead of falling into another board's MMIO map. It has no hardware
+   log yet.
+3. **UART.** The Pi 5 debug UART is a PL011. `pl011.rs` accepts a base and
+   reference clock from the FDT; the built-in no-tree path deliberately returns
+   no console for BCM2712. First serial output is the P0 milestone.
+4. **Interrupt controller and timer.** The tree-derived GIC and ARM generic
+   timer paths exist (Pi 5 uses a GIC-400/GICv2 and a timer PPI), but neither has
+   been observed on a board.
+5. **Storage.** The SFS root lives on a block device. Pi 5 boots from microSD
+   through BCM2712 `sdio1`; the kernel has a small block layer and a polled SDHCI
+   core with the `brcm,bcm2712-sdhci` pin mux and a 200 MHz base-clock fallback.
+   QEMU's `-device sdhci-pci` exercises the same command/card/read/write core,
+   including CSD v1 and v2 cards and a write that survived reboot, but not on a
+   BCM2712 board. QEMU's default boot remains virtio-blk.
+6. **Power and time.** PSCI conduit and per-CPU MPIDR come from the live tree;
+   the Pi 5 is expected to provide `SYSTEM_OFF`/`SYSTEM_RESET` over SMC. The
+   firmware mailbox (`0xFE00_B880`) is the fallback if it does not, and is not
+   implemented yet. The generic timer needs `CNTFRQ_EL0` and the PPI from the
+   FDT.
 7. **Display (optional for ConsoleOS).** A console image only needs the UART;
    HDMI would use the firmware framebuffer mailbox, which `simplefb.rs` could
    consume once the mailbox driver exists.

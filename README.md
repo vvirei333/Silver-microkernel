@@ -17,8 +17,10 @@ frame by frame.
   limits, the full Linux ABI test matrix, next steps.
 - Manifesto at the bottom.
 - Active target: QEMU `virt` (Cortex-A72), developed from a Windows/Linux
-  desktop. Hardware ports (Redmi 10C) are parked until the OS layer is
-  ready ([redmi10c_poc/README.md](redmi10c_poc/README.md)).
+  desktop. Raspberry Pi 5 is the intended first physical board: the platform,
+  tree-derived UART/GIC/timer, PSCI and generic SDHCI paths are in the tree,
+  but there is no board serial log yet ([docs/PI5.md](docs/PI5.md)). The Redmi
+  10C port stays parked ([redmi10c_poc/README.md](redmi10c_poc/README.md)).
 
 ## Documentation
 
@@ -90,7 +92,7 @@ serial stream (`assets/fastfetch-0.1.2.ansi`, raw PL011 bytes) by
 aligned summary includes processes, open files, SFS usage and DMA state. The
 interactive `howl` shell and the `howler` UART driver run in userspace.
 
-Release notes for this version: [`RELEASE.md`](RELEASE.md). Contributions:
+Release notes for the 0.1.2 milestone and the current 1.0.3 bundle: [`RELEASE.md`](RELEASE.md). Contributions:
 [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## What already works
@@ -144,6 +146,7 @@ Release notes for this version: [`RELEASE.md`](RELEASE.md). Contributions:
 - [x] Userspace UART driver: IRQ-bound RX plus IPC-routed input and output
 - [x] DMA infrastructure: contiguous frames and Normal Non-Cacheable user mappings
 - [x] PCI ECAM access plus a Virtio-PCI block driver: modern capabilities, split virtqueue and `read_sector`
+- [x] Storage abstraction: SFS on a synchronous 512-byte block device, preferring DTB/PCI SDHCI over virtio-blk; QEMU `sdhci-pci` has mounted byte- and block-addressed cards and survived a write/reboot, with no Pi 5 board log
 - [x] VirtIO-Net driver: modern virtio-pci capabilities, split RX/TX virtqueues, 16 x 2 KiB buffers and MAC discovery
 - [x] Shared-memory frame transport: one 8 KiB DMA mailbox, `OP_ATTACH`/`OP_ATTACHED`, `OP_FRAME`/`OP_TX` doorbells, length-word fencing and backpressure
 - [x] `net_server`: `smoltcp` in a separate EL0 task with DHCP, ARP, IPv4, DNS and TCP; a static 10.0.2.15/24 fallback keeps a NIC-less or DHCP-less boot usable
@@ -205,7 +208,7 @@ win. No XNU or Redox code is copied.
 
 ## Redmi 10C (`fog`, SM6225) — RAM-only bring-up (parked)
 
-> The active vector is QEMU/desktop + Linux ABI/Phosh. This hardware port is
+> The active vector is QEMU/desktop + Linux ABI/Denial. This hardware port is
 > kept as a documented later milestone, not an active deliverable.
 
 Status as of 2026-11-03 (TASK №19–№23). The authoritative port document is
@@ -291,16 +294,15 @@ directions, smoltcp's ARP and IPv4/ICMP layers, and the checksum check. Any
 IPv4 address can be pinged — not only the slirp gateway — and success is
 reported only on a matching echo reply before the timeout.
 
-## Phase 5: Graphics — removed (2026-11-08)
+## Phase 5: Graphics — native stack removed, Linux DRM path added (2026-11-08 →)
 
-The compositor, framebuffer backends, kernel surface objects and the input
-driver were deleted. The development vector was reconsidered: a full graphical
-OS is outside the project's scope, so the product is a console system. A single
-window will return later only as a host for a basic browser, with its own
-minimal display path.
-
-`build_and_qemu.sh` boots the console OS with `-display none`; the shell runs
-over the serial line.
+The native compositor, framebuffer backends, kernel surface objects and input
+driver were deleted. The console product remains the base; the graphical track
+is now the Linux ABI, not a native compositor. The kernel still exposes a
+DRM/KMS UAPI over virtio-gpu, and the Mobile image runs Denial (Smithay +
+Flutter) on it. `build_and_qemu.sh` boots the console OS with `-display none`;
+the shell runs over the serial line. Denial is a separate Linux image, not a
+console task.
 
 ## Phase 6: Dynamic ELF loader — complete
 
@@ -360,7 +362,7 @@ EOF), `exit`/`exit_group`, `set_tid_address`, `set_robust_list`,
 and `tgkill`; anything else returns `-ENOSYS`. File descriptors are a
 per-process table in `src/linux_fd.rs` (console, `/dev` devices, VFS handles,
 pipes, eventfds, memfds, timerfds, epoll instances or Unix sockets), so `dup2`
-redirects work; the filesystem view is read-only.
+redirects work; the Linux filesystem view is read-only outside `/tmp`.
 
 The personality is fixed at spawn, so a foreign binary can never reach the
 Silver syscall table by choosing a colliding number. `linuxrun` is a
@@ -1006,12 +1008,10 @@ resolved at runtime from the task bound to INTID 33, so console routing survives
 any spawn order (`spawn block_driver` reusing Howler's old task ID cannot capture
 the shell output).
 
-`diskread [sector]` and `hexdump [sector]` talk to the block driver over IPC and
-read real sectors from the attached `virtio-blk-pci` disk. Like the console sink,
-the driver is found by program ID through `SYS_TASK_LIST`, never by a fixed task
-number, and a request is bounded by a reply timeout. Killing or crashing the
-driver therefore prints an error and returns the prompt; the kernel and the shell
-keep running.
+`diskread [sector]` and `hexdump [sector]` read real sectors from the attached
+block device — SDHCI or virtio-blk, whichever `block` selected. The device is
+synchronous and in-kernel; the shell path is bounded by a timeout. A missing
+or failed backend returns an error and the prompt instead of killing the shell.
 
 Press `Ctrl-A`, then `X`, to quit QEMU. For an unattended smoke test,
 prefix QEMU with `timeout 5s`; exit code 124 then means the kernel stayed alive.
@@ -1023,8 +1023,9 @@ regression programs), `tablet` (SM8650, **parked**), `fog` (SM6225 RAM-only brin
 `fog-auto-reset` (diagnostic PSCI reset), `fog-hw-selftests` (run the newer
 MMU proofs on hardware) and `fog-timer-test`. Normal bare-metal boot starts
 silverd, which starts Scout, the network driver/server, Howl and Howler. There
-is no graphics task in any normal build. `build.rs` automatically builds and
-embeds every userspace ELF; no separate userspace command is needed.
+is no native graphics task in a console build; the Mobile image runs Denial
+as a Linux task. `build.rs` automatically builds and embeds every userspace
+ELF; no separate userspace command is needed.
 
 ## Network
 
@@ -1223,7 +1224,7 @@ to 48 KiB of sanitized HTML and external CSS to 64 KiB; modern 200 KiB
 stylesheets (Wikipedia Vector) are skipped in favour of the reader view.
 Images are capped at four per page, and six tabs plus one text field per form
 are the current UI limits. **YouTube still cannot work here**; it needs a
-WebKit/Gecko-class engine with a media stack, which is the Linux ABI + Phosh
+WebKit/Gecko-class engine with a media stack, which is the Linux ABI + Denial
 track, not another reader-mode increment. TLS runs in the guest and needs no
 host, but the root store is intentionally small and certificate time is a fixed
 build date until the RTC lands; the viewer proxy remains the fallback.
@@ -1236,8 +1237,8 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | File | Purpose |
 | --- | --- |
 | `build.rs` | Builds and embeds the userspace ELFs; also copies `hello.elf` for the VFS seed |
-| `src/main.rs` | Physical boot entry, hand-over capture, fog placement policy, high-half transition, exception trampolines |
-| `src/boot.rs` | `BOOT_PARAMS` / `BOOT_CLAIM` layout shared with the assembly stub |
+| `src/main.rs`, `src/boot/` | Physical boot entry, hand-over capture, fog placement policy, high-half transition, exception trampolines and the milestone boot order |
+| `src/boot/mod.rs` | `BOOT_PARAMS` / `BOOT_CLAIM` layout shared with the assembly stub |
 | `src/exceptions.rs` | EL0 fault register dump, switch trace and the kernel exit path |
 | `src/pl011.rs` | Kernel UART diagnostics and bounded RX fallback |
 | `src/memory.rs` | Physical memory map and high-half address conversion; fog DRAM window |
@@ -1248,7 +1249,7 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `src/gicv3.rs` | Runtime GICv3 distributor/redistributor setup and IRQ dispatch |
 | `src/gicv3_policy.rs` | Host-tested GICR_TYPER affinity matching |
 | `src/reloc.rs` | Host-tested fail-closed self-relocation boundary policy |
-| `src/platform.rs` | Runtime `Kind::{Qemu,Sm8650,Fog,Unknown}` identity |
+| `src/platform.rs`, `src/board.rs` | Runtime `Kind::{Qemu,Sm8650,Fog,Bcm2712,Unknown}` identity and DT `compatible` matching |
 | `linker_fog.ld` | Fog high-half VMA and `0x4008_0000` link slot |
 | `src/frame_allocator.rs` | Physical page frame allocator (bitmap) |
 | `src/allocator.rs` | Kernel heap, `#[global_allocator]` |
@@ -1270,10 +1271,14 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `src/semaphore.rs` | Counting semaphore on mutex + condvar |
 | `src/channel.rs` | Bounded channel: two semaphores + a mutex (backpressure) |
 | `src/mmu/` | TTBR1 kernel map, per-task TTBR0 maps, permission validation |
+| `src/block.rs`, `src/sdhci.rs` | Synchronous 512-byte block registry and the polled SDHCI core (DTB or PCI transport) |
+| `src/pci.rs`, `src/pci_boot.rs` | Tree-driven PCIe discovery, ECAM/BCM2712 MMIO back ends and SDHCI BAR binding |
+| `src/drm.rs`, `src/virtio_gpu.rs` | DRM/KMS UAPI and the virtio-gpu device behind it |
+| `src/linux_abi/`, `src/linux_fd.rs` | Linux syscall personality, descriptor tables and UAPI devices |
 | `src/elf_loader.rs` | Thin shim over `elf::load_elf` for embedded images |
 | `src/elf.rs` | Dynamic ELF64/AArch64 `PT_LOAD` loader, `LoadedImage`, `PageKind`, `ElfError` |
 | `src/user_program.rs` | Program IDs and embedded userspace ELF selection |
-| `src/vfs.rs` | RAM file tree, normalized paths and per-task file descriptors |
+| `src/vfs.rs` | Mount tree (SFS root, `/tmp` RamFs, synthetic trees), normalized paths and per-task descriptors |
 | `src/seed.rs` | Boot-time VFS seeding of apps, probes and `/bin/hello` |
 | `userspace/src/allocator.rs` | Per-task first-fit `malloc/free` over `SYS_BRK` |
 | `userspace/src/bin/silvershell.rs` | Shell entry point, input loop and UART driver link |
@@ -1466,7 +1471,7 @@ driver's contract.
 | [docs/FINAL_AUDIT.md](docs/archive/FINAL_AUDIT.md) | Historical audit: DMA window, Ed25519 signing, evidence and known limitations (surface/graphics parts superseded by the graphics removal) |
 | [docs/PORTING_FOG.md](docs/archive/PORTING_FOG.md) | Redmi 10C port plan (parked): console-over-UART/storage/power path, hardware unknowns and regression matrix |
 | [docs/REFERENCE.md](docs/archive/REFERENCE.md) | Reference console product: definition, acceptance checklist, current status, known gaps and next work |
-| [docs/VECTOR.md](docs/VECTOR.md) | Direction: console OS, host-rendered browser window, Linux ABI/Phosh assessment and staged plan |
+| [docs/VECTOR.md](docs/VECTOR.md) | Direction: console OS, host-rendered browser window, Linux ABI/Denial assessment and staged plan |
 | [docs/MOBILE_LINUX_ARCH.md](docs/archive/MOBILE_LINUX_ARCH.md) | How postmarketOS/Nura works as mobile Linux (boot, deviceinfo, initramfs, Alpine/systemd, Phosh/phoc services) and what to borrow for WerewolfOS |
 | [docs/M3_DRIVER.md](docs/archive/M3_DRIVER.md) | M3.1a driver-task framework: region-scoped MMIO, driver resource table, `SYS_MMIO_GRANT`, limits and next DT slice |
 | [docs/M3_SIMPLEFB.md](docs/archive/M3_SIMPLEFB.md) | M3.2a simplefb boot framebuffer: contract, Redmi panel constants, QEMU selftest, limits |
@@ -1476,15 +1481,14 @@ driver's contract.
 | [docs/ALPINE_OPENRC.md](docs/archive/ALPINE_OPENRC.md) | Alpine + OpenRC + Phosh from one SFS image: Linux `/` = SFS `/sfs`, SFS symlinks, synthetic procfs, mount/PID-1/vfork fixes, the empty-deptree limitation |
 | [keys/README.md](keys/README.md) | Bundle signing key provisioning (public key only; never commit `*.key`) |
 
-Current verification snapshot (2026-11-08, console product): **217 host
+Current verification snapshot (2026-11-25, console product): **272 host
 tests** pass; the fog QEMU suite covers relocation, at-link boot, default
 fail-closed park and an FDT-reserved-destination rejection; normal QEMU
 release and debug builds reach `howl>`; the console OS answers `help`,
 `uname`, `ls /` and `health` over the serial line with no graphics task in the
-boot chain; SMP `-smp 4` selftest reports 15 PASS / 0 FAIL; the `no_std`,
-`fog`, `fog-reloc`, `fog-auto-reset`, `fog-hw-selftests`, `smp-selftest`
-and `demo-tasks` configurations all build (`tablet` still compiles but is
-parked). `scopeprobe` exits 0
+boot chain; SMP `-smp 4` selftest reports 16 PASS / 0 FAIL; the `no_std`,
+`linux-abi`, `linux-abi-trace`, `smp`, `smp-selftest`, `fog`, `tablet` and
+`gdb-stub` configurations all build (`tablet` still compiles but is parked). `scopeprobe` exits 0
 with no leaks, `sfs_fsck` is clean, and the three signing cases (unsigned
 refused, valid `sig=` accepted, tampered signature refused) still hold. The opt-in `smp-churn` profile passes `churn PASS`, `push PASS`,
 `watchdog stall PASS`, `bkl stall PASS` and `priority PASS` on `-smp 2`,
@@ -1543,6 +1547,13 @@ graphics subsystem has since been removed, the boot/timer result stands). The GI
 does not use `GICR_IGROUPR0`: on Rain it reads zero for timer PPI 18 even
 though the interrupt is delivered as Group 1 NS. This is a boot/timer smoke
 test, not a DMA-reclamation or TLB/cache stress test.
+
+The block path was rechecked on 2026-11-25. QEMU's `sdhci-pci` device mounted
+both a 64 MiB byte-addressed card (CSD v1) and a 4 GiB sparse block-addressed
+card (CSD v2), issued CMD17/CMD24, and a file created at the shell survived a
+reboot on a copy of the image; the default QEMU boot still selects virtio-blk.
+The generic SDHCI core has no BCM2712 hardware log, and no Pi 5 boot or SD-card
+claim is made.
 
 ## Trademark
 

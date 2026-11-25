@@ -9,6 +9,7 @@ disagrees with a boot log is a bug in the document.
 | If you want to… | Read |
 |---|---|
 | install and run it | [INSTALL.md](INSTALL.md) — QEMU quickstart, checksums, board status |
+| read the release notes | [../RELEASE.md](../RELEASE.md) — current 1.0.3 ConsoleOS bundle and the historical 0.1.2 milestone |
 | bring it up on a real board | [PI5.md](PI5.md) — Raspberry Pi 5 (BCM2712) plan, milestones, what a board owner can contribute |
 | see what is actually done | [STATUS.md](STATUS.md) — capabilities, limits, test matrix, measured numbers |
 | understand the shape of the system | [ARCHITECTURE.md](ARCHITECTURE.md) — layers, boot chain, repository layout |
@@ -51,8 +52,8 @@ Every number in [STATUS.md](STATUS.md) comes from a command in the repo:
 |---|---|
 | release boots and behaves | `scripts/release_smoke.py` (8 checks) |
 | fast paths | `bench` at the `howl>` prompt |
-| host-side unit tests | `cargo test --lib` (229 tests) |
-| SMP scheduler probes | build with `no_std,linux-abi,smp-selftest`, boot `-smp 4` |
+| host-side unit tests | `cargo test --lib` (272 tests) |
+| SMP scheduler probes | build with `no_std,smp-selftest`, boot `-smp 4` |
 | Linux ABI matrix | `tools/linux_matrix.py` |
 | capability/IPC security suite | `secprobe <case>` at the shell |
 | filesystem structure | `scripts/sfs_fsck.py disk.img` |

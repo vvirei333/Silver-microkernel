@@ -4,11 +4,12 @@
 > input driver, home screen) was removed after reconsidering the project's
 > development vector. The `fog-ui`/`fog-display` panel evidence below is
 > historical; the port target is now the console OS over UART. See
-> [`../docs/PORTING_FOG.md`](../docs/PORTING_FOG.md).
+> [`../docs/archive/PORTING_FOG.md`](../docs/archive/PORTING_FOG.md).
 
-> **Статус (2026-11-08): припарковано.** Активный вектор — QEMU/десктоп,
-> host-окно браузера и Linux ABI/Phosh. Этот файл — запись аппаратного
-> bring-up Redmi 10C для более позднего возврата; не активная задача.
+> **Статус (2026-11-25): припарковано.** Активный вектор — QEMU/десктоп,
+> Linux ABI + Denial и первая физическая плата Raspberry Pi 5. Этот файл —
+> запись аппаратного bring-up Redmi 10C для более позднего возврата; не
+> активная задача.
 
 Minimal RAM-only path for booting Silver on a Xiaomi Redmi 10C and reaching the
 Howl shell prompt:
@@ -450,7 +451,7 @@ log says so.
 - `linker_fog.ld` — high-half VMA, `0x4008_0000` link/relocation slot.
 - `src/main.rs` — entry stub, hand-over capture, fail-closed placement policy,
   fog boot order.
-- `src/boot.rs` — `BOOT_PARAMS` layout shared with the assembly stub.
+- `src/boot/mod.rs` — `BOOT_PARAMS` layout shared with the assembly stub.
 - `src/fdt.rs` — allocation-free DTB parser and boot-memory planner (host
   tested).
 - `src/reloc.rs` — host-tested relocation boundary policy mirrored by the stub.

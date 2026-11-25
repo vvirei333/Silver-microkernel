@@ -1,8 +1,10 @@
 # Reference board: Raspberry Pi 5 (BCM2712)
 
-Status: **target, not supported.** No image exists for this board and none of
-the milestones below is done. This page is the plan and the checklist, so that
-work can be measured against hardware instead of against hope.
+Status: **target, not supported.** No image or install procedure exists, and no
+milestone below has a board serial log. The P0–P3 software paths (platform
+kind, link-base override, tree-derived UART/GIC/timer, PSCI, PCIe and generic
+SDHCI) are in the tree; this page separates that code from the hardware
+evidence that is still missing.
 
 WerewolfOS is developed on QEMU `virt` (Cortex-A72). Raspberry Pi 5 is the
 intended first physical board: AArch64, well documented device trees, a

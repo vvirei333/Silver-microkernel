@@ -1,6 +1,6 @@
 # WerewolfOS — Implementation Status
 
-_Last refreshed: 2026-11-22. Verification markers: **IMPLEMENTED** (proven
+_Last refreshed: 2026-11-25. Verification markers: **IMPLEMENTED** (proven
 by code + boot self-tests or reproducible QEMU runs), **PARTIALLY
 IMPLEMENTED**, **EXPERIMENTAL**, **PLANNED**. Detailed session notes live in
 `handoff.md` (working notes); this file is the public summary._
@@ -25,9 +25,12 @@ replacing the parked phosh/phoc stack. See [ARCHITECTURE.md](ARCHITECTURE.md),
 | Mesa llvmpipe over DRM/KMS + udmabuf + syncobj fencing | IMPLEMENTED | deniald reaches GPU-transfer/TEST_ONLY stages |
 | Denial WM boot to engine session start | PARTIALLY IMPLEMENTED | deniald log stages verified |
 | First rendered desktop frame | IN PROGRESS — current stop | scanout buffers verified black; no post-engine atomic commits |
+| Block storage (SDHCI + virtio-blk) | IMPLEMENTED (QEMU) | SFS mounts over DTB/PCI SDHCI; CSD v1/v2, CMD17/24 and a write surviving reboot; no Pi 5 board log |
+| Raspberry Pi 5 (BCM2712) | PLANNED (hardware log) | platform/UART/GIC/timer/PSCI/SDHCI software paths are in the tree; no serial log from a board |
 | evdev input / udev glue for libinput | PLANNED | /dev/input empty today |
 | Package manager (in-OS) | PLANNED | host-side builders only |
-| Persistent writable SFS / journaling | PLANNED | scratch-only writes today |
+| Persistent writable SFS | IMPLEMENTED | writes survive reboot; `sfs_fsck` clean |
+| SFS journaling / crash consistency | PLANNED | no journal; an interrupted write can leave stale metadata |
 | Hardware ports (Redmi 10C `fog`) | PARKED | platform support merged behind feature flags |
 
 Resolved kernel issue (2026-11-22, fix `6846e49`): the intermittent
@@ -42,8 +45,8 @@ lookup, and a boot self-test covers the crossing. No open MMU issue is known.
 native space                          optional linux-abi module
 ---------------------------------     -----------------------------------------
 kernel: MMU, scheduler, IPC, caps     Linux ELF + ld.so, syscall ABI
-drivers: virtio-blk/net, UART         fd table, threads, signals, futex
-SFS rootfs loaded into RAM            AF_UNIX sockets + SCM_RIGHTS
+drivers: SDHCI/virtio-blk, net, UART fd table, threads, signals, futex
+SFS rootfs streamed on demand         AF_UNIX sockets + SCM_RIGHTS
 VFS + RamFs scratch (/tmp)            memfd + MAP_SHARED, epoll/timerfd
 TCP/IP (smoltcp), Howl shell          Wayland xdg-shell / D-Bus transports
 ```
@@ -56,7 +59,7 @@ same scheduler, address spaces, VFS and frame allocator as native tasks.
 ### Native base
 - AArch64 kernel with SMP (`-smp 4` selftest), per-task address spaces, COW
   fork, wait/exit, capabilities, IPC mailboxes and mutexes.
-- virtio-blk-pci + virtio-net, GENI UART, PSCI power off/reset.
+- DTB or PCI SDHCI block, virtio-blk-pci fallback, virtio-net, PL011/GENI UART, PSCI power off/reset.
 - SFS rootfs read on demand through a 256 KiB block cache (streaming); the
   image no longer occupies RAM. Create/truncate/write, mkdir/remove and
   rename/replace all work on the same cache. The block tree reaches a third
@@ -183,8 +186,9 @@ Console-image fixes in the same pass:
 
 - Simplefb path: `FOG_PANEL` (0x5C00_0000, 720x1650, stride 720, ARGB8888)
   paints the Redmi `cont_splash` panel; QEMU runs a 128x96 synthetic selftest
-  (`SIMPLEFB TEST PASS 128x96`). Pure canvas is host-tested. No EL0 API or
-  compositor yet; hardware photo is tomorrow's Redmi step.
+  (`SIMPLEFB TEST PASS 128x96`). Pure canvas is host-tested. The native
+  simplefb path stays diagnostic; the active desktop path is Denial over the
+  kernel's DRM/KMS UAPI.
 
 ### Phosh desktop (parked 2026-11-19)
 
@@ -232,15 +236,15 @@ Console-image fixes in the same pass:
   built with zig cc): the real library asserts deep inside its helpers when
   systemd is absent; libudev.so.1 embeds the same sources statically, so the
   builder also NOPs its fds_are_same_mount assert branches.
-- **Current stop** (2026-11-22): two fronts. (1) The intermittent deniald
-  kill is explained: the lazy file/anon fill fails inside
-  `mmu::map_user_pages_at_inner` (LAZY_FAIL reason=map) despite 41k free
-  frames — a page-table bookkeeping bug (937 mmap regions in the task); the
-  fill failure then kills the task instead of returning ENOMEM. (2) The
-  Flutter engine still never draws frame 1: threads idle in futex waits, no
-  atomic commits; an external Wayland client probe (`/sfs/wl-client`,
-  stage 4 start) is in place to separate the compositor pipeline from the
-  engine frame clock. Details in `handoff.md` "2026-11-22".
+- **Current stop** (2026-11-22): the Wayland registry handshake works — the
+  external `/sfs/wl-client` probe receives the global list. deniald then
+  stops dispatching: it spins level-triggered on the listener and client
+  sockets and never reads the follow-up bind/shm-pool messages. The Flutter
+  engine still never draws frame 1 (no post-engine atomic commits); this
+  dispatch livelock is the current suspect for the missing frame clock.
+  The intermittent lazy-fill kill was root-caused separately and fixed in
+  `6846e49`; no recurrence in four boots since. Details in `handoff.md`
+  "2026-11-22 (day)".
 - Debugging method: `no_mangle` static rings (TRACE_RING syscall history,
   FAIL_RING, IOC_RING, FAULT_RING, LAZY_FAIL) read through QEMU monitor
   `pmemsave`; helper `tools/boot_dump.py` boots, dumps and replays deniald's
@@ -308,10 +312,11 @@ The same list can be run manually at `howl>`:
 | `linuxrun /sfs/linux-dbus` | `dbus ok` |
 | `health` | 0 zombies, 0 open files, 0 DMA leaks |
 
-Host-side: `cargo test --lib` → **229 tests**. Feature builds: `no_std`,
-`no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,smp-selftest`; the
-`--no-linux` build is clean (the switch is also a regression test for Linux
-code leaking into the kernel).
+Host-side: `cargo test --lib` → **272 tests**. Feature builds: `no_std`,
+`no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,smp`,
+`no_std,smp-selftest`, `no_std,fog`, `no_std,tablet` and
+`no_std,gdb-stub`; `--no-linux` stays clean (the switch is also a regression
+test for Linux code leaking into the kernel).
 
 **Release 1.0.3 gate (2026-11-23): `scripts/release_smoke.py` 8/8 green on the
 packaged artifacts** (`uname` reports 1.0.3, SFS read, native utility, Linux
@@ -358,13 +363,15 @@ contains the current test image.
 
 ## Next
 
-0. **Modularisation** (see [REFACTOR.md](REFACTOR.md)): the scheduler is now a
-   module directory; `task.rs`, `wait.rs`, `spawn.rs`, `switch.rs`, then
-   `main.rs`/`linux_abi.rs`/`silvershell.rs` follow, one pure-move commit at a
-   time, each gated by the release smoke test and the SMP self-tests.
-1. Several clients with **per-surface focus** (keyboard/pointer enter/leave
-   driven by surface commits) and a small animation loop in the compositor.
-2. **Streaming SFS** (read blocks on demand instead of loading the whole
-   image) to lift the 32 MiB/RAM limit, then a larger file-tree format.
-3. D-Bus `match` rules / `AddMatch`, then a real daemon or toolkit client.
-4. Network base maintenance: keep-alive, TLS roots/RTC/RNG, TLS 1.2.
+0. **Denial dispatch / first frame**: explain why deniald stops reading a
+   client after the registry handshake (epoll/eventfd level semantics are the
+   current suspects), then get the Flutter engine's frame clock to issue the
+   first atomic commit.
+1. **evdev input**: wire `/dev/input` and the udev/sysfs metadata libinput
+   expects; today the directory is empty.
+2. **Pi 5 evidence**: capture a serial log from the board, then validate the
+   BCM2712 SDHCI path with a real card. The software path is ready; no board
+   claim is made until that log exists.
+3. **Network base maintenance**: keep-alive, TLS roots/RTC/RNG, TLS 1.2.
+4. **SFS crash consistency**: journal or copy-on-write metadata; persistence
+   across reboot already works.

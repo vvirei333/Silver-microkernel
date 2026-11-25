@@ -13,7 +13,9 @@ The native configuration: what boots from a plain Silver image.
 - Filesystem: SFS.
 - Linux ABI: optional (off by default in plain images; enabling the cargo
   feature adds it).
-- Targets: QEMU `virt` today; hardware ports are parked (see ROADMAP.md).
+- Targets: QEMU `virt` today. Raspberry Pi 5 is the intended first physical
+  board; its software paths exist, but no board is supported until a serial
+  log is captured (see [PI5.md](PI5.md)). The Redmi 10C port is parked.
 - Use cases: embedded/consoles, minimal systems, the base-OS foundation the
   other configurations build on.
 
@@ -50,4 +52,4 @@ components — the kernel depends on neither.
   x86-64 translation work would be a separate experimental track and would
   be documented as such.
 - **Phosh/phoc**: a former mobile desktop attempt, PARKED. Kept for history
-  (`docs/ALPINE_PHOSH.md`, archived images); not a configuration.
+  (`docs/archive/ALPINE_PHOSH.md`, archived images); not a configuration.

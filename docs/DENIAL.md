@@ -51,10 +51,12 @@ deliberate for QEMU; the same UAPI path serves real GPUs later.
 
 The engine session starts (display/raster/io threads alive, idle in futex
 waits) but the first frame is not produced: no DRM atomic commit is issued
-after engine start, and scanout buffers stay black. Investigation is split
-between the compositor pipeline (external Wayland client probe `/sfs/wl-client`)
-and Denial's KMS frame-clock mode, where the compositor answers the
-engine's vsync requests itself.
+after engine start, and scanout buffers stay black. The external
+`/sfs/wl-client` probe now completes the Wayland registry handshake and
+receives the global list, but deniald then stops dispatching it: the event
+loop spins level-triggered on the listener and client sockets without reading
+the follow-up bind/shm-pool messages. This dispatch livelock is the current
+suspect for the missing frame clock.
 
 ## Layers Denial brings to the table
 

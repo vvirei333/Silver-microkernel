@@ -1,4 +1,71 @@
-# WerewolfOS 0.1.2 — “First Howl”
+# WerewolfOS release notes
+
+## 1.0.3 — ConsoleOS (2026-11-23)
+
+This is the current release track: the native ConsoleOS bundle on the Silver
+microkernel. The version lives in `Cargo.toml`; the banner, `uname` and the
+Linux `utsname` are generated from it.
+
+Artifacts (`dist/`, never committed):
+
+| Artifact | Description |
+|---|---|
+| `werewolfos-1.0.3-consoleos-aarch64.tar.gz` | kernel + 64 MiB SFS image + install guide + checksums |
+| `werewolfos-1.0.3-consoleos-minimal-aarch64.tar.gz` | same, built with `no_std` only (no Linux ABI code linked) |
+| `silver_microkernel` | release ELF for QEMU `virt` (Cortex-A72) |
+| `disk.img` | SFS image with the native userspace and Linux ABI probes |
+| `MANIFEST`, `SHA256SUMS` | version/features/toolchain and checksums |
+
+### What is in 1.0.3
+
+- AArch64 microkernel with SMP, per-task address spaces, COW fork,
+  capabilities, IPC, mutexes, timers, watchdog and a per-task memory ledger.
+- ConsoleOS: `silverd`, Howl, Scout, the native toolbox, SFS on a synchronous
+  512-byte block device, and a writable root image.
+- Block storage prefers a DTB SDHCI controller, then a PCI SD host
+  controller, then virtio-blk. QEMU's `sdhci-pci` device was exercised with
+  both CSD v1 and CSD v2 cards; the default QEMU boot still uses virtio-blk.
+- virtio-net plus the userspace `net_server`/smoltcp stack: DHCP, DNS, TCP,
+  HTTP and TLS, with `ping`, `ip`, `dns` and `wget`.
+- Optional Linux ABI: static and dynamic glibc, threads, futex, signals,
+  epoll/timerfd/eventfd, memfd, AF_UNIX with `SCM_RIGHTS`, DRM/KMS and
+  udmabuf UAPI. The Mobile image runs Denial on this path.
+- Release gate: `scripts/release_smoke.py` boots the packaged artifacts and
+  checks the banner/version, SFS reads, a native utility, a Linux ELF,
+  `bench` and `health` (8 checks).
+
+### What does not work yet
+
+- **No physical board is supported.** Raspberry Pi 5 is the intended first
+  board; its platform, tree-derived UART/GIC/timer, PSCI and SDHCI software
+  paths exist, but there is no board serial log. The Redmi 10C port is parked.
+- **No first Denial frame.** deniald starts its Flutter engine session and an
+  external Wayland client completes the registry handshake, but deniald then
+  stops dispatching the client; no post-engine atomic commit is issued.
+- **No hardware GPU path.** Denial uses Mesa llvmpipe over the kernel DRM/KMS
+  UAPI; there is no GPU acceleration.
+- evdev input is not wired (`/dev/input` is empty), SFS has no journal, and
+  ordinary-file `ftruncate` supports only length 0.
+
+### Reproduce
+
+```bash
+rustup target add aarch64-unknown-none
+scripts/make_release.sh --smoke
+```
+
+The smoke build uses `no_std,linux-abi`; `scripts/make_release.sh --no-linux`
+produces the minimal console-only variant. See [docs/INSTALL.md](docs/INSTALL.md)
+for the QEMU command and the board checklist.
+
+Verification at this revision: 272 host tests, eight feature builds, release
+smoke 8/8, SMP self-test 16 PASS / 0 FAIL on `-smp 4`, QEMU SDHCI with both
+card geometries, and no Pi 5 hardware log.
+
+## 0.1.2 — “First Howl” (historical)
+
+The notes below are the original 0.1.2 milestone, kept for provenance. The
+Phosh/phoc desktop described there is parked; Denial is the active desktop.
 
 Release date: 2026-11-15
 Tag: `werewolfos-0.1.2`
@@ -11,7 +78,7 @@ the kernel.
 This release is the first one that ships a **real desktop**: Phosh 0.57 running
 on phoc 0.57 over the Linux ABI, rendered by the kernel's software path and
 published into a host window. It also closes the M0 blockers from the master
-plan (see `docs/MASTER_PLAN.md`).
+plan (see `docs/archive/MASTER_PLAN.md`).
 
 ## What is in the box
 
@@ -168,5 +235,6 @@ The full audit trail (snapshots, leads, verdicts, manifests) is in
 ## License and project direction
 
 MIT — see `LICENSE`. The project vector (console OS first, Linux applications
-through the compatibility layer, Phosh as the active desktop goal) is in
-`docs/VECTOR.md`; the roadmap and milestones are in `docs/MASTER_PLAN.md`.
+through the compatibility layer) is in `docs/VECTOR.md`; the historical
+roadmap and milestones are in `docs/archive/MASTER_PLAN.md`. Denial replaced
+Phosh as the active desktop after this milestone.

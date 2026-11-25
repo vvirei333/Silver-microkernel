@@ -1,7 +1,7 @@
-# Вектор проекта — активный статус (2026-11-20)
+# Вектор проекта — активный статус (2026-11-25)
 
 Этот документ — источник истины о направлении. Технические детали — в
-[`REFERENCE.md`](REFERENCE.md) и [`ARCHITECTURE.md`](ARCHITECTURE.md).
+[`REFERENCE.md`](archive/REFERENCE.md) и [`ARCHITECTURE.md`](ARCHITECTURE.md).
 
 ## Решения
 
@@ -61,7 +61,7 @@ inline-CSS и внешними стилями до 64 KiB. Закладки `Ctr
 спиннером, а хост копирует только завершённый кадр. Это всё ещё текстовый
 reader: DOM/JavaScript/CSS-движка и медиа-конвейера нет, поэтому **YouTube
 здесь работать не может** — для него нужен WebKit/Gecko-класс движок по
-треку Linux ABI + Phosh. Дальше: укрепление TLS (больше корней, RTC,
+треку Linux ABI + Denial. Дальше: укрепление TLS (больше корней, RTC,
 энтропия, TLS 1.2), полноценные формы/виджеты, keep-alive,
 damage-прямоугольники, `date` (RTC), pager, больше applets.
 
@@ -137,10 +137,13 @@ Silver-специфичных патчей.
   socket-namespace stat/unlink, group-kill при терминирующих сигналах,
   полный DRM atomic UAPI (SET_CLIENT_CAP, planes, properties, blobs,
   CLOSEFB, PRIME export/import, ADDFB2).
-- **Текущий статус**: deniald доходит до "Created new socket wayland-1"
-  (Wayland-сервер) и "DrmDevice initializing"; текущий стоп — assert
-  systemd-crate `isatty_safe(fd=13)` → EBADF (fd не открыт у нас). Детали и
-  методики — в `handoff.md` "2026-11-20".
+- **Текущий статус**: deniald стартует engine-сессию, внешний
+  `/sfs/wl-client` проходит registry-handshake и получает список globals, но
+  deniald перестаёт читать клиента: event loop крутится level-triggered на
+  listener/client-сокетах, не разбирая bind/shm-pool. Этот dispatch-livelock —
+  текущий подозреваемый в отсутствии frame clock; первого кадра по-прежнему
+  нет. Lazy-fill kill из `mmu::map_user_pages_at_inner` исправлен в `6846e49`.
+  Детали — в `handoff.md` "2026-11-22 (day)".
 
 Вехи:
 
@@ -149,8 +152,8 @@ Silver-специфичных патчей.
 | P1 | Linux ABI: busybox `sh`, glibc-бинарники |
 | P2 | deniald проходит seatd/DrmDevice/EGL (llvmpipe) |
 | P3 | [сделано] deniald: Wayland-сокет, portal IPC, GPU transfer, atomic TEST_ONLY, control socket — полный DE-флоу до старта Flutter |
-| P4 | [текущая точка] ICU закрыт (проба заполняет все 2656 страниц); intermittent kill = bug в mmu::map_user_pages_at_inner (lazyfail reason=map при свободных фреймах) — чинить; engine idle (frame clock не тикает), wl-client probe staged (см. handoff "2026-11-22") |
-| P5 | screencopy-minimal как первый внешний Wayland-клиент |
+| P4 | [текущая точка] ICU закрыт; MMU lazy-fill kill исправлен; wl-client проходит registry-handshake, затем deniald застревает в dispatch-livelock; engine idle, первого кадра нет (см. handoff "2026-11-22 (day)") |
+| P5 | screencopy-minimal как первый внешний Wayland-клиент: handshake уже проверен, atomic commit буфера ещё нет |
 
 Риски: glibc-поведение (треды/exit_group/futex), системная интеграция deniald
 (systemd-crate, portal IPC, D-Bus), ввод через udev/evdev, производительность
@@ -168,7 +171,7 @@ llvmpipe. Каждый риск закрывается своей вехой; д
 - DHCP/DNS/TCP — в этом сервисе; клиенты ходят через общий буфер/ring;
 - TLS — rustls + webpki-roots (no_std), HTTP — свой клиент поверх TCP;
 - браузер — отдельный процесс; у них это порт WebKit (месяцы работы), у нас
-  ближайший шаг — свой HTTP + HTML-подмножество в host-окно, WebKit/Phosh —
+  ближайший шаг — свой HTTP + HTML-подмножество в host-окно, WebKit/Denial —
   следующий трек;
 - POSIX-слой, затем Linux ABI — тот же порядок, что в нашем плане.
 
@@ -179,11 +182,12 @@ llvmpipe. Каждый риск закрывается своей вехой; д
 
 - **Legion Y700 / SM8650**: профиль `tablet` собирается, но не развивается.
 - **Redmi 10C / fog**: RAM-only порт остаётся задокументированным
-  ([`PORTING_FOG.md`](PORTING_FOG.md)), но активная работа — сначала
+  ([`PORTING_FOG.md`](archive/PORTING_FOG.md)), но активная работа — сначала
   QEMU/десктоп и Linux ABI/Denial.
 - **Phosh/phoc**: брошены 2026-11-19 (upstream phoc 0.55.1 heap corruption
   и тяжёлый GTK-стек); образы и наработки сохранены, не развиваются.
-- **Своя графика/композитор**: удалены; окно — только host Qt + один surface.
+- **Свой нативный композитор/окно**: удалены; DRM/KMS UAPI в ядре остаётся
+  путём для Denial, а не отдельной нативной графической подсистемой.
 
 ## 6. Ближайший порядок работ
 
@@ -191,8 +195,9 @@ llvmpipe. Каждый риск закрывается своей вехой; д
    - [сделано] Linux ABI (статика+динамика glibc), файлы, треды, futex,
      Wayland/D-Bus транспорт, полный DRM atomic, glibc-компат-слой;
    - [сделано] deniald проходит seatd → DrmDevice → EGL → Wayland-сокет;
-   - дальше: assert `isatty_safe(fd=13)` (текущий стоп, см. handoff.md);
-   - затем: render loop/Flutter-шелл, evdev/libinput ввод;
+   - [сделано] внешний `/sfs/wl-client` проходит registry-handshake;
+   - дальше: dispatch-livelock после handshake (epoll/eventfd семантика);
+   - затем: frame clock → первый кадр, evdev/libinput ввод;
    - затем: screencopy-minimal как первый внешний клиент.
 2. Сеть как база ОС: keep-alive, больше корней TLS, RTC/энтропия. Это
    обслуживание базы, не прикладной слой.
