@@ -285,8 +285,17 @@ impl Host {
         self.write8(TIMEOUT_CONTROL, 0x0e);
         self.write8(HOST_CONTROL, 0);
         self.write16(HOST_CONTROL2, 0);
-        self.write16(NORMAL_INT_ENABLE, 0);
-        self.write16(ERROR_INT_ENABLE, 0);
+        // Polling still needs the status bits to be enabled: QEMU only sets
+        // them when the matching interrupt-enable bit is on. Signal enable
+        // stays clear, so no IRQ reaches the GIC.
+        self.write16(
+            NORMAL_INT_ENABLE,
+            INT_COMMAND_COMPLETE
+                | INT_DATA_COMPLETE
+                | INT_BUFFER_WRITE_READY
+                | INT_BUFFER_READ_READY,
+        );
+        self.write16(ERROR_INT_ENABLE, 0xffff);
         self.write16(SIGNAL_ENABLE, 0);
         self.clear_interrupts();
 
