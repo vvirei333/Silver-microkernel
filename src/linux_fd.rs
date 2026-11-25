@@ -1049,7 +1049,9 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
     if let Some(device) = device {
         return insert(task, device).ok_or(EMFILE);
     }
-    if !crate::scheduler::read_path_allowed(task, &resolved) {
+    // `/` is the guest root (the SFS mount internally); every Linux task may
+    // reopen it even though the policy prefix is `/sfs`.
+    if resolved != "/" && !crate::scheduler::read_path_allowed(task, &resolved) {
         return Err(EACCES);
     }
     let wants_write =

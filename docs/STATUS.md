@@ -27,7 +27,7 @@ replacing the parked phosh/phoc stack. See [ARCHITECTURE.md](ARCHITECTURE.md),
 | First rendered desktop frame | IN PROGRESS — current stop | scanout buffers verified black; no post-engine atomic commits |
 | Block storage (SDHCI + virtio-blk) | IMPLEMENTED (QEMU) | SFS mounts over DTB/PCI SDHCI; CSD v1/v2, CMD17/24 and a write surviving reboot; no Pi 5 board log |
 | Raspberry Pi 5 (BCM2712) | PLANNED (hardware log) | platform/UART/GIC/timer/PSCI/SDHCI software paths are in the tree; no serial log from a board |
-| evdev input (`/dev/input/event0..1`) | IMPLEMENTED (keyboard + absolute pointer) | two virtio-input devices, evdev ioctls (`EVIOCGVERSION/GID/GNAME/GBIT/GPROP/GKEY/GABS`) and `/dev/input` listing verified in QEMU; the real systemd 257 `libudev` enumerates both devices from `/sys/class/input` + `uevent` with `ID_INPUT=1` / `ID_SEAT=seat0` (`linuxrun /sfs/udev-test`); libinput backend not yet proven |
+| evdev input (`/dev/input/event0..1`) | IMPLEMENTED (keyboard + absolute pointer) | two virtio-input devices, evdev ioctls (`EVIOCGVERSION/GID/GNAME/GBIT/GPROP/GKEY/GABS`) and `/dev/input` listing verified in QEMU; the real systemd 257 `libudev` enumerates both devices from `/sys/class/input` + `uevent` with `ID_INPUT=1` / `ID_SEAT=seat0` (`linuxrun /sfs/udev-test`); real libinput 1.28 with its udev backend adds a keyboard and a pointer (`linuxrun /sfs/libinput-test`) |
 | Package manager (in-OS) | PLANNED | host-side builders only |
 | Persistent writable SFS | IMPLEMENTED | writes survive reboot; `sfs_fsck` clean |
 | SFS journaling / crash consistency | PLANNED | no journal; an interrupted write can leave stale metadata |
@@ -171,7 +171,19 @@ Console-image fixes in the same pass:
   `statx` `STATX_MNT_ID`, `statfs`/`fstatfs` SYSFS magic, directory fds that
   survive `openat(dirfd, ...)`, `/proc/self/fd/N` reopening, `O_NOFOLLOW`
   symlink fds with `readlinkat(fd, "")`, and ENOENT for missing readlink
-  targets. libinput itself is still unproven.
+  targets.
+- **libinput 1.28 udev backend**: `tests/linux/libinput.c` creates a
+  `libinput_udev` context, assigns `seat0` and dispatches the real library.
+  Both devices are added: `QEMU Virtio Keyboard` (keyboard capability) and
+  `QEMU Virtio Tablet` (pointer capability). Three gaps had to close first:
+  `/sys/dev/char/13:64` is now a symlink to `/sys/class/input/event0` (and
+  `13:65` to `event1`) so `udev_device_new_from_devnum()` can match the
+  enumerated syspath; the udev database carries `ID_INPUT_KEYBOARD=1` for
+  the keyboard and `ID_INPUT_MOUSE=1` for the absolute tablet (same tags
+  udev's `input_id` derives from the capabilities); and reopening `/` now
+  passes the read-policy check even though the SFS mount is internally
+  `/sfs`. libinput still reports missing `/usr/share/libinput` quirks
+  (no data files are staged), which only affects behaviour tuning.
 
 ### Wayland
 - Hand-written mini compositor plus a **real `libwayland-client`**:
@@ -389,9 +401,9 @@ contains the current test image.
    client after the registry handshake (epoll/eventfd level semantics are the
    current suspects), then get the Flutter engine's frame clock to issue the
    first atomic commit.
-1. **libinput udev backend**: feed the now-verified `/sys` + `/dev` metadata
-   to libinput 1.28 (`libinput10`/`libevdev2` are staged in the build cache)
-   and route its events through the compositor.
+1. **Route libinput events**: the udev backend now sees both devices; feed
+   `libinput_dispatch()` events into the compositor's seat instead of reading
+   evdev directly, and stage the `/usr/share/libinput` quirks data.
 2. **Pi 5 evidence**: capture a serial log from the board, then validate the
    BCM2712 SDHCI path with a real card. The software path is ready; no board
    claim is made until that log exists.

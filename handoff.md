@@ -8246,3 +8246,46 @@ Night session results, in order:
   272 passed.
 - Open: libinput 1.28 itself has not been run against this backend yet;
   more than two input devices remains out of scope.
+
+### 2026-11-26 — real libinput 1.28 adds both input devices
+
+- Built the actual libinput 1.28 stack from the staged Debian libraries
+  (`libinput.so.10`, `libevdev.so.2`, `libmtdev.so.1`, `libwacom.so.9`,
+  `libgudev-1.0.so.0`, glib/gobject, `libatomic`, `libpcre2-8`, `libffi`)
+  plus `libm.so.6` extracted from the cached libc6 deb. `patchelf` is not
+  available in this shell, so the probe is linked with
+  `zig cc -target aarch64-linux-gnu` and
+  `-Wl,--dynamic-linker=/sfs/ld-linux-aarch64.so.1 -Wl,-rpath,$ORIGIN`
+  instead. `tests/linux/libinput.c` drives the library through its udev
+  backend: create context, assign `seat0`, poll/dispatch up to two
+  `DEVICE_ADDED` events, then check keyboard/pointer capabilities.
+- First run added zero devices. Diagnosed in three steps:
+  1. `open_restricted()` opens the evdev node `O_RDWR`; that worked, and
+     libevdev read the keyboard name, so the fd was fine.
+  2. `evdev_device_have_same_syspath()` calls
+     `udev_device_new_from_devnum(udev, 'c', st_rdev)`, which looks up
+     `/sys/dev/char/13:64`. It only worked once that path became a symlink
+     to `/sys/class/input/event0`; a directory made the syspaths differ and
+     libinput silently dropped the device.
+  3. The devnum lookup then failed with EACCES inside systemd's `chase`:
+     after following the symlink it calls
+     `fd_reopen(root_fd)` -> `openat(root_fd, ".")`, and the read policy
+     rejected `/` because the guest root is internally `/sfs`. Allow
+     `resolved == "/"` in `linux_fd::open`.
+- With the syspath matching, libinput reported not tagged as supported
+  input device: the udev shim only carried `ID_INPUT=1`. The tags are
+  now `ID_INPUT_KEYBOARD=1` for event0 and `ID_INPUT_MOUSE=1` for the
+  absolute tablet. `ID_INPUT_TABLET` was wrong here: the virtio tablet
+  has no pen/stylus/resolution, so libinput (correctly) refused it as a
+  tablet. As a mouse it becomes a pointer.
+- Evidence (QEMU virt, `build/sysfs-test.img`, 2026-11-26):
+  `device added name=QEMU Virtio Keyboard keyboard=1 pointer=0`,
+  `device added name=QEMU Virtio Tablet keyboard=0 pointer=1`,
+  `added=2 keyboard=1 pointer=1`, `libinput ok`, exit status 0. The same
+  image still passes `linux-sysfs` (`sysfs ok`) and `udev-test`
+  (`udev ok`); `cargo test --lib` 272 passed, console build `health`
+  7 live / 0 zombie / 0 open / 0 leaked and `svc` 5 running.
+- Only warning left: libinput cannot find `/usr/share/libinput` quirks,
+  which is tuning data, not an enumeration failure.
+- Open: route `libinput_dispatch()` events into the compositor seat, stage
+  the quirks data, and keep more than two input devices out of scope.

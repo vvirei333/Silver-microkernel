@@ -111,10 +111,16 @@ const CLASS_INPUT_TWO: &[Entry] = &[
     Entry { name: "event1", kind: DT_DIR },
 ];
 
-const UDEV_INPUT0: &[u8] =
-    b"I:1\nE:ID_INPUT=1\nE:ID_SEAT=seat0\nE:ID_PATH=platform-virtio-input0\n";
-const UDEV_INPUT1: &[u8] =
-    b"I:2\nE:ID_INPUT=1\nE:ID_SEAT=seat0\nE:ID_PATH=platform-virtio-input1\n";
+const UDEV_INPUT0: &[u8] = b"I:1\n\
+    E:ID_INPUT=1\n\
+    E:ID_INPUT_KEYBOARD=1\n\
+    E:ID_SEAT=seat0\n\
+    E:ID_PATH=platform-virtio-input0\n";
+const UDEV_INPUT1: &[u8] = b"I:2\n\
+    E:ID_INPUT=1\n\
+    E:ID_INPUT_MOUSE=1\n\
+    E:ID_SEAT=seat0\n\
+    E:ID_PATH=platform-virtio-input1\n";
 
 /// One entry of the synthetic tree.
 pub enum Node {
@@ -239,7 +245,14 @@ fn char_node(rest: &str) -> Option<Node> {
     if let Some(index) = input_minor_of(node) {
         let tail = tail.unwrap_or("");
         return match tail {
-            "" => Some(Node::Dir),
+            // libinput maps an open evdev fd back to a syspath through
+            // udev_device_new_from_devnum(); that path must be the same
+            // symlink target as /sys/class/input/eventN.
+            "" => Some(Node::Symlink(if index == 0 {
+                "/sys/class/input/event0"
+            } else {
+                "/sys/class/input/event1"
+            })),
             "dev" => Some(Node::File(input_dev_file(index))),
             "uevent" => Some(Node::File(crate::virtio_input::sysfs_uevent(index))),
             "subsystem" => Some(Node::Symlink("/sys/class/input")),
