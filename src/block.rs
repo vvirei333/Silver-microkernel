@@ -26,13 +26,16 @@ static mut ACTIVE: Option<Device> = None;
 /// ECAM, so the kernel never touches QEMU's fixed ECAM address there.
 pub fn init(dtb: Option<&[u8]>) -> bool {
     if crate::sdhci::init(dtb) {
-        install(Device {
-            name: "sdhci",
-            sector_count: crate::sdhci::sector_count,
-            read_sector: crate::sdhci::read_sector,
-            write_sector: crate::sdhci::write_sector,
-        });
+        install_sdhci();
         return true;
+    }
+    // A PCI SD host controller is a generic fallback: firmware-assigned BAR
+    // on real ECAM boards, a fixed test window on QEMU's direct-kernel boot.
+    if let Some(base) = crate::pci_boot::sdhci_base() {
+        if crate::sdhci::init_at(base, 0x100, crate::sdhci::Variant::Generic) {
+            install_sdhci();
+            return true;
+        }
     }
     if ecam_available(dtb) && crate::virtio_blk::init() {
         install(Device {
@@ -44,6 +47,15 @@ pub fn init(dtb: Option<&[u8]>) -> bool {
         return true;
     }
     false
+}
+
+fn install_sdhci() {
+    install(Device {
+        name: "sdhci",
+        sector_count: crate::sdhci::sector_count,
+        read_sector: crate::sdhci::read_sector,
+        write_sector: crate::sdhci::write_sector,
+    });
 }
 
 fn install(device: Device) {
