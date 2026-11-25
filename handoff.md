@@ -8162,3 +8162,40 @@ Night session results, in order:
 - Stage deniald runtime deps (denial-settings, denial-polkit-agent,
   libpulse) in the image builder to reduce noise.
 - Frame clock / first frame unchanged (see previous section).
+
+### 2026-11-22 (later) — evdev: keyboard + absolute pointer, capability ioctls
+
+- Rewrote `src/virtio_input.rs` for up to two devices (`MAX_DEVICES = 2`):
+  one `Queue`/`Device` per PCI function, BAR4 relocated to
+  `0x1080_0000`/`0x1084_0000` (0x4000 stride; avoids the blk/gpu/SDHCI/
+  ivshmem windows), per-device rings and capability reads (`ID_NAME`,
+  `ID_PROPS`, `EV_BITS` per event type, `ABS_INFO` per present axis).
+- Config layout gotcha: `struct virtio_input_config` is `select u8, subsel
+  u8, size u8, reserved[5], data[128]` — the payload starts at offset **8**,
+  not 4. Reading at 4 produced a shifted EV_KEY bitmap (199 bits) and empty
+  names/ABS. With the fix event0 reports "QEMU Virtio Keyboard" (EV_KEY 231
+  bits) and event1 "QEMU Virtio Tablet" (EV_KEY 8, EV_ABS 2 bits, ABS_X
+  `0..32767`).
+- QEMU does not enumerate EV_SYN; the driver synthesizes
+  SYN_REPORT|SYN_DROPPED so `EVIOCGBIT(EV_SYN)` matches Linux expectations.
+- `src/linux_fd.rs`: `Target::Input(index)`, `/dev/input` listing
+  (`event0`, `event1`), fstat char dev 13:64+i, per-device read/poll.
+- `src/linux_abi/fs.rs`: `input_ioctl()` serves EVIOCGVERSION
+  (`0x010001`), GID, GNAME (returns the count including NUL), GPHYS/GUNIQ
+  (empty), GPROP, GKEY/GLED/GSND/GSW, GBIT (0x20..0x3f) and GABS
+  (0x40..0x7f, 24-byte `input_absinfo`); other type-0x45 requests return
+  ENOTTY. `/dev/input` is enumerable; the driver starts fine without any
+  virtio-input device.
+- `tests/linux/input.rs` rewritten: prints identity/capabilities for both
+  nodes, expects 3 monitor `sendkey` presses, then 2 QMP
+  `input-send-event` ABS records; exits 0 only when both paths deliver.
+  `tools/input_probe.py` boots QEMU (keyboard + tablet, HMP + QMP sockets),
+  drives the probe and runs `health`/`svc` afterwards.
+- Evidence (QEMU virt, this session): evdev0 version=0x10001 bus=0x6
+  vendor=0x1af4 product=0x1052 name="QEMU Virtio Keyboard" ev=2 keys=231;
+  evdev1 same IDs, name="QEMU Virtio Tablet" keys=8 axes=2 abs_x=0..32767;
+  events `t=1 c=1e v=1`, `t=0 c=0`; abs `t=3 c=0 v=4096`,
+  `t=3 c=1 v=8192`; "input ok", exit status 0; health 7 live / 0 zombie /
+  0 DMA leaks; svc 5 services running; `cargo test --lib` 272 passed.
+- Open: `/sys/class/input` and `uevent` files (libudev/libinput
+  enumeration), readdir; more than two input devices is out of scope.

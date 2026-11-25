@@ -27,7 +27,7 @@ replacing the parked phosh/phoc stack. See [ARCHITECTURE.md](ARCHITECTURE.md),
 | First rendered desktop frame | IN PROGRESS — current stop | scanout buffers verified black; no post-engine atomic commits |
 | Block storage (SDHCI + virtio-blk) | IMPLEMENTED (QEMU) | SFS mounts over DTB/PCI SDHCI; CSD v1/v2, CMD17/24 and a write surviving reboot; no Pi 5 board log |
 | Raspberry Pi 5 (BCM2712) | PLANNED (hardware log) | platform/UART/GIC/timer/PSCI/SDHCI software paths are in the tree; no serial log from a board |
-| evdev input (`/dev/input/event0` via virtio-input) | PARTIALLY IMPLEMENTED | kernel driver + Linux read verified with QEMU `virtio-keyboard-pci`; udev glue for libinput still PLANNED |
+| evdev input (`/dev/input/event0..1`) | IMPLEMENTED (keyboard + absolute pointer) | two virtio-input devices, evdev ioctls (`EVIOCGVERSION/GID/GNAME/GBIT/GPROP/GKEY/GABS`) and `/dev/input` listing verified in QEMU; udev/sysfs metadata for libinput still PLANNED |
 | Package manager (in-OS) | PLANNED | host-side builders only |
 | Persistent writable SFS | IMPLEMENTED | writes survive reboot; `sfs_fsck` clean |
 | SFS journaling / crash consistency | PLANNED | no journal; an interrupted write can leave stale metadata |
@@ -150,12 +150,18 @@ Console-image fixes in the same pass:
 - Writable `/tmp` with `O_CREAT`/`O_EXCL`/`O_TRUNC`, `mkdirat`, `unlinkat`,
   `renameat`; `XDG_RUNTIME_DIR=/tmp`.
 - `MAP_SHARED` memfd windows shared across processes and `fork`.
-- **evdev input**: a polled kernel virtio-input driver (PCI `1af4:1052`) feeds
-  `/dev/input/event0`; `read(2)` returns 24-byte `struct input_event` records
-  and `poll` reports `POLLIN` when the bounded event ring is non-empty.
-  Verified in QEMU with `virtio-keyboard-pci`: `tests/linux/input.rs`
-  (`linuxrun /sfs/linux-input`) prints press/release key events injected via
-  the QEMU monitor `sendkey`. udev glue for libinput is still open.
+- **evdev input**: a polled kernel virtio-input driver (PCI `1af4:1052`) serves
+  up to two devices in PCI order: `event0` (keyboard) and `event1` (absolute
+  pointer/tablet). `read(2)` returns 24-byte `struct input_event` records
+  (including `SYN_REPORT`), `poll` reports `POLLIN` when the bounded
+  per-device ring is non-empty, and the evdev ioctls answer capability
+  queries from the device configuration (`EVIOCGVERSION`, `EVIOCGID`,
+  `EVIOCGNAME`, `EVIOCGBIT`, `EVIOCGPROP`, `EVIOCGKEY`, `EVIOCGABS`). Verified
+  in QEMU with `virtio-keyboard-pci` + `virtio-tablet-pci`:
+  `tests/linux/input.rs` (`linuxrun /sfs/linux-input`, driven by
+  `tools/input_probe.py`) prints monitor-injected key press/release pairs and
+  QMP-injected `ABS_X`/`ABS_Y` events; `EVIOCGABS(ABS_X)` reports `0..32767`.
+  udev/sysfs glue for libinput is still open.
 
 ### Wayland
 - Hand-written mini compositor plus a **real `libwayland-client`**:
@@ -373,8 +379,9 @@ contains the current test image.
    client after the registry handshake (epoll/eventfd level semantics are the
    current suspects), then get the Flutter engine's frame clock to issue the
    first atomic commit.
-1. **evdev input**: wire `/dev/input` and the udev/sysfs metadata libinput
-   expects; today the directory is empty.
+1. **libinput udev glue**: populate `/sys/class/input` and the `uevent`
+   metadata libudev enumerates; `/dev/input/eventN` and the evdev ioctls now
+   exist.
 2. **Pi 5 evidence**: capture a serial log from the board, then validate the
    BCM2712 SDHCI path with a real card. The software path is ready; no board
    claim is made until that log exists.

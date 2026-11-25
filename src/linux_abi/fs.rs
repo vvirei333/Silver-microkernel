@@ -348,6 +348,129 @@ pub(super) fn linux_readv(fd: u64, iovec: u64, count: u64) -> u64 {
     total
 }
 
+/// evdev capability ioctls for `/dev/input/eventN`. Returns `None` when
+/// the request is not an `E`-type evdev command, so the caller can answer
+/// `ENOTTY` like every other non-terminal descriptor.
+fn input_ioctl(index: usize, request: u64, argument: u64) -> Option<u64> {
+    // _IOC layout: dir 30..32, size 16..30, type 8..16, nr 0..8.
+    if ((request >> 8) & 0xff) != 0x45 {
+        return None;
+    }
+    let nr = (request & 0xff) as u8;
+    let size = ((request >> 16) & 0x3fff) as usize;
+    let copy_out = |bytes: &[u8]| -> u64 {
+        if user_memory::copy_to_user(bytes, argument).is_err() {
+            errno(EFAULT)
+        } else {
+            0
+        }
+    };
+    Some(match nr {
+        // EVIOCGVERSION -> EV_VERSION (0x010001).
+        0x01 => {
+            if size < 4 {
+                return Some(errno(EINVAL));
+            }
+            copy_out(&0x0001_0001_u32.to_le_bytes())
+        }
+        // EVIOCGID: struct input_id { bustype, vendor, product, version }.
+        0x02 => {
+            if size < 8 {
+                return Some(errno(EINVAL));
+            }
+            let mut id = [0_u8; 8];
+            id[0..2].copy_from_slice(&0x06_u16.to_le_bytes()); // BUS_VIRTUAL
+            id[2..4].copy_from_slice(&0x1af4_u16.to_le_bytes());
+            id[4..6].copy_from_slice(&0x1052_u16.to_le_bytes());
+            id[6..8].copy_from_slice(&1_u16.to_le_bytes());
+            copy_out(&id)
+        }
+        // EVIOCGNAME(len): the name from the virtio device config.
+        0x06 => {
+            if size == 0 {
+                return Some(errno(EINVAL));
+            }
+            let name = crate::virtio_input::name(index);
+            // Keep one byte for the NUL terminator: never write past the
+            // caller-supplied buffer size.
+            let take = size.saturating_sub(1).min(name.len());
+            let mut buffer = alloc::vec![0_u8; take + 1];
+            buffer[..take].copy_from_slice(&name[..take]);
+            if copy_out(&buffer) == 0 {
+                (take + 1) as u64
+            } else {
+                errno(EFAULT)
+            }
+        }
+        // EVIOCGPHYS: a stable bus/port-style path, one per slot.
+        0x07 => {
+            if size == 0 {
+                return Some(errno(EINVAL));
+            }
+            let phys: &[u8] = if index == 0 {
+                b"virtio0/input0"
+            } else {
+                b"virtio0/input1"
+            };
+            let take = size.saturating_sub(1).min(phys.len());
+            let mut buffer = alloc::vec![0_u8; take + 1];
+            buffer[..take].copy_from_slice(&phys[..take]);
+            if copy_out(&buffer) == 0 {
+                (take + 1) as u64
+            } else {
+                errno(EFAULT)
+            }
+        }
+        // EVIOCGUNIQ: virtio-input has no unique id.
+        0x08 => 0,
+        // EVIOCGPROP: the VIRTIO_INPUT_PROP_* bitmap.
+        0x09 => {
+            let props = crate::virtio_input::props(index);
+            let take = size.min(props.len());
+            copy_out(&props[..take])
+        }
+        // EVIOCGKEY: current key state, tracked from EV_KEY events.
+        0x18 => {
+            let keys = crate::virtio_input::key_state(index);
+            let take = size.min(keys.len());
+            copy_out(&keys[..take])
+        }
+        // EVIOCGLED / EVIOCGSND / EVIOCGSW: no outputs or switches.
+        0x19 | 0x1a | 0x1b => {
+            let take = size.min(96);
+            let zeros = alloc::vec![0_u8; take];
+            copy_out(&zeros)
+        }
+        // EVIOCGBIT(ev, len): the capability bitmap for one event type.
+        0x20..=0x3f => {
+            let bits = crate::virtio_input::ev_bits(index, nr - 0x20);
+            let take = size.min(bits.len());
+            copy_out(&bits[..take])
+        }
+        // EVIOCGABS(abs): struct input_absinfo { value, min, max, fuzz, flat,
+        // resolution }.
+        0x40..=0x7f => {
+            if size < 24 {
+                return Some(errno(EINVAL));
+            }
+            let Some((value, minimum, maximum, fuzz, flat, resolution)) =
+                crate::virtio_input::abs_info(index, nr - 0x40)
+            else {
+                return Some(errno(EINVAL));
+            };
+            let mut raw = [0_u8; 24];
+            for (slot, word) in raw
+                .chunks_exact_mut(4)
+                .zip([value, minimum, maximum, fuzz, flat, resolution])
+            {
+                slot.copy_from_slice(&word.to_le_bytes());
+            }
+            copy_out(&raw)
+        }
+        _ => return Some(errno(ENOTTY)),
+    })
+}
+
 /// `ioctl(2)`: only the terminal size query is meaningful while stdout is the
 /// console. Everything else reports "not a tty".
 pub(super) fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
@@ -373,6 +496,12 @@ pub(super) fn linux_ioctl(fd: u64, request: u64, argument: u64) -> u64 {
         if let Some(result) = crate::drm::render_ioctl(request, argument) {
             return result;
         }
+    }
+    if let Some(index) = linux_fd::input_device(task, fd) {
+        if let Some(result) = input_ioctl(index, request, argument) {
+            return result;
+        }
+        return errno(ENOTTY);
     }
     if request == GPU_IOCTL_FLUSH && linux_fd::is_gpufb(task, fd) {
         return if crate::virtio_gpu::flush() {

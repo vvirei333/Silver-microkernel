@@ -47,6 +47,8 @@
 #   linuxrun /sfs/giotest       # real GIO file I/O + main loop
 #   linuxrun /sfs/linux-libc    # static glibc: stdio/files/dirs, exit 0
 #                               # (only when the cross compiler has libc.a)
+#   linuxrun /sfs/linux-input   # evdev keyboard+tablet probe; inject keys and
+#                               # ABS events with tools/input_probe.py
 #
 # The image is modified in place. It is git-tracked; on first use the script
 # grows the committed base to 16 MiB (scripts/sfs_resize.py preserves the

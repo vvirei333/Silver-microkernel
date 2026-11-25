@@ -257,9 +257,9 @@ enum Target {
     Sysfs(&'static [u8], usize),
     /// A file in the synthetic procfs tree (read-only, process must be init).
     Proc(&'static [u8], usize),
-    /// The evdev-compatible event device (`/dev/input/event0`), backed by
-    /// the kernel's virtio-input driver.
-    Input,
+    /// One evdev event device (`/dev/input/eventN`), backed by the kernel's
+    /// virtio-input driver. The index selects the device.
+    Input(usize),
     /// A synthetic directory listing (`/dev/dri`), with the next entry index.
     DirList {
         entries: &'static [&'static str],
@@ -817,13 +817,19 @@ pub fn require_right(task: u64, fd: u64, need: u32) -> Result<(), u64> {
 
 /// Nodes listed by the synthetic `/dev/dri` directory.
 const DRM_NODES: &[&str] = &["card0", "renderD128"];
-/// `/dev` listing: udev enumerate and glib scan the device root. `input` is
-/// empty until the evdev stage lands; libinput then finds no devices and the
-/// compositor runs headless-of-input.
+/// `/dev` listing: udev enumerate and glib scan the device root.
 const DEV_NODES: &[&str] = &[
     "dri", "input", "shm", "null", "zero", "full", "urandom", "random", "console", "tty0", "tty1",
 ];
-const INPUT_NODES: &[&str] = &["event0"];
+
+/// The `/dev/input` directory, sized to the devices the kernel brought up.
+fn input_nodes() -> &'static [&'static str] {
+    match crate::virtio_input::count() {
+        0 => &[],
+        1 => &["event0"],
+        _ => &["event0", "event1"],
+    }
+}
 
 /// `openat(2)`. Write flags are rejected for real files (the VFS view is
 /// read-only), but synthetic devices accept writes.
@@ -974,10 +980,11 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
             offset: 0,
         }),
         "/dev/input" if crate::virtio_input::present() => Some(Target::DirList {
-            entries: INPUT_NODES,
+            entries: input_nodes(),
             offset: 0,
         }),
-        "/dev/input/event0" if crate::virtio_input::present() => Some(Target::Input),
+        "/dev/input/event0" if crate::virtio_input::present() => Some(Target::Input(0)),
+        "/dev/input/event1" if crate::virtio_input::count() > 1 => Some(Target::Input(1)),
         "/dev/dri" if crate::virtio_gpu::size().is_some() => Some(Target::DirList {
             entries: DRM_NODES,
             offset: 0,
@@ -995,8 +1002,6 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
         return insert(task, device).ok_or(EMFILE);
     }
     if !crate::scheduler::read_path_allowed(task, &resolved) {
-        crate::console::write_str(&resolved);
-        crate::console::write_str("\r\n");
         return Err(EACCES);
     }
     let wants_write =
@@ -1270,11 +1275,11 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             // The caller polls before reading; an empty queue is not an error.
             None => Ok(0),
         },
-        Target::Input => {
+        Target::Input(index) => {
             crate::virtio_input::pump();
             let length = (count as usize).min(64 * 1024);
             let mut records = alloc::vec![0_u8; length];
-            let filled = crate::virtio_input::read_events(&mut records);
+            let filled = crate::virtio_input::read_events(index, &mut records);
             if filled == 0 {
                 // The caller polls before reading; an empty queue is not an error.
                 return Ok(0);
@@ -1402,9 +1407,9 @@ pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize
             buffer.fill(0);
             Ok(count)
         }
-        Target::Input => {
+        Target::Input(index) => {
             crate::virtio_input::pump();
-            let count = crate::virtio_input::read_events(buffer);
+            let count = crate::virtio_input::read_events(index, buffer);
             if count == 0 {
                 Err(EAGAIN)
             } else {
@@ -1430,7 +1435,7 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
                 Ok(count)
             }
         }
-        Target::Input
+        Target::Input(_)
         | Target::Null
         | Target::Zero
         | Target::Random
@@ -1599,8 +1604,16 @@ pub fn stat_fields(
         | Target::Full
         | Target::Random
         | Target::Ivshmem
-        | Target::Input
         | Target::GpuFb => (S_IFCHR | 0o666, 0, fd.max(1), None),
+        Target::Input(index) => (
+            S_IFCHR | 0o660,
+            0,
+            fd.max(1),
+            Some(makedev(
+                crate::virtio_input::EVDEV_MAJOR,
+                crate::virtio_input::EVDEV_MINOR_BASE + index as u32,
+            )),
+        ),
         Target::Drm { render } => (
             S_IFCHR | 0o666,
             0,
@@ -3004,7 +3017,7 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::Prime { .. }
         | Target::MemFd(_)
         | Target::Udmabuf
-        | Target::Input
+        | Target::Input(_)
         | Target::Epoll(_) => (O_RDWR, false),
     };
     Some(access | if nonblock { O_NONBLOCK } else { 0 })
@@ -3056,9 +3069,9 @@ fn poll_ready_at(task: u64, fd: u64, depth: u8) -> Option<i16> {
     Some(match target {
         Target::Console | Target::Null => POLLIN | POLLOUT,
         Target::Zero | Target::Random => POLLIN,
-        Target::Input => {
+        Target::Input(index) => {
             crate::virtio_input::pump();
-            if crate::virtio_input::available() > 0 {
+            if crate::virtio_input::available(index) > 0 {
                 POLLIN
             } else {
                 0
@@ -3319,7 +3332,10 @@ pub fn device_exists(path: &str) -> bool {
         "/dev/console" | "/dev/tty" => true,
         "/dev/ivshmem" => true,
         "/dev/gpufb" => crate::virtio_gpu::size().is_some(),
-        "/dev" | "/dev/input" => true,
+        "/dev" => true,
+        "/dev/input" => crate::virtio_input::present(),
+        "/dev/input/event0" => crate::virtio_input::count() > 0,
+        "/dev/input/event1" => crate::virtio_input::count() > 1,
         "/dev/dri" => crate::virtio_gpu::size().is_some(),
         "/dev/dri/card0" => crate::virtio_gpu::size().is_some(),
         "/dev/dri/renderD128" => crate::virtio_gpu::size().is_some(),
@@ -3391,6 +3407,15 @@ pub fn is_console(task: u64, fd: u64) -> bool {
 pub fn is_drm(task: u64, fd: u64) -> bool {
     let task = crate::scheduler::fd_table_owner(task);
     matches!(lookup(task, fd), Some(Target::Drm { .. }))
+}
+
+/// The evdev device index behind `fd`, if it is a `/dev/input/eventN` node.
+pub fn input_device(task: u64, fd: u64) -> Option<usize> {
+    let task = crate::scheduler::fd_table_owner(task);
+    match lookup(task, fd) {
+        Some(Target::Input(index)) => Some(index),
+        _ => None,
+    }
 }
 
 /// True when `fd` names the virtio-gpu scanout framebuffer.
