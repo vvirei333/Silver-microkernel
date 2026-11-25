@@ -62,7 +62,7 @@ const ACMD6_ARGUMENT: u32 = 2;
 
 /// Board-specific quirks on top of the standard SDHCI register model.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Variant {
+pub(crate) enum Variant {
     Generic,
     Bcm2712,
 }
@@ -403,6 +403,12 @@ pub fn init(dtb: Option<&[u8]>) -> bool {
     let Ok(size) = usize::try_from(reg.size()) else {
         return false;
     };
+    init_at(start, size, variant)
+}
+
+/// Binds a controller at a known physical base. The DTB path sizes the
+/// window from `reg`; a PCI function passes the BAR size it decoded.
+pub(crate) fn init_at(start: usize, size: usize, variant: Variant) -> bool {
     // BCM2712 keeps the SD pin mux in a separate cfg window at +0x400;
     // require that too. Generic hosts only need their own reg window.
     let probe_size = if variant == Variant::Bcm2712 {
@@ -419,7 +425,7 @@ pub fn init(dtb: Option<&[u8]>) -> bool {
         variant,
     };
     console::write_str("SDHCI: base=0x");
-    write_hex(reg.start);
+    write_hex(start as u64);
     console::write_str(if variant == Variant::Bcm2712 {
         " variant=BCM2712"
     } else {
