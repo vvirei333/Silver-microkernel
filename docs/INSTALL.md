@@ -160,10 +160,11 @@ promise of dates):
 4. **Interrupt controller.** Pi 4 uses a GIC-400 at `0xFF84_1000`. GICv2
    dispatch exists (`gic.rs`), again with QEMU's base hardcoded.
 5. **Storage.** The SFS root lives on a block device. Pi 4/5 boot from SD/eMMC
-   through SDHCI; the kernel now has a small block layer and a polled SDHCI
-   core (Pi 5: `brcm,bcm2712-sdhci`, 4-bit at 25 MHz). Neither has run on a
-   board yet, so there is still no supported root filesystem; QEMU keeps
-   using virtio-blk.
+   through SDHCI; the kernel has a small block layer and a polled SDHCI core
+   (Pi 5: `brcm,bcm2712-sdhci`, 4-bit at 25 MHz). The SDHCI core has been
+   exercised in QEMU with `-device sdhci-pci` and a card, including a
+   write that survived reboot, but not on a BCM2712 board. QEMU's default
+   boot remains virtio-blk.
 6. **Power and time.** `poweroff`/`reboot` on a Pi go through the firmware
    mailbox (`0xFE00_B880`), not PSCI `SYSTEM_OFF`; the ARM generic timer works
    if `CNTFRQ_EL0` and the PPI are taken from the FDT.

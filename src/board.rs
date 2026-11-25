@@ -24,10 +24,11 @@ pub enum Kind {
     Fog,
     /// Raspberry Pi 5 (BCM2712, Cortex-A76): PL011 debug UART, GIC-400.
     ///
-    /// Only the identity is wired here (from the live device tree). The console,
-    /// interrupt and storage paths for this board do not exist yet — see
-    /// `docs/PI5.md`. Until they do, a BCM2712 boot must fail closed rather than
-    /// fall into another platform's MMIO map.
+    /// Only the identity is wired here (from the live device tree). The console
+    /// and interrupt paths for this board do not exist yet; the generic SDHCI
+    /// storage core does, but has no BCM2712 hardware log — see `docs/PI5.md`.
+    /// A BCM2712 boot must fail closed rather than fall into another
+    /// platform's MMIO map.
     Bcm2712,
     /// No reliable identification. Every device path must fail closed.
     Unknown,

@@ -53,9 +53,14 @@ loader.
 ## block devices — IMPLEMENTED (device side)
 
 `block` owns one synchronous 512-byte device and SFS sits above it. `init`
-prefers a polled SDHCI card and falls back to virtio-blk when the tree has an
-ECAM host; QEMU therefore keeps using virtio-blk. The SDHCI path has not run
-on a Pi 5. No partitioning. Writes are **write-through**: the block cache
+prefers a DTB-described SDHCI controller, then a PCI SD host controller, then
+virtio-blk when the tree has an ECAM host. QEMU's default boot still uses
+virtio-blk; adding `-device sdhci-pci` plus a card exercises the same SDHCI
+core as the board. In that QEMU setup a 64 MiB byte-addressed card (CSD v1)
+and a 4 GiB block-addressed card (CSD v2) both mount SFS, sector reads and
+writes use CMD17/CMD24, and a file created at the shell survives reboot.
+The SDHCI path has not run on a Pi 5. No partitioning. Writes are
+**write-through**: the block cache
 updates the image through the device on every create/write/remove, so a file
 written at the shell survives a reboot (verified: `echo … > /sfs/keep.txt`,
 reboot, `cat`, then `scripts/sfs_fsck.py` reports no cross-links and a

@@ -28,7 +28,7 @@
 | virtio-gpu | in-kernel DRM/KMS implementation (drm.rs) exposing the Linux UAPI | IMPLEMENTED (deviation) |
 | Input (evdev) | absent; `/dev/input` is an empty dir | PLANNED |
 | Audio / USB / RP1 | absent | PLANNED |
-| SDHCI | polled in-kernel, generic core with a BCM2712 quirk | SOFTWARE PATH, no board run |
+| SDHCI | polled in-kernel, generic core with a BCM2712 quirk; DTB or PCI transport | SOFTWARE PATH; QEMU `sdhci-pci` exercised, no BCM2712 board run |
 
 ## Deviations, and why
 

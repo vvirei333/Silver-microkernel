@@ -19,7 +19,7 @@ the same plan applies one step earlier in the SoC family.
 | Console | PL011 debug UART (uart10 on a Pi 5) at 115200 8N1 on the header | known shape; base, INTID and reference clock are read from the node, including the Pi's `clocks = <&clk_uart>` phandle form |
 | Interrupts | GIC-400, ARM generic timer PPI | known shape; distributor and CPU-interface bases and the timer PPI INTID are all read from the tree (verified on QEMU's tree) |
 | Secondary cores / power | PSCI via firmware | expected, to be confirmed |
-| Storage | the Pi 5 microSD slot is the BCM2712 `sdio1` controller (`brcm,bcm2712-sdhci`, `reg = <0x10 0x00fff000 ...>`, IRQ 273). RP1 contains `rp1_mmc0`/`rp1_mmc1`, but both are `disabled` in the Pi 5 tree. RP1 is still needed for USB and Ethernet, not for the SD card. | controller and tree shape known; no hardware log yet |
+| Storage | the Pi 5 microSD slot is the BCM2712 `sdio1` controller (`brcm,bcm2712-sdhci`, `reg = <0x10 0x00fff000 ...>`, IRQ 273). RP1 contains `rp1_mmc0`/`rp1_mmc1`, but both are `disabled` in the Pi 5 tree. RP1 is still needed for USB and Ethernet, not for the SD card. | controller and tree shape known; generic core and PCI transport exercised under QEMU, no BCM2712 hardware log |
 | Firmware services | mailbox for poweroff/reboot, framebuffer (not needed for a console image) | known shape, to be implemented |
 
 Two rules follow from the right-hand column:
@@ -37,7 +37,7 @@ Two rules follow from the right-hand column:
 | P0 | Firmware hands over to the kernel and the UART prints | a boot log on the header UART through the first `console::init` line | ~~platform `Kind` for BCM2712~~ (done), ~~PL011 base and reference clock from the DTB~~ (done), ~~link base as a build parameter~~ (done), remaining: confirm the firmware's `kernel_address`/armstub handoff and capture the first serial log; the stub already drops EL2 → EL1 when the firmware enters there |
 | P1 | Interrupts and time | timer tick, GIC init, `health`/`uptime` advancing, no fault | ~~GIC-400 base from the DTB~~ (done), ~~timer PPI selection~~ (done), ~~PSCI conduit and per-CPU MPIDR from the tree~~ (done), remaining: a hardware run |
 | P2 | Console userspace from RAM | `howl>` prompt and `help` **with no storage at all** | already reachable on QEMU with no disk: the shell and its commands are embedded in the kernel; remaining: one Pi 5 serial log |
-| P3 | Root filesystem on the board | `ls /sfs` reads the real image; `cat`, `spawn`, `bench fs` work | ~~PCIe host discovery and RP1 identification~~ (software); ~~block-device layer and polled SDHCI core, including the BCM2712 `sdio1` pin mux and 4-bit/25 MHz bring-up~~ (software, not hardware-verified); remaining: one Pi 5 serial log with an actual card, and RP1 USB/Ethernet if SD is unavailable |
+| P3 | Root filesystem on the board | `ls /sfs` reads the real image; `cat`, `spawn`, `bench fs` work | ~~PCIe host discovery and RP1 identification~~ (software); ~~block-device layer and polled SDHCI core, including the BCM2712 `sdio1` pin mux and 4-bit/25 MHz bring-up~~ (software); ~~generic SDHCI command/card/read/write path exercised under QEMU's `sdhci-pci`~~ (software); remaining: one Pi 5 serial log with an actual card, and RP1 USB/Ethernet if SD is unavailable |
 | P4 | Power control | `poweroff`/`reboot` from the shell | ~~PSCI conduit from the tree~~ (done); remaining: confirm `SYSTEM_OFF`/`SYSTEM_RESET` over SMC on the board (use the mailbox only if firmware lacks PSCI power calls) |
 | P5 | Network (optional) | `ping`/`wget` over the on-board Ethernet | RP1 Ethernet + the existing virtio-free userspace stack |
 
@@ -55,8 +55,10 @@ without waiting for the storage stack, which is the riskiest part of the board.
    a small block layer with a polled SDHCI back end. The Pi 5 path is BCM2712
    `sdio1`, not RP1: the driver selects an enabled `brcm,bcm2712-sdhci` node,
    applies the SD pin mux and brings the card up at 400 kHz, then 4-bit at
-   25 MHz. QEMU still uses virtio-blk. What is missing is hardware evidence
-   with a real card, plus RP1 USB/Ethernet for the other I/O.
+   25 MHz. QEMU's default boot still uses virtio-blk; its `sdhci-pci`
+   device exercises the same core, including CMD17/CMD24 and a write that
+   survived reboot. What is missing is BCM2712 hardware evidence with a
+   real card, plus RP1 USB/Ethernet for the other I/O.
 3. P4: check whether the Pi firmware implements PSCI `SYSTEM_OFF` and
    `SYSTEM_RESET`; only add mailbox power control if it does not.
 
@@ -195,6 +197,7 @@ The most useful contributions are *data from real hardware*, not patches:
 
 | Date | Change | Evidence |
 |---|---|---|
+| 2026-11-25 | The generic SDHCI core can bind a PCI SD host controller, not only a DTB node. `pci_boot` recognizes class `0805`, enables the memory BAR, and QEMU's direct-kernel path assigns a free window only for its own `sdhci-pci` device. Also fixed the polled path to enable the SDHCI status bits: QEMU only raises command/data complete when the matching interrupt-enable bit is set, so the old zero-enable setup timed out on every command. | 272 host tests; QEMU `sdhci-pci` + 64 MiB card logs `PCI: SDHCI bar=0x10300000`, `BLOCK: sdhci sectors=131072`, mounts SFS with both a 64 MiB byte-addressed card and a 4 GiB block-addressed card, issues CMD17/CMD24, and `touch /sfs/pci-persist` survives a reboot on a copy; default virtio-blk boot unchanged; still no Pi 5 log |
 | 2026-11-25 | SFS is no longer welded to virtio-blk. `block` owns one synchronous 512-byte device and `init` picks SDHCI first, then virtio-blk only when the tree has an ECAM host (or no tree). The polled SDHCI core is generic; `brcm,bcm2712-sdhci` adds the BCM2712 SD pin mux and 200 MHz base-clock fallback. Pi 5 microSD is BCM2712 `sdio1`, not RP1; the RP1 MMC nodes are disabled. The BCM peripheral mapping grows from 2 MiB to 16 MiB so `0x10_00fff000` is reachable. | 270 host tests; no_std and QEMU boots with and without a DTB still select `virtio-blk`; SDHCI command/card path is software-only, no Pi 5 log |
 | 2026-11-24 | PCIe discovery is tree-driven. `pci` parses `pci-host-ecam-generic` and `brcm,bcm2712-pcie`, and an MMIO backend reads either ECAM or the BCM2712 index (`0x9000`) / data (`0x8000`) registers. Enumeration records vendor/device/class, skips disabled hosts, and recognizes RP1 as `1de4:0001` at `01:00.0`. The BCM controller block is mapped as Device memory in the kernel page tables. | 261 host tests; `no_std` build; flat-Image QEMU boot with a real DTB logs `PCI: host=ECAM`, four functions and the shell still runs; BCM/RP1 path is covered by parser and scanner tests, not hardware |
 | 2026-11-24 | PSCI conduit and AP MPIDRs come from the live tree instead of the board name and CPU index. `fdt` reads `/psci/method` (`hvc`/`smc`) and each `/cpus/cpu*` `reg`; `power` caches the conduit and issues both power and `CPU_ON` through it. This is what the Pi 5 needs (`smc`, clustered affinity); QEMU keeps `hvc` and the index fallback. Also confirmed the no-storage console path already works: QEMU without any disk reaches `howl>`, `help` and `health`. | 254 host tests; no_std and `smp-selftest` builds; `-smp 4` boot 11/11 self-tests; no-disk serial log shows `howl>` + `help` + `health` |
