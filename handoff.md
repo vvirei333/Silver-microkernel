@@ -8113,6 +8113,11 @@ Night session results, in order:
 - Stage 3: evdev /dev/input + udev /sys/class/input glue for libinput.
 - Cleanup: SOCKDBG/SOCKCL/SOCKEOF/SOCKRD, OPENFAIL/EXECFAIL and UDMABUF
   debug prints were removed (2026-11-25); VFSDBG was already gone.
+
+- Windows footgun: writing disk.img through a Python `mmap` does NOT update
+  the file mtime, so `git status` keeps reporting the image clean (the stat
+  cache matches). After any `sfs_inject` run on Windows, `touch disk.img`
+  before committing, or the injection silently escapes version control.
   FAIL_RING/TRACE_RING scaffolding, futex filter is OFF in TRACE_RING.
 
 ### 2026-11-22 (day) — wayland client handshake works; dispatch livelock found
