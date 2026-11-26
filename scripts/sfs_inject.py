@@ -12,11 +12,12 @@ without embedding the binary in the kernel image.
 Usage:
   python3 scripts/sfs_inject.py disk.img /path/to/file.elf [name]
 
-`name` defaults to the source basename. The destination is the image root
-directory (mounted as `/sfs`). An existing entry with the same name is
-replaced, freeing the old blocks first. Files up to the VFS limit (4 direct +
-128 indirect + 128*128 double-indirect + 128^3 triple-indirect blocks) are
-supported.
+`name` defaults to the source basename. A plain name lands in the image
+root directory (mounted as `/sfs`); a slash-separated name lands at that
+path below the root, creating missing parent directories. An existing entry
+with the same name is replaced, freeing the old blocks first. Files up to
+the VFS limit (4 direct + 128 indirect + 128*128 double-indirect + 128^3
+triple-indirect blocks) are supported.
 """
 
 import mmap
@@ -411,9 +412,14 @@ def main() -> int:
     with open(source, "rb") as handle:
         payload = handle.read()
     image = Image(image_path)
-    image.write_file(name, payload)
+    # A destination with slashes is a path below the root; the parents are
+    # created as real SFS directories (libinput needs /usr/share/libinput).
+    if "/" in name.strip("/"):
+        image.write_file_at(name, payload)
+    else:
+        image.write_file(name, payload)
     image.save()
-    print(f"{image_path}: wrote {len(payload)} bytes as /{name}")
+    print(f"{image_path}: wrote {len(payload)} bytes as /{name.strip('/')}")
     return 0
 
 

@@ -8319,9 +8319,26 @@ Night session results, in order:
   (`sysfs ok`), `udev-test` (`udev ok`), `linux-input` (`input ok`),
   `cargo test --lib` 272 passed, console `health` 7 live / 0 zombie / 0 open /
   0 leaked, `svc` 5 running.
-- Open: feed `libinput_dispatch()` events into the compositor seat and stage
-  `/usr/share/libinput` quirks; more than two input devices stays out of
-  scope.
+- Open: feed `libinput_dispatch()` events into the compositor seat; more than
+  two input devices stays out of scope.
+
+### 2026-11-26 (quirks) — stage libinput quirks instead of warning
+
+- `libinput-bin` (Debian trixie) carries the 50
+  `/usr/share/libinput/*.quirks` files; `libinput10` does not. Extracted them
+  from `build/deb-cache/libinput-bin_1.28.1-1+deb13u1_arm64.deb` and injected
+  all 50 into the scratch image, which first needed nested destinations:
+  `scripts/sfs_inject.py` now routes a slash-separated name through
+  `Image.write_file_at()`, creating real SFS parent directories.
+- `tools/build_glibc_denial.py` adds `libinput-bin` to `DEBIAN_ROOTS`; the
+  closure unpack already copies `/usr/share/libinput`, so the Denial image
+  gets the same data on its next build.
+- Evidence (QEMU virt, `build/sysfs-test.img`): with the quirks staged,
+  `libinput-test` prints no `failed to find data files` / `Failed to load the
+  device quirks` warning and still reports `device added` for both devices,
+  `key event code=30 state=1`, `key=30`, `libinput ok`. `sfs_fsck.py` reports
+  `141 files, 7 dirs`, no cross-links and a consistent bitmap; `linux-sysfs`
+  and `udev-test` still pass.
 
 ### 2026-11-26 (blocking evdev) — block instead of spinning on EAGAIN
 

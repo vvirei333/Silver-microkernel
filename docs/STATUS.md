@@ -194,9 +194,11 @@ Console-image fixes in the same pass:
   key; an empty non-blocking evdev `read` returned 0 instead of `EAGAIN`, so
   libevdev saw end-of-device; and event timestamps always had `tv_sec = 0`.
   The type set is now rebuilt from the per-type bitmaps, empty reads return
-  `EAGAIN`, and timestamps come from the monotonic tick counter. libinput
-  still reports missing `/usr/share/libinput` quirks (no data files are
-  staged), which only affects behaviour tuning.
+  `EAGAIN`, and timestamps come from the monotonic tick counter. The 50
+  `/usr/share/libinput/*.quirks` files from Debian `libinput-bin` are staged
+  in the test image (`sfs_inject.py` now creates nested destinations) and
+  `tools/build_glibc_denial.py` adds `libinput-bin` to the Denial closure, so
+  libinput no longer reports missing quirks data.
 
 ### Wayland
 - Hand-written mini compositor plus a **real `libwayland-client`**:

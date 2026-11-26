@@ -50,7 +50,7 @@ DEBIAN_ROOTS = [
     "libc6", "libgcc-s1", "libstdc++6",
     "libgbm1", "libegl1", "libgl1-mesa-dri",
     "seatd", "libseat1", "libudev1",
-    "libinput10", "libxkbcommon0",
+    "libinput10", "libinput-bin", "libxkbcommon0",
     "libglib2.0-0t64", "libpolkit-agent-1-0", "libpolkit-gobject-1-0",
     "libfontconfig1",
 ]
