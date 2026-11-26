@@ -297,6 +297,7 @@ pub fn spawn_thread(
         ),
         user_stack: MemoryRegion::new(0, 0),
         user_stack_generation: 0,
+        user_stack_cow: Default::default(),
         private_page: 0,
         private_page_generation: 0,
         space_token: TableToken::empty(),

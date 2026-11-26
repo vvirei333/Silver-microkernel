@@ -818,8 +818,8 @@ pub fn remap_private_page(ttbr0: usize, physical: usize) -> bool {
 }
 
 /// Re-points an existing user range at a new physical run with one uniform
-/// protection. Used by the COW fault path after it copied a stack/heap/mmap
-/// run. All target slots must already be live pages.
+/// protection. Used by the COW fault path for one image/stack page and for a
+/// copied heap/mmap run. All target slots must already be live pages.
 pub fn remap_user_pages_at(
     ttbr0: usize,
     virtual_address: usize,
@@ -877,72 +877,6 @@ pub fn remap_user_pages_at(
                 l3_index,
                 user_anonymous_page(physical_start + index * GRANULE, prot),
             );
-            clean_entry_line(l3, l3_index);
-        }
-    }
-    finish_table_changes_for(ttbr0);
-    true
-}
-
-/// Re-points an existing image range at a new physical run, preserving each
-/// page's permission class. The COW path uses this after copying a whole
-/// image run and promoting `Cow` pages back to `Data`.
-pub fn remap_user_kinds_at(
-    ttbr0: usize,
-    virtual_address: usize,
-    physical_start: usize,
-    kinds: &[crate::elf::PageKind],
-) -> bool {
-    if kinds.is_empty() || virtual_address % GRANULE != 0 || physical_start % GRANULE != 0 {
-        return false;
-    }
-    let Some(span) = kinds.len().checked_mul(GRANULE) else {
-        return false;
-    };
-    let Some(end) = virtual_address.checked_add(span) else {
-        return false;
-    };
-    if virtual_address < GRANULE || end > USER_STACK_VA + USER_STACK_SIZE {
-        return false;
-    }
-    let root = root_of(ttbr0);
-    unsafe {
-        let l1_user = follow_table(root, 0);
-        for index in 0..kinds.len() {
-            let va = virtual_address + index * GRANULE;
-            let l1_index = (va >> 30) & (ENTRIES - 1);
-            let l2_index = (va >> 21) & (ENTRIES - 1);
-            let l3_index = (va >> 12) & 0x1FF;
-            let l2_entry = read_entry(l1_user, l1_index);
-            if l2_entry & DESC_TABLE != DESC_TABLE {
-                return false;
-            }
-            let l2 = descriptor_address(l2_entry) as usize;
-            let l3_entry = read_entry(l2, l2_index);
-            if l3_entry & DESC_TABLE != DESC_TABLE {
-                return false;
-            }
-            let l3 = descriptor_address(l3_entry) as usize;
-            if read_entry(l3, l3_index) & DESC_PAGE != DESC_PAGE {
-                return false;
-            }
-        }
-        for (index, kind) in kinds.iter().enumerate() {
-            let va = virtual_address + index * GRANULE;
-            let l1_index = (va >> 30) & (ENTRIES - 1);
-            let l2_index = (va >> 21) & (ENTRIES - 1);
-            let l3_index = (va >> 12) & 0x1FF;
-            let l2 = descriptor_address(read_entry(l1_user, l1_index)) as usize;
-            let l3 = descriptor_address(read_entry(l2, l2_index)) as usize;
-            let physical = physical_start + index * GRANULE;
-            let descriptor = match kind {
-                crate::elf::PageKind::Text => user_text_page(physical),
-                crate::elf::PageKind::ReadOnly | crate::elf::PageKind::Cow => {
-                    user_rodata_page(physical)
-                }
-                crate::elf::PageKind::Data => user_data_page(physical),
-            };
-            write_entry(l3, l3_index, descriptor);
             clean_entry_line(l3, l3_index);
         }
     }
@@ -1098,17 +1032,21 @@ pub fn unmap_user_pages_at(ttbr0: usize, virtual_address: usize, page_count: usi
 /// pages: the Linux loader fills and zeroes the whole run before the space
 /// exists, and zeroing here would erase the code it just copied.
 ///
+/// A page recorded in `run.cow_pages` is mapped from its private frame instead
+/// of the base run, so a forked child sees the parent's already-broken pages.
+///
 /// Runs under the kernel lock, for a space that is not executing. On failure
 /// the pages installed by this call are unmapped again; tables allocated by it
 /// stay registered with the space and are reclaimed if the space is destroyed.
 #[cfg(feature = "linux-abi")]
 pub fn install_linux_run(
     ttbr0: usize,
-    virtual_address: usize,
-    physical_start: usize,
-    page_count: usize,
-    kinds: &[crate::elf::PageKind],
+    run: &crate::linux_elf::LinuxRun,
 ) -> bool {
+    let virtual_address = run.virtual_address;
+    let physical_start = run.physical_start;
+    let page_count = run.page_count;
+    let kinds = &run.kinds;
     if page_count == 0
         || kinds.len() != page_count
         || virtual_address % GRANULE != 0
@@ -1177,7 +1115,13 @@ pub fn install_linux_run(
                 rollback_linux_run(ttbr0, virtual_address, installed);
                 return false;
             }
-            let physical = physical_start + index * GRANULE;
+            // A page broken out by COW lives in its own frame; the rest of
+            // the run is still the original contiguous allocation.
+            let physical = run
+                .cow_pages
+                .get(&(index as u32))
+                .map(|&(page, _)| page)
+                .unwrap_or(physical_start + index * GRANULE);
             // The software page watch (debug::arm_soft_log) needs the watched
             // data page mapped read-only at exec time, so its first write
             // faults into the logging path instead of passing silently.
@@ -1212,13 +1156,7 @@ pub fn install_linux_run(
 #[cfg(feature = "linux-abi")]
 pub fn install_linux_image(ttbr0: usize, image: &crate::linux_elf::LinuxImage) -> bool {
     for run in &image.runs {
-        if !install_linux_run(
-            ttbr0,
-            run.virtual_address,
-            run.physical_start,
-            run.page_count,
-            &run.kinds,
-        ) {
+        if !install_linux_run(ttbr0, run) {
             return false;
         }
     }

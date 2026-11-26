@@ -8539,3 +8539,43 @@ Night session results, in order:
 - Still open: heap **quotas** (this is accounting, not a limit), wait-queue
   growth, and per-process aggregate limits. The next memory slice remains
   page-granular COW for contiguous image/stack runs.
+
+### 2026-11-26 (page-granular COW) - copy one image/stack page, not the run
+
+- A forked ELF image used to copy its whole contiguous data run on the first
+  write to any page; a 1 MiB BSS therefore turned one byte into 256 frame
+  copies. The user stack had the same problem (eight pages).
+- `LinuxRun` now carries `cow_pages: BTreeMap<u32, (physical, generation)>`,
+  keyed by page offset. The base run stays owned as a whole; a COW fault
+  allocates one tagged frame, copies only the faulting page from either the
+  base run or an earlier override, remaps one PTE writable, frees the replaced
+  override reference, and records the new frame. `Task` has the matching
+  `user_stack_cow` map for the fixed stack window.
+- `LinuxImage::share` bumps the base run and every override page, converts
+  writable kinds to `Cow`, and copies the override map; `install_linux_run`
+  maps an override frame when present. Forking after the parent has already
+  broken pages therefore gives the child the parent's private bytes instead of
+  the stale base page. `ForkParts` and `execve` release overrides with the
+  stack/image they belong to, and the ledger charges exactly one new frame per
+  first break (replacing an override is net-zero).
+- `remap_user_kinds_at` (whole-run remap) and the unused deep `duplicate`
+  path are gone. `protect_cow_image` still protects parent pages using the
+  child's `Cow` kinds, so overrides are covered by the same read-only pass.
+- The base page of a broken offset stays part of the contiguous run until the
+  image/stack is released. That is a bounded stale frame per written page, not
+  a leak; splitting a run into per-page allocations would need a `VmObject`.
+- `tests/linux/cowfork.c` now forks a second time after the parent has written
+  image, mmap, stack and heap pages. The second child checks the parent's
+  private bytes, writes all of them, and the parent verifies isolation again.
+- Evidence (QEMU virt, Linux ABI kernel): `linux-cowfork` prints
+  `cow fork ok`; both children (tasks 8 and 9) exit 0. A clean-boot `health`
+  and the same boot after the test both report `frames: used 9353`, so the two
+  child teardowns leak no override frames. `linux-fork`,
+  `linux-pthread-lifetime`, `linux-signal` and `linux-kill-group` still hit
+  their markers, and `health` reports `zombie 0`. `cargo test --lib` remains
+  272 passed; `no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,gdb-stub`,
+  `no_std,smp-selftest` and `no_std,tablet` check cleanly. The console kernel
+  still reports `heap: used 76 / 16384 KiB` and `memory: normal`.
+- Still open: page-granular COW for writable `mmap` regions (they still copy
+  a whole run), and a VmObject/page-cache representation that can split a
+  contiguous image run and reclaim the stale base page.

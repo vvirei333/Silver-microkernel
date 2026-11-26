@@ -7,8 +7,9 @@
  * The parent fills a large BSS array, an anonymous mapping and a stack array,
  * forks, then waits. The child checks the inherited values, writes different
  * bytes everywhere and exits. The parent re-checks that its pages were not
- * changed, then writes its own values. This covers image data, mmap and stack
- * COW runs.
+ * changed, then writes its own values. It forks again after those writes so
+ * the child must inherit the parent's private image, mmap, stack and heap
+ * pages. This covers page-granular image/stack COW and run-granular mmap COW.
  */
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
     register long x8 __asm__("x8") = n;
@@ -51,6 +52,31 @@ static unsigned char image_data[1024 * 1024];
 static unsigned char *mapping;
 static unsigned char *stack_data;
 static unsigned char *heap_data;
+
+/* After the parent has broken one page of each kind, a second fork must
+ * inherit those private pages (not the stale base frames) and share them
+ * copy-on-write in turn. */
+static int child_check_after_parent(void) {
+    if (image_data[0] != 0x55 || image_data[512 * 1024] != 0xA5) {
+        return 20;
+    }
+    if (mapping[0] != 0x66 || mapping[128 * 1024] != 0x11) {
+        return 21;
+    }
+    if (stack_data[0] != 0x99 || heap_data[0] != 0xBB || heap_data[1] != 0xCC) {
+        return 22;
+    }
+    image_data[0] = 0x15;
+    image_data[512 * 1024] = 0x25;
+    mapping[0] = 0x35;
+    stack_data[0] = 0x45;
+    heap_data[0] = 0x55;
+    if (image_data[0] != 0x15 || image_data[512 * 1024] != 0x25 ||
+        mapping[0] != 0x35 || stack_data[0] != 0x45 || heap_data[0] != 0x55) {
+        return 23;
+    }
+    return 0;
+}
 
 static int child_check(void) {
     const long SIZE = 256 * 1024;
@@ -157,6 +183,29 @@ void _start(void) {
     if (image_data[0] != 0x55 || mapping[0] != 0x66 || stack_data[0] != 0x99 ||
         heap_data[0] != 0xBB || heap_data[1] != 0xCC) {
         fail("parent write failed\n", 20, 6);
+    }
+
+    /* The parent has now broken image, mmap, stack and heap pages. A second
+     * child must see those private values, not the original base run. */
+    long pid2 = sys5(220, 17, 0, 0, 0, 0);
+    if (pid2 < 0) {
+        fail("second fork failed\n", 18, 14);
+    }
+    if (pid2 == 0) {
+        sys3(93, child_check_after_parent(), 0, 0);
+        for (;;) {
+        }
+    }
+    int status2 = 0;
+    if (sys4(260, pid2, (long)&status2, 0, 0) != pid2) {
+        fail("second wait failed\n", 18, 15);
+    }
+    if (((status2 >> 8) & 0xff) != 0) {
+        fail("second child saw stale page\n", 27, 16);
+    }
+    if (image_data[0] != 0x55 || image_data[512 * 1024] != 0xA5 ||
+        mapping[0] != 0x66 || stack_data[0] != 0x99 || heap_data[0] != 0xBB) {
+        fail("second child changed parent\n", 27, 17);
     }
 
     sys3(64, 1, (long)"cow fork ok\n", 12);

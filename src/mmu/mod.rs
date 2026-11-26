@@ -46,7 +46,7 @@ pub use user::{
     unmap_user_heap_page, map_user_pages_at, map_shared_user_pages_at,
     map_shared_writable_pages_at, map_user_page_at, protect_user_pages_at,
     protect_user_pages_at_lenient, protect_private_page, remap_private_page,
-    remap_user_pages_at, remap_user_kinds_at, unmap_user_pages_at_lenient,
+    remap_user_pages_at, unmap_user_pages_at_lenient,
     unmap_user_pages_at, range_mapped_by, revoke_phys_range, map_phys_to_user,
     map_phys_nc_to_user, map_dma_to_user, map_dma_to_user_space,
     map_shared_normal_to_user, map_shared_dma_to_user, destroy_task_space,

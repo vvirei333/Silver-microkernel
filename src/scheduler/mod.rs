@@ -2495,8 +2495,9 @@ pub fn exec_linux_current(
         );
     }
 
-    let (old_resources, old_stack, old_stack_generation) = {
+    let (old_resources, old_stack, old_stack_generation, old_stack_cow) = {
         let task = current_task_mut()?;
+        let old_stack_cow = core::mem::take(&mut task.user_stack_cow);
         let old_resources = SpaceResources {
             ttbr0: task.ttbr0,
             space_token: task.space_token,
@@ -2520,6 +2521,7 @@ pub fn exec_linux_current(
             new_stack_start + TASK_USER_STACK_SIZE,
         );
         task.user_stack_generation = new_stack_generation;
+        task.user_stack_cow.clear();
         task.linux_image = Some(image);
         task.user_image = None;
         task.mmap_bytes = 0;
@@ -2533,7 +2535,7 @@ pub fn exec_linux_current(
         // superseded image. The next EL0 exit restores these zeroes.
         task.fp = smp::FpState::zero();
         unsafe { *smp::this_cpu().fp.get() = smp::FpState::zero(); }
-        (old_resources, old_stack, old_stack_generation)
+        (old_resources, old_stack, old_stack_generation, old_stack_cow)
     };
 
     // TTBR0 must point at the new space before the old tables are retired.
@@ -2545,6 +2547,9 @@ pub fn exec_linux_current(
             TASK_USER_STACK_PAGES,
             old_stack_generation,
         );
+    }
+    for (_, (page, generation)) in old_stack_cow {
+        let _ = frame_allocator::free_page_tagged(page, generation);
     }
 
     Some(ExecResult {
@@ -2563,6 +2568,7 @@ struct ForkParts {
     /// The private page; owned by the space once `space` is `Some`.
     private: Option<(usize, u32)>,
     stack: Option<(usize, u32)>,
+    stack_cow: BTreeMap<u32, (usize, u32)>,
     heap: Vec<(usize, u32)>,
     mmap: Vec<MmapRegion>,
 }
@@ -2582,6 +2588,9 @@ impl Drop for ForkParts {
                 TASK_USER_STACK_PAGES,
                 generation,
             );
+        }
+        for &(page, generation) in self.stack_cow.values() {
+            let _ = frame_allocator::free_page_tagged(page, generation);
         }
         for &(page, generation) in &self.heap {
             let _ = frame_allocator::free_page_tagged(page, generation);
@@ -2615,8 +2624,8 @@ impl Drop for ForkParts {
 ///
 /// The child shares the parent's image, heap, anonymous mappings, private
 /// page and user stack copy-on-write: frames gain a refcount, writable pages
-/// are mapped read-only in both spaces, and the first write copies the
-/// containing run through `cow_fault`. The kernel stack is new and starts with
+/// are mapped read-only in both spaces, and the first write copies one page
+/// through `cow_fault`. The kernel stack is new and starts with
 /// a copy of the parent's SVC frame whose `x0` is zero, so the child returns
 /// from `clone` as a new process. File descriptors and the Linux fd table are
 /// duplicated, and the child's parent is the caller.
@@ -2655,6 +2664,7 @@ pub fn fork_current_with_sp(
         parent_image,
         parent_stack,
         parent_stack_generation,
+        parent_stack_cow,
         parent_private,
         parent_private_generation,
         parent_heap,
@@ -2685,6 +2695,7 @@ pub fn fork_current_with_sp(
             },
             parent.user_stack,
             parent.user_stack_generation,
+            parent.user_stack_cow.clone(),
             parent.private_page,
             parent.private_page_generation,
             parent.heap_pages.clone(),
@@ -2718,6 +2729,7 @@ pub fn fork_current_with_sp(
         stack: None,
         heap: Vec::new(),
         mmap: Vec::new(),
+        stack_cow: BTreeMap::new(),
     };
 
     // Copy-on-write: share the parent's pages instead of allocating copies.
@@ -2729,6 +2741,14 @@ pub fn fork_current_with_sp(
     ) { return None;
     }
     parts.stack = Some((parent_stack.start, parent_stack_generation));
+    // A page the parent already broke out is a separate frame; share it
+    // instead of letting the child fall back to the stale base page.
+    for (&offset, &(page, generation)) in &parent_stack_cow {
+        if !frame_allocator::share_page_tagged(page, generation) {
+            return None;
+        }
+        parts.stack_cow.insert(offset, (page, generation));
+    }
     if !frame_allocator::share_page_tagged(parent_private, parent_private_generation) { return None;
     }
     parts.private = Some((parent_private, parent_private_generation));
@@ -2852,6 +2872,7 @@ pub fn fork_current_with_sp(
         + mmu::SPACE_TABLE_FRAMES
         + 1
         + TASK_USER_STACK_PAGES
+        + parent_stack_cow.len()
         + parts.image.as_ref()?.page_count()
         + heap_frames
         + mmap_frames;
@@ -2883,6 +2904,10 @@ pub fn fork_current_with_sp(
     let (stack_start, stack_generation) = parts.stack.take()?;
     let (private_page, private_generation) = parts.private.take()?;
     let Some((ttbr0, token)) = mmu::create_task_space(private_page, stack_start, None, true) else {
+        // The constructor frees only the page tables it allocated; the stack
+        // and private frame are still this guard's to release.
+        parts.stack = Some((stack_start, stack_generation));
+        parts.private = Some((private_page, private_generation));
         kernel_stack::free(kernel_stack_start); return None;
     };
     parts.space = Some((token, mmu::asid_of(ttbr0) as u32));
@@ -2890,6 +2915,21 @@ pub fn fork_current_with_sp(
     // table, so keep it in the guard for failure cleanup and take it again at
     // publication.
     parts.stack = Some((stack_start, stack_generation));
+
+    // The child's stack table was filled from the base run; point the pages
+    // the parent already broke out at their real (shared, read-only) frames.
+    for (&offset, &(page, _generation)) in &parts.stack_cow {
+        if !mmu::remap_user_pages_at(
+            ttbr0,
+            mmu::USER_STACK_VA + offset as usize * PAGE_SIZE,
+            page,
+            1,
+            mmu::PROT_READ,
+        ) {
+            kernel_stack::free(kernel_stack_start);
+            return None;
+        }
+    }
 
     if !mmu::install_linux_image(ttbr0, parts.image.as_ref()?) {
         kernel_stack::free(kernel_stack_start); return None;
@@ -3076,6 +3116,7 @@ pub fn fork_current_with_sp(
         stack: MemoryRegion::new(kernel_stack_start, kernel_stack_start + TASK_STACK_SIZE),
         user_stack: MemoryRegion::new(stack_start, stack_start + TASK_USER_STACK_SIZE),
         user_stack_generation: stack_generation,
+        user_stack_cow: core::mem::take(&mut parts.stack_cow),
         private_page,
         private_page_generation: private_generation,
         space_token,

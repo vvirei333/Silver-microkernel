@@ -12,6 +12,7 @@
 //! owned by the returned [`LinuxImage`], whose `Drop` releases it. The loader
 //! never maps anything: the address space does not exist yet.
 
+use alloc::collections::BTreeMap;
 use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -63,6 +64,11 @@ pub struct LinuxRun {
     pub generation: u32,
     /// Permission class per page, index `0` is `virtual_address`.
     pub kinds: Vec<PageKind>,
+    /// Pages broken out of the shared run by copy-on-write, keyed by page
+    /// offset. The base run remains owned (and released) as a whole; these
+    /// frames are additional private pages, so a write to one page never
+    /// copies its neighbours. Empty until a COW fault.
+    pub cow_pages: BTreeMap<u32, (usize, u32)>,
 }
 
 /// A fully loaded Linux image plus the metadata the scheduler needs to map it
@@ -88,44 +94,17 @@ pub struct LinuxImage {
 }
 
 impl LinuxImage {
-    /// Total frames held by the image, for the per-task memory ledger.
+    /// Total frames held by the image, including private COW pages, for the
+    /// per-task memory ledger.
     pub fn page_count(&self) -> usize {
-        self.runs.iter().map(|run| run.page_count).sum()
+        self.runs
+            .iter()
+            .map(|run| run.page_count + run.cow_pages.len())
+            .sum()
     }
 
-    /// Deep copy for `fork`: fresh runs with the same content, addresses and
-    /// permission classes.
-    pub fn duplicate(&self) -> Option<LinuxImage> {
-        let mut runs: Vec<LinuxRun> = Vec::with_capacity(self.runs.len());
-        for run in &self.runs {
-            let Some((physical_start, generation)) =
-                frame_allocator::alloc_user_contiguous_pages_tagged(run.page_count)
-            else {
-                for prior in &runs {
-                    frame_allocator::free_contiguous_pages_tagged(
-                        prior.physical_start,
-                        prior.page_count,
-                        prior.generation,
-                    );
-                }
-                return None;
-            };
-            unsafe {
-                core::ptr::copy_nonoverlapping(
-                    phys_to_virt(run.physical_start) as *const u8,
-                    phys_to_virt(physical_start) as *mut u8,
-                    run.page_count * PAGE_SIZE,
-                );
-            }
-            runs.push(LinuxRun {
-                virtual_address: run.virtual_address,
-                physical_start,
-                page_count: run.page_count,
-                generation,
-                kinds: run.kinds.clone(),
-            });
-        }
-        Some(LinuxImage {
+    fn empty_like(&self, runs: Vec<LinuxRun>) -> LinuxImage {
+        LinuxImage {
             entry: self.entry,
             program_entry: self.program_entry,
             interp_base: self.interp_base,
@@ -136,27 +115,21 @@ impl LinuxImage {
             upper_bound: self.upper_bound,
             runs,
             released: AtomicBool::new(false),
-        })
+        }
     }
 
     /// Shares every run with a forked child. The refcount is bumped for each
-    /// page and writable data pages become `PageKind::Cow`, so both address
-    /// spaces map them read-only until a write fault copies the run.
+    /// base and private COW page, and writable data pages become
+    /// `PageKind::Cow`, so both address spaces map them read-only until a
+    /// write fault copies just that page.
     pub fn share(&self) -> Option<LinuxImage> {
-        let mut runs: Vec<LinuxRun> = Vec::with_capacity(self.runs.len());
+        let mut image = self.empty_like(Vec::with_capacity(self.runs.len()));
         for run in &self.runs {
             if !frame_allocator::share_contiguous_pages_tagged(
                 run.physical_start,
                 run.page_count,
                 run.generation,
             ) {
-                for prior in &runs {
-                    frame_allocator::free_contiguous_pages_tagged(
-                        prior.physical_start,
-                        prior.page_count,
-                        prior.generation,
-                    );
-                }
                 return None;
             }
             let mut kinds = run.kinds.clone();
@@ -165,26 +138,25 @@ impl LinuxImage {
                     *kind = PageKind::Cow;
                 }
             }
-            runs.push(LinuxRun {
+            image.runs.push(LinuxRun {
                 virtual_address: run.virtual_address,
                 physical_start: run.physical_start,
                 page_count: run.page_count,
                 generation: run.generation,
                 kinds,
+                cow_pages: BTreeMap::new(),
             });
+            let current = image.runs.len() - 1;
+            for (&offset, &(page, page_generation)) in &run.cow_pages {
+                if !frame_allocator::share_page_tagged(page, page_generation) {
+                    return None;
+                }
+                image.runs[current]
+                    .cow_pages
+                    .insert(offset, (page, page_generation));
+            }
         }
-        Some(LinuxImage {
-            entry: self.entry,
-            program_entry: self.program_entry,
-            interp_base: self.interp_base,
-            interp_path: self.interp_path.clone(),
-            phdr_address: self.phdr_address,
-            phentsize: self.phentsize,
-            phnum: self.phnum,
-            upper_bound: self.upper_bound,
-            runs,
-            released: AtomicBool::new(false),
-        })
+        Some(image)
     }
 
     /// Converts writable image pages to the shared COW state. Called on the
@@ -232,6 +204,11 @@ impl LinuxImage {
             return;
         }
         for run in &self.runs {
+            // Private COW pages are additional frames; the base run still owns
+            // every one of its original pages.
+            for &(page, generation) in run.cow_pages.values() {
+                let _ = frame_allocator::free_page_tagged(page, generation);
+            }
             frame_allocator::free_contiguous_pages_tagged(
                 run.physical_start,
                 run.page_count,
@@ -626,6 +603,7 @@ fn load_linux_elf_from_source(
             page_count: pages,
             generation,
             kinds: vec![segment.kind; pages],
+            cow_pages: BTreeMap::new(),
         };
         // Zero the whole run first (BSS is the tail the file does not cover),
         // then stream the file bytes from the segment's page offset directly

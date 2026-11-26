@@ -251,6 +251,10 @@ pub struct Task {
     /// was already recycled.
     pub(super) heap_pages: Vec<(usize, u32)>,
     pub(super) user_stack_generation: u32,
+    /// Stack pages broken out of the shared run by copy-on-write, keyed by page
+    /// offset. The base run remains owned as a whole, so these are additional
+    /// private frames (see `release_stack`).
+    pub(super) user_stack_cow: BTreeMap<u32, (usize, u32)>,
     pub(super) private_page: usize,
     pub(super) private_page_generation: u32,
     /// Root token for `ttbr0`: the only proof that teardown still owns this
@@ -593,6 +597,7 @@ impl Task {
             stack,
             user_stack,
             user_stack_generation,
+            user_stack_cow: BTreeMap::new(),
             private_page,
             private_page_generation,
             space_token,
@@ -1279,10 +1284,11 @@ impl Task {
         true
     }
 
-    /// Handles a write to a page shared by `fork`. Copies the containing run,
-    /// remaps it writable in this address space and drops this task's reference
-    /// to the old run. A write to a genuinely read-only page returns `false`,
-    /// which the fault path turns into the normal task kill.
+    /// Handles a write to a page shared by `fork`. Image and stack pages are
+    /// copied one at a time into a private override frame; a writable mapping
+    /// that is still shared as one contiguous run is copied whole. A write to
+    /// a genuinely read-only page returns `false`, which the fault path turns
+    /// into the normal task kill.
     #[cfg(feature = "linux-abi")]
     pub(super) fn cow_fault(&mut self, address: usize, esr: u64) -> bool {
         const WNR: u64 = 1 << 6;
@@ -1357,11 +1363,17 @@ impl Task {
             return false;
         }
 
-        if let Some(image) = self.linux_image.as_mut() {
-            if let Some(run) = image.runs.iter_mut().find(|run| {
+        // Image and stack COW copy exactly one page: the original run (and
+        // its reference) stays intact, and the private page is recorded as an
+        // override. This keeps a 1 MiB data segment from being copied on the
+        // first write to a single byte.
+        let mut image_page = None;
+        if let Some(image) = self.linux_image.as_ref() {
+            if let Some(run_index) = image.runs.iter().position(|run| {
                 page >= run.virtual_address
                     && page < run.virtual_address + run.page_count * PAGE_SIZE
             }) {
+                let run = &image.runs[run_index];
                 let index = (page - run.virtual_address) / PAGE_SIZE;
                 if !matches!(
                     run.kinds[index],
@@ -1370,98 +1382,133 @@ impl Task {
                     cow_reason_set(b"img refuse-kind");
                     return false;
                 }
-                let old_physical = run.physical_start;
-                let old_generation = run.generation;
-                let count = run.page_count;
-                let virtual_address = run.virtual_address;
-                let Some((new_physical, new_generation)) =
-                    cow_copy_run(old_physical, count, old_generation)
-                else {
-                    cow_reason_set(b"img copy-fail");
-                    return false;
-                };
-                let mut kinds = run.kinds.clone();
-                for kind in &mut kinds {
-                    if *kind == crate::elf::PageKind::Cow {
-                        *kind = crate::elf::PageKind::Data;
-                    }
-                }
-                if !mmu::remap_user_kinds_at(ttbr0, virtual_address, new_physical, &kinds) {
-                    cow_reason_set(b"img remap-fail");
-                    frame_allocator::free_contiguous_pages_tagged(
-                        new_physical,
-                        count,
-                        new_generation,
-                    );
-                    return false;
-                }
-                frame_allocator::free_contiguous_pages_tagged(
+                let key = index as u32;
+                let old_override = run.cow_pages.get(&key).copied();
+                let old_physical = old_override
+                    .map(|(page, _)| page)
+                    .unwrap_or(run.physical_start + index * PAGE_SIZE);
+                image_page = Some((
+                    run_index,
+                    index,
+                    key,
+                    old_override,
                     old_physical,
-                    count,
-                    old_generation,
-                );
-                run.physical_start = new_physical;
-                run.generation = new_generation;
-                run.kinds = kinds;
-                // Log mode: the just-remapped page is writable; put the watch
-                // back on the single faulting page so the next write logs and
-                // the SVC hook re-protects it again.
-                #[cfg(feature = "gdb-stub")]
-                if crate::debug::log_mode()
-                    && crate::debug::fault_context_valid()
-                    && crate::debug::soft_page_is(page as u64)
-                {
-                    let writable = mmu::PROT_READ | mmu::PROT_WRITE;
-                    let physical = new_physical + (page - run.virtual_address);
-                    let _ = mmu::map_user_page_at(
-                        ttbr0,
-                        page,
-                        physical,
-                        writable & !mmu::PROT_WRITE,
-                    );
-                    crate::debug::request_reprotect(
-                        ttbr0 as u64,
-                        page as u64,
-                        physical as u64,
-                        writable,
-                    );
-                }
-                return true;
+                ));
             }
+        }
+        if let Some((run_index, index, key, old_override, old_physical)) = image_page {
+            // Replacing an earlier private page is a net-zero ledger change;
+            // the first break adds one frame because the shared run keeps its
+            // original page.
+            let charged = old_override.is_none();
+            if charged && !self.charge_frames(1) {
+                cow_reason_set(b"img charge-fail");
+                return false;
+            }
+            let Some((new_physical, new_generation)) =
+                frame_allocator::alloc_user_page_tagged()
+            else {
+                if charged {
+                    self.release_frames(1);
+                }
+                cow_reason_set(b"img copy-fail");
+                return false;
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(old_physical) as *const u8,
+                    phys_to_virt(new_physical) as *mut u8,
+                    PAGE_SIZE,
+                );
+            }
+            if !mmu::remap_user_pages_at(
+                ttbr0,
+                page,
+                new_physical,
+                1,
+                mmu::PROT_READ | mmu::PROT_WRITE,
+            ) {
+                cow_reason_set(b"img remap-fail");
+                frame_allocator::free_page_tagged(new_physical, new_generation);
+                if charged {
+                    self.release_frames(1);
+                }
+                return false;
+            }
+            if let Some((old_page, generation)) = old_override {
+                let _ = frame_allocator::free_page_tagged(old_page, generation);
+            }
+            let image = self.linux_image.as_mut().expect("image checked above");
+            let run = &mut image.runs[run_index];
+            run.cow_pages.insert(key, (new_physical, new_generation));
+            run.kinds[index] = crate::elf::PageKind::Data;
+            // Log mode: the just-remapped page is writable; put the watch
+            // back on the single faulting page so the next write logs and
+            // the SVC hook re-protects it again.
+            #[cfg(feature = "gdb-stub")]
+            if crate::debug::log_mode()
+                && crate::debug::fault_context_valid()
+                && crate::debug::soft_page_is(page as u64)
+            {
+                let writable = mmu::PROT_READ | mmu::PROT_WRITE;
+                let _ = mmu::map_user_page_at(
+                    ttbr0,
+                    page,
+                    new_physical,
+                    writable & !mmu::PROT_WRITE,
+                );
+                crate::debug::request_reprotect(
+                    ttbr0 as u64,
+                    page as u64,
+                    new_physical as u64,
+                    writable,
+                );
+            }
+            return true;
         }
 
         if page >= mmu::USER_STACK_VA && page < mmu::USER_STACK_VA + TASK_USER_STACK_SIZE {
-            let old_physical = self.user_stack.start;
-            let old_generation = self.user_stack_generation;
-            let Some((new_physical, new_generation)) =
-                cow_copy_run(old_physical, TASK_USER_STACK_PAGES, old_generation)
-            else {
-                return false;
-            };
-            if !mmu::remap_user_pages_at(
-                ttbr0,
-                mmu::USER_STACK_VA,
-                new_physical,
-                TASK_USER_STACK_PAGES,
-                mmu::PROT_WRITE,
-            ) {
-                frame_allocator::free_contiguous_pages_tagged(
-                    new_physical,
-                    TASK_USER_STACK_PAGES,
-                    new_generation,
-                );
+            let key = ((page - mmu::USER_STACK_VA) / PAGE_SIZE) as u32;
+            let old_override = self.user_stack_cow.get(&key).copied();
+            let old_physical = old_override
+                .map(|(old_page, _)| old_page)
+                .unwrap_or(self.user_stack.start + key as usize * PAGE_SIZE);
+            let charged = old_override.is_none();
+            if charged && !self.charge_frames(1) {
                 return false;
             }
-            frame_allocator::free_contiguous_pages_tagged(
-                old_physical,
-                TASK_USER_STACK_PAGES,
-                old_generation,
-            );
-            self.user_stack = MemoryRegion::new(
+            let Some((new_physical, new_generation)) =
+                frame_allocator::alloc_user_page_tagged()
+            else {
+                if charged {
+                    self.release_frames(1);
+                }
+                return false;
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(old_physical) as *const u8,
+                    phys_to_virt(new_physical) as *mut u8,
+                    PAGE_SIZE,
+                );
+            }
+            if !mmu::remap_user_pages_at(
+                ttbr0,
+                page,
                 new_physical,
-                new_physical + TASK_USER_STACK_SIZE,
-            );
-            self.user_stack_generation = new_generation;
+                1,
+                mmu::PROT_WRITE,
+            ) {
+                frame_allocator::free_page_tagged(new_physical, new_generation);
+                if charged {
+                    self.release_frames(1);
+                }
+                return false;
+            }
+            if let Some((old_page, generation)) = old_override {
+                let _ = frame_allocator::free_page_tagged(old_page, generation);
+            }
+            self.user_stack_cow.insert(key, (new_physical, new_generation));
             return true;
         }
 
@@ -1927,7 +1974,7 @@ impl Task {
         wake
     }
 
-    pub(super) fn release_stack(&self) {
+    pub(super) fn release_stack(&mut self) {
         if self.resources_released {
             return;
         }
@@ -1935,6 +1982,15 @@ impl Task {
             console::write_str("STACK: kernel stack release refused for 0x");
             console::write_hex_u64(self.stack.start as u64);
             console::write_str(" - leaked\r\n");
+        }
+        // A page broken out of the stack by COW is an extra frame; the base
+        // run still owns its original page.
+        for (_, (page, generation)) in core::mem::take(&mut self.user_stack_cow) {
+            if !frame_allocator::free_page_tagged(page, generation) {
+                console::write_str("STACK: COW page release refused for 0x");
+                console::write_hex_u64(page as u64);
+                console::write_str(" - leaked\r\n");
+            }
         }
         if !self.user_stack.is_empty()
             && !frame_allocator::free_contiguous_pages_tagged(
@@ -1994,6 +2050,7 @@ impl Task {
         self.stack = MemoryRegion::new(0, 0);
         self.user_stack = MemoryRegion::new(0, 0);
         self.user_stack_generation = 0;
+        self.user_stack_cow.clear();
         self.private_page = 0;
         self.private_page_generation = 0;
         self.space_token = TableToken::empty();
