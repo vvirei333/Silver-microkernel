@@ -132,6 +132,14 @@ def main() -> int:
         time.sleep(0.3)
         qmp.recv(65536)
 
+        # The probe drains the queue, clears O_NONBLOCK and blocks in read;
+        # release it only once it has printed the marker.
+        deadline = time.time() + args.timeout
+        while time.time() < deadline and b"blocking-ready" not in log and b"input FAILED" not in log:
+            pump(0.5)
+        if b"blocking-ready" in log:
+            monitor.sendall(b"sendkey d\n")
+
         deadline = time.time() + args.timeout
         while time.time() < deadline and b"input ok" not in log and b"input FAILED" not in log:
             pump(0.5)

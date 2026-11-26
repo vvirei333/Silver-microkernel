@@ -19,6 +19,7 @@ const SYS_IOCTL: i64 = 29;
 const SYS_WRITE: i64 = 64;
 const SYS_OPENAT: i64 = 56;
 const SYS_READ: i64 = 63;
+const SYS_FCNTL: i64 = 25;
 const SYS_NANOSLEEP: i64 = 101;
 const SYS_EXIT: i64 = 93;
 const AT_FDCWD: i64 = -100;
@@ -96,13 +97,12 @@ fn ioc_read(nr: u64, length: u64) -> u64 {
     0x8000_0000 | (length << 16) | (0x45 << 8) | nr
 }
 
+fn open_with(path: &[u8], flags: i64) -> i64 {
+    sys3(SYS_OPENAT, AT_FDCWD, path.as_ptr() as i64, flags)
+}
+
 fn open(path: &[u8]) -> i64 {
-    sys3(
-        SYS_OPENAT,
-        AT_FDCWD,
-        path.as_ptr() as i64,
-        O_RDONLY | O_NONBLOCK,
-    )
+    open_with(path, O_RDONLY | O_NONBLOCK)
 }
 
 fn set_bits(bits: &[u8]) -> u64 {
@@ -258,6 +258,50 @@ pub extern "C" fn _start() -> ! {
     if keys_seen == 0 {
         write_all(b"input: no key events\n");
         ok = false;
+    }
+
+    // Blocking semantics: open a second keyboard fd without O_NONBLOCK (or
+    // clear the flag) and read without polling. The host injects "d" after
+    // the marker, so this read must wait rather than return EAGAIN.
+    if keyboard >= 0 {
+        let blocking = open_with(b"/dev/input/event0\0", O_RDONLY);
+        let getfl = sys3(SYS_FCNTL, keyboard, 3, 0);
+        sleep_ms(300);
+        let mut drained = 0;
+        while drained < 256 {
+            let got = sys3(SYS_READ, keyboard, buffer.as_mut_ptr() as i64, 24);
+            if got != 24 {
+                break;
+            }
+            drained += 1;
+        }
+        let mut flags_ok = getfl >= 0 && getfl & O_NONBLOCK != 0;
+        let mut blocking_fd = blocking;
+        if blocking_fd < 0 {
+            blocking_fd = keyboard;
+            flags_ok = sys3(SYS_FCNTL, keyboard, 4, 0) >= 0;
+        }
+        write_all(b"blocking-ready\n");
+        let got = sys3(SYS_READ, blocking_fd, buffer.as_mut_ptr() as i64, 24);
+        let kind = u16::from_le_bytes([buffer[16], buffer[17]]);
+        let code = u16::from_le_bytes([buffer[18], buffer[19]]);
+        let value = i32::from_le_bytes([buffer[20], buffer[21], buffer[22], buffer[23]]);
+        if got == 24 && kind == 1 && value != 0 {
+            write_all(b"blocking ok code=");
+            print_u64(code as u64);
+            write_all(b"\n");
+            ok &= flags_ok;
+        } else {
+            write_all(b"blocking FAILED got=");
+            if got < 0 {
+                write_all(b"-");
+                print_u64((-got) as u64);
+            } else {
+                print_u64(got as u64);
+            }
+            write_all(b"\n");
+            ok = false;
+        }
     }
 
     // The pointer path: QEMU injects ABS_X/ABS_Y through QMP when a tablet is

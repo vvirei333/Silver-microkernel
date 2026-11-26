@@ -8322,3 +8322,21 @@ Night session results, in order:
 - Open: feed `libinput_dispatch()` events into the compositor seat and stage
   `/usr/share/libinput` quirks; more than two input devices stays out of
   scope.
+
+### 2026-11-26 (blocking evdev) — block instead of spinning on EAGAIN
+
+- The evdev fix that returned `EAGAIN` on an empty read was correct only for
+  `O_NONBLOCK`. `Target::Input` now carries the descriptor's non-blocking
+  flag: `open` seeds it from the open flags, `fcntl(F_GETFL/F_SETFL)` reads
+  and updates it, and `read` loops on `scheduler::sleep(1)` until an event
+  arrives when the flag is clear. `count == 0` returns 0 and a buffer shorter
+  than the 24-byte record returns `EINVAL`, matching Linux instead of
+  blocking forever.
+- Extended `tests/linux/input.rs`: after the normal drain it opens a second
+  `event0` without `O_NONBLOCK`, checks `F_GETFL`, prints `blocking-ready`,
+  and blocks in `read`. `tools/input_probe.py` waits for that marker, injects
+  `d`, and the probe prints `blocking ok code=32` (KEY_D).
+- Evidence (QEMU virt, `build/sysfs-test.img`): `blocking ok code=32`,
+  `input ok`; `libinput-test` still reports `key=30` and `libinput ok`;
+  `linux-sysfs` and `udev-test` pass; `cargo test --lib` 272 passed; console
+  `health` 7 live / 0 zombie / 0 open / 0 leaked, `svc` 5 running.

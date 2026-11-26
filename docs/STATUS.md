@@ -156,7 +156,10 @@ Console-image fixes in the same pass:
   (including `SYN_REPORT`), `poll` reports `POLLIN` when the bounded
   per-device ring is non-empty, and the evdev ioctls answer capability
   queries from the device configuration (`EVIOCGVERSION`, `EVIOCGID`,
-  `EVIOCGNAME`, `EVIOCGBIT`, `EVIOCGPROP`, `EVIOCGKEY`, `EVIOCGABS`). Verified
+  `EVIOCGNAME`, `EVIOCGBIT`, `EVIOCGPROP`, `EVIOCGKEY`, `EVIOCGABS`). Each
+  descriptor remembers `O_NONBLOCK` from `open`/`fcntl`: a non-blocking read
+  returns `EAGAIN` when empty, a blocking read sleeps until the next record,
+  and buffers shorter than one record are `EINVAL`. Verified
   in QEMU with `virtio-keyboard-pci` + `virtio-tablet-pci`:
   `tests/linux/input.rs` (`linuxrun /sfs/linux-input`, driven by
   `tools/input_probe.py`) prints monitor-injected key press/release pairs and

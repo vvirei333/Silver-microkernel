@@ -258,8 +258,9 @@ enum Target {
     /// A file in the synthetic procfs tree (read-only, process must be init).
     Proc(&'static [u8], usize),
     /// One evdev event device (`/dev/input/eventN`), backed by the kernel's
-    /// virtio-input driver. The index selects the device.
-    Input(usize),
+    /// virtio-input driver. The index selects the device; the flag mirrors
+    /// `O_NONBLOCK` so a blocking read waits for the next event.
+    Input(usize, bool),
     /// A synthetic directory listing (`/dev/dri`), with the next entry index.
     DirList {
         entries: &'static [&'static str],
@@ -579,6 +580,7 @@ impl Target {
 /// Installs `target` at the lowest free slot, growing the table.
 /// `O_ACCMODE` value shared with the Linux ABI (read is `0`).
 const O_RDWR: u64 = 2;
+const O_NONBLOCK: u64 = 0o4000;
 
 fn set_access(table: &mut Table, fd: u64, access: u64) {
     while table.access.len() <= fd as usize {
@@ -1031,8 +1033,12 @@ pub fn open(task: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, u64> {
             entries: input_nodes(),
             offset: 0,
         }),
-        "/dev/input/event0" if crate::virtio_input::present() => Some(Target::Input(0)),
-        "/dev/input/event1" if crate::virtio_input::count() > 1 => Some(Target::Input(1)),
+        "/dev/input/event0" if crate::virtio_input::present() => {
+            Some(Target::Input(0, flags & O_NONBLOCK != 0))
+        }
+        "/dev/input/event1" if crate::virtio_input::count() > 1 => {
+            Some(Target::Input(1, flags & O_NONBLOCK != 0))
+        }
         "/dev/dri" if crate::virtio_gpu::size().is_some() => Some(Target::DirList {
             entries: DRM_NODES,
             offset: 0,
@@ -1326,18 +1332,34 @@ pub fn read(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
             // The caller polls before reading; an empty queue is not an error.
             None => Ok(0),
         },
-        Target::Input(index) => {
-            crate::virtio_input::pump();
+        Target::Input(index, nonblock) => {
+            if count == 0 {
+                return Ok(0);
+            }
+            // Linux refuses short evdev buffers instead of blocking forever on
+            // a read that could never receive one complete record.
+            if count < 24 {
+                return Err(EINVAL);
+            }
             let length = (count as usize).min(64 * 1024);
             let mut records = alloc::vec![0_u8; length];
-            let filled = crate::virtio_input::read_events(index, &mut records);
-            if filled == 0 {
+            loop {
+                crate::virtio_input::pump();
+                let filled = crate::virtio_input::read_events(index, &mut records);
+                if filled > 0 {
+                    user_memory::copy_to_user(&records[..filled], buffer)
+                        .map_err(|_| EFAULT)?;
+                    return Ok(filled as u64);
+                }
                 // libinput opens evdev non-blocking and relies on EAGAIN to
                 // stop draining; zero would look like end-of-device.
-                return Err(EAGAIN);
+                if nonblock {
+                    return Err(EAGAIN);
+                }
+                // A blocking reader has no other event source; sleeping lets
+                // the virtio pump run and keeps the kernel lock out of the way.
+                crate::scheduler::sleep(1);
             }
-            user_memory::copy_to_user(&records[..filled], buffer).map_err(|_| EFAULT)?;
-            Ok(filled as u64)
         }
         Target::Null | Target::Full | Target::Ivshmem | Target::GpuFb => Ok(0),
         Target::Zero => {
@@ -1459,7 +1481,7 @@ pub fn pread(task: u64, fd: u64, offset: u64, buffer: &mut [u8]) -> Result<usize
             buffer.fill(0);
             Ok(count)
         }
-        Target::Input(index) => {
+        Target::Input(index, _) => {
             crate::virtio_input::pump();
             let count = crate::virtio_input::read_events(index, buffer);
             if count == 0 {
@@ -1487,7 +1509,7 @@ pub fn write(task: u64, fd: u64, buffer: u64, count: u64) -> Result<u64, u64> {
                 Ok(count)
             }
         }
-        Target::Input(_)
+        Target::Input(_, _)
         | Target::Null
         | Target::Zero
         | Target::Random
@@ -1664,7 +1686,7 @@ pub fn stat_fields(
         | Target::Random
         | Target::Ivshmem
         | Target::GpuFb => (S_IFCHR | 0o666, 0, fd.max(1), None),
-        Target::Input(index) => (
+        Target::Input(index, _) => (
             S_IFCHR | 0o660,
             0,
             fd.max(1),
@@ -3117,7 +3139,6 @@ pub fn socket_shutdown(task: u64, fd: u64, how: u64) -> Result<(), u64> {
 pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
     const O_WRONLY: u64 = 1;
     const O_RDWR: u64 = 2;
-    const O_NONBLOCK: u64 = 0o4000;
     let target = lookup(task, fd)?;
     let file_access = with_table(task, |table| access_at(table, fd));
     let (access, nonblock) = match target {
@@ -3146,8 +3167,8 @@ pub fn status_flags(task: u64, fd: u64) -> Option<u64> {
         | Target::Prime { .. }
         | Target::MemFd(_)
         | Target::Udmabuf
-        | Target::Input(_)
         | Target::Epoll(_) => (O_RDWR, false),
+        Target::Input(_, nonblock) => (O_RDWR, nonblock),
     };
     Some(access | if nonblock { O_NONBLOCK } else { 0 })
 }
@@ -3176,6 +3197,10 @@ pub fn set_nonblock(task: u64, fd: u64, nonblock: bool) -> Result<(), u64> {
                 *flag = nonblock;
                 true
             }
+            Some(Target::Input(_, flag)) => {
+                *flag = nonblock;
+                true
+            }
             _ => false,
         }
     })
@@ -3198,7 +3223,7 @@ fn poll_ready_at(task: u64, fd: u64, depth: u8) -> Option<i16> {
     Some(match target {
         Target::Console | Target::Null => POLLIN | POLLOUT,
         Target::Zero | Target::Random => POLLIN,
-        Target::Input(index) => {
+        Target::Input(index, _) => {
             crate::virtio_input::pump();
             if crate::virtio_input::available(index) > 0 {
                 POLLIN
@@ -3547,7 +3572,7 @@ pub fn is_drm(task: u64, fd: u64) -> bool {
 pub fn input_device(task: u64, fd: u64) -> Option<usize> {
     let task = crate::scheduler::fd_table_owner(task);
     match lookup(task, fd) {
-        Some(Target::Input(index)) => Some(index),
+        Some(Target::Input(index, _)) => Some(index),
         _ => None,
     }
 }
