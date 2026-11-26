@@ -49,6 +49,7 @@
 #                               # (only when the cross compiler has libc.a)
 #   linuxrun /sfs/linux-input   # evdev keyboard+tablet probe; inject keys and
 #                               # ABS events with tools/input_probe.py
+#   linuxrun /sfs/linux-clock   # PL031 CLOCK_REALTIME vs CLOCK_MONOTONIC
 #   linuxrun /sfs/linux-sysfs   # sysfs input class + udev database probe
 #
 # The image is modified in place. It is git-tracked; on first use the script
@@ -130,6 +131,13 @@ rustc --edition 2021 --target aarch64-unknown-none -O tests/linux/input.rs \
     -o build/linux-input.elf \
     -C link-arg=-Ttests/linux/input.ld -C link-arg=--build-id=none -C panic=abort
 python3 scripts/sfs_inject.py "$IMAGE" build/linux-input.elf linux-input
+
+# Wall clock: the PL031 epoch must reach CLOCK_REALTIME while CLOCK_MONOTONIC
+# stays relative to boot.
+rustc --edition 2021 --target aarch64-unknown-none -O tests/linux/clock.rs \
+    -o build/linux-clock.elf \
+    -C link-arg=-Ttests/linux/input.ld -C link-arg=--build-id=none -C panic=abort
+python3 scripts/sfs_inject.py "$IMAGE" build/linux-clock.elf linux-clock
 
 # Sysfs/udev probe: readdir of the input class plus the dev/name/uevent
 # attributes and the udev database shim libudev/libinput read.

@@ -30,6 +30,16 @@ pub fn init() {
     // Console first after that: a bad memory map must be *reported* before the
     // allocator asserts on an empty window.
     console::init();
+    // Wall-clock epoch for CLOCK_REALTIME. The PL031 is optional: a tree
+    // without the node leaves it unavailable and the clock falls back to
+    // the monotonic tick count.
+    if crate::rtc::init(dtb) {
+        if let Some((seconds, _)) = crate::rtc::now() {
+            console::write_str("RTC=PL031 epoch=");
+            console::write_dec_u64(seconds);
+            console::write_str("\r\n");
+        }
+    }
     // Cache state is reported on every console-capable profile. The boot
     // self-test below re-checks the same bits on the APs, whose values are
     // recorded per CPU rather than inferred from this line.

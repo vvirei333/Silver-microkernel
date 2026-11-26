@@ -87,6 +87,7 @@ mod debug;
 mod platform;
 mod pci_boot;
 mod power;
+mod rtc;
 mod ram_log;
 // The boot stub mirrors this policy in assembly; the Rust copy exists for
 // host boundary tests, so the binary itself does not call these items.

@@ -8322,6 +8322,25 @@ Night session results, in order:
 - Open: feed `libinput_dispatch()` events into the compositor seat; more than
   two input devices stays out of scope.
 
+### 2026-11-26 (wall clock) — PL031 epoch for CLOCK_REALTIME
+
+- `clock_gettime` ignored the clock id and returned `timer::ticks()/100`, so
+  every Linux process saw 1970 plus uptime; certificate validity and build
+  stamps had no real epoch.
+- Added `src/rtc.rs`: reads the `arm,pl031` data register named by the live
+  device tree once at boot, keeps the offset, and exposes `now()` as
+  `(seconds, microseconds)`. QEMU `virt` uses `0x0901_0000` when `-kernel`
+  passes no DTB; other boards without the node stay clockless.
+- `linux_clock_gettime` now maps `CLOCK_REALTIME` (0) and
+  `CLOCK_REALTIME_COARSE` (5) to the RTC and everything else to the old tick
+  count; `gettimeofday` uses the same wall clock.
+- First attempt read the physical address directly and took an EL1 translation
+  fault (`FAR=0x9010000`): kernel MMIO is only mapped through
+  `KERNEL_VIRT_BASE`, so the read now goes through `memory::phys_to_virt`.
+- Evidence: boot logs `RTC=PL031 epoch=1795700839`; `linux-clock` prints
+  `rt=1795700784 mono=4 gettimeofday=1795700784` and `clock ok`; console build
+  boots and `health` is clean; `cargo test --lib` 272 passed.
+
 ### 2026-11-26 (quirks) — stage libinput quirks instead of warning
 
 - `libinput-bin` (Debian trixie) carries the 50

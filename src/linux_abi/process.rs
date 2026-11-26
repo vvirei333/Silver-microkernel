@@ -626,13 +626,27 @@ pub(super) fn may_signal(sender: u64, target: u64) -> bool {
     )
 }
 
-pub(super) fn linux_clock_gettime(_clock: u64, timespec: u64) -> u64 {
-    // `timer::ticks()` is 100 Hz; report it as whole seconds plus the
-    // remaining fraction.
+/// Monotonic time from the 100 Hz scheduler tick as `(seconds, nanoseconds)`.
+fn monotonic_time() -> (u64, u64) {
     let ticks = timer::ticks();
+    (ticks / 100, (ticks % 100) * 10_000_000)
+}
+
+pub(super) fn linux_clock_gettime(clock: u64, timespec: u64) -> u64 {
+    const CLOCK_REALTIME: u64 = 0;
+    const CLOCK_REALTIME_COARSE: u64 = 5;
+    // Only the realtime clocks are wall-clock; every other id keeps the
+    // monotonic tick count (including CPU-time ids glibc may probe).
+    let (seconds, nanoseconds) = if matches!(clock, CLOCK_REALTIME | CLOCK_REALTIME_COARSE) {
+        crate::rtc::now()
+            .map(|(seconds, micros)| (seconds, micros * 1_000))
+            .unwrap_or_else(monotonic_time)
+    } else {
+        monotonic_time()
+    };
     let mut bytes = [0_u8; 16];
-    bytes[..8].copy_from_slice(&(ticks / 100).to_le_bytes());
-    bytes[8..].copy_from_slice(&((ticks % 100) * 10_000_000).to_le_bytes());
+    bytes[..8].copy_from_slice(&seconds.to_le_bytes());
+    bytes[8..].copy_from_slice(&nanoseconds.to_le_bytes());
     if user_memory::copy_to_user(&bytes, timespec).is_err() {
         return errno(EFAULT);
     }
@@ -656,10 +670,13 @@ pub(super) fn linux_gettimeofday(time: u64) -> u64 {
     if time == 0 {
         return 0;
     }
-    let ticks = timer::ticks();
+    let (seconds, micros) = crate::rtc::now().unwrap_or_else(|| {
+        let ticks = timer::ticks();
+        (ticks / 100, (ticks % 100) * 10_000)
+    });
     let mut bytes = [0_u8; 16];
-    bytes[..8].copy_from_slice(&(ticks / 100).to_le_bytes());
-    bytes[8..16].copy_from_slice(&((ticks % 100) * 10_000).to_le_bytes());
+    bytes[..8].copy_from_slice(&seconds.to_le_bytes());
+    bytes[8..16].copy_from_slice(&micros.to_le_bytes());
     if user_memory::copy_to_user(&bytes, time).is_err() {
         return errno(EFAULT);
     }

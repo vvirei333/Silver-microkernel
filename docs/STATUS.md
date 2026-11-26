@@ -22,6 +22,7 @@ replacing the parked phosh/phoc stack. See [ARCHITECTURE.md](ARCHITECTURE.md),
 | SFS + VFS + scratch writes | IMPLEMENTED | VFS self-test, fsck |
 | Network (virtio-net device, smoltcp userspace stack) | IMPLEMENTED | DHCP/DNS/TCP/TLS fetches |
 | Linux ABI core (exec, mmap, fds, epoll, futex, signals, AF_UNIX) | IMPLEMENTED | tests/linux suite, glibc stacks boot |
+| Wall clock (PL031 RTC → `CLOCK_REALTIME`) | IMPLEMENTED (QEMU) | `RTC=PL031 epoch=...` at boot; `linux-clock` reports `rt=1795700784 mono=4` |
 | Mesa llvmpipe over DRM/KMS + udmabuf + syncobj fencing | IMPLEMENTED | deniald reaches GPU-transfer/TEST_ONLY stages |
 | Denial WM boot to engine session start | PARTIALLY IMPLEMENTED | deniald log stages verified |
 | First rendered desktop frame | IN PROGRESS — current stop | scanout buffers verified black; no post-engine atomic commits |
@@ -199,6 +200,18 @@ Console-image fixes in the same pass:
   in the test image (`sfs_inject.py` now creates nested destinations) and
   `tools/build_glibc_denial.py` adds `libinput-bin` to the Denial closure, so
   libinput no longer reports missing quirks data.
+
+### Wall clock
+- `src/rtc.rs` binds the tree's `arm,pl031` node, samples its data register
+  once at boot and logs `RTC=PL031 epoch=...`. QEMU `virt` keeps
+  `0x0901_0000` as a fallback because `-kernel` does not always pass a DTB;
+  any other board without the node stays clockless instead of probing MMIO.
+- `clock_gettime(CLOCK_REALTIME/CLOCK_REALTIME_COARSE)` and `gettimeofday`
+  return epoch + uptime. `CLOCK_MONOTONIC` and every other id keep the 100 Hz
+  tick count, so programs that poll monotonic clocks are unchanged.
+- `linuxrun /sfs/linux-clock` prints `rt=... mono=... gettimeofday=...` and
+  `clock ok`; a QEMU run shows `rt=1795700784`, `mono=4`,
+  `gettimeofday=1795700784`.
 
 ### Wayland
 - Hand-written mini compositor plus a **real `libwayland-client`**:
@@ -422,6 +435,6 @@ contains the current test image.
 2. **Pi 5 evidence**: capture a serial log from the board, then validate the
    BCM2712 SDHCI path with a real card. The software path is ready; no board
    claim is made until that log exists.
-3. **Network base maintenance**: keep-alive, TLS roots/RTC/RNG, TLS 1.2.
+3. **Network base maintenance**: keep-alive, TLS roots/RNG, TLS 1.2.
 4. **SFS crash consistency**: journal or copy-on-write metadata; persistence
    across reboot already works.
