@@ -8322,6 +8322,39 @@ Night session results, in order:
 - Open: feed `libinput_dispatch()` events into the compositor seat; more than
   two input devices stays out of scope.
 
+### 2026-11-26 (kernel log) — mirror everything, then explain it
+
+- The panic banner says *what* died but not *how the machine got there*, and
+  the console was write-only: once a line scrolled past, there was no way to
+  read it back. Added `src/log.rs` with a 16 KiB circular console mirror.
+- `console::write_byte/write_str/write_bytes` now call `log::capture` before
+  taking the UART lock; `write_hex_u64`/`write_dec_u64` were rerouted through
+  `write_bytes` so a number is captured as one whole token instead of leaking
+  unlogged fragments. No allocation, no lock held across the UART. EL0
+  print/write takes `write_bytes_unlogged`, so the ring stays a kernel log.
+- Structured entries come from `log_{error,warn,info,debug,trace}!` and the
+  `_why!` variants: `[   12.345] INFO  sched    src/scheduler/switch.rs:123
+  switch task=7 (why: timer)`. The macros capture `file!()`/`line!()`; the
+  optional reason is the explicit why. Threshold defaults to INFO.
+- `SYS_LOG_DUMP` (93) copies the ring to an EL0 buffer; `dmesg` decodes it in
+  4 KiB-safe UTF-8 chunks. The panic path calls `log::dump_tail(1536)` before
+  the banner, so the last lines before a crash are visible without changing
+  the stable `KERNEL PANIC code=0xNN` contract.
+- Evidence: `dmesg` in the console image prints the boot history plus
+  `[    0.556] INFO  vfs        src\main.rs:259  mounted /sfs (why: kernel
+  image is readable)` and `[    0.594] INFO  boot       src\boot\start.rs:38
+  boot complete, handing control to the scheduler (why: all init milestones
+  reached)`. A temporary `panic!` after that line printed the newest boot
+  history and then `KERNEL PANIC code=0x01 (rust panic)` / `panic at
+  src\boot\start.rs:44`; the hook was removed. Clean console boot, Linux ABI
+  build, `linux-clock` (`clock ok`), `health` (7 live / 0 zombie / 0 open / 0
+  DMA leaks) and `cargo test --lib` (272 passed) all still pass.
+- EL0 output is deliberately excluded: `console::write_bytes_unlogged` is the
+  path for `SYS_PRINT`/Linux stdout, so a userspace screen clear cannot erase
+  the dump it just requested. Limitation: the ring is still a raw kernel
+  console tail (16 KiB), so a long kernel session can evict early boot lines;
+  treat `dmesg` as diagnostics, not an audit log.
+
 ### 2026-11-26 (panic banner) — one code per fatal path
 
 - Fatal output started with `EL1 EXCEPTION kind=..`, and the words `KERNEL

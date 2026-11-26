@@ -85,6 +85,7 @@ mod gdb;
 mod debug;
 #[cfg(not(feature = "std"))]
 mod platform;
+mod log;
 mod pci_boot;
 mod panic;
 mod power;
@@ -255,6 +256,7 @@ pub extern "C" fn kernel_main() -> ! {
     if sfs::loaded() {
         let _ = vfs::mkdir("/", "/sfs");
         if vfs::mount("/", "/sfs", "sfs", "", 0, |_| false).is_ok() {
+            crate::log_info_why!("vfs", "kernel image is readable", "mounted /sfs");
             ram_log::log("KSFS mounted");
             // Service state belongs in RAM, not on the image: OpenRC writes
             // `/run/openrc` and `/var/log` on every boot.
@@ -279,6 +281,7 @@ pub extern "C" fn kernel_main() -> ! {
     }
     #[cfg(all(not(feature = "tablet"), not(feature = "fog")))]
     vfs::run_self_test();
+    crate::log_info!("vfs", "seed complete");
     ram_log::log("VFS+SEED OK");
     if silver_microkernel::bundle_sig::signatures_enabled() {
         console::write_str("BUNDLE SIGNATURES: ENFORCED\r\n");

@@ -79,6 +79,7 @@ const SYS_WAITPID: u64 = 83;
 const SYS_SPAWN_ARGSV: u64 = 84;
 const SYS_MEMINFO_V2: u64 = 85;
 const SYS_HEALTH: u64 = 86;
+const SYS_LOG_DUMP: u64 = 93;
 
 /// `prot` bits for `mmap`: read / write / execute.
 pub const PROT_READ: u64 = 1;
@@ -304,6 +305,22 @@ pub fn memory_info_v2() -> Option<MemoryInfoV2> {
         Some(info)
     } else {
         None
+    }
+}
+
+/// Copies the kernel console ring into `buffer`; returns the byte count.
+pub fn log_dump(buffer: &mut [u8]) -> Option<usize> {
+    let result = unsafe {
+        syscall2(
+            SYS_LOG_DUMP,
+            buffer.as_mut_ptr() as u64,
+            buffer.len() as u64,
+        )
+    };
+    if result == u64::MAX {
+        None
+    } else {
+        Some(result as usize)
     }
 }
 

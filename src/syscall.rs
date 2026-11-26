@@ -120,6 +120,9 @@ pub const SYS_MEMORY_PRESSURE: u64 = 91;
 /// Arm a hardware write watchpoint: `debug_watch(address, length)`.
 /// Debug builds only (`gdb-stub`).
 pub const SYS_DEBUG_WATCH: u64 = 92;
+/// Copy the kernel console ring into an EL0 buffer: `log_dump(buffer, len)`.
+/// Returns the byte count. Native ABI only; `dmesg` uses it.
+pub const SYS_LOG_DUMP: u64 = 93;
 
 const ARGUMENT_LIMIT: usize = 192;
 const PATH_LIMIT: usize = 191;
@@ -371,6 +374,7 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
             }
         }
         SYS_HEALTH => sys_health(frame[0]),
+        SYS_LOG_DUMP => sys_log_dump(frame[0], frame[1]),
         SYS_TASK_LIST => sys_task_list(frame[0], frame[1]),
         SYS_SPAWN_ARGS => sys_spawn_with_args(frame[0], frame[1], frame[2], frame[3]),
         SYS_SPAWN_ARGS_CONSOLE => {
@@ -1353,6 +1357,29 @@ fn sys_health(info_ptr: u64) -> u64 {
     0
 }
 
+/// Copies the raw console ring (boot output plus structured entries) into the
+/// caller's buffer. The ring is a rolling tail: a heavy userspace log can
+/// evict early boot lines, exactly like `dmesg` on Linux.
+fn sys_log_dump(ptr: u64, len: u64) -> u64 {
+    if !scheduler::current_task_owns_console() {
+        return SYSCALL_ERROR;
+    }
+    const LIMIT: usize = 32 * 1024;
+    let length = (len as usize).min(LIMIT);
+    if length == 0 || ptr == 0 {
+        return 0;
+    }
+    let mut bytes = alloc::vec![0_u8; length];
+    let count = crate::log::snapshot(&mut bytes);
+    if count == 0 {
+        return 0;
+    }
+    if user_memory::copy_to_user(&bytes[..count], ptr).is_err() {
+        return SYSCALL_ERROR;
+    }
+    count as u64
+}
+
 fn sys_print(ptr: u64, len: u64) -> u64 {
     // Background output is deliberately discarded in the interactive MVP.
     // Kernel diagnostics use console directly and remain visible for all tasks.
@@ -1436,7 +1463,7 @@ fn sys_print_dec(value: u64) -> u64 {
 
 #[cfg(feature = "demo-tasks")]
 fn write_console_bytes(bytes: &[u8]) {
-    console::write_bytes(bytes);
+    console::write_bytes_unlogged(bytes);
 }
 
 #[cfg(not(feature = "demo-tasks"))]
@@ -1449,7 +1476,7 @@ fn write_console_bytes(bytes: &[u8]) {
     // be hardcoded: another task reusing that ID would swallow the output.
     // Before Howler binds INTID 33 the kernel writes to PL011 directly.
     let Some(sink) = scheduler::console_sink_task() else {
-        console::write_bytes(bytes);
+        console::write_bytes_unlogged(bytes);
         return;
     };
 
@@ -1468,7 +1495,7 @@ fn write_console_bytes(bytes: &[u8]) {
                 scheduler::notify_bound_task(sink);
                 scheduler::yield_current();
             }
-            Err(ipc::SendError::TargetDead) => console::write_bytes(chunk),
+            Err(ipc::SendError::TargetDead) => console::write_bytes_unlogged(chunk),
             Err(ipc::SendError::QueueFull) => return,
         }
     }

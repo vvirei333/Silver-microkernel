@@ -26,15 +26,19 @@ pub fn mark_boot_start() {
     START_COUNT.store(counter_value(), Ordering::Relaxed);
 }
 
-/// Prints `[ s.mmm s ] name\r\n` where `s.mmm` is the time since
-/// `mark_boot_start`, with the milliseconds zero-padded to three digits.
-pub fn log_milestone(name: &str) {
+/// Milliseconds since `mark_boot_start`, using the free-running counter. This
+/// works before the generic timer is initialized, unlike `timer::ticks`.
+pub fn elapsed_millis() -> u64 {
     let start = START_COUNT.load(Ordering::Relaxed);
     let frequency = FREQUENCY_HZ.load(Ordering::Relaxed).max(1);
     let elapsed = counter_value().wrapping_sub(start);
+    elapsed / frequency * 1000 + (elapsed % frequency) * 1000 / frequency
+}
 
-    // Seconds and milliseconds, avoiding floating point entirely.
-    let total_ms = elapsed / frequency * 1000 + (elapsed % frequency) * 1000 / frequency;
+/// Prints `[ s.mmm s ] name\r\n` where `s.mmm` is the time since
+/// `mark_boot_start`, with the milliseconds zero-padded to three digits.
+pub fn log_milestone(name: &str) {
+    let total_ms = elapsed_millis();
     let seconds = total_ms / 1000;
     let millis = total_ms % 1000;
 

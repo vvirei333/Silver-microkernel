@@ -201,6 +201,30 @@ Console-image fixes in the same pass:
   `tools/build_glibc_denial.py` adds `libinput-bin` to the Denial closure, so
   libinput no longer reports missing quirks data.
 
+### Kernel log ring
+`src/log.rs` mirrors every kernel console write — boot self-tests, direct
+driver prints, structured entries — into a 16 KiB circular buffer. Structured entries
+use `log_info!`/`log_warn!`/`log_error!`/`log_debug!`/`log_trace!` (and the
+`_why!` variants) and add the context a raw boot line lacks:
+
+```
+[    0.556] INFO  vfs        src\main.rs:259  mounted /sfs (why: kernel image is readable)
+[    0.594] INFO  boot       src\boot\start.rs:38  boot complete, handing control to the scheduler (why: all init milestones reached)
+```
+
+The fields are uptime, level, subsystem target, `file:line` captured by the
+macro, message and an optional reason. The default threshold is `INFO`;
+`DEBUG`/`TRACE` compile into the same call and stay hidden until
+`log::set_level` raises it. The ring is allocation-free, masks interrupts while
+its index moves, and never holds its lock across a UART write.
+
+`dmesg` calls `SYS_LOG_DUMP` (93), which copies the ring into an EL0 buffer.
+The ring records kernel output only: EL0 `print`/`write` goes through
+`console::write_bytes_unlogged`, so a userspace banner or screen clear can
+neither flood the ring nor erase the dump. The panic path prints the newest
+1536 bytes before the stable banner, so the crash has visible history as well
+as a code.
+
 ### Panic banner
 Every fatal path now funnels through `src/panic.rs`, which prints one stable
 first line and then only the registers the caller actually has:

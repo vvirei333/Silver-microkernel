@@ -246,6 +246,7 @@ impl Line {
 }
 
 pub fn write_byte(byte: u8) {
+    crate::log::capture(&[byte]);
     let _writer = WriterGuard::acquire();
     match active() {
         Active::Geni => crate::geni_uart::write_byte(byte),
@@ -255,6 +256,7 @@ pub fn write_byte(byte: u8) {
 }
 
 pub fn write_str(message: &str) {
+    crate::log::capture(message.as_bytes());
     let _writer = WriterGuard::acquire();
     match active() {
         Active::Geni => crate::geni_uart::write_str(message),
@@ -264,6 +266,20 @@ pub fn write_str(message: &str) {
 }
 
 pub fn write_bytes(bytes: &[u8]) {
+    write_bytes_inner(bytes, true)
+}
+
+/// Console output that did not originate in the kernel. EL0 `print`/`write`
+/// takes this path so `dmesg` stays a kernel log: replaying a captured screen
+/// clear or banner would erase the dump the user just asked for.
+pub fn write_bytes_unlogged(bytes: &[u8]) {
+    write_bytes_inner(bytes, false)
+}
+
+fn write_bytes_inner(bytes: &[u8], log: bool) {
+    if log {
+        crate::log::capture(bytes);
+    }
     let _writer = WriterGuard::acquire();
     match active() {
         Active::Geni => crate::geni_uart::write_bytes(bytes),
@@ -273,21 +289,31 @@ pub fn write_bytes(bytes: &[u8]) {
 }
 
 pub fn write_hex_u64(value: u64) {
-    let _writer = WriterGuard::acquire();
-    match active() {
-        Active::Geni => crate::geni_uart::write_hex_u64(value),
-        Active::Pl011 => crate::pl011::write_hex_u64(value),
-        Active::None => {}
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut digits = [0_u8; 16];
+    for (index, digit) in digits.iter_mut().enumerate() {
+        *digit = HEX[((value >> (60 - index * 4)) & 0xF) as usize];
     }
+    write_bytes(&digits);
 }
 
 pub fn write_dec_u64(value: u64) {
-    let _writer = WriterGuard::acquire();
-    match active() {
-        Active::Geni => crate::geni_uart::write_dec_u64(value),
-        Active::Pl011 => crate::pl011::write_dec_u64(value),
-        Active::None => {}
+    let mut digits = [0_u8; 20];
+    let mut count = 0;
+    let mut remaining = value;
+    loop {
+        digits[count] = b'0' + (remaining % 10) as u8;
+        count += 1;
+        remaining /= 10;
+        if remaining == 0 {
+            break;
+        }
     }
+    let mut text = [0_u8; 20];
+    for index in 0..count {
+        text[index] = digits[count - 1 - index];
+    }
+    write_bytes(&text[..count]);
 }
 
 pub fn read_byte() -> Option<u8> {

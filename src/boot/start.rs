@@ -35,6 +35,11 @@ pub fn run() -> ! {
             console::write_str("SCHEDULER START\r\n");
         }
         ram_log::log("SCHEDULER START - BOOT COMPLETE");
+        crate::log_info_why!(
+            "boot",
+            "all init milestones reached",
+            "boot complete, handing control to the scheduler"
+        );
         scheduler::start();
     }
 }

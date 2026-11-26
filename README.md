@@ -163,6 +163,7 @@ Release notes for the 0.1.2 milestone and the current 1.0.3 bundle: [`RELEASE.md
 - [x] High-half and removed-alias probes: both fault without stopping other tasks
 - [x] Kernel-stamped IPC senders, checked nameserver IDs, saturating sleep deadlines and release-safe mutex ownership
 - [x] Kernel health snapshot (`SYS_HEALTH`, `health`) for frames, tasks, open files and DMA leak counters
+- [x] Kernel log ring: every kernel console write is mirrored into 16 KiB; structured `log_*!` entries carry uptime, level, subsystem, `file:line`, message and optional `why`; `dmesg` reads it through `SYS_LOG_DUMP` (93), and a panic dumps the newest history before its banner
 - [x] Dynamic ELF loader: `run <path>` loads an ELF64 file from the VFS into a fresh EL0 task with its own W^X address space
 - [x] EL0 fault containment: a crashed EL0 task (e.g. `run bin/crash`) is killed with a `Task X killed: Page Fault` log and the shell keeps running
 - [x] Unix-style toolbox: a multi-call `utils` ELF with `grep`, `wc`, `head`, `tail`, `cp`, `find`, `seq`, `basename`, `dirname`, `true`, `false` and `sleep`; `echo` redirection is line-terminated and the shell input queue no longer drops bursts
@@ -1255,6 +1256,7 @@ assumes the block driver keeps `0x1010_0000`. Both tasks are visible in `ps`.
 | `src/allocator.rs` | Kernel heap, `#[global_allocator]` |
 | `src/gic.rs` | GICv2 setup plus runtime dispatch to GICv3; timer availability gate |
 | `src/timer.rs` | ARM Generic Timer, tick counter |
+| `src/log.rs` | Console-mirrored 16 KiB log ring, levels, `log_*!` macros, `dmesg`/panic dump |
 | `src/interrupts.rs` | IRQ control: masking/restoring DAIF |
 | `src/capability.rs` | Capability tables, rights, delegation and revocation |
 | `src/scheduler/mod.rs` | Task table, ready queues, spawn/wait/exit, context switch, DMA ownership, console control and reaping |

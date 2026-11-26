@@ -52,6 +52,9 @@ pub fn code_for_kind(kind: u64) -> (u64, &'static str) {
 pub fn banner(code: u64, name: &str) {
     #[cfg(not(feature = "tablet"))]
     {
+        // History first: the last few hundred bytes explain how the machine
+        // reached this point, and the banner below is not repeated in it.
+        crate::log::dump_tail(1536);
         crate::console::write_str("KERNEL PANIC code=");
         write_code(code);
         crate::console::write_str(" (");

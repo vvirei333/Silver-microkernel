@@ -112,5 +112,11 @@ pub fn init() -> (usize, Box<u64>) {
         boot_metrics::log_milestone("Heap init");
     }
     ram_log::log("HEAP OK");
+    crate::log_info!(
+        "boot",
+        "heap ready base=0x{:x} test_value={}",
+        heap_base as u64,
+        *value
+    );
     (heap_base, value)
 }

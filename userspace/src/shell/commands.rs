@@ -16,7 +16,7 @@ const COMMANDS: &[&str] = &[
     "help", "fastfetch", "sfsinfo", "memtest", "bench", "ping", "ip",
     "ifconfig", "dns", "wget", "wolfser", "browser", "ls", "bigdir",
     "bigfile", "cat", "touch", "run", "sl", "mkdir", "rm", "rmdir",
-    "mv", "replace", "cd", "pwd", "clear", "uname", "health", "watch",
+    "mv", "replace", "cd", "pwd", "clear", "uname", "health", "dmesg", "watch",
     "unwatch", "du", "ps", "spawn", "bg", "secprobe", "fg", "kill",
     "wait", "svc", "poweroff", "reboot", "grep", "wc", "head", "tail",
     "cp", "find", "seq", "basename", "dirname", "true", "false", "sleep",
@@ -112,6 +112,7 @@ pub fn execute(command: &str) {
             syscall::print("  clear      Clear the terminal screen\r\n");
             syscall::print("  uname      Print kernel name, version and architecture\r\n");
             syscall::print("  health     Kernel resource and leak snapshot\r\n");
+            syscall::print("  dmesg      Dump the kernel console ring (boot + structured log)\r\n");
             syscall::print("  watch <addr> [len]  Arm a hardware write watchpoint (gdb-stub)\r\n");
             syscall::print("  unwatch    Disarm the watchpoint\r\n");
             syscall::print("  du [path]  SFS inode/block usage of a subtree\r\n");
@@ -170,6 +171,7 @@ pub fn execute(command: &str) {
             " aarch64 (WerewolfOS)\r\n"
         )),
         Some("health") => show_health(),
+        Some("dmesg") => dump_kernel_log(),
         Some("watch") => watch_command(words.next(), words.next()),
         Some("unwatch") => {
             let _ = syscall::debug_watch(0, 0);
@@ -192,6 +194,49 @@ pub fn execute(command: &str) {
             run_utility(syscall::PROGRAM_UTILS, command);
         }
         Some(_) => syscall::print("Unknown command. Type 'help'.\r\n"),
+    }
+}
+
+/// Prints the kernel console ring. `SYS_PRINT` caps one call at 4 KiB, so the
+/// dump is split on UTF-8 boundaries instead of on raw byte offsets.
+pub(super) fn dump_kernel_log() {
+    let mut buffer = [0_u8; 16 * 1024];
+    let length = match syscall::log_dump(&mut buffer) {
+        None => {
+            syscall::print("dmesg: unavailable (console owner only)\r\n");
+            return;
+        }
+        Some(0) => {
+            syscall::print("dmesg: log is empty\r\n");
+            return;
+        }
+        Some(length) => length,
+    };
+    let mut offset = 0;
+    while offset < length {
+        let end = (offset + 3800).min(length);
+        match core::str::from_utf8(&buffer[offset..end]) {
+            Ok(text) => {
+                syscall::print(text);
+                offset = end;
+            }
+            Err(error) => {
+                // The ring can start in the middle of a character; drop the
+                // invalid prefix and keep the valid run that follows it.
+                let valid = error.valid_up_to();
+                if valid != 0 {
+                    if let Ok(text) = core::str::from_utf8(&buffer[offset..offset + valid]) {
+                        syscall::print(text);
+                    }
+                    offset += valid;
+                } else {
+                    offset += 1;
+                }
+            }
+        }
+    }
+    if buffer[length - 1] != b'\n' {
+        syscall::print("\r\n");
     }
 }
 
