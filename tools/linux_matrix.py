@@ -49,7 +49,7 @@ CASES = [
     ("linuxrun /sfs/linux-pthread", b"pthread 42"),
     ("linuxrun /sfs/linux-pthread-lifetime", b"worker survived"),
     ("linuxrun /sfs/linux-leader-exit", b"worker survived"),
-    ("linuxrun /sfs/linux-kill-group", b"group kill"),
+    ("linuxrun /sfs/linux-kill-group", b"group kill signal ok"),
     ("linuxrun /sfs/linux-exitgroup", b"worker exiting"),
     ("linuxrun /sfs/linux-groupsig", b"group signal ok"),
     ("linuxrun /sfs/linux-unixsock", b"unix socket ok"),

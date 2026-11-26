@@ -27,6 +27,10 @@ pub fn exit_current() -> ! {
 }
 
 pub fn exit_current_with_status(raw_status: u64) -> ! {
+    exit_current_with_status_and_signal(raw_status, None)
+}
+
+fn exit_current_with_status_and_signal(raw_status: u64, signal: Option<u8>) -> ! {
     // Reserve the top three u64 values for SYS_WAIT_EVENT sentinels
     // (ERROR/STOPPED/ECHILD). A user exit status must never alias them.
     let status = raw_status.min(u64::MAX - 4);
@@ -107,7 +111,7 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
         // The status survives the Dead -> Zombie transition in `reap`; the
         // executable resources are released there, after this CPU has left
         // the context (see `reap_dead_tasks`).
-        task.exit_status = Some(status);
+        task.exit_status = Some(ExitStatus { code: status, signal });
     }
     if let Some(manager) = scheduler_manager() {
         recover_console(manager, id);
@@ -136,7 +140,7 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
     }
 }
 
-pub fn kill_task(id: u64) -> bool {
+pub fn kill_task(id: u64, signal: Option<u8>) -> bool {
     if id == IDLE_TASK_ID || id == current_task_id() {
         return false;
     }
@@ -194,7 +198,12 @@ pub fn kill_task(id: u64) -> bool {
         }
         task.state = TaskState::Dead;
         release_bound_irq(task);
-        task.exit_status = Some(1);
+        task.exit_status = Some(ExitStatus {
+            // Native waiters see the shell-compatible 128 + signal value;
+            // Linux wait4 uses `signal` and ignores this compatibility code.
+            code: signal.map_or(1, |signal| 128 + signal as u64),
+            signal,
+        });
         victims.push(task.id);
     }
     if victims.is_empty() {
@@ -273,13 +282,13 @@ pub(super) fn recover_console(manager: &mut TaskManager, exited: u64) {
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub enum WaitEvent {
-    Exited(u64),
+    Exited(ExitStatus),
     Stopped,
 }
 
 pub fn wait_for_task(id: u64) -> Option<u64> {
     match wait_inner(id, false, true) {
-        Some(WaitEvent::Exited(status)) => Some(status),
+        Some(WaitEvent::Exited(status)) => Some(status.code),
         _ => None,
     }
 }
@@ -299,7 +308,7 @@ pub fn wait_for_task_event(id: u64) -> Option<WaitEvent> {
 /// status to user memory, and then call [`consume_zombie`] in the same
 /// non-blocking critical section. No `schedule`/BKL release may happen in
 /// between; otherwise another waiter could consume the same zombie.
-pub fn wait_status_for_pid(id: u64) -> Option<u64> {
+pub fn wait_status_for_pid(id: u64) -> Option<ExitStatus> {
     if id == IDLE_TASK_ID || id == current_task_id() || !current_task_can_wait(id) {
         return None;
     }
@@ -315,7 +324,7 @@ pub fn wait_status_for_pid(id: u64) -> Option<u64> {
 /// Re-validates pid, state and status so a stale peek can never remove a
 /// different task or report a mismatched status. Runs with interrupts masked and
 /// the kernel lock held; it never blocks.
-pub fn consume_zombie(id: u64, expected_status: u64) -> bool {
+pub fn consume_zombie(id: u64, expected_status: ExitStatus) -> bool {
     // The transaction contract: peek and consume must be one BKL-protected
     // step so no other waiter can slip in between. This is a no-op in release.
     smp::bkl_assert_held();
@@ -325,7 +334,7 @@ pub fn consume_zombie(id: u64, expected_status: u64) -> bool {
             let index = manager.tasks.iter().position(|task| {
                 task.id == id
                     && task.state == TaskState::Zombie
-                    && task.exit_status.unwrap_or(0) == expected_status
+                    && task.exit_status == Some(expected_status)
             })?;
             take_zombie(manager, index);
             Some(())
@@ -380,7 +389,9 @@ pub(super) fn wait_inner(id: u64, report_stopped: bool, consume: bool) -> Option
                 if !consume {
                     // Transactional peek: report the status but keep the
                     // zombie available until the caller has copied it out.
-                    let status = manager.tasks[index].exit_status.unwrap_or(0);
+                    let status = manager.tasks[index]
+                        .exit_status
+                        .unwrap_or(ExitStatus::exited(0));
                     interrupts::restore_irq(saved_daif);
                     return Some(WaitEvent::Exited(status));
                 }
@@ -414,13 +425,15 @@ pub(super) fn wait_inner(id: u64, report_stopped: bool, consume: bool) -> Option
 /// Removal shifts every later index, so the current-task IDs of all online
 /// CPUs are snapshotted first and remapped afterwards. Capability records that
 /// target the dead task are dropped from the caller's table.
-pub(super) fn take_zombie(manager: &mut TaskManager, index: usize) -> u64 {
+pub(super) fn take_zombie(manager: &mut TaskManager, index: usize) -> ExitStatus {
     let id = manager.tasks[index].id;
     debug_assert!(
         manager.tasks[index].running_on.is_none(),
         "removing a zombie that is still running on a CPU"
     );
-    let status = manager.tasks[index].exit_status.unwrap_or(0);
+    let status = manager.tasks[index]
+        .exit_status
+        .unwrap_or(ExitStatus::exited(0));
     let cpu_ids = snapshot_current_ids(manager);
     let live_id = manager.tasks.get(smp::current_index()).map(|task| task.id);
     manager.tasks.remove(index);
@@ -482,6 +495,18 @@ pub(super) fn reaper_pid(manager: &TaskManager, excluded: u64) -> u64 {
 /// the space and descriptor table cannot disappear underneath a sibling.
 #[cfg(feature = "linux-abi")]
 pub fn exit_group(status: u64) -> ! {
+    exit_group_inner(status, None)
+}
+
+/// Group exit for a default-terminating signal. The leader's record carries
+/// the signal so a parent's wait4 can report WIFSIGNALED/WTERMSIG.
+#[cfg(feature = "linux-abi")]
+pub fn exit_group_signaled(signal: u8) -> ! {
+    exit_group_inner(128 + signal as u64, Some(signal))
+}
+
+#[cfg(feature = "linux-abi")]
+fn exit_group_inner(status: u64, signal: Option<u8>) -> ! {
     let current = current_task_id();
     let tgid = current_tgid();
     let is_leader = scheduler_manager()
@@ -502,7 +527,11 @@ pub fn exit_group(status: u64) -> ! {
             {
                 task.state = TaskState::Dead;
                 release_bound_irq(task);
-                task.exit_status = Some(if task.id == tgid { status } else { 1 });
+                task.exit_status = Some(if task.id == tgid {
+                    ExitStatus { code: status, signal }
+                } else {
+                    ExitStatus::exited(1)
+                });
                 wake.push(task.id);
             }
         }
@@ -517,7 +546,7 @@ pub fn exit_group(status: u64) -> ! {
     if !is_leader {
         // The leader is now Dead; its reaper releases the shared space. This
         // thread only has to leave its own context.
-        exit_current_with_status(status);
+        exit_current_with_status_and_signal(status, signal);
     }
     // Wait until every sibling is reaped. They were just woken, so a blocked
     // futex waiter or sleeper cannot delay this indefinitely.
@@ -536,6 +565,6 @@ pub fn exit_group(status: u64) -> ! {
         }
         sleep(1);
     }
-    exit_current_with_status(status)
+    exit_current_with_status_and_signal(status, signal)
 }
 

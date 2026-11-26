@@ -92,8 +92,21 @@ void _start(void) {
     if (sys2(129, pid, 9 /* SIGKILL */) != 0) {
         fail("kill failed\n", 12);
     }
-    if (sys4(260, pid, (long)&status, 0, 0) != pid) {
-        fail("kill wait failed\n", 17);
+    if (sys4(260, pid, (long)&status, 0, 0) != pid ||
+        (status & 0x7f) != 9) {
+        fail("kill status failed\n", 19);
+    }
+
+    /* Self-delivered fatal signal uses the group-exit path, not kill_task. */
+    pid = sys5(220, 17, 0, 0, 0, 0);
+    if (pid == 0) {
+        sys2(129, 0 /* own process */, 15 /* SIGTERM */);
+        for (;;) {
+        }
+    }
+    if (sys4(260, pid, (long)&status, 0, 0) != pid ||
+        (status & 0x7f) != 15) {
+        fail("self kill status failed\n", 24);
     }
 
     sys3(64, 1, (long)"signal ok\n", 10);

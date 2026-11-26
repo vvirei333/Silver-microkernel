@@ -3105,7 +3105,7 @@ pub fn fork_current_with_sp(
 /// Result of `wait4`.
 #[cfg(feature = "linux-abi")]
 pub enum WaitChild {
-    Exited(u64, u64),
+    Exited(u64, ExitStatus),
     StillRunning,
     NoChild,
 }
@@ -3150,7 +3150,9 @@ pub fn wait_child(pid: i64, nohang: bool) -> WaitChild {
             if pid > 0 {
                 // A qualified wait blocks on that child specifically.
                 return match wait_inner(pid as u64, false, true) {
-                    Some(WaitEvent::Exited(status)) => WaitChild::Exited(pid as u64, status),
+                    Some(WaitEvent::Exited(status)) => {
+                        WaitChild::Exited(pid as u64, status)
+                    }
                     _ => WaitChild::NoChild,
                 };
             }

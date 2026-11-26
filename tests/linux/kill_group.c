@@ -5,7 +5,8 @@
  * A child process starts a worker that sleeps, then touches a private page.
  * The parent, outside the group, sends SIGKILL to the child leader. If only
  * the leader dies, the worker wakes into a freed address space and faults; if
- * the kernel retires the group, wait4 returns and no fault appears.
+ * the kernel retires the group, wait4 returns a WIFSIGNALED status with
+ * WTERMSIG == SIGKILL and no fault appears.
  */
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
     register long x8 __asm__("x8") = n;
@@ -39,9 +40,17 @@ static void delay(long seconds) {
 }
 
 static volatile char *page;
+static int self_signal;
 
 static void worker(void) {
     delay(2);
+    if (self_signal) {
+        /* A worker's fatal signal must terminate its whole group and leave a
+         * WTERMSIG status on the leader record. */
+        sys3(129, 0 /* own process */, 15 /* SIGTERM */, 0);
+        for (;;) {
+        }
+    }
     page[0] = 'x';
     page[1] = 'y';
     print("worker should have been killed\n", 30);
@@ -106,11 +115,26 @@ void _start(void) {
     }
     /* Let a leaked worker wake and fault before declaring success. */
     delay(3);
-    if ((status & 0x7f) == 9) {
-        print("group kill signal ok\n", 21);
-    } else {
-        print("group kill reaped\n", 18);
+    if ((status & 0x7f) != 9) {
+        print("group kill wrong status\n", 24);
+        sys3(93, 4, 0, 0);
     }
+
+    /* The same group exit initiated by a worker must carry its signal. */
+    self_signal = 1;
+    pid = sys6(220, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
+    if (pid == 0) {
+        child();
+    }
+    if (pid < 0) {
+        sys3(93, 5, 0, 0);
+    }
+    if (sys6(260, pid, (long)&status, 0, 0, 0, 0) != pid ||
+        (status & 0x7f) != 15) {
+        print("group signal status wrong\n", 26);
+        sys3(93, 6, 0, 0);
+    }
+    print("group kill signal ok\n", 21);
     sys3(93, 0, 0, 0);
     for (;;) {
     }

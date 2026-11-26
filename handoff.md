@@ -8481,3 +8481,36 @@ Night session results, in order:
   `input ok`; `libinput-test` still reports `key=30` and `libinput ok`;
   `linux-sysfs` and `udev-test` pass; `cargo test --lib` 272 passed; console
   `health` 7 live / 0 zombie / 0 open / 0 leaked, `svc` 5 running.
+
+### 2026-11-26 (wait status) — report WIFSIGNALED for signal deaths
+
+- `Task.exit_status` is now `Option<ExitStatus>` with `code: u64` and
+  `signal: Option<u8>`. Normal exits use `ExitStatus::exited(code)`; a
+  default-terminating signal records `signal` alongside the compatibility
+  `128 + signal` code. The old single u64 could not distinguish
+  `exit(9)` from death by SIGKILL.
+- The scheduler wait event carries the whole `ExitStatus`
+  (`WaitEvent::Exited`, `WaitChild::Exited`). The native `SYS_WAITPID`
+  transaction still writes only `.code`, so native waiters keep their old ABI;
+  `consume_zombie` compares the full status so a stale peek cannot consume a
+  differently-terminated zombie.
+- `linux_wait4` now encodes a signal death as `signal & 0x7f`, making
+  `WIFSIGNALED` true and `WTERMSIG` return the number; normal exits still
+  use `(code & 0xff) << 8` and `WEXITSTATUS`. Core-dump and stopped statuses
+  are deliberately not fabricated.
+- `kill_task` takes an optional signal; `linux_kill` passes the actual
+  signal and `exit_group` gained `exit_group_signaled(signal)` for the
+  self/same-group path. Native `SYS_KILL` passes `None` and keeps the old
+  status-1 behaviour.
+- Tests: `linux-signal` now rejects a SIGKILL child whose wait status is not
+  `WIFSIGNALED` with signal 9, then forks a child that sends itself SIGTERM
+  and checks `WTERMSIG == 15` (the group-exit path). `linux-kill-group`
+  checks both an external SIGKILL of a group with a live worker and a
+  worker-initiated SIGTERM; it prints `group kill signal ok` only when both
+  leader statuses have the expected `WTERMSIG`.
+- Evidence (QEMU virt, Linux ABI kernel): `linux-signal` prints
+  `signal ok`, `linux-kill-group` prints `group kill signal ok` and returns
+  to `howl>`; `linux-fork` still sees `parent saw child 42`,
+  `linux-pthread-lifetime` still exits 0, and `linux-hello` still prints
+  `hello from linux abi`. Both kernel feature sets compile; `cargo test --lib`
+  remains 272 passed.

@@ -4,7 +4,7 @@
  *
  * The main thread calls pthread_exit(NULL) after a worker has signalled that
  * it is inside the process. The worker then sleeps, touches its heap, opens a
- * file and prints before returning. On Linux the mm, descriptor table and
+ * file, prints and exits. On Linux the mm, descriptor table and
  * signal dispositions belong to the thread group and survive the leader's
  * exit; a kernel that frees the leader's address space immediately faults in
  * the worker or reuses its ASID for another process. The expected output is

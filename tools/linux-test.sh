@@ -30,6 +30,9 @@
 #   linuxrun /sfs/linux-dynsig  # glibc sigaction + raise, prints 'dyn signal 10'
 #   linuxrun /sfs/linux-pthread # glibc pthread_create/join, prints 'pthread 42'
 #   linuxrun /sfs/linux-pthread-exit # exit_group kills a live worker
+#   linuxrun /sfs/linux-pthread-lifetime # leader pthread_exit, worker survives
+#   linuxrun /sfs/linux-leader-exit # raw SYS_EXIT leader, worker survives
+#   linuxrun /sfs/linux-kill-group # SIGKILL group, WTERMSIG == 9
 #   linuxrun /sfs/linux-groupsig # signal dispositions shared by the group
 #   linuxrun /sfs/linux-exitgroup # exit_group from a worker kills the process
 #   linuxrun /sfs/linux-sockets # glibc AF_UNIX + SCM_RIGHTS, prints 'glibc socket ok'

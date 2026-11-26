@@ -338,9 +338,10 @@ pub(super) fn linux_clone(
     }
 }
 
-/// `wait4(2)`. The exit status is encoded the Linux way: normal exit is
-/// `(code & 0xff) << 8`, which makes `WIFEXITED` true and `WEXITSTATUS` return
-/// the low byte.
+/// `wait4(2)`. Normal exits use `(code & 0xff) << 8` (WIFEXITED and
+/// WEXITSTATUS); a signal death uses the signal number in the low seven bits
+/// (WIFSIGNALED and WTERMSIG). Core-dump and stopped statuses are not produced
+/// by this kernel yet.
 pub(super) fn linux_wait4(pid: i64, status_pointer: u64, options: u64) -> Result<u64, u64> {
     const WNOHANG: u64 = 1;
     match scheduler::wait_child(pid, options & WNOHANG != 0) {
@@ -357,7 +358,10 @@ pub(super) fn linux_wait4(pid: i64, status_pointer: u64, options: u64) -> Result
                 crate::linux_signal::clear_pending(task, crate::linux_signal::SIGCHLD);
             }
             if status_pointer != 0 {
-                let word = ((status & 0xff) << 8) as u32;
+                let word = match status.signal {
+                    Some(signal) => signal as u32 & 0x7f,
+                    None => ((status.code & 0xff) << 8) as u32,
+                };
                 user_memory::copy_to_user(&word.to_le_bytes(), status_pointer)
                     .map_err(|_| EFAULT)?;
             }
@@ -589,9 +593,9 @@ pub(super) fn linux_kill(pid: i64, signal: u64) -> u64 {
                 // a sibling): the other threads share the leader's address
                 // space and would fault on the torn-down pages if one Task died
                 // alone.
-                scheduler::exit_group(128 + signal as u64);
+                scheduler::exit_group_signaled(signal as u8);
             }
-            let _ = scheduler::kill_task(target);
+            let _ = scheduler::kill_task(target, Some(signal as u8));
         }
         return 0;
     }

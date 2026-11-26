@@ -174,6 +174,22 @@ pub(super) const MAX_MMAP_REGIONS: usize = 16384;
 // user VA window reaches 0xF0000000.
 pub(super) const MAX_MMAP_BYTES_PER_TASK: usize = 2 * 1024 * 1024 * 1024;
 
+/// How a task left the system: a normal exit code or a terminating signal.
+///
+/// The native wait ABI exposes only `code`; the Linux ABI converts a signal
+/// into the low seven bits of a wait status so `WIFSIGNALED`/`WTERMSIG` work.
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub struct ExitStatus {
+    pub code: u64,
+    pub signal: Option<u8>,
+}
+
+impl ExitStatus {
+    pub fn exited(code: u64) -> Self {
+        Self { code, signal: None }
+    }
+}
+
 pub struct Task {
     pub id: u64,
     pub state: TaskState,
@@ -202,7 +218,7 @@ pub struct Task {
     /// parent dies, so an orphan is never left pointing at a dead PID.
     pub(super) ppid: Option<u64>,
     /// Exit status written by exit/kill and consumed exactly once by wait.
-    pub(super) exit_status: Option<u64>,
+    pub(super) exit_status: Option<ExitStatus>,
     /// Set when the executable resources (stacks, image, address space, DMA,
     /// heap, cwd, argv/envp) have been released. A `Zombie` only keeps this
     /// metadata; `wait` removes the record.

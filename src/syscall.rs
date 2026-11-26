@@ -408,14 +408,14 @@ fn dispatch_for_personality(frame: &mut [u64; FRAME_QUADWORDS], number: u64) -> 
             match scheduler::capability_task_id_with_rights(frame[0], capability::CAP_WAIT)
                 .and_then(scheduler::wait_for_task_event)
             {
-                Some(scheduler::WaitEvent::Exited(status)) => status,
+                Some(scheduler::WaitEvent::Exited(status)) => status.code,
                 Some(scheduler::WaitEvent::Stopped) => SYSCALL_STOPPED,
                 None => SYSCALL_ERROR,
             }
         }
         SYS_KILL => {
             if scheduler::capability_task_id_with_rights(frame[0], capability::CAP_KILL)
-                .map(scheduler::kill_task)
+                .map(|target| scheduler::kill_task(target, None))
                 .unwrap_or(false)
             {
                 0
@@ -665,7 +665,7 @@ fn sys_waitpid(pid: u64, status_ptr: u64) -> u64 {
         return SYSCALL_ECHILD;
     }
     if status_ptr != 0 {
-        let bytes = status.to_le_bytes();
+        let bytes = status.code.to_le_bytes();
         if user_memory::copy_to_user(&bytes[..], status_ptr).is_err() {
             // Unreachable: the same pointer was validated above and no mapping
             // change can occur while the BKL is held. Kept as a defensive

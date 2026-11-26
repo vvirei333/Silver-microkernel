@@ -227,7 +227,7 @@ fn terminate(signal: u32) -> ! {
     // A default-terminating signal ends the whole thread group: the other
     // threads share the leader's address space, and leaving any of them
     // running turns the leader's teardown into faults on dead pages.
-    scheduler::exit_group(128 + signal as u64)
+    scheduler::exit_group_signaled(signal as u8)
 }
 
 /// Builds and enters one pending user handler, if any. Runs immediately
