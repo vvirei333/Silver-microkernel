@@ -11,9 +11,11 @@
 
 use alloc::{format, vec, vec::Vec};
 
+use silver_microkernel::mem_policy;
+
 use crate::{
-    capability, channel, elf, frame_allocator, ipc, memory, mmu, mutex, console, scheduler, timer,
-    user_memory, vfs,
+    allocator, capability, channel, elf, frame_allocator, ipc, memory, mmu, mutex, console,
+    scheduler, timer, user_memory, vfs,
 };
 
 pub const SYS_SLEEP: u64 = 1;
@@ -215,6 +217,10 @@ struct HealthInfo {
     open_files: u64,
     dma_leaked_pages: u64,
     dma_quarantined_pages: u64,
+    kernel_heap_used: u64,
+    kernel_heap_free: u64,
+    kernel_heap_total: u64,
+    memory_pressure: u64,
     uptime_ticks: u64,
 }
 
@@ -1333,16 +1339,23 @@ fn sys_random(buffer: u64, length: u64) -> u64 {
 
 fn sys_health(info_ptr: u64) -> u64 {
     let (live_tasks, zombies) = scheduler::task_counts();
+    let total_pages = frame_allocator::total_pages();
+    let free_pages = frame_allocator::free_pages();
+    let (heap_used, heap_free, heap_total) = allocator::heap_stats();
     let info = HealthInfo {
-        version: 1,
+        version: 2,
         size: core::mem::size_of::<HealthInfo>() as u64,
-        total_pages: frame_allocator::total_pages() as u64,
-        free_pages: frame_allocator::free_pages() as u64,
+        total_pages: total_pages as u64,
+        free_pages: free_pages as u64,
         live_tasks: live_tasks as u64,
         zombies: zombies as u64,
         open_files: vfs::open_total() as u64,
         dma_leaked_pages: scheduler::dma_leaked_pages() as u64,
         dma_quarantined_pages: scheduler::dma_quarantined_pages() as u64,
+        kernel_heap_used: heap_used as u64,
+        kernel_heap_free: heap_free as u64,
+        kernel_heap_total: heap_total as u64,
+        memory_pressure: mem_policy::pressure_level(free_pages, total_pages) as u64,
         uptime_ticks: timer::ticks(),
     };
     let bytes = unsafe {

@@ -176,6 +176,10 @@ pub struct HealthInfo {
     pub open_files: u64,
     pub dma_leaked_pages: u64,
     pub dma_quarantined_pages: u64,
+    pub kernel_heap_used: u64,
+    pub kernel_heap_free: u64,
+    pub kernel_heap_total: u64,
+    pub memory_pressure: u64,
     pub uptime_ticks: u64,
 }
 
@@ -335,6 +339,10 @@ pub fn health_info() -> Option<HealthInfo> {
         open_files: 0,
         dma_leaked_pages: 0,
         dma_quarantined_pages: 0,
+        kernel_heap_used: 0,
+        kernel_heap_free: 0,
+        kernel_heap_total: 0,
+        memory_pressure: 0,
         uptime_ticks: 0,
     };
     if unsafe { syscall1(SYS_HEALTH, &mut info as *mut HealthInfo as u64) } == 0 {

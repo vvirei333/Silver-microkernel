@@ -3112,8 +3112,9 @@ qemu-system-aarch64 -machine virt -cpu cortex-a72 -m 128M -nographic \
 5. **SFS durability.** Per-bundle block/inode quotas and atomic replacement are
    done; a metadata journal, crash recovery beyond the current fail-closed
    fsck direction, file-size quotas and larger-image sparse reads remain.
-6. **Resource limits.** Wait-queue growth and kernel-heap accounting are still
-   unbounded; everything else has an explicit cap.
+6. **Resource limits.** Wait-queue growth and kernel-heap quotas are still
+   open; heap usage is now observable in `health`, but every other resource
+   already has an explicit cap.
 7. **Network services.** TCP/UDP on smoltcp, DHCP/DNS, virtio-net interrupts
    and more than one frame per direction.
 8. **Program credentials and dynamic loader.** Decide which embedded programs
@@ -8514,3 +8515,27 @@ Night session results, in order:
   `linux-pthread-lifetime` still exits 0, and `linux-hello` still prints
   `hello from linux abi`. Both kernel feature sets compile; `cargo test --lib`
   remains 272 passed.
+
+### 2026-11-26 (kernel heap accounting) — health reports heap and pressure
+
+- `allocator::heap_stats()` samples the linked-list heap under its own lock and
+  returns exact used/free/total bytes. It is a read-only snapshot, so it cannot
+  drift after a failed allocation or a leaked frame.
+- `SYS_HEALTH` is now v2: the userspace and kernel `HealthInfo` structures
+  gained `kernel_heap_used/free/total` and `memory_pressure` (0 normal,
+  1 warning, 2 critical). The size field still carries the struct size, so a
+  mismatch is detectable.
+- A failed kernel allocation now prints `HEAP USED/FREE/TOTAL` next to the
+  requested size and alignment before the panic; previously it showed only the
+  request.
+- `health` prints the heap line (KiB used/total and free) and the pressure
+  level. This makes a slow heap leak or a session approaching the frame reserve
+  visible without a debugger.
+- Evidence (QEMU virt, console kernel): `health` prints
+  `WerewolfOS health v2`, `heap: used 76 / 16384 KiB (free 16307 KiB)`
+  and `memory: normal`, with `live 7 zombie 0`, 0 open files and 0 DMA
+  leaks. `cargo check` passes for the console feature set; `cargo test --lib`
+  remains 272 passed.
+- Still open: heap **quotas** (this is accounting, not a limit), wait-queue
+  growth, and per-process aggregate limits. The next memory slice remains
+  page-granular COW for contiguous image/stack runs.

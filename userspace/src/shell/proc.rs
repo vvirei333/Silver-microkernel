@@ -406,6 +406,20 @@ pub(super) fn show_health() {
     syscall::print("  files:  open ");
     syscall::print_dec_u64(info.open_files);
     syscall::print("\r\n");
+    syscall::print("  heap:   used ");
+    syscall::print_dec_u64(info.kernel_heap_used / 1024);
+    syscall::print(" / ");
+    syscall::print_dec_u64(info.kernel_heap_total / 1024);
+    syscall::print(" KiB (free ");
+    syscall::print_dec_u64(info.kernel_heap_free / 1024);
+    syscall::print(" KiB)\r\n");
+    syscall::print("  memory: ");
+    match info.memory_pressure {
+        1 => syscall::print("warning"),
+        2 => syscall::print("critical"),
+        _ => syscall::print("normal"),
+    }
+    syscall::print("\r\n");
     syscall::print("  dma:    leaked ");
     syscall::print_dec_u64(info.dma_leaked_pages);
     syscall::print(" quarantined ");

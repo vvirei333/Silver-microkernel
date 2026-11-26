@@ -134,6 +134,11 @@ Console-image fixes in the same pass:
   per call, so a line assembled from several calls could be cut in half by
   another CPU (visible as `Spawned task ID=EXIT: task=10 …`). `console::Line`
   and `syscall::Line` assemble in a stack buffer and emit with one write.
+- **Kernel heap accounting is visible.** `SYS_HEALTH` (v2) reports exact heap
+  used/free/total bytes and the memory-pressure level derived from free frames.
+  `health` prints both, so a leak or a session approaching the reserve is
+  visible without a debugger. A failed kernel allocation now prints
+  `HEAP USED/FREE/TOTAL` before the panic, instead of only the requested size.
 
 ### Linux ABI
 - Static and dynamic glibc programs; real `ld.so`, PIE/`PT_INTERP`, `$ORIGIN`.
@@ -430,7 +435,7 @@ The same list can be run manually at `howl>`:
 | `linuxrun /sfs/linux-wlreal` | `libwayland 2 clients ok` |
 | `linuxrun /sfs/linux-wlinfo` | `wayland-info ok` (stock binary) |
 | `linuxrun /sfs/linux-dbus` | `dbus ok` |
-| `health` | 0 zombies, 0 open files, 0 DMA leaks |
+| `health` | 0 zombies, 0 open files, 0 DMA leaks; heap used < total, memory normal |
 
 Host-side: `cargo test --lib` → **272 tests**. Feature builds: `no_std`,
 `no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,smp`,
