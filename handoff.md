@@ -8322,6 +8322,28 @@ Night session results, in order:
 - Open: feed `libinput_dispatch()` events into the compositor seat; more than
   two input devices stays out of scope.
 
+### 2026-11-26 (panic banner) — one code per fatal path
+
+- Fatal output started with `EL1 EXCEPTION kind=..`, and the words `KERNEL
+  PANIC` only appeared last as `: halting`; there was no stable value to
+  quote. Added `src/panic.rs`: `code_for_kind` maps the internal entry kinds
+  to a byte code, `banner` prints `KERNEL PANIC code=0xNN (name)`, `details`
+  prints ESR/ELR/FAR only when nonzero, and `park` records the code in
+  ramoops before the `wfe` loop.
+- `silver_handle_exception` is now a three-line adapter around
+  `panic::halt`; the Rust `#[panic_handler]` prints the same banner, then
+  `panic at file:line` / `panic msg ...`; PSCI failures use kind 10
+  (`0x09 power off`) instead of the old generic kind 4.
+- Codes: `0x01` rust panic, `0x02` sync exception, `0x03` FIQ, `0x04`
+  SError, `0x05` boot assertion, `0x06` allocator, `0x07` unexpected IRQ,
+  `0x08` self-test, `0x09` power off, `0xff` unknown.
+- Evidence: a temporary `panic!` at boot printed
+  `KERNEL PANIC code=0x01 (rust panic)` plus location/message; a temporary
+  synthetic kind 6 printed
+  `KERNEL PANIC code=0x05 (boot assertion)` with the supplied
+  ESR/ELR/FAR. Both hooks were removed, the clean console kernel boots to
+  `howl>`, and `cargo test --lib` still passes 272 tests.
+
 ### 2026-11-26 (wall clock) — PL031 epoch for CLOCK_REALTIME
 
 - `clock_gettime` ignored the clock id and returned `timer::ticks()/100`, so

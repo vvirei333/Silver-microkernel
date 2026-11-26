@@ -201,6 +201,32 @@ Console-image fixes in the same pass:
   `tools/build_glibc_denial.py` adds `libinput-bin` to the Denial closure, so
   libinput no longer reports missing quirks data.
 
+### Panic banner
+Every fatal path now funnels through `src/panic.rs`, which prints one stable
+first line and then only the registers the caller actually has:
+
+```
+KERNEL PANIC code=0x05 (boot assertion)
+ESR_EL1=00000000DEADBEEF ELR_EL1=0000000040001234 FAR_EL1=FFFF000000000000
+```
+
+| Code | Name | Source |
+|---|---|---|
+| `0x01` | rust panic | `panic!`, `assert!`, explicit kernel assertions |
+| `0x02` | sync exception | EL1 data/instruction abort, undefined instruction |
+| `0x03` | fiq | unhandled FIQ |
+| `0x04` | serror | SError interrupt |
+| `0x05` | boot assertion | boot-time invariants (`kind 6`) |
+| `0x06` | allocator | frame/heap allocator (`kind 7`) |
+| `0x07` | unexpected irq | IRQ with no handler (`kind 8`) |
+| `0x08` | self-test | boot self-test failure (`kind 9`) |
+| `0x09` | power off | PSCI power-off/reset failure |
+| `0xff` | unknown | an internal kind without a public code |
+
+The code is also written to ramoops as `PANIC code=0x..`; the tablet still
+writes no UART output. A Rust panic adds `panic at file:line` and
+`panic msg ...` below the banner.
+
 ### Wall clock
 - `src/rtc.rs` binds the tree's `arm,pl031` node, samples its data register
   once at boot and logs `RTC=PL031 epoch=...`. QEMU `virt` keeps

@@ -86,6 +86,7 @@ mod debug;
 #[cfg(not(feature = "std"))]
 mod platform;
 mod pci_boot;
+mod panic;
 mod power;
 mod rtc;
 mod ram_log;
@@ -295,29 +296,29 @@ fn panic(info: &PanicInfo) -> ! {
     // the ramoops log; a stray UART write here could abort before logging.
     #[cfg(feature = "tablet")]
     {
-        crate::ram_log::log("PANIC");
         if let Some(location) = info.location() {
-            crate::ram_log::log_raw(" line=");
+            crate::ram_log::log_raw("panic line=");
             crate::ram_log::log_hex(location.line() as u64);
             crate::ram_log::log_raw("\n");
         }
     }
     #[cfg(not(feature = "tablet"))]
     {
+        crate::panic::banner(crate::panic::RUST_PANIC, "rust panic");
         if let Some(location) = info.location() {
-            console::write_str("PANIC AT ");
+            console::write_str("panic at ");
             console::write_str(location.file());
             console::write_str(":");
             console::write_dec_u64(location.line() as u64);
             console::write_str("\r\n");
         }
         if let Some(message) = info.message().as_str() {
-            console::write_str("PANIC MSG ");
+            console::write_str("panic msg ");
             console::write_str(message);
             console::write_str("\r\n");
         }
     }
-    exceptions::silver_handle_exception(4, 0, 0, 0)
+    crate::panic::park(crate::panic::RUST_PANIC, 0, 0, 0)
 }
 
 #[cfg(feature = "std")]
