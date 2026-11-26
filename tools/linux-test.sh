@@ -96,6 +96,8 @@ build capmode
 build fexec
 build fexec-memfd
 build threads
+build leader_exit
+build kill_group
 build unixsock
 build namedsock
 build wayland
@@ -258,6 +260,9 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     "$CC" -O2 -pthread -o build/pthread-exit tests/linux/pthread_exit.c
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/pthread-exit
+    "$CC" -O2 -pthread -o build/pthread-lifetime tests/linux/pthread_lifetime.c
+    patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
+        --set-rpath '$ORIGIN' build/pthread-lifetime
     "$CC" -O2 -pthread -o build/group-signal tests/linux/group_signal.c
     patchelf --set-interpreter /sfs/ld-linux-aarch64.so.1 \
         --set-rpath '$ORIGIN' build/group-signal
@@ -319,6 +324,7 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     python3 scripts/sfs_inject.py "$IMAGE" build/dyn-signal linux-dynsig
     python3 scripts/sfs_inject.py "$IMAGE" build/pthread-test linux-pthread
     python3 scripts/sfs_inject.py "$IMAGE" build/pthread-exit linux-pthread-exit
+    python3 scripts/sfs_inject.py "$IMAGE" build/pthread-lifetime linux-pthread-lifetime
     python3 scripts/sfs_inject.py "$IMAGE" build/group-signal linux-groupsig
     python3 scripts/sfs_inject.py "$IMAGE" build/exitgroup-thread linux-exitgroup
     python3 scripts/sfs_inject.py "$IMAGE" build/sockets linux-sockets
@@ -326,13 +332,15 @@ if command -v patchelf >/dev/null 2>&1 && [ -f "$LD_SO" ] && [ -f "$LIBC_SO" ] \
     python3 scripts/sfs_inject.py "$IMAGE" build/threadfork linux-threadfork
     python3 scripts/sfs_inject.py "$IMAGE" build/futexping linux-futexping
     python3 scripts/sfs_inject.py "$IMAGE" build/scratch linux-scratch
+python3 scripts/sfs_inject.py "$IMAGE" build/leader_exit.elf linux-leader-exit
+python3 scripts/sfs_inject.py "$IMAGE" build/kill_group.elf linux-kill-group
 python3 scripts/sfs_inject.py "$IMAGE" build/stdio linux-stdio
 printf 'long name ok' > build/long-name-payload
 python3 scripts/sfs_inject.py "$IMAGE" build/long-name-payload \
     alpine-package-version-3.24.4-r0-aarch64-long-name-test-file.txt
 python3 scripts/sfs_inject.py "$IMAGE" build/longname linux-longname
     python3 scripts/sfs_inject.py "$IMAGE" build/eventloop linux-eventloop
-    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit linuxrun /sfs/linux-groupsig linuxrun /sfs/linux-exitgroup linuxrun /sfs/linux-sockets linuxrun /sfs/linux-memfd linuxrun /sfs/linux-threadfork linuxrun /sfs/linux-futexping linuxrun /sfs/linux-scratch linuxrun /sfs/linux-eventloop$WLREAL"
+    DYN=" linuxrun /sfs/linux-dyn linuxrun /sfs/linux-dynsig linuxrun /sfs/linux-pthread linuxrun /sfs/linux-pthread-exit linuxrun /sfs/linux-pthread-lifetime linuxrun /sfs/linux-groupsig linuxrun /sfs/linux-exitgroup linuxrun /sfs/linux-sockets linuxrun /sfs/linux-memfd linuxrun /sfs/linux-threadfork linuxrun /sfs/linux-futexping linuxrun /sfs/linux-scratch linuxrun /sfs/linux-eventloop$WLREAL"
 else
     DYN=""
     echo "note: patchelf or the dynamic AArch64 libc is missing; skipped the dynamic test" >&2

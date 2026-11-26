@@ -231,7 +231,17 @@ pub fn spawn_thread(
             unsafe { *smp::this_cpu().fp.get() },
         )
     };
-    if !mem_policy::task_charge_ok(0, TASK_STACK_PAGES, task_frame_limit()) {
+    // A thread stack is part of the process footprint, not a separate ledger:
+    // charge it to the group leader so `RLIMIT_AS`-style accounting (and the
+    // per-task frame limit) sees the real cost of N threads. The thread's own
+    // `mem_frames` stays zero; its address-space operations are routed to the
+    // leader by `with_group_owner` anyway.
+    let leader_index = manager.tasks.iter().position(|task| task.id == tgid)?;
+    if !mem_policy::task_charge_ok(
+        manager.tasks[leader_index].mem_frames,
+        TASK_STACK_PAGES,
+        task_frame_limit(),
+    ) {
         return None;
     }
     let kernel_stack_start = kernel_stack::alloc()?;
@@ -294,7 +304,7 @@ pub fn spawn_thread(
         mmap_regions: Vec::new(),
         mmap_bytes: 0,
         signal_trampoline: None,
-        mem_frames: TASK_STACK_PAGES,
+        mem_frames: 0,
         program_break,
         waiting_on: None,
         owned_mutexes: Vec::new(),
@@ -321,6 +331,7 @@ pub fn spawn_thread(
         kernel_stack::free(kernel_stack_start);
         return None;
     }
+    manager.tasks[leader_index].mem_frames += TASK_STACK_PAGES;
     manager.tasks.push(task);
     manager.next_id += 1;
     let index = manager.tasks.len() - 1;

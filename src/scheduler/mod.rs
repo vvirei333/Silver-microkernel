@@ -3782,6 +3782,42 @@ fn wake_expired_tasks(manager: &mut TaskManager, now: u64) {
     }
 }
 
+/// A process leader owns the shared page tables, descriptor table and signal
+/// dispositions. Its record must stay Dead, not become a Zombie, while any
+/// thread is still alive or still executing in that space on another CPU.
+fn group_is_quiescent(manager: &TaskManager, task: &Task) -> bool {
+    if task.is_thread {
+        return true;
+    }
+    manager
+        .tasks
+        .iter()
+        .filter(|member| member.tgid == task.id)
+        .all(|member| {
+            member.running_on.is_none()
+                && matches!(member.state, TaskState::Dead | TaskState::Zombie)
+        })
+}
+
+/// Announce a completed process to its Linux parent. Thread exits are not
+/// waitable and must not generate SIGCHLD; the leader's Zombie transition is
+/// the single point where the whole group is gone.
+#[cfg(feature = "linux-abi")]
+fn notify_parent_exit(manager: &TaskManager, id: u64) {
+    let Some(task) = manager.tasks.iter().find(|task| task.id == id) else {
+        return;
+    };
+    if task.is_thread {
+        return;
+    }
+    let Some(parent) = task.ppid else {
+        return;
+    };
+    if task_alive(parent) && crate::linux_signal::has_table(parent) {
+        crate::linux_signal::raise(parent, crate::linux_signal::SIGCHLD);
+    }
+}
+
 fn reap_dead_tasks(manager: &mut TaskManager) {
     // Drain the DMA quarantine on every pass, including passes with no dead
     // task: the grace window is measured in these passes, and delaying the
@@ -3795,6 +3831,22 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     {
         return;
     }
+
+    // Freeze the set of tasks whose resources may be released in this pass.
+    // A leader is releasable only once every member of its group is Dead or
+    // Zombie and no CPU is still executing in the shared space. Computing the
+    // list once also keeps the DMA revoke pass on the same rule.
+    let releasable_ids: Vec<u64> = manager
+        .tasks
+        .iter()
+        .filter(|task| {
+            task.state == TaskState::Dead
+                && task.running_on.is_none()
+                && !task.resources_released
+                && group_is_quiescent(manager, task)
+        })
+        .map(|task| task.id)
+        .collect();
 
     // Snapshot every online CPU's current task: removals (zombie cap) shift
     // indices, and the local CPU must be remapped too.
@@ -3814,15 +3866,16 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     // revoke; ordinary schedule passes must not pay for a world stop. If the
     // handshake times out, fall back to the conservative per-range gate and
     // leak rather than tearing a live space down.
-    let needs_quiesce = manager.tasks.iter().any(|task| {
-        task.state == TaskState::Dead && task.running_on.is_none() && !task.dma_pages.is_empty()
-    });
+    let needs_quiesce = manager
+        .tasks
+        .iter()
+        .any(|task| releasable_ids.contains(&task.id) && !task.dma_pages.is_empty());
     let quiesced = needs_quiesce && smp::quiesce_begin();
     let mut dma_revokes: Vec<(usize, usize, mmu::RevokeResult)> = Vec::new();
     for dead in manager
         .tasks
         .iter()
-        .filter(|task| task.state == TaskState::Dead && task.running_on.is_none())
+        .filter(|task| releasable_ids.contains(&task.id))
     {
         for &(physical, page_count, _) in &dead.dma_pages {
             let fail = mmu::RevokeResult {
@@ -3912,8 +3965,12 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     let mut lost_console: Vec<u64> = Vec::new();
     let mut drop_threads: Vec<u64> = Vec::new();
     let mut wake: Vec<u64> = Vec::new();
+    let mut thread_charges: Vec<u64> = Vec::new();
     for task in &mut manager.tasks {
         if task.state != TaskState::Dead || task.running_on.is_some() || task.resources_released {
+            continue;
+        }
+        if !releasable_ids.contains(&task.id) {
             continue;
         }
         // Backstop unlink: ipc queues were already detached in `remove_task`
@@ -3944,6 +4001,9 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         task.irq_pending = false;
         task.release_stack();
         task.release_space(&dma_revokes);
+        if task.is_thread {
+            thread_charges.push(task.tgid);
+        }
         task.clear_resources();
         task.state = TaskState::Zombie;
         if task.owns_console {
@@ -3952,6 +4012,19 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
         became_zombie.push(task.id);
         if task.is_thread {
             drop_threads.push(task.id);
+        }
+    }
+    // Return each retired thread's kernel-stack charge to its group ledger.
+    // If the leader itself is retired in this pass, its ledger is about to be
+    // cleared and the debit is irrelevant; skip a cleared leader to avoid
+    // silently underflowing a live process's accounting.
+    for tgid in thread_charges {
+        if let Some(leader) = manager
+            .tasks
+            .iter_mut()
+            .find(|task| task.id == tgid && !task.resources_released)
+        {
+            leader.release_frames(TASK_STACK_PAGES);
         }
     }
     if quiesced {
@@ -3972,6 +4045,14 @@ fn reap_dead_tasks(manager: &mut TaskManager) {
     // Orphans must point at a live reaper, never at a dead PID.
     for &dead_id in &became_zombie {
         reparent_children(manager, dead_id);
+    }
+
+    // A process becomes visible to its parent only now, after its last thread
+    // has left the address space. Sending SIGCHLD from the leader's own exit
+    // path would wake the parent while workers were still running.
+    #[cfg(feature = "linux-abi")]
+    for &dead_id in &became_zombie {
+        notify_parent_exit(manager, dead_id);
     }
 
     // Retire capability records targeting the new zombies, keeping CAP_WAIT so

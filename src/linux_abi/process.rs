@@ -581,11 +581,14 @@ pub(super) fn linux_kill(pid: i64, signal: u64) -> u64 {
     }
     if handler == crate::linux_signal::SIG_DFL {
         if crate::linux_signal::default_terminates(signal) || signal == crate::linux_signal::SIGKILL {
-            if target == task {
+            if target == task
+                || scheduler::group_leader(target) == scheduler::group_leader(task)
+            {
                 // A default-terminating signal ends the whole thread group
-                // (glibc abort() raises against itself): the other threads
-                // share the leader's address space and would fault on the
-                // torn-down pages if the leader died alone.
+                // (glibc abort() raises against itself, pthread_kill can target
+                // a sibling): the other threads share the leader's address
+                // space and would fault on the torn-down pages if one Task died
+                // alone.
                 scheduler::exit_group(128 + signal as u64);
             }
             let _ = scheduler::kill_task(target);

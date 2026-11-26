@@ -148,6 +148,9 @@ Console-image fixes in the same pass:
   `getrandom`.
 - Threads (`CLONE_VM`), per-thread TLS, futex join, shared thread-group fds,
   heap/mmap/image and signal dispositions; `exit_group` from any thread.
+  A leader may exit before its workers: the group's page tables, descriptors
+  and signal table stay live until the last member is quiescent, and a fatal
+  signal retires the whole group rather than one Task.
 - Writable `/tmp` with `O_CREAT`/`O_EXCL`/`O_TRUNC`, `mkdirat`, `unlinkat`,
   `renameat`; `XDG_RUNTIME_DIR=/tmp`.
 - `MAP_SHARED` memfd windows shared across processes and `fork`.
@@ -410,6 +413,9 @@ The same list can be run manually at `howl>`:
 | `linuxrun /sfs/linux-scope` | `scope ok` |
 | `linuxrun /sfs/linux-threads` | `threads ok` |
 | `linuxrun /sfs/linux-pthread` | `worker x` / `pthread 42` |
+| `linuxrun /sfs/linux-pthread-lifetime` | `leader exiting` / `worker survived` (exit 0) |
+| `linuxrun /sfs/linux-leader-exit` | `worker survived` (leader exited first) |
+| `linuxrun /sfs/linux-kill-group` | `group kill` (no worker fault) |
 | `linuxrun /sfs/linux-exitgroup` | `worker exiting` (main killed) |
 | `linuxrun /sfs/linux-groupsig` | `group signal ok` |
 | `linuxrun /sfs/linux-unixsock` | `unix socket ok` |

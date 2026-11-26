@@ -597,6 +597,56 @@ Redmi port is parked. The reference checklist is
   harness (`wayland_info.c`) serves until EOF and prints `wayland-info ok`.
   Full series plus repeats and `health`: 9596/31575 frames, zero zombies/open
   files/DMA leaks; fsck clean.
+
+### 2026-11-26 (process lifetime) — keep a thread group alive after its leader exits
+
+- **Leader exit no longer tears down a live group.** `exit_current_with_status`
+  now detects a leader with live (or Dead-but-not-yet-switched) siblings and
+  defers the group-wide fds, signal dispositions, VFS table and child
+  reparenting. The leader record stays `Dead` so `with_group_owner` /
+  `fd_table_owner` still resolve for workers, but it does not become a
+  waitable `Zombie` yet. A worker continues to malloc, fault, open files and
+  print normally; the reaper retires the leader only after the last member has
+  left every CPU.
+- **The reaper gates address-space and DMA release on group quiescence.**
+  `group_is_quiescent` requires every task with the leader's `tgid` to be
+  `Dead`/`Zombie` with `running_on == None`. `releasable_ids` is computed
+  before the teardown loop and used for both DMA revoke and the main release,
+  closing the race where a sibling was still executing in a freed `ttbr0`.
+- **Fatal signals are group-wide.** `kill_task` marks every live member Dead
+  (and refuses a caller inside the same group, where `exit_group` is correct);
+  `linux_kill` routes a same-group fatal signal through `exit_group`. Group
+  fds/VFS/signals stay live until the reaper sees the last member leave.
+- **Console ownership follows the process.** If the exiting leader owned the
+  terminal, `recover_console` transfers it to a live sibling before falling
+  back to `howl`; otherwise the worker's output would be discarded.
+- **SIGCHLD is emitted once, at finalization.** The leader's exit no longer
+  signals the parent while workers still run; the reaper does it when the
+  leader becomes a `Zombie`. Child reparenting is likewise deferred to that
+  point.
+- **Thread stacks are charged to the group ledger.** `spawn_thread` checks
+  `task_charge_ok` against the leader's `mem_frames`, adds
+  `TASK_STACK_PAGES` only after every fallible publication succeeds, and the
+  reaper returns the charge when the thread's stack is freed. The thread's own
+  `mem_frames` is zero; a failed spawn never debits the leader.
+- **Tests.** New freestanding `linux-leader-exit` exits `SYS_EXIT` from the
+  leader, sleeps in a `CLONE_VM` worker, touches its page, prints
+  `worker survived` and exits the group; new `linux-kill-group` forks a child
+  with a live worker, sends `SIGKILL` from the parent, waits and then sleeps
+  long enough for a leaked worker to fault. New
+  `linux-pthread-lifetime` uses a real pthread worker, calls
+  `pthread_exit(NULL)` from main, then touches its heap and opens a file;
+  `leader_exit.ld`/`kill_group.ld` are single-segment linker scripts. All are
+  wired into `tools/linux-test.sh` and `tools/linux_matrix.py`.
+- **Evidence.** QEMU virt, Linux ABI kernel: `linux-leader-exit` prints
+  `worker running`, `EXIT: task=7 ... status=0`, `worker survived`,
+  `EXIT: task=8 ... status=0`, then returns to `howl>`; the same probe with
+  the worker using `SYS_EXIT` instead of `SYS_EXIT_GROUP` also reaps cleanly.
+  `linux-kill-group` prints `group kill reaped` and returns to the shell with
+  no fault. The static-musl `linux-pthread-lifetime` prints
+  `leader exiting`, `worker survived ok! fd=3` and exits 0. Console build
+  boots and `health` reports `live 7 zombie 0`; `cargo test --lib` remains
+  **272 passed**.
   **Slice 33 (frame callbacks and buffer release):** the real client creates
   two buffers from one shm pool (offsets 0 and 2048), draws two distinct
   patterns and commits three alternating frames. It requests a

@@ -38,12 +38,30 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
         smp::bkl_acquire();
     }
     let id = current_task_id();
+    let (tgid, is_thread) = current_task_mut()
+        .map(|task| (task.tgid, task.is_thread))
+        .unwrap_or((id, false));
+    // A leader that exits with live siblings must not take the shared address
+    // space, descriptor table or signal dispositions with it. The leader record
+    // stays Dead (so `with_group_owner` and `fd_table_owner` still resolve)
+    // until the last thread has left the space; only then does the reaper
+    // release the group resources and turn the leader into a waitable Zombie.
+    let group_alive = scheduler_manager()
+        .map(|manager| {
+            manager.tasks.iter().any(|task| {
+                task.id != id
+                    && task.tgid == tgid
+                    && task.state != TaskState::Zombie
+                    // A Dead sibling whose CPU has not switched away yet still
+                    // owns a slice of the shared context until `running_on`
+                    // clears; keep the tables alive for it.
+                    && (task.state != TaskState::Dead || task.running_on.is_some())
+            })
+        })
+        .unwrap_or(false);
+    let defer_group = !is_thread && group_alive;
     #[cfg(feature = "linux-abi")]
-    let parent = current_task_mut().and_then(|task| task.ppid);
-    #[cfg(feature = "linux-abi")]
-    let (tgid, clear_tid) = current_task_mut()
-        .map(|task| (task.tgid, task.clear_child_tid))
-        .unwrap_or((0, None));
+    let clear_tid = current_task_mut().and_then(|task| task.clear_child_tid);
     // Kernel-side trace: syscall::print is discarded for tasks that do not own
     // the console, so a task dying silently leaves no user-visible evidence.
     // console writes here are raw MMIO pokes and stay visible for every task.
@@ -70,13 +88,18 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
         crate::linux_abi::futex_wake_address(pointer, tgid, 1);
     }
     crate::ipc::remove_task(id);
-    #[cfg(feature = "linux-abi")]
-    crate::linux_fd::close_task(id);
-    #[cfg(feature = "linux-abi")]
-    crate::linux_signal::close_task(id);
+    // These tables are keyed by the group leader. A leader that leaves a live
+    // worker behind keeps them until the reaper retires the whole group; a
+    // thread id has no table of its own, so closing it here is a no-op.
+    if !defer_group {
+        #[cfg(feature = "linux-abi")]
+        crate::linux_fd::close_task(id);
+        #[cfg(feature = "linux-abi")]
+        crate::linux_signal::close_task(id);
+        vfs::close_task(id);
+    }
     #[cfg(feature = "linux-abi")]
     crate::linux_abi::futex_cleanup(id);
-    vfs::close_task(id);
     let saved_daif = interrupts::save_and_disable_irq();
     if let Some(task) = current_task_mut() {
         task.state = TaskState::Dead;
@@ -88,15 +111,13 @@ pub fn exit_current_with_status(raw_status: u64) -> ! {
     }
     if let Some(manager) = scheduler_manager() {
         recover_console(manager, id);
-        // A dying parent must not leave its children pointing at a dead PID.
-        reparent_children(manager, id);
-        wake_process_waiters(manager);
-    }
-    #[cfg(feature = "linux-abi")]
-    if let Some(parent) = parent {
-        if task_alive(parent) && crate::linux_signal::has_table(parent) {
-            crate::linux_signal::raise(parent, crate::linux_signal::SIGCHLD);
+        // A process is not over while a worker still runs in its space: its
+        // children keep their PPID and the parent gets SIGCHLD only when the
+        // reaper retires the last member. A thread has no children of its own.
+        if !defer_group && !is_thread {
+            reparent_children(manager, id);
         }
+        wake_process_waiters(manager);
     }
 
     schedule_released();
@@ -137,40 +158,102 @@ pub fn kill_task(id: u64) -> bool {
     }
     // Side effects only after the target is proven live: a bogus CAP_KILL
     // target must not broadcast mailbox/console wakeups across the system.
-    let parent = manager.tasks[index].ppid;
-    crate::ipc::remove_task(id);
-    #[cfg(feature = "linux-abi")]
-    crate::linux_fd::close_task(id);
-    #[cfg(feature = "linux-abi")]
-    crate::linux_signal::close_task(id);
-    #[cfg(feature = "linux-abi")]
-    crate::linux_abi::futex_cleanup(id);
-    vfs::close_task(id);
-    manager.tasks[index].state = TaskState::Dead;
-    release_bound_irq(&mut manager.tasks[index]);
-    manager.tasks[index].exit_status = Some(1);
-    recover_console(manager, id);
-    reparent_children(manager, id);
-    wake_process_waiters(manager);
-    #[cfg(feature = "linux-abi")]
-    if let Some(parent) = parent {
-        if task_alive(parent) && crate::linux_signal::has_table(parent) {
-            crate::linux_signal::raise(parent, crate::linux_signal::SIGCHLD);
-        }
+    //
+    // Linux signals target a thread group. Killing only the leader would leave
+    // its workers running in freed page tables and close the descriptor table
+    // underneath them, so a fatal signal retires every live member. A caller
+    // inside the same group cannot mark itself Dead here; it must take the
+    // `exit_group` path instead.
+    let target_tgid = manager.tasks[index].tgid;
+    let group_member = manager.tasks[index].is_thread
+        || manager
+            .tasks
+            .iter()
+            .any(|task| task.id != id && task.tgid == target_tgid);
+    let current = current_task_id();
+    if group_member
+        && manager
+            .tasks
+            .iter()
+            .any(|task| task.id == current && task.tgid == target_tgid)
+    {
+        interrupts::restore_irq(saved_daif);
+        return false;
     }
+    let mut victims = Vec::new();
+    for task in manager.tasks.iter_mut() {
+        if group_member {
+            if task.tgid != target_tgid {
+                continue;
+            }
+        } else if task.id != id {
+            continue;
+        }
+        if matches!(task.state, TaskState::Dead | TaskState::Zombie) {
+            continue;
+        }
+        task.state = TaskState::Dead;
+        release_bound_irq(task);
+        task.exit_status = Some(1);
+        victims.push(task.id);
+    }
+    if victims.is_empty() {
+        interrupts::restore_irq(saved_daif);
+        return false;
+    }
+    for &victim in &victims {
+        crate::ipc::remove_task(victim);
+        #[cfg(feature = "linux-abi")]
+        crate::linux_abi::futex_cleanup(victim);
+    }
+    for &victim in &victims {
+        recover_console(manager, victim);
+    }
+    // The group's tables and address space stay live until the reaper sees the
+    // last victim leave its CPU; a worker running on another CPU is kicked so
+    // it can obey the Dead state instead of touching a dying space.
+    wake_process_waiters(manager);
+    smp::ipi_reschedule_others();
     schedule_released();
     interrupts::restore_irq(saved_daif);
     true
 }
 
 pub(super) fn recover_console(manager: &mut TaskManager, exited: u64) {
-    let Some(exited_task) = manager.tasks.iter_mut().find(|task| task.id == exited) else {
+    let Some((exited_tgid, owns_console)) = manager
+        .tasks
+        .iter()
+        .find(|task| task.id == exited)
+        .map(|task| (task.tgid, task.owns_console))
+    else {
         return;
     };
-    if !exited_task.owns_console {
+    if !owns_console {
         return;
     }
-    exited_task.owns_console = false;
+    // The terminal belongs to the process, not to the one Task record that
+    // happened to call `set_console_owner`. If a worker is still running in
+    // this group, hand the console to it before falling back to the shell.
+    let successor = manager
+        .tasks
+        .iter()
+        .find(|task| {
+            task.id != exited
+                && task.tgid == exited_tgid
+                && !matches!(task.state, TaskState::Dead | TaskState::Zombie)
+        })
+        .map(|task| task.id);
+    for task in &mut manager.tasks {
+        if task.id == exited {
+            task.owns_console = false;
+        }
+        if Some(task.id) == successor {
+            task.owns_console = true;
+        }
+    }
+    if successor.is_some() {
+        return;
+    }
     manager.console_parent = None;
     if cfg!(feature = "demo-tasks") {
         return;
@@ -393,10 +476,10 @@ pub(super) fn reaper_pid(manager: &TaskManager, excluded: u64) -> u64 {
     IDLE_TASK_ID
 }
 
-/// `exit_group(2)` from the thread-group leader: mark every sibling Dead,
-/// let the reaper retire them, then exit the leader and release the shared
-/// address space. A non-leader falls back to exiting only itself; transferring
-/// process ownership safely is a later refactor.
+/// `exit_group(2)`: mark every member Dead, let the reaper retire them, then
+/// exit the caller and release the shared address space. A non-leader uses the
+/// same path; the leader record stays Dead until the last worker has left, so
+/// the space and descriptor table cannot disappear underneath a sibling.
 #[cfg(feature = "linux-abi")]
 pub fn exit_group(status: u64) -> ! {
     let current = current_task_id();
