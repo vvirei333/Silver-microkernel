@@ -103,6 +103,10 @@ pub(super) struct MmapRegion {
     /// Faulted pages of a lazy region, keyed by page offset. Sparse, because
     /// a 128 MiB reservation usually has only a few MiB touched.
     pub(super) pages: BTreeMap<u32, (usize, u32)>,
+    /// Pages broken out of an anonymous contiguous run by copy-on-write,
+    /// keyed by page offset. The base run stays owned as a whole; these are
+    /// additional private frames, so one write never copies its neighbours.
+    pub(super) cow_pages: BTreeMap<u32, (usize, u32)>,
     /// File-backed lazy region: `(path, byte offset of the mapping inside the
     /// file)`. Pages are read from the file on first touch, so mapping a
     /// 160 MiB library costs only the pages the program actually executes.
@@ -138,6 +142,54 @@ impl MmapRegion {
             }
         }
         tail
+    }
+
+    /// Removes and returns the private COW frames with offsets in
+    /// `[start, start + count)`.
+    pub(super) fn remove_cow_range(&mut self, start: u32, count: u32) -> Vec<(usize, u32)> {
+        let end = start.saturating_add(count);
+        let keys: Vec<u32> = self
+            .cow_pages
+            .range(start..end)
+            .map(|(&key, _)| key)
+            .collect();
+        let mut removed = Vec::with_capacity(keys.len());
+        for key in keys {
+            if let Some(frame) = self.cow_pages.remove(&key) {
+                removed.push(frame);
+            }
+        }
+        removed
+    }
+
+    /// Splits off the private COW frames at or above `at`, keyed from zero.
+    pub(super) fn take_cow_from(&mut self, at: u32) -> BTreeMap<u32, (usize, u32)> {
+        let keys: Vec<u32> = self.cow_pages.range(at..).map(|(&key, _)| key).collect();
+        let mut tail = BTreeMap::new();
+        for key in keys {
+            if let Some(value) = self.cow_pages.remove(&key) {
+                tail.insert(key - at, value);
+            }
+        }
+        tail
+    }
+
+    /// Physical frame backing `offset`, including a private COW override.
+    pub(super) fn page_physical(&self, offset: u32) -> Option<usize> {
+        if self.lazy {
+            return self.pages.get(&offset).map(|&(page, _)| page);
+        }
+        if !self.frames.is_empty() {
+            return self.frames.get(offset as usize).map(|&(page, _)| page);
+        }
+        if let Some(&(page, _)) = self.cow_pages.get(&offset) {
+            return Some(page);
+        }
+        let index = offset as usize;
+        if index >= self.page_count {
+            return None;
+        }
+        Some(self.physical_start + index * PAGE_SIZE)
     }
 }
 
@@ -796,6 +848,7 @@ impl Task {
                 frames: Vec::new(),
                 lazy: true,
                 pages: BTreeMap::new(),
+                cow_pages: BTreeMap::new(),
                 file: None,
             };
             let position = self
@@ -891,6 +944,7 @@ impl Task {
             frames: Vec::new(),
             lazy: false,
             pages: BTreeMap::new(),
+            cow_pages: BTreeMap::new(),
             file: None,
         };
         let position = self
@@ -930,6 +984,7 @@ impl Task {
             frames: Vec::new(),
             lazy: true,
             pages: BTreeMap::new(),
+            cow_pages: BTreeMap::new(),
             file: Some((path, file_offset)),
         };
         let position = self
@@ -1018,6 +1073,7 @@ impl Task {
             frames,
             lazy: false,
             pages: BTreeMap::new(),
+            cow_pages: BTreeMap::new(),
             file: None,
         };
         let position = self
@@ -1122,14 +1178,9 @@ impl Task {
             if page < start || page >= end {
                 continue;
             }
-            let physical = if region.lazy {
-                let offset = ((page - start) / crate::memory::PAGE_SIZE) as u32;
-                match region.pages.get(&offset) {
-                    Some((physical, _)) => *physical,
-                    None => return false,
-                }
-            } else {
-                region.physical_start + (page - start)
+            let offset = ((page - start) / crate::memory::PAGE_SIZE) as u32;
+            let Some(physical) = region.page_physical(offset) else {
+                return false;
             };
             return mmu::map_user_page_at(ttbr0, page, physical, region.prot);
         }
@@ -1147,14 +1198,9 @@ impl Task {
             if page < start || page >= end {
                 continue;
             }
-            let physical = if region.lazy {
-                let offset = ((page - start) / crate::memory::PAGE_SIZE) as u32;
-                match region.pages.get(&offset) {
-                    Some((physical, _)) => *physical,
-                    None => return false,
-                }
-            } else {
-                region.physical_start + (page - start)
+            let offset = ((page - start) / crate::memory::PAGE_SIZE) as u32;
+            let Some(physical) = region.page_physical(offset) else {
+                return false;
             };
             crate::debug::request_reprotect(
                 ttbr0 as u64,
@@ -1598,38 +1644,47 @@ impl Task {
                     (new_physical, new_generation);
                 return true;
             }
-            let old_physical = region.physical_start;
-            let old_generation = region.generation;
-            let count = region.page_count;
-            let virtual_address = region.virtual_address;
+            let page_index = (page - region.virtual_address) / PAGE_SIZE;
+            let key = page_index as u32;
             let prot = region.prot;
-            let Some((new_physical, new_generation)) =
-                cow_copy_run(old_physical, count, old_generation)
-            else {
-                return false;
-            };
-            if !mmu::remap_user_pages_at(
-                ttbr0,
-                virtual_address,
-                new_physical,
-                count,
-                prot,
-            ) {
-                frame_allocator::free_contiguous_pages_tagged(
-                    new_physical,
-                    count,
-                    new_generation,
-                );
+            let old_override = region.cow_pages.get(&key).copied();
+            let old_physical = old_override
+                .map(|(page, _)| page)
+                .unwrap_or(region.physical_start + page_index * PAGE_SIZE);
+            let charged = old_override.is_none();
+            if charged && !self.charge_frames(1) {
+                cow_reason_set(b"mmap charge-fail");
                 return false;
             }
-            frame_allocator::free_contiguous_pages_tagged(
-                old_physical,
-                count,
-                old_generation,
-            );
-            let region = &mut self.mmap_regions[region_index];
-            region.physical_start = new_physical;
-            region.generation = new_generation;
+            let Some((new_physical, new_generation)) = frame_allocator::alloc_user_page_tagged()
+            else {
+                if charged {
+                    self.release_frames(1);
+                }
+                cow_reason_set(b"mmap copy-fail");
+                return false;
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(old_physical) as *const u8,
+                    phys_to_virt(new_physical) as *mut u8,
+                    PAGE_SIZE,
+                );
+            }
+            if !mmu::remap_user_pages_at(ttbr0, page, new_physical, 1, prot) {
+                frame_allocator::free_page_tagged(new_physical, new_generation);
+                if charged {
+                    self.release_frames(1);
+                }
+                cow_reason_set(b"mmap remap-fail");
+                return false;
+            }
+            if let Some((old_page, old_generation)) = old_override {
+                let _ = frame_allocator::free_page_tagged(old_page, old_generation);
+            }
+            self.mmap_regions[region_index]
+                .cow_pages
+                .insert(key, (new_physical, new_generation));
             return true;
         }
 
@@ -1707,6 +1762,16 @@ impl Task {
                 console::write_str(" pages)\r\n");
                 return false;
             }
+            let removed_cow =
+                self.mmap_regions[index].remove_cow_range(start_page as u32, count as u32);
+            let removed_cow_count = removed_cow.len();
+            for (page, frame_generation) in removed_cow {
+                if !frame_allocator::free_page_tagged(page, frame_generation) {
+                    console::write_str("MMAP: allocator refused COW page 0x");
+                    console::write_hex_u64(page as u64);
+                    console::write_str(" - leaked\r\n");
+                }
+            }
             if lazy {
                 // Only touched pages were ever charged; release exactly the
                 // frames inside the removed range.
@@ -1765,6 +1830,12 @@ impl Task {
                         }
                     } else if !paged {
                         region.physical_start = removed_physical + count * PAGE_SIZE;
+                        // Override offsets are relative to the region start.
+                        let shift = count as u32;
+                        let cow_pages = core::mem::take(&mut region.cow_pages);
+                        for (key, value) in cow_pages {
+                            region.cow_pages.insert(key - shift, value);
+                        }
                     }
                 }
                 (true, true) => {
@@ -1781,6 +1852,16 @@ impl Task {
                         tail.frames = self.mmap_regions[index].frames.split_off(start_page);
                     } else {
                         tail.physical_start = removed_physical + count * PAGE_SIZE;
+                        let tail_start = (start_page + count) as u32;
+                        let cow_pages = core::mem::take(&mut self.mmap_regions[index].cow_pages);
+                        tail.cow_pages.clear();
+                        for (key, value) in cow_pages {
+                            if key >= tail_start {
+                                tail.cow_pages.insert(key - tail_start, value);
+                            } else {
+                                self.mmap_regions[index].cow_pages.insert(key, value);
+                            }
+                        }
                     }
                     self.mmap_regions[index].page_count = left;
                     self.mmap_regions.insert(index + 1, tail);
@@ -1788,7 +1869,7 @@ impl Task {
             }
             self.mmap_bytes = self.mmap_bytes.saturating_sub(count * PAGE_SIZE);
             if !lazy {
-                self.release_frames(count);
+                self.release_frames(count + removed_cow_count);
             }
         }
         true
@@ -1955,6 +2036,7 @@ impl Task {
         } else if tail.frames.is_empty() {
             tail.physical_start =
                 self.mmap_regions[index].physical_start + offset_pages * PAGE_SIZE;
+            tail.cow_pages = self.mmap_regions[index].take_cow_from(offset_pages as u32);
         } else {
             tail.frames = tail.frames.split_off(offset_pages);
             self.mmap_regions[index].frames.truncate(offset_pages);

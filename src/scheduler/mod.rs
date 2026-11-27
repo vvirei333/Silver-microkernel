@@ -2596,6 +2596,11 @@ impl Drop for ForkParts {
             let _ = frame_allocator::free_page_tagged(page, generation);
         }
         for region in &self.mmap {
+            if region.shared.is_some() {
+                // A shared memfd window owns no frames of its own; its
+                // handle is released when this guard's Vec is dropped.
+                continue;
+            }
             if region.lazy {
                 for &(page, generation) in region.pages.values() {
                     let _ = frame_allocator::free_page_tagged(page, generation);
@@ -2607,6 +2612,9 @@ impl Drop for ForkParts {
                     let _ = frame_allocator::free_page_tagged(page, generation);
                 }
                 continue;
+            }
+            for &(page, generation) in region.cow_pages.values() {
+                let _ = frame_allocator::free_page_tagged(page, generation);
             }
             let _ = frame_allocator::free_contiguous_pages_tagged(
                 region.physical_start,
@@ -2801,6 +2809,7 @@ pub fn fork_current_with_sp(
                 frames: Vec::new(),
                 lazy: true,
                 pages,
+                cow_pages: BTreeMap::new(),
                 file: region.file.clone(),
             });
             continue;
@@ -2832,15 +2841,33 @@ pub fn fork_current_with_sp(
                 frames: shared,
                 lazy: false,
                 pages: BTreeMap::new(),
+                cow_pages: BTreeMap::new(),
                 file: None,
             });
             continue;
+        }
+        // A page the parent already broke out of the contiguous run is a
+        // separate frame; share it explicitly and carry the override into the
+        // child, exactly as the stack and image maps do.
+        let mut shared_cow = BTreeMap::new();
+        for (&offset, &(page, generation)) in &region.cow_pages {
+            if !frame_allocator::share_page_tagged(page, generation) {
+                for &(page, generation) in shared_cow.values() {
+                    let _ = frame_allocator::free_page_tagged(page, generation);
+                }
+                return None;
+            }
+            shared_cow.insert(offset, (page, generation));
         }
         if !frame_allocator::share_contiguous_pages_tagged(
             region.physical_start,
             region.page_count,
             region.generation,
-        ) { return None;
+        ) {
+            for &(page, generation) in shared_cow.values() {
+                let _ = frame_allocator::free_page_tagged(page, generation);
+            }
+            return None;
         }
         parts.mmap.push(MmapRegion {
             virtual_address: region.virtual_address,
@@ -2852,6 +2879,7 @@ pub fn fork_current_with_sp(
             frames: Vec::new(),
             lazy: false,
             pages: BTreeMap::new(),
+            cow_pages: shared_cow,
             file: None,
         });
     }
@@ -2864,7 +2892,9 @@ pub fn fork_current_with_sp(
             if region.lazy {
                 region.pages.len()
             } else {
-                region.page_count
+                // The base run stays mapped for every page; a broken page
+                // is an additional private frame, not a replacement.
+                region.page_count + region.cow_pages.len()
             }
         })
         .sum();
@@ -2988,13 +3018,36 @@ pub fn fork_current_with_sp(
                 region.prot,
             )
         } else {
-            mmu::map_shared_user_pages_at(
+            // The base run is mapped read-only by `map_shared_user_pages_at`;
+            // now point the pages the parent already broke at their shared
+            // private frames. Otherwise the child would read stale base bytes.
+            let child_prot = if region.prot & mmu::PROT_WRITE != 0 {
+                mmu::PROT_READ
+            } else {
+                region.prot
+            };
+            let mut ok = mmu::map_shared_user_pages_at(
                 ttbr0,
                 region.virtual_address,
                 region.physical_start,
                 region.page_count,
                 region.prot,
-            )
+            );
+            if ok {
+                for (&offset, &(page, _generation)) in &region.cow_pages {
+                    if !mmu::remap_user_pages_at(
+                        ttbr0,
+                        region.virtual_address + offset as usize * PAGE_SIZE,
+                        page,
+                        1,
+                        child_prot,
+                    ) {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            ok
         };
         if !mapped {
             kernel_stack::free(kernel_stack_start); return None;
@@ -4438,6 +4491,13 @@ fn release_space_resources(
                 }
                 continue;
             }
+            for &(page, generation) in region.cow_pages.values() {
+                if !frame_allocator::free_page_tagged(page, generation) {
+                    console::write_str("MMAP: release refused COW page 0x");
+                    console::write_hex_u64(page as u64);
+                    console::write_str(" - leaked\r\n");
+                }
+            }
             frame_allocator::free_contiguous_pages_tagged(
                 region.physical_start,
                 region.page_count,
@@ -4446,7 +4506,8 @@ fn release_space_resources(
         } else {
             // A live PTE still references these frames; leaking is the only
             // safe outcome.
-            MMAP_LEAKED_FRAMES.fetch_add(region.page_count, Ordering::Relaxed);
+            let leaked = region.page_count + region.cow_pages.len();
+            MMAP_LEAKED_FRAMES.fetch_add(leaked, Ordering::Relaxed);
             console::write_str("MMAP LEAK: teardown could not unmap range 0x");
             console::write_hex_u64(if region.lazy {
                 region.virtual_address as u64
@@ -4454,7 +4515,7 @@ fn release_space_resources(
                 region.physical_start as u64
             });
             console::write_str(" (");
-            console::write_dec_u64(region.page_count as u64);
+            console::write_dec_u64(leaked as u64);
             console::write_str(" pages)\r\n");
         }
     }

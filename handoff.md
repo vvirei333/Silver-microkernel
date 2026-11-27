@@ -8576,6 +8576,39 @@ Night session results, in order:
   272 passed; `no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,gdb-stub`,
   `no_std,smp-selftest` and `no_std,tablet` check cleanly. The console kernel
   still reports `heap: used 76 / 16384 KiB` and `memory: normal`.
-- Still open: page-granular COW for writable `mmap` regions (they still copy
-  a whole run), and a VmObject/page-cache representation that can split a
-  contiguous image run and reclaim the stale base page.
+- Still open: a VmObject/page-cache representation that can split a
+  contiguous image/mmap run and reclaim the stale base page.
+
+### 2026-11-26 (page-granular mmap COW) - one page per anonymous mapping write
+
+- Anonymous writable `mmap` was the last whole-run COW path: the first write
+  duplicated the entire contiguous mapping even though one page faulted.
+  `MmapRegion` now carries `cow_pages: BTreeMap<u32, (physical, generation)>`
+  next to the existing lazy and paged representations; the contiguous base
+  run is still owned and mapped for pages that were never written.
+- The fault path copies one 4 KiB page from the override or the base run,
+  remaps one PTE writable, frees the replaced override, and charges one net
+  frame only for the first break. `page_physical` is the single lookup used
+  by the gdb soft-watch helpers, so a broken page keeps its real frame.
+- `fork` shares every override along with the base run, copies the override
+  map into the child, adds them to the child ledger, and maps the child's
+  overrides read-only. A second fork therefore sees the parent's private
+  bytes, not the stale base page.
+- `munmap` removes overrides from the unmapped range and releases both those
+  frames and this task's base-run reference. Prefix and middle removals
+  shift the surviving override offsets, and `split_region_at` (used by
+  `mprotect`) splits the map with the region. `ForkParts::drop` and
+  `release_space_resources` free overrides with the rest of the mapping;
+  the fork-failure guard now also skips `MAP_SHARED` memfd windows instead
+  of freeing frames it does not own.
+- `tests/linux/cowfork.c` writes a third mmap page (200 KiB), has the second
+  child verify it, then unmaps a prefix, a middle slice, the tail and the
+  final piece. That covers override inheritance, offset shifting, and slice
+  release, not just the happy path.
+- Evidence (QEMU virt, Linux ABI kernel): `linux-cowfork` prints
+  `cow fork ok`; `health` after the test reports `frames: used 9353` and
+  `zombie 0`, the same count as a clean boot. `linux-fork`,
+  `linux-pthread-lifetime`, `linux-signal` and `linux-kill-group` still hit
+  their markers. `cargo test --lib` remains 272 passed;
+  `no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,linux-abi,gdb-stub`,
+  `no_std,gdb-stub`, `no_std,smp-selftest` and `no_std,tablet` check cleanly.

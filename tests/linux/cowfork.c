@@ -9,7 +9,7 @@
  * bytes everywhere and exits. The parent re-checks that its pages were not
  * changed, then writes its own values. It forks again after those writes so
  * the child must inherit the parent's private image, mmap, stack and heap
- * pages. This covers page-granular image/stack COW and run-granular mmap COW.
+ * pages. This covers page-granular image, stack and anonymous mmap COW.
  */
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
     register long x8 __asm__("x8") = n;
@@ -60,7 +60,8 @@ static int child_check_after_parent(void) {
     if (image_data[0] != 0x55 || image_data[512 * 1024] != 0xA5) {
         return 20;
     }
-    if (mapping[0] != 0x66 || mapping[128 * 1024] != 0x11) {
+    if (mapping[0] != 0x66 || mapping[128 * 1024] != 0x11 ||
+        mapping[200 * 1024] != 0x77) {
         return 21;
     }
     if (stack_data[0] != 0x99 || heap_data[0] != 0xBB || heap_data[1] != 0xCC) {
@@ -69,10 +70,12 @@ static int child_check_after_parent(void) {
     image_data[0] = 0x15;
     image_data[512 * 1024] = 0x25;
     mapping[0] = 0x35;
+    mapping[200 * 1024] = 0x27;
     stack_data[0] = 0x45;
     heap_data[0] = 0x55;
     if (image_data[0] != 0x15 || image_data[512 * 1024] != 0x25 ||
-        mapping[0] != 0x35 || stack_data[0] != 0x45 || heap_data[0] != 0x55) {
+        mapping[0] != 0x35 || mapping[200 * 1024] != 0x27 ||
+        stack_data[0] != 0x45 || heap_data[0] != 0x55) {
         return 23;
     }
     return 0;
@@ -166,6 +169,7 @@ void _start(void) {
         fail("heap ptr lost after image write\n", 31, 10);
     }
     mapping[0] = 0x66;
+    mapping[200 * 1024] = 0x77;
     if (heap_data == 0) {
         fail("heap ptr lost after mmap write\n", 31, 11);
     }
@@ -180,7 +184,8 @@ void _start(void) {
         fail("x11 not preserved across COW\n", 28, 13);
     }
     heap_data[0] = 0xBB;
-    if (image_data[0] != 0x55 || mapping[0] != 0x66 || stack_data[0] != 0x99 ||
+    if (image_data[0] != 0x55 || mapping[0] != 0x66 ||
+        mapping[200 * 1024] != 0x77 || stack_data[0] != 0x99 ||
         heap_data[0] != 0xBB || heap_data[1] != 0xCC) {
         fail("parent write failed\n", 20, 6);
     }
@@ -204,8 +209,23 @@ void _start(void) {
         fail("second child saw stale page\n", 27, 16);
     }
     if (image_data[0] != 0x55 || image_data[512 * 1024] != 0xA5 ||
-        mapping[0] != 0x66 || stack_data[0] != 0x99 || heap_data[0] != 0xBB) {
+        mapping[0] != 0x66 || mapping[200 * 1024] != 0x77 ||
+        stack_data[0] != 0x99 || heap_data[0] != 0xBB) {
         fail("second child changed parent\n", 27, 17);
+    }
+    /* The region has three private frames. Unmap a prefix, a middle slice
+     * and the tail to exercise offset shifting and slice release. */
+    if (sys2(215, (long)mapping, 64 * 1024) != 0) {
+        fail("munmap prefix failed\n", 21, 18);
+    }
+    if (sys2(215, (long)mapping + 128 * 1024, 64 * 1024) != 0) {
+        fail("munmap middle failed\n", 20, 19);
+    }
+    if (sys2(215, (long)mapping + 192 * 1024, 64 * 1024) != 0) {
+        fail("munmap tail failed\n", 18, 20);
+    }
+    if (sys2(215, (long)mapping + 64 * 1024, 64 * 1024) != 0) {
+        fail("munmap rest failed\n", 18, 21);
     }
 
     sys3(64, 1, (long)"cow fork ok\n", 12);
