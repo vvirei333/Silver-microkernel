@@ -1381,9 +1381,69 @@ pub(super) fn linux_umount(target: u64, _flags: u64) -> u64 {
     }
 }
 
+/// Linux `sysinfo(2)`. The booting init only needs a plausible structure,
+/// but reporting real frame counts makes it useful to tests and health
+/// tooling instead of a zeroed lie. `mem_unit` stays 1, so all sizes are
+/// bytes. `sharedram`, swap and high memory are zero: the kernel has no
+/// swap and keeps all managed RAM in one zone.
+#[repr(C)]
+struct LinuxSysinfo {
+    uptime: i64,
+    loads: [u64; 3],
+    totalram: u64,
+    freeram: u64,
+    sharedram: u64,
+    bufferram: u64,
+    totalswap: u64,
+    freeswap: u64,
+    procs: u16,
+    pad: u16,
+    pad2: u32,
+    totalhigh: u64,
+    freehigh: u64,
+    mem_unit: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<LinuxSysinfo>() == 112);
+
+pub(super) fn linux_sysinfo(pointer: u64) -> u64 {
+    if pointer == 0 {
+        return errno(EFAULT);
+    }
+    let page_size = crate::memory::PAGE_SIZE as u64;
+    let total = crate::frame_allocator::total_pages() as u64 * page_size;
+    let free = crate::frame_allocator::free_pages() as u64 * page_size;
+    let info = LinuxSysinfo {
+        uptime: 0,
+        loads: [0; 3],
+        totalram: total,
+        freeram: free,
+        sharedram: 0,
+        bufferram: 0,
+        totalswap: 0,
+        freeswap: 0,
+        procs: 0,
+        pad: 0,
+        pad2: 0,
+        totalhigh: 0,
+        freehigh: 0,
+        mem_unit: 1,
+    };
+    let bytes = unsafe {
+        core::slice::from_raw_parts(
+            (&info as *const LinuxSysinfo).cast::<u8>(),
+            core::mem::size_of::<LinuxSysinfo>(),
+        )
+    };
+    match user_memory::copy_to_user(bytes, pointer) {
+        Ok(()) => 0,
+        Err(_) => errno(EFAULT),
+    }
+}
+
 /// Zero-fills a user structure for the calls whose values do not matter to a
-/// booting init (`getrusage`, `sysinfo`, `statfs`). A null pointer is a
-/// no-op, matching the kernel's tolerance for optional outputs.
+/// booting init (`getrusage`, `statfs`). A null pointer is a no-op, matching
+/// the kernel's tolerance for optional outputs.
 pub(super) fn linux_zero_struct(pointer: u64, length: usize) -> u64 {
     if pointer == 0 {
         return 0;

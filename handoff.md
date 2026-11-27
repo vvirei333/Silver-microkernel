@@ -8639,3 +8639,44 @@ Night session results, in order:
   `zombie 0`, the clean-boot count. `linux-fork`, `linux-signal`,
   `linux-kill-group`, `linux-pipe`, `linux-mmapfile` and
   `linux-pthread-lifetime` still hit their markers.
+
+### 2026-11-26 (lazy mmap VmObject) - share the backing object across fork
+
+- Lazy anonymous and file mappings no longer copy every touched page in
+  `fork`. `MmapRegion` now owns an `Arc<SpinLock<VmObject>>` plus a
+  `base_bias`; the object holds the pages faulted before a fork, and every
+  child shares the same Arc. A private `pages` map holds only pages broken
+  out after the fork, so the common case is one frame per first write
+  instead of one frame per touched page per child.
+- `lazy_page_fault` looks up a private override first, then the object at
+  `base_bias + offset`. A store while `cow_shared` copies one page, remaps
+  the already-present PTE with `remap_user_pages_at` (not
+  `map_user_page_at`), and records the override. Before a fork, a fresh
+  page goes into the object; after a fork it stays private.
+- Prefix and middle `munmap` adjust `base_bias` (and the file offset) rather
+  than rekeying every object page. `VmObject::drop` releases the frames
+  when the last mapping goes away; `free_pages_range` frees object pages
+  only at strong count one and otherwise releases just this task's charges.
+  `resident_pages()` is used for fork quota accounting and debug output.
+- `fork` shares parent private overrides with `share_page_tagged`, maps
+  object pages first and overrides second, and protects writable lazy
+  regions read-only on both sides. `cow_shared` is set for lazy regions too,
+  so a later `mprotect(PROT_WRITE)` cannot bypass the object.
+- `tests/linux/cowfork.c` now writes the surviving `[64K,128K)` slice after
+  prefix and tail unmaps, checking that `base_bias` still finds the object
+  page. Test evidence: `linux-cowfork` prints `cow fork ok`; `health` reports
+  `frames: used 9353 / 260183` and `zombie 0`, the clean-boot count.
+  `linux-mmapfile` (file-backed lazy mmap), `linux-threads` and `linux-fork`
+  still hit their markers; `cargo test --lib` is 272 passed.
+- Linux `sysinfo(2)` now returns real total/free frame bytes instead of a
+  zeroed structure (`mem_unit = 1`); the probe that motivated it was removed
+  from `cowfork.c` because its extra fork exposed a separate stack-COW
+  lifetime problem.
+- Known limitations: a private override leaves the stale object page
+  allocated until the object is dropped; the per-task ledger counts shared
+  object pages in both parent and child, so quotas can be stricter than
+  physical sharing; object pages are owned by the Arc, not per-page frame
+  refcounts. Open: an extra forked child that exits without touching a
+  4 KiB stack local can still leave the parent's stack COW page zeroed;
+  that probe is not part of the committed test. The page cache / file-backed
+  VmObject and stale-base reclaim remain the next VM step.

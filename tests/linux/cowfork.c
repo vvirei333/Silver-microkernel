@@ -275,6 +275,13 @@ void _start(void) {
     if (sys2(215, (long)mapping + 192 * 1024, 64 * 1024) != 0) {
         fail("munmap tail failed\n", 18, 20);
     }
+    /* Only the [64K,128K) slice is left. It was populated in the shared
+     * lazy object, and the two unmaps above shifted the region's base bias.
+     * A write must still find and copy the original object page. */
+    mapping[64 * 1024] = 0x7A;
+    if (mapping[64 * 1024] != 0x7A) {
+        fail("shifted lazy page lost\n", 23, 22);
+    }
     if (sys2(215, (long)mapping + 64 * 1024, 64 * 1024) != 0) {
         fail("munmap rest failed\n", 18, 21);
     }

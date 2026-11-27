@@ -79,6 +79,39 @@ impl SharedMapping {
     }
 }
 
+/// One refcounted page object for a lazy mapping.  Until `fork` the owning
+/// region mutates it directly; after `fork` the same object is shared by
+/// every child and pages broken by a write live in the region's private
+/// `pages` map.  The object frees its frames only when the last mapping
+/// drops it, so a child can outlive the parent that populated it.
+pub(super) struct VmObject {
+    pub(super) pages: BTreeMap<u32, (usize, u32)>,
+}
+
+impl VmObject {
+    fn new() -> Self {
+        Self {
+            pages: BTreeMap::new(),
+        }
+    }
+
+    fn page_count_range(&self, start: u32, end: u32) -> usize {
+        self.pages.range(start..end).count()
+    }
+}
+
+impl Drop for VmObject {
+    fn drop(&mut self) {
+        for &(page, generation) in self.pages.values() {
+            if !frame_allocator::free_page_tagged(page, generation) {
+                console::write_str("VM: object release refused page 0x");
+                console::write_hex_u64(page as u64);
+                console::write_str(" - leaked\r\n");
+            }
+        }
+    }
+}
+
 /// `virtual_address` so the first-fit allocator can scan in a single pass.
 #[derive(Clone)]
 pub(super) struct MmapRegion {
@@ -100,9 +133,17 @@ pub(super) struct MmapRegion {
     /// `new_heap` probe) expecting no memory to be committed; an eager
     /// allocator answers `ENOMEM` and glibc retries forever.
     pub(super) lazy: bool,
-    /// Faulted pages of a lazy region, keyed by page offset. Sparse, because
-    /// a 128 MiB reservation usually has only a few MiB touched.
+    /// Private pages of a lazy region, keyed by page offset. Before `fork`
+    /// the shared object holds every faulted page and this map is empty; a
+    /// write after `fork` puts a broken page here instead of mutating the
+    /// object the child still maps.
     pub(super) pages: BTreeMap<u32, (usize, u32)>,
+    /// Backing object for a lazy mapping. The same object is referenced by
+    /// every `fork` child, so it must outlive any one address space.
+    pub(super) base: Option<Arc<crate::smp::SpinLock<VmObject>>>,
+    /// Bias from this region's offset to a key in `base`. A split region
+    /// keeps the object's original offsets so both halves can share it.
+    pub(super) base_bias: u32,
     /// Pages broken out of an anonymous contiguous run by copy-on-write,
     /// keyed by page offset. The base run stays owned as a whole; these are
     /// additional private frames, so one write never copies its neighbours.
@@ -121,19 +162,64 @@ pub(super) struct MmapRegion {
 }
 
 impl MmapRegion {
-    /// Frees the faulted pages with offsets in `[start, start + count)` and
-    /// returns how many frames were released.
+    fn base_key_range(&self, start: u32, count: u32) -> (u32, u32) {
+        let first = self.base_bias.saturating_add(start);
+        (first, first.saturating_add(count))
+    }
+
+    fn base_page_count_range(&self, start: u32, count: u32) -> usize {
+        let Some(base) = &self.base else {
+            return 0;
+        };
+        let (first, last) = self.base_key_range(start, count);
+        base.lock().page_count_range(first, last)
+    }
+
+    /// Pages resident in this region: shared object pages plus private
+    /// overrides. Used for fork quota accounting and teardown.
+    pub(super) fn resident_pages(&self) -> usize {
+        self.pages.len() + self.base_page_count_range(0, self.page_count as u32)
+    }
+
+    /// Frees the private pages with offsets in `[start, start + count)` and
+    /// returns how many task charges were released. Shared object pages are
+    /// freed only when this region is the last reference; otherwise the
+    /// frame stays alive for the other mappings and only the charge goes.
     pub(super) fn free_pages_range(&mut self, start: u32, count: u32) -> usize {
         let end = start.saturating_add(count);
         let keys: Vec<u32> = self.pages.range(start..end).map(|(&key, _)| key).collect();
-        let mut freed = 0;
+        let mut released = 0;
         for key in keys {
             if let Some((page, generation)) = self.pages.remove(&key) {
                 let _ = frame_allocator::free_page_tagged(page, generation);
-                freed += 1;
+                released += 1;
             }
         }
-        freed
+        let Some(base) = &self.base else {
+            return released;
+        };
+        let (first, last) = self.base_key_range(start, count);
+        let base_pages = base.lock().page_count_range(first, last);
+        if base_pages > 0 && Arc::strong_count(base) == 1 {
+            let mut removed = Vec::with_capacity(base_pages);
+            {
+                let mut object = base.lock();
+                let keys: Vec<u32> = object
+                    .pages
+                    .range(first..last)
+                    .map(|(&key, _)| key)
+                    .collect();
+                for key in keys {
+                    if let Some(frame) = object.pages.remove(&key) {
+                        removed.push(frame);
+                    }
+                }
+            }
+            for (page, generation) in removed {
+                let _ = frame_allocator::free_page_tagged(page, generation);
+            }
+        }
+        released + base_pages
     }
 
     /// Splits off the pages at or above `at` into a new map keyed from zero.
@@ -181,7 +267,12 @@ impl MmapRegion {
     /// Physical frame backing `offset`, including a private COW override.
     pub(super) fn page_physical(&self, offset: u32) -> Option<usize> {
         if self.lazy {
-            return self.pages.get(&offset).map(|&(page, _)| page);
+            if let Some(&(page, _)) = self.pages.get(&offset) {
+                return Some(page);
+            }
+            let base = self.base.as_ref()?;
+            let key = self.base_bias.saturating_add(offset);
+            return base.lock().pages.get(&key).map(|&(page, _)| page);
         }
         if !self.frames.is_empty() {
             return self.frames.get(offset as usize).map(|&(page, _)| page);
@@ -852,6 +943,8 @@ impl Task {
                 frames: Vec::new(),
                 lazy: true,
                 pages: BTreeMap::new(),
+                base: Some(Arc::new(crate::smp::SpinLock::new(VmObject::new()))),
+                base_bias: 0,
                 cow_pages: BTreeMap::new(),
                 cow_shared: false,
                 file: None,
@@ -949,6 +1042,8 @@ impl Task {
             frames: Vec::new(),
             lazy: false,
             pages: BTreeMap::new(),
+            base: None,
+            base_bias: 0,
             cow_pages: BTreeMap::new(),
             cow_shared: false,
             file: None,
@@ -990,6 +1085,8 @@ impl Task {
             frames: Vec::new(),
             lazy: true,
             pages: BTreeMap::new(),
+            base: Some(Arc::new(crate::smp::SpinLock::new(VmObject::new()))),
+            base_bias: 0,
             cow_pages: BTreeMap::new(),
             cow_shared: false,
             file: Some((path, file_offset)),
@@ -1080,6 +1177,8 @@ impl Task {
             frames,
             lazy: false,
             pages: BTreeMap::new(),
+            base: None,
+            base_bias: 0,
             cow_pages: BTreeMap::new(),
             cow_shared: false,
             file: None,
@@ -1262,11 +1361,63 @@ impl Task {
             lazy_fail!(b"no-prot");
         }
         let offset = ((page - self.mmap_regions[index].virtual_address) / PAGE_SIZE) as u32;
-        if self.mmap_regions[index].pages.contains_key(&offset) {
-            // Another thread backed this page while this one was on its way
-            // to the fault handler. The mapping exists, so the retry must
-            // succeed; killing the faulting task here would murder a healthy
-            // thread racing a sibling on a shared, lazily mapped region.
+        let base = self.mmap_regions[index].base.clone();
+        let key = self.mmap_regions[index].base_bias.saturating_add(offset);
+        let object_page = base
+            .as_ref()
+            .and_then(|base| base.lock().pages.get(&key).copied());
+        let private_page = self.mmap_regions[index].pages.get(&offset).copied();
+        if let Some((old_physical, old_generation)) = private_page.or(object_page) {
+            // The page is backed but may have been write-protected by fork.
+            // A read (or a store while not shared) is already satisfied; a
+            // store after fork copies the one page into a private frame.
+            if !write || !self.mmap_regions[index].cow_shared {
+                // Another thread backed this page while this one was on its
+                // way to the fault handler. The mapping exists, so the retry
+                // must succeed; killing the faulting task here would murder a
+                // healthy thread racing a sibling on a shared region.
+                return true;
+            }
+            let replacing_private = private_page.is_some();
+            let charge = if replacing_private { 0 } else { 1 };
+            if charge > 0 && !self.charge_frames(charge) {
+                lazy_fail!(b"charge");
+            }
+            let Some((physical, generation)) = frame_allocator::alloc_user_page_tagged() else {
+                self.release_frames(charge);
+                lazy_fail!(b"alloc");
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(old_physical) as *const u8,
+                    phys_to_virt(physical) as *mut u8,
+                    PAGE_SIZE,
+                );
+            }
+            // The page is already mapped (read-only after fork), so this is
+            // a replacement, not a fresh mapping.
+            if !mmu::remap_user_pages_at(self.ttbr0, page, physical, 1, prot) {
+                frame_allocator::free_page_tagged(physical, generation);
+                self.release_frames(charge);
+                lazy_fail!(b"map");
+            }
+            // Replacing an override keeps the ledger flat; the old frame is
+            // only this region's reference and any fork child holds its own.
+            if replacing_private {
+                let _ = frame_allocator::free_page_tagged(old_physical, old_generation);
+            }
+            self.mmap_regions[index]
+                .pages
+                .insert(offset, (physical, generation));
+            #[cfg(feature = "gdb-stub")]
+            if crate::debug::soft_page_is(page as u64) {
+                let _ = mmu::map_user_page_at(
+                    self.ttbr0,
+                    page,
+                    physical,
+                    prot & !mmu::PROT_WRITE,
+                );
+            }
             return true;
         }
         let source = self.mmap_regions[index].file.clone();
@@ -1320,9 +1471,17 @@ impl Task {
                 prot & !mmu::PROT_WRITE,
             );
         }
-        self.mmap_regions[index]
-            .pages
-            .insert(offset, (physical, generation));
+        if self.mmap_regions[index].cow_shared {
+            self.mmap_regions[index]
+                .pages
+                .insert(offset, (physical, generation));
+        } else if let Some(base) = base {
+            base.lock().pages.insert(key, (physical, generation));
+        } else {
+            self.mmap_regions[index]
+                .pages
+                .insert(offset, (physical, generation));
+        }
         let index2 = LAZY_OK_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         unsafe {
             let ring = core::ptr::addr_of_mut!(LAZY_OK);
@@ -1836,6 +1995,10 @@ impl Task {
                         for (key, value) in pages {
                             region.pages.insert(key - shift, value);
                         }
+                        region.base_bias = region.base_bias.saturating_add(shift);
+                        if let Some((_, file_offset)) = region.file.as_mut() {
+                            *file_offset += shift as usize * PAGE_SIZE;
+                        }
                     } else if !paged {
                         region.physical_start = removed_physical + count * PAGE_SIZE;
                         // Override offsets are relative to the region start.
@@ -1852,8 +2015,12 @@ impl Task {
                     tail.page_count = right;
                     tail.prot = prot;
                     if lazy {
-                        tail.pages = self.mmap_regions[index]
-                            .take_pages_from((start_page + count) as u32);
+                        let tail_start = (start_page + count) as u32;
+                        tail.pages = self.mmap_regions[index].take_pages_from(tail_start);
+                        tail.base_bias = tail.base_bias.saturating_add(tail_start);
+                        if let Some((_, file_offset)) = tail.file.as_mut() {
+                            *file_offset += tail_start as usize * PAGE_SIZE;
+                        }
                     } else if paged {
                         // The drain above left left+right frames; split the
                         // tail off after the retained prefix.
@@ -2067,6 +2234,9 @@ impl Task {
         tail.page_count = self.mmap_regions[index].page_count - offset_pages;
         if tail.lazy {
             tail.pages = self.mmap_regions[index].take_pages_from(offset_pages as u32);
+            // The object keeps the original offsets; the tail's page 0 is
+            // `offset_pages` further into it.
+            tail.base_bias = tail.base_bias.saturating_add(offset_pages as u32);
             // A file-backed region reads page `n` at `file_offset + n * PAGE`.
             // The tail's page 0 is `offset_pages` further into the file.
             if let Some((_, file_offset)) = tail.file.as_mut() {

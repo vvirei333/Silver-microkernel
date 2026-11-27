@@ -1583,7 +1583,7 @@ pub fn dump_current_task_map() {
                 if region.lazy {
                     push(&mut line, &mut length, b" lazy(");
                     crate::console::write_bytes(&line[..length]);
-                    crate::console::write_dec_u64(region.pages.len() as u64);
+                    crate::console::write_dec_u64(region.resident_pages() as u64);
                     let mut length = 0;
                     push(&mut line, &mut length, b" touched)");
                     crate::console::write_bytes(&line[..length]);
@@ -2776,28 +2776,20 @@ pub fn fork_current_with_sp(
             continue;
         }
         if region.lazy {
-            // Copy the pages the parent has already touched. They hold live
-            // data (a pthread TCB and stack, glibc heaps), so handing the
-            // child a zeroed reservation would make its first libc call
-            // dereference a null TCB field. Untouched pages stay lazy.
+            // Share the parent's backing object and its already-broken
+            // private pages. This keeps live data (a pthread TCB and stack,
+            // glibc heaps) visible without copying every touched page, and
+            // both sides write-protect them below so a store still copies.
+            // Untouched pages stay lazy and fault privately.
             let mut pages: BTreeMap<u32, (usize, u32)> = BTreeMap::new();
-            for (&offset, &(page, _generation)) in &region.pages {
-                let Some((new_page, new_generation)) =
-                    frame_allocator::alloc_user_page_tagged()
-                else {
+            for (&offset, &(page, generation)) in &region.pages {
+                if !frame_allocator::share_page_tagged(page, generation) {
                     for (page, generation) in pages.values() {
                         let _ = frame_allocator::free_page_tagged(*page, *generation);
                     }
                     return None;
-                };
-                unsafe {
-                    core::ptr::copy_nonoverlapping(
-                        phys_to_virt(page) as *const u8,
-                        phys_to_virt(new_page) as *mut u8,
-                        PAGE_SIZE,
-                    );
                 }
-                pages.insert(offset, (new_page, new_generation));
+                pages.insert(offset, (page, generation));
             }
             parts.mmap.push(MmapRegion {
                 virtual_address: region.virtual_address,
@@ -2809,8 +2801,10 @@ pub fn fork_current_with_sp(
                 frames: Vec::new(),
                 lazy: true,
                 pages,
+                base: region.base.clone(),
+                base_bias: region.base_bias,
                 cow_pages: BTreeMap::new(),
-                cow_shared: false,
+                cow_shared: true,
                 file: region.file.clone(),
             });
             continue;
@@ -2842,6 +2836,8 @@ pub fn fork_current_with_sp(
                 frames: shared,
                 lazy: false,
                 pages: BTreeMap::new(),
+                base: None,
+                base_bias: 0,
                 cow_pages: BTreeMap::new(),
                 cow_shared: true,
                 file: None,
@@ -2881,6 +2877,8 @@ pub fn fork_current_with_sp(
             frames: Vec::new(),
             lazy: false,
             pages: BTreeMap::new(),
+            base: None,
+            base_bias: 0,
             cow_pages: shared_cow,
             cow_shared: true,
             file: None,
@@ -2893,7 +2891,7 @@ pub fn fork_current_with_sp(
         .iter()
         .map(|region| {
             if region.lazy {
-                region.pages.len()
+                region.resident_pages()
             } else {
                 // The base run stays mapped for every page; a broken page
                 // is an additional private frame, not a replacement.
@@ -2973,16 +2971,51 @@ pub fn fork_current_with_sp(
     }
     for region in &parts.mmap {
         let mapped = if region.lazy {
+            // A writable lazy mapping starts read-only in the child, the
+            // same rule as paged file mappings. Shared object pages are
+            // mapped first, then the parent's private overrides replace the
+            // object page at the same offset.
+            let child_prot = if region.prot & mmu::PROT_WRITE != 0 {
+                mmu::PROT_READ
+            } else {
+                region.prot
+            };
+            let base_pages: Vec<(u32, usize)> = match &region.base {
+                Some(base) => {
+                    let first = region.base_bias;
+                    let last = first.saturating_add(region.page_count as u32);
+                    base.lock()
+                        .pages
+                        .range(first..last)
+                        .map(|(&key, &(page, _))| (key - first, page))
+                        .collect()
+                }
+                None => Vec::new(),
+            };
             let mut ok = true;
-            for (&offset, &(page, _generation)) in &region.pages {
+            for (offset, page) in base_pages {
                 if !mmu::map_user_page_at(
                     ttbr0,
                     region.virtual_address + offset as usize * PAGE_SIZE,
                     page,
-                    region.prot,
+                    child_prot,
                 ) {
                     ok = false;
                     break;
+                }
+            }
+            if ok {
+                for (&offset, &(page, _generation)) in &region.pages {
+                    if !mmu::remap_user_pages_at(
+                        ttbr0,
+                        region.virtual_address + offset as usize * PAGE_SIZE,
+                        page,
+                        1,
+                        child_prot,
+                    ) {
+                        ok = false;
+                        break;
+                    }
                 }
             }
             ok
@@ -3084,8 +3117,20 @@ pub fn fork_current_with_sp(
                 continue;
             }
             if region.lazy {
-                // Nothing is committed on either side yet; faults allocate
-                // private frames in whichever address space touches first.
+                // The child shares the parent's object pages. Protect every
+                // mapped page (object page or private override) read-only so
+                // the first store on either side goes through COW.
+                if region.prot & mmu::PROT_WRITE != 0
+                    && !mmu::protect_user_pages_at_lenient(
+                        parent.ttbr0,
+                        region.virtual_address,
+                        region.page_count,
+                        mmu::PROT_READ,
+                    )
+                {
+                    kernel_stack::free(kernel_stack_start);
+                    return None;
+                }
                 continue;
             }
             if !region.frames.is_empty() {
@@ -3117,7 +3162,7 @@ pub fn fork_current_with_sp(
             }
         }
         for region in &mut parent.mmap_regions {
-            if region.shared.owner.is_none() && !region.lazy {
+            if region.shared.owner.is_none() {
                 // Even a read-only region can gain write through a later
                 // mprotect; keep write faults going through COW.
                 region.cow_shared = true;
@@ -4258,7 +4303,7 @@ pub fn debug_fault_region(far: usize) {
         console::write_str(" frames=");
         console::write_dec_u64(region.frames.len() as u64);
         console::write_str(" faultpages=");
-        console::write_dec_u64(region.pages.len() as u64);
+        console::write_dec_u64(region.resident_pages() as u64);
         if let Some((path, offset)) = &region.file {
             console::write_str(" file=");
             console::write_str(path);

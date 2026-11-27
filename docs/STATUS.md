@@ -161,13 +161,20 @@ Console-image fixes in the same pass:
 - Writable `/tmp` with `O_CREAT`/`O_EXCL`/`O_TRUNC`, `mkdirat`, `unlinkat`,
   `renameat`; `XDG_RUNTIME_DIR=/tmp`.
 - `MAP_SHARED` memfd windows shared across processes and `fork`.
-- `fork` copy-on-write is page-granular for ELF image runs, the user stack
-  and non-lazy writable `mmap` frames: the first write copies only that
-  4 KiB page into a private frame, while the shared base run stays mapped
-  for its other pages. A second fork inherits those broken pages, so a child
-  never falls back to stale base data. Re-granting write with `mprotect` on
-  a forked image or paged mapping records the new protection but leaves the
-  PTE read-only, so the next store still goes through COW.
+- `fork` copy-on-write is page-granular for ELF image runs, the user stack,
+  non-lazy writable `mmap` frames and lazy anonymous/file `mmap` objects: the
+  first write copies only that 4 KiB page into a private frame, while the
+  shared base run or backing `VmObject` stays mapped for its other pages. A
+  second fork inherits those broken pages, so a child never falls back to
+  stale base data. Re-granting write with `mprotect` on a forked image or
+  paged mapping records the new protection but leaves the PTE read-only, so
+  the next store still goes through COW.
+- A lazy mapping owns one refcounted `VmObject`; `fork` shares the object
+  rather than copying touched pages, and prefix/middle `munmap` shifts a
+  `base_bias` instead of rekeying the object. Object frames are released when
+  the last mapping drops it. Stale object pages behind a private override
+  stay allocated until teardown (bounded, a future reclaim target), and the
+  per-task ledger counts shared object pages in each task.
 - **evdev input**: a polled kernel virtio-input driver (PCI `1af4:1052`) serves
   up to two devices in PCI order: `event0` (keyboard) and `event1` (absolute
   pointer/tablet). `read(2)` returns 24-byte `struct input_event` records

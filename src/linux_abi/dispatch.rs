@@ -316,7 +316,7 @@ fn dispatch_inner(
         SYS_GETPGID | SYS_GETSID => scheduler::current_tgid(),
         SYS_UMASK => 0o22,
         SYS_GETRUSAGE => linux_zero_struct(args[1], 144),
-        SYS_SYSINFO => linux_zero_struct(args[0], 112),
+        SYS_SYSINFO => linux_sysinfo(args[0]),
         SYS_STATFS => {
             if cap_denies_cwd() {
                 errno(EPERM)
