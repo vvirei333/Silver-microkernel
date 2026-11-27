@@ -8612,3 +8612,30 @@ Night session results, in order:
   their markers. `cargo test --lib` remains 272 passed;
   `no_std,linux-abi`, `no_std,linux-abi-trace`, `no_std,linux-abi,gdb-stub`,
   `no_std,gdb-stub`, `no_std,smp-selftest` and `no_std,tablet` check cleanly.
+
+### 2026-11-26 (COW-safe mprotect) - write re-grant cannot bypass a fork
+
+- `mprotect(PROT_WRITE)` on a mapping that `fork` had shared installed a
+  writable PTE directly. The store then overwrote the base frame that the
+  child still mapped read-only; the child observed the parent's byte despite
+  copy-on-write. The same hole existed for a shared ELF image run.
+- `MmapRegion` and `LinuxRun` now carry `cow_shared`, set on both sides when
+  `fork` shares a non-lazy mapping or image run. `mprotect` still records the
+  requested protection (and image `PageKind`), but clears `PROT_WRITE` from
+  the PTE while `cow_shared` is set. The first store faults into the existing
+  one-page COW path instead of touching the shared frame.
+- The mmap branch now splits the requested range first and protects each
+  covered region individually. A range that also contains a `MAP_SHARED`
+  memfd window therefore leaves that window writable; a single aggregate
+  read-only walk would have broken shared-memory visibility.
+- `tests/linux/cowfork.c` maps a non-lazy memfd range, forks a child that
+  sleeps, calls `mprotect(PROT_READ|PROT_WRITE)`, writes one page, wakes the
+  child and waits. Before the fix the child exits 32 (`mprotect child saw
+  shared page`, parent status 27); after it reads the original byte and the
+  test prints `cow fork ok`. The child sleep is required because anonymous
+  `mmap` is lazy and lazy fork copies touched pages instead of sharing them.
+- Evidence (QEMU virt, Linux ABI kernel): `linux-cowfork` prints
+  `cow fork ok`; `health` reports `frames: used 9353 / 260184` and
+  `zombie 0`, the clean-boot count. `linux-fork`, `linux-signal`,
+  `linux-kill-group`, `linux-pipe`, `linux-mmapfile` and
+  `linux-pthread-lifetime` still hit their markers.

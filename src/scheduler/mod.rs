@@ -2810,6 +2810,7 @@ pub fn fork_current_with_sp(
                 lazy: true,
                 pages,
                 cow_pages: BTreeMap::new(),
+                cow_shared: false,
                 file: region.file.clone(),
             });
             continue;
@@ -2842,6 +2843,7 @@ pub fn fork_current_with_sp(
                 lazy: false,
                 pages: BTreeMap::new(),
                 cow_pages: BTreeMap::new(),
+                cow_shared: true,
                 file: None,
             });
             continue;
@@ -2880,6 +2882,7 @@ pub fn fork_current_with_sp(
             lazy: false,
             pages: BTreeMap::new(),
             cow_pages: shared_cow,
+            cow_shared: true,
             file: None,
         });
     }
@@ -3111,6 +3114,13 @@ pub fn fork_current_with_sp(
             {
                 kernel_stack::free(kernel_stack_start);
                 return None;
+            }
+        }
+        for region in &mut parent.mmap_regions {
+            if region.shared.owner.is_none() && !region.lazy {
+                // Even a read-only region can gain write through a later
+                // mprotect; keep write faults going through COW.
+                region.cow_shared = true;
             }
         }
         if !mmu::protect_cow_image(parent.ttbr0, parts.image.as_ref()?) {

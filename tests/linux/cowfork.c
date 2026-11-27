@@ -10,6 +10,8 @@
  * changed, then writes its own values. It forks again after those writes so
  * the child must inherit the parent's private image, mmap, stack and heap
  * pages. This covers page-granular image, stack and anonymous mmap COW.
+ * A live sleeping child also checks that re-granting write through mprotect
+ * on a non-lazy memfd mapping does not bypass the COW copy.
  */
 static long sys6(long n, long a, long b, long c, long d, long e, long f) {
     register long x8 __asm__("x8") = n;
@@ -52,6 +54,7 @@ static unsigned char image_data[1024 * 1024];
 static unsigned char *mapping;
 static unsigned char *stack_data;
 static unsigned char *heap_data;
+static unsigned char *cow_map;
 
 /* After the parent has broken one page of each kind, a second fork must
  * inherit those private pages (not the stale base frames) and share them
@@ -133,6 +136,54 @@ void _start(void) {
     }
     heap_data = (unsigned char *)heap;
     heap_data[0] = 0x99;
+
+    /* The anonymous mapping above is lazy, so fork gives the child private
+     * copies on first touch. Use a non-lazy memfd-backed mapping to exercise
+     * page-granular COW frames, then re-grant write with mprotect while the
+     * child is alive. The parent must still copy, not write the shared page. */
+    long mpfd = sys3(279, (long)"cowmp", 0, 0); /* memfd_create */
+    if (mpfd < 0 || sys3(46, mpfd, SIZE, 0) < 0) {
+        fail("memfd setup failed\n", 20, 28);
+    }
+    cow_map = (unsigned char *)sys6(
+        222, 0, SIZE, 1 | 2, 0x2 /* PRIVATE */, mpfd, 0);
+    if ((long)cow_map < 0) {
+        fail("memfd mmap failed\n", 18, 29);
+    }
+    for (long index = 0; index < SIZE; index += 4096) {
+        cow_map[index] = 0x11;
+    }
+    long delay[2] = {0, 200000000};
+    long sync_pid = sys5(220, 17, 0, 0, 0, 0);
+    if (sync_pid < 0) {
+        fail("mprotect fork failed\n", 21, 23);
+    }
+    if (sync_pid == 0) {
+        sys3(101, (long)delay, 0, 0);
+        if (cow_map[64 * 1024] != 0x11) {
+            sys3(93, 32, 0, 0);
+        }
+        sys3(93, 0, 0, 0);
+        for (;;) {
+        }
+    }
+    if (sys3(226, (long)cow_map, SIZE, 3) != 0) {
+        fail("mprotect failed\n", 16, 24);
+    }
+    cow_map[64 * 1024] = 0x66;
+    int sync_status = 0;
+    if (sys4(260, sync_pid, (long)&sync_status, 0, 0) != sync_pid) {
+        fail("mprotect wait failed\n", 22, 26);
+    }
+    if (((sync_status >> 8) & 0xff) != 0) {
+        fail("mprotect child saw shared page\n", 31, 27);
+    }
+    if (cow_map[64 * 1024] != 0x66) {
+        fail("mprotect page lost\n", 19, 30);
+    }
+    if (sys3(215, (long)cow_map, SIZE, 0) != 0) {
+        fail("mprotect munmap failed\n", 24, 31);
+    }
 
     long pid = sys5(220, 17, 0, 0, 0, 0);
     if (pid < 0) {

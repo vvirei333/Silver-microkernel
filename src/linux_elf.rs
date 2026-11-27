@@ -69,6 +69,10 @@ pub struct LinuxRun {
     /// frames are additional private pages, so a write to one page never
     /// copies its neighbours. Empty until a COW fault.
     pub cow_pages: BTreeMap<u32, (usize, u32)>,
+    /// True once this run is shared with a forked image. `mprotect` may
+    /// grant write later, but the PTE must stay read-only so the store still
+    /// goes through the COW fault.
+    pub cow_shared: bool,
 }
 
 /// A fully loaded Linux image plus the metadata the scheduler needs to map it
@@ -145,6 +149,7 @@ impl LinuxImage {
                 generation: run.generation,
                 kinds,
                 cow_pages: BTreeMap::new(),
+                cow_shared: true,
             });
             let current = image.runs.len() - 1;
             for (&offset, &(page, page_generation)) in &run.cow_pages {
@@ -163,6 +168,7 @@ impl LinuxImage {
     /// parent after `share`; the parent's PTEs are made read-only separately.
     pub fn mark_data_cow(&mut self) {
         for run in &mut self.runs {
+            run.cow_shared = true;
             for kind in &mut run.kinds {
                 if *kind == PageKind::Data {
                     *kind = PageKind::Cow;
@@ -604,6 +610,7 @@ fn load_linux_elf_from_source(
             generation,
             kinds: vec![segment.kind; pages],
             cow_pages: BTreeMap::new(),
+            cow_shared: false,
         };
         // Zero the whole run first (BSS is the tail the file does not cover),
         // then stream the file bytes from the segment's page offset directly

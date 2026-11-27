@@ -162,10 +162,12 @@ Console-image fixes in the same pass:
   `renameat`; `XDG_RUNTIME_DIR=/tmp`.
 - `MAP_SHARED` memfd windows shared across processes and `fork`.
 - `fork` copy-on-write is page-granular for ELF image runs, the user stack
-  and anonymous writable `mmap`: the first write to one page copies only
-  that 4 KiB page into a private frame, while the shared base run stays
-  mapped for its other pages. A second fork inherits those broken pages, so
-  a child never falls back to stale base data.
+  and non-lazy writable `mmap` frames: the first write copies only that
+  4 KiB page into a private frame, while the shared base run stays mapped
+  for its other pages. A second fork inherits those broken pages, so a child
+  never falls back to stale base data. Re-granting write with `mprotect` on
+  a forked image or paged mapping records the new protection but leaves the
+  PTE read-only, so the next store still goes through COW.
 - **evdev input**: a polled kernel virtio-input driver (PCI `1af4:1052`) serves
   up to two devices in PCI order: `event0` (keyboard) and `event1` (absolute
   pointer/tablet). `read(2)` returns 24-byte `struct input_event` records

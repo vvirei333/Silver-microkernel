@@ -107,6 +107,10 @@ pub(super) struct MmapRegion {
     /// keyed by page offset. The base run stays owned as a whole; these are
     /// additional private frames, so one write never copies its neighbours.
     pub(super) cow_pages: BTreeMap<u32, (usize, u32)>,
+    /// Set when this region was forked. A later `mprotect` that adds write
+    /// must leave the PTE read-only, otherwise it would write straight into
+    /// frames the parent and child still share.
+    pub(super) cow_shared: bool,
     /// File-backed lazy region: `(path, byte offset of the mapping inside the
     /// file)`. Pages are read from the file on first touch, so mapping a
     /// 160 MiB library costs only the pages the program actually executes.
@@ -849,6 +853,7 @@ impl Task {
                 lazy: true,
                 pages: BTreeMap::new(),
                 cow_pages: BTreeMap::new(),
+                cow_shared: false,
                 file: None,
             };
             let position = self
@@ -945,6 +950,7 @@ impl Task {
             lazy: false,
             pages: BTreeMap::new(),
             cow_pages: BTreeMap::new(),
+            cow_shared: false,
             file: None,
         };
         let position = self
@@ -985,6 +991,7 @@ impl Task {
             lazy: true,
             pages: BTreeMap::new(),
             cow_pages: BTreeMap::new(),
+            cow_shared: false,
             file: Some((path, file_offset)),
         };
         let position = self
@@ -1074,6 +1081,7 @@ impl Task {
             lazy: false,
             pages: BTreeMap::new(),
             cow_pages: BTreeMap::new(),
+            cow_shared: false,
             file: None,
         };
         let position = self
@@ -1936,19 +1944,37 @@ impl Task {
             if self.mmap_regions.len() + splits > MAX_MMAP_REGIONS {
                 return false;
             }
-            // Lazy reservations may not have a frame behind every page yet;
-            // a lenient walk records the protection for the ones that do.
-            if !mmu::protect_user_pages_at_lenient(self.ttbr0, address, page_count, prot) {
-                return false;
-            }
             if !self.split_region_at(address) || !self.split_region_at(end) {
                 return false;
             }
             for region in &mut self.mmap_regions {
                 let region_end = region.virtual_address + region.page_count * PAGE_SIZE;
-                if region.virtual_address >= address && region_end <= end {
-                    region.prot = prot;
+                if region.virtual_address < address || region_end > end {
+                    continue;
                 }
+                // Once a region is shared with a child, granting write
+                // through mprotect must not bypass COW: record the writable
+                // protection for future fork/prot queries, but leave the
+                // PTE read-only so the next store still copies one page.
+                // Other regions in the same call (notably a shared memfd)
+                // keep the protection the caller asked for.
+                let pte_prot = if prot & mmu::PROT_WRITE != 0 && region.cow_shared {
+                    prot & !mmu::PROT_WRITE
+                } else {
+                    prot
+                };
+                // Lazy reservations may not have a frame behind every page
+                // yet; a lenient walk records the protection for the mapped
+                // ones.
+                if !mmu::protect_user_pages_at_lenient(
+                    self.ttbr0,
+                    region.virtual_address,
+                    region.page_count,
+                    pte_prot,
+                ) {
+                    return false;
+                }
+                region.prot = prot;
             }
             return true;
         }
@@ -1977,7 +2003,20 @@ impl Task {
                 }
                 cursor = next.min(end);
             }
-            if !mmu::protect_user_pages_at(ttbr0, address, page_count, prot) {
+            // A writable image run may still be the shared side of a fork.
+            // Granting write must keep the PTE read-only, or the store would
+            // land in the child's frame too. `cow_shared` remembers this even
+            // after another mprotect removes write again.
+            let has_cow = image.runs.iter().any(|run| {
+                let run_end = run.virtual_address + run.page_count * PAGE_SIZE;
+                run.cow_shared && run.virtual_address < end && address < run_end
+            });
+            let pte_prot = if prot & mmu::PROT_WRITE != 0 && has_cow {
+                prot & !mmu::PROT_WRITE
+            } else {
+                prot
+            };
+            if !mmu::protect_user_pages_at(ttbr0, address, page_count, pte_prot) {
                 return false;
             }
             // Keep `kinds` in sync so `fork` restores the final protections.
