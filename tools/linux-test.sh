@@ -17,6 +17,7 @@
 #   linuxrun /sfs/linux-pie     # ET_DYN + PT_INTERP, prints 'pie main', exit 7
 #   linuxrun /sfs/linux-bigfile # 64 MiB rootfs + 12 MiB file, prints 'rootfs ok'
 #   linuxrun /sfs/linux-mmapfile # file mmap + mprotect + MAP_FIXED, prints 'mmap ok'
+#   linuxrun /sfs/linux-mmapcache # shared file page cache + COW, prints 'mmap cache ok'
 #   linuxrun /sfs/linux-sighandler # user handler + rt_sigframe/rt_sigreturn, prints 'sigframe ok'
 #   linuxrun /sfs/linux-asyncsig  # IRQ-delivered signal + sigaltstack, prints 'async sig ok'
 #   linuxrun /sfs/linux-cowfork   # COW fork isolation, prints 'cow fork ok'
@@ -92,6 +93,7 @@ build ipc
 build signal
 build bigfile
 build mmapfile
+build mmapcache
 build sighandler
 build asyncsig
 build cowfork
@@ -182,6 +184,7 @@ PY
 python3 scripts/sfs_inject.py "$IMAGE" build/big.bin big.bin
 python3 scripts/sfs_inject.py "$IMAGE" build/bigfile.elf linux-bigfile
 python3 scripts/sfs_inject.py "$IMAGE" build/mmapfile.elf linux-mmapfile
+python3 scripts/sfs_inject.py "$IMAGE" build/mmapcache.elf linux-mmapcache
 python3 scripts/sfs_inject.py "$IMAGE" build/sighandler.elf linux-sighandler
 python3 scripts/sfs_inject.py "$IMAGE" build/asyncsig.elf linux-asyncsig
 python3 scripts/sfs_inject.py "$IMAGE" build/cowfork.elf linux-cowfork

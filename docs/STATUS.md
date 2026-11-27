@@ -178,6 +178,19 @@ Console-image fixes in the same pass:
   deferred, not per-page. Object pages are owned by the Arc rather than
   per-page frame refcounts, and the per-task ledger counts shared object
   pages in each task.
+- File-backed private mappings share a weak, path-keyed `VmObject` for as
+  long as any mapping is alive. Object keys are absolute file page numbers,
+  so mappings at different file offsets reuse the same cached pages. Cached
+  pages are mapped read-only and a store copies one page into a private
+  override, leaving the cached bytes untouched. VFS writes, create/unlink,
+  rename and replace drop the weak entry so the next `mmap` reads fresh
+  contents; mappings that already hold the object keep their snapshot.
+  Cache entries do not pin frames after the last mapping drops; a live entry
+  is evicted only when the 64-entry table is full, and nothing persists across
+  boot. Ledger caveat: a mapping that maps a page already cached by another
+  task is charged when it first faults that page,
+  but an untouched cached page is still counted by `resident_pages()` at
+  teardown; `release_frames` saturates, so this remains an approximation.
 - **evdev input**: a polled kernel virtio-input driver (PCI `1af4:1052`) serves
   up to two devices in PCI order: `event0` (keyboard) and `event1` (absolute
   pointer/tablet). `read(2)` returns 24-byte `struct input_event` records
@@ -430,6 +443,7 @@ The same list can be run manually at `howl>`:
 | `linuxrun /sfs/linux-fork` | `parent saw child 42` |
 | `linuxrun /sfs/linux-cowfork` | `cow fork ok` |
 | `linuxrun /sfs/linux-reclaim` | `reclaim ok` |
+| `linuxrun /sfs/linux-mmapcache` | `mmap cache ok` |
 | `linuxrun /sfs/linux-pipe` | `pipe: ping` |
 | `linuxrun /sfs/linux-ipc` | `ipc ok` |
 | `linuxrun /sfs/linux-signal` | `signal ok` |

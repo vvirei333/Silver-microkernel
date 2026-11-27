@@ -8731,3 +8731,60 @@ Night session results, in order:
   `stackfork` probe all pass; `cargo test --lib` is 272 passed; QEMU
   `-smp 4` reports `quiesce PASS (64 rounds)`, `ticks PASS (3 peer
   CPU(s))` and the boot reaches `howl ready`.
+
+### 2026-11-27 (file page cache) - one object per path, absolute file pages
+
+- File-backed private `mmap` used to allocate a fresh `VmObject` for every
+  call, so mapping the same range twice read the file twice and kept two
+  copies. `src/scheduler/task.rs` now keeps a 64-entry
+  `SpinLock<Vec<FileObjectEntry>>` cache. Each entry stores the normalized
+  path and a `Weak<SpinLock<VmObject>>`; dead entries are pruned on lookup,
+  the last mapping still owns the frames, and the cache never pins an
+  unmapped file.
+- Object keys are absolute file pages, not mapping-relative pages.
+  `mmap_file_lazy` sets `base_bias = file_offset / PAGE_SIZE`, so mappings
+  of the same path at different offsets share every overlapping page, and
+  the existing `base_bias` shifts in `munmap`/`mprotect` continue to work.
+- Cached pages are read-only. A read fault maps the cached frame into this
+  address space when needed (or finds it already mapped); a write fault
+  allocates a private frame, copies the cached page, and replaces the PTE.
+  A write-first fault on a cached page that has no PTE yet uses
+  `map_user_page_at`, not `remap_user_pages_at`. Private overrides inherited
+  from a fork are replaced with a fresh private frame on write, preserving
+  the existing all-private anonymous behaviour.
+- A private file mapping is not marked `cow_shared` at creation; the fault
+  path treats `file.is_some()` as COW, and `mprotect` keeps file mappings
+  read-only after a write grant. `prune_shadowed_base` also runs for file
+  mappings, so a sole user can drop cached pages already shadowed by COW
+  overrides.
+- VFS mutations invalidate the weak entry for the affected path: `write`,
+  `pwrite`, `truncate_zero`, `create_file`, `remove_file`, `rename`,
+  `replace` and `seed_file`. Existing mappings keep their snapshot; the
+  next `mmap` reads the new file contents into a fresh object. This avoids
+  returning stale cached pages after a writable file changes, without
+  claiming full Linux page-cache coherence for already-live mappings.
+- New regression `tests/linux/mmapcache.c` (`linux-mmapcache`, linked with
+  `tests/linux/mmapcache.ld`) maps a 1 MiB slice of `big.bin` twice,
+  faults every page, and checks `sysinfo(2)` free frames. The second mapping
+  may add at most 32 page-table/allocator pages; without cache reuse the
+  test fails with `file cache miss` (verified by temporarily disabling the
+  cache lookup). It also maps at file offset 4096 (absolute-page reuse),
+  makes the first access to a cached page a store (write-first COW), and
+  checks that writing every page of the second mapping leaves the first
+  mapping and cached bytes unchanged. After both mappings are gone it
+  checks that the weak cache did not pin the frames. A final section creates
+  `/tmp/mmapcache.dat`, maps `AAAA`, overwrites it with `pwrite` to `BBBB`,
+  maps it again and expects `B` while the old mapping still reads `A`;
+  disabling the `pwrite` invalidation makes this fail with
+  `stale file cache`.
+- Evidence (QEMU virt, release kernel): `linux-mmapcache` prints
+  `mmap cache ok`; `linux-mmapfile`, `linux-cowfork`, `linux-reclaim`,
+  `linux-threads` and `linux-fork` still pass; `cargo test --lib` is 272
+  passed; all `no_std` feature builds pass. The test harness builds and
+  injects `linux-mmapcache` in `tools/linux-test.sh`, and
+  `tools/linux_matrix.py` expects `mmap cache ok`.
+- Limitations: live mappings keep the contents they cached, the cache is
+  weak-only (no persistence and no eviction of live frames), eviction at 64
+  entries can split a file into two objects, and the per-task ledger still
+  charges a mapping for cached pages it never faulted. Per-page frame
+  refcounts and a real eviction/persistence policy remain future work.

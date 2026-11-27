@@ -39,6 +39,7 @@ CASES = [
     ("linuxrun /sfs/linux-rw", b"data+bss ok"),
     ("linuxrun /sfs/linux-fork", b"parent saw child 42"),
     ("linuxrun /sfs/linux-cowfork", b"cow fork ok"),
+    ("linuxrun /sfs/linux-mmapcache", b"mmap cache ok"),
     ("linuxrun /sfs/linux-reclaim", b"reclaim ok"),
     ("linuxrun /sfs/linux-pipe", b"pipe: ping"),
     ("linuxrun /sfs/linux-ipc", b"ipc ok"),

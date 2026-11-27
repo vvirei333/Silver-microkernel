@@ -112,6 +112,50 @@ impl Drop for VmObject {
     }
 }
 
+/// A live `VmObject` for one VFS path. The cache holds only a weak
+/// reference: the last mapping still owns the pages, so an unmapped file
+/// does not pin frames. A later mapping of the same path before teardown
+/// reuses the still-live object instead of reading the same file pages
+/// again.
+struct FileObjectEntry {
+    path: alloc::string::String,
+    object: alloc::sync::Weak<crate::smp::SpinLock<VmObject>>,
+}
+
+const FILE_OBJECT_CACHE_LEN: usize = 64;
+
+static FILE_OBJECTS: crate::smp::SpinLock<Vec<FileObjectEntry>> =
+    crate::smp::SpinLock::new(Vec::new());
+
+fn file_vm_object(path: &str) -> Arc<crate::smp::SpinLock<VmObject>> {
+    let mut cache = FILE_OBJECTS.lock();
+    cache.retain(|entry| entry.object.strong_count() != 0);
+    for entry in cache.iter() {
+        if entry.path.as_str() == path {
+            if let Some(object) = entry.object.upgrade() {
+                return object;
+            }
+        }
+    }
+    let object = Arc::new(crate::smp::SpinLock::new(VmObject::new()));
+    if cache.len() >= FILE_OBJECT_CACHE_LEN {
+        cache.remove(0);
+    }
+    cache.push(FileObjectEntry {
+        path: alloc::string::String::from(path),
+        object: Arc::downgrade(&object),
+    });
+    object
+}
+
+/// Drops the weak cache entry for `path` after a VFS mutation. Mappings that
+/// already hold the object keep their snapshot; the next `mmap` reads the new
+/// file contents into a fresh object instead of reusing stale pages.
+pub(crate) fn invalidate_file_cache(path: &str) {
+    let mut cache = FILE_OBJECTS.lock();
+    cache.retain(|entry| entry.path.as_str() != path);
+}
+
 /// `virtual_address` so the first-fit allocator can scan in a single pass.
 #[derive(Clone)]
 pub(super) struct MmapRegion {
@@ -1111,8 +1155,20 @@ impl Task {
         path: alloc::string::String,
         file_offset: usize,
     ) -> Option<usize> {
+        if file_offset % PAGE_SIZE != 0 {
+            return None;
+        }
+        let file_page = file_offset / PAGE_SIZE;
+        if file_page > u32::MAX as usize {
+            return None;
+        }
         let (virtual_address, page_count, span) =
             self.mmap_prepare(length, prot, fixed, true)?;
+        // The object is keyed by absolute file page, not mapping-relative
+        // page: two mappings of the same file at different offsets then share
+        // the cached pages they overlap. `base_bias` shifts a region offset
+        // into that file-page space and already survives `munmap` splits.
+        let base = file_vm_object(&path);
         let region = MmapRegion {
             virtual_address,
             page_count,
@@ -1123,8 +1179,8 @@ impl Task {
             frames: Vec::new(),
             lazy: true,
             pages: BTreeMap::new(),
-            base: Some(Arc::new(crate::smp::SpinLock::new(VmObject::new()))),
-            base_bias: 0,
+            base: Some(base),
+            base_bias: file_page as u32,
             cow_pages: BTreeMap::new(),
             cow_shared: false,
             file: Some((path, file_offset)),
@@ -1399,11 +1455,13 @@ impl Task {
             lazy_fail!(b"no-prot");
         }
         let offset = ((page - self.mmap_regions[index].virtual_address) / PAGE_SIZE) as u32;
-        if write && self.mmap_regions[index].cow_shared {
-            // A fork may have left object pages that this region has already
-            // overridden. Once the children are gone, drop those dead frames
-            // before handling the new fault instead of keeping them until
-            // mapping teardown.
+        if write
+            && (self.mmap_regions[index].cow_shared || self.mmap_regions[index].file.is_some())
+        {
+            // A fork (or a shared file object) may have left object pages
+            // that this region has already overridden. Once this region is
+            // the last user, drop those dead frames before handling the new
+            // fault instead of keeping them until mapping teardown.
             let pruned = self.mmap_regions[index].prune_shadowed_base();
             if pruned > 0 {
                 self.release_frames(pruned);
@@ -1411,28 +1469,24 @@ impl Task {
         }
         let base = self.mmap_regions[index].base.clone();
         let key = self.mmap_regions[index].base_bias.saturating_add(offset);
+        let file_backed = self.mmap_regions[index].file.is_some();
+        // A file object may be shared by another mapping or process, so its
+        // pages are cached read-only and a store always breaks one page out.
+        let cow = self.mmap_regions[index].cow_shared || file_backed;
         let object_page = base
             .as_ref()
             .and_then(|base| base.lock().pages.get(&key).copied());
-        let private_page = self.mmap_regions[index].pages.get(&offset).copied();
-        if let Some((old_physical, old_generation)) = private_page.or(object_page) {
-            // The page is backed but may have been write-protected by fork.
-            // A read (or a store while not shared) is already satisfied; a
-            // store after fork copies the one page into a private frame.
+        if let Some((old_physical, old_generation)) =
+            self.mmap_regions[index].pages.get(&offset).copied()
+        {
+            // A private override is already mapped. Reads are satisfied; a
+            // store after fork must replace it with a fresh private frame,
+            // or the PTE would stay read-only and fault forever.
             if !write || !self.mmap_regions[index].cow_shared {
-                // Another thread backed this page while this one was on its
-                // way to the fault handler. The mapping exists, so the retry
-                // must succeed; killing the faulting task here would murder a
-                // healthy thread racing a sibling on a shared region.
                 return true;
             }
-            let replacing_private = private_page.is_some();
-            let charge = if replacing_private { 0 } else { 1 };
-            if charge > 0 && !self.charge_frames(charge) {
-                lazy_fail!(b"charge");
-            }
+            let was_mapped = mmu::user_page_is_mapped(self.ttbr0, page);
             let Some((physical, generation)) = frame_allocator::alloc_user_page_tagged() else {
-                self.release_frames(charge);
                 lazy_fail!(b"alloc");
             };
             unsafe {
@@ -1442,17 +1496,85 @@ impl Task {
                     PAGE_SIZE,
                 );
             }
-            // The page is already mapped (read-only after fork), so this is
-            // a replacement, not a fresh mapping.
-            if !mmu::remap_user_pages_at(self.ttbr0, page, physical, 1, prot) {
+            let mapped = if was_mapped {
+                mmu::remap_user_pages_at(self.ttbr0, page, physical, 1, prot)
+            } else {
+                mmu::map_user_page_at(self.ttbr0, page, physical, prot)
+            };
+            if !mapped {
                 frame_allocator::free_page_tagged(physical, generation);
-                self.release_frames(charge);
                 lazy_fail!(b"map");
             }
-            // Replacing an override keeps the ledger flat; the old frame is
-            // only this region's reference and any fork child holds its own.
-            if replacing_private {
-                let _ = frame_allocator::free_page_tagged(old_physical, old_generation);
+            // Replacing an override is ledger-neutral: the old frame was
+            // already charged to this region and no fork child references it
+            // after the remap.
+            let _ = frame_allocator::free_page_tagged(old_physical, old_generation);
+            self.mmap_regions[index]
+                .pages
+                .insert(offset, (physical, generation));
+            #[cfg(feature = "gdb-stub")]
+            if crate::debug::soft_page_is(page as u64) {
+                let _ = mmu::map_user_page_at(
+                    self.ttbr0,
+                    page,
+                    physical,
+                    prot & !mmu::PROT_WRITE,
+                );
+            }
+            return true;
+        }
+        if let Some((old_physical, _old_generation)) = object_page {
+            if !write {
+                // A file object can already hold this page while this
+                // address space has never mapped it: another process faulted
+                // it first. Map the cached frame here; a store still COWs.
+                if !mmu::user_page_is_mapped(self.ttbr0, page) {
+                    let charged = file_backed && self.charge_frames(1);
+                    if file_backed && !charged {
+                        lazy_fail!(b"charge");
+                    }
+                    let map_prot = if cow { prot & !mmu::PROT_WRITE } else { prot };
+                    if !mmu::map_user_page_at(self.ttbr0, page, old_physical, map_prot) {
+                        if charged {
+                            self.release_frames(1);
+                        }
+                        lazy_fail!(b"map");
+                    }
+                }
+                return true;
+            }
+            if !cow {
+                // Anonymous pre-fork mapping: this is the only user and the
+                // PTE is already writable.
+                return true;
+            }
+            if !self.charge_frames(1) {
+                lazy_fail!(b"charge");
+            }
+            let Some((physical, generation)) = frame_allocator::alloc_user_page_tagged() else {
+                self.release_frames(1);
+                lazy_fail!(b"alloc");
+            };
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    phys_to_virt(old_physical) as *const u8,
+                    phys_to_virt(physical) as *mut u8,
+                    PAGE_SIZE,
+                );
+            }
+            // The object page is normally mapped read-only, but a cached
+            // file page can be written before this address space ever read
+            // it. Replace a live PTE, or create one if it is still absent.
+            let was_mapped = mmu::user_page_is_mapped(self.ttbr0, page);
+            let mapped = if was_mapped {
+                mmu::remap_user_pages_at(self.ttbr0, page, physical, 1, prot)
+            } else {
+                mmu::map_user_page_at(self.ttbr0, page, physical, prot)
+            };
+            if !mapped {
+                frame_allocator::free_page_tagged(physical, generation);
+                self.release_frames(1);
+                lazy_fail!(b"map");
             }
             self.mmap_regions[index]
                 .pages
@@ -1505,7 +1627,20 @@ impl Task {
                 }
             }
         }
-        if !mmu::map_user_page_at(self.ttbr0, page, physical, prot) {
+        // A file page read is cached in the shared object and mapped
+        // read-only; only a private override becomes writable. Anonymous
+        // pages after fork keep their existing all-private behaviour.
+        let private_target = if file_backed {
+            write
+        } else {
+            self.mmap_regions[index].cow_shared
+        };
+        let map_prot = if !private_target && cow {
+            prot & !mmu::PROT_WRITE
+        } else {
+            prot
+        };
+        if !mmu::map_user_page_at(self.ttbr0, page, physical, map_prot) {
             frame_allocator::free_page_tagged(physical, generation);
             self.release_frames(1);
             lazy_fail!(b"map");
@@ -1519,16 +1654,12 @@ impl Task {
                 prot & !mmu::PROT_WRITE,
             );
         }
-        if self.mmap_regions[index].cow_shared {
+        if private_target || base.is_none() {
             self.mmap_regions[index]
                 .pages
                 .insert(offset, (physical, generation));
         } else if let Some(base) = base {
             base.lock().pages.insert(key, (physical, generation));
-        } else {
-            self.mmap_regions[index]
-                .pages
-                .insert(offset, (physical, generation));
         }
         let index2 = LAZY_OK_INDEX.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
         unsafe {
@@ -2173,7 +2304,9 @@ impl Task {
                 // PTE read-only so the next store still copies one page.
                 // Other regions in the same call (notably a shared memfd)
                 // keep the protection the caller asked for.
-                let pte_prot = if prot & mmu::PROT_WRITE != 0 && region.cow_shared {
+                let pte_prot = if prot & mmu::PROT_WRITE != 0
+                    && (region.cow_shared || region.file.is_some())
+                {
                     prot & !mmu::PROT_WRITE
                 } else {
                     prot

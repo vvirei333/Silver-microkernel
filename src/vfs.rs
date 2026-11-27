@@ -757,7 +757,11 @@ impl Vfs {
     fn create_file(&mut self, cwd: &str, path: &str) -> Result<(), ()> {
         let resolved = resolve_path(cwd, path)?;
         let (mount, relative) = self.resolve(&resolved);
-        self.mounts[mount].fs.create_file(&relative)
+        let result = self.mounts[mount].fs.create_file(&relative);
+        if result.is_ok() {
+            crate::scheduler::invalidate_file_cache(&resolved);
+        }
+        result
     }
 
     fn make_directory(&mut self, cwd: &str, path: &str) -> Result<(), ()> {
@@ -772,7 +776,11 @@ impl Vfs {
             return Err(());
         }
         let (mount, relative) = self.resolve(&resolved);
-        self.mounts[mount].fs.remove_file(&relative)
+        let result = self.mounts[mount].fs.remove_file(&relative);
+        if result.is_ok() {
+            crate::scheduler::invalidate_file_cache(&resolved);
+        }
+        result
     }
 
     fn remove_directory(
@@ -840,9 +848,14 @@ impl Vfs {
             return Err(());
         }
 
-        self.mounts[source_mount]
+        let result = self.mounts[source_mount]
             .fs
-            .rename(&source_relative, &destination_relative)
+            .rename(&source_relative, &destination_relative);
+        if result.is_ok() {
+            crate::scheduler::invalidate_file_cache(&source);
+            crate::scheduler::invalidate_file_cache(&destination);
+        }
+        result
     }
 
     /// Replaces a file's contents with another file, atomically at the inode
@@ -871,9 +884,14 @@ impl Vfs {
         {
             return Err(());
         }
-        self.mounts[source_mount]
+        let result = self.mounts[source_mount]
             .fs
-            .replace(&source_relative, &destination_relative)
+            .replace(&source_relative, &destination_relative);
+        if result.is_ok() {
+            crate::scheduler::invalidate_file_cache(&source);
+            crate::scheduler::invalidate_file_cache(&destination);
+        }
+        result
     }
 
     fn open(&mut self, owner: u64, cwd: &str, path: &str, flags: u64) -> Result<u64, ()> {
@@ -1093,6 +1111,7 @@ impl Vfs {
             .fs
             .write_at(&relative, offset, bytes, append)?;
         self.open_files[index].offset = new_offset;
+        crate::scheduler::invalidate_file_cache(&path);
         Ok(written)
     }
 
@@ -1104,7 +1123,11 @@ impl Vfs {
         }
         let path = self.open_files[index].path.clone();
         let (mount, relative) = self.resolve(&path);
-        self.mounts[mount].fs.create_file(&relative)
+        let result = self.mounts[mount].fs.create_file(&relative);
+        if result.is_ok() {
+            crate::scheduler::invalidate_file_cache(&path);
+        }
+        result
     }
 
     /// Positional write (`pwrite`): writes at `offset` without moving the
@@ -1121,6 +1144,7 @@ impl Vfs {
         let (written, _) = self.mounts[mount]
             .fs
             .write_at(&relative, offset as usize, bytes, append)?;
+        crate::scheduler::invalidate_file_cache(&path);
         Ok(written)
     }
 
@@ -1322,7 +1346,11 @@ impl Vfs {
     fn seed_file(&mut self, cwd: &str, path: &str, contents: &[u8]) -> Result<(), ()> {
         let resolved = resolve_path(cwd, path)?;
         let (mount, relative) = self.resolve(&resolved);
-        self.mounts[mount].fs.seed_file(&relative, contents)
+        let result = self.mounts[mount].fs.seed_file(&relative, contents);
+        if result.is_ok() {
+            crate::scheduler::invalidate_file_cache(&resolved);
+        }
+        result
     }
 
     /// Mounts a new empty backend at `target`.
