@@ -2987,6 +2987,10 @@ pub fn fork_current_with_sp(
                     base.lock()
                         .pages
                         .range(first..last)
+                        // A private override owns this offset in the child.
+                        // Do not map the stale object page first: it may
+                        // already have been reclaimed by the parent.
+                        .filter(|(&key, _)| !region.pages.contains_key(&(key - first)))
                         .map(|(&key, &(page, _))| (key - first, page))
                         .collect()
                 }
@@ -3006,11 +3010,12 @@ pub fn fork_current_with_sp(
             }
             if ok {
                 for (&offset, &(page, _generation)) in &region.pages {
-                    if !mmu::remap_user_pages_at(
+                    // Shadowed object pages were skipped above, so this
+                    // offset is still free in the child.
+                    if !mmu::map_user_page_at(
                         ttbr0,
                         region.virtual_address + offset as usize * PAGE_SIZE,
                         page,
-                        1,
                         child_prot,
                     ) {
                         ok = false;

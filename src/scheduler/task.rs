@@ -181,6 +181,44 @@ impl MmapRegion {
         self.pages.len() + self.base_page_count_range(0, self.page_count as u32)
     }
 
+    /// Drops object pages that a private override already covers when this
+    /// region is the last user of the object. The PTE points at the override,
+    /// so nobody can observe the stale object page; removing it keeps a
+    /// long-lived parent from retaining one dead frame per written page after
+    /// its children exit. Returns how many task charges were released.
+    fn prune_shadowed_base(&mut self) -> usize {
+        let Some(base) = &self.base else {
+            return 0;
+        };
+        if self.pages.is_empty() || Arc::strong_count(base) != 1 {
+            return 0;
+        }
+        let (first, last) = self.base_key_range(0, self.page_count as u32);
+        let mut removed = Vec::new();
+        {
+            let mut object = base.lock();
+            let keys: Vec<u32> = object
+                .pages
+                .range(first..last)
+                .filter(|(&key, _)| self.pages.contains_key(&(key - first)))
+                .map(|(&key, _)| key)
+                .collect();
+            for key in keys {
+                if let Some(frame) = object.pages.remove(&key) {
+                    removed.push(frame);
+                }
+            }
+        }
+        for (page, generation) in &removed {
+            if !frame_allocator::free_page_tagged(*page, *generation) {
+                console::write_str("VM: shadow release refused page 0x");
+                console::write_hex_u64(*page as u64);
+                console::write_str(" - leaked\r\n");
+            }
+        }
+        removed.len()
+    }
+
     /// Frees the private pages with offsets in `[start, start + count)` and
     /// returns how many task charges were released. Shared object pages are
     /// freed only when this region is the last reference; otherwise the
@@ -1361,6 +1399,16 @@ impl Task {
             lazy_fail!(b"no-prot");
         }
         let offset = ((page - self.mmap_regions[index].virtual_address) / PAGE_SIZE) as u32;
+        if write && self.mmap_regions[index].cow_shared {
+            // A fork may have left object pages that this region has already
+            // overridden. Once the children are gone, drop those dead frames
+            // before handling the new fault instead of keeping them until
+            // mapping teardown.
+            let pruned = self.mmap_regions[index].prune_shadowed_base();
+            if pruned > 0 {
+                self.release_frames(pruned);
+            }
+        }
         let base = self.mmap_regions[index].base.clone();
         let key = self.mmap_regions[index].base_bias.saturating_add(offset);
         let object_page = base

@@ -20,6 +20,7 @@
 #   linuxrun /sfs/linux-sighandler # user handler + rt_sigframe/rt_sigreturn, prints 'sigframe ok'
 #   linuxrun /sfs/linux-asyncsig  # IRQ-delivered signal + sigaltstack, prints 'async sig ok'
 #   linuxrun /sfs/linux-cowfork   # COW fork isolation, prints 'cow fork ok'
+#   linuxrun /sfs/linux-reclaim   # stale object-page reclaim, prints 'reclaim ok'
 #   linuxrun /sfs/linux-scope     # only /sfs is readable, prints 'scope ok'
 #   linuxrun /sfs/linux-capmode   # Capsicum-lite fd rights + cap mode, prints 'capmode ok'
 #   linuxrun /sfs/linux-fexec     # execveat(AT_EMPTY_PATH) after cap_enter, execs hello
@@ -94,6 +95,7 @@ build mmapfile
 build sighandler
 build asyncsig
 build cowfork
+build reclaim
 build scope
 build capmode
 build fexec
@@ -183,6 +185,7 @@ python3 scripts/sfs_inject.py "$IMAGE" build/mmapfile.elf linux-mmapfile
 python3 scripts/sfs_inject.py "$IMAGE" build/sighandler.elf linux-sighandler
 python3 scripts/sfs_inject.py "$IMAGE" build/asyncsig.elf linux-asyncsig
 python3 scripts/sfs_inject.py "$IMAGE" build/cowfork.elf linux-cowfork
+python3 scripts/sfs_inject.py "$IMAGE" build/reclaim.elf linux-reclaim
 python3 scripts/sfs_inject.py "$IMAGE" build/scope.elf linux-scope
 python3 scripts/sfs_inject.py "$IMAGE" build/capmode.elf linux-capmode
 python3 scripts/sfs_inject.py "$IMAGE" build/fexec.elf linux-fexec

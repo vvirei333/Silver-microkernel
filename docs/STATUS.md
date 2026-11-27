@@ -172,9 +172,12 @@ Console-image fixes in the same pass:
 - A lazy mapping owns one refcounted `VmObject`; `fork` shares the object
   rather than copying touched pages, and prefix/middle `munmap` shifts a
   `base_bias` instead of rekeying the object. Object frames are released when
-  the last mapping drops it. Stale object pages behind a private override
-  stay allocated until teardown (bounded, a future reclaim target), and the
-  per-task ledger counts shared object pages in each task.
+  the last mapping drops it, and once this mapping is the last user a write
+  fault also drops object pages already shadowed by private overrides.
+  While a child still shares the object those pages must stay, so reclaim is
+  deferred, not per-page. Object pages are owned by the Arc rather than
+  per-page frame refcounts, and the per-task ledger counts shared object
+  pages in each task.
 - **evdev input**: a polled kernel virtio-input driver (PCI `1af4:1052`) serves
   up to two devices in PCI order: `event0` (keyboard) and `event1` (absolute
   pointer/tablet). `read(2)` returns 24-byte `struct input_event` records
@@ -426,6 +429,7 @@ The same list can be run manually at `howl>`:
 | `linuxrun /sfs/linux-rw` | `RWed` / `data+bss ok` |
 | `linuxrun /sfs/linux-fork` | `parent saw child 42` |
 | `linuxrun /sfs/linux-cowfork` | `cow fork ok` |
+| `linuxrun /sfs/linux-reclaim` | `reclaim ok` |
 | `linuxrun /sfs/linux-pipe` | `pipe: ping` |
 | `linuxrun /sfs/linux-ipc` | `ipc ok` |
 | `linuxrun /sfs/linux-signal` | `signal ok` |

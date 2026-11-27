@@ -736,21 +736,17 @@ impl<T> SpinLock<T> {
 
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         let saved_daif = interrupts::save_and_disable_irq();
-        // Opaque asm retry loop — see `bkl_acquire` for why the plain
-        // `while swap { spin_loop() }` form is unsound here: LLVM deleted
-        // the atomic retry and emitted an infinite `b .`.
-        unsafe {
-            core::arch::asm!(
-                "1: ldaxr {tmp:w}, [{flag}]",
-                "   cbnz {tmp:w}, 1b",
-                "   mov {one:w}, #1",
-                "   stlxr {tmp:w}, {one:w}, [{flag}]",
-                "   cbnz {tmp:w}, 1b",
-                tmp = out(reg) _,
-                one = out(reg) _,
-                flag = in(reg) &self.flag as *const AtomicBool as usize,
-                options(nostack),
-            );
+        // `compare_exchange_weak` is a real atomic RMW, so LLVM keeps the
+        // retry. The old hand-written `ldaxr`/`stlxr` loop let the compiler
+        // allocate the address input in the same register as a scratch
+        // output; a different inlining layout then spun forever on a lock
+        // whose word was already zero.
+        while self
+            .flag
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            core::hint::spin_loop();
         }
         SpinLockGuard {
             lock: self,

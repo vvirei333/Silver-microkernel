@@ -8680,3 +8680,54 @@ Night session results, in order:
   4 KiB stack local can still leave the parent's stack COW page zeroed;
   that probe is not part of the committed test. The page cache / file-backed
   VmObject and stale-base reclaim remain the next VM step.
+
+### 2026-11-27 (stale object-page reclaim) - free what the last user shadowed
+
+- Once a forked child exits, the parent is often the only user of a lazy
+  mapping's `VmObject`, but its private overrides still shadow object pages.
+  `MmapRegion::prune_shadowed_base` now removes those object entries when
+  `Arc::strong_count(base) == 1` and frees their frames, releasing the
+  matching task charges. It runs on the next write fault for a `cow_shared`
+  region, so a parent that stops writing keeps the pages only until the
+  next COW activity; teardown still owns the final release.
+- `fork` no longer maps a shadowed object page only to replace it with the
+  private override. It filters those offsets out of the base run and maps
+  each private override with `map_user_page_at` into the free slot. This is
+  required now that the parent may have reclaimed the object page first;
+  `remap_user_pages_at` assumed the slot was occupied and made a second
+  fork fail.
+- New regression `tests/linux/reclaim.c` (`linux-reclaim` in the test
+  matrix) maps and touches 64 pages, forks once, waits, then writes every
+  page and checks `sysinfo(2)` free frames. With reclaim, the mapping's
+  frames are replaced rather than duplicated; with `prune_shadowed_base`
+  forced to return zero the test fails with `stale pages retained`.
+- Evidence (QEMU virt, release kernel): `linux-reclaim` prints `reclaim ok`;
+  `linux-cowfork` prints `cow fork ok`; `health` reports `frames: used 9353`
+  and `zombie 0`. The temporary diagnostic that disabled pruning was removed
+  before the final build.
+- Remaining limitations: a child that still shares the object forces stale
+  pages to stay, reclaim is triggered by the next write fault rather than by
+  the child's exit, and object pages still lack per-page refcounts.
+- The previously open extra-fork stack probe now passes: a new 4 KiB
+  `volatile` stack local survives four fork/wait rounds (`stackfork ok`).
+  The old exact trigger was not preserved, so this is evidence, not a
+  formal proof that every large-frame stack-COW lifetime is fixed.
+
+### 2026-11-27 (spinlock) - remove register aliasing in `lock`
+
+- Adding the reclaim code changed inlining and exposed a latent bug in
+  `SpinLock::lock`: the hand-written `ldaxr`/`stlxr` loop took the lock
+  address as an `in(reg)` operand and two scratch values as `out(reg)`.
+  LLVM could place the address in the same register as a scratch output,
+  so the second instruction used a clobbered address. The symptom was a
+  hang on a lock whose word was observably zero, seen as
+  `linux-mmapfile` stopping at its first file-mapped fault.
+- `lock` now uses `AtomicBool::compare_exchange_weak` with `Acquire`/
+  `Relaxed` ordering and `spin_loop` in the retry. This is a real atomic
+  RMW, so LLVM cannot delete the retry, and the compiler owns register
+  allocation. Interrupt masking and the guard's restore are unchanged.
+- Evidence: `linux-mmapfile` prints `mmap ok` again; `linux-reclaim`,
+  `linux-cowfork`, `linux-threads`, `linux-fork` and the four-fork
+  `stackfork` probe all pass; `cargo test --lib` is 272 passed; QEMU
+  `-smp 4` reports `quiesce PASS (64 rounds)`, `ticks PASS (3 peer
+  CPU(s))` and the boot reaches `howl ready`.
